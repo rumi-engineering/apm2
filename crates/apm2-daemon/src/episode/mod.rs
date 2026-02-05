@@ -212,8 +212,10 @@ pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
 pub use raw_adapter::{
     RawAdapter, RawAdapterHolon, RawAdapterOutput, RawAdapterState, SharedAdapterState,
 };
+// Re-export registry types (TCK-00162, TCK-00328: profile-based selection)
 pub use registry::{
-    AdapterRegistry, InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
+    AdapterRegistry, AdapterRegistryError, InMemorySessionRegistry, PersistentRegistryError,
+    PersistentSessionRegistry,
 };
 // Re-export reviewer manifest types (TCK-00317)
 pub use reviewer_manifest::{

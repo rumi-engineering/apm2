@@ -4,7 +4,34 @@
 //! harness adapters by type. Per AD-LAYER-001 and AD-ADAPT-001, the registry
 //! acts as a factory for per-episode Holon instances.
 //!
-//! # Usage
+//! # Profile-Based Selection (TCK-00328)
+//!
+//! Per RFC-0019 Addendum, adapter profiles are CAS-addressed artifacts. Profile
+//! selection is explicit by hash; **ambient defaults are forbidden**.
+//!
+//! The registry supports two modes:
+//!
+//! 1. **Legacy Mode**: Uses `with_defaults()` for backward compatibility with
+//!    existing tests. This mode is **deprecated** and will be removed.
+//!
+//! 2. **Profile Mode**: Uses `with_profile()` to load an
+//!    `AgentAdapterProfileV1` from CAS by hash. This is the preferred mode for
+//!    production use.
+//!
+//! # Usage (Profile Mode - Recommended)
+//!
+//! ```rust,ignore
+//! use apm2_daemon::episode::registry::AdapterRegistry;
+//! use apm2_core::fac::AgentAdapterProfileV1;
+//!
+//! // Load profile from CAS by hash
+//! let registry = AdapterRegistry::with_profile(&cas, &profile_hash)?;
+//!
+//! // Profile hash is recorded for attribution
+//! let hash = registry.profile_hash().expect("profile was loaded");
+//! ```
+//!
+//! # Usage (Legacy Mode - Deprecated)
 //!
 //! ```rust,ignore
 //! use apm2_daemon::episode::registry::AdapterRegistry;
@@ -24,15 +51,59 @@
 
 use std::collections::HashMap;
 
+use apm2_core::evidence::ContentAddressedStore;
+use apm2_core::fac::{AdapterMode, AgentAdapterProfileError, AgentAdapterProfileV1};
+
 use super::adapter::{AdapterType, HarnessAdapter};
 use super::claude_code::{ClaudeCodeAdapter, ClaudeCodeHolon};
 use super::raw_adapter::{RawAdapter, RawAdapterHolon};
+
+/// Error type for adapter registry operations.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum AdapterRegistryError {
+    /// Failed to load profile from CAS.
+    #[error("failed to load profile from CAS: {0}")]
+    ProfileLoadFailed(String),
+
+    /// Profile validation failed.
+    #[error("profile validation failed: {0}")]
+    ProfileInvalid(String),
+
+    /// Unsupported adapter mode for this profile.
+    #[error("unsupported adapter mode: {mode}")]
+    UnsupportedAdapterMode {
+        /// The unsupported mode.
+        mode: String,
+    },
+
+    /// No profile hash available (legacy mode).
+    #[error("no profile hash available: registry was created in legacy mode")]
+    NoProfileHash,
+}
+
+impl From<AgentAdapterProfileError> for AdapterRegistryError {
+    fn from(e: AgentAdapterProfileError) -> Self {
+        Self::ProfileLoadFailed(e.to_string())
+    }
+}
 
 /// Registry for harness adapters.
 ///
 /// Provides a centralized location for registering and retrieving adapters
 /// by their type. The registry owns the adapter instances and acts as a
 /// factory for per-episode Holon instances.
+///
+/// # Profile-Based Selection (TCK-00328)
+///
+/// Per RFC-0019 Addendum, adapter profiles are CAS-addressed artifacts.
+/// The registry records the `profile_hash` for attribution in ledger events.
+///
+/// Use [`with_profile`](Self::with_profile) for production use:
+///
+/// ```rust,ignore
+/// let registry = AdapterRegistry::with_profile(&cas, &profile_hash)?;
+/// let hash = registry.profile_hash().expect("profile loaded");
+/// ```
 ///
 /// # Factory Pattern
 ///
@@ -51,16 +122,40 @@ use super::raw_adapter::{RawAdapter, RawAdapterHolon};
 pub struct AdapterRegistry {
     /// Registered adapters by type.
     adapters: HashMap<AdapterType, Box<dyn HarnessAdapter>>,
+    /// CAS hash of the loaded profile (TCK-00328).
+    ///
+    /// This is `Some` when the registry was created via `with_profile()`,
+    /// and `None` when created via legacy methods (`new()`, `with_defaults()`).
+    /// The hash is used for ledger attribution per SEC-CTRL-FAC-0015.
+    profile_hash: Option<[u8; 32]>,
+    /// The loaded profile configuration (TCK-00328).
+    ///
+    /// Stored for reference by execution code that needs profile parameters.
+    profile: Option<AgentAdapterProfileV1>,
 }
 
 impl AdapterRegistry {
     /// Create a new empty adapter registry.
+    ///
+    /// # Note
+    ///
+    /// This creates a registry in legacy mode with no profile hash.
+    /// For production use, prefer [`with_profile`](Self::with_profile).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create a new registry with default adapters registered.
+    ///
+    /// # Deprecation Notice (TCK-00328)
+    ///
+    /// This method uses ambient defaults, which is **deprecated** per RFC-0019
+    /// Addendum. For production use, prefer
+    /// [`with_profile`](Self::with_profile) to load a CAS-addressed profile
+    /// by hash.
+    ///
+    /// This method is retained for backward compatibility with existing tests.
     ///
     /// This registers:
     /// - [`RawAdapter`] for [`AdapterType::Raw`]
@@ -71,6 +166,105 @@ impl AdapterRegistry {
         registry.register(Box::new(RawAdapter::new()));
         registry.register(Box::new(ClaudeCodeAdapter::new()));
         registry
+    }
+
+    /// Create a new registry from a CAS-addressed profile (TCK-00328).
+    ///
+    /// Per RFC-0019 Addendum, adapter profiles are CAS-addressed artifacts.
+    /// Profile selection is explicit by hash; ambient defaults are forbidden.
+    ///
+    /// # Arguments
+    ///
+    /// * `cas` - Content-addressed store to load the profile from
+    /// * `profile_hash` - BLAKE3 hash of the profile to load
+    ///
+    /// # Returns
+    ///
+    /// A configured registry with the appropriate adapters registered based
+    /// on the profile's `adapter_mode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdapterRegistryError` if:
+    /// - Profile cannot be loaded from CAS
+    /// - Profile fails validation
+    /// - Profile uses an unsupported adapter mode
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let registry = AdapterRegistry::with_profile(&cas, &profile_hash)?;
+    ///
+    /// // Profile hash is available for attribution
+    /// let hash = registry.profile_hash().expect("profile was loaded");
+    /// ```
+    pub fn with_profile(
+        cas: &dyn ContentAddressedStore,
+        profile_hash: &[u8; 32],
+    ) -> Result<Self, AdapterRegistryError> {
+        // Load profile from CAS
+        let profile = AgentAdapterProfileV1::load_from_cas(cas, profile_hash)?;
+
+        // Create registry based on profile configuration
+        let mut registry = Self {
+            adapters: HashMap::new(),
+            profile_hash: Some(*profile_hash),
+            profile: Some(profile.clone()),
+        };
+
+        // Register adapters based on adapter_mode
+        match profile.adapter_mode {
+            AdapterMode::BlackBox | AdapterMode::StructuredOutput => {
+                // Black-box and structured output modes use ClaudeCode adapter
+                // with kernel-side tool execution
+                registry.register(Box::new(ClaudeCodeAdapter::new()));
+                registry.register(Box::new(RawAdapter::new()));
+            },
+            AdapterMode::McpBridge | AdapterMode::HookedVendor => {
+                // MCP bridge and hooked vendor modes are allowed but not
+                // preferred for FAC v0. Register basic adapters.
+                registry.register(Box::new(ClaudeCodeAdapter::new()));
+                registry.register(Box::new(RawAdapter::new()));
+            },
+        }
+
+        Ok(registry)
+    }
+
+    /// Returns the CAS hash of the loaded profile (TCK-00328).
+    ///
+    /// This hash is used for ledger attribution per SEC-CTRL-FAC-0015.
+    /// Returns `None` if the registry was created in legacy mode.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let registry = AdapterRegistry::with_profile(&cas, &hash)?;
+    /// assert_eq!(registry.profile_hash(), Some(&hash));
+    ///
+    /// let legacy = AdapterRegistry::with_defaults();
+    /// assert!(legacy.profile_hash().is_none());
+    /// ```
+    #[must_use]
+    pub const fn profile_hash(&self) -> Option<&[u8; 32]> {
+        self.profile_hash.as_ref()
+    }
+
+    /// Returns the loaded profile configuration (TCK-00328).
+    ///
+    /// Returns `None` if the registry was created in legacy mode.
+    #[must_use]
+    pub const fn profile(&self) -> Option<&AgentAdapterProfileV1> {
+        self.profile.as_ref()
+    }
+
+    /// Returns `true` if this registry was created with an explicit profile.
+    ///
+    /// Per RFC-0019 Addendum, production use should always have a profile.
+    /// Legacy mode (no profile) is deprecated.
+    #[must_use]
+    pub const fn has_profile(&self) -> bool {
+        self.profile_hash.is_some()
     }
 
     /// Register an adapter.
@@ -225,7 +419,12 @@ impl std::fmt::Debug for AdapterRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdapterRegistry")
             .field("adapter_types", &self.adapters.keys().collect::<Vec<_>>())
-            .finish()
+            .field("has_profile", &self.profile_hash.is_some())
+            .field(
+                "profile_hash",
+                &self.profile_hash.map(|h| hex::encode(&h[..8])),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -405,6 +604,171 @@ mod tests {
 
         assert_eq!(holon1.unwrap().type_name(), "ClaudeCodeHolon");
         assert_eq!(holon2.unwrap().type_name(), "ClaudeCodeHolon");
+    }
+
+    // =========================================================================
+    // TCK-00328: Profile-Based Selection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_legacy_registry_has_no_profile() {
+        // Legacy with_defaults() mode has no profile hash
+        let registry = AdapterRegistry::with_defaults();
+        assert!(!registry.has_profile());
+        assert!(registry.profile_hash().is_none());
+        assert!(registry.profile().is_none());
+    }
+
+    #[test]
+    fn test_new_registry_has_no_profile() {
+        // Empty registry has no profile hash
+        let registry = AdapterRegistry::new();
+        assert!(!registry.has_profile());
+        assert!(registry.profile_hash().is_none());
+        assert!(registry.profile().is_none());
+    }
+
+    #[test]
+    fn test_profile_registry_from_cas() {
+        use std::collections::BTreeMap;
+
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{
+            AdapterMode, AgentAdapterProfileV1, BudgetDefaults, EvidencePolicy, HealthChecks,
+            InputMode, OutputMode, VersionProbe,
+        };
+
+        // Create a valid profile
+        let profile = AgentAdapterProfileV1::builder()
+            .profile_id("claude-code-test-v1")
+            .adapter_mode(AdapterMode::BlackBox)
+            .command("/usr/bin/claude")
+            .args_template(vec!["-p".to_string()])
+            .env_template(vec![("CLAUDE_NO_TOOLS".to_string(), "1".to_string())])
+            .cwd("/workspace")
+            .requires_pty(false)
+            .input_mode(InputMode::Stdin)
+            .output_mode(OutputMode::Raw)
+            .permission_mode_map(BTreeMap::new())
+            .capability_map(BTreeMap::new())
+            .version_probe(VersionProbe::new(
+                "claude --version",
+                r"claude (\d+\.\d+\.\d+)",
+            ))
+            .health_checks(HealthChecks::default())
+            .budget_defaults(BudgetDefaults::default())
+            .evidence_policy(EvidencePolicy::default())
+            .build()
+            .expect("valid profile");
+
+        // Store in CAS
+        let cas = MemoryCas::new();
+        let hash = profile.store_in_cas(&cas).expect("store should succeed");
+
+        // Create registry from profile
+        let registry =
+            AdapterRegistry::with_profile(&cas, &hash).expect("should load profile from CAS");
+
+        // Verify profile is loaded
+        assert!(registry.has_profile());
+        assert_eq!(registry.profile_hash(), Some(&hash));
+        assert!(registry.profile().is_some());
+        assert_eq!(
+            registry.profile().unwrap().profile_id,
+            "claude-code-test-v1"
+        );
+
+        // Verify adapters are registered
+        assert!(registry.contains(AdapterType::ClaudeCode));
+        assert!(registry.contains(AdapterType::Raw));
+    }
+
+    #[test]
+    fn test_profile_registry_load_fails_for_missing_hash() {
+        use apm2_core::evidence::MemoryCas;
+
+        let cas = MemoryCas::new();
+        let fake_hash = [0x42u8; 32];
+
+        // Should fail to load non-existent profile
+        let result = AdapterRegistry::with_profile(&cas, &fake_hash);
+        assert!(result.is_err());
+
+        match result {
+            Err(AdapterRegistryError::ProfileLoadFailed(_)) => {
+                // Expected
+            },
+            other => panic!("Expected ProfileLoadFailed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_profile_hash_available_for_attribution() {
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{
+            AdapterMode, AgentAdapterProfileV1, InputMode, OutputMode, VersionProbe,
+        };
+
+        let profile = AgentAdapterProfileV1::builder()
+            .profile_id("test-profile")
+            .adapter_mode(AdapterMode::StructuredOutput)
+            .command("/usr/bin/agent")
+            .cwd("/workspace")
+            .input_mode(InputMode::Stdin)
+            .output_mode(OutputMode::Jsonl)
+            .version_probe(VersionProbe::new("agent --version", r"v(\d+)"))
+            .build()
+            .expect("valid profile");
+
+        let cas = MemoryCas::new();
+        let hash = profile.store_in_cas(&cas).expect("store should succeed");
+
+        let registry = AdapterRegistry::with_profile(&cas, &hash).expect("load profile");
+
+        // Profile hash should be available for ledger attribution
+        let profile_hash = registry.profile_hash().expect("has profile hash");
+        assert_eq!(*profile_hash, hash);
+
+        // Hash can be encoded for ledger events
+        let hex_hash = hex::encode(profile_hash);
+        assert_eq!(hex_hash.len(), 64); // 32 bytes = 64 hex chars
+    }
+
+    #[test]
+    fn test_profile_debug_shows_hash() {
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{
+            AdapterMode, AgentAdapterProfileV1, InputMode, OutputMode, VersionProbe,
+        };
+
+        let profile = AgentAdapterProfileV1::builder()
+            .profile_id("debug-test")
+            .adapter_mode(AdapterMode::BlackBox)
+            .command("/usr/bin/test")
+            .cwd("/workspace")
+            .input_mode(InputMode::Stdin)
+            .output_mode(OutputMode::Raw)
+            .version_probe(VersionProbe::new("test --version", r"v(\d+)"))
+            .build()
+            .expect("valid profile");
+
+        let cas = MemoryCas::new();
+        let hash = profile.store_in_cas(&cas).expect("store should succeed");
+
+        let registry = AdapterRegistry::with_profile(&cas, &hash).expect("load profile");
+        let debug_str = format!("{registry:?}");
+
+        // Debug should show has_profile and partial hash
+        assert!(debug_str.contains("has_profile: true"));
+        assert!(debug_str.contains("profile_hash"));
+    }
+
+    #[test]
+    fn test_legacy_debug_shows_no_profile() {
+        let registry = AdapterRegistry::with_defaults();
+        let debug_str = format!("{registry:?}");
+
+        assert!(debug_str.contains("has_profile: false"));
     }
 }
 
