@@ -610,8 +610,9 @@ pub struct LedgerTailer {
     conn: Arc<Mutex<Connection>>,
     /// Last processed event timestamp (for ordering).
     last_processed_ns: u64,
-    /// Last processed event ID (for deterministic ordering within same timestamp).
-    /// MAJOR FIX: Together with timestamp, forms a composite cursor.
+    /// Last processed event ID (for deterministic ordering within same
+    /// timestamp). MAJOR FIX: Together with timestamp, forms a composite
+    /// cursor.
     last_event_id: String,
     /// Tailer identifier for watermark persistence.
     tailer_id: String,
@@ -715,7 +716,8 @@ impl LedgerTailer {
     ///
     /// Uses a composite cursor `(timestamp_ns, event_id)` to handle timestamp
     /// collisions. Events are ordered by timestamp first, then by event_id
-    /// (lexicographically) for deterministic ordering within the same timestamp.
+    /// (lexicographically) for deterministic ordering within the same
+    /// timestamp.
     ///
     /// # At-Least-Once Delivery
     ///
@@ -738,12 +740,14 @@ impl LedgerTailer {
         // MAJOR FIX: Use composite cursor (timestamp_ns, event_id) to handle
         // timestamp collisions. The query selects events where:
         // - timestamp > last_timestamp, OR
-        // - timestamp == last_timestamp AND event_id > last_event_id (only if last_event_id is set)
+        // - timestamp == last_timestamp AND event_id > last_event_id (only if
+        //   last_event_id is set)
         // This ensures no events are skipped when multiple events share a timestamp.
         //
-        // When last_event_id is empty (e.g., from_timestamp or fresh start), we only use
-        // timestamp comparison to maintain backward compatibility and correct semantics:
-        // timestamp_ns > last means "everything after this timestamp".
+        // When last_event_id is empty (e.g., from_timestamp or fresh start), we only
+        // use timestamp comparison to maintain backward compatibility and
+        // correct semantics: timestamp_ns > last means "everything after this
+        // timestamp".
         let query = if self.last_event_id.is_empty() {
             // No event_id cursor - use timestamp-only comparison
             "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
@@ -876,7 +880,8 @@ impl LedgerTailer {
             })?;
 
             // MAJOR FIX: Use composite cursor (timestamp_ns, event_id)
-            // When last_event_id is empty, use timestamp-only comparison for backward compat.
+            // When last_event_id is empty, use timestamp-only comparison for backward
+            // compat.
             let query = if last_event_id.is_empty() {
                 "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
                  FROM ledger_events
@@ -918,7 +923,12 @@ impl LedgerTailer {
                 .collect::<Vec<_>>()
             } else {
                 stmt.query_map(
-                    params![event_type, last_processed_ns as i64, last_event_id, limit as i64],
+                    params![
+                        event_type,
+                        last_processed_ns as i64,
+                        last_event_id,
+                        limit as i64
+                    ],
                     |row| {
                         Ok(SignedLedgerEvent {
                             event_id: row.get(0)?,
@@ -983,7 +993,12 @@ impl LedgerTailer {
                         "INSERT OR REPLACE INTO tailer_watermark
                          (tailer_id, last_processed_ns, last_event_id, updated_at)
                          VALUES (?1, ?2, ?3, ?4)",
-                        params![tailer_id, last_processed_ns as i64, last_event_id, now as i64],
+                        params![
+                            tailer_id,
+                            last_processed_ns as i64,
+                            last_event_id,
+                            now as i64
+                        ],
                     )
                     .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 

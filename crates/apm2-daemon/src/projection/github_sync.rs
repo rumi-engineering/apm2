@@ -803,13 +803,14 @@ impl IdempotencyCache {
 // GitHub HTTP Client
 // =============================================================================
 
+use std::sync::OnceLock;
+
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use std::sync::OnceLock;
 
 /// Type alias for the persistent HTTPS client.
 ///

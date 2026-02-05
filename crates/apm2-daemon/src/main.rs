@@ -619,9 +619,10 @@ async fn async_main(args: Args) -> Result<()> {
             .with_batch_size(projection_config.batch_size);
 
         // BLOCKER FIX: Incomplete Feature Wiring (Dead Code)
-        // Previously, ProjectionWorker was initialized but set_adapter was never called,
-        // causing self.adapter to always be None and all projections to be skipped.
-        // Now we properly instantiate GitHubProjectionAdapter and inject it.
+        // Previously, ProjectionWorker was initialized but set_adapter was never
+        // called, causing self.adapter to always be None and all projections to
+        // be skipped. Now we properly instantiate GitHubProjectionAdapter and
+        // inject it.
         let mut github_adapter: Option<GitHubProjectionAdapter> = None;
 
         // Enable GitHub projection if configured
@@ -674,9 +675,7 @@ async fn async_main(args: Args) -> Result<()> {
                         .ledger_db_path
                         .as_ref()
                         .map(|p| p.with_extension("projection_cache.db"))
-                        .unwrap_or_else(|| {
-                            std::env::temp_dir().join("apm2_projection_cache.db")
-                        });
+                        .unwrap_or_else(|| std::env::temp_dir().join("apm2_projection_cache.db"));
 
                     // Create adapter - use mock mode if no token, real mode otherwise
                     let adapter_result = if has_token {
@@ -717,9 +716,7 @@ async fn async_main(args: Args) -> Result<()> {
                     worker.set_adapter(adapter);
                     info!("GitHub adapter injected into projection worker");
                 } else {
-                    warn!(
-                        "No GitHub adapter available - projections will be skipped (fail-safe)"
-                    );
+                    warn!("No GitHub adapter available - projections will be skipped (fail-safe)");
                 }
 
                 let shutdown_flag = worker.shutdown_handle();
