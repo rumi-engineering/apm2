@@ -70,6 +70,7 @@ pub mod aat_reuse;
 mod aat_spec;
 mod agent_adapter_profile;
 pub mod anti_downgrade;
+pub mod builtin_profiles;
 mod artifact_manifest;
 mod changeset_bundle;
 mod ci_attestation;
@@ -122,6 +123,12 @@ pub use agent_adapter_profile::{
     MAX_PERMISSION_MODE_FLAGS_COUNT, MAX_PERMISSION_MODE_KEY_LENGTH, MAX_PERMISSION_MODE_MAP_COUNT,
     MAX_PROFILE_ID_LENGTH, MAX_VERSION_PROBE_COMMAND_LENGTH, MAX_VERSION_PROBE_REGEX_LENGTH,
     OutputMode, ToolBridgeConfig, VersionProbe,
+};
+// Re-export builtin profile types (TCK-00329)
+pub use builtin_profiles::{
+    CLAUDE_CODE_PROFILE_ID, CODEX_CLI_PROFILE_ID, GEMINI_CLI_PROFILE_ID, LOCAL_INFERENCE_PROFILE_ID,
+    all_builtin_profiles, claude_code_profile, codex_cli_profile, gemini_cli_profile,
+    get_builtin_profile, local_inference_profile,
 };
 // Re-export artifact manifest types
 pub use artifact_manifest::{
