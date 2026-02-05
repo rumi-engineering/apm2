@@ -146,10 +146,10 @@ pub const EFFICIENCY_PRIMITIVES_VERSION: &str = "1.0.0";
 // Bounded Deserialization Helpers (SEC-CTRL-FAC-0016)
 // =============================================================================
 
-/// Deserialize a Vec with a maximum size bound to prevent OOM attacks.
+/// Deserialize a `Vec` with a maximum size bound to prevent OOM attacks.
 ///
 /// Per SEC-CTRL-FAC-0016, all collections deserialized from untrusted input
-/// must enforce size limits during parsing to prevent DoS via memory exhaustion.
+/// must enforce size limits during parsing to prevent denial-of-service via memory exhaustion.
 fn deserialize_bounded_vec<'de, D, T>(
     deserializer: D,
     max_items: usize,
@@ -206,7 +206,7 @@ where
     })
 }
 
-/// Deserialize changed_files with MAX_CHANGED_FILES bound.
+/// Deserialize `changed_files` with `MAX_CHANGED_FILES` bound.
 fn deserialize_changed_files<'de, D>(deserializer: D) -> Result<Vec<ChangedFile>, D::Error>
 where
     D: Deserializer<'de>,
@@ -214,7 +214,7 @@ where
     deserialize_bounded_vec(deserializer, MAX_CHANGED_FILES, "changed_files")
 }
 
-/// Deserialize findings with MAX_FINDINGS bound.
+/// Deserialize `findings` with `MAX_FINDINGS` bound.
 fn deserialize_findings<'de, D>(deserializer: D) -> Result<Vec<Finding>, D::Error>
 where
     D: Deserializer<'de>,
@@ -222,7 +222,7 @@ where
     deserialize_bounded_vec(deserializer, MAX_FINDINGS, "findings")
 }
 
-/// Deserialize tool_outputs with MAX_TOOL_OUTPUTS bound.
+/// Deserialize `tool_outputs` with `MAX_TOOL_OUTPUTS` bound.
 fn deserialize_tool_outputs<'de, D>(deserializer: D) -> Result<Vec<ToolOutputRef>, D::Error>
 where
     D: Deserializer<'de>,
@@ -230,7 +230,7 @@ where
     deserialize_bounded_vec(deserializer, MAX_TOOL_OUTPUTS, "tool_outputs")
 }
 
-/// Deserialize deltas with MAX_DELTAS bound.
+/// Deserialize `deltas` with `MAX_DELTAS` bound.
 fn deserialize_deltas<'de, D>(deserializer: D) -> Result<Vec<ContextDelta>, D::Error>
 where
     D: Deserializer<'de>,
@@ -238,7 +238,7 @@ where
     deserialize_bounded_vec(deserializer, MAX_DELTAS, "deltas")
 }
 
-/// Deserialize zoom_selectors with MAX_ZOOM_SELECTORS bound.
+/// Deserialize `zoom_selectors` with `MAX_ZOOM_SELECTORS` bound.
 fn deserialize_zoom_selectors<'de, D>(deserializer: D) -> Result<Vec<ZoomSelector>, D::Error>
 where
     D: Deserializer<'de>,
