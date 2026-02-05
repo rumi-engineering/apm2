@@ -256,8 +256,33 @@ pub use transcript_binding::{
     AatTranscriptBinding, MAX_CHUNK_CONTENT_BYTES, MAX_RUN_TRANSCRIPT_HASHES,
     MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
 };
+pub mod summary_receipt;
+pub mod tool_execution_receipt;
+pub mod tool_log_index;
 pub mod view_commitment;
 // Re-export view commitment types
+// Re-export summary receipt types (TCK-00327)
+pub use summary_receipt::{
+    LossProfile, MAX_REVIEW_ID_LENGTH as MAX_SUMMARY_RECEIPT_REVIEW_ID_LENGTH,
+    MAX_SELECTOR_TAG_LENGTH, MAX_SELECTOR_TAGS, MAX_SUMMARY_TEXT_LENGTH, ReviewOutcome,
+    SUMMARY_RECEIPT_PREFIX, SUMMARY_RECEIPT_SCHEMA, SUMMARY_RECEIPT_VERSION, SummaryReceipt,
+    SummaryReceiptBuilder, SummaryReceiptError,
+};
+// Re-export tool execution receipt types (TCK-00327)
+pub use tool_execution_receipt::{
+    MAX_CAPABILITY_ID_LENGTH as MAX_TOOL_RECEIPT_CAPABILITY_ID_LENGTH,
+    MAX_EPISODE_ID_LENGTH as MAX_TOOL_RECEIPT_EPISODE_ID_LENGTH,
+    MAX_REQUEST_ID_LENGTH as MAX_TOOL_RECEIPT_REQUEST_ID_LENGTH,
+    MAX_TOOL_CLASS_LENGTH as MAX_TOOL_RECEIPT_TOOL_CLASS_LENGTH, TOOL_EXECUTION_RECEIPT_PREFIX,
+    TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_EXECUTION_RECEIPT_VERSION, ToolExecutionReceipt,
+    ToolExecutionReceiptBuilder, ToolExecutionReceiptError,
+};
+// Re-export tool log index types (TCK-00327)
+pub use tool_log_index::{
+    MAX_CONTINUATION_HASHES, MAX_EPISODE_ID_LENGTH as MAX_TOOL_LOG_INDEX_EPISODE_ID_LENGTH,
+    MAX_RECEIPT_HASHES_PER_INDEX, TOOL_LOG_INDEX_V1_SCHEMA, TOOL_LOG_INDEX_V1_VERSION,
+    ToolLogCounts, ToolLogIndexError, ToolLogIndexV1, ToolLogIndexV1Builder,
+};
 pub use view_commitment::{
     MAX_POLICY_REF_LENGTH as MAX_VIEW_COMMITMENT_POLICY_REF_LENGTH,
     MAX_WORK_ID_LENGTH as MAX_VIEW_COMMITMENT_WORK_ID_LENGTH, VIEW_COMMITMENT_V1_SCHEMA,
