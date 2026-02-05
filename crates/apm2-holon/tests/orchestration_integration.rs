@@ -25,7 +25,9 @@ fn test_twenty_plus_iterations_without_human_interaction() {
             .with_time_budget_ms(10_000_000),
     );
 
-    let mut state = driver.create_state("work-integration-test", "orch-001").unwrap();
+    let mut state = driver
+        .create_state("work-integration-test", "orch-001")
+        .unwrap();
     state.set_started_at_ns(1_000_000_000);
 
     let mut events: Vec<OrchestrationEvent> = vec![];
@@ -112,7 +114,8 @@ fn test_twenty_plus_iterations_without_human_interaction() {
     assert_eq!(events.len(), 27); // 1 start + 25 iterations + 1 termination
 }
 
-/// Test crash-only resumability: restart from ledger head without duplicating projections.
+/// Test crash-only resumability: restart from ledger head without duplicating
+/// projections.
 ///
 /// This test simulates a crash by:
 /// 1. Starting orchestration and running 10 iterations
@@ -196,7 +199,10 @@ fn test_crash_only_resumability() {
         );
         events.push(iter_event.into());
 
-        assert!(termination.is_none(), "Should not terminate at iteration {i}");
+        assert!(
+            termination.is_none(),
+            "Should not terminate at iteration {i}"
+        );
     }
 
     // Verify total 20 iterations completed
@@ -241,10 +247,7 @@ fn test_termination_reasons_as_authoritative_facts() {
             TerminationReason::max_iterations_reached(100),
             "max_iterations_reached",
         ),
-        (
-            TerminationReason::error("fatal error"),
-            "error",
-        ),
+        (TerminationReason::error("fatal error"), "error"),
     ];
 
     for (reason, expected_str) in test_cases {
@@ -373,31 +376,35 @@ fn test_resume_error_handling() {
     let driver = OrchestrationDriver::with_defaults();
 
     // Test 1: IterationCompleted without OrchestrationStarted
-    let events: Vec<OrchestrationEvent> = vec![IterationCompleted::new(
-        "orch-orphan",
-        "work-orphan",
-        1,
-        IterationOutcome::ChangeSetProduced,
-        1000,
-        100,
-        2_000_000_000,
-    )
-    .into()];
+    let events: Vec<OrchestrationEvent> = vec![
+        IterationCompleted::new(
+            "orch-orphan",
+            "work-orphan",
+            1,
+            IterationOutcome::ChangeSetProduced,
+            1000,
+            100,
+            2_000_000_000,
+        )
+        .into(),
+    ];
 
     let result = driver.resume_from_events(&events);
     assert!(result.is_err());
 
     // Test 2: OrchestrationTerminated without OrchestrationStarted
-    let events: Vec<OrchestrationEvent> = vec![OrchestrationTerminated::new(
-        "orch-orphan",
-        "work-orphan",
-        TerminationReason::pass(),
-        0,
-        0,
-        0,
-        2_000_000_000,
-    )
-    .into()];
+    let events: Vec<OrchestrationEvent> = vec![
+        OrchestrationTerminated::new(
+            "orch-orphan",
+            "work-orphan",
+            TerminationReason::pass(),
+            0,
+            0,
+            0,
+            2_000_000_000,
+        )
+        .into(),
+    ];
 
     let result = driver.resume_from_events(&events);
     assert!(result.is_err());
@@ -451,7 +458,11 @@ fn test_budget_exhaustion_detection() {
 
     assert!(termination.is_some());
     match termination.unwrap() {
-        TerminationReason::BudgetExhausted { resource, consumed, limit } => {
+        TerminationReason::BudgetExhausted {
+            resource,
+            consumed,
+            limit,
+        } => {
             assert_eq!(resource, "tokens");
             assert_eq!(consumed, 5000);
             assert_eq!(limit, 5000);
@@ -532,6 +543,14 @@ fn test_iteration_binding_to_artifacts() {
     assert_eq!(event.receipt_hash(), Some(&receipt_hash));
     assert_eq!(event.implementer_episode_id(), Some("impl-ep-001"));
     assert_eq!(event.reviewer_episode_ids().len(), 2);
-    assert!(event.reviewer_episode_ids().contains(&"sec-rev-ep-001".to_string()));
-    assert!(event.reviewer_episode_ids().contains(&"qual-rev-ep-001".to_string()));
+    assert!(
+        event
+            .reviewer_episode_ids()
+            .contains(&"sec-rev-ep-001".to_string())
+    );
+    assert!(
+        event
+            .reviewer_episode_ids()
+            .contains(&"qual-rev-ep-001".to_string())
+    );
 }

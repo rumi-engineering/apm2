@@ -1,14 +1,15 @@
 //! Orchestration state machine for FAC revision loops.
 //!
-//! This module implements the orchestration layer for Forge Admission Cycle (FAC)
-//! revision loops as specified in RFC-0019 and TCK-00332. The orchestrator drives
-//! implementer + reviewer episodes iteratively until a terminal condition is reached.
+//! This module implements the orchestration layer for Forge Admission Cycle
+//! (FAC) revision loops as specified in RFC-0019 and TCK-00332. The
+//! orchestrator drives implementer + reviewer episodes iteratively until a
+//! terminal condition is reached.
 //!
 //! # Design
 //!
-//! The orchestration follows a crash-only recovery model: all state is derived from
-//! ledger events, enabling deterministic restart from any checkpoint without
-//! duplicating projections.
+//! The orchestration follows a crash-only recovery model: all state is derived
+//! from ledger events, enabling deterministic restart from any checkpoint
+//! without duplicating projections.
 //!
 //! ## Terminal Conditions
 //!
@@ -37,16 +38,15 @@
 //!
 //! ```rust
 //! use apm2_holon::orchestration::{
-//!     OrchestrationConfig, OrchestrationDriver, OrchestrationStateV1, TerminationReason,
+//!     OrchestrationConfig, OrchestrationDriver, OrchestrationStateV1,
+//!     TerminationReason,
 //! };
 //!
 //! // Create orchestration state
 //! let state = OrchestrationStateV1::new(
-//!     "work-123",
-//!     "orch-001",
-//!     100,  // max_iterations
-//!     1_000_000,  // token_budget
-//!     3_600_000,  // time_budget_ms (1 hour)
+//!     "work-123", "orch-001", 100,       // max_iterations
+//!     1_000_000, // token_budget
+//!     3_600_000, // time_budget_ms (1 hour)
 //! );
 //!
 //! assert_eq!(state.iteration_count(), 0);

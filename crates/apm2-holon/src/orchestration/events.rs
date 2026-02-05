@@ -795,25 +795,13 @@ mod tests {
     #[test]
     fn test_orchestration_started_validation() {
         // Invalid orchestration_id
-        let result = OrchestrationStarted::try_new(
-            "",
-            "work-123",
-            100,
-            1_000_000,
-            3_600_000,
-            1_000_000_000,
-        );
+        let result =
+            OrchestrationStarted::try_new("", "work-123", 100, 1_000_000, 3_600_000, 1_000_000_000);
         assert!(result.is_err());
 
         // Invalid work_id
-        let result = OrchestrationStarted::try_new(
-            "orch-001",
-            "",
-            100,
-            1_000_000,
-            3_600_000,
-            1_000_000_000,
-        );
+        let result =
+            OrchestrationStarted::try_new("orch-001", "", 100, 1_000_000, 3_600_000, 1_000_000_000);
         assert!(result.is_err());
     }
 
@@ -833,7 +821,10 @@ mod tests {
         assert_eq!(event.orchestration_id(), "orch-001");
         assert_eq!(event.work_id(), "work-123");
         assert_eq!(event.iteration_number(), 1);
-        assert!(matches!(event.outcome(), IterationOutcome::ChangeSetProduced));
+        assert!(matches!(
+            event.outcome(),
+            IterationOutcome::ChangeSetProduced
+        ));
         assert_eq!(event.tokens_consumed(), 5000);
         assert_eq!(event.time_consumed_ms(), 10_000);
     }

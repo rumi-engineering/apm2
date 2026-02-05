@@ -18,7 +18,8 @@ pub const MAX_ITERATIONS_LIMIT: u64 = 100;
 /// Minimum number of iterations (must be at least 1).
 pub const MIN_ITERATIONS: u64 = 1;
 
-/// Maximum length for reason strings in termination (reserved for future validation).
+/// Maximum length for reason strings in termination (reserved for future
+/// validation).
 #[allow(dead_code)]
 pub const MAX_REASON_LENGTH: usize = 1024;
 
@@ -155,11 +156,7 @@ impl TerminationReason {
 
     /// Creates a BudgetExhausted termination.
     #[must_use]
-    pub fn budget_exhausted(
-        resource: impl Into<String>,
-        consumed: u64,
-        limit: u64,
-    ) -> Self {
+    pub fn budget_exhausted(resource: impl Into<String>, consumed: u64, limit: u64) -> Self {
         Self::BudgetExhausted {
             resource: resource.into(),
             consumed,
@@ -255,7 +252,10 @@ impl fmt::Display for TerminationReason {
             } => {
                 write!(f, "budget exhausted: {resource} ({consumed}/{limit})")
             },
-            Self::OperatorStop { reason, operator_id } => {
+            Self::OperatorStop {
+                reason,
+                operator_id,
+            } => {
                 write!(f, "operator stop: {reason}")?;
                 if let Some(id) = operator_id {
                     write!(f, " (by {id})")?;
@@ -294,7 +294,7 @@ impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
             max_iterations: MAX_ITERATIONS_LIMIT,
-            token_budget: 10_000_000, // 10M tokens
+            token_budget: 10_000_000,  // 10M tokens
             time_budget_ms: 3_600_000, // 1 hour
             emit_events: true,
             fail_fast: true,
@@ -579,7 +579,8 @@ impl OrchestrationStateV1 {
     /// Returns remaining token budget.
     #[must_use]
     pub const fn remaining_tokens(&self) -> u64 {
-        self.initial_token_budget.saturating_sub(self.tokens_consumed)
+        self.initial_token_budget
+            .saturating_sub(self.tokens_consumed)
     }
 
     /// Returns the initial time budget in milliseconds.
@@ -628,10 +629,7 @@ impl OrchestrationStateV1 {
     /// Returns `true` if the orchestration succeeded (Pass).
     #[must_use]
     pub fn is_success(&self) -> bool {
-        matches!(
-            &self.termination_reason,
-            Some(TerminationReason::Pass)
-        )
+        matches!(&self.termination_reason, Some(TerminationReason::Pass))
     }
 
     /// Returns `true` if budget is exhausted.
@@ -1058,8 +1056,9 @@ mod tests {
 
     #[test]
     fn test_orchestration_state_creation() {
-        let state = OrchestrationStateV1::try_new("work-123", "orch-001", 100, 1_000_000, 3_600_000)
-            .unwrap();
+        let state =
+            OrchestrationStateV1::try_new("work-123", "orch-001", 100, 1_000_000, 3_600_000)
+                .unwrap();
 
         assert_eq!(state.work_id(), "work-123");
         assert_eq!(state.orchestration_id(), "orch-001");
@@ -1096,8 +1095,7 @@ mod tests {
 
     #[test]
     fn test_orchestration_state_record_iteration() {
-        let mut state =
-            OrchestrationStateV1::new("work-123", "orch-001", 10, 10_000, 100_000);
+        let mut state = OrchestrationStateV1::new("work-123", "orch-001", 10, 10_000, 100_000);
 
         let changeset_hash = [1u8; 32];
         let receipt_hash = [2u8; 32];
@@ -1158,7 +1156,8 @@ mod tests {
 
     #[test]
     fn test_orchestration_state_terminate() {
-        let mut state = OrchestrationStateV1::new("work-123", "orch-001", 100, 1_000_000, 1_000_000);
+        let mut state =
+            OrchestrationStateV1::new("work-123", "orch-001", 100, 1_000_000, 1_000_000);
 
         // First termination succeeds
         assert!(state.terminate(TerminationReason::pass()));
@@ -1243,10 +1242,7 @@ mod tests {
         for i in 1..=25 {
             let result =
                 state.record_iteration(1000, 1000, i * 1_000_000_000, Some([i as u8; 32]), None);
-            assert!(
-                result.is_none(),
-                "Should not terminate at iteration {i}"
-            );
+            assert!(result.is_none(), "Should not terminate at iteration {i}");
         }
 
         assert_eq!(state.iteration_count(), 25);
