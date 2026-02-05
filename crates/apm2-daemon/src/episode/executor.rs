@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use apm2_core::fac::{CacheKey, ToolOutputCache};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -175,6 +176,20 @@ impl From<ClockError> for ExecutorError {
 /// # Thread Safety
 ///
 /// Implementations must be `Send + Sync` for use with async executors.
+///
+/// # Note on Trait Divergence
+///
+/// This trait differs from `apm2_core::evidence::ContentAddressedStore`:
+/// - This trait returns `Hash` and `Option<Vec<u8>>` directly
+/// - The core trait returns `Result<StoreResult, CasError>` and
+///   `Result<Vec<u8>, CasError>`
+///
+/// This divergence exists because the daemon requires infallible storage for
+/// tool results during execution (budget already charged), while the core
+/// trait supports fallible operations for disk-backed CAS implementations.
+///
+/// TODO(TCK-future): Unify these traits by extracting a common interface
+/// or providing adapters between the two representations.
 pub trait ContentAddressedStore: Send + Sync + std::fmt::Debug {
     /// Stores content and returns its BLAKE3 hash.
     fn store(&self, content: &[u8]) -> Hash;
@@ -245,9 +260,17 @@ impl ExecutionContext {
 ///
 /// 1. Create executor with budget tracker and CAS
 /// 2. Optionally set clock via `with_clock()` for time envelope stamping
-/// 3. Register tool handlers via `register_handler()`
-/// 4. Execute tools via `execute()`
-/// 5. Results are automatically stored in CAS with time envelope refs
+/// 3. Optionally set isolation key via `with_isolation_key()` for session
+///    scoping
+/// 4. Register tool handlers via `register_handler()`
+/// 5. Execute tools via `execute()`
+/// 6. Results are automatically stored in CAS with time envelope refs
+///
+/// # Security (SEC-CTRL-FAC-0017)
+///
+/// When caching is enabled, the `isolation_key` MUST be set to prevent
+/// cross-session information leakage. The isolation key (typically the
+/// `EpisodeId`) scopes all cache keys to the current session.
 ///
 /// # Example
 ///
@@ -260,7 +283,9 @@ impl ExecutionContext {
 /// let cas = Arc::new(StubContentAddressedStore::new());
 /// let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None)?);
 ///
-/// let mut executor = ToolExecutor::new(tracker, cas).with_clock(clock);
+/// let mut executor = ToolExecutor::new(tracker, cas)
+///     .with_clock(clock)
+///     .with_isolation_key("ep-session-123"); // SEC-CTRL-FAC-0017
 /// executor.register_handler(Box::new(ReadFileHandler))?;
 ///
 /// let args = ToolArgs::Read(ReadArgs { path: "/workspace/file.rs".into(), ... });
@@ -284,6 +309,15 @@ pub struct ToolExecutor {
     /// When present, tool executions are stamped with a `TimeEnvelopeRef`
     /// for temporal ordering and causality tracking.
     clock: Option<Arc<HolonicClock>>,
+
+    /// Optional tool output cache (TCK-00335).
+    output_cache: Option<ToolOutputCache>,
+
+    /// Isolation key for session-scoped caching (SEC-CTRL-FAC-0017).
+    ///
+    /// When set, cache keys include this isolation key to prevent
+    /// cross-session information leakage. Typically set to the `EpisodeId`.
+    isolation_key: Option<String>,
 }
 
 impl ToolExecutor {
@@ -300,6 +334,8 @@ impl ToolExecutor {
             cas,
             handlers: HashMap::new(),
             clock: None,
+            output_cache: None,
+            isolation_key: None,
         }
     }
 
@@ -318,6 +354,35 @@ impl ToolExecutor {
     pub fn with_clock(mut self, clock: Arc<HolonicClock>) -> Self {
         self.clock = Some(clock);
         self
+    }
+
+    /// Sets the tool output cache (TCK-00335).
+    #[must_use]
+    pub fn with_output_cache(mut self, cache: ToolOutputCache) -> Self {
+        self.output_cache = Some(cache);
+        self
+    }
+
+    /// Sets the isolation key for session-scoped caching (SEC-CTRL-FAC-0017).
+    ///
+    /// When caching is enabled, the isolation key ensures cache keys are scoped
+    /// to the current session/episode, preventing cross-session information
+    /// leakage. Typically set to the `EpisodeId`.
+    ///
+    /// # Security (SEC-CTRL-FAC-0017)
+    ///
+    /// This MUST be set when using caching in a multi-session context to ensure
+    /// isolation between sessions.
+    #[must_use]
+    pub fn with_isolation_key(mut self, key: impl Into<String>) -> Self {
+        self.isolation_key = Some(key.into());
+        self
+    }
+
+    /// Returns the isolation key, if configured.
+    #[must_use]
+    pub fn isolation_key(&self) -> Option<&str> {
+        self.isolation_key.as_deref()
     }
 
     /// Returns a reference to the holonic clock, if configured.
@@ -417,6 +482,47 @@ impl ToolExecutor {
         let tool_class = args.tool_class();
         let start_time = Instant::now();
 
+        // TCK-00335: Check cache for Read/Search
+        // SEC-CTRL-FAC-0017: Cache keys include isolation_key when set
+        let cache_key = self
+            .output_cache
+            .as_ref()
+            .and_then(|_| self.compute_cache_key(args));
+
+        if let Some(ref key) = cache_key {
+            if let Some(cache) = &self.output_cache {
+                if let Ok(cached_bytes) = cache.retrieve(key) {
+                    if let Ok(cached_data) = serde_json::from_slice::<ToolResultData>(&cached_bytes)
+                    {
+                        debug!(
+                            tool_class = %tool_class,
+                            "cache hit"
+                        );
+
+                        let cas_hash = self.cas.store(&cached_bytes); // Deduplicate
+
+                        let mut result = ToolResult::success(
+                            &ctx.request_id,
+                            cached_data.output,
+                            BudgetDelta::default(),
+                            Duration::from_millis(0),
+                            ctx.started_at_ns,
+                        )
+                        .with_result_hash(cas_hash);
+
+                        if let Some(ref clock) = self.clock {
+                            let notes = format!("tool.executed:{}", ctx.request_id);
+                            let (envelope, envelope_ref) =
+                                clock.stamp_envelope(Some(notes)).await?;
+                            result = result.with_time_envelope(envelope, envelope_ref);
+                        }
+
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
         // Step 1: Get handler
         let handler = self
             .handlers
@@ -436,13 +542,24 @@ impl ToolExecutor {
             "budget charged"
         );
 
-        // Step 4: Execute handler
+        // Step 4: Pre-invalidate cache for state-modifying tools (TCK-00335 fix)
+        //
+        // State-modifying tools (Write, Execute, Git, Artifact) may modify the
+        // workspace even if they return an error. For example, a partial `git pull`
+        // or a failed shell command might have already changed files on disk.
+        // To prevent stale cache entries, we invalidate BEFORE execution for these
+        // tool classes, not just on success.
+        if tool_class.can_mutate() {
+            if let Some(cache) = &self.output_cache {
+                self.invalidate_cache(args, cache);
+            }
+        }
+
+        // Step 5: Execute handler
         let result_data = match handler.execute(args, credential).await {
             Ok(data) => data,
             Err(err) => {
                 warn!(error = %err, "handler execution failed");
-                // Return failure result with consumed budget (no reconciliation needed
-                // since we charged the estimate and execution failed)
                 return self
                     .build_failure_result_with_stamp(
                         ctx,
@@ -454,47 +571,46 @@ impl ToolExecutor {
             },
         };
 
-        // Step 5: Reconcile budget - adjust for actual vs estimated usage
-        // This is critical for security: prevents fail-open if actual > estimate
+        // Step 6: Reconcile budget
         if let Err(reconcile_err) = self
             .budget_tracker
             .reconcile(&estimated_delta, &result_data.budget_consumed)
         {
             warn!(
                 error = %reconcile_err,
-                estimated_tokens = estimated_delta.tokens,
-                actual_tokens = result_data.budget_consumed.tokens,
-                "budget reconciliation failed: actual exceeded estimate"
+                "budget reconciliation failed"
             );
-            // Fail-closed: return error result, budget remains at charged amount
             return Err(ExecutorError::BudgetExceeded(reconcile_err));
         }
 
         debug!(
             estimated_tokens = estimated_delta.tokens,
             actual_tokens = result_data.budget_consumed.tokens,
-            refund_tokens = estimated_delta
-                .tokens
-                .saturating_sub(result_data.budget_consumed.tokens),
             "budget reconciled"
         );
 
-        // Step 6: Store result in CAS
+        // Step 7: Store result in CAS
         let cas_hash = self.store_result_data(&result_data)?;
         debug!(cas_hash = %hex::encode(&cas_hash[..8]), "result stored in CAS");
 
-        // Step 7: Build result
+        // TCK-00335: Update cache for read-only tools (cache_key is only set for
+        // Read/Search) Note: State-modifying tools (Write, Execute, Git)
+        // already invalidated the cache before execution (Step 4), so we don't
+        // need to invalidate again here.
+        if let Some(cache) = &self.output_cache {
+            if let Some(key) = cache_key {
+                if let Ok(bytes) = serde_json::to_vec(&result_data) {
+                    let _ = cache.store(&key, &bytes);
+                }
+            }
+        }
+
+        // Step 8: Build result
         let duration = start_time.elapsed();
-        // Safe truncation: durations > 585 years would overflow, which is impractical
         #[allow(clippy::cast_possible_truncation)]
         let duration_ns = duration.as_nanos() as u64;
         let completed_at_ns = ctx.started_at_ns.saturating_add(duration_ns);
 
-        // TCK-00320: Set CAS result hash for evidence integrity.
-        // The result_hash references the full ToolResultData (output, error_output,
-        // budget) so clients can retrieve complete execution data when inline
-        // results are size-limited. Per SEC-CTRL-FAC-0015, all success paths
-        // MUST populate this field.
         let mut result = ToolResult::success(
             &ctx.request_id,
             result_data.output,
@@ -504,8 +620,7 @@ impl ToolExecutor {
         )
         .with_result_hash(cas_hash);
 
-        // Step 8: Stamp time envelope (RFC-0016 HTF, TCK-00240)
-        // Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
+        // Step 9: Stamp time envelope
         if let Some(ref clock) = self.clock {
             let notes = format!("tool.executed:{}", ctx.request_id);
             let (envelope, envelope_ref) = clock.stamp_envelope(Some(notes)).await?;
@@ -560,6 +675,55 @@ impl ToolExecutor {
 
         let estimated = handler.estimate_budget(args);
         !estimated.would_exceed(self.budget_tracker.limits())
+    }
+
+    /// Computes a cache key for the given arguments if cacheable.
+    ///
+    /// # Security (SEC-CTRL-FAC-0017 - Fail-Closed)
+    ///
+    /// This method implements FAIL-CLOSED behavior: if no isolation key is
+    /// configured, caching is DISABLED (returns `None`). This prevents
+    /// cross-session information leakage when the caller forgets to set
+    /// an isolation key.
+    ///
+    /// The isolation key (typically the `EpisodeId`) scopes all cache keys
+    /// to the current session. Without it, cache entries could leak between
+    /// unrelated sessions.
+    fn compute_cache_key(&self, args: &ToolArgs) -> Option<CacheKey> {
+        // SEC-CTRL-FAC-0017: FAIL-CLOSED - No caching without isolation key
+        let isolation_key = self.isolation_key.as_ref()?;
+
+        let base_key = match args {
+            ToolArgs::Read(read_args) => {
+                let json = serde_json::to_vec(read_args).ok()?;
+                let hash = blake3::hash(&json);
+                Some(CacheKey::new("Read", *hash.as_bytes()))
+            },
+            ToolArgs::Search(search_args) => {
+                let json = serde_json::to_vec(search_args).ok()?;
+                let hash = blake3::hash(&json);
+                Some(CacheKey::new("Search", *hash.as_bytes()))
+            },
+            _ => None,
+        }?;
+
+        // Apply isolation key to prevent cross-session leakage
+        Some(base_key.with_isolation_key(isolation_key.clone()))
+    }
+
+    /// Invalidates cache based on tool execution.
+    #[allow(clippy::unused_self)]
+    fn invalidate_cache(&self, args: &ToolArgs, cache: &ToolOutputCache) {
+        match args {
+            ToolArgs::Write(_) => {
+                cache.invalidate_tool_type("Read");
+                cache.invalidate_tool_type("Search");
+            },
+            ToolArgs::Git(_) | ToolArgs::Execute(_) => {
+                cache.clear();
+            },
+            _ => {},
+        }
     }
 
     // =========================================================================
@@ -1157,6 +1321,300 @@ mod tests {
         assert!(
             result.result_hash.is_none(),
             "Failed execution may not have result_hash"
+        );
+    }
+
+    // =========================================================================
+    // SEC-CTRL-FAC-0017: Isolation Key Tests
+    // =========================================================================
+
+    #[test]
+    fn test_executor_isolation_key_configuration() {
+        // SEC-CTRL-FAC-0017: Verify isolation key can be set and retrieved
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+
+        let executor = ToolExecutor::new(tracker, cas).with_isolation_key("ep-test-123");
+
+        assert_eq!(
+            executor.isolation_key(),
+            Some("ep-test-123"),
+            "isolation_key should be retrievable after setting"
+        );
+    }
+
+    #[test]
+    fn test_executor_compute_cache_key_without_isolation_returns_none() {
+        // SEC-CTRL-FAC-0017: FAIL-CLOSED - No caching without isolation key
+        // When no isolation key is set, compute_cache_key returns None to
+        // disable caching entirely, preventing cross-session leakage.
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let executor = ToolExecutor::new(tracker, cas);
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        // Without isolation key, caching is disabled (fail-closed)
+        assert!(
+            executor.compute_cache_key(&args).is_none(),
+            "compute_cache_key should return None when no isolation_key is set (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_executor_compute_cache_key_with_isolation() {
+        // SEC-CTRL-FAC-0017: Verify cache key includes isolation_key when set
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let executor = ToolExecutor::new(tracker, cas).with_isolation_key("ep-session-abc");
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let key = executor.compute_cache_key(&args).unwrap();
+        assert_eq!(
+            key.isolation_key,
+            Some("ep-session-abc".to_string()),
+            "cache key should include isolation_key from executor"
+        );
+        assert!(
+            key.as_string().contains("ep-session-abc"),
+            "cache key string should include isolation_key"
+        );
+    }
+
+    #[test]
+    fn test_executor_isolation_prevents_cross_session_cache_access() {
+        // SEC-CTRL-FAC-0017: Verify different isolation keys produce different cache
+        // keys
+        let tracker1 = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas1 = Arc::new(StubContentAddressedStore::new());
+        let executor1 = ToolExecutor::new(tracker1, cas1).with_isolation_key("ep-session-A");
+
+        let tracker2 = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas2 = Arc::new(StubContentAddressedStore::new());
+        let executor2 = ToolExecutor::new(tracker2, cas2).with_isolation_key("ep-session-B");
+
+        // Same tool args
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let key1 = executor1.compute_cache_key(&args).unwrap();
+        let key2 = executor2.compute_cache_key(&args).unwrap();
+
+        // Cache keys should have the same input_hash but different isolation_keys
+        assert_eq!(
+            key1.input_hash, key2.input_hash,
+            "input hashes should match for same args"
+        );
+        assert_ne!(
+            key1.isolation_key, key2.isolation_key,
+            "isolation keys should differ between sessions"
+        );
+        assert_ne!(
+            key1.as_string(),
+            key2.as_string(),
+            "full cache key strings should differ to prevent cross-session access"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00335 Fix: Cache Invalidation on Handler Failure
+    // =========================================================================
+
+    // Mock Execute handler that always fails (simulates failed command)
+    #[derive(Debug)]
+    struct MockExecuteHandler {
+        should_fail: bool,
+    }
+
+    impl MockExecuteHandler {
+        fn failing() -> Self {
+            Self { should_fail: true }
+        }
+
+        fn succeeding() -> Self {
+            Self { should_fail: false }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolHandler for MockExecuteHandler {
+        fn tool_class(&self) -> ToolClass {
+            ToolClass::Execute
+        }
+
+        async fn execute(
+            &self,
+            _args: &ToolArgs,
+            _credential: Option<&Credential>,
+        ) -> Result<ToolResultData, ToolHandlerError> {
+            if self.should_fail {
+                return Err(ToolHandlerError::ExecutionFailed {
+                    message: "command failed with exit code 1".to_string(),
+                });
+            }
+            Ok(ToolResultData::success(
+                b"output".to_vec(),
+                BudgetDelta::single_call().with_bytes_io(6),
+                Duration::from_millis(100),
+            ))
+        }
+
+        fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
+            if !matches!(args, ToolArgs::Execute(_)) {
+                return Err(ToolHandlerError::InvalidArgs {
+                    reason: "expected Execute args".to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "MockExecuteHandler"
+        }
+
+        fn estimate_budget(&self, _args: &ToolArgs) -> BudgetDelta {
+            BudgetDelta::single_call().with_bytes_io(1000)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidated_on_state_modifying_tool_failure() {
+        // TCK-00335 Fix: Verify that cache is invalidated BEFORE execution
+        // for state-modifying tools, so even failed executions clear stale data.
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{ToolOutputCache, ToolOutputCacheConfig};
+
+        // Setup executor with cache
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let cache_cas = Arc::new(MemoryCas::new());
+        let cache = ToolOutputCache::new(ToolOutputCacheConfig::default(), cache_cas);
+
+        let mut executor = ToolExecutor::new(tracker, cas)
+            .with_output_cache(cache.clone())
+            .with_isolation_key("test-session");
+
+        // Register both Read and Execute handlers
+        executor
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+        executor
+            .register_handler(Box::new(MockExecuteHandler::failing()))
+            .unwrap();
+
+        // First: Execute a Read to populate the cache
+        let read_args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let result = executor
+            .execute(&test_context(), &read_args, None)
+            .await
+            .unwrap();
+        assert!(result.success, "Read should succeed");
+
+        // Verify cache is populated
+        assert!(!cache.is_empty(), "Cache should have entries after Read");
+        let cache_size_before = cache.len();
+
+        // Second: Execute a failing Execute command
+        // This should invalidate the cache BEFORE execution (even though it fails)
+        let execute_args = ToolArgs::Execute(crate::episode::tool_handler::ExecuteArgs {
+            command: "failing-command".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: None,
+        });
+
+        let result = executor
+            .execute(&test_context(), &execute_args, None)
+            .await
+            .unwrap();
+
+        // The Execute should fail (return failure result, not error)
+        assert!(
+            !result.success,
+            "Execute should fail (handler configured to fail)"
+        );
+
+        // Critical assertion: Cache should be cleared even though Execute failed
+        // This is the bug fix - previously cache was only cleared on success
+        assert!(
+            cache.is_empty(),
+            "Cache should be cleared on state-modifying tool failure \
+            (was {cache_size_before} entries before Execute)",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidated_before_state_modifying_tool_success() {
+        // Verify that cache is also invalidated on success for state-modifying tools
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{ToolOutputCache, ToolOutputCacheConfig};
+
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let cache_cas = Arc::new(MemoryCas::new());
+        let cache = ToolOutputCache::new(ToolOutputCacheConfig::default(), cache_cas);
+
+        let mut executor = ToolExecutor::new(tracker, cas)
+            .with_output_cache(cache.clone())
+            .with_isolation_key("test-session");
+
+        executor
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+        executor
+            .register_handler(Box::new(MockExecuteHandler::succeeding()))
+            .unwrap();
+
+        // Populate cache with Read
+        let read_args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        executor
+            .execute(&test_context(), &read_args, None)
+            .await
+            .unwrap();
+        assert!(!cache.is_empty(), "Cache should have entries after Read");
+
+        // Execute a successful Execute command
+        let execute_args = ToolArgs::Execute(crate::episode::tool_handler::ExecuteArgs {
+            command: "successful-command".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: None,
+        });
+
+        let result = executor
+            .execute(&test_context(), &execute_args, None)
+            .await
+            .unwrap();
+        assert!(result.success, "Execute should succeed");
+
+        // Cache should be cleared
+        assert!(
+            cache.is_empty(),
+            "Cache should be cleared on state-modifying tool success"
         );
     }
 }

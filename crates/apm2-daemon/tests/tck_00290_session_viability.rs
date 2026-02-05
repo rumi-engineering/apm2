@@ -32,8 +32,8 @@ use apm2_daemon::protocol::LedgerEventEmitter;
 use apm2_daemon::protocol::credentials::PeerCredentials;
 use apm2_daemon::protocol::dispatch::{ConnectionContext, StubLedgerEventEmitter};
 use apm2_daemon::protocol::messages::{
-    DecisionType, EmitEventRequest, EvidenceKind, PublishEvidenceRequest, RequestToolRequest,
-    RetentionHint, SessionErrorCode, StreamTelemetryRequest, TelemetryFrame,
+    EmitEventRequest, EvidenceKind, PublishEvidenceRequest, RequestToolRequest, RetentionHint,
+    SessionErrorCode, StreamTelemetryRequest, TelemetryFrame,
 };
 use apm2_daemon::protocol::session_dispatch::{
     InMemoryManifestStore, SessionDispatcher, SessionResponse, encode_emit_event_request,
@@ -102,8 +102,10 @@ fn make_test_manifest(tools: Vec<ToolClass>) -> apm2_daemon::episode::Capability
 // Verification: cargo test -p apm2-daemon session_request_tool_exec
 // =============================================================================
 
-/// Verify `RequestTool` with configured manifest store returns Allow for valid
-/// tool.
+/// Verify `RequestTool` with configured manifest store returns fail-closed
+/// error when tool broker is unavailable.
+///
+/// TCK-00335: Legacy manifest store validation removed; tool broker required.
 #[test]
 fn session_request_tool_exec_allow_with_manifest() {
     let minter = test_minter();
@@ -127,26 +129,25 @@ fn session_request_tool_exec_allow_with_manifest() {
 
     let response = dispatcher.dispatch(&frame, &ctx).unwrap();
     match response {
-        SessionResponse::RequestTool(resp) => {
+        SessionResponse::Error(err) => {
             assert_eq!(
-                resp.decision,
-                DecisionType::Allow as i32,
-                "Tool should be allowed"
+                err.code,
+                SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                "Expected TOOL_NOT_ALLOWED error code (fail-closed)"
             );
             assert!(
-                !resp.policy_hash.is_empty(),
-                "Policy hash should be present"
-            );
-            assert!(
-                resp.request_id.starts_with("REQ-"),
-                "Request ID should have REQ- prefix"
+                err.message.contains("broker unavailable"),
+                "Error message should indicate broker unavailable: {}",
+                err.message
             );
         },
-        _ => panic!("Expected RequestTool response, got: {response:?}"),
+        _ => panic!("Expected Error response, got: {response:?}"),
     }
 }
 
-/// Verify `RequestTool` denies tool not in allowlist.
+/// Verify `RequestTool` returns fail-closed error when tool broker unavailable.
+///
+/// TCK-00335: Legacy manifest store validation removed; tool broker required.
 #[test]
 fn session_request_tool_exec_deny_not_in_allowlist() {
     let minter = test_minter();
@@ -174,15 +175,15 @@ fn session_request_tool_exec_deny_not_in_allowlist() {
             assert_eq!(
                 err.code,
                 SessionErrorCode::SessionErrorToolNotAllowed as i32,
-                "Should be TOOL_NOT_ALLOWED"
+                "Expected TOOL_NOT_ALLOWED error code (fail-closed)"
             );
             assert!(
-                err.message.contains("not in allowlist"),
-                "Error should mention allowlist: {}",
+                err.message.contains("broker unavailable"),
+                "Error message should indicate broker unavailable: {}",
                 err.message
             );
         },
-        _ => panic!("Expected error response, got: {response:?}"),
+        _ => panic!("Expected Error response, got: {response:?}"),
     }
 }
 
@@ -510,7 +511,7 @@ fn session_event_evidence_persist_full_config_integration() {
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
-    // Test RequestTool
+    // Test RequestTool - TCK-00335: now returns broker unavailable (fail-closed)
     let tool_request = RequestToolRequest {
         session_token: serde_json::to_string(&token).unwrap(),
         tool_id: "write".to_string(),
@@ -519,10 +520,21 @@ fn session_event_evidence_persist_full_config_integration() {
     };
     let tool_frame = encode_request_tool_request(&tool_request);
     let tool_response = dispatcher.dispatch(&tool_frame, &ctx).unwrap();
-    assert!(
-        matches!(tool_response, SessionResponse::RequestTool(_)),
-        "RequestTool should succeed with full config"
-    );
+    match tool_response {
+        SessionResponse::Error(err) => {
+            assert_eq!(
+                err.code,
+                SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                "RequestTool should return TOOL_NOT_ALLOWED (broker unavailable)"
+            );
+            assert!(
+                err.message.contains("broker unavailable"),
+                "Error message should indicate broker unavailable: {}",
+                err.message
+            );
+        },
+        _ => panic!("Expected Error response for RequestTool, got: {tool_response:?}"),
+    }
 
     // Test EmitEvent
     let event_request = EmitEventRequest {
