@@ -152,6 +152,17 @@ pub struct EpisodeStarted {
 
     /// Goal specification for this episode.
     goal_spec: Option<String>,
+
+    /// BLAKE3 hash of the `RoleSpecV1` governing this episode (TCK-00331).
+    ///
+    /// Per RFC-0019 Addendum, role specs are CAS-addressed artifacts. This hash
+    /// provides attribution for which role's tool allowlist and budgets were in
+    /// effect during the episode.
+    ///
+    /// This field is `Option` for backward compatibility with events created
+    /// before TCK-00331.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role_spec_hash: Option<[u8; 32]>,
 }
 
 impl EpisodeStarted {
@@ -206,6 +217,7 @@ impl EpisodeStarted {
             remaining_tokens: None,
             remaining_time_ms: None,
             goal_spec: None,
+            role_spec_hash: None,
         })
     }
 
@@ -247,6 +259,7 @@ impl EpisodeStarted {
             remaining_tokens: None,
             remaining_time_ms: None,
             goal_spec: None,
+            role_spec_hash: None,
         }
     }
 
@@ -329,6 +342,26 @@ impl EpisodeStarted {
     #[must_use]
     pub fn with_goal_spec(mut self, goal: impl Into<String>) -> Self {
         self.goal_spec = Some(goal.into());
+        self
+    }
+
+    /// Returns the role spec hash (TCK-00331).
+    ///
+    /// This hash identifies the `RoleSpecV1` that governed this episode's
+    /// tool allowlist and budgets.
+    #[must_use]
+    pub const fn role_spec_hash(&self) -> Option<&[u8; 32]> {
+        self.role_spec_hash.as_ref()
+    }
+
+    /// Sets the role spec hash (TCK-00331).
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - BLAKE3 hash of the `RoleSpecV1` stored in CAS
+    #[must_use]
+    pub const fn with_role_spec_hash(mut self, hash: [u8; 32]) -> Self {
+        self.role_spec_hash = Some(hash);
         self
     }
 }

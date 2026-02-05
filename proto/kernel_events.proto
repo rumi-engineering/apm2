@@ -1,5 +1,9 @@
 // APM2 Kernel Event Schema
-// Version: 0.9.0
+// Version: 0.10.0
+//
+// CHANGELOG (0.10.0):
+// - Added role_spec_hash to ReviewReceiptRecorded (RFC-0019, TCK-00331)
+// - Binds review outcomes to RoleSpecV1 for attribution and conformance verification
 //
 // CHANGELOG (0.9.0):
 // - Added capability_manifest_hash and context_pack_hash to ReviewBlockedRecorded (RFC-0019, TCK-00326)
@@ -1749,6 +1753,9 @@ message ReviewReceiptRecorded {
   // BLAKE3 hash of the sealed ContextPackManifest used during review (32 bytes, TCK-00326).
   // Binds the review to the context firewall configuration.
   bytes context_pack_hash = 8;
+  // BLAKE3 hash of the RoleSpecV1 used during review (32 bytes, TCK-00331).
+  // Binds the review to the role specification for attribution and conformance verification.
+  bytes role_spec_hash = 9;
 }
 
 // ============================================================

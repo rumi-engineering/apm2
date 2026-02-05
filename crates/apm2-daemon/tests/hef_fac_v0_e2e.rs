@@ -330,6 +330,8 @@ impl FacV0TestHarness {
             // TCK-00326: Authority binding fields
             capability_manifest_hash: vec![0x55; 32],
             context_pack_hash: vec![0x66; 32],
+            // TCK-00331: Role spec binding
+            role_spec_hash: vec![0x77; 32],
         };
 
         let payload = event.encode_to_vec();
@@ -1287,6 +1289,8 @@ async fn test_domain_separation_rejects_fac_prefix() {
         // TCK-00326: Authority binding fields
         capability_manifest_hash: vec![0x55; 32],
         context_pack_hash: vec![0x66; 32],
+        // TCK-00331: Role spec binding
+        role_spec_hash: vec![0x77; 32],
     };
     let payload = event_proto.encode_to_vec();
 

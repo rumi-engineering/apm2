@@ -1928,6 +1928,10 @@ pub struct ReviewReceiptRecorded {
     /// Binds the review to the context firewall configuration.
     #[prost(bytes = "vec", tag = "8")]
     pub context_pack_hash: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the RoleSpecV1 used during review (32 bytes, TCK-00331).
+    /// Binds the review to the role specification for attribution and conformance verification.
+    #[prost(bytes = "vec", tag = "9")]
+    pub role_spec_hash: ::prost::alloc::vec::Vec<u8>,
 }
 /// Emitted when a projection is successfully completed.
 ///

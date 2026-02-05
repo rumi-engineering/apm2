@@ -72,6 +72,7 @@ mod agent_adapter_profile;
 pub mod anti_downgrade;
 mod artifact_manifest;
 pub mod builtin_profiles;
+pub mod builtin_roles;
 mod changeset_bundle;
 mod ci_attestation;
 mod ci_import;
@@ -91,6 +92,8 @@ pub mod retry_manager;
 pub mod review_blocked;
 pub mod review_receipt;
 pub mod risk_tier;
+pub mod role_conformance;
+mod role_spec;
 pub mod selection_policy;
 pub mod serde_helpers;
 mod terminal_verifier;
@@ -281,6 +284,27 @@ pub mod tool_log_index;
 pub mod view_commitment;
 // Re-export view commitment types
 // Re-export summary receipt types (TCK-00327)
+// Re-export builtin role types (TCK-00331)
+pub use builtin_roles::{
+    CODE_QUALITY_REVIEWER_ROLE_ID, IMPLEMENTER_ROLE_ID, ORCHESTRATOR_ROLE_ID,
+    SECURITY_REVIEWER_ROLE_ID, all_builtin_roles, code_quality_reviewer_role, get_builtin_role,
+    implementer_role, orchestrator_role, security_reviewer_role,
+};
+// Re-export role conformance harness types (TCK-00331)
+pub use role_conformance::{
+    ConformanceError, ConformanceResult, ConformanceViolation, RoleConformanceHarness,
+    ViolationType,
+};
+// Re-export role spec types (TCK-00331)
+pub use role_spec::{
+    MAX_CAPABILITY_ID_LENGTH as MAX_ROLE_CAPABILITY_ID_LENGTH,
+    MAX_DESCRIPTION_LENGTH as MAX_ROLE_DESCRIPTION_LENGTH,
+    MAX_OUTPUT_SCHEMA_LENGTH as MAX_ROLE_OUTPUT_SCHEMA_LENGTH,
+    MAX_REQUIRED_OUTPUT_SCHEMAS as MAX_ROLE_OUTPUT_SCHEMAS, MAX_ROLE_ID_LENGTH,
+    MAX_ROLE_NAME_LENGTH, MAX_TOOL_BUDGETS, MAX_TOOL_CLASS_LENGTH, MAX_TOOLS_IN_ALLOWLIST,
+    ROLE_SPEC_V1_SCHEMA, RequiredOutputSchema, RoleBudgets, RoleSpecError, RoleSpecV1,
+    RoleSpecV1Builder, RoleType, ToolAllowlist, ToolBudget,
+};
 pub use summary_receipt::{
     LossProfile, MAX_REVIEW_ID_LENGTH as MAX_SUMMARY_RECEIPT_REVIEW_ID_LENGTH,
     MAX_SELECTOR_TAG_LENGTH, MAX_SELECTOR_TAGS, MAX_SUMMARY_TEXT_LENGTH, ReviewOutcome,
