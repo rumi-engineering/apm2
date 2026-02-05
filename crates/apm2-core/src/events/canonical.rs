@@ -156,6 +156,23 @@ pub const REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.review_rec
 /// security rationale.
 pub const REVIEW_BLOCKED_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.review_blocked_recorded:";
 
+/// Domain prefix for `ProjectionReceiptRecorded` events **in the ledger**.
+///
+/// Per RFC-0019 FAC: domain prefixes prevent cross-context replay.
+/// Used when signing/verifying projection receipt events for ledger ingestion.
+///
+/// # Security: Domain Separation
+///
+/// This prefix (`apm2.event.projection_receipt_recorded:`) is intentionally
+/// **distinct** from the FAC event-level prefix (`PROJECTION_RECEIPT_RECORDED:`
+/// in `crate::fac`). See [`REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX`] for the
+/// security rationale.
+///
+/// The `apm2.event.*` namespace follows the same pattern as other kernel
+/// events (e.g., `tool_decided`, `session_terminated`).
+pub const PROJECTION_RECEIPT_RECORDED_DOMAIN_PREFIX: &[u8] =
+    b"apm2.event.projection_receipt_recorded:";
+
 /// Trait for canonicalizing messages before signing.
 ///
 /// Types implementing this trait have repeated fields that must be sorted
@@ -560,7 +577,9 @@ impl Canonicalize for KernelEvent {
                 // ReviewBlockedRecorded has no repeated fields (TCK-00311)
                 | kernel_event::Payload::ReviewBlockedRecorded(_)
                 // ReviewReceiptRecorded has no repeated fields (TCK-00312)
-                | kernel_event::Payload::ReviewReceiptRecorded(_),
+                | kernel_event::Payload::ReviewReceiptRecorded(_)
+                // ProjectionReceiptRecorded has no repeated fields (TCK-00323)
+                | kernel_event::Payload::ProjectionReceiptRecorded(_),
             )
             | None => {},
         }

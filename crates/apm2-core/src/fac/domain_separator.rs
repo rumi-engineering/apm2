@@ -139,6 +139,12 @@ pub const REVIEW_BLOCKED_RECORDED_PREFIX: &[u8] = b"REVIEW_BLOCKED_RECORDED:";
 /// This records successful review outcomes with artifact bundle bindings.
 pub const REVIEW_RECEIPT_RECORDED_PREFIX: &[u8] = b"REVIEW_RECEIPT_RECORDED:";
 
+/// Domain prefix for `ProjectionReceiptRecorded` events.
+///
+/// Used when signing/verifying projection receipt events.
+/// This records successful projection outcomes with artifact bundle bindings.
+pub const PROJECTION_RECEIPT_RECORDED_PREFIX: &[u8] = b"PROJECTION_RECEIPT_RECORDED:";
+
 // =============================================================================
 // Domain-Separated Signing
 // =============================================================================
@@ -353,7 +359,7 @@ pub mod tests {
 
     #[test]
     fn test_all_domain_prefixes_defined() {
-        // Verify all 15 required domain prefixes are defined
+        // Verify all 16 required domain prefixes are defined
         let prefixes = [
             GATE_LEASE_ISSUED_PREFIX,
             LEASE_REVOKED_PREFIX,
@@ -370,6 +376,7 @@ pub mod tests {
             CHANGESET_PUBLISHED_PREFIX,
             REVIEW_BLOCKED_RECORDED_PREFIX,
             REVIEW_RECEIPT_RECORDED_PREFIX,
+            PROJECTION_RECEIPT_RECORDED_PREFIX,
         ];
 
         // All prefixes should be non-empty and end with ':'
