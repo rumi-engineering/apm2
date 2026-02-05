@@ -365,6 +365,16 @@ impl_bounded_decode_simple!(
     ReloadProcessResponse,
     StreamLogsRequest,
     LogEntry,
+    // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+    ConsensusStatusRequest,
+    ConsensusStatusResponse,
+    ConsensusValidatorsRequest,
+    ValidatorInfo,
+    ConsensusMetricsRequest,
+    ConsensusMetricsResponse,
+    ConsensusByzantineEvidenceRequest,
+    ByzantineEvidenceEntry,
+    ConsensusError,
 );
 
 // Implement BoundedDecode for messages with repeated fields
@@ -383,6 +393,9 @@ impl_bounded_decode_with_repeated!(SubscribePulseResponse, accepted_patterns, re
 // CTR-PROTO-011: Process Management Endpoints (TCK-00342)
 impl_bounded_decode_with_repeated!(ListProcessesResponse, processes);
 impl_bounded_decode_with_repeated!(StreamLogsResponse, entries);
+// CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+impl_bounded_decode_with_repeated!(ConsensusValidatorsResponse, validators);
+impl_bounded_decode_with_repeated!(ConsensusByzantineEvidenceResponse, evidence);
 
 // ============================================================================
 // HEF Field Bounds (CTR-HEF-0001, REQ-HEF-0002, RFC-0018)

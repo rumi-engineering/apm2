@@ -24,16 +24,20 @@
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
 //! - `05_rollout_and_ops.yaml`: CLI commands specification
+//! - TCK-00345: Consensus commands daemon integration
+
+use std::path::Path;
 
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
+
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
 
 /// Exit codes for consensus commands.
 pub mod exit_codes {
     /// Success exit code.
     pub const SUCCESS: u8 = 0;
-    /// General error exit code (reserved for daemon connection errors).
-    #[allow(dead_code)] // Reserved for future daemon integration
+    /// General error exit code.
     pub const ERROR: u8 = 1;
     /// Cluster unhealthy exit code.
     pub const UNHEALTHY: u8 = 2;
@@ -289,270 +293,385 @@ pub struct ErrorResponse {
 /// - 1: General error
 /// - 2: Cluster unhealthy
 #[allow(clippy::too_many_lines)]
-pub fn run_consensus(cmd: &ConsensusCommand, _socket_path: &std::path::Path) -> u8 {
+pub fn run_consensus(cmd: &ConsensusCommand, socket_path: &Path) -> u8 {
     let json_output = cmd.json;
 
     match &cmd.subcommand {
-        ConsensusSubcommand::Status(args) => run_status(args, json_output),
-        ConsensusSubcommand::Validators(args) => run_validators(args, json_output),
+        ConsensusSubcommand::Status(args) => run_status(args, json_output, socket_path),
+        ConsensusSubcommand::Validators(args) => run_validators(args, json_output, socket_path),
         ConsensusSubcommand::ByzantineEvidence(subcmd) => match subcmd {
-            ByzantineEvidenceCommand::List(args) => run_byzantine_list(args, json_output),
+            ByzantineEvidenceCommand::List(args) => {
+                run_byzantine_list(args, json_output, socket_path)
+            },
         },
-        ConsensusSubcommand::Metrics(args) => run_metrics(args, json_output),
+        ConsensusSubcommand::Metrics(args) => run_metrics(args, json_output, socket_path),
     }
 }
 
 /// Execute the status command.
 ///
-/// Currently returns mock data since daemon integration is pending.
-/// In production, this would query the daemon via UDS.
-fn run_status(args: &StatusArgs, json_output: bool) -> u8 {
-    // TODO: Query daemon for actual status via UDS
-    // For now, return mock data to demonstrate the interface
-    // NOTE: Using "unknown" health and quorum_met=false to indicate mock data
-
-    let response = StatusResponse {
-        node_id: "mock-node-001".to_string(),
-        epoch: 0,
-        round: 0,
-        leader_id: "unknown".to_string(),
-        is_leader: false,
-        validator_count: 0,
-        active_validators: 0,
-        quorum_threshold: 0,
-        quorum_met: false,
-        health: "unknown".to_string(),
-        high_qc_round: if args.verbose { Some(0) } else { None },
-        locked_qc_round: None,
-        committed_blocks: if args.verbose { Some(0) } else { None },
-        last_committed_hash: None,
+/// Queries the daemon via UDS for consensus status information.
+/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not
+/// active.
+fn run_status(args: &StatusArgs, json_output: bool, socket_path: &Path) -> u8 {
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::ERROR,
+            );
+        },
     };
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Consensus Cluster Status");
-        println!("========================");
-        println!();
-        println!("WARNING: Daemon not connected. Displaying mock data.");
-        println!();
-        println!("Node ID:           {}", response.node_id);
-        println!("Epoch:             {}", response.epoch);
-        println!("Round:             {}", response.round);
-        println!("Leader:            {}", response.leader_id);
-        println!(
-            "Is Leader:         {}",
-            if response.is_leader { "yes" } else { "no" }
-        );
-        println!();
-        println!("Validators:");
-        println!("  Total:           {}", response.validator_count);
-        println!("  Active:          {}", response.active_validators);
-        println!(
-            "  Quorum:          {}/{}",
-            response.active_validators, response.quorum_threshold
-        );
-        println!(
-            "  Quorum Met:      {}",
-            if response.quorum_met { "yes" } else { "NO" }
-        );
-        println!();
-        println!("Health:            {}", response.health.to_uppercase());
+    // Query daemon for consensus status
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(socket_path).await?;
+        client.consensus_status(args.verbose).await
+    });
 
-        if args.verbose {
-            println!();
-            println!("Details:");
-            if let Some(hqr) = response.high_qc_round {
-                println!("  High QC Round:   {hqr}");
+    match result {
+        Ok(daemon_response) => {
+            let response = StatusResponse {
+                node_id: daemon_response.node_id,
+                epoch: daemon_response.epoch,
+                round: daemon_response.round,
+                leader_id: daemon_response.leader_id,
+                is_leader: daemon_response.is_leader,
+                validator_count: daemon_response.validator_count as usize,
+                active_validators: daemon_response.active_validators as usize,
+                quorum_threshold: daemon_response.quorum_threshold as usize,
+                quorum_met: daemon_response.quorum_met,
+                health: daemon_response.health,
+                high_qc_round: daemon_response.high_qc_round,
+                locked_qc_round: daemon_response.locked_qc_round,
+                committed_blocks: daemon_response.committed_blocks.map(|v| v as usize),
+                last_committed_hash: daemon_response.last_committed_hash,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Consensus Cluster Status");
+                println!("========================");
+                println!();
+                println!("Node ID:           {}", response.node_id);
+                println!("Epoch:             {}", response.epoch);
+                println!("Round:             {}", response.round);
+                println!("Leader:            {}", response.leader_id);
+                println!(
+                    "Is Leader:         {}",
+                    if response.is_leader { "yes" } else { "no" }
+                );
+                println!();
+                println!("Validators:");
+                println!("  Total:           {}", response.validator_count);
+                println!("  Active:          {}", response.active_validators);
+                println!(
+                    "  Quorum:          {}/{}",
+                    response.active_validators, response.quorum_threshold
+                );
+                println!(
+                    "  Quorum Met:      {}",
+                    if response.quorum_met { "yes" } else { "NO" }
+                );
+                println!();
+                println!("Health:            {}", response.health.to_uppercase());
+
+                if args.verbose {
+                    println!();
+                    println!("Details:");
+                    if let Some(hqr) = response.high_qc_round {
+                        println!("  High QC Round:   {hqr}");
+                    }
+                    if let Some(lqr) = response.locked_qc_round {
+                        println!("  Locked QC Round: {lqr}");
+                    }
+                    if let Some(cb) = response.committed_blocks {
+                        println!("  Committed Blocks: {cb}");
+                    }
+                    if let Some(ref lch) = response.last_committed_hash {
+                        println!("  Last Committed:  {lch}");
+                    }
+                }
             }
-            if let Some(lqr) = response.locked_qc_round {
-                println!("  Locked QC Round: {lqr}");
+
+            // Return unhealthy if health is not "healthy"
+            if response.health.to_lowercase() == "healthy" {
+                exit_codes::SUCCESS
+            } else {
+                exit_codes::UNHEALTHY
             }
-            if let Some(cb) = response.committed_blocks {
-                println!("  Committed Blocks: {cb}");
-            }
-            if let Some(ref lch) = response.last_committed_hash {
-                println!("  Last Committed:  {lch}");
-            }
-        }
+        },
+        Err(e) => handle_protocol_error(&e, json_output),
     }
-
-    // Return unhealthy exit code since status is unknown (mock data)
-    exit_codes::UNHEALTHY
 }
 
 /// Execute the validators command.
-fn run_validators(args: &ValidatorsArgs, json_output: bool) -> u8 {
-    // TODO: Query daemon for actual validator list
-    // Return empty list to indicate no daemon connection (mock data)
-
-    let all_validators: Vec<ValidatorInfo> = vec![];
-
-    let validators: Vec<ValidatorInfo> = if args.active_only {
-        all_validators.into_iter().filter(|v| v.active).collect()
-    } else {
-        all_validators
-    };
-
-    let active_count = validators.iter().filter(|v| v.active).count();
-    let total = validators.len();
-
-    let response = ValidatorsResponse {
-        validators,
-        total,
-        active: active_count,
-    };
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("WARNING: Daemon not connected. Displaying mock data.");
-        println!();
-        println!(
-            "{:<6} {:<16} {:<8} {:<25}",
-            "INDEX", "ID (TRUNCATED)", "ACTIVE", "LAST SEEN"
-        );
-        println!("{}", "-".repeat(60));
-        for v in &response.validators {
-            let truncated_id = if v.id.len() > 12 {
-                format!("{}...", &v.id[..12])
-            } else {
-                v.id.clone()
-            };
-            println!(
-                "{:<6} {:<16} {:<8} {:<25}",
-                v.index,
-                truncated_id,
-                if v.active { "yes" } else { "no" },
-                v.last_seen.as_deref().unwrap_or("-"),
+///
+/// Queries the daemon via UDS for validator list.
+/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not
+/// active.
+fn run_validators(args: &ValidatorsArgs, json_output: bool, socket_path: &Path) -> u8 {
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::ERROR,
             );
-        }
-        println!();
-        println!(
-            "Total: {} validators, {} active",
-            response.total, response.active
-        );
-    }
+        },
+    };
 
-    exit_codes::SUCCESS
+    // Query daemon for validators
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(socket_path).await?;
+        client.consensus_validators(args.active_only).await
+    });
+
+    match result {
+        Ok(daemon_response) => {
+            // Convert daemon response to CLI response type
+            let validators: Vec<ValidatorInfo> = daemon_response
+                .validators
+                .into_iter()
+                .map(|v| ValidatorInfo {
+                    id: v.id,
+                    index: v.index as usize,
+                    public_key: v.public_key,
+                    active: v.active,
+                    last_seen: v.last_seen,
+                })
+                .collect();
+
+            let active_count = validators.iter().filter(|v| v.active).count();
+            let total = validators.len();
+
+            let response = ValidatorsResponse {
+                validators,
+                total,
+                active: active_count,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!(
+                    "{:<6} {:<16} {:<8} {:<25}",
+                    "INDEX", "ID (TRUNCATED)", "ACTIVE", "LAST SEEN"
+                );
+                println!("{}", "-".repeat(60));
+                for v in &response.validators {
+                    let truncated_id = if v.id.len() > 12 {
+                        format!("{}...", &v.id[..12])
+                    } else {
+                        v.id.clone()
+                    };
+                    println!(
+                        "{:<6} {:<16} {:<8} {:<25}",
+                        v.index,
+                        truncated_id,
+                        if v.active { "yes" } else { "no" },
+                        v.last_seen.as_deref().unwrap_or("-"),
+                    );
+                }
+                println!();
+                println!(
+                    "Total: {} validators, {} active",
+                    response.total, response.active
+                );
+            }
+
+            exit_codes::SUCCESS
+        },
+        Err(e) => handle_protocol_error(&e, json_output),
+    }
 }
 
 /// Execute the byzantine-evidence list command.
-fn run_byzantine_list(args: &ByzantineListArgs, json_output: bool) -> u8 {
-    // TODO: Query daemon for actual evidence
-    // Return empty list to indicate no daemon connection (mock data)
-
-    let all_evidence: Vec<ByzantineEvidence> = vec![];
-
-    // Use effective_limit to cap at MAX_BYZANTINE_EVIDENCE_ENTRIES
-    let limit = args.effective_limit();
-
-    // Filter by fault type if specified
-    let evidence: Vec<ByzantineEvidence> = if let Some(ref ft) = args.fault_type {
-        all_evidence
-            .into_iter()
-            .filter(|e| e.fault_type == *ft)
-            .take(limit)
-            .collect()
-    } else {
-        all_evidence.into_iter().take(limit).collect()
+///
+/// Queries the daemon via UDS for Byzantine fault evidence.
+/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not
+/// active.
+fn run_byzantine_list(args: &ByzantineListArgs, json_output: bool, socket_path: &Path) -> u8 {
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::ERROR,
+            );
+        },
     };
 
-    let total = evidence.len();
+    // Use effective_limit to cap at MAX_BYZANTINE_EVIDENCE_ENTRIES (max 1000, fits
+    // u32)
+    #[allow(clippy::cast_possible_truncation)]
+    let limit = args.effective_limit() as u32;
 
-    let response = ByzantineEvidenceResponse { evidence, total };
+    // Query daemon for Byzantine evidence
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(socket_path).await?;
+        client
+            .consensus_byzantine_evidence(args.fault_type.as_deref(), limit)
+            .await
+    });
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else if response.evidence.is_empty() {
-        println!("WARNING: Daemon not connected. Displaying mock data.");
-        println!();
-        println!("No Byzantine fault evidence detected.");
-    } else {
-        println!("WARNING: Daemon not connected. Displaying mock data.");
-        println!();
-        println!("Byzantine Fault Evidence");
-        println!("========================");
-        println!();
-        for e in &response.evidence {
-            println!("ID:         {}", e.id);
-            println!("Type:       {}", e.fault_type);
-            println!("Validator:  {}", e.validator_id);
-            println!("Epoch/Round: {}/{}", e.epoch, e.round);
-            println!("Timestamp:  {}", e.timestamp);
-            println!("Details:    {}", e.details);
-            println!();
-        }
-        println!("Total: {} evidence entries", response.total);
-    }
+    match result {
+        Ok(daemon_response) => {
+            // Convert daemon response to CLI response type
+            let evidence: Vec<ByzantineEvidence> = daemon_response
+                .evidence
+                .into_iter()
+                .map(|e| ByzantineEvidence {
+                    id: e.id,
+                    fault_type: e.fault_type,
+                    validator_id: e.validator_id,
+                    details: truncate_evidence_details(&e.details),
+                    timestamp: e.timestamp,
+                    epoch: e.epoch,
+                    round: e.round,
+                })
+                .collect();
 
-    // Return unhealthy if any evidence exists (indicates active Byzantine behavior)
-    if response.total > 0 {
-        exit_codes::UNHEALTHY
-    } else {
-        exit_codes::SUCCESS
+            let total = evidence.len();
+
+            let response = ByzantineEvidenceResponse { evidence, total };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else if response.evidence.is_empty() {
+                println!("No Byzantine fault evidence detected.");
+            } else {
+                println!("Byzantine Fault Evidence");
+                println!("========================");
+                println!();
+                for e in &response.evidence {
+                    println!("ID:         {}", e.id);
+                    println!("Type:       {}", e.fault_type);
+                    println!("Validator:  {}", e.validator_id);
+                    println!("Epoch/Round: {}/{}", e.epoch, e.round);
+                    println!("Timestamp:  {}", e.timestamp);
+                    println!("Details:    {}", e.details);
+                    println!();
+                }
+                println!("Total: {} evidence entries", response.total);
+            }
+
+            // Return unhealthy if any evidence exists (indicates active Byzantine behavior)
+            if response.total > 0 {
+                exit_codes::UNHEALTHY
+            } else {
+                exit_codes::SUCCESS
+            }
+        },
+        Err(e) => handle_protocol_error(&e, json_output),
     }
 }
 
 /// Execute the metrics command.
-fn run_metrics(_args: &MetricsArgs, json_output: bool) -> u8 {
-    // TODO: Query daemon for actual metrics
-    // Return zeroed metrics to indicate no daemon connection (mock data)
-
-    let response = MetricsResponse {
-        node_id: "mock-node-001".to_string(),
-        proposals_committed: 0,
-        proposals_rejected: 0,
-        proposals_timeout: 0,
-        leader_elections: 0,
-        sync_events: 0,
-        conflicts: 0,
-        byzantine_evidence: 0,
-        latency_p50_ms: 0.0,
-        latency_p99_ms: 0.0,
+///
+/// Queries the daemon via UDS for consensus metrics.
+/// Returns `CONSENSUS_NOT_CONFIGURED` error if consensus subsystem is not
+/// active.
+fn run_metrics(args: &MetricsArgs, json_output: bool, socket_path: &Path) -> u8 {
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::ERROR,
+            );
+        },
     };
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Consensus Metrics Summary");
-        println!("=========================");
-        println!();
-        println!("WARNING: Daemon not connected. Displaying mock data.");
-        println!();
-        println!("Node ID: {}", response.node_id);
-        println!();
-        println!("Proposals:");
-        println!("  Committed:       {}", response.proposals_committed);
-        println!("  Rejected:        {}", response.proposals_rejected);
-        println!("  Timeout:         {}", response.proposals_timeout);
-        println!();
-        println!("Leader Elections:  {}", response.leader_elections);
-        println!();
-        println!("Anti-Entropy:");
-        println!("  Sync Events:     {}", response.sync_events);
-        println!("  Conflicts:       {}", response.conflicts);
-        println!();
-        println!("Byzantine Evidence: {}", response.byzantine_evidence);
-        println!();
-        println!("Latency:");
-        println!("  p50:             {:.1}ms", response.latency_p50_ms);
-        println!("  p99:             {:.1}ms", response.latency_p99_ms);
-    }
+    // Query daemon for consensus metrics
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(socket_path).await?;
+        client.consensus_metrics(args.period).await
+    });
 
-    exit_codes::SUCCESS
+    match result {
+        Ok(daemon_response) => {
+            let response = MetricsResponse {
+                node_id: daemon_response.node_id,
+                proposals_committed: daemon_response.proposals_committed,
+                proposals_rejected: daemon_response.proposals_rejected,
+                proposals_timeout: daemon_response.proposals_timeout,
+                leader_elections: daemon_response.leader_elections,
+                sync_events: daemon_response.sync_events,
+                conflicts: daemon_response.conflicts,
+                byzantine_evidence: daemon_response.byzantine_evidence,
+                latency_p50_ms: daemon_response.latency_p50_ms,
+                latency_p99_ms: daemon_response.latency_p99_ms,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Consensus Metrics Summary");
+                println!("=========================");
+                println!();
+                println!("Node ID: {}", response.node_id);
+                println!();
+                println!("Proposals:");
+                println!("  Committed:       {}", response.proposals_committed);
+                println!("  Rejected:        {}", response.proposals_rejected);
+                println!("  Timeout:         {}", response.proposals_timeout);
+                println!();
+                println!("Leader Elections:  {}", response.leader_elections);
+                println!();
+                println!("Anti-Entropy:");
+                println!("  Sync Events:     {}", response.sync_events);
+                println!("  Conflicts:       {}", response.conflicts);
+                println!();
+                println!("Byzantine Evidence: {}", response.byzantine_evidence);
+                println!();
+                println!("Latency:");
+                println!("  p50:             {:.1}ms", response.latency_p50_ms);
+                println!("  p99:             {:.1}ms", response.latency_p99_ms);
+            }
+
+            exit_codes::SUCCESS
+        },
+        Err(e) => handle_protocol_error(&e, json_output),
+    }
 }
 
 // ============================================================================
@@ -560,7 +679,6 @@ fn run_metrics(_args: &MetricsArgs, json_output: bool) -> u8 {
 // ============================================================================
 
 /// Output an error in the appropriate format.
-#[allow(dead_code)]
 fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
     if json_output {
         let error = ErrorResponse {
@@ -577,11 +695,52 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
     exit_code
 }
 
+/// Converts a `ProtocolClientError` into an appropriate error output and exit
+/// code.
+///
+/// Maps daemon errors to user-friendly messages and handles "not configured"
+/// errors with a specific exit code and message.
+fn handle_protocol_error(err: &ProtocolClientError, json_output: bool) -> u8 {
+    match err {
+        ProtocolClientError::DaemonNotRunning => output_error(
+            json_output,
+            "daemon_not_running",
+            "daemon is not running",
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::DaemonError { code, message } => {
+            // Map ConsensusNotConfigured to a specific error code
+            if code.contains("ConsensusNotConfigured") || code.contains("CONSENSUS_NOT_CONFIGURED")
+            {
+                output_error(
+                    json_output,
+                    "consensus_not_configured",
+                    message,
+                    exit_codes::ERROR,
+                )
+            } else {
+                output_error(json_output, code, message, exit_codes::ERROR)
+            }
+        },
+        ProtocolClientError::Timeout => output_error(
+            json_output,
+            "timeout",
+            "operation timed out",
+            exit_codes::ERROR,
+        ),
+        _ => output_error(
+            json_output,
+            "protocol_error",
+            &err.to_string(),
+            exit_codes::ERROR,
+        ),
+    }
+}
+
 /// Truncates Byzantine evidence details to the maximum allowed length.
 ///
 /// This function should be used when receiving evidence from the daemon
 /// to prevent unbounded memory usage from large payloads.
-#[allow(dead_code)]
 fn truncate_evidence_details(details: &str) -> String {
     if details.len() <= limits::MAX_BYZANTINE_EVIDENCE_DETAILS_LENGTH {
         details.to_string()

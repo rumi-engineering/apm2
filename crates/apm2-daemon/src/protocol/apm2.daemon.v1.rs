@@ -1014,6 +1014,193 @@ pub struct StreamLogsResponse {
     #[prost(string, tag = "3")]
     pub process_name: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-011: ConsensusStatus
+/// Query current consensus cluster status.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ConsensusStatusRequest {
+    /// Include verbose details (QC info, committed block hash).
+    #[prost(bool, tag = "1")]
+    pub verbose: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsensusStatusResponse {
+    /// Node ID reporting this status.
+    #[prost(string, tag = "1")]
+    pub node_id: ::prost::alloc::string::String,
+    /// Current consensus epoch.
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    /// Current consensus round.
+    #[prost(uint64, tag = "3")]
+    pub round: u64,
+    /// Current leader validator ID (hex).
+    #[prost(string, tag = "4")]
+    pub leader_id: ::prost::alloc::string::String,
+    /// Whether this node is the current leader.
+    #[prost(bool, tag = "5")]
+    pub is_leader: bool,
+    /// Total validators in cluster.
+    #[prost(uint32, tag = "6")]
+    pub validator_count: u32,
+    /// Active validators.
+    #[prost(uint32, tag = "7")]
+    pub active_validators: u32,
+    /// Quorum threshold (2f+1).
+    #[prost(uint32, tag = "8")]
+    pub quorum_threshold: u32,
+    /// Whether quorum is currently met.
+    #[prost(bool, tag = "9")]
+    pub quorum_met: bool,
+    /// Cluster health status: "healthy", "degraded", "critical", "unknown".
+    #[prost(string, tag = "10")]
+    pub health: ::prost::alloc::string::String,
+    /// Highest QC round (if verbose).
+    #[prost(uint64, optional, tag = "11")]
+    pub high_qc_round: ::core::option::Option<u64>,
+    /// Locked QC round (if verbose).
+    #[prost(uint64, optional, tag = "12")]
+    pub locked_qc_round: ::core::option::Option<u64>,
+    /// Committed blocks count (if verbose).
+    #[prost(uint32, optional, tag = "13")]
+    pub committed_blocks: ::core::option::Option<u32>,
+    /// Last committed hash (hex, if verbose).
+    #[prost(string, optional, tag = "14")]
+    pub last_committed_hash: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// IPC-PRIV-012: ConsensusValidators
+/// Query validator list and status.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ConsensusValidatorsRequest {
+    /// Show only active validators.
+    #[prost(bool, tag = "1")]
+    pub active_only: bool,
+}
+/// Validator information.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ValidatorInfo {
+    /// Validator ID (hex).
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Validator index in the set.
+    #[prost(uint32, tag = "2")]
+    pub index: u32,
+    /// Public key (hex).
+    #[prost(string, tag = "3")]
+    pub public_key: ::prost::alloc::string::String,
+    /// Whether validator is active (reachable).
+    #[prost(bool, tag = "4")]
+    pub active: bool,
+    /// Last seen timestamp (RFC 3339, optional).
+    #[prost(string, optional, tag = "5")]
+    pub last_seen: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsensusValidatorsResponse {
+    /// List of validators.
+    #[prost(message, repeated, tag = "1")]
+    pub validators: ::prost::alloc::vec::Vec<ValidatorInfo>,
+    /// Total count.
+    #[prost(uint32, tag = "2")]
+    pub total: u32,
+    /// Active count.
+    #[prost(uint32, tag = "3")]
+    pub active: u32,
+}
+/// IPC-PRIV-013: ConsensusByzantineEvidence
+/// Query detected Byzantine fault evidence.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsensusByzantineEvidenceRequest {
+    /// Filter by fault type: "equivocation", "invalid_signature",
+    /// "quorum_forgery", "replay", or empty for all.
+    #[prost(string, optional, tag = "1")]
+    pub fault_type: ::core::option::Option<::prost::alloc::string::String>,
+    /// Maximum number of entries to return (max 1000).
+    #[prost(uint32, tag = "2")]
+    pub limit: u32,
+}
+/// Byzantine fault evidence entry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ByzantineEvidenceEntry {
+    /// Evidence ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Fault type.
+    #[prost(string, tag = "2")]
+    pub fault_type: ::prost::alloc::string::String,
+    /// Validator ID that generated the fault.
+    #[prost(string, tag = "3")]
+    pub validator_id: ::prost::alloc::string::String,
+    /// Evidence details.
+    #[prost(string, tag = "4")]
+    pub details: ::prost::alloc::string::String,
+    /// Timestamp (RFC 3339).
+    #[prost(string, tag = "5")]
+    pub timestamp: ::prost::alloc::string::String,
+    /// Epoch when detected.
+    #[prost(uint64, tag = "6")]
+    pub epoch: u64,
+    /// Round when detected.
+    #[prost(uint64, tag = "7")]
+    pub round: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsensusByzantineEvidenceResponse {
+    /// List of evidence entries.
+    #[prost(message, repeated, tag = "1")]
+    pub evidence: ::prost::alloc::vec::Vec<ByzantineEvidenceEntry>,
+    /// Total count.
+    #[prost(uint32, tag = "2")]
+    pub total: u32,
+}
+/// IPC-PRIV-014: ConsensusMetrics
+/// Query consensus metrics summary.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ConsensusMetricsRequest {
+    /// Time period for rate calculations (seconds).
+    #[prost(uint64, tag = "1")]
+    pub period_secs: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsensusMetricsResponse {
+    /// Node ID.
+    #[prost(string, tag = "1")]
+    pub node_id: ::prost::alloc::string::String,
+    /// Proposals committed (total).
+    #[prost(uint64, tag = "2")]
+    pub proposals_committed: u64,
+    /// Proposals rejected (total).
+    #[prost(uint64, tag = "3")]
+    pub proposals_rejected: u64,
+    /// Proposals timed out (total).
+    #[prost(uint64, tag = "4")]
+    pub proposals_timeout: u64,
+    /// Leader elections (total).
+    #[prost(uint64, tag = "5")]
+    pub leader_elections: u64,
+    /// Anti-entropy sync events (total).
+    #[prost(uint64, tag = "6")]
+    pub sync_events: u64,
+    /// Anti-entropy conflicts (total).
+    #[prost(uint64, tag = "7")]
+    pub conflicts: u64,
+    /// Byzantine evidence count (total).
+    #[prost(uint64, tag = "8")]
+    pub byzantine_evidence: u64,
+    /// Finalization latency p50 (ms).
+    #[prost(double, tag = "9")]
+    pub latency_p50_ms: f64,
+    /// Finalization latency p99 (ms).
+    #[prost(double, tag = "10")]
+    pub latency_p99_ms: f64,
+}
+/// Error response for consensus query endpoints.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConsensusError {
+    #[prost(enumeration = "ConsensusErrorCode", tag = "1")]
+    pub code: i32,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -1616,6 +1803,38 @@ impl ProcessErrorCode {
             "PROCESS_ERROR_START_FAILED" => Some(Self::ProcessErrorStartFailed),
             "PROCESS_ERROR_STOP_FAILED" => Some(Self::ProcessErrorStopFailed),
             "PROCESS_ERROR_INVALID_NAME" => Some(Self::ProcessErrorInvalidName),
+            _ => None,
+        }
+    }
+}
+/// Error code for consensus queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ConsensusErrorCode {
+    ConsensusErrorUnspecified = 0,
+    /// Consensus subsystem is not configured (single-node mode).
+    ConsensusNotConfigured = 1,
+    /// Invalid parameter in request.
+    ConsensusInvalidParameter = 2,
+}
+impl ConsensusErrorCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::ConsensusErrorUnspecified => "CONSENSUS_ERROR_UNSPECIFIED",
+            Self::ConsensusNotConfigured => "CONSENSUS_NOT_CONFIGURED",
+            Self::ConsensusInvalidParameter => "CONSENSUS_INVALID_PARAMETER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONSENSUS_ERROR_UNSPECIFIED" => Some(Self::ConsensusErrorUnspecified),
+            "CONSENSUS_NOT_CONFIGURED" => Some(Self::ConsensusNotConfigured),
+            "CONSENSUS_INVALID_PARAMETER" => Some(Self::ConsensusInvalidParameter),
             _ => None,
         }
     }

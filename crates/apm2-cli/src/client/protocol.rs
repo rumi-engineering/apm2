@@ -42,6 +42,17 @@ use apm2_daemon::protocol::{
     ClaimWorkResponse,
     // Handshake
     ClientHandshake,
+    // TCK-00345: Consensus query messages
+    ConsensusByzantineEvidenceRequest,
+    ConsensusByzantineEvidenceResponse,
+    ConsensusError,
+    ConsensusErrorCode,
+    ConsensusMetricsRequest,
+    ConsensusMetricsResponse,
+    ConsensusStatusRequest,
+    ConsensusStatusResponse,
+    ConsensusValidatorsRequest,
+    ConsensusValidatorsResponse,
     DecodeConfig,
     EmitEventRequest,
     EmitEventResponse,
@@ -87,6 +98,11 @@ use apm2_daemon::protocol::{
     // Work types
     WorkRole,
     encode_claim_work_request,
+    // TCK-00345: Consensus query encoding
+    encode_consensus_byzantine_evidence_request,
+    encode_consensus_metrics_request,
+    encode_consensus_status_request,
+    encode_consensus_validators_request,
     encode_emit_event_request,
     encode_issue_capability_request,
     // TCK-00342: Process management encoding
@@ -591,6 +607,164 @@ impl OperatorClient {
         Self::decode_issue_capability_response(&response_frame)
     }
 
+    // =========================================================================
+    // TCK-00345: Consensus Query Methods (RFC-0014)
+    // =========================================================================
+
+    /// Queries consensus status from the daemon.
+    ///
+    /// # Arguments
+    ///
+    /// * `verbose` - Whether to include extended status information
+    ///
+    /// # Returns
+    ///
+    /// Consensus status including cluster health, current term, and leader
+    /// info. Returns `ConsensusNotConfigured` error if consensus subsystem
+    /// is not active.
+    pub async fn consensus_status(
+        &mut self,
+        verbose: bool,
+    ) -> Result<ConsensusStatusResponse, ProtocolClientError> {
+        let request = ConsensusStatusRequest { verbose };
+        let request_bytes = encode_consensus_status_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_consensus_status_response(&response_frame)
+    }
+
+    /// Queries validator list from the daemon.
+    ///
+    /// # Arguments
+    ///
+    /// * `active_only` - Whether to return only active validators
+    ///
+    /// # Returns
+    ///
+    /// List of validators with their status information.
+    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not
+    /// active.
+    pub async fn consensus_validators(
+        &mut self,
+        active_only: bool,
+    ) -> Result<ConsensusValidatorsResponse, ProtocolClientError> {
+        let request = ConsensusValidatorsRequest { active_only };
+        let request_bytes = encode_consensus_validators_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_consensus_validators_response(&response_frame)
+    }
+
+    /// Queries Byzantine evidence from the daemon.
+    ///
+    /// # Arguments
+    ///
+    /// * `fault_type` - Optional filter for specific fault type
+    /// * `limit` - Maximum number of evidence entries to return
+    ///
+    /// # Returns
+    ///
+    /// List of detected Byzantine faults.
+    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not
+    /// active.
+    pub async fn consensus_byzantine_evidence(
+        &mut self,
+        fault_type: Option<&str>,
+        limit: u32,
+    ) -> Result<ConsensusByzantineEvidenceResponse, ProtocolClientError> {
+        let request = ConsensusByzantineEvidenceRequest {
+            fault_type: fault_type.map(String::from),
+            limit,
+        };
+        let request_bytes = encode_consensus_byzantine_evidence_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_consensus_byzantine_evidence_response(&response_frame)
+    }
+
+    /// Queries consensus metrics from the daemon.
+    ///
+    /// # Arguments
+    ///
+    /// * `period_secs` - Time period for metrics aggregation (0 = current
+    ///   snapshot)
+    ///
+    /// # Returns
+    ///
+    /// Consensus performance metrics.
+    /// Returns `ConsensusNotConfigured` error if consensus subsystem is not
+    /// active.
+    pub async fn consensus_metrics(
+        &mut self,
+        period_secs: u64,
+    ) -> Result<ConsensusMetricsResponse, ProtocolClientError> {
+        let request = ConsensusMetricsRequest { period_secs };
+        let request_bytes = encode_consensus_metrics_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_consensus_metrics_response(&response_frame)
+    }
+
     /// Decodes an `IssueCapability` response.
     fn decode_issue_capability_response(
         frame: &Bytes,
@@ -1041,6 +1215,182 @@ impl OperatorClient {
         }
 
         ReloadProcessResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    // =========================================================================
+    // TCK-00345: Consensus Response Decoders
+    // =========================================================================
+
+    /// Decodes a `ConsensusStatus` response.
+    fn decode_consensus_status_response(
+        frame: &Bytes,
+    ) -> Result<ConsensusStatusResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response - check if it's a consensus error
+            if let Ok(err) = ConsensusError::decode_bounded(payload, &DecodeConfig::default()) {
+                let code = ConsensusErrorCode::try_from(err.code)
+                    .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+                return Err(ProtocolClientError::DaemonError {
+                    code,
+                    message: err.message,
+                });
+            }
+            // Fallback to privileged error
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ConsensusStatus.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ConsensusStatus response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ConsensusStatus.tag()
+            )));
+        }
+
+        ConsensusStatusResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `ConsensusValidators` response.
+    fn decode_consensus_validators_response(
+        frame: &Bytes,
+    ) -> Result<ConsensusValidatorsResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response - check if it's a consensus error
+            if let Ok(err) = ConsensusError::decode_bounded(payload, &DecodeConfig::default()) {
+                let code = ConsensusErrorCode::try_from(err.code)
+                    .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+                return Err(ProtocolClientError::DaemonError {
+                    code,
+                    message: err.message,
+                });
+            }
+            // Fallback to privileged error
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ConsensusValidators.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ConsensusValidators response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ConsensusValidators.tag()
+            )));
+        }
+
+        ConsensusValidatorsResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `ConsensusByzantineEvidence` response.
+    fn decode_consensus_byzantine_evidence_response(
+        frame: &Bytes,
+    ) -> Result<ConsensusByzantineEvidenceResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response - check if it's a consensus error
+            if let Ok(err) = ConsensusError::decode_bounded(payload, &DecodeConfig::default()) {
+                let code = ConsensusErrorCode::try_from(err.code)
+                    .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+                return Err(ProtocolClientError::DaemonError {
+                    code,
+                    message: err.message,
+                });
+            }
+            // Fallback to privileged error
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ConsensusByzantineEvidence.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ConsensusByzantineEvidence response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ConsensusByzantineEvidence.tag()
+            )));
+        }
+
+        ConsensusByzantineEvidenceResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `ConsensusMetrics` response.
+    fn decode_consensus_metrics_response(
+        frame: &Bytes,
+    ) -> Result<ConsensusMetricsResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response - check if it's a consensus error
+            if let Ok(err) = ConsensusError::decode_bounded(payload, &DecodeConfig::default()) {
+                let code = ConsensusErrorCode::try_from(err.code)
+                    .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+                return Err(ProtocolClientError::DaemonError {
+                    code,
+                    message: err.message,
+                });
+            }
+            // Fallback to privileged error
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ConsensusMetrics.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ConsensusMetrics response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ConsensusMetrics.tag()
+            )));
+        }
+
+        ConsensusMetricsResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 }

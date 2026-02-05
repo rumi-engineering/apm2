@@ -877,7 +877,7 @@ message HefError {
 //
 // ## Message Tag Range
 //
-// Process management messages use tag range 5-15 for privileged endpoints:
+// Process management messages use tag range 5-10 for privileged endpoints:
 // - 5 = ListProcesses
 // - 6 = ProcessStatus
 // - 7 = StartProcess
@@ -1101,4 +1101,171 @@ enum ProcessErrorCode {
   PROCESS_ERROR_STOP_FAILED = 5;
   // Invalid process name.
   PROCESS_ERROR_INVALID_NAME = 6;
+}
+
+// =============================================================================
+// CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+// =============================================================================
+// Privileged endpoints for querying consensus subsystem state.
+// These endpoints are only accessible via operator.sock.
+//
+// ## Message Tag Range (Consensus Reserved)
+//
+// Consensus query messages use tag range 11-14 on operator socket:
+// - 11 = ConsensusStatusRequest/Response
+// - 12 = ConsensusValidatorsRequest/Response
+// - 13 = ConsensusByzantineEvidenceRequest/Response
+// - 14 = ConsensusMetricsRequest/Response
+//
+// ## Behavior When Consensus Not Configured
+//
+// If the consensus subsystem is not configured (single-node mode), these
+// endpoints return CONSENSUS_NOT_CONFIGURED error rather than mock data.
+
+// IPC-PRIV-011: ConsensusStatus
+// Query current consensus cluster status.
+message ConsensusStatusRequest {
+  // Include verbose details (QC info, committed block hash).
+  bool verbose = 1;
+}
+
+message ConsensusStatusResponse {
+  // Node ID reporting this status.
+  string node_id = 1;
+  // Current consensus epoch.
+  uint64 epoch = 2;
+  // Current consensus round.
+  uint64 round = 3;
+  // Current leader validator ID (hex).
+  string leader_id = 4;
+  // Whether this node is the current leader.
+  bool is_leader = 5;
+  // Total validators in cluster.
+  uint32 validator_count = 6;
+  // Active validators.
+  uint32 active_validators = 7;
+  // Quorum threshold (2f+1).
+  uint32 quorum_threshold = 8;
+  // Whether quorum is currently met.
+  bool quorum_met = 9;
+  // Cluster health status: "healthy", "degraded", "critical", "unknown".
+  string health = 10;
+  // Highest QC round (if verbose).
+  optional uint64 high_qc_round = 11;
+  // Locked QC round (if verbose).
+  optional uint64 locked_qc_round = 12;
+  // Committed blocks count (if verbose).
+  optional uint32 committed_blocks = 13;
+  // Last committed hash (hex, if verbose).
+  optional string last_committed_hash = 14;
+}
+
+// IPC-PRIV-012: ConsensusValidators
+// Query validator list and status.
+message ConsensusValidatorsRequest {
+  // Show only active validators.
+  bool active_only = 1;
+}
+
+// Validator information.
+message ValidatorInfo {
+  // Validator ID (hex).
+  string id = 1;
+  // Validator index in the set.
+  uint32 index = 2;
+  // Public key (hex).
+  string public_key = 3;
+  // Whether validator is active (reachable).
+  bool active = 4;
+  // Last seen timestamp (RFC 3339, optional).
+  optional string last_seen = 5;
+}
+
+message ConsensusValidatorsResponse {
+  // List of validators.
+  repeated ValidatorInfo validators = 1;
+  // Total count.
+  uint32 total = 2;
+  // Active count.
+  uint32 active = 3;
+}
+
+// IPC-PRIV-013: ConsensusByzantineEvidence
+// Query detected Byzantine fault evidence.
+message ConsensusByzantineEvidenceRequest {
+  // Filter by fault type: "equivocation", "invalid_signature",
+  // "quorum_forgery", "replay", or empty for all.
+  optional string fault_type = 1;
+  // Maximum number of entries to return (max 1000).
+  uint32 limit = 2;
+}
+
+// Byzantine fault evidence entry.
+message ByzantineEvidenceEntry {
+  // Evidence ID.
+  string id = 1;
+  // Fault type.
+  string fault_type = 2;
+  // Validator ID that generated the fault.
+  string validator_id = 3;
+  // Evidence details.
+  string details = 4;
+  // Timestamp (RFC 3339).
+  string timestamp = 5;
+  // Epoch when detected.
+  uint64 epoch = 6;
+  // Round when detected.
+  uint64 round = 7;
+}
+
+message ConsensusByzantineEvidenceResponse {
+  // List of evidence entries.
+  repeated ByzantineEvidenceEntry evidence = 1;
+  // Total count.
+  uint32 total = 2;
+}
+
+// IPC-PRIV-014: ConsensusMetrics
+// Query consensus metrics summary.
+message ConsensusMetricsRequest {
+  // Time period for rate calculations (seconds).
+  uint64 period_secs = 1;
+}
+
+message ConsensusMetricsResponse {
+  // Node ID.
+  string node_id = 1;
+  // Proposals committed (total).
+  uint64 proposals_committed = 2;
+  // Proposals rejected (total).
+  uint64 proposals_rejected = 3;
+  // Proposals timed out (total).
+  uint64 proposals_timeout = 4;
+  // Leader elections (total).
+  uint64 leader_elections = 5;
+  // Anti-entropy sync events (total).
+  uint64 sync_events = 6;
+  // Anti-entropy conflicts (total).
+  uint64 conflicts = 7;
+  // Byzantine evidence count (total).
+  uint64 byzantine_evidence = 8;
+  // Finalization latency p50 (ms).
+  double latency_p50_ms = 9;
+  // Finalization latency p99 (ms).
+  double latency_p99_ms = 10;
+}
+
+// Error code for consensus queries.
+enum ConsensusErrorCode {
+  CONSENSUS_ERROR_UNSPECIFIED = 0;
+  // Consensus subsystem is not configured (single-node mode).
+  CONSENSUS_NOT_CONFIGURED = 1;
+  // Invalid parameter in request.
+  CONSENSUS_INVALID_PARAMETER = 2;
+}
+
+// Error response for consensus query endpoints.
+message ConsensusError {
+  ConsensusErrorCode code = 1;
+  string message = 2;
 }

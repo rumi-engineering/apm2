@@ -42,7 +42,10 @@ use tracing::{debug, info, warn};
 use super::credentials::PeerCredentials;
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
-    BoundedDecode, ClaimWorkRequest, ClaimWorkResponse, DecodeConfig, IssueCapabilityRequest,
+    BoundedDecode, ClaimWorkRequest, ClaimWorkResponse, ConsensusByzantineEvidenceRequest,
+    ConsensusByzantineEvidenceResponse, ConsensusErrorCode, ConsensusMetricsRequest,
+    ConsensusMetricsResponse, ConsensusStatusRequest, ConsensusStatusResponse,
+    ConsensusValidatorsRequest, ConsensusValidatorsResponse, DecodeConfig, IssueCapabilityRequest,
     IssueCapabilityResponse, ListProcessesRequest, ListProcessesResponse, PatternRejection,
     PrivilegedError, PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
     ProcessStatusResponse, ReloadProcessRequest, ReloadProcessResponse, RestartProcessRequest,
@@ -1784,6 +1787,14 @@ impl ConnectionContext {
 /// These tags are used to identify the message type before decoding,
 /// allowing the dispatcher to route to the appropriate handler.
 ///
+/// # Consensus Query Tag Range (CTR-PROTO-011)
+///
+/// Consensus query messages use tags 5-8 per RFC-0014/TCK-00345:
+/// - 5 = `ConsensusStatus`
+/// - 6 = `ConsensusValidators`
+/// - 7 = `ConsensusByzantineEvidence`
+/// - 8 = `ConsensusMetrics`
+///
 /// # HEF Tag Range (CTR-PROTO-010)
 ///
 /// HEF messages use tag range 64-79 per RFC-0018:
@@ -1796,33 +1807,42 @@ impl ConnectionContext {
 #[repr(u8)]
 pub enum PrivilegedMessageType {
     /// `ClaimWork` request (IPC-PRIV-001)
-    ClaimWork        = 1,
+    ClaimWork           = 1,
     /// `SpawnEpisode` request (IPC-PRIV-002)
-    SpawnEpisode     = 2,
+    SpawnEpisode        = 2,
     /// `IssueCapability` request (IPC-PRIV-003)
-    IssueCapability  = 3,
+    IssueCapability     = 3,
     /// Shutdown request (IPC-PRIV-004)
-    Shutdown         = 4,
+    Shutdown            = 4,
     // --- Process Management (CTR-PROTO-011, TCK-00342) ---
     /// `ListProcesses` request (IPC-PRIV-005)
-    ListProcesses    = 5,
+    ListProcesses       = 5,
     /// `ProcessStatus` request (IPC-PRIV-006)
-    ProcessStatus    = 6,
+    ProcessStatus       = 6,
     /// `StartProcess` request (IPC-PRIV-007)
-    StartProcess     = 7,
+    StartProcess        = 7,
     /// `StopProcess` request (IPC-PRIV-008)
-    StopProcess      = 8,
+    StopProcess         = 8,
     /// `RestartProcess` request (IPC-PRIV-009)
-    RestartProcess   = 9,
+    RestartProcess      = 9,
     /// `ReloadProcess` request (IPC-PRIV-010)
-    ReloadProcess    = 10,
+    ReloadProcess       = 10,
+    // --- Consensus Query Endpoints (CTR-PROTO-011, RFC-0014, TCK-00345) ---
+    /// `ConsensusStatus` request (IPC-PRIV-011)
+    ConsensusStatus     = 11,
+    /// `ConsensusValidators` request (IPC-PRIV-012)
+    ConsensusValidators = 12,
+    /// `ConsensusByzantineEvidence` request (IPC-PRIV-013)
+    ConsensusByzantineEvidence = 13,
+    /// `ConsensusMetrics` request (IPC-PRIV-014)
+    ConsensusMetrics    = 14,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
-    SubscribePulse   = 64,
+    SubscribePulse      = 64,
     /// `UnsubscribePulse` request (IPC-HEF-002)
-    UnsubscribePulse = 66,
+    UnsubscribePulse    = 66,
     /// `PulseEvent` notification (server->client, IPC-HEF-003)
-    PulseEvent       = 68,
+    PulseEvent          = 68,
 }
 
 impl PrivilegedMessageType {
@@ -1841,6 +1861,11 @@ impl PrivilegedMessageType {
             8 => Some(Self::StopProcess),
             9 => Some(Self::RestartProcess),
             10 => Some(Self::ReloadProcess),
+            // Consensus query tags (11-14)
+            11 => Some(Self::ConsensusStatus),
+            12 => Some(Self::ConsensusValidators),
+            13 => Some(Self::ConsensusByzantineEvidence),
+            14 => Some(Self::ConsensusMetrics),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -1890,6 +1915,14 @@ pub enum PrivilegedResponse {
     SubscribePulse(SubscribePulseResponse),
     /// Successful `UnsubscribePulse` response (TCK-00302).
     UnsubscribePulse(UnsubscribePulseResponse),
+    /// Successful `ConsensusStatus` response (TCK-00345).
+    ConsensusStatus(ConsensusStatusResponse),
+    /// Successful `ConsensusValidators` response (TCK-00345).
+    ConsensusValidators(ConsensusValidatorsResponse),
+    /// Successful `ConsensusByzantineEvidence` response (TCK-00345).
+    ConsensusByzantineEvidence(ConsensusByzantineEvidenceResponse),
+    /// Successful `ConsensusMetrics` response (TCK-00345).
+    ConsensusMetrics(ConsensusMetricsResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -1972,6 +2005,22 @@ impl PrivilegedResponse {
             },
             Self::UnsubscribePulse(resp) => {
                 buf.push(UNSUBSCRIBE_PULSE_RESPONSE_TAG);
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::ConsensusStatus(resp) => {
+                buf.push(PrivilegedMessageType::ConsensusStatus.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::ConsensusValidators(resp) => {
+                buf.push(PrivilegedMessageType::ConsensusValidators.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::ConsensusByzantineEvidence(resp) => {
+                buf.push(PrivilegedMessageType::ConsensusByzantineEvidence.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::ConsensusMetrics(resp) => {
+                buf.push(PrivilegedMessageType::ConsensusMetrics.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -2343,6 +2392,24 @@ pub struct PrivilegedDispatcher {
     /// process information. When `None`, handlers return stub responses
     /// (for testing without full daemon context).
     daemon_state: Option<SharedState>,
+
+    /// Node ID for consensus status reporting (TCK-00345).
+    ///
+    /// Used in consensus query responses to identify this node.
+    node_id: String,
+
+    /// Consensus subsystem state handle (TCK-00345).
+    ///
+    /// When `Some`, consensus queries return real state data.
+    /// When `None`, consensus queries return `CONSENSUS_NOT_CONFIGURED` error.
+    ///
+    /// # Future Work
+    ///
+    /// This will be wired to actual consensus state (`HotStuffState`,
+    /// `ConsensusMetrics`, etc.) when the daemon consensus integration is
+    /// complete. For now, presence/absence controls whether the subsystem
+    /// is considered "configured".
+    consensus_state: Option<()>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -2411,6 +2478,9 @@ impl PrivilegedDispatcher {
             holonic_clock,
             subscription_registry,
             daemon_state: None,
+            // TCK-00345: Consensus state not configured in test mode
+            node_id: "test-node".to_string(),
+            consensus_state: None,
         }
     }
 
@@ -2462,6 +2532,9 @@ impl PrivilegedDispatcher {
             holonic_clock,
             subscription_registry,
             daemon_state: None,
+            // TCK-00345: Consensus state not configured in test mode
+            node_id: "test-node".to_string(),
+            consensus_state: None,
         }
     }
 
@@ -2532,6 +2605,9 @@ impl PrivilegedDispatcher {
             holonic_clock: clock,
             subscription_registry,
             daemon_state: None,
+            // TCK-00345: Consensus state not configured by default
+            node_id: "node-001".to_string(),
+            consensus_state: None,
         }
     }
 
@@ -2579,6 +2655,9 @@ impl PrivilegedDispatcher {
             holonic_clock: clock,
             subscription_registry,
             daemon_state: None,
+            // TCK-00345: Consensus state not configured by default
+            node_id: "node-001".to_string(),
+            consensus_state: None,
         }
     }
 
@@ -2872,6 +2951,13 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::StopProcess => self.handle_stop_process(payload),
             PrivilegedMessageType::RestartProcess => self.handle_restart_process(payload),
             PrivilegedMessageType::ReloadProcess => self.handle_reload_process(payload),
+            // Consensus Query Endpoints (TCK-00345)
+            PrivilegedMessageType::ConsensusStatus => self.handle_consensus_status(payload),
+            PrivilegedMessageType::ConsensusValidators => self.handle_consensus_validators(payload),
+            PrivilegedMessageType::ConsensusByzantineEvidence => {
+                self.handle_consensus_byzantine_evidence(payload)
+            },
+            PrivilegedMessageType::ConsensusMetrics => self.handle_consensus_metrics(payload),
             // HEF Pulse Plane (TCK-00302): Operator subscription handlers
             PrivilegedMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             PrivilegedMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
@@ -2896,6 +2982,11 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::StopProcess => "StopProcess",
                 PrivilegedMessageType::RestartProcess => "RestartProcess",
                 PrivilegedMessageType::ReloadProcess => "ReloadProcess",
+                // Consensus Query Endpoints (TCK-00345)
+                PrivilegedMessageType::ConsensusStatus => "ConsensusStatus",
+                PrivilegedMessageType::ConsensusValidators => "ConsensusValidators",
+                PrivilegedMessageType::ConsensusByzantineEvidence => "ConsensusByzantineEvidence",
+                PrivilegedMessageType::ConsensusMetrics => "ConsensusMetrics",
                 // HEF Pulse Plane (TCK-00300)
                 PrivilegedMessageType::SubscribePulse => "SubscribePulse",
                 PrivilegedMessageType::UnsubscribePulse => "UnsubscribePulse",
@@ -4402,6 +4493,183 @@ impl PrivilegedDispatcher {
     }
 
     // ========================================================================
+    // Consensus Query Handlers (TCK-00345)
+    // ========================================================================
+
+    /// Maximum number of Byzantine evidence entries to return.
+    /// Per `consensus.rs::limits::MAX_BYZANTINE_EVIDENCE_ENTRIES`.
+    const MAX_BYZANTINE_EVIDENCE_ENTRIES: u32 = 1000;
+
+    /// Handles `ConsensusStatus` requests (IPC-PRIV-011).
+    ///
+    /// # TCK-00345: Consensus Status Query
+    ///
+    /// Returns current consensus cluster status. If the consensus subsystem
+    /// is not configured (single-node mode), returns `CONSENSUS_NOT_CONFIGURED`
+    /// error instead of mock data.
+    fn handle_consensus_status(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request = ConsensusStatusRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid ConsensusStatusRequest: {e}"),
+            })?;
+
+        debug!(
+            verbose = request.verbose,
+            "ConsensusStatus request received"
+        );
+
+        // Check if consensus subsystem is configured
+        // For now, return "not configured" since consensus state integration
+        // requires additional daemon wiring (future work)
+        if self.consensus_state.is_none() {
+            return Ok(PrivilegedResponse::Error(PrivilegedError {
+                code: ConsensusErrorCode::ConsensusNotConfigured.into(),
+                message: "consensus subsystem is not configured".to_string(),
+            }));
+        }
+
+        // TODO: Wire to actual consensus state when available
+        // For now, return a response indicating the subsystem exists but has no data
+        let response = ConsensusStatusResponse {
+            node_id: self.node_id.clone(),
+            epoch: 0,
+            round: 0,
+            leader_id: String::new(),
+            is_leader: false,
+            validator_count: 0,
+            active_validators: 0,
+            quorum_threshold: 0,
+            quorum_met: false,
+            health: "unknown".to_string(),
+            high_qc_round: if request.verbose { Some(0) } else { None },
+            locked_qc_round: None,
+            committed_blocks: if request.verbose { Some(0) } else { None },
+            last_committed_hash: None,
+        };
+
+        Ok(PrivilegedResponse::ConsensusStatus(response))
+    }
+
+    /// Handles `ConsensusValidators` requests (IPC-PRIV-012).
+    ///
+    /// # TCK-00345: Validator List Query
+    ///
+    /// Returns list of validators in the consensus cluster. If the consensus
+    /// subsystem is not configured, returns `CONSENSUS_NOT_CONFIGURED` error.
+    fn handle_consensus_validators(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request = ConsensusValidatorsRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid ConsensusValidatorsRequest: {e}"),
+            })?;
+
+        debug!(
+            active_only = request.active_only,
+            "ConsensusValidators request received"
+        );
+
+        // Check if consensus subsystem is configured
+        if self.consensus_state.is_none() {
+            return Ok(PrivilegedResponse::Error(PrivilegedError {
+                code: ConsensusErrorCode::ConsensusNotConfigured.into(),
+                message: "consensus subsystem is not configured".to_string(),
+            }));
+        }
+
+        // TODO: Wire to actual consensus state when available
+        let response = ConsensusValidatorsResponse {
+            validators: Vec::new(),
+            total: 0,
+            active: 0,
+        };
+
+        Ok(PrivilegedResponse::ConsensusValidators(response))
+    }
+
+    /// Handles `ConsensusByzantineEvidence` requests (IPC-PRIV-013).
+    ///
+    /// # TCK-00345: Byzantine Evidence Query
+    ///
+    /// Returns list of detected Byzantine fault evidence. If the consensus
+    /// subsystem is not configured, returns `CONSENSUS_NOT_CONFIGURED` error.
+    fn handle_consensus_byzantine_evidence(
+        &self,
+        payload: &[u8],
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            ConsensusByzantineEvidenceRequest::decode_bounded(payload, &self.decode_config)
+                .map_err(|e| ProtocolError::Serialization {
+                    reason: format!("invalid ConsensusByzantineEvidenceRequest: {e}"),
+                })?;
+
+        // Cap limit to prevent DoS
+        let effective_limit = request.limit.min(Self::MAX_BYZANTINE_EVIDENCE_ENTRIES);
+
+        debug!(
+            fault_type = ?request.fault_type,
+            limit = effective_limit,
+            "ConsensusByzantineEvidence request received"
+        );
+
+        // Check if consensus subsystem is configured
+        if self.consensus_state.is_none() {
+            return Ok(PrivilegedResponse::Error(PrivilegedError {
+                code: ConsensusErrorCode::ConsensusNotConfigured.into(),
+                message: "consensus subsystem is not configured".to_string(),
+            }));
+        }
+
+        // TODO: Wire to actual consensus state when available
+        let response = ConsensusByzantineEvidenceResponse {
+            evidence: Vec::new(),
+            total: 0,
+        };
+
+        Ok(PrivilegedResponse::ConsensusByzantineEvidence(response))
+    }
+
+    /// Handles `ConsensusMetrics` requests (IPC-PRIV-014).
+    ///
+    /// # TCK-00345: Consensus Metrics Query
+    ///
+    /// Returns consensus metrics summary. If the consensus subsystem
+    /// is not configured, returns `CONSENSUS_NOT_CONFIGURED` error.
+    fn handle_consensus_metrics(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request = ConsensusMetricsRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid ConsensusMetricsRequest: {e}"),
+            })?;
+
+        debug!(
+            period_secs = request.period_secs,
+            "ConsensusMetrics request received"
+        );
+
+        // Check if consensus subsystem is configured
+        if self.consensus_state.is_none() {
+            return Ok(PrivilegedResponse::Error(PrivilegedError {
+                code: ConsensusErrorCode::ConsensusNotConfigured.into(),
+                message: "consensus subsystem is not configured".to_string(),
+            }));
+        }
+
+        // TODO: Wire to actual consensus state when available
+        let response = ConsensusMetricsResponse {
+            node_id: self.node_id.clone(),
+            proposals_committed: 0,
+            proposals_rejected: 0,
+            proposals_timeout: 0,
+            leader_elections: 0,
+            sync_events: 0,
+            conflicts: 0,
+            byzantine_evidence: 0,
+            latency_p50_ms: 0.0,
+            latency_p99_ms: 0.0,
+        };
+
+        Ok(PrivilegedResponse::ConsensusMetrics(response))
+    }
+
+    // ========================================================================
     // HEF Pulse Plane Handlers (TCK-00302)
     // ========================================================================
 
@@ -4772,6 +5040,72 @@ pub fn encode_restart_process_request(request: &RestartProcessRequest) -> Bytes 
 #[must_use]
 pub fn encode_reload_process_request(request: &ReloadProcessRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::ReloadProcess.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+// ============================================================================
+// CTR-PROTO-011: Consensus Query Request Encoding (RFC-0014, TCK-00345)
+// ============================================================================
+
+/// Encodes a `ConsensusStatus` request to bytes for sending.
+///
+/// # Wire Format
+/// ```text
+/// +------+---------------------------+
+/// | 0x0B | ConsensusStatusRequest    |
+/// +------+---------------------------+
+/// ```
+#[must_use]
+pub fn encode_consensus_status_request(request: &ConsensusStatusRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ConsensusStatus.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `ConsensusValidators` request to bytes for sending.
+///
+/// # Wire Format
+/// ```text
+/// +------+------------------------------+
+/// | 0x0C | ConsensusValidatorsRequest   |
+/// +------+------------------------------+
+/// ```
+#[must_use]
+pub fn encode_consensus_validators_request(request: &ConsensusValidatorsRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ConsensusValidators.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `ConsensusByzantineEvidence` request to bytes for sending.
+///
+/// # Wire Format
+/// ```text
+/// +------+------------------------------------+
+/// | 0x0D | ConsensusByzantineEvidenceRequest  |
+/// +------+------------------------------------+
+/// ```
+#[must_use]
+pub fn encode_consensus_byzantine_evidence_request(
+    request: &ConsensusByzantineEvidenceRequest,
+) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ConsensusByzantineEvidence.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `ConsensusMetrics` request to bytes for sending.
+///
+/// # Wire Format
+/// ```text
+/// +------+---------------------------+
+/// | 0x0E | ConsensusMetricsRequest   |
+/// +------+---------------------------+
+/// ```
+#[must_use]
+pub fn encode_consensus_metrics_request(request: &ConsensusMetricsRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ConsensusMetrics.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }

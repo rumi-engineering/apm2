@@ -1235,7 +1235,7 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     let json_array_byte: u8 = b'[';
     assert_eq!(json_array_byte, 91);
 
-    // Valid privileged message types are 1-10
+    // Valid privileged message types are 1-14
     // Tags 1-4: Original privileged endpoints
     assert!(PrivilegedMessageType::from_tag(1).is_some()); // ClaimWork
     assert!(PrivilegedMessageType::from_tag(2).is_some()); // SpawnEpisode
@@ -1248,7 +1248,12 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(PrivilegedMessageType::from_tag(8).is_some()); // StopProcess
     assert!(PrivilegedMessageType::from_tag(9).is_some()); // RestartProcess
     assert!(PrivilegedMessageType::from_tag(10).is_some()); // ReloadProcess
-    assert!(PrivilegedMessageType::from_tag(11).is_none()); // Invalid (reserved for future)
+    // Tags 11-14: TCK-00345 Consensus Query
+    assert!(PrivilegedMessageType::from_tag(11).is_some()); // ConsensusStatus
+    assert!(PrivilegedMessageType::from_tag(12).is_some()); // ConsensusValidators
+    assert!(PrivilegedMessageType::from_tag(13).is_some()); // ConsensusByzantineEvidence
+    assert!(PrivilegedMessageType::from_tag(14).is_some()); // ConsensusMetrics
+    assert!(PrivilegedMessageType::from_tag(15).is_none()); // Invalid (reserved for future)
     assert!(PrivilegedMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
     assert!(PrivilegedMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
 

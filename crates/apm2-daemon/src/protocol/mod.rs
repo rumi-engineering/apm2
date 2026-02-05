@@ -162,6 +162,11 @@ pub use dispatch::{
     derive_actor_id,
     // Request encoding helpers
     encode_claim_work_request,
+    encode_consensus_byzantine_evidence_request,
+    encode_consensus_metrics_request,
+    // TCK-00345: Consensus query encoding helpers
+    encode_consensus_status_request,
+    encode_consensus_validators_request,
     encode_issue_capability_request,
     // TCK-00342: Process management encoding helpers
     encode_list_processes_request,
@@ -191,6 +196,8 @@ pub use messages::{
     BoundedDecode,
     // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
     BoundedWallInterval,
+    // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+    ByzantineEvidenceEntry,
     CanonicalBytes,
     Canonicalize,
     // CTR-PROTO-007: Privileged Endpoints (RFC-0017)
@@ -198,6 +205,16 @@ pub use messages::{
     CasRef,
     ClaimWorkRequest,
     ClaimWorkResponse,
+    ConsensusByzantineEvidenceRequest,
+    ConsensusByzantineEvidenceResponse,
+    ConsensusError,
+    ConsensusErrorCode,
+    ConsensusMetricsRequest,
+    ConsensusMetricsResponse,
+    ConsensusStatusRequest,
+    ConsensusStatusResponse,
+    ConsensusValidatorsRequest,
+    ConsensusValidatorsResponse,
     DEFAULT_MAX_MESSAGE_SIZE,
     DEFAULT_MAX_REPEATED_FIELD_COUNT,
     DecodeConfig,
@@ -256,6 +273,7 @@ pub use messages::{
     SubscribePulseResponse,
     UnsubscribePulseRequest,
     UnsubscribePulseResponse,
+    ValidatorInfo,
     WorkRole,
 };
 // CTR-PROTO-010: HEF Pulse ACL (RFC-0018, TCK-00302)
