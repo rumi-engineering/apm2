@@ -68,6 +68,7 @@
 mod aat_receipt;
 pub mod aat_reuse;
 mod aat_spec;
+mod agent_adapter_profile;
 pub mod anti_downgrade;
 mod artifact_manifest;
 mod changeset_bundle;
@@ -110,6 +111,17 @@ pub use aat_reuse::{
 pub use aat_spec::{
     AatSpec, AatSpecBuilder, AatSpecError, AatStep, AatStepBuilder, Invariant, InvariantBuilder,
     MAX_ACTION_LENGTH, MAX_INVARIANTS, MAX_STATEMENT_LENGTH, MAX_STEPS,
+};
+// Re-export agent adapter profile types (TCK-00328)
+pub use agent_adapter_profile::{
+    AGENT_ADAPTER_PROFILE_V1_SCHEMA, AdapterMode, AgentAdapterProfileError, AgentAdapterProfileV1,
+    AgentAdapterProfileV1Builder, BudgetDefaults, EvidencePolicy, HealthChecks, InputMode,
+    MAX_ARG_LENGTH, MAX_ARGS_COUNT, MAX_CAPABILITY_MAP_COUNT, MAX_CAPABILITY_MAP_KEY_LENGTH,
+    MAX_CAPABILITY_MAP_VALUE_LENGTH, MAX_COMMAND_LENGTH, MAX_CWD_LENGTH, MAX_ENV_COUNT,
+    MAX_ENV_KEY_LENGTH, MAX_ENV_VALUE_LENGTH, MAX_PERMISSION_MODE_FLAG_LENGTH,
+    MAX_PERMISSION_MODE_FLAGS_COUNT, MAX_PERMISSION_MODE_KEY_LENGTH, MAX_PERMISSION_MODE_MAP_COUNT,
+    MAX_PROFILE_ID_LENGTH, MAX_VERSION_PROBE_COMMAND_LENGTH, MAX_VERSION_PROBE_REGEX_LENGTH,
+    OutputMode, ToolBridgeConfig, VersionProbe,
 };
 // Re-export artifact manifest types
 pub use artifact_manifest::{

@@ -143,6 +143,13 @@ pub enum ReasonCode {
     ContextPackMissing,
     /// Context pack seal verification failed (TCK-00326).
     ContextPackInvalid,
+    /// Agent adapter profile is misconfigured (TCK-00328).
+    ///
+    /// This code is emitted when the agent adapter profile fails validation,
+    /// cannot be loaded from CAS, or the adapter fails to start due to
+    /// configuration issues. Per RFC-0019 Addendum, profiles must be explicitly
+    /// selected by hash; ambient defaults are forbidden.
+    AdapterMisconfigured,
 }
 
 impl std::fmt::Display for ReasonCode {
@@ -159,6 +166,7 @@ impl std::fmt::Display for ReasonCode {
             Self::MissingViewCommitment => write!(f, "MISSING_VIEW_COMMITMENT"),
             Self::ContextPackMissing => write!(f, "CONTEXT_PACK_MISSING"),
             Self::ContextPackInvalid => write!(f, "CONTEXT_PACK_INVALID"),
+            Self::AdapterMisconfigured => write!(f, "ADAPTER_MISCONFIGURED"),
         }
     }
 }
@@ -179,6 +187,7 @@ impl std::str::FromStr for ReasonCode {
             "MISSING_VIEW_COMMITMENT" => Ok(Self::MissingViewCommitment),
             "CONTEXT_PACK_MISSING" => Ok(Self::ContextPackMissing),
             "CONTEXT_PACK_INVALID" => Ok(Self::ContextPackInvalid),
+            "ADAPTER_MISCONFIGURED" => Ok(Self::AdapterMisconfigured),
             _ => Err(ReviewBlockedError::InvalidReasonCode(s.to_string())),
         }
     }
@@ -196,6 +205,7 @@ impl ReasonCode {
     /// - 9 = `MISSING_VIEW_COMMITMENT` (TCK-00325)
     /// - 10 = `CONTEXT_PACK_MISSING` (TCK-00326)
     /// - 11 = `CONTEXT_PACK_INVALID` (TCK-00326)
+    /// - 12 = `ADAPTER_MISCONFIGURED` (TCK-00328)
     #[must_use]
     pub const fn to_code(self) -> u8 {
         match self {
@@ -210,6 +220,7 @@ impl ReasonCode {
             Self::MissingViewCommitment => 9,
             Self::ContextPackMissing => 10,
             Self::ContextPackInvalid => 11,
+            Self::AdapterMisconfigured => 12,
         }
     }
 
@@ -231,6 +242,7 @@ impl ReasonCode {
             9 => Ok(Self::MissingViewCommitment),
             10 => Ok(Self::ContextPackMissing),
             11 => Ok(Self::ContextPackInvalid),
+            12 => Ok(Self::AdapterMisconfigured),
             0 => Err(ReviewBlockedError::InvalidReasonCode(
                 "UNSPECIFIED (0) is not a valid reason code".to_string(),
             )),
@@ -805,20 +817,24 @@ mod tests {
             "MISSING_VIEW_COMMITMENT".parse::<ReasonCode>().unwrap(),
             ReasonCode::MissingViewCommitment
         );
+        assert_eq!(
+            "ADAPTER_MISCONFIGURED".parse::<ReasonCode>().unwrap(),
+            ReasonCode::AdapterMisconfigured
+        );
         assert!("UNKNOWN".parse::<ReasonCode>().is_err());
     }
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        // Values 1-11 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9,
-        // TCK-00326 added 10-11)
-        for code in 1..=11u8 {
+        // Values 1-12 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9,
+        // TCK-00326 added 10-11, TCK-00328 added 12)
+        for code in 1..=12u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
         }
-        // 0 (UNSPECIFIED) and 12+ are invalid
+        // 0 (UNSPECIFIED) and 13+ are invalid
         assert!(ReasonCode::from_code(0).is_err());
-        assert!(ReasonCode::from_code(12).is_err());
+        assert!(ReasonCode::from_code(13).is_err());
     }
 
     #[test]
@@ -838,6 +854,10 @@ mod tests {
             ReasonCode::MissingViewCommitment.to_string(),
             "MISSING_VIEW_COMMITMENT"
         );
+        assert_eq!(
+            ReasonCode::AdapterMisconfigured.to_string(),
+            "ADAPTER_MISCONFIGURED"
+        );
     }
 
     #[test]
@@ -852,6 +872,9 @@ mod tests {
         assert!(!ReasonCode::ContextMiss.is_retryable());
         // MissingViewCommitment is NOT retryable - it indicates a structural issue
         assert!(!ReasonCode::MissingViewCommitment.is_retryable());
+        // AdapterMisconfigured is NOT retryable - requires operator intervention
+        // (TCK-00328)
+        assert!(!ReasonCode::AdapterMisconfigured.is_retryable());
     }
 
     #[test]
@@ -1132,6 +1155,23 @@ mod tests {
         // Context pack errors are not retryable
         assert!(!ReasonCode::ContextPackMissing.is_retryable());
         assert!(!ReasonCode::ContextPackInvalid.is_retryable());
+    }
+
+    #[test]
+    fn test_adapter_misconfigured_reason_code() {
+        // TCK-00328: Test the new adapter misconfigured reason code
+        assert_eq!(
+            "ADAPTER_MISCONFIGURED".parse::<ReasonCode>().unwrap(),
+            ReasonCode::AdapterMisconfigured
+        );
+        assert_eq!(
+            ReasonCode::AdapterMisconfigured.to_string(),
+            "ADAPTER_MISCONFIGURED"
+        );
+        // TCK-00328 reserved code 12 for AdapterMisconfigured
+        assert_eq!(ReasonCode::AdapterMisconfigured.to_code(), 12);
+        // Adapter misconfigured is NOT retryable - requires operator intervention
+        assert!(!ReasonCode::AdapterMisconfigured.is_retryable());
     }
 
     #[test]
