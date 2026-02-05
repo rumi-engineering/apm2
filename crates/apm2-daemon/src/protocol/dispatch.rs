@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime};
 
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
+use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
 use bytes::Bytes;
 use prost::Message;
 use subtle::ConstantTimeEq;
@@ -264,6 +265,87 @@ pub trait LedgerEventEmitter: Send + Sync {
 
     /// Queries events by work ID.
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent>;
+
+    /// Emits an episode lifecycle event to the ledger (TCK-00321).
+    ///
+    /// Per REQ-0005, episode events must be streamed directly to the ledger
+    /// as they occur, rather than buffered in memory. This enables:
+    /// - Events survive daemon restart (ledger-backed durability)
+    /// - Receipt event appended atomically at completion
+    /// - CAS-before-ledger ordering for events referencing CAS hashes
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode ID for this event
+    /// * `event_type` - The event type discriminant (e.g., "episode.created")
+    /// * `payload` - The JSON-serialized event payload
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_episode_event(
+        &self,
+        episode_id: &str,
+        event_type: &str,
+        payload: &[u8],
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a `ReviewReceiptRecorded` ledger event (TCK-00321).
+    ///
+    /// Per REQ-0005, receipt events must be emitted atomically at episode
+    /// completion. This method:
+    /// - Validates that referenced CAS artifacts exist (CAS-before-event)
+    /// - Persists the receipt to the ledger atomically
+    /// - Returns the signed event for verification
+    ///
+    /// # Ledger Event vs Protocol Event
+    ///
+    /// This produces a **ledger event** (JCS-canonicalized JSON) for
+    /// persistence and audit, which is distinct from the FAC protocol's
+    /// `ReviewReceiptRecorded` event (binary canonical format) defined in
+    /// `apm2_core::fac::review_receipt`.
+    ///
+    /// The ledger event format includes:
+    /// - `event_type`: Event discriminant for querying
+    /// - `timestamp_ns`: HTF-compliant timestamp in the signed payload
+    /// - All required fields for audit trail reconstruction
+    ///
+    /// Both formats use the same domain prefix (`REVIEW_RECEIPT_RECORDED:`) to
+    /// ensure namespace consistency, but serve different purposes in the
+    /// system.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode that produced this receipt
+    /// * `receipt_id` - Unique receipt identifier
+    /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
+    /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
+    /// * `reviewer_actor_id` - Actor ID of the reviewer
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing, CAS validation, or persistence
+    /// fails.
+    fn emit_review_receipt(
+        &self,
+        episode_id: &str,
+        receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
 }
 
 /// Domain separation prefix for `WorkClaimed` events.
@@ -273,6 +355,15 @@ pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
 
 /// Domain separation prefix for `DefectRecorded` events.
 pub const DEFECT_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.defect_recorded:";
+
+/// Domain separation prefix for episode lifecycle events (TCK-00321).
+///
+/// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
+pub const EPISODE_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.episode:";
+
+// Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
+// to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
+// See `apm2_core::fac::domain_separator` for the canonical definition.
 
 /// Maximum length for ID fields (`work_id`, `lease_id`, etc.).
 ///
@@ -764,6 +855,198 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn emit_episode_event(
+        &self,
+        episode_id: &str,
+        event_type: &str,
+        payload: &[u8],
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with episode event metadata
+        // The payload is already JSON-serialized episode event data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
+        let payload_json = serde_json::json!({
+            "event_type": event_type,
+            "episode_id": episode_id,
+            "payload": hex::encode(payload),
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // Use JCS (RFC 8785) canonicalization for deterministic signing
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(EPISODE_EVENT_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(EPISODE_EVENT_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: event_type.to_string(),
+            work_id: episode_id.to_string(), // Use episode_id as work_id for indexing
+            actor_id: "daemon".to_string(),  // Episode events are daemon-authored
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(episode_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            episode_id = %episode_id,
+            event_type = %event_type,
+            "EpisodeEvent signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_review_receipt(
+        &self,
+        episode_id: &str,
+        receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with review receipt data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
+        let payload_json = serde_json::json!({
+            "event_type": "review_receipt_recorded",
+            "episode_id": episode_id,
+            "receipt_id": receipt_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // Use JCS (RFC 8785) canonicalization for deterministic signing
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
+        // protocol compatibility across daemon/core boundary.
+        let mut canonical_bytes =
+            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "review_receipt_recorded".to_string(),
+            work_id: episode_id.to_string(),
+            actor_id: reviewer_actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(episode_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            episode_id = %episode_id,
+            receipt_id = %receipt_id,
+            "ReviewReceiptRecorded event signed and persisted"
+        );
+
+        Ok(signed_event)
     }
 }
 

@@ -192,6 +192,18 @@ pub enum EpisodeError {
         /// Error message.
         message: String,
     },
+
+    /// Ledger persistence failed.
+    ///
+    /// Per REQ-0005, episode events must be persisted to the ledger. Failure
+    /// to persist is a critical error (Fail-Closed).
+    #[error("ledger persistence failed for episode {id}: {message}")]
+    LedgerFailure {
+        /// Episode identifier (or "unknown").
+        id: String,
+        /// Error message.
+        message: String,
+    },
 }
 
 impl EpisodeError {
@@ -216,6 +228,7 @@ impl EpisodeError {
             Self::ClockFailure { .. } => "clock_failure",
             Self::CustodyDomainViolation { .. } => "custody_domain_violation",
             Self::ExecutionFailed { .. } => "execution_failed",
+            Self::LedgerFailure { .. } => "ledger_failure",
         }
     }
 }
@@ -281,6 +294,12 @@ mod tests {
             to: "Created",
         };
         assert_eq!(err.kind(), "invalid_transition");
+
+        let err = EpisodeError::LedgerFailure {
+            id: "ep-123".to_string(),
+            message: "disk full".to_string(),
+        };
+        assert_eq!(err.kind(), "ledger_failure");
     }
 
     #[test]

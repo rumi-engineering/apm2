@@ -17,14 +17,15 @@ use std::sync::{Arc, Mutex};
 
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
+use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
 use ed25519_dalek::Signer;
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::info;
 
 use crate::protocol::dispatch::{
-    DEFECT_RECORDED_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
-    LedgerEventError, SignedLedgerEvent, WORK_CLAIMED_DOMAIN_PREFIX, WorkClaim, WorkRegistry,
-    WorkRegistryError,
+    DEFECT_RECORDED_DOMAIN_PREFIX, EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError,
+    LeaseValidator, LedgerEventEmitter, LedgerEventError, SignedLedgerEvent,
+    WORK_CLAIMED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -453,6 +454,183 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         });
 
         rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
+    }
+
+    fn emit_episode_event(
+        &self,
+        episode_id: &str,
+        event_type: &str,
+        payload: &[u8],
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // TCK-00321: EPISODE_EVENT_DOMAIN_PREFIX imported from
+        // crate::protocol::dispatch to maintain single source of truth for
+        // domain prefixes.
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with episode event metadata
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
+        let payload_json = serde_json::json!({
+            "event_type": event_type,
+            "episode_id": episode_id,
+            "payload": hex::encode(payload),
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(EPISODE_EVENT_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(EPISODE_EVENT_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: event_type.to_string(),
+            work_id: episode_id.to_string(), // Use episode_id as work_id for indexing
+            actor_id: "daemon".to_string(),  // Episode events are daemon-authored
+            payload: payload_bytes.clone(),
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // Persist to SQLite
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns
+            ],
+        ).map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+
+        info!(
+            event_id = %event_id,
+            episode_id = %episode_id,
+            event_type = %event_type,
+            "Persisted EpisodeEvent"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_review_receipt(
+        &self,
+        episode_id: &str,
+        receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
+        // protocol compatibility across daemon/core boundary.
+        // (Previously used daemon-local prefix; now aligned with core.)
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with review receipt data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
+        let payload_json = serde_json::json!({
+            "event_type": "review_receipt_recorded",
+            "episode_id": episode_id,
+            "receipt_id": receipt_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "review_receipt_recorded".to_string(),
+            work_id: episode_id.to_string(),
+            actor_id: reviewer_actor_id.to_string(),
+            payload: payload_bytes.clone(),
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // Persist to SQLite
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns
+            ],
+        ).map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+
+        info!(
+            event_id = %event_id,
+            episode_id = %episode_id,
+            receipt_id = %receipt_id,
+            "Persisted ReviewReceiptRecorded event"
+        );
+
+        Ok(signed_event)
     }
 }
 
