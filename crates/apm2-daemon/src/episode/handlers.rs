@@ -35,6 +35,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -828,21 +829,284 @@ impl ToolHandler for WriteFileHandler {
 // ExecuteHandler
 // =============================================================================
 
+// SEC-CTRL-FAC-0016: Environment variable allowlist for sandboxed execution.
+// Only these variables are passed through to spawned processes.
+// All others are scrubbed to prevent credential/secret leakage.
+const ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+];
+
+// SEC-CTRL-FAC-0016: Environment variable patterns that are ALWAYS blocked,
+// even if they appear in a custom passthrough list.
+const ENV_BLOCKLIST_PATTERNS: &[&str] = &[
+    "API_KEY",
+    "API_SECRET",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+    "PRIVATE_KEY",
+    "AWS_SECRET",
+    "AZURE_SECRET",
+    "GCP_SECRET",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    "DOCKER_PASSWORD",
+    "SSH_PRIVATE",
+    "PGP_PRIVATE",
+    "GPG_PRIVATE",
+];
+
+// =============================================================================
+// TCK-00338: Shell Argument Escaping (SEC-CTRL-FAC-0016)
+// =============================================================================
+
+/// Characters that require shell escaping when appearing in arguments.
+/// These characters have special meaning in POSIX shells and could enable
+/// injection attacks if not properly escaped.
+const SHELL_SPECIAL_CHARS: &[char] = &[
+    ' ', '\t', '\n', '\r', // Whitespace (argument separators)
+    '"', '\'', '\\', // Quoting characters
+    '$', '`', // Variable/command expansion
+    '!', '*', '?', '[', ']', // Globbing and history
+    '(', ')', '{', '}', // Subshells and brace expansion
+    '<', '>', '|', '&', ';', // Redirection and control operators
+    '#', // Comments
+    '~', // Home directory expansion
+];
+
+/// Escapes a shell argument to prevent injection attacks.
+///
+/// # Security (TCK-00338)
+///
+/// This function ensures that arguments are properly escaped when building
+/// a command line string for allowlist matching. Without escaping, an argument
+/// containing spaces or special characters could be interpreted as multiple
+/// arguments or shell metacharacters.
+///
+/// For example, without escaping:
+/// - `["sh", "-c", "rm -rf /"]` becomes `sh -c rm -rf /`
+/// - With escaping: `sh '-c' 'rm -rf /'`
+///
+/// The escaping strategy uses single quotes for arguments containing special
+/// characters, with single quotes within the argument escaped as `'\''`.
+///
+/// # Arguments
+///
+/// * `arg` - The argument to escape
+///
+/// # Returns
+///
+/// The escaped argument suitable for shell command line representation.
+fn escape_shell_arg(arg: &str) -> String {
+    // If the argument is empty, represent it as ''
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+
+    // If the argument contains no special characters, return as-is
+    if !arg.chars().any(|c| SHELL_SPECIAL_CHARS.contains(&c)) {
+        return arg.to_string();
+    }
+
+    // Escape using single quotes, handling embedded single quotes
+    // The pattern 'arg' works for most cases, but single quotes within
+    // the argument must be escaped as '\'' (end quote, escaped quote, start quote)
+    let mut escaped = String::with_capacity(arg.len() + 2);
+    escaped.push('\'');
+    for c in arg.chars() {
+        if c == '\'' {
+            // End current quote, add escaped single quote, restart quote
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+/// Builds a shell-safe command line string for allowlist matching.
+///
+/// # Security (TCK-00338)
+///
+/// This function constructs a command line representation where each argument
+/// is properly escaped to prevent injection attacks. The resulting string
+/// accurately represents what the command would look like if it were executed
+/// in a shell.
+///
+/// # Arguments
+///
+/// * `command` - The command/executable name
+/// * `args` - The arguments to the command
+///
+/// # Returns
+///
+/// A shell-safe command line string suitable for allowlist matching.
+fn build_escaped_command_line(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        escape_shell_arg(command)
+    } else {
+        let escaped_command = escape_shell_arg(command);
+        let escaped_args: Vec<String> = args.iter().map(|a| escape_shell_arg(a)).collect();
+        format!("{} {}", escaped_command, escaped_args.join(" "))
+    }
+}
+
+/// Configuration for sandboxed command execution (TCK-00338).
+///
+/// This struct encapsulates security policies for the `ExecuteHandler`:
+/// - Shell command allowlist (fail-closed if empty)
+/// - Environment variable passthrough list
+/// - Stall detection timeout
+///
+/// # Security Model (SEC-CTRL-FAC-0016)
+///
+/// - **Fail-closed**: Empty allowlist means no commands are allowed
+/// - **Env scrubbing**: Only allowlisted env vars pass through
+/// - **Blocklist override**: Sensitive patterns are always blocked
+#[derive(Debug, Clone)]
+pub struct SandboxConfig {
+    /// Shell command patterns that are allowed.
+    /// Uses glob-style matching via `shell_pattern_matches`.
+    /// Empty means fail-closed (no commands allowed).
+    pub shell_allowlist: Vec<String>,
+
+    /// Additional environment variables to pass through beyond the defaults.
+    /// Variables matching `ENV_BLOCKLIST_PATTERNS` are still blocked.
+    pub env_passthrough: Vec<String>,
+
+    /// Stall detection timeout in milliseconds.
+    /// If a process produces no output for this duration, it's considered
+    /// stalled. Default: 60000ms (60 seconds). Set to 0 to disable.
+    pub stall_timeout_ms: u64,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            shell_allowlist: Vec::new(), // Fail-closed by default
+            env_passthrough: Vec::new(),
+            stall_timeout_ms: 60_000, // 60 second stall detection
+        }
+    }
+}
+
+impl SandboxConfig {
+    /// Creates a permissive config that allows all commands.
+    /// Use with caution - only for trusted environments.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self {
+            shell_allowlist: vec!["*".to_string()], // Allow everything
+            env_passthrough: Vec::new(),
+            stall_timeout_ms: 60_000,
+        }
+    }
+
+    /// Creates a config with a specific shell allowlist.
+    #[must_use]
+    pub fn with_shell_allowlist(allowlist: Vec<String>) -> Self {
+        Self {
+            shell_allowlist: allowlist,
+            ..Default::default()
+        }
+    }
+
+    /// Adds environment variables to the passthrough list.
+    #[must_use]
+    pub fn with_env_passthrough(mut self, vars: Vec<String>) -> Self {
+        self.env_passthrough = vars;
+        self
+    }
+
+    /// Sets the stall detection timeout.
+    #[must_use]
+    pub const fn with_stall_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.stall_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Checks if an environment variable name should be passed through.
+    ///
+    /// Returns `true` if the variable is in the passthrough list AND
+    /// does not match any blocklist patterns.
+    #[must_use]
+    pub fn should_pass_env(&self, name: &str) -> bool {
+        // Check blocklist first (case-insensitive)
+        let name_upper = name.to_uppercase();
+        for pattern in ENV_BLOCKLIST_PATTERNS {
+            if name_upper.contains(pattern) {
+                return false;
+            }
+        }
+
+        // Check if in default passthrough
+        if ENV_PASSTHROUGH.contains(&name) {
+            return true;
+        }
+
+        // Check if in custom passthrough
+        self.env_passthrough.iter().any(|v| v == name)
+    }
+
+    /// Checks if a command is allowed by the shell allowlist.
+    ///
+    /// Returns `true` if the full command line matches any pattern in the
+    /// allowlist. Returns `false` if the allowlist is empty (fail-closed).
+    #[must_use]
+    pub fn is_command_allowed(&self, command_line: &str) -> bool {
+        use super::tool_class::shell_pattern_matches;
+
+        if self.shell_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+
+        self.shell_allowlist
+            .iter()
+            .any(|pattern| shell_pattern_matches(pattern, command_line))
+    }
+}
+
 /// Real handler for command execution.
 ///
 /// This handler executes commands in a sandboxed environment (restricted to
 /// CWD/workspace), enforces timeouts, and bounds output capture.
 ///
-/// # Security
+/// # Security (TCK-00338)
 ///
+/// - **Shell Allowlist**: Commands must match patterns in
+///   `SandboxConfig::shell_allowlist`. Empty allowlist means fail-closed (no
+///   commands allowed).
+/// - **Env Scrubbing**: Environment is cleared, only allowlisted vars pass
+///   through. Sensitive patterns (`API_KEY`, `TOKEN`, etc.) are always blocked.
 /// - **Sandbox**: Commands execute in specified CWD (validated relative path),
 ///   anchored to the configured root.
 /// - **Timeout**: Enforced per-execution timeout (default 30s, max 1h).
+/// - **Stall Detection**: Processes producing no output are terminated.
 /// - **Output**: Stdout/Stderr captured up to `MAX_TOOL_OUTPUT_SIZE`.
 /// - **Input**: Stdin pipe supported with size limits.
 #[derive(Debug)]
 pub struct ExecuteHandler {
     root: PathBuf,
+    sandbox_config: SandboxConfig,
 }
 
 /// TCK-00319: Default implementation is restricted to test builds only.
@@ -853,6 +1117,8 @@ impl Default for ExecuteHandler {
     fn default() -> Self {
         Self {
             root: PathBuf::from("."),
+            // Test default uses permissive config for backwards compatibility
+            sandbox_config: SandboxConfig::permissive(),
         }
     }
 }
@@ -875,13 +1141,81 @@ impl ExecuteHandler {
     pub fn new() -> Self {
         Self {
             root: PathBuf::from("."),
+            // Deprecated constructor uses permissive config for backwards compatibility
+            sandbox_config: SandboxConfig::permissive(),
         }
     }
 
     /// Creates a new execute handler with a specific root directory.
+    ///
+    /// # Security (TCK-00338)
+    ///
+    /// This constructor uses a fail-closed sandbox config (empty allowlist).
+    /// No commands will be allowed unless you explicitly configure the sandbox
+    /// using `with_root_and_sandbox()`.
+    ///
+    /// For production use, call `with_root_and_sandbox()` with an explicit
+    /// shell allowlist. For tests that need permissive mode, use
+    /// `with_root_permissive()`.
     #[must_use]
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            // TCK-00338: Fail-closed by default (no commands allowed)
+            sandbox_config: SandboxConfig::default(),
+        }
+    }
+
+    /// Creates a new execute handler with permissive sandbox config.
+    ///
+    /// # Security Warning (TCK-00338)
+    ///
+    /// This constructor allows ALL commands to execute. Only use in:
+    /// - Tests that need backwards-compatible permissive behavior
+    /// - Trusted environments where command filtering is done elsewhere
+    ///
+    /// For production use, prefer `with_root_and_sandbox()` with an explicit
+    /// shell allowlist.
+    #[must_use]
+    pub fn with_root_permissive(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            sandbox_config: SandboxConfig::permissive(),
+        }
+    }
+
+    /// Creates a new execute handler with explicit sandbox configuration.
+    ///
+    /// # Security (TCK-00338)
+    ///
+    /// This is the recommended constructor for production use. It allows you to
+    /// specify:
+    /// - A shell allowlist (fail-closed if empty)
+    /// - Environment variable passthrough rules
+    /// - Stall detection timeout
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = SandboxConfig::with_shell_allowlist(vec![
+    ///     "cargo *".to_string(),
+    ///     "npm *".to_string(),
+    ///     "git *".to_string(),
+    /// ]);
+    /// let handler = ExecuteHandler::with_root_and_sandbox("/workspace", config);
+    /// ```
+    #[must_use]
+    pub fn with_root_and_sandbox(root: impl Into<PathBuf>, sandbox_config: SandboxConfig) -> Self {
+        Self {
+            root: root.into(),
+            sandbox_config,
+        }
+    }
+
+    /// Returns the current sandbox configuration.
+    #[must_use]
+    pub const fn sandbox_config(&self) -> &SandboxConfig {
+        &self.sandbox_config
     }
 }
 
@@ -908,8 +1242,48 @@ impl ToolHandler for ExecuteHandler {
         // Start timing execution (MAJOR 2 fix)
         let exec_start = Instant::now();
 
+        // =====================================================================
+        // TCK-00338: Shell Allowlist Validation (SEC-CTRL-FAC-0016)
+        // =====================================================================
+        // Build full command line for allowlist matching.
+        // Arguments are escaped to prevent injection attacks where special
+        // characters in arguments could be interpreted as shell metacharacters.
+        // For example, `sh -c "rm -rf /"` must be represented as `sh '-c' 'rm -rf /'`
+        // to prevent the space-separated arguments from being misinterpreted.
+        let full_command_line = build_escaped_command_line(&exec_args.command, &exec_args.args);
+
+        if !self.sandbox_config.is_command_allowed(&full_command_line) {
+            warn!(
+                command = %exec_args.command,
+                full_command = %full_command_line,
+                "command denied by shell allowlist (SEC-CTRL-FAC-0016)"
+            );
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: format!(
+                    "command '{}' not in shell allowlist (SEC-CTRL-FAC-0016)",
+                    exec_args.command
+                ),
+            });
+        }
+
         let mut cmd = tokio::process::Command::new(&exec_args.command);
         cmd.args(&exec_args.args);
+
+        // =====================================================================
+        // TCK-00338: Environment Variable Scrubbing (SEC-CTRL-FAC-0016)
+        // =====================================================================
+        // Clear all environment variables to prevent credential/secret leakage,
+        // then selectively restore only allowlisted variables.
+        cmd.env_clear();
+
+        // Restore allowlisted environment variables
+        for (key, value) in std::env::vars_os() {
+            if let Some(key_str) = key.to_str() {
+                if self.sandbox_config.should_pass_env(key_str) {
+                    cmd.env(&key, &value);
+                }
+            }
+        }
 
         // Set working directory with symlink-aware validation (TCK-00319: TOCTOU
         // mitigation) Canonicalize root for comparison
@@ -967,7 +1341,11 @@ impl ToolHandler for ExecuteHandler {
         let timeout_ms = exec_args.timeout_ms.unwrap_or(30_000);
         let timeout = Duration::from_millis(timeout_ms);
 
-        // BLOCKER 2 FIX: Manual bounded pipe reading instead of wait_with_output()
+        // TCK-00338: Stall detection timeout configuration
+        let stall_timeout_ms = self.sandbox_config.stall_timeout_ms;
+        let stall_detection_enabled = stall_timeout_ms > 0;
+
+        // Manual bounded pipe reading instead of wait_with_output()
         // This prevents OOM from processes that emit gigabytes of output before
         // timeout. We read stdout and stderr concurrently with bounded buffers.
 
@@ -988,7 +1366,24 @@ impl ToolHandler for ExecuteHandler {
         // other
         let per_stream_limit = MAX_TOOL_OUTPUT_SIZE / 2;
 
-        // Read stdout with bounded buffer
+        // TCK-00338: Shared state for stall detection - tracks last output time
+        // across both stdout and stderr readers using atomic operations.
+        // Note: truncation from u128 to u64 is safe here as millis since exec_start
+        // will never approach u64::MAX in any reasonable execution.
+        #[allow(clippy::cast_possible_truncation)]
+        let last_output_time =
+            std::sync::Arc::new(AtomicU64::new(exec_start.elapsed().as_millis() as u64));
+
+        // Helper to update last output time
+        // Note: truncation from u128 to u64 is safe - see comment above.
+        #[allow(clippy::cast_possible_truncation)]
+        let update_last_output = |last_time: &AtomicU64, start: Instant| {
+            let now_ms = start.elapsed().as_millis() as u64;
+            last_time.store(now_ms, Ordering::Release);
+        };
+
+        // Read stdout with bounded buffer and stall tracking
+        let last_output_stdout = last_output_time.clone();
         let stdout_future = async {
             let mut buf = Vec::new();
             let mut chunk = vec![0u8; 64 * 1024]; // 64KB chunks
@@ -996,6 +1391,9 @@ impl ToolHandler for ExecuteHandler {
                 match stdout.read(&mut chunk).await {
                     Ok(0) | Err(_) => break, // EOF or read error
                     Ok(n) => {
+                        // TCK-00338: Update last output time on successful read
+                        update_last_output(&last_output_stdout, exec_start);
+
                         if buf.len() + n > per_stream_limit {
                             // Take only what fits
                             let remaining = per_stream_limit.saturating_sub(buf.len());
@@ -1009,7 +1407,8 @@ impl ToolHandler for ExecuteHandler {
             (buf, false)
         };
 
-        // Read stderr with bounded buffer
+        // Read stderr with bounded buffer and stall tracking
+        let last_output_stderr = last_output_time.clone();
         let stderr_future = async {
             let mut buf = Vec::new();
             let mut chunk = vec![0u8; 64 * 1024]; // 64KB chunks
@@ -1017,6 +1416,9 @@ impl ToolHandler for ExecuteHandler {
                 match stderr.read(&mut chunk).await {
                     Ok(0) | Err(_) => break, // EOF or read error
                     Ok(n) => {
+                        // TCK-00338: Update last output time on successful read
+                        update_last_output(&last_output_stderr, exec_start);
+
                         if buf.len() + n > per_stream_limit {
                             let remaining = per_stream_limit.saturating_sub(buf.len());
                             buf.extend_from_slice(&chunk[..remaining]);
@@ -1029,21 +1431,69 @@ impl ToolHandler for ExecuteHandler {
             (buf, false)
         };
 
-        // Wait for process with bounded output reading
+        // TCK-00338: Stall detection monitor task
+        // Periodically checks if the process has produced any output recently.
+        // If no output for stall_timeout_ms, signals that the process is stalled.
+        let last_output_monitor = last_output_time.clone();
+
+        let stall_monitor = async {
+            if !stall_detection_enabled {
+                // Stall detection disabled, never signal stall
+                std::future::pending::<()>().await;
+            }
+
+            let check_interval = Duration::from_millis(1000.min(stall_timeout_ms / 2).max(100));
+
+            loop {
+                tokio::time::sleep(check_interval).await;
+
+                // Note: truncation from u128 to u64 is safe - see comment above.
+                #[allow(clippy::cast_possible_truncation)]
+                let now_ms = exec_start.elapsed().as_millis() as u64;
+                let last_ms = last_output_monitor.load(Ordering::Acquire);
+
+                if now_ms.saturating_sub(last_ms) >= stall_timeout_ms {
+                    // Process has stalled - no output for stall_timeout_ms
+                    // Return to trigger the stall detection branch in select!
+                    return;
+                }
+            }
+        };
+
+        // Wait for process with bounded output reading and stall detection
         let read_result = tokio::time::timeout(timeout, async {
-            // Run all three concurrently: stdout read, stderr read, and process wait
-            let (stdout_result, stderr_result, wait_result) =
-                tokio::join!(stdout_future, stderr_future, child.wait());
+            // Run all four concurrently: stdout read, stderr read, process wait, stall
+            // monitor
+            tokio::select! {
+                biased;
 
-            let (stdout_buf, stdout_exceeded) = stdout_result;
-            let (stderr_buf, stderr_exceeded) = stderr_result;
-            let output_exceeded = stdout_exceeded || stderr_exceeded;
+                // Stall detected - terminate early
+                () = stall_monitor => {
+                    Err(ToolHandlerError::ExecutionFailed {
+                        message: format!(
+                            "process stalled: no output for {stall_timeout_ms}ms (SEC-CTRL-FAC-0016)"
+                        ),
+                    })
+                }
 
-            match wait_result {
-                Ok(status) => Ok((stdout_buf, stderr_buf, Some(status), output_exceeded)),
-                Err(e) => Err(ToolHandlerError::ExecutionFailed {
-                    message: format!("failed to wait for process: {e}"),
-                }),
+                // Normal completion path
+                result = async {
+                    let (stdout_result, stderr_result, wait_result) =
+                        tokio::join!(stdout_future, stderr_future, child.wait());
+
+                    let (stdout_buf, stdout_exceeded) = stdout_result;
+                    let (stderr_buf, stderr_exceeded) = stderr_result;
+                    let output_exceeded = stdout_exceeded || stderr_exceeded;
+
+                    match wait_result {
+                        Ok(status) => Ok((stdout_buf, stderr_buf, Some(status), output_exceeded)),
+                        Err(e) => Err(ToolHandlerError::ExecutionFailed {
+                            message: format!("failed to wait for process: {e}"),
+                        }),
+                    }
+                } => {
+                    result
+                }
             }
         })
         .await;
@@ -2694,9 +3144,95 @@ pub fn register_handlers_with_root(
     })?;
 
     // Register all handlers with the canonical workspace root
+    // NOTE: Uses permissive sandbox config for backwards compatibility.
+    // For production use with explicit shell allowlist, use
+    // `register_handlers_with_root_and_sandbox` instead.
     executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
-    executor.register_handler(Box::new(ExecuteHandler::with_root(&canonical_root)))?;
+    // TCK-00338: This deprecated function uses permissive mode for backwards compat
+    executor.register_handler(Box::new(ExecuteHandler::with_root_permissive(
+        &canonical_root,
+    )))?;
+    executor.register_handler(Box::new(GitOperationHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
+    executor.register_handler(Box::new(ListFilesHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(SearchHandler::with_root(&canonical_root)))?;
+    Ok(())
+}
+
+/// Registers all tool handlers with an executor using a specified workspace
+/// root and explicit sandbox configuration.
+///
+/// # Security (TCK-00338)
+///
+/// This is the recommended registration function for production use. It ensures
+/// that the `ExecuteHandler` uses an explicit `SandboxConfig` rather than
+/// defaulting to `SandboxConfig::permissive()`.
+///
+/// Unlike `register_handlers_with_root`, this function:
+/// - Accepts an explicit `SandboxConfig` for the execute handler
+/// - Enables fail-closed shell allowlist enforcement
+/// - Enables stall detection timeout
+///
+/// # Arguments
+///
+/// * `executor` - The tool executor to register handlers with
+/// * `cas` - Content-addressed store for artifact operations
+/// * `workspace_root` - The root directory for file/execute operations
+/// * `sandbox_config` - Explicit sandbox configuration for the execute handler
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::path::Path;
+/// use apm2_daemon::episode::executor::ToolExecutor;
+/// use apm2_daemon::episode::handlers::{register_handlers_with_root_and_sandbox, SandboxConfig};
+///
+/// let workspace = Path::new("/var/lib/apm2/workspaces/episode-123");
+/// let config = SandboxConfig::with_shell_allowlist(vec![
+///     "cargo *".to_string(),
+///     "npm *".to_string(),
+///     "git *".to_string(),
+/// ]);
+/// let mut executor = ToolExecutor::new(tracker, cas.clone());
+/// register_handlers_with_root_and_sandbox(&mut executor, cas, workspace, config)?;
+/// ```
+pub fn register_handlers_with_root_and_sandbox(
+    executor: &mut super::executor::ToolExecutor,
+    cas: std::sync::Arc<dyn ContentAddressedStore>,
+    workspace_root: &Path,
+    sandbox_config: SandboxConfig,
+) -> Result<(), super::executor::ExecutorError> {
+    // Validate workspace root exists and can be canonicalized (fail-closed)
+    // This catches misconfiguration early rather than at first tool execution
+    if !workspace_root.exists() {
+        return Err(super::executor::ExecutorError::ExecutionFailed {
+            message: format!(
+                "workspace root does not exist: {}",
+                workspace_root.display()
+            ),
+        });
+    }
+
+    // Canonicalize early to catch symlink issues at registration time
+    let canonical_root = std::fs::canonicalize(workspace_root).map_err(|e| {
+        super::executor::ExecutorError::ExecutionFailed {
+            message: format!(
+                "failed to canonicalize workspace root '{}': {}",
+                workspace_root.display(),
+                e
+            ),
+        }
+    })?;
+
+    // Register all handlers with the canonical workspace root
+    executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
+    executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
+    // Use explicit sandbox config for ExecuteHandler (TCK-00338: fail-closed)
+    executor.register_handler(Box::new(ExecuteHandler::with_root_and_sandbox(
+        &canonical_root,
+        sandbox_config,
+    )))?;
     executor.register_handler(Box::new(GitOperationHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
     executor.register_handler(Box::new(ListFilesHandler::with_root(&canonical_root)))?;
@@ -4096,6 +4632,117 @@ mod tests {
     }
 
     // =========================================================================
+    // register_handlers_with_root_and_sandbox tests (TCK-00338)
+    // =========================================================================
+
+    #[test]
+    fn test_register_handlers_with_root_and_sandbox_validates_existence() {
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::budget::EpisodeBudget;
+        use crate::episode::budget_tracker::BudgetTracker;
+        use crate::episode::executor::ToolExecutor;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let budget = EpisodeBudget::builder().tool_calls(100).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let mut executor = ToolExecutor::new(tracker, cas.clone());
+
+        // Try to register with nonexistent workspace
+        let nonexistent = temp_dir.path().join("does_not_exist");
+        let config = SandboxConfig::default();
+        let result =
+            register_handlers_with_root_and_sandbox(&mut executor, cas, &nonexistent, config);
+
+        assert!(result.is_err(), "Should reject nonexistent workspace root");
+    }
+
+    #[test]
+    fn test_register_handlers_with_root_and_sandbox_works_with_valid_path() {
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::budget::EpisodeBudget;
+        use crate::episode::budget_tracker::BudgetTracker;
+        use crate::episode::executor::ToolExecutor;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let budget = EpisodeBudget::builder().tool_calls(100).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let mut executor = ToolExecutor::new(tracker, cas.clone());
+
+        // Register with valid workspace and explicit sandbox config
+        let config = SandboxConfig::with_shell_allowlist(vec!["echo *".to_string()]);
+        let result =
+            register_handlers_with_root_and_sandbox(&mut executor, cas, &workspace, config);
+
+        assert!(
+            result.is_ok(),
+            "Should accept valid workspace root with sandbox config: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_register_handlers_with_root_and_sandbox_uses_provided_config() {
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::budget::EpisodeBudget;
+        use crate::episode::budget_tracker::BudgetTracker;
+        use crate::episode::executor::ToolExecutor;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let budget = EpisodeBudget::builder().tool_calls(100).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let mut executor = ToolExecutor::new(tracker, cas.clone());
+
+        // Register with fail-closed config (empty allowlist)
+        let config = SandboxConfig::default(); // Fail-closed by default
+        let result =
+            register_handlers_with_root_and_sandbox(&mut executor, cas, &workspace, config);
+
+        assert!(
+            result.is_ok(),
+            "Should accept valid workspace root: {:?}",
+            result.err()
+        );
+
+        // The executor now has handlers registered with the provided config.
+        // The ExecuteHandler should have the fail-closed config (tested
+        // indirectly through the allowlist tests).
+    }
+
+    // =========================================================================
+    // Stall detection tests (TCK-00338)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_sandbox_config_stall_timeout_default() {
+        // Default config should have 60 second stall timeout
+        let config = SandboxConfig::default();
+        assert_eq!(config.stall_timeout_ms, 60_000);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_config_stall_timeout_disabled() {
+        // Should be able to disable stall detection
+        let config = SandboxConfig::default().with_stall_timeout_ms(0);
+        assert_eq!(config.stall_timeout_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_config_stall_timeout_custom() {
+        // Should be able to set custom stall timeout
+        let config = SandboxConfig::default().with_stall_timeout_ms(5_000);
+        assert_eq!(config.stall_timeout_ms, 5_000);
+    }
+
+    // =========================================================================
     // TOCTOU mitigation integration tests (TCK-00319)
     // =========================================================================
 
@@ -4176,7 +4823,8 @@ mod tests {
         let symlink = root.join("evil_cwd");
         std::os::unix::fs::symlink("/etc", &symlink).expect("create symlink");
 
-        let handler = ExecuteHandler::with_root(root);
+        // Use permissive mode for this test since we're testing TOCTOU, not allowlist
+        let handler = ExecuteHandler::with_root_permissive(root);
         let args = ToolArgs::Execute(ExecuteArgs {
             command: "ls".to_string(),
             args: vec![],
@@ -4331,5 +4979,343 @@ mod tests {
                 "Error should mention absolute: {reason}"
             );
         }
+    }
+
+    // =========================================================================
+    // TCK-00338: SandboxConfig Tests (SEC-CTRL-FAC-0016)
+    // =========================================================================
+
+    #[test]
+    fn test_sandbox_config_default_is_fail_closed() {
+        // Default config should have empty allowlist (fail-closed)
+        let config = SandboxConfig::default();
+        assert!(config.shell_allowlist.is_empty());
+        assert!(!config.is_command_allowed("echo hello"));
+        assert!(!config.is_command_allowed("ls"));
+    }
+
+    #[test]
+    fn test_sandbox_config_permissive_allows_all() {
+        let config = SandboxConfig::permissive();
+        assert!(config.is_command_allowed("echo hello"));
+        assert!(config.is_command_allowed("rm -rf /"));
+        assert!(config.is_command_allowed("any command at all"));
+    }
+
+    #[test]
+    fn test_sandbox_config_shell_allowlist_exact_match() {
+        let config = SandboxConfig::with_shell_allowlist(vec!["ls".to_string()]);
+        assert!(config.is_command_allowed("ls"));
+        assert!(!config.is_command_allowed("ls -la"));
+        assert!(!config.is_command_allowed("echo"));
+    }
+
+    #[test]
+    fn test_sandbox_config_shell_allowlist_wildcard() {
+        let config = SandboxConfig::with_shell_allowlist(vec![
+            "cargo *".to_string(),
+            "npm *".to_string(),
+            "git status".to_string(),
+        ]);
+        assert!(config.is_command_allowed("cargo build"));
+        assert!(config.is_command_allowed("cargo test --release"));
+        assert!(config.is_command_allowed("npm install"));
+        assert!(config.is_command_allowed("git status"));
+        assert!(!config.is_command_allowed("git push")); // Not in allowlist
+        assert!(!config.is_command_allowed("rm -rf /"));
+    }
+
+    // =========================================================================
+    // TCK-00338: Shell Argument Escaping Tests (SEC-CTRL-FAC-0016)
+    // =========================================================================
+
+    #[test]
+    fn test_escape_shell_arg_simple() {
+        // Simple alphanumeric args should not be escaped
+        assert_eq!(escape_shell_arg("hello"), "hello");
+        assert_eq!(escape_shell_arg("build"), "build");
+        assert_eq!(escape_shell_arg("123"), "123");
+        assert_eq!(escape_shell_arg("-la"), "-la");
+        assert_eq!(escape_shell_arg("--release"), "--release");
+    }
+
+    #[test]
+    fn test_escape_shell_arg_empty() {
+        // Empty string should be quoted
+        assert_eq!(escape_shell_arg(""), "''");
+    }
+
+    #[test]
+    fn test_escape_shell_arg_spaces() {
+        // Arguments with spaces should be quoted
+        assert_eq!(escape_shell_arg("hello world"), "'hello world'");
+        assert_eq!(escape_shell_arg("rm -rf /"), "'rm -rf /'");
+    }
+
+    #[test]
+    fn test_escape_shell_arg_single_quotes() {
+        // Single quotes within the argument should be escaped
+        assert_eq!(escape_shell_arg("it's"), "'it'\\''s'");
+        assert_eq!(escape_shell_arg("don't do that"), "'don'\\''t do that'");
+    }
+
+    #[test]
+    fn test_escape_shell_arg_shell_metacharacters() {
+        // Shell metacharacters should trigger quoting
+        assert_eq!(escape_shell_arg("$HOME"), "'$HOME'");
+        assert_eq!(escape_shell_arg("`whoami`"), "'`whoami`'");
+        assert_eq!(escape_shell_arg("a|b"), "'a|b'");
+        assert_eq!(escape_shell_arg("a;b"), "'a;b'");
+        assert_eq!(escape_shell_arg("a&b"), "'a&b'");
+        assert_eq!(escape_shell_arg("a>b"), "'a>b'");
+        assert_eq!(escape_shell_arg("a<b"), "'a<b'");
+        assert_eq!(escape_shell_arg("*.txt"), "'*.txt'");
+        assert_eq!(escape_shell_arg("a?b"), "'a?b'");
+        assert_eq!(escape_shell_arg("[abc]"), "'[abc]'");
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_no_args() {
+        // Command only - should escape if needed
+        assert_eq!(build_escaped_command_line("ls", &[]), "ls");
+        assert_eq!(
+            build_escaped_command_line("my command", &[]),
+            "'my command'"
+        );
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_simple_args() {
+        // Simple args - no escaping needed
+        let args = vec!["build".to_string()];
+        assert_eq!(build_escaped_command_line("cargo", &args), "cargo build");
+
+        let args = vec!["test".to_string(), "--release".to_string()];
+        assert_eq!(
+            build_escaped_command_line("cargo", &args),
+            "cargo test --release"
+        );
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_args_with_spaces() {
+        // Arguments containing spaces must be quoted
+        // Note: -c has no special chars, so it's not quoted
+        let args = vec!["-c".to_string(), "rm -rf /".to_string()];
+        assert_eq!(build_escaped_command_line("sh", &args), "sh -c 'rm -rf /'");
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_injection_prevention() {
+        // This is the critical security test:
+        // An attacker might try to use `sh -c "malicious; command"` as a single
+        // argument Without proper escaping, this could be interpreted
+        // differently
+        let args = vec!["-c".to_string(), "echo hello; rm -rf /".to_string()];
+        let escaped = build_escaped_command_line("sh", &args);
+        // The semicolon should be inside quotes, preventing command injection
+        // Note: -c has no special chars, so it's not quoted, but the dangerous arg is
+        assert_eq!(escaped, "sh -c 'echo hello; rm -rf /'");
+        // The key security property: "echo hello; rm -rf /" is a single quoted
+        // arg, not multiple shell commands. This prevents the allowlist
+        // from being bypassed via shell metacharacter injection.
+    }
+
+    #[test]
+    fn test_build_escaped_command_line_allows_correct_matching() {
+        // Verify that allowlist patterns work correctly with escaped commands
+        let config = SandboxConfig::with_shell_allowlist(vec![
+            "echo *".to_string(),
+            "sh -c *".to_string(), // Matches "sh -c 'anything'"
+        ]);
+
+        // Simple echo should still work
+        let echo_cmd = build_escaped_command_line("echo", &["hello".to_string()]);
+        assert!(config.is_command_allowed(&echo_cmd));
+
+        // sh -c with quoted argument should work - the allowlist sees "sh -c 'echo
+        // hello'"
+        let sh_cmd =
+            build_escaped_command_line("sh", &["-c".to_string(), "echo hello".to_string()]);
+        assert!(config.is_command_allowed(&sh_cmd));
+    }
+
+    #[test]
+    fn test_sandbox_config_env_passthrough_defaults() {
+        let config = SandboxConfig::default();
+        // Default safe vars should pass
+        assert!(config.should_pass_env("PATH"));
+        assert!(config.should_pass_env("HOME"));
+        assert!(config.should_pass_env("USER"));
+        assert!(config.should_pass_env("TERM"));
+        assert!(config.should_pass_env("LANG"));
+        assert!(config.should_pass_env("TZ"));
+        // Unknown vars should not pass
+        assert!(!config.should_pass_env("MY_CUSTOM_VAR"));
+        assert!(!config.should_pass_env("FOO"));
+    }
+
+    #[test]
+    fn test_sandbox_config_env_blocklist_patterns() {
+        let config = SandboxConfig::default();
+        // Sensitive patterns should always be blocked
+        assert!(!config.should_pass_env("API_KEY"));
+        assert!(!config.should_pass_env("MY_API_KEY"));
+        assert!(!config.should_pass_env("GITHUB_TOKEN"));
+        assert!(!config.should_pass_env("AWS_SECRET_ACCESS_KEY"));
+        assert!(!config.should_pass_env("NPM_TOKEN"));
+        assert!(!config.should_pass_env("DOCKER_PASSWORD"));
+        assert!(!config.should_pass_env("MY_SECRET_VALUE"));
+        assert!(!config.should_pass_env("AUTH_TOKEN"));
+        assert!(!config.should_pass_env("PRIVATE_KEY_PATH"));
+    }
+
+    #[test]
+    fn test_sandbox_config_custom_env_passthrough() {
+        let config = SandboxConfig::default()
+            .with_env_passthrough(vec!["MY_SAFE_VAR".to_string(), "ANOTHER_VAR".to_string()]);
+        // Custom vars should now pass
+        assert!(config.should_pass_env("MY_SAFE_VAR"));
+        assert!(config.should_pass_env("ANOTHER_VAR"));
+        // But sensitive patterns should still be blocked
+        assert!(!config.should_pass_env("MY_API_KEY"));
+    }
+
+    #[test]
+    fn test_sandbox_config_blocklist_overrides_passthrough() {
+        // Even if you add a sensitive var to passthrough, blocklist wins
+        let config = SandboxConfig::default()
+            .with_env_passthrough(vec!["API_KEY".to_string(), "MY_SECRET".to_string()]);
+        // These should still be blocked due to pattern matching
+        assert!(!config.should_pass_env("API_KEY"));
+        assert!(!config.should_pass_env("MY_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_handler_command_allowlist_blocks_disallowed() {
+        // Create handler with restrictive allowlist
+        let tmp = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::with_shell_allowlist(vec!["echo *".to_string()]);
+        let handler = ExecuteHandler::with_root_and_sandbox(tmp.path(), config);
+
+        // Try to run a command not in the allowlist
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "ls".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: Some(1000),
+        });
+
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_err());
+        if let Err(ToolHandlerError::InvalidArgs { reason }) = result {
+            assert!(
+                reason.contains("not in shell allowlist"),
+                "Error should mention allowlist: {reason}"
+            );
+        } else {
+            panic!("Expected InvalidArgs error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_handler_command_allowlist_allows_matching() {
+        // Create handler with allowlist that permits echo
+        let tmp = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::with_shell_allowlist(vec!["echo *".to_string()]);
+        let handler = ExecuteHandler::with_root_and_sandbox(tmp.path(), config);
+
+        // Run allowed command
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "echo".to_string(),
+            args: vec!["hello".to_string()],
+            cwd: None,
+            stdin: None,
+            timeout_ms: Some(1000),
+        });
+
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_ok(), "Allowed command should succeed: {result:?}");
+        let data = result.unwrap();
+        let output = String::from_utf8_lossy(&data.output);
+        assert!(output.contains("hello"), "Output should contain 'hello'");
+    }
+
+    #[tokio::test]
+    #[allow(unsafe_code)] // Required for env var manipulation in tests
+    async fn test_execute_handler_env_scrubbing() {
+        // Set a secret env var that should be scrubbed
+        // SAFETY: This is a test running in isolation
+        unsafe {
+            std::env::set_var("TEST_API_KEY_SECRET", "supersecret123");
+            std::env::set_var("TEST_SAFE_VAR", "safevalue");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config =
+            SandboxConfig::permissive().with_env_passthrough(vec!["TEST_SAFE_VAR".to_string()]);
+        let handler = ExecuteHandler::with_root_and_sandbox(tmp.path(), config);
+
+        // Run printenv to see what environment the child process sees
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "env".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: Some(5000),
+        });
+
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_ok(), "env command should succeed");
+        let data = result.unwrap();
+        let output = String::from_utf8_lossy(&data.output);
+
+        // Secret should NOT appear (blocked by pattern)
+        assert!(
+            !output.contains("supersecret123"),
+            "Secret value should be scrubbed from env"
+        );
+        assert!(
+            !output.contains("TEST_API_KEY_SECRET"),
+            "Secret key should be scrubbed from env"
+        );
+
+        // Safe var should appear (in custom passthrough)
+        assert!(
+            output.contains("TEST_SAFE_VAR") || output.contains("safevalue"),
+            "Safe var should be passed through"
+        );
+
+        // Clean up
+        // SAFETY: This is a test running in isolation
+        unsafe {
+            std::env::remove_var("TEST_API_KEY_SECRET");
+            std::env::remove_var("TEST_SAFE_VAR");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_handler_default_env_passthrough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::permissive();
+        let handler = ExecuteHandler::with_root_and_sandbox(tmp.path(), config);
+
+        // Run printenv to check PATH is passed through
+        let args = ToolArgs::Execute(ExecuteArgs {
+            command: "env".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: Some(5000),
+        });
+
+        let result = handler.execute(&args, None).await;
+        assert!(result.is_ok());
+        let data = result.unwrap();
+        let output = String::from_utf8_lossy(&data.output);
+
+        // Default safe vars should be present
+        assert!(output.contains("PATH="), "PATH should be passed through");
     }
 }
