@@ -26,7 +26,7 @@
 //!
 //! let commitment = ViewCommitmentV1::new(
 //!     "work-001",
-//!     "abc123...def456", // BLAKE3 hash of workspace state
+//!     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", // 64 hex chars
 //!     "policy-ref-001",
 //!     1_704_067_200_000_000_000, // nanoseconds since epoch
 //! );
