@@ -533,7 +533,8 @@ fn run_coordinate_inner(
 
     // Determine workspace root (default to current directory)
     let workspace_root = args.workspace_root.clone().unwrap_or_else(|| {
-        std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.to_string_lossy().to_string())
+        std::env::current_dir()
+            .map_or_else(|_| ".".to_string(), |p| p.to_string_lossy().to_string())
     });
 
     // Create budget
