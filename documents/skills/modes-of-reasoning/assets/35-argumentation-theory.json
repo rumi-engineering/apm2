@@ -1,0 +1,165 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/argumentation-theory@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 35,
+    "name": "argumentation-theory",
+    "cat": "argumentation",
+    "core": "Model reasoning as directed graph of arguments and attacks; compute accepted claims via extension semantics (grounded, preferred, stable). Unit of analysis is argument-attacks-argument, not rule-defeats-rule or thesis-meets-antithesis.",
+    "key_concepts": {
+      "argument": "〈premises, claim〉 pair; premises support claim",
+      "attack": "A attacks B iff A's claim contradicts B's premise or claim (undercutter vs rebuttal)",
+      "defense": "A defends B iff A attacks all attackers of B",
+      "extension": "maximal conflict-free set where each member is defended by the set",
+      "semantics": {
+        "grounded": "unique minimal extension built iteratively from unattacked arguments",
+        "preferred": "maximal admissible sets (may be multiple)",
+        "stable": "preferred extension that attacks all non-members",
+        "skeptical": "claim accepted iff in ALL preferred extensions",
+        "credulous": "claim accepted iff in ANY preferred extension"
+      }
+    },
+    "out": [
+      {"n": "argument_graph", "d": "nodes = arguments, edges = attacks; format: {args: [{id, premises, claim}], attacks: [[src,tgt]]}"},
+      {"n": "accepted_claims", "d": "claims in chosen extension with semantics label"},
+      {"n": "rejection_rationale", "d": "for each rejected claim: attacking argument and why defense failed"},
+      {"n": "undecided_claims", "d": "claims neither accepted nor rejected under skeptical semantics"},
+      {"n": "sensitivity_report", "d": "which attacks, if removed, would flip acceptance status"}
+    ],
+    "proc": [
+      "enumerate claims: list all propositions under dispute with unique IDs",
+      "construct arguments: for each claim, build support chain 〈P1..Pn → C〉; each premise must be grounded or another argument's claim",
+      "classify attacks: for each argument pair, determine if attack exists and type (rebuttal: attacks claim directly; undercutter: attacks inference step)",
+      "build graph: create adjacency list {arg_id: [attacked_arg_ids]}",
+      "select semantics: grounded for unique answer, preferred for alternatives, stable for complete partitions",
+      "compute extension: apply Dung-style fixed-point or labeling algorithm",
+      "label claims: IN (accepted), OUT (rejected), UNDEC (undecided)",
+      "document rationale: for each OUT claim, trace attack chain; for each IN claim, trace defense chain"
+    ],
+    "decision_steps": [
+      {"q": "Do you need a single definitive answer or multiple defensible positions?", "single": "use grounded semantics", "multiple": "use preferred semantics"},
+      {"q": "Are there cycles in the attack graph?", "yes": "grounded may leave claims undecided; consider preferred", "no": "grounded yields complete answer"},
+      {"q": "Must every claim be decided?", "yes": "use stable semantics (may not exist)", "no": "grounded or preferred acceptable"},
+      {"q": "Are premises verifiable or themselves disputed?", "verifiable": "treat as axioms", "disputed": "recursively build supporting arguments"}
+    ],
+    "check": [
+      "every claim has at least one supporting argument or is marked axiom",
+      "attack edges typed: rebuttal vs undercutter",
+      "no orphan arguments (disconnected from any claim under dispute)",
+      "extension algorithm matches stated semantics",
+      "conflict-free: no two arguments in extension attack each other",
+      "admissible: every attacked member is defended by another member",
+      "rationale traces complete for all OUT claims",
+      "sensitivity analysis run on at least 2 critical attacks"
+    ],
+    "quick_checklist": [
+      "graph drawn or serialized before computing extension?",
+      "semantics choice justified in output?",
+      "cycles identified and handled?",
+      "premise truth assessed independently of argument strength?",
+      "absent counterarguments flagged as assumption risk?"
+    ],
+    "diff": {
+      "defeasible": {
+        "boundary": "defeasible uses rule priorities to resolve conflicts; argumentation uses attack/defense graph with extension semantics",
+        "test": "if you're assigning priorities to rules, use defeasible; if you're modeling which arguments attack which, use argumentation"
+      },
+      "dialectical": {
+        "boundary": "dialectical seeks synthesis from thesis-antithesis; argumentation partitions into accepted/rejected without merging",
+        "test": "if the goal is to create a new integrated position, use dialectical; if the goal is to determine winners among fixed positions, use argumentation"
+      },
+      "rhetorical": {
+        "boundary": "rhetorical optimizes persuasion for audience; argumentation evaluates logical attack/defense regardless of audience",
+        "test": "if output is a communication strategy, use rhetorical; if output is a labeled graph of accepted/rejected claims, use argumentation"
+      },
+      "assurance-case": {
+        "boundary": "assurance-case requires traceable evidence at leaves per GSN/ISO standards; argumentation accepts premises as given or recursively argued",
+        "test": "if every leaf must cite dated evidence asset, use assurance-case; if premises can be stipulated or argued, use argumentation"
+      },
+      "legal": {
+        "boundary": "legal adds burdens of proof, jurisdiction, and institutional authority; argumentation is domain-neutral",
+        "test": "if burden allocation (who must prove what to what standard) matters, use legal; if you only need to know which arguments survive, use argumentation"
+      }
+    },
+    "confusions": [
+      {
+        "pair": ["argumentation-theory", "defeasible"],
+        "symptom": "user builds priority ordering over arguments instead of modeling attacks",
+        "resolution": "defeasible resolves by rule specificity/priority; argumentation resolves by graph-based defense relation. If no natural priority exists, argumentation is more appropriate."
+      },
+      {
+        "pair": ["argumentation-theory", "dialectical"],
+        "symptom": "user expects synthesis output but receives accept/reject partition",
+        "resolution": "argumentation partitions positions; dialectical integrates them. Chain: argumentation first to identify surviving positions, then dialectical to synthesize if needed."
+      }
+    ],
+    "fail": {
+      "mode": "debate_truth_conflation",
+      "desc": "treating dialectical victory as epistemic truth; undefended claim assumed false rather than merely undefended",
+      "signals": [
+        "accepted claim reported as 'true' rather than 'defensible given stated arguments'",
+        "rejected claim treated as proven false rather than undefended",
+        "missing counterarguments not flagged as model incompleteness",
+        "premise truth inferred from argument survival",
+        "rhetorical skill (articulation quality) confused with logical structure"
+      ],
+      "mitigations": [
+        {"m": "label outputs as 'accepted' not 'true'", "test": "output text uses 'accepted/rejected' not 'true/false'"},
+        {"m": "require premise audit", "test": "each premise has explicit truth-status annotation: verified | assumed | disputed"},
+        {"m": "flag absent counterarguments", "test": "output includes 'assumptions' section listing known argument gaps"},
+        {"m": "separate epistemic from dialectical status", "test": "two columns in output: dialectical-status (IN/OUT/UNDEC) and epistemic-status (verified/assumed/disputed)"},
+        {"m": "run sensitivity analysis", "test": "at least 2 'what-if attack removed' scenarios documented"}
+      ]
+    },
+    "use": [
+      "multi-stakeholder governance decisions with explicit pro/con structure",
+      "policy dispute resolution where positions are fixed and must be ranked",
+      "design review: enumerate objections, determine which survive scrutiny",
+      "ethics review: model arguments for/against action, compute defensible position",
+      "requirements conflict resolution: which requirements 'win' under stated constraints",
+      "ADR (architecture decision record) justification: document why alternatives were rejected"
+    ],
+    "rel": [
+      {"id": 32, "n": "defeasible", "r": "use when rule priorities are the conflict-resolution mechanism"},
+      {"id": 59, "n": "dialectical", "r": "chain after argumentation when synthesis of surviving positions is needed"},
+      {"id": 60, "n": "rhetorical", "r": "use when goal is persuasion of specific audience, not logical defense"},
+      {"id": 65, "n": "deontic", "r": "normative claims appear as argument premises; combine for ethics disputes"},
+      {"id": 36, "n": "assurance-case", "r": "use when arguments must terminate in traceable evidence assets"},
+      {"id": 71, "n": "legal", "r": "use when institutional authority, precedent, and burden of proof apply"}
+    ],
+    "ex": {
+      "sit": "Architecture decision: adopt microservices? Stakeholders present arguments; ops team is large.",
+      "graph": {
+        "args": [
+          {"id": "A1", "premises": ["microservices enable independent scaling"], "claim": "adopt"},
+          {"id": "A2", "premises": ["microservices enable team autonomy"], "claim": "adopt"},
+          {"id": "A3", "premises": ["microservices increase operational complexity"], "claim": "reject"},
+          {"id": "A4", "premises": ["large ops team can handle complexity"], "claim": "complexity is manageable"}
+        ],
+        "attacks": [
+          ["A3", "A1"],
+          ["A4", "A3"]
+        ]
+      },
+      "steps": [
+        "graph: A1, A2 support 'adopt'; A3 supports 'reject'; A4 defends A1 by attacking A3",
+        "grounded extension: {A1, A2, A4} - A3 is attacked by A4 and undefended",
+        "accepted: 'adopt' (supported by A1, A2); rejected: 'reject' (A3 defeated)",
+        "sensitivity: if A4 removed, A3 enters extension; 'adopt' becomes contested"
+      ],
+      "insight": "context (ops team size) instantiates A4; argumentation surfaces that this premise is load-bearing for the decision"
+    },
+    "micro_example": {
+      "situation": "Two-argument cycle: A attacks B, B attacks A (e.g., 'prioritize speed' vs 'prioritize quality')",
+      "grounded_result": "both UNDEC - no unattacked starting point",
+      "preferred_result": "two extensions: {A} and {B} - credulously both accepted, skeptically neither",
+      "action": "escalate to decision-maker or add third argument that breaks cycle"
+    }
+  }
+}

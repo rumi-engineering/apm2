@@ -283,7 +283,7 @@
         {
           "id": "CAC-P-PRIN-0004",
           "name": "Hermetic consumption, bounded production",
-          "statement": "ZTI applies to context consumption: no discretionary context discovery; production may use tools under explicit leases/budgets with replayable evidence."
+          "statement": "Context Discipline applies to context consumption: no discretionary context discovery; production may use tools under explicit leases/budgets with replayable evidence."
         },
         {
           "id": "CAC-P-PRIN-0005",

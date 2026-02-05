@@ -29,7 +29,7 @@
     },
     "ctx": [
       "documents/skills/rfc-council/references/create-mode.md",
-      "documents/skills/modes-of-reasoning/artifacts/selector.json"
+      "documents/skills/modes-of-reasoning/assets/selector.json"
     ],
     "lex": {
       "C1": "Create RFC v0: directory + 9 YAML files (00-09) from PRD; binds_to_prd set.",

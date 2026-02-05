@@ -1,61 +1,59 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00321"
-    title: "Episode event sink to ledger"
+    id: TCK-00321
+    title: Episode event sink to ledger
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0005"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0005.yaml#requirement"
+    - requirement_id: REQ-0005
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0005.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0005"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0005.yaml#evidence_artifact"
+    - evidence_id: EVID-0005
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0005.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
-      - "DOMAIN_KERNEL"
+    - DOMAIN_DAEMON
+    - DOMAIN_KERNEL
   dependencies:
     tickets:
-      - ticket_id: "TCK-00288"
-        reason: "EpisodeRuntime exists and emits events; this ticket makes those events durable"
-      - ticket_id: "TCK-00289"
-        reason: "SqliteLedgerEventEmitter infrastructure required for durable append"
-      - ticket_id: "TCK-00316"
-        reason: "Session viability requires durable event emission for tool/episode lifecycle signals"
-      - ticket_id: "TCK-00320"
-        reason: "Tool lifecycle events should include CAS hashes (result_hash) when streamed to ledger"
+    - ticket_id: TCK-00316
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
+    - ticket_id: TCK-00320
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Replace EpisodeRuntime in-memory event buffering with a ledger-backed event sink"
-      - "Stream episode lifecycle and tool lifecycle events as they occur (HEF-ready)"
-      - "Ensure CAS-before-ledger ordering for any event referencing a CAS hash"
-      - "Ensure receipt emission occurs atomically at episode completion (final commit after CAS artifacts stored)"
-      - "Add tests proving events survive daemon restart and ordering invariants hold"
+    - Episode event sink appends to ledger
+    - Atomic receipt emission at completion
+    - CAS-before-event ordering
     out_of_scope:
-      - "Projection worker wiring (TCK-00322)"
-      - "ToolExecutionReceipt + ToolLogIndexV1 generation (TCK-00327)"
+    - Tool log capture (TCK-00320)
   plan:
     steps:
-      - "Audit EpisodeRuntime::emit_event and drain_events usage (crates/apm2-daemon/src/episode/runtime.rs)"
-      - "Define an EpisodeEventSink interface that can be backed by LedgerEventEmitter"
-      - "Inject the sink into EpisodeRuntime construction (state.rs wiring) and remove production reliance on drain_events"
-      - "Map EpisodeEvent variants to canonical kernel events and append to ledger with HTF time envelopes"
-      - "Enforce CAS-before-ledger ordering at the call sites that produce CAS artifacts (tool results, receipts)"
-      - "Add integration test: run episode, restart daemon, verify ledger contains the streamed events in correct order"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Episode event sink appends to ledger'
+    - 'Implement: Atomic receipt emission at completion'
+    - 'Implement: CAS-before-event ordering'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0005"
+    - EVID-0005
     criteria:
-      - "Episode lifecycle + tool lifecycle events are persisted to ledger as they occur."
-      - "Receipt is emitted after all referenced CAS artifacts exist (CAS-before-ledger)."
-      - "Event stream survives daemon restart and is queryable from the ledger."
+    - Episode events persisted to ledger as they occur
+    - Receipt emitted atomically at completion
+    - Events survive daemon restart
   notes:
-    security: "Durability is part of the security boundary: no 'successful' episodes without durable truth-plane events."
-    verification: "Include negative tests for missing ledger; behavior must fail closed (blocked/terminated), not best-effort."
-    general: "Required for reducer-driven automation (projection worker, audit, and HEF pulses)."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

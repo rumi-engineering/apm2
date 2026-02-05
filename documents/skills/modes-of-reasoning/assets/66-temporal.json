@@ -1,0 +1,182 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/temporal@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 66,
+    "name": "temporal",
+    "cat": "formal",
+    "core": "Reason about ordering, duration, persistence, and change over time using temporal logic operators (always, eventually, until, since) and interval relations (before, meets, overlaps, during, starts, finishes, equals). Model when events occur, how long states persist, and what triggers state transitions. Central challenge: the frame problem—specifying what stays true across time without exhaustive enumeration.",
+    "key_concepts": {
+      "instant_vs_interval": "instant is dimensionless time point; interval has duration with start/end bounds",
+      "allen_relations": "13 mutually exclusive interval relations: before, after, meets, met-by, overlaps, overlapped-by, during, contains, starts, started-by, finishes, finished-by, equals",
+      "temporal_operators": "G (always), F (eventually), X (next), U (until), S (since), P (past), H (historically)",
+      "frame_problem": "how to specify what persists unchanged without listing every non-affected proposition",
+      "persistence_frame": "default assumption that properties hold until explicitly changed by an action or event"
+    },
+    "out": [
+      {"type": "temporal_constraints", "form": "Allen interval relations or point-ordering assertions", "test": "constraint graph has no negative cycles; path consistency satisfied"},
+      {"type": "timeline", "form": "ordered sequence of (timestamp, event, state-changes) tuples", "test": "all events placed; no ordering contradictions; gaps explained"},
+      {"type": "persistence_frame", "form": "table: [property, holds_from, invalidated_by, current_status]", "test": "every property has explicit invalidation trigger or 'never invalidated' marker"},
+      {"type": "state_transition_log", "form": "sequence of (trigger_event, preconditions, state_before, state_after, timestamp)", "test": "every transition has identified trigger; preconditions were satisfied at trigger time"},
+      {"type": "temporal_query_result", "form": "answer to 'did P hold at t?' or 'when did P become true?' with justification", "test": "answer traceable to timeline and persistence frame"}
+    ],
+    "proc": [
+      "1. ENTITIES: enumerate temporal entities—distinguish instants (points) from intervals (durations); name each event and state",
+      "2. ORDERING: establish Allen interval relations or point orderings; use constraint propagation to derive implied relations",
+      "3. PERSISTENCE FRAME: for each property, declare (a) when it starts holding, (b) what events invalidate it, (c) default status if unknown",
+      "4. TRANSITIONS: for each state change, specify trigger event, preconditions, and resulting state; verify preconditions held at trigger time",
+      "5. CONSISTENCY CHECK: verify no circular orderings (A before B before A); run path-consistency on constraint graph",
+      "6. GAP ANALYSIS: identify unobserved intervals; mark as {unknown, assumed-stable, interpolated} with justification",
+      "7. QUERY RESOLUTION: to answer 'did P hold at t?', trace from last known state through transitions and persistence assumptions"
+    ],
+    "quick_check": [
+      "Every event has timestamp or ordering relation (no floating events)",
+      "Every property in persistence frame has explicit invalidation trigger",
+      "Constraint graph checked for cycles and path-consistency",
+      "Unobserved intervals explicitly marked, not silently assumed stable",
+      "Temporal query answers cite timeline + persistence frame evidence"
+    ],
+    "check": [
+      "all events have relative or absolute time placement",
+      "persistence assumptions are explicit not implicit",
+      "invalidation triggers specified for each persistent property",
+      "Allen relations or point orderings form consistent constraint graph",
+      "no circular temporal dependencies (A before B before A)",
+      "duration estimates have stated precision and uncertainty bounds",
+      "timeline accounts for all known events; gaps marked as gaps",
+      "state transitions have identified trigger events with satisfied preconditions"
+    ],
+    "diff": {
+      "modal": {
+        "temporal": "reasons about when propositions hold using time-indexed operators (always, eventually, until)",
+        "modal": "reasons about possibility/necessity across possible worlds without time structure",
+        "test": "if operators are G/F/U/S (time-indexed), use temporal; if operators are box/diamond (world-indexed), use modal"
+      },
+      "planning-policy": {
+        "temporal": "provides time logic—ordering constraints, durations, persistence rules",
+        "planning": "produces action sequences that satisfy temporal constraints to achieve goals",
+        "test": "temporal says 'A must finish before B starts'; planning says 'schedule A at t1, B at t2'"
+      },
+      "historical-investigative": {
+        "temporal": "formal framework for representing and querying time-indexed facts",
+        "historical": "reconstructs what happened from incomplete evidence, assessing source credibility",
+        "test": "temporal enforces consistency; historical triangulates uncertain evidence"
+      },
+      "counterfactual": {
+        "temporal": "represents what did happen and when; queries actual timeline",
+        "counterfactual": "represents what would have happened under hypothetical intervention",
+        "test": "if asking 'when did X occur?', use temporal; if asking 'what if X had been different?', use counterfactual"
+      },
+      "non-monotonic": {
+        "temporal": "persistence frame is mechanism for temporal default reasoning (frame axioms)",
+        "non-monotonic": "general framework for defeasible defaults with exception handling",
+        "test": "temporal handles time-indexed persistence; non-monotonic handles general 'normally X' defaults"
+      },
+      "narrative-causal-storytelling": {
+        "temporal": "formal constraints on event ordering; detects timeline inconsistencies",
+        "narrative": "constructs coherent causal story; may sacrifice strict chronology for explanatory flow",
+        "test": "temporal rejects out-of-order events; narrative may present flashbacks"
+      }
+    },
+    "confusions": [
+      {
+        "trap": "confusing temporal consistency with causal sufficiency",
+        "symptom": "concluding 'X caused Y' because X preceded Y in timeline",
+        "correction": "temporal establishes ordering, not causation. 'A before B' means A could have caused B, not that it did. For causation, use causal-inference (#37) or counterfactual (#39)."
+      },
+      {
+        "trap": "treating persistence as certainty",
+        "symptom": "concluding 'X still holds at t2' because X held at t1 and no invalidation observed",
+        "correction": "persistence is a default assumption, not a proof. Mark as 'assumed to hold' vs 'known to hold'. If observation gap exists, state confidence explicitly. For reasoning under uncertainty, combine with non-monotonic (#30)."
+      },
+      {
+        "trap": "conflating timeline with narrative",
+        "symptom": "accepting out-of-order presentation as valid temporal representation",
+        "correction": "narrative may use flashbacks for explanatory effect; temporal representation must be chronologically consistent. Separate presentation order from logical order."
+      }
+    ],
+    "fail": {
+      "mode": "hidden_persistence_assumptions",
+      "desc": "assuming states persist without explicit frame; silent gap interpolation; unstated invalidation conditions",
+      "signals": [
+        "conclusions rely on 'still true' without stating when last verified",
+        "no invalidation triggers defined for persistent properties",
+        "observation gaps treated as stability rather than uncertainty",
+        "timeline jumps without marking unobserved intervals",
+        "temporal queries answered without citing persistence frame"
+      ],
+      "mitigations": [
+        {
+          "id": "M1-explicit-persistence-frame",
+          "trigger": "before any 'X holds at t' conclusion",
+          "action": "create persistence_frame table with columns [property, holds_from, invalidated_by, last_verified, status]",
+          "test": "persistence_frame.rows.every(r => r.invalidated_by !== null || r.invalidated_by === 'never')"
+        },
+        {
+          "id": "M2-gap-marking",
+          "trigger": "observation gap > threshold (e.g., 2x normal sampling interval)",
+          "action": "mark interval as 'unobserved'; state assumption (stable, unknown, interpolated) with confidence",
+          "test": "timeline.gaps.every(g => g.assumption !== undefined && g.confidence !== undefined)"
+        },
+        {
+          "id": "M3-known-vs-assumed",
+          "trigger": "answering temporal query",
+          "action": "distinguish 'known to hold (direct observation at t)' from 'assumed to hold (last observation at t-delta)'",
+          "test": "query_result.evidence_type in ['direct_observation', 'persistence_assumption', 'interpolation']"
+        },
+        {
+          "id": "M4-path-consistency-check",
+          "trigger": "after adding new temporal constraint",
+          "action": "run path-consistency algorithm on constraint graph; report any inconsistencies",
+          "test": "constraint_graph.is_path_consistent === true"
+        },
+        {
+          "id": "M5-precondition-verification",
+          "trigger": "before recording state transition",
+          "action": "verify transition preconditions held at trigger time by querying timeline",
+          "test": "transition.preconditions.every(p => timeline.query(p, transition.timestamp) === true)"
+        }
+      ]
+    },
+    "use": [
+      "scheduling and resource allocation with temporal constraints",
+      "workflow design with ordering dependencies and deadlines",
+      "forensic timeline reconstruction from logs and evidence",
+      "narrative consistency checking (did events happen in claimed order?)",
+      "state management in event-sourced systems",
+      "protocol verification (message ordering, happens-before relations)",
+      "database temporal queries (valid-time, transaction-time)"
+    ],
+    "rel": [
+      {"id": 64, "name": "modal", "why": "temporal logic is modal logic specialized for time; shares possible-worlds semantics"},
+      {"id": 47, "name": "planning-policy", "why": "planning consumes temporal constraints to produce action sequences"},
+      {"id": 73, "name": "historical-investigative", "why": "historical uses temporal framework for evidence-based timeline reconstruction"},
+      {"id": 39, "name": "counterfactual", "why": "counterfactual asks 'what if timeline had been different'; temporal provides the baseline timeline"},
+      {"id": 30, "name": "non-monotonic", "why": "persistence frame is temporal default reasoning; subject to non-monotonic revision"},
+      {"id": 62, "name": "narrative-causal-storytelling", "why": "narrative may violate strict chronology; temporal enforces it"}
+    ],
+    "ex": {
+      "ctx": "Security audit: Events: A(login 9:00), B(file-access 9:15), C(logout 9:10). Query: could B have occurred under claimed account?",
+      "persistence_frame": [
+        {"property": "session_active", "holds_from": "A(9:00)", "invalidated_by": "C(logout)", "status": "invalidated at 9:10"}
+      ],
+      "constraint_analysis": "A before C (9:00 < 9:10). B at 9:15 is after C. Session_active holds [9:00, 9:10]. B requires session_active. B at 9:15: session_active was invalidated at 9:10.",
+      "conclusion": "B cannot have occurred under this session. Either B timestamp is wrong, B used different session, or logout timestamp is wrong.",
+      "evidence_type": "persistence_assumption (session_active inferred from A until C)"
+    },
+    "micro_ex": {
+      "sit": "Build system: task A takes 10min, task B takes 5min, B depends on A's output. Query: earliest B can complete?",
+      "entities": "A: interval [t0, t0+10min]; B: interval [?, ?+5min]",
+      "constraint": "A.end meets B.start (B starts when A finishes)",
+      "derivation": "B.start = A.end = t0+10min; B.end = B.start + 5min = t0+15min",
+      "answer": "earliest B completion: t0+15min",
+      "persistence_frame": "A.output holds_from A.end, invalidated_by never (immutable asset)"
+    }
+  }
+}

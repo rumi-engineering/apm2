@@ -1,0 +1,111 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/deductive-reasoning@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 1,
+    "name": "deductive-reasoning",
+    "cat": "formal",
+    "core": "If premises are true and inference rules valid, the conclusion must be true; makes explicit what is implicit in premises. Monotonic: adding premises never retracts conclusions.",
+    "out": [
+      "valid entailments with explicit inference chain",
+      "proofs/derivations (natural deduction, sequent, tableaux)",
+      "contradictions surfaced via refutation or reductio",
+      "explicit list of premises used (traceability asset)"
+    ],
+    "proc": [
+      "1. COLLECT: enumerate all premises; tag each as {axiom | assumption | derived}",
+      "2. FORMALIZE: translate natural-language claims into logical form; flag ambiguity",
+      "3. SELECT RULES: choose inference rules (modus ponens, modus tollens, disjunctive syllogism, etc.)",
+      "4. DERIVE: apply rules step-by-step; record each inference in proof trace",
+      "5. VALIDATE: check no undischarged assumptions remain; confirm conclusion follows",
+      "6. REFUTE-CHECK: attempt reductio or countermodel search to stress-test validity"
+    ],
+    "check": [
+      "each premise tagged with source and verification status?",
+      "all inference steps use named, valid rules?",
+      "hidden premises (enthymemes) surfaced and justified?",
+      "no fallacies of affirming consequent or denying antecedent?",
+      "proof trace reproducible by independent reviewer?"
+    ],
+    "diff": {
+      "vs_mathematical-proof-theoretic": "deductive is broader (any valid logic); mathematical adds proof objects, induction schemas, and construction requirements",
+      "vs_constraint-satisfiability": "deductive derives new truths; constraint finds assignments satisfying fixed clauses without generating entailments",
+      "vs_abductive": "deductive guarantees conclusion if premises true; abduction infers best explanation from incomplete evidence—ampliative, not truth-preserving",
+      "vs_non-monotonic": "deductive is monotonic (new premises never retract); non-monotonic allows defaults that new info can defeat"
+    },
+    "confusions": [
+      {
+        "pair": ["deductive-reasoning", "mathematical-proof-theoretic"],
+        "symptom": "treating informal validity check as rigorous proof",
+        "resolution": "if you need a proof object or induction schema, escalate to mode #2"
+      },
+      {
+        "pair": ["deductive-reasoning", "abductive"],
+        "symptom": "claiming 'best explanation' is 'proven'",
+        "resolution": "abduction generates hypotheses; deduction tests them—chain modes, don't conflate"
+      }
+    ],
+    "fail": {
+      "mode": "garbage-in",
+      "desc": "false or missing premises yield unreliable conclusions despite valid argument structure"
+    },
+    "mitigations": [
+      {
+        "id": "M1-premise-audit",
+        "trigger": "before deriving conclusions",
+        "action": "list every premise; for each, record evidence source and confidence level; reject derivation if any premise is unverified"
+      },
+      {
+        "id": "M2-enthymeme-surface",
+        "trigger": "argument feels too short",
+        "action": "ask 'what unstated assumption bridges this gap?'; make implicit premises explicit and verify separately"
+      },
+      {
+        "id": "M3-countermodel-probe",
+        "trigger": "after deriving conclusion",
+        "action": "construct scenario where premises hold but conclusion fails; if found, argument is invalid; if none after systematic search, confidence rises"
+      },
+      {
+        "id": "M4-domain-boundary",
+        "trigger": "applying deduction to empirical claims",
+        "action": "flag that empirical premises require inductive/abductive support; deduction alone cannot establish them"
+      }
+    ],
+    "use": [
+      "spec checking: does requirement R entail behavior B?",
+      "compliance logic: do policy clauses collectively permit action A?",
+      "must/shall implications: derive obligations from normative premises",
+      "formal arguments: construct airtight reasoning chains for audits",
+      "requirements verification: trace system properties back to axioms"
+    ],
+    "rel": [
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "escalate when proof objects or induction needed"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "use when problem is 'find assignment' not 'derive truth'"},
+      {"id": 7, "name": "type-theoretic", "link": "use when proofs are programs (Curry-Howard)"},
+      {"id": 8, "name": "counterexample-guided", "link": "combine for refutation-based validation"},
+      {"id": 13, "name": "abductive", "link": "pair: abduction hypothesizes, deduction tests"}
+    ],
+    "ex": {
+      "scenario": "verifying a requirement implies a system behavior",
+      "approach": "formalize premises, apply modus ponens to derive entailed conclusion"
+    },
+    "micro_example": {
+      "premises": [
+        "P1: All API calls must be authenticated (policy axiom)",
+        "P2: Request R lacks valid token (observation)",
+        "P3: A call is authenticated iff it has valid token (definition)"
+      ],
+      "inference": [
+        "From P3: R is not authenticated (modus tollens on P2)",
+        "From P1 + not-authenticated: R must be rejected (modus ponens)"
+      ],
+      "asset": "Proof trace: [P1, P2, P3] ⊢ reject(R); reviewable, monotonic"
+    }
+  }
+}

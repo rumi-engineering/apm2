@@ -1,59 +1,57 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00317"
-    title: "Reviewer capability manifest (real allowlist)"
+    id: TCK-00317
+    title: Reviewer capability manifest (real allowlist)
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0002"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0002.yaml#requirement"
+    - requirement_id: REQ-0002
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0002.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0002"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0002.yaml#evidence_artifact"
+    - evidence_id: EVID-0002
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0002.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
-      - "DOMAIN_SECURITY"
+    - DOMAIN_DAEMON
+    - DOMAIN_SECURITY
   dependencies:
     tickets:
-      - ticket_id: "TCK-00292"
-        reason: "Capability manifest core types/validation exist; this ticket supplies real reviewer v0 content"
-      - ticket_id: "TCK-00293"
-        reason: "CAS required to store manifests by content hash"
-      - ticket_id: "TCK-00316"
-        reason: "Session tool execution must be kernel-side for manifests to be meaningful"
+    - ticket_id: TCK-00316
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Define reviewer v0 capability manifest content (tool classes + risk tiers + CAS hash allowlist)"
-      - "Store reviewer manifest bytes as a CAS artifact and reference it by hash"
-      - "Ensure policy resolution returns the reviewer manifest hash (no empty allowlist stubs)"
-      - "Ensure SpawnEpisode loads the manifest by hash and registers it for the session/broker"
-      - "Add tests proving reviewer v0 tools are allowed and non-allowlisted tools are denied"
+    - Define reviewer v0 capability manifest schema
+    - Store manifest in CAS
+    - SpawnEpisode loads manifest by hash
     out_of_scope:
-      - "Implementor v0 manifest and higher-risk tool surfaces (future)"
-      - "Dynamic capability updates during an episode"
+    - Implementor capability manifest (future)
   plan:
     steps:
-      - "Define the reviewer v0 tool surface (Git read-only, ArtifactFetch, ListFiles, Search, optional ReadFile) and required risk tiers"
-      - "Implement canonical manifest serialization for CAS storage and compute/verify hash"
-      - "Update policy resolution (StubPolicyResolver + future GovernancePolicyResolver contract) to return the stored manifest hash"
-      - "Update SpawnEpisode/ClaimWork flow to load the manifest from CAS by hash and register it for the session"
-      - "Add unit tests for manifest allowlist enforcement and fail-closed behavior on missing manifests"
-      - "Add integration test that a spawned reviewer session can request allowed tools and is denied for disallowed tool classes"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Define reviewer v0 capability manifest schema'
+    - 'Implement: Store manifest in CAS'
+    - 'Implement: SpawnEpisode loads manifest by hash'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0002"
+    - EVID-0002
     criteria:
-      - "Reviewer v0 manifest is stored in CAS and referenced by hash."
-      - "SpawnEpisode registers a non-empty reviewer v0 allowlist (no stubs)."
-      - "Allowed tool classes succeed and non-allowlisted tools are denied deterministically."
+    - 'Reviewer manifest allows: GitOperation (read), ArtifactFetch, ListFiles, Search'
+    - Manifest stored in CAS with content hash
+    - SpawnEpisode resolves manifest from policy
   notes:
-    security: "OCAP-only; default deny; manifests are hash-addressed and verified on load."
-    verification: "Tests must include both allow and deny cases; missing manifest hash must fail closed."
-    general: "This ticket removes the empty-allowlist blocker that prevents FAC v0 episodes from progressing."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

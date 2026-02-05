@@ -1,52 +1,58 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00324"
-    title: "xtask cutover stage 1"
+    id: TCK-00324
+    title: xtask cutover stage 1
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0007"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0007.yaml#requirement"
+    - requirement_id: REQ-0007
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0007.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0007"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0007.yaml#evidence_artifact"
+    - evidence_id: EVID-0007
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0007.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
+    - DOMAIN_DAEMON
   dependencies:
     tickets:
-      - ticket_id: "TCK-00322"
-        reason: "Projection worker must exist for xtask to default to the projection path"
-      - ticket_id: "TCK-00323"
-        reason: "Projection receipts/events provide auditability for external writes"
+    - ticket_id: TCK-00322
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
+    - ticket_id: TCK-00323
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Add --emit-receipt-only mode to xtask (no direct GitHub writes)"
-      - "Require explicit --allow-github-write flag for any direct write path"
-      - "Default xtask path triggers ingestion + waits for projection completion"
-      - "Ensure all writes are attributable via durable projection receipts"
+    - Add --emit-receipt-only mode to xtask
+    - Require --allow-github-write for direct writes
+    - xtask triggers ingestion + waits for projection
     out_of_scope:
-      - "Full xtask deprecation (future stages)"
+    - Full xtask deprecation (future stages)
   plan:
     steps:
-      - "Add CLI flags and enforce default-deny for GitHub write permissions"
-      - "Implement emit-receipt-only path: ingest changeset, request review episode, and wait for receipt+projection"
-      - "Retain legacy direct-write path behind explicit flag for staged migration"
-      - "Add tests for flag gating and audit attribution (write path must record receipts)"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Add --emit-receipt-only mode to xtask'
+    - 'Implement: Require --allow-github-write for direct writes'
+    - 'Implement: xtask triggers ingestion + waits for projection'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0007"
+    - EVID-0007
     criteria:
-      - "xtask has --emit-receipt-only mode."
-      - "Direct writes require explicit --allow-github-write flag."
-      - "Default path uses projection worker and produces durable projection receipts."
+    - xtask has --emit-receipt-only mode
+    - Direct writes require explicit flag
+    - Default path uses projection worker
   notes:
-    security: "xtask is progressively demoted; default behavior must not grant external write authority."
-    verification: "Verify flag gating and ensure writes are recorded as receipts before/after projection."
-    general: "Stage 1 preserves backwards compatibility while shifting authority to daemon reducers."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

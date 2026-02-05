@@ -1,51 +1,59 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00323"
-    title: "ProjectionReceiptRecorded kernel event"
+    id: TCK-00323
+    title: ProjectionReceiptRecorded kernel event
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0006"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0006.yaml#requirement"
+    - requirement_id: REQ-0006
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0006.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0006"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+    - evidence_id: EVID-0006
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0006.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_KERNEL"
-      - "DOMAIN_PROJECTION"
+    - DOMAIN_KERNEL
+    - DOMAIN_PROJECTION
   dependencies:
     tickets:
-      - ticket_id: "TCK-00322"
-        reason: "Projection receipts must exist before anchoring them in the ledger"
+    - ticket_id: TCK-00322
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Define ProjectionReceiptRecorded event schema in proto/kernel_events.proto"
-      - "Define canonicalization rules + topic derivation for projection receipts"
-      - "Anchor durable projection receipts in CAS and reference by hash in the event"
-      - "Ensure idempotency via receipt lookup keyed by (work_id, review_receipt_hash) or equivalent"
+    - Define ProjectionReceiptRecorded event schema
+    - Canonicalization + topic derivation
+    - Durable projection receipts in CAS
+    - Idempotency via receipt lookup
     out_of_scope:
-      - "Tamper detection beyond basic receipt anchoring (optional future)"
+    - Tamper detection (optional v0.1)
   plan:
     steps:
-      - "Add ProjectionReceiptRecorded message to proto/kernel_events.proto with minimal required fields (work_id, review_receipt_hash, projection_receipt_hash, time_envelope_ref)"
-      - "Update codegen + reducer/topic derivation to handle the new event"
-      - "Update projection worker to emit ProjectionReceiptRecorded after successful external write and CAS receipt storage"
-      - "Add tests verifying ProjectionReceiptRecorded ordering and idempotency behavior on replay"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Define ProjectionReceiptRecorded event schema'
+    - 'Implement: Canonicalization + topic derivation'
+    - 'Implement: Durable projection receipts in CAS'
+    - 'Implement: Idempotency via receipt lookup'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0006"
+    - EVID-0006
     criteria:
-      - "ProjectionReceiptRecorded event exists and is emitted after GitHub write + CAS receipt storage."
-      - "Projection receipts are resolvable in CAS from the event."
-      - "Idempotency prevents duplicate projection events/writes for the same input receipt."
+    - ProjectionReceiptRecorded event defined
+    - Projection receipts stored in CAS
+    - Idempotency prevents duplicate projections
   notes:
-    security: "Anchoring projections in the ledger strengthens audit and replay; do not emit event unless CAS receipt exists."
-    verification: "Replay tests must show no duplication and consistent event ordering."
-    general: "Recommended for strong idempotency and audit; keeps projection truth internal."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

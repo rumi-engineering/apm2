@@ -120,31 +120,31 @@ rfc_meta:
     laws:
       - id: LAW-01
         name: "Receipt-Backed Gate for Authoritative Promotion"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_01.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-02
         name: "ZTI-Configured Context Supply"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_02.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-03
         name: "Monotone Ledger vs. Overwritable Projection"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_03.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-04
         name: "Stochastic Stability Contracts"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_04.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-05
         name: "OCAP and Capability Scoping"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_05.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-10
         name: "Anti-Entropy & Merge Semantics"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_10.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-12
         name: "Termination Guarantees"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_12.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-15
         name: "Measurement Integrity"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_15.md"
+        ref: "documents/theory/laws.json"
     related_documents:
       glossary: "documents/skills/glossary/SKILL.md"
-      laws: "documents/skills/laws-of-holonic-agent-systems/SKILL.md"
+      laws: "documents/theory/AGENTS.md"
       work_substrate: "documents/prds/PRD-0004/"
       cac_substrate: "documents/prds/PRD-0007/"
   implementation:

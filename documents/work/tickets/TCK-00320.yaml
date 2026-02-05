@@ -1,55 +1,58 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00320"
-    title: "Tool result hash propagation (executor -> events -> artifacts)"
+    id: TCK-00320
+    title: Tool result hash propagation (executor -> events -> artifacts)
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0004"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0004.yaml#requirement"
+    - requirement_id: REQ-0004
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0004.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0004"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0004.yaml#evidence_artifact"
+    - evidence_id: EVID-0004
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0004.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
+    - DOMAIN_DAEMON
   dependencies:
     tickets:
-      - ticket_id: "TCK-00316"
-        reason: "Session tool execution must be kernel-side so result hashes can be surfaced mechanically"
-      - ticket_id: "TCK-00315"
-        reason: "Tool handlers exist and produce ToolResultData; this ticket surfaces CAS hashes for those results"
+    - ticket_id: TCK-00316
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "After storing ToolResultData in CAS, surface its CAS hash as result_hash in the tool execution stack"
-      - "Add a dedicated CAS result hash field to ToolResult (distinct from output_hash truncation hash)"
-      - "Propagate result_hash through tool lifecycle signals (ToolExecuted) and session/tool responses"
-      - "Accumulate per-episode tool result hashes in deterministic tool sequence order"
-      - "Add tests verifying surfaced hashes resolve in CAS"
+    - ToolExecutor returns CAS result_hash per tool execution (ToolResultData stored in CAS)
+    - Propagate result_hash through tool lifecycle events (ToolExecuted) and tool responses
+    - Accumulate per-episode tool result hashes for downstream indexing/audit
     out_of_scope:
-      - "ToolExecutionReceipt + ToolLogIndexV1 + SummaryReceipt (TCK-00327)"
+    - ToolExecutionReceipt + ToolLogIndexV1 + SummaryReceipt (TCK-00327)
   plan:
     steps:
-      - "Add a CAS result hash field to episode::decision::ToolResult (crates/apm2-daemon/src/episode/decision.rs)"
-      - "Set the field in ToolExecutor after CAS store (crates/apm2-daemon/src/episode/executor.rs)"
-      - "Plumb result_hash through broker decision/record_result and any tool lifecycle events"
-      - "Update session-scoped IPC to return result_hash or a tool-result reference (proto/apm2d_runtime_v1.proto)"
-      - "Add unit/integration tests: executor returns result_hash; hash resolves in CAS; ordering is deterministic"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: ToolExecutor returns CAS result_hash per tool execution (ToolResultData stored
+      in CAS)'
+    - 'Implement: Propagate result_hash through tool lifecycle events (ToolExecuted) and tool
+      responses'
+    - 'Implement: Accumulate per-episode tool result hashes for downstream indexing/audit'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0004"
+    - EVID-0004
     criteria:
-      - "ToolExecutor surfaces CAS result_hash for each execution."
-      - "Tool lifecycle signal/response includes result_hash."
-      - "Episode runtime accumulates an ordered set of result hashes for downstream indexing."
-      - "All surfaced result hashes resolve in CAS."
+    - Tool results returned from executor include CAS result_hash
+    - Tool lifecycle events include result_hash and resolve in CAS
+    - Per-episode accumulator contains complete ordered set of tool result hashes
   notes:
-    security: "Evidence must be hash-addressed; do not allow 'success' paths that omit result hashes."
-    verification: "Tests should validate both direct execution and dedupe/cache paths preserve result_hash semantics."
-    general: "This ticket provides the data-plane hash plumbing required for proof-carrying tool receipts (TCK-00327)."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

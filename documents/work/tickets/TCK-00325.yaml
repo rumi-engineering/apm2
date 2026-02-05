@@ -1,54 +1,61 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00325"
-    title: "ViewCommitment capture + embedding in review artifacts"
+    id: TCK-00325
+    title: ViewCommitment capture + embedding in review artifacts
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0008"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0008.yaml#requirement"
+    - requirement_id: REQ-0008
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0008.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0008"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0008.yaml#evidence_artifact"
+    - evidence_id: EVID-0008
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0008.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
-      - "DOMAIN_KERNEL"
+    - DOMAIN_DAEMON
+    - DOMAIN_KERNEL
   dependencies:
     tickets:
-      - ticket_id: "TCK-00318"
-        reason: "Workspace materialization must exist to compute a pinned view"
-      - ticket_id: "TCK-00321"
-        reason: "Receipt emission requires CAS+ledger ordering and durable event sink"
+    - ticket_id: TCK-00318
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
+    - ticket_id: TCK-00321
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Capture ViewCommitment material during workspace materialization/episode execution"
-      - "Store ViewCommitment as CAS artifact (schemas/apm2/view_commitment.schema.json) and reference by hash"
-      - "Bind view_commitment_hash and policy_resolved_ref into review artifacts/receipts (holon-ready binding)"
-      - "Fail closed on missing pins or inability to compute view commitment (emit ReviewBlockedRecorded)"
+    - Capture ViewCommitment during workspace materialization/episode execution
+    - Store ViewCommitment as CAS artifact (apm2.view_commitment.v1)
+    - Embed view_commitment_hash and policy_resolved_ref into review artifacts/receipts (holon-ready
+      binding)
     out_of_scope:
-      - "Full multi-cell anti-entropy replication (future)"
+    - Multi-cell anti-entropy replication (future)
   plan:
     steps:
-      - "Identify the pinned inputs for ViewCommitment (repo base ref, diff hash, toolchain/policy/model digests)"
-      - "Implement ViewCommitment artifact creation and CAS storage"
-      - "Extend review artifact bundle schema/versioning to include view_commitment_hash + policy_resolved_ref (v2 or binding sub-artifact)"
-      - "Wire the receipt builder to embed the view commitment hash and fail closed if missing"
-      - "Add tests that verifiers can reconstruct the pinned world from CAS+ledger without ambient filesystem truth"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Capture ViewCommitment during workspace materialization/episode execution'
+    - 'Implement: Store ViewCommitment as CAS artifact (apm2.view_commitment.v1)'
+    - 'Implement: Embed view_commitment_hash and policy_resolved_ref into review artifacts/receipts
+      (holon-ready binding)'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0008"
+    - EVID-0008
     criteria:
-      - "ViewCommitment is stored in CAS and referenced by hash."
-      - "Review artifacts include view_commitment_hash and policy_resolved_ref bindings."
-      - "Missing pins/view commitment causes ReviewBlockedRecorded (fail closed)."
+    - ViewCommitment stored in CAS and referenced by hash
+    - Review artifacts include view_commitment_hash and policy_resolved_ref bindings
+    - Missing pins/view commitment causes ReviewBlockedRecorded (fail closed)
   notes:
-    security: "ViewCommitment prevents ambient truth; receipts must be replayable and verifiable from CAS+ledger alone."
-    verification: "Test missing pins and confirm fail-closed blocked outcome with durable defect/blocked record."
-    general: "Closes the binding gap so receipts can be validated across holons/cells."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

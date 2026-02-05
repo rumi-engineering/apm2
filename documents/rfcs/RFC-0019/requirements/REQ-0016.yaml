@@ -1,0 +1,28 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0016"
+  title: "Security hardening after FAC viability: broker sandboxing, taint tracking, attestation tightening"
+  category: "SECURITY"
+  priority: "P2"
+  status: "PROPOSED"
+  statement: |
+    After FAC v0 is viable and productive, the system MUST harden the tool execution and evidence pipeline.
+
+    Minimum hardening scope:
+    - broker hardening: strict allowlists, canonical paths, env scrubbing, timeouts, PTY controls
+    - prompt injection resistance: taint tracking for untrusted inputs (diffs, tool outputs, web content)
+      and policies for what can flow into high-authority prompts
+    - multi-holon policy inheritance enforcement + stronger attestation requirements on receipts
+
+    This requirement is intentionally staged after productivity milestones.
+  rationale: |
+    Early validation requires throughput, but production autonomy requires containment.
+    The hardening work should be a follow-on stage once the basic loop is proven.
+  acceptance_criteria:
+    - "Broker enforces strict execution constraints (allowlists, timeouts, env policy) and emits structured denials."
+    - "Taint tracking prevents untrusted content from silently influencing high-risk decisions."
+    - "Attestation requirements are ratcheted for higher risk tiers without breaking FAC throughput at low tiers."
+  evidence_ids:
+    - "EVID-0016"
+  source_refs:
+    - "documents/rfcs/RFC-0019/03_trust_boundaries.yaml#rfc_trust_boundaries"

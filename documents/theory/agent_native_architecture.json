@@ -1,0 +1,539 @@
+{
+  "schema": "cac.architecture_bundle.v1",
+  "meta": {
+    "title": "Agent-Native Software Architecture: Theory, Doctrine & Practice",
+    "version": "1.0.0",
+    "created_at": "2026-02-04T22:27:53.975717Z",
+    "description": "The unified architectural definition for agent-native systems, combining theoretical foundations (axioms, models) with operational doctrine (protocols, prescriptions).",
+    "concepts_count": 62
+  },
+  "payload": {
+    "axioms": [
+      {
+        "id": "AX-01",
+        "name": "Stochastic Transducer",
+        "statement": "LLMs are conditional distributions p(y|x), not proof systems. Correctness requires external verification.",
+        "math": "p_theta(y | x) approx delta(y - y_true) is false.",
+        "implications": [
+          "Anchor outputs to tests/linters/schemas.",
+          "Cognition is a function of prompt/retrieval, not just weights."
+        ],
+        "law_refs": ["LAW-04"],
+        "mechanism_refs": ["MECH-GATES", "MECH-RECEIPTS"]
+      },
+      {
+        "id": "AX-02",
+        "name": "Bounded Context Channel",
+        "statement": "Context window W is a hard bandwidth limit; state must be compressed (s) such that |s| <= W via Context Discipline.",
+        "math": "I(s; a*) -> max subject to |s| <= W",
+        "implications": [
+          "Prioritize structural artifacts (hashes, IDs) over prose.",
+          "Omission error is a primary failure mode."
+        ],
+        "law_refs": ["LAW-02", "LAW-06"],
+        "mechanism_refs": ["MECH-CONTEXTPACK"]
+      },
+      {
+        "id": "AX-03",
+        "name": "Information Bottleneck",
+        "statement": "Maximize mutual information with correct action while minimizing description length.",
+        "math": "min L(s) s.t. I(s; A) >= I_min",
+        "implications": [
+          "Refactoring is conceptual compression.",
+          "High entropy in interfaces increases error probability."
+        ],
+        "law_refs": ["LAW-06"]
+      },
+      {
+        "id": "AX-04",
+        "name": "Lossy State Projection",
+        "statement": "Any subset of external memory re-injected into context is a lossy view.",
+        "implications": [
+          "Results in omission, staleness, or hallucinated linkage.",
+          "Use verifiable references to mitigate projection errors."
+        ],
+        "law_refs": ["LAW-02", "LAW-07"]
+      },
+      {
+        "id": "AX-05",
+        "name": "Contract-Cognition Interface",
+        "statement": "Contracts (predicates P(x)) provide stability for unstable stochastic cognition.",
+        "implications": [
+          "Shift work from reasoning to satisfiability.",
+          "Elevate structural contracts (types/schemas) for determinism."
+        ],
+        "law_refs": ["LAW-13"]
+      },
+      {
+        "id": "AX-06",
+        "name": "Claims-Evidence Disjunction",
+        "statement": "Claims are untrusted until bound to reproducible cryptographic evidence.",
+        "mechanism": "Commitment = Hash(Artifact) + Provenance + VerificationProc",
+        "implications": [
+          "Separation of readable assertions from verifiable artifacts.",
+          "Evidence collapses ambiguity in belief state."
+        ],
+        "law_refs": ["LAW-07", "LAW-15"],
+        "mechanism_refs": ["MECH-EVIDENCE-BUNDLE"]
+      },
+      {
+        "id": "AX-07",
+        "name": "Monotonic Growth",
+        "statement": "Prefer monotone, commutative updates over destructive edits to reduce coordination complexity.",
+        "implications": [
+          "Enables convergence without global locks.",
+          "Improves robustness under retries."
+        ],
+        "law_refs": ["LAW-03", "LAW-10"]
+      },
+      {
+        "id": "AX-08",
+        "name": "Determinism Envelope",
+        "statement": "Nondeterminism is a first-class dimension; replay requires recording effective inputs and entropy sources.",
+        "math": "y = F(x, r) where r is recorded randomness.",
+        "implications": [
+          "Isolate side effects behind explicit boundaries.",
+          "Use canonical encodings to prevent spurious diffs."
+        ],
+        "law_refs": ["LAW-04", "LAW-11"]
+      },
+      {
+        "id": "AX-09",
+        "name": "Holonic Duality",
+        "statement": "Holons are simultaneously autonomous wholes and constrained parts.",
+        "components": ["Interface", "Internal State", "Invariants", "Resource Budgets"],
+        "implications": [
+          "Complexity must be hidden behind verifiable behavior.",
+          "Boundaries define the locus of understanding."
+        ],
+        "law_refs": ["LAW-01", "LAW-05"]
+      },
+      {
+        "id": "AX-10",
+        "name": "Selective Permeability",
+        "statement": "Information and authority flow must be constrained via capabilities (OCAP) and Variety Control.",
+        "implications": [
+          "Prevent unauthorized action paths via noninterference.",
+          "Minimize privilege surface and interface variety to reduce confusion risk."
+        ],
+        "law_refs": ["LAW-05"],
+        "mechanism_refs": ["MECH-OCAP", "MECH-PERMEABILITY-RECEIPT"]
+      },
+      {
+        "id": "AX-11",
+        "name": "Coordination Dominance",
+        "statement": "Parallel speedup is limited by serial coordination (Amdahl's Law).",
+        "implications": [
+          "Throughput requires low-coupling decomposition.",
+          "Verification cost must not dominate execution."
+        ],
+        "law_refs": ["LAW-12"]
+      },
+      {
+        "id": "AX-12",
+        "name": "Cognitive Entropy & Recursive Improvement",
+        "statement": "Redundant abstractions increase minimal description length (MDL). Systems must recurse to densify successful patterns into primitives.",
+        "implications": [
+          "Entropy directly increases agent error rate.",
+          "Continuous refactoring is a mathematical necessity for evolution (Gall's Law)."
+        ],
+        "law_refs": ["LAW-01", "LAW-06"],
+        "mechanism_refs": ["LOOP-RECURRENCE"]
+      },
+      {
+        "id": "AX-13",
+        "name": "Representation Adversity",
+        "statement": "Adversaries target the context representation to force omission of constraints or inclusion of misinformation.",
+        "implications": [
+          "Security engineering is representation engineering.",
+          "Clearly label and isolate untrusted content."
+        ],
+        "law_refs": ["LAW-05"]
+      },
+      {
+        "id": "AX-14",
+        "name": "Safe Impossibility",
+        "statement": "Prefer denial-by-construction (capabilities) over post-hoc detection.",
+        "implications": [
+          "Safe failure is the default.",
+          "Authority must be explicit, not ambient."
+        ],
+        "law_refs": ["LAW-05", "LAW-15"]
+      },
+      {
+        "id": "AX-15",
+        "name": "Ambient Authority Elimination",
+        "statement": "Any implicit privilege is a vulnerability; all authority must be externalized into unforgeable objects.",
+        "implications": [
+          "Eliminate environment-based privileges.",
+          "Use time-bounded, narrowly scoped capabilities."
+        ],
+        "law_refs": ["LAW-05"],
+        "mechanism_refs": ["MECH-OCAP"]
+      },
+      {
+        "id": "AX-16",
+        "name": "Transitive Trust",
+        "statement": "Trust in distributed holarchies must be transitive through reproducible evidence, not narratives.",
+        "implications": [
+          "Attestation reduces re-evaluation cost.",
+          "Scaling requires machine-verifiable trust paths."
+        ],
+        "law_refs": ["LAW-15"],
+        "mechanism_refs": ["MECH-ATTESTATION"]
+      },
+      {
+        "id": "AX-17",
+        "name": "Autonomy Ceiling",
+        "statement": "Universal autonomy is impossible (Halting Problem/Rice's Theorem).",
+        "implications": [
+          "Autonomy must be bounded, constructive, and verifiable.",
+          "Adjudication points are inevitable."
+        ],
+        "law_refs": ["LAW-12"]
+      },
+      {
+        "id": "AX-18",
+        "name": "Search Explosion",
+        "statement": "Planning is heuristic search; architecture must reduce degrees of freedom to maintain tractability.",
+        "implications": [
+          "Restrict action space via schemas and capabilities.",
+          "Factor tasks into compositional subgoals."
+        ],
+        "law_refs": ["LAW-12"]
+      },
+      {
+        "id": "AX-19",
+        "name": "Hierarchy as Compression",
+        "statement": "Holarchies provide multi-scale representations; higher levels summarize, lower levels execute.",
+        "implications": [
+          "Mirror context management needs across the system.",
+          "Summaries upward, drill-down on demand."
+        ],
+        "law_refs": ["LAW-07"]
+      },
+      {
+        "id": "AX-20",
+        "name": "Adjudication Bottleneck",
+        "statement": "Human bandwidth is the ultimate constraint; systems must surface bounded options with evidence.",
+        "implications": [
+          "Minimize human intervention points.",
+          "Preserve authority only where decisions are irreducible."
+        ],
+        "law_refs": ["LAW-01", "LAW-14"]
+      }
+    ],
+    "models": [
+      {
+        "id": "MOD-TRANS",
+        "name": "Conditional Transducer",
+        "statement": "Agent behavior is a function of conditional probability and context construction.",
+        "math": "A ~ p_theta(A | prompt + retrieval)",
+        "law_refs": ["LAW-04"]
+      },
+      {
+        "id": "MOD-POMDP",
+        "name": "Agent as Controller",
+        "components": {
+          "S": "Hidden Environment State",
+          "O": "Observations (Tools/Logs)",
+          "A": "Actions (Tools/Edits)",
+          "b": "Belief State (Context)"
+        },
+        "rule": "Every side effect A must be followed by measurement O to close the loop.",
+        "law_refs": ["LAW-01"]
+      },
+      {
+        "id": "MOD-COST",
+        "name": "Multi-Objective Optimization",
+        "objectives": ["Token Cost (Ct)", "Tool Cost (Cu)", "Latency (Cl)", "Error (Ce)", "Security (Cs)"],
+        "rule": "Architecture selects mechanisms that minimize expected total cost.",
+        "law_refs": ["LAW-08"]
+      },
+      {
+        "id": "MOD-EVENT",
+        "name": "Event Sourcing",
+        "statement": "State is a projection (reduction) of an append-only sequence or partial order of events.",
+        "properties": ["Causal Ordering", "Commutativity", "Replayability"],
+        "law_refs": ["LAW-03"]
+      },
+      {
+        "id": "MOD-EVIDENCE",
+        "name": "Cryptographic Commitment",
+        "structure": {
+          "hash": "Content Addressing",
+          "provenance": "Production Inputs/Toolchain",
+          "verification": "Deterministic Procedure"
+        },
+        "law_refs": ["LAW-15"]
+      },
+      {
+        "id": "MOD-COMPAT",
+        "name": "Schema Evolution",
+        "statement": "Schema changes are transformations in a type system; compatibility is a constraint on reader/writer interaction.",
+        "law_refs": ["LAW-13"]
+      },
+      {
+        "id": "MOD-CAP",
+        "name": "Object Capability (OCAP)",
+        "statement": "Authority = Possession of unforgeable object reference.",
+        "properties": ["No Ambient Authority", "Least Privilege", "Transferability"],
+        "law_refs": ["LAW-05"]
+      },
+      {
+        "id": "MOD-CONV",
+        "name": "Convergent Replication",
+        "statement": "Consistency via monotone updates and merge operators (CRDT). Distinguish Control (BFT) vs Data (Convergence).",
+        "rule": "Favor availability and partitions over global consensus for Data Plane.",
+        "law_refs": ["LAW-10"],
+        "mechanism_refs": ["MECH-ANTI-ENTROPY"]
+      },
+      {
+        "id": "MOD-REF-COMPRESS",
+        "name": "Refactoring as Compression",
+        "goal": "Reduce minimal description length (MDL) and branching factor.",
+        "metrics": ["Duplication", "Churn", "Defect Density", "Interface Instability"],
+        "law_refs": ["LAW-01", "LAW-06"]
+      },
+      {
+        "id": "MOD-THREAT",
+        "name": "Adversarial Representation",
+        "vectors": ["Prompt Injection", "Malicious Diffs", "Poisoned Logs", "Forged Metadata"],
+        "defense": "Structural Isolation and Labeling.",
+        "law_refs": ["LAW-05", "LAW-08"]
+      },
+      {
+        "id": "MOD-GOV-CONTROL",
+        "name": "Adaptive Governance",
+        "components": {
+          "Sensors": "Telemetry/Defects",
+          "Controller": "Policy/Gates",
+          "Plant": "Workflow"
+        },
+        "rule": "Tune strictness based on observability and controllability.",
+        "law_refs": ["LAW-14"]
+      },
+      {
+        "id": "MOD-ACTOR",
+        "name": "Distributed Actor",
+        "semantics": ["Async Messaging", "Private State", "Supervision", "Backpressure"],
+        "guarantees": ["At-least-once", "Idempotency Required"],
+        "law_refs": ["LAW-11"]
+      },
+      {
+        "id": "MOD-SUMMARY",
+        "name": "Multi-Scale Artifacts",
+        "layers": ["Indices", "Manifests", "Summaries"],
+        "function": "Enable navigation without full context recall.",
+        "law_refs": ["LAW-07"]
+      }
+    ],
+    "strategies": [
+      {
+        "id": "STRAT-VERIFY",
+        "name": "External Anchoring",
+        "rule": "Verify stochastic LLM outputs via deterministic tools (tests, linters, schemas).",
+        "law_refs": ["LAW-04"]
+      },
+      {
+        "id": "STRAT-SUFFICIENT-STATS",
+        "name": "State Compression",
+        "rule": "Compute representation s = f(h) such that s is sufficient for decision-making within W tokens.",
+        "law_refs": ["LAW-02"]
+      },
+      {
+        "id": "STRAT-VERIFIABLE-REFS",
+        "name": "Verifiable References",
+        "rule": "Inject content-hashes and stable IDs into context; expand details only on demand.",
+        "law_refs": ["LAW-07"]
+      },
+      {
+        "id": "STRAT-CLOSED-LOOP",
+        "name": "Closed-Loop Control",
+        "rule": "Follow every actuation with measurement and acceptance testing to prevent divergence.",
+        "law_refs": ["LAW-01"]
+      },
+      {
+        "id": "STRAT-MONOTONE",
+        "name": "Monotonicity",
+        "rule": "Design state transitions as append-facts to simplify consensus and retries.",
+        "law_refs": ["LAW-03"]
+      },
+      {
+        "id": "STRAT-CANONICAL",
+        "name": "Canonical Encoding",
+        "rule": "Use JCS/Canonical formats to ensure stable content addressing and avoid spurious diffs.",
+        "law_refs": ["LAW-13"]
+      },
+      {
+        "id": "STRAT-DETERMINISM",
+        "name": "Determinism Isolation",
+        "rule": "Isolate nondeterminism behind boundaries; record all entropy for replayability.",
+        "law_refs": ["LAW-04"]
+      },
+      {
+        "id": "STRAT-CONTRACT-FIRST",
+        "name": "Contract-First Design",
+        "rule": "Prioritize structural contracts to reduce ambiguity in the finite context channel.",
+        "law_refs": ["LAW-13"]
+      },
+      {
+        "id": "STRAT-BOUNDED-HIDING",
+        "name": "Complexity Hiding",
+        "rule": "Encapsulate internal holon complexity behind stable, verifiable interfaces.",
+        "law_refs": ["LAW-05"]
+      },
+      {
+        "id": "STRAT-OCAP-FIRST",
+        "name": "Capability Default",
+        "rule": "Default to safe impossibility by withholding capabilities from agents unless explicitly required.",
+        "law_refs": ["LAW-05", "LAW-14"]
+      },
+      {
+        "id": "STRAT-LEAST-AUTHORITY",
+        "name": "Confinement",
+        "rule": "Minimize privilege surface using OCAP to limit impact of harmful agent actions.",
+        "law_refs": ["LAW-05"]
+      },
+      {
+        "id": "STRAT-DECOUPLE",
+        "name": "Low-Coupling",
+        "rule": "Decompose work into units with minimal coordination to maximize parallel efficiency.",
+        "law_refs": ["LAW-10", "LAW-11"]
+      },
+      {
+        "id": "STRAT-DEGRADING",
+        "name": "Graceful Degradation",
+        "rule": "Surface replication state to agents to prevent misdiagnosis of network partitions.",
+        "law_refs": ["LAW-10"]
+      },
+      {
+        "id": "STRAT-ISOLATE-UNTRUSTED",
+        "name": "Untrusted Labeling",
+        "rule": "Explicitly label untrusted tool/network outputs to prevent cognitive corruption.",
+        "law_refs": ["LAW-05"]
+      },
+      {
+        "id": "STRAT-ATTESTATION",
+        "name": "Verification Scaling",
+        "rule": "Use attestation to propagate trust without re-executing upstream logic.",
+        "law_refs": ["LAW-15"]
+      },
+      {
+        "id": "STRAT-ADAPTIVE-POSTURE",
+        "name": "Rachet Posture",
+        "rule": "Enforce hard invariants only where verification is reliable and cheap.",
+        "law_refs": ["LAW-14"]
+      },
+      {
+        "id": "STRAT-IDEMPOTENCY",
+        "name": "Reliable Execution",
+        "rule": "Ensure all agent-facing primitives are idempotent to survive distributed reordering.",
+        "law_refs": ["LAW-11"]
+      },
+      {
+        "id": "STRAT-GATED-AUTONOMY",
+        "name": "Bounded Failure",
+        "rule": "Define task success as either Predicate(result) == True OR Bound(FailureEvidence).",
+        "law_refs": ["LAW-01", "LAW-12"]
+      },
+      {
+        "id": "STRAT-INDEX-STABILITY",
+        "name": "Structural Anchors",
+        "rule": "Externalize stable indices so agents navigate via references, not discovery.",
+        "law_refs": ["LAW-02"]
+      },
+      {
+        "id": "STRAT-SUMMARY-UPWARD",
+        "name": "Summarization Upward",
+        "rule": "Route high-level summaries to higher holons; maintain drill-down links for execution.",
+        "law_refs": ["LAW-07"]
+      },
+      {
+        "id": "STRAT-RECURSIVE-EVOLUTION",
+        "name": "Defect-Driven Evolution",
+        "rule": "Convert every recurring defect into a stronger gate or a new primitive (Gall's Law).",
+        "law_refs": ["LAW-01", "LAW-08"]
+      }
+    ],
+    "doctrines": [
+      {
+        "id": "DOC-SPEC-STATE-SEP",
+        "name": "Spec/State Separation",
+        "rule": "Strict separation between specification content (schema-validated YAML) and workflow state (derived from event record). Workflow state MUST NOT be inferred from filesystem scans or branch names."
+      },
+      {
+        "id": "DOC-EVENT-AUTHORITY",
+        "name": "Event Authority",
+        "rule": "Append-only event log is the authoritative record. Projections are computed by deterministic reducers."
+      },
+      {
+        "id": "DOC-INTERNAL-FORGE",
+        "name": "Internal Forge Model",
+        "rule": "Forge semantics (proposal, review, acceptance) are native work semantics. ChangeSets are not synonymous with branches. Merges are governed state transitions yielding Merge Receipts."
+      },
+      {
+        "id": "DOC-GATE-PROTOCOL",
+        "name": "Gate Protocol",
+        "rule": "Verification gates are protocols with evidence contracts. Decisions must be backed by EvidenceBundles stored in CAS. AAT is an independent gate."
+      },
+      {
+        "id": "DOC-RECURRENCE-LOOP",
+        "name": "Recurrence Loop",
+        "rule": "Repeated issues indicate factory control failure. Normalized FindingSignatures drive recurrence metrics, triggering Countermeasure work to improve guardrails."
+      },
+      {
+        "id": "DOC-HARDENING-CYCLE",
+        "name": "Hardening Cycle",
+        "rule": "Lifecycle includes post-implementation hardening cycles for refactoring, simplification, and integration coherence. Stopping condition is measurable reduction of complexity."
+      }
+    ],
+    "protocols": [
+      {
+        "id": "PROTO-GATE-EXEC",
+        "steps": [
+          "Load rubric and evidence schema.",
+          "Instantiate runner with allowed tools and budget.",
+          "Execute checks/tests.",
+          "Emit Findings with signatures.",
+          "Publish EvidenceBundle (raw outputs, digests, provenance).",
+          "Emit GateRun event with decision (Pass/Fail/Escalate)."
+        ]
+      },
+      {
+        "id": "PROTO-MERGE",
+        "steps": [
+          "Acquire lease (exclusive authority).",
+          "Verify input digests (Plan-of-Record, ChangeSet, GateRuns, Decisions).",
+          "Verify repository state digest.",
+          "Apply patch/update refs.",
+          "Emit Merge Receipt event binding inputs to output state.",
+          "Release lease."
+        ]
+      },
+      {
+        "id": "PROTO-RECURRENCE",
+        "steps": [
+          "Normalize Finding fields.",
+          "Compute FindingSignature.",
+          "Reducer updates recurrence counts/rates.",
+          "If threshold exceeded: Schedule Countermeasure.",
+          "Implement Countermeasure (guardrail update).",
+          "Verify Countermeasure (corpus replay evidence).",
+          "Deploy Countermeasure with rollback plan."
+        ]
+      }
+    ],
+    "prescriptions": {
+      "language": "Rust",
+      "serialization": "prost (Protocol Buffers) for events, serde_yaml/schemars for specs",
+      "hashing": "blake3",
+      "signing": "ed25519-dalek",
+      "storage": "rusqlite (SQLite with WAL) for local durability",
+      "git_interaction": "gix (gitoxide) for deterministic inspection",
+      "secrets": "secrecy, zeroize, chacha20poly1305 for sensitive artifacts",
+      "observability": "tracing for structured instrumentation",
+      "policy": "cedar-policy for authority rules"
+    }
+  }
+}

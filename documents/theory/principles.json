@@ -1,0 +1,1280 @@
+{
+  "schema": "cac.holonic_principle_bundle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.principle_bundle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/principles/bundle@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T22:30:00Z",
+    "description": "Operational principles for holonic design, providing guidance and best practices for agent-native systems."
+  },
+  "payload": {
+    "version": "1.0.0",
+    "principle_count": 102,
+    "principles": [
+      {
+        "id": "PRIN-001",
+        "name": "Landauer’s Principle",
+        "title": "Erasure costs energy, so “free compute” is fake",
+        "formal": "any logically irreversible bit erase dissipates at least\n[\nE_{\\min} = kT \\ln 2 \\quad \\text{joules per bit}\n]\nwhere (k) is Boltzmann’s constant and (T) is temperature. Real systems are orders of magnitude above this bound, but the direction is immutable: *compute → heat → limits*.",
+        "apm2_mapping": "Treat **token budgets**, **tool budgets**, and **artifact bytes** not as \"product limits\" but as **thermodynamic proxies**: every extra tool call and every extra token is irrecoverable physical work somewhere. APM2 encodes this via **Context Discipline**: strict budgets (`apm2_core::budget`) and compiled ContextPacks prevent wasteful discovery. The missing step is to express *energy/cost* as a first-class budget dimension bound to receipts.",
+        "connections": [
+          "PRIN-008",
+          "PRIN-027",
+          "PRIN-063"
+        ],
+        "law_refs": [
+          "LAW-02",
+          "LAW-06"
+        ],
+        "mechanism_refs": [
+          "MECH-CONTEXTPACK",
+          "MECH-LEASES-BUDGETS"
+        ],
+        "defect_refs": [
+          "CONTEXT_OVERBUDGET"
+        ]
+      },
+      {
+        "id": "PRIN-002",
+        "name": "Roofline Model",
+        "title": "Performance is min(compute peak, bandwidth peak × arithmetic intensity)",
+        "formal": "[\nP = \\min(P_{\\text{peak}}, ; BW_{\\text{peak}} \\cdot AI)\n]\nwhere (AI = \\frac{\\text{FLOPs}}{\\text{bytes moved}}). This is the cleanest “why is my code slow?” litmus test.",
+        "apm2_mapping": "APM2’s *dominant* workload is often “move bytes and validate them” (ledger/event replay, CAS retrieval, schema validation, policy eval), which is usually **bandwidth/latency bound**, not FLOP bound. That means performance wins come from: (a) fewer bytes (PRIN-005), (b) fewer round‑trips (PRIN-013), (c) deterministic compression (PRIN-066), and (d) locality (PRIN-020–PRIN-022). Treat “bytes moved per verified progress” as a first‑class metric in the observability plane.",
+        "connections": [
+          "PRIN-003",
+          "PRIN-004",
+          "PRIN-005",
+          "PRIN-009",
+          "PRIN-066"
+        ]
+      },
+      {
+        "id": "PRIN-003",
+        "name": "Arithmetic Intensity",
+        "title": "Predicts compute‑bound vs bandwidth‑bound regimes",
+        "formal": "(AI) is the slope of the bandwidth line in roofline. If your algorithm’s (AI) is low, adding more compute doesn’t help.",
+        "apm2_mapping": "translate (AI) into *cognitive* and *governance* terms:\n\n* **Data‑plane AI:** validation and hashing are memory bound; optimize for fewer passes and smaller payloads (PRIN-013).\n* **Control‑plane AI:** “verification work per byte of evidence” is what matters. Evidence must be compact but sufficient (PRIN-092).\n  If a gate requires fetching huge context, it is low “verification intensity” and will dominate budgets. This is exactly why APM2 pushes ContextPacks and content hashes: ship **references** not blobs.",
+        "connections": [
+          "PRIN-004",
+          "PRIN-005",
+          "PRIN-045",
+          "PRIN-092",
+          "PRIN-097"
+        ]
+      },
+      {
+        "id": "PRIN-004",
+        "name": "GEMM Tiling/blocking",
+        "title": "Locality engineering is *the* performance lever",
+        "formal": "",
+        "apm2_mapping": "",
+        "connections": []
+      },
+      {
+        "id": "PRIN-005",
+        "name": "Communication‑avoiding Algorithms",
+        "title": "Minimize bytes moved per unit of progress",
+        "formal": "in distributed systems, cost is dominated by communication (C) not compute (W). Many optimal algorithms minimize (C) even if (W) rises.",
+        "apm2_mapping": "APM2 enforces **Context Discipline** to minimize communication: do not discover what can be compiled. Use **CAS + hashes** to pass references, not values. Tool protocol passes prompt hashes and artifact hashes rather than raw bodies. Extend this to **authority**: minimize *capability movement*—delegation should be rare, attenuated, and auditable.",
+        "connections": [
+          "PRIN-038",
+          "PRIN-045",
+          "PRIN-046",
+          "PRIN-047",
+          "PRIN-053"
+        ],
+        "law_refs": [
+          "LAW-07"
+        ],
+        "mechanism_refs": [
+          "MECH-CAS",
+          "MECH-CONTEXTPACK"
+        ]
+      },
+      {
+        "id": "PRIN-006",
+        "name": "Amdahl + Gustafson",
+        "title": "Small serial paths dominate at scale",
+        "formal": "Amdahl:\n[\nS(N)=\\frac{1}{(1-p)+p/N}\n]\nGustafson: scaled speedup grows with problem size:\n[\nS(N)=N-(1-p)(N-1)\n]",
+        "apm2_mapping": "APM2’s serial fraction is the **control plane**: policy decisions, lease issuance, ledger append, gate adjudication. If those are slow or flaky, the whole holarchy stalls. Hence: keep control-plane state minimal (PRIN-049), deterministic (PRIN-059), and always-on. Anything expensive must move to the data plane with receipts.",
+        "connections": [
+          "PRIN-049",
+          "PRIN-059",
+          "PRIN-063"
+        ]
+      },
+      {
+        "id": "PRIN-007",
+        "name": "Work–span Model",
+        "title": "Optimize critical path under verification constraints",
+        "formal": "(T_p \\ge \\max(W/p,; S)), where (W) = total work, (S) = span (critical path).",
+        "apm2_mapping": "APM2’s “work” is not just code changes; it’s **verified progress**. Verification adds edges to the DAG, increasing span. So decomposition must explicitly minimize **verification span**, not just implementation span. The work module already models parent_work_ids and transitions; use that DAG to compute span and to choose parallelization that doesn’t explode evidence dependencies.",
+        "connections": [
+          "PRIN-008",
+          "PRIN-009",
+          "PRIN-095"
+        ]
+      },
+      {
+        "id": "PRIN-008",
+        "name": "Batching",
+        "title": "Amortize overhead but trade for tail latency",
+        "formal": "batching lowers per-request fixed cost, increases waiting time. Queueing theory: batching inflates (W) even if service time drops.",
+        "apm2_mapping": "APM2 already batches ledger reads in reducer replay and rate-limits/paces pulses. But you need explicit **batch policies by risk tier**: high-risk actions (deploy, key ops) should *not* wait for throughput optimization. Low-risk telemetry can batch aggressively. Encode these policies as part of resource governance and gate scheduling.",
+        "connections": [
+          "PRIN-009",
+          "PRIN-026",
+          "PRIN-027",
+          "PRIN-028",
+          "PRIN-029",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-009",
+        "name": "Tail Latency",
+        "title": "Is usually queueing, not kernel speed",
+        "formal": "p99 latency explodes when utilization (\\rho \\to 1). In M/M/1, (W = \\frac{1}{\\mu-\\lambda}) (diverges as (\\lambda \\uparrow \\mu)).",
+        "apm2_mapping": "the daemon’s HEF pulse plane already includes queue depth limits and drop policy—this is the correct instinct: **bound queues, drop low-priority first**. Extend this to tool execution, gate evaluation, and evidence publication: every subsystem needs backpressure and bounded in-flight work, or you will get cascading failure.",
+        "connections": [
+          "PRIN-025",
+          "PRIN-026",
+          "PRIN-027",
+          "PRIN-053",
+          "PRIN-054",
+          "PRIN-055",
+          "PRIN-056",
+          "PRIN-066"
+        ]
+      },
+      {
+        "id": "PRIN-010",
+        "name": "Stochastic Rounding + Mixed Precision",
+        "title": "Trade numeric noise for throughput",
+        "formal": "stochastic rounding yields unbiased quantization; mixed precision uses FP16/BF16 with occasional FP32 accumulation to control error.",
+        "apm2_mapping": "treat *every approximate agent decision* (model outputs, heuristic routing) as “mixed precision.” The system must define explicit **error budgets** and **fallback triggers**: when uncertainty rises, escalate to higher precision (more context, better model, more verification). Encode these as policies keyed to risk tiers and gate outcomes.",
+        "connections": [
+          "PRIN-063",
+          "PRIN-076",
+          "PRIN-077",
+          "PRIN-078",
+          "PRIN-079",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-011",
+        "name": "Quantization-aware Training/inference",
+        "title": "“capability” depends on deployment format",
+        "formal": "accuracy is a function of quantization scheme (q(\\cdot)), hardware kernels, and calibration.",
+        "apm2_mapping": "model selection in APM2 cannot be “model name only.” It must be “model × runtime profile × context budget × reliability constraints.” This is why a model_router exists: route based on SLOs, cost, and risk. Store **capability profiles** as versioned artifacts, and treat them as inputs to scheduling and policy.",
+        "connections": [
+          "PRIN-017",
+          "PRIN-018",
+          "PRIN-063",
+          "PRIN-066"
+        ]
+      },
+      {
+        "id": "PRIN-012",
+        "name": "Structured Sparsity",
+        "title": "Is only real if hardware exploits it",
+        "formal": "sparsity only yields speedup if it improves effective bandwidth/compute; otherwise it’s overhead.",
+        "apm2_mapping": "the analogy is “structured governance.” Adding more gates and policies is only beneficial if enforcement is cheap and predictable; otherwise governance becomes its own DoS. Therefore: **compile governance** (policy-as-code, schema validation) into fast monotone checks and cache results by content hash (PRIN-045).",
+        "connections": [
+          "PRIN-059",
+          "PRIN-071",
+          "PRIN-093"
+        ]
+      },
+      {
+        "id": "PRIN-013",
+        "name": "Kernel Fusion",
+        "title": "Reduce memory round-trips",
+        "formal": "fuse ops to avoid writing intermediate tensors to memory.",
+        "apm2_mapping": "in APM2, “fusion” means: avoid multi-step parse→validate→transform passes over the same data. Canonicalize once, validate once, hash once, store once, then only ship references. Evidence and CAC pipelines already push in this direction. Make it explicit: one pass from untrusted input to canonical form + receipt.",
+        "connections": [
+          "PRIN-045",
+          "PRIN-046",
+          "PRIN-047",
+          "PRIN-090"
+        ]
+      },
+      {
+        "id": "PRIN-014",
+        "name": "Io-aware Attention",
+        "title": "Long-context inference is memory traffic dominated",
+        "formal": "attention complexity and bandwidth dominate as context grows; KV reads/writes dominate decode.",
+        "apm2_mapping": "this is why **ContextPack budgets** matter. Long context is a systems problem: caching, invalidation, and eviction are required (15, 97). In APM2, “long context” is mostly *retrieved documents + evidence + diffs*. Treat that as cacheable content-addressed artifacts with explicit TTL and version bindings.",
+        "connections": [
+          "PRIN-015",
+          "PRIN-096",
+          "PRIN-097"
+        ]
+      },
+      {
+        "id": "PRIN-015",
+        "name": "Kv-cache",
+        "title": "Is a physical resource; budget it like OS pages",
+        "formal": "KV-cache capacity (M) limits concurrent sequences; eviction policy affects recomputation.",
+        "apm2_mapping": "**agent working memory is KV-cache**. ContextPacks are effectively “pinned pages.” Budget token/context per lease and per risk class. If a task requires more context than allowed, that’s a *context defect* (pack miss) and should be logged as such, not worked around by “just retrieve more.”",
+        "connections": [
+          "PRIN-003",
+          "PRIN-004",
+          "PRIN-005",
+          "PRIN-096",
+          "PRIN-097"
+        ]
+      },
+      {
+        "id": "PRIN-016",
+        "name": "Speculative Decoding",
+        "title": "Trade extra compute for latency by “betting” on tokens",
+        "formal": "speculative decoding uses a draft model; accept if verifier agrees, otherwise rollback.",
+        "apm2_mapping": "speculative decoding is **optimistic execution + verification**. That’s the APM2 pattern in general: agents propose actions; gates verify; ledger commits. The key is rollback safety: all side effects must be idempotent and capability-scoped (48, 38). Use speculation for low-risk steps (formatting, lint fixes), but require receipts before promotion.",
+        "connections": [
+          "PRIN-048",
+          "PRIN-063",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-017",
+        "name": "Continuous Batching",
+        "title": "Separate prefill from decode; schedule on token throughput",
+        "formal": "throughput is tokens/sec, not requests/sec; prefill is parallelizable, decode is sequential.",
+        "apm2_mapping": "for inference, the scheduler should think in **token budget burn rate**. For the control plane, think in **event throughput** and **receipt throughput**, not “number of sessions.” Track costs per stage (prefill/context compilation, tool actuation, verification) and allocate capacity accordingly.",
+        "connections": [
+          "PRIN-008",
+          "PRIN-009",
+          "PRIN-027"
+        ]
+      },
+      {
+        "id": "PRIN-018",
+        "name": "Parallelism Modes",
+        "title": "Are topology optimization, not a toggle",
+        "formal": "data/tensor/pipeline/expert parallelism trade latency, bandwidth, memory, synchronization.",
+        "apm2_mapping": "“where an agent runs” is similarly a topology problem: running a holon near its data (repo, ledger shard, evidence store) matters more than raw compute. This is roofline applied to *networked cognition.* Model the placement problem as constrained optimization (PRIN-075) under failure domains (PRIN-062).",
+        "connections": [
+          "PRIN-019",
+          "PRIN-024",
+          "PRIN-062",
+          "PRIN-075"
+        ]
+      },
+      {
+        "id": "PRIN-019",
+        "name": "Collectives",
+        "title": "Are topology-sensitive; placement must match fabric",
+        "formal": "all-reduce cost depends on link bandwidth/latency and algorithm (ring/tree).",
+        "apm2_mapping": "in a distributed APM2, consensus replication and anti-entropy are your collectives. Design replication and witness protocols to minimize cross‑partition chatter and to align with network topology. The consensus module already encodes bounded jitter and fixed-size frames—extend with topology-aware peer selection and batching.",
+        "connections": [
+          "PRIN-024",
+          "PRIN-025",
+          "PRIN-049"
+        ]
+      },
+      {
+        "id": "PRIN-020",
+        "name": "NUMA Locality",
+        "title": "“one rack” isn’t uniform memory",
+        "formal": "remote NUMA accesses cost more; thread/page placement matters.",
+        "apm2_mapping": "the analog is “one trust domain isn’t uniform authority.” Inside a rack, some executors should still be isolated (side channels, secrets). Pin high‑risk workloads to isolated domains (PRIN-035). Also pin data-plane heavy tasks near their storage.",
+        "connections": [
+          "PRIN-034",
+          "PRIN-035",
+          "PRIN-055"
+        ]
+      },
+      {
+        "id": "PRIN-021",
+        "name": "Memory Tiers (hbm/dram/ssd/object Store)",
+        "title": "Map cognitive tiers explicitly",
+        "formal": "latency/cost hierarchy demands explicit placement and eviction.",
+        "apm2_mapping": "APM2 already has:\n\n* **working context** (episode/session),\n* **episodic ledger** (append-only events),\n* **artifacts/evidence** (CAS),\n* and likely a **semantic index** (future).\n  Make tiering explicit: working memory is lossy; ledger+CAS are authoritative. Anything you can’t replay from ledger+CAS is a design defect.",
+        "connections": [
+          "PRIN-045",
+          "PRIN-046",
+          "PRIN-047",
+          "PRIN-096"
+        ]
+      },
+      {
+        "id": "PRIN-022",
+        "name": "PCIe Host↔device Transfers Are Expensive",
+        "title": "Treat boundaries as quota’d interfaces",
+        "formal": "crossing bus boundaries costs latency and bandwidth; avoid chatty transfers.",
+        "apm2_mapping": "“boundary” = **tool call**. Every tool call crosses a trust boundary and should carry explicit budgets, schemas, and receipts. APM2 does this with protobuf tool requests, validation, policy evaluation, and budget consumption accounting. Don’t bypass that boundary “for convenience.”",
+        "connections": [
+          "PRIN-038",
+          "PRIN-090",
+          "PRIN-091"
+        ]
+      },
+      {
+        "id": "PRIN-023",
+        "name": "Rdma/kernel-bypass IO",
+        "title": "Higher performance, more footguns",
+        "formal": "bypassing kernel reduces overhead but removes safety rails; correctness burden shifts to user code.",
+        "apm2_mapping": "any “fast path” (direct executor access, privileged tools, bypassed gates) must be wrapped in **typed, verified libraries** and restricted to high-trust actors. Otherwise you just created a privileged injection surface.",
+        "connections": [
+          "PRIN-033",
+          "PRIN-038",
+          "PRIN-089",
+          "PRIN-090",
+          "PRIN-091"
+        ]
+      },
+      {
+        "id": "PRIN-024",
+        "name": "Network Topology",
+        "title": "Shapes bisection bandwidth; partition to minimize chatter",
+        "formal": "cost of communication depends on graph cut size; minimize edge cut for task graph.",
+        "apm2_mapping": "treat the **work DAG** as a graph partitioning problem: co-locate tightly-coupled work items (shared context packs, shared artifacts) and isolate weakly coupled ones. This reduces both bandwidth and *attack surface* (bulkheads).",
+        "connections": [
+          "PRIN-055",
+          "PRIN-095"
+        ]
+      },
+      {
+        "id": "PRIN-025",
+        "name": "Congestion Control + AQM",
+        "title": "Decide whether the system collapses under load",
+        "formal": "queue discipline (RED/CoDel) and pacing prevent bufferbloat and collapse.",
+        "apm2_mapping": "HEF resource governance is AQM: bounded queues, rate limits, drop priority. Extend the same design to: tool execution pools, ledger append contention, CAS retrieval, and CI import. The measurable goal is stability under load (no oscillation, bounded tail latency).",
+        "connections": [
+          "PRIN-009",
+          "PRIN-026",
+          "PRIN-027",
+          "PRIN-028",
+          "PRIN-029",
+          "PRIN-053"
+        ]
+      },
+      {
+        "id": "PRIN-026",
+        "name": "Pacing Jitter Control Deadline Scheduling Separate P50 From P99",
+        "title": "Pacing + jitter control + deadline scheduling separate p50 from p99",
+        "formal": "jitter adds variance; EDF (earliest deadline first) can be optimal under certain assumptions.",
+        "apm2_mapping": "assign **SLO and deadline semantics** to actions: tool calls, gate evaluations, replication messages. The consensus module already uses bounded jitter constants; extend to scheduling policies per topic class (ledger head vs episode IO).",
+        "connections": [
+          "PRIN-025",
+          "PRIN-063",
+          "PRIN-064",
+          "PRIN-065",
+          "PRIN-066"
+        ]
+      },
+      {
+        "id": "PRIN-027",
+        "name": "Little’s Law",
+        "title": "(L = \\lambda W) makes autoscaling/admission math explicit",
+        "formal": "average number in system (L) equals arrival rate (\\lambda) times average time in system (W).",
+        "apm2_mapping": "treat “active work items,” “in-flight tool calls,” and “queued pulses” as (L). If you can measure (\\lambda) (arrivals) and want bounded (W) (latency), then you must enforce admission control (PRIN-053) or increase capacity. “Heuristic autoscaling” without Little’s law is basically superstition.",
+        "connections": [
+          "PRIN-008",
+          "PRIN-009",
+          "PRIN-053"
+        ]
+      },
+      {
+        "id": "PRIN-028",
+        "name": "Model Predictive Control (mpc)",
+        "title": "Stability under constraints/delays",
+        "formal": "optimize control sequence (u_{t:t+H}) over horizon (H) subject to dynamics (x_{t+1}=f(x_t,u_t)) and constraints.",
+        "apm2_mapping": "governance and autoscaling are controllers. The “plant” is: queue lengths, token burn, tool pool occupancy, ledger growth. MPC suggests: don’t react to instantaneous spikes; plan with constraints (budgets, risk tiers) and with known delays (CI latency, network partitions). Encode the plant model and constraints in policies, not ad-hoc code.",
+        "connections": [
+          "PRIN-029",
+          "PRIN-063"
+        ]
+      },
+      {
+        "id": "PRIN-029",
+        "name": "Feedback Loops Oscillate Under Delayed Noisy Observation",
+        "title": "Feedback loops oscillate under delayed/noisy observation",
+        "formal": "delayed feedback can destabilize proportional controllers; filtering and hysteresis are standard mitigations.",
+        "apm2_mapping": "telemetry is a control input. If you react to noisy error rates with immediate throttling/spawning, you will oscillate. APM2 should treat telemetry ingestion and aggregation as part of the stability story: risk-aware sampling (PRIN-066), smoothing, hysteresis, and “hold-down timers” for policy changes.",
+        "connections": [
+          "PRIN-066",
+          "PRIN-067"
+        ]
+      },
+      {
+        "id": "PRIN-030",
+        "name": "Time Synchronization",
+        "title": "Limits tracing and ordering; tolerate skew",
+        "formal": "no global time; clocks drift; ordering must be logical (Lamport/HLC/vector clocks).",
+        "apm2_mapping": "APM2 already embeds **HLC fields** in ledger events and uses **tick-based time (HTF)** for lease expiry. That is the correct direction: avoid “wall clock as authority.” For observability and replay, bind events by sequence/causality, not timestamps.",
+        "connections": [
+          "PRIN-050",
+          "PRIN-065"
+        ]
+      },
+      {
+        "id": "PRIN-031",
+        "name": "Record/replay Debugging",
+        "title": "Capture minimal deterministic traces",
+        "formal": "reproduce by recording nondeterministic inputs and replaying under deterministic execution.",
+        "apm2_mapping": "the ledger + CAS is the natural record/replay substrate. The missing piece is **tool determinism receipts**: store tool request, tool response hash, environment snapshot hash (hermeticity), and attach to work/gate receipts. If an action can’t be replayed from receipts, it is not fully verified.",
+        "connections": [
+          "PRIN-058",
+          "PRIN-092",
+          "PRIN-095"
+        ]
+      },
+      {
+        "id": "PRIN-032",
+        "name": "Os Scheduler + Cgroups",
+        "title": "Are the last line of single-host isolation",
+        "formal": "kernel primitives enforce CPU/mem/IO quotas; without them, “policy” is advisory.",
+        "apm2_mapping": "APM2’s policy engine must compile down to kernel-enforced constraints for high-risk executors: cgroups, namespaces, seccomp. The “policy said no network” is meaningless if the process can still open sockets.",
+        "connections": [
+          "PRIN-091"
+        ]
+      },
+      {
+        "id": "PRIN-033",
+        "name": "eBPF",
+        "title": "Programmable measurement/enforcement close to substrate",
+        "formal": "attach programs at kernel hook points for observability and policy.",
+        "apm2_mapping": "eBPF is an ideal *observability amplifier* for APM2: you can measure per-tool syscall patterns, detect unexpected egress, and feed that into gates as receipts. Treat this as “hardware telemetry” for the governance controller.",
+        "connections": [
+          "PRIN-065",
+          "PRIN-066",
+          "PRIN-091",
+          "PRIN-092"
+        ]
+      },
+      {
+        "id": "PRIN-034",
+        "name": "Containers Share A Kernel High Risk Executors May Need Microvms",
+        "title": "Containers share a kernel; high-risk executors may need microVMs",
+        "formal": "container isolation is weaker than VM isolation; kernel bugs and side channels remain.",
+        "apm2_mapping": "default should be: low-risk tools in containers; higher-risk actions in microVMs with stricter boundaries. Map “risk tier” directly to isolation class. If you don’t, prompt injection becomes “get root in shared kernel.”",
+        "connections": [
+          "PRIN-035",
+          "PRIN-091",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-035",
+        "name": "Side Channels",
+        "title": "Are unavoidable; separate secrets by isolation class and hardware domain",
+        "formal": "timing/cache/power leak information even with perfect software.",
+        "apm2_mapping": "treat “secrets” and “high-risk workloads” as physically separate. Don’t put key material in the same host as adversarial workloads. In APM2 terms: capability minting, signing keys, and policy bundles must live in hardened enclaves/domains.",
+        "connections": [
+          "PRIN-036",
+          "PRIN-037",
+          "PRIN-038",
+          "PRIN-039",
+          "PRIN-040",
+          "PRIN-041",
+          "PRIN-042",
+          "PRIN-043"
+        ]
+      },
+      {
+        "id": "PRIN-036",
+        "name": "Secure Boot + Measured Boot",
+        "title": "Bind software state to hardware roots of trust",
+        "formal": "a chain of trust extends from hardware (TPM) through bootloader to OS.",
+        "apm2_mapping": "to scale beyond one developer machine, APM2 needs executor attestation. Otherwise your “kernel” can be replaced and still claim compliance.",
+        "connections": [
+          "PRIN-037",
+          "PRIN-044"
+        ]
+      },
+      {
+        "id": "PRIN-037",
+        "name": "Remote Attestation",
+        "title": "Trust becomes a verifiable claim",
+        "formal": "prove to a verifier that the prover is running approved code/config, typically using TPM quotes or enclave attestation.",
+        "apm2_mapping": "any node receiving authority (capabilities, keys, deployment power) must present attestation *before* delegation. This aligns with APM2’s “fail-closed” posture: if attestation missing/unverifiable, deny.",
+        "connections": [
+          "PRIN-038",
+          "PRIN-093",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-038",
+        "name": "Capability-based Security",
+        "title": "Prevent ambient authority via attenuable tokens",
+        "formal": "authority is represented explicitly as a capability object; delegation is attenuation:\n[\ncap' \\preceq cap\n]\nin a partial order of privilege.",
+        "apm2_mapping": "APM2 already implements OCAP in the lease/capability system: scope hashes, budgets, expiry, delegation depth, signatures. This is the primary defense against confused-deputy prompt injection. Treat capability attenuation as a *lattice* (PRIN-071): operations should be monotone (only reduce privileges).",
+        "connections": [
+          "PRIN-071",
+          "PRIN-089",
+          "PRIN-090",
+          "PRIN-091"
+        ]
+      },
+      {
+        "id": "PRIN-039",
+        "name": "Zero-trust Service Identity",
+        "title": "Authenticate/authorize every hop",
+        "formal": "assume hostile networks; use strong identities and per-request authorization.",
+        "apm2_mapping": "the consensus layer uses mutual TLS; extend this to all internal planes, including pulse/HEF distribution and any external adapters. “Inside the rack” is not a boundary.",
+        "connections": [
+          "PRIN-040"
+        ]
+      },
+      {
+        "id": "PRIN-040",
+        "name": "Mtls + Automated Rotation",
+        "title": "Table stakes",
+        "formal": "long-lived certificates become liabilities; rotation must be automated.",
+        "apm2_mapping": "bake cert lifecycle into the system as an autonomous subsystem. If rotation requires humans, it will fail under pressure. Integrate rotation events into ledger for auditability.",
+        "connections": [
+          "PRIN-043",
+          "PRIN-044"
+        ]
+      },
+      {
+        "id": "PRIN-041",
+        "name": "Post Quantum Migration Requires Crypto Agility And Hybrid Modes",
+        "title": "Post-quantum migration requires crypto agility and hybrid modes",
+        "formal": "plan for hybrid key exchange/signatures: classical + PQ, with version negotiation and downgrade protection.",
+        "apm2_mapping": "APM2’s signing/verification and identity protocols should be versioned and negotiation‑safe now, not after you ship global. Treat crypto algorithms as policy-configured primitives with signed policy bundles.",
+        "connections": [
+          "PRIN-093"
+        ]
+      },
+      {
+        "id": "PRIN-042",
+        "name": "Harvest-now-decrypt-later",
+        "title": "Confidentiality lifetimes matter",
+        "formal": "adversary records ciphertext now, decrypts later when capabilities improve.",
+        "apm2_mapping": "the evidence store and telemetry are extremely sensitive. Classification and retention (already present in evidence module) are non-negotiable: store only what you must, for as short as you can, and encrypt according to confidentiality lifetime.",
+        "connections": [
+          "PRIN-043",
+          "PRIN-066"
+        ]
+      },
+      {
+        "id": "PRIN-043",
+        "name": "Secrets Should Be Short Lived And Scoped Prefer Secretless Jit Credentials",
+        "title": "Secrets should be short-lived and scoped; prefer “secretless” JIT credentials",
+        "formal": "blast radius scales with secret lifetime and scope.",
+        "apm2_mapping": "capabilities and session tokens should be time-bounded; tooling should fetch JIT credentials rather than storing secrets in context. Every secret that enters a prompt is a future incident.",
+        "connections": [
+          "PRIN-089",
+          "PRIN-091"
+        ]
+      },
+      {
+        "id": "PRIN-044",
+        "name": "Supply-chain Provenance",
+        "title": "Promotion is graph verification, not a trust leap",
+        "formal": "verify build graph integrity: source → build → artifact → deploy, with signed attestations.",
+        "apm2_mapping": "APM2 already wants evidence bundles; extend to full supply chain: deterministic builds (PRIN-058), provenance attestations, and content-addressed artifact manifests. Promotion should require verifying the graph, not “someone said it passed.”",
+        "connections": [
+          "PRIN-058",
+          "PRIN-092"
+        ]
+      },
+      {
+        "id": "PRIN-045",
+        "name": "Content-addressed Storage",
+        "title": "Immutability by digest makes rollbacks pointer moves",
+        "formal": "store content at address (h(content)). Integrity and identity unify.",
+        "apm2_mapping": "CAS is already core: evidence artifacts, prompts, scopes, and packs are hash-addressed. The key operational leap: treat all important state as *references* to CAS content; mutable pointers live in small, auditable consensual state.",
+        "connections": [
+          "PRIN-046",
+          "PRIN-047",
+          "PRIN-049"
+        ]
+      },
+      {
+        "id": "PRIN-046",
+        "name": "Merkle Trees + Hash Chaining",
+        "title": "Tamper evidence at scale",
+        "formal": "hash chain gives linear integrity; Merkle trees give efficient inclusion proofs.",
+        "apm2_mapping": "ledger hash chaining exists; consensus module includes Merkle structures. Use Merkle roots for efficient replication proofs and for “audit sampling” without full log transfer.",
+        "connections": [
+          "PRIN-049",
+          "PRIN-066"
+        ]
+      },
+      {
+        "id": "PRIN-047",
+        "name": "Event Sourcing",
+        "title": "Model system as sequence of decisions, not hidden state mutation",
+        "formal": "state is a fold over events:\n[\nstate_t = fold(apply, state_0, events_{0:t})\n]",
+        "apm2_mapping": "this is literally APM2’s kernel: ledger events + deterministic reducers. Operationally: “the truth” is the event stream + CAS. Everything else is a projection.",
+        "connections": [
+          "PRIN-059",
+          "PRIN-095"
+        ]
+      },
+      {
+        "id": "PRIN-048",
+        "name": "Idempotency Keys + Deduplication",
+        "title": "Retries must be safe",
+        "formal": "operation (op(k)) with idempotency key (k) must satisfy (op(k)) applied multiple times ≡ once.",
+        "apm2_mapping": "tool requests already include `dedupe_key`, and work transitions include sequence checks. Make idempotency a hard requirement for any side-effecting tool: file writes, git ops, deploys. If you cannot make it idempotent, wrap it in a transactional boundary and record a receipt.",
+        "connections": [
+          "PRIN-053",
+          "PRIN-054",
+          "PRIN-092"
+        ]
+      },
+      {
+        "id": "PRIN-049",
+        "name": "Consensus For Control, Convergence For Data",
+        "title": "Minimize global serialization",
+        "formal": "consensus replicates a state machine; cost is high, so keep the replicated state small.",
+        "apm2_mapping": "Reserve BFT consensus for shared-authority control-plane facts (membership, policy roots). Treat data-plane replication as convergent (CRDTs/anti-entropy) per **TRUTH-AX-07**. Global consensus on every event is a liveness hazard and contradicts the Unified Theory (Consensus is Expensive).",
+        "connections": [
+          "PRIN-045",
+          "PRIN-047"
+        ],
+        "law_refs": [
+          "LAW-10",
+          "LAW-11"
+        ],
+        "mechanism_refs": [
+          "MECH-LEDGER",
+          "MECH-ANTI-ENTROPY"
+        ]
+      },
+      {
+        "id": "PRIN-050",
+        "name": "Vector Clocks + Causal Consistency",
+        "title": "Encode partial order, don’t pretend in wall time",
+        "formal": "vector clocks represent causality; (a \\rightarrow b) if all components ≤ and at least one <.",
+        "apm2_mapping": "APM2 already uses HLC fields, which are a practical compromise between Lamport and wall-clock. Extend causal encoding into work DAGs: parent_work_ids and gate dependencies are explicit causality. Avoid deriving causality from timestamps.",
+        "connections": [
+          "PRIN-030",
+          "PRIN-095"
+        ]
+      },
+      {
+        "id": "PRIN-051",
+        "name": "Crdts",
+        "title": "Some state can converge without coordination",
+        "formal": "CRDTs rely on a join-semilattice ((S,\\sqcup)) and monotone updates; eventual convergence is guaranteed.",
+        "apm2_mapping": "consensus module includes CRDTs. Use CRDTs for *non-critical* shared views: caches, indexes, presence, “best effort” telemetry summaries. Never use CRDTs for authority or money unless you deeply understand the algebra and threat model.",
+        "connections": [
+          "PRIN-071",
+          "PRIN-087"
+        ]
+      },
+      {
+        "id": "PRIN-052",
+        "name": "Actor Model",
+        "title": "Isolate failures by message-driven components with supervision",
+        "formal": "actors have mailboxes; no shared mutable state; supervisors restart.",
+        "apm2_mapping": "holons are actors: they intake work, execute bounded episodes, emit artifacts, and can be supervised/escalated. Keep the actor boundary crisp: message schemas + capability tokens are the only ingress.",
+        "connections": [
+          "PRIN-053",
+          "PRIN-055"
+        ]
+      },
+      {
+        "id": "PRIN-053",
+        "name": "Backpressure",
+        "title": "The only honest overload strategy",
+        "formal": "when downstream cannot process, upstream must slow/stop; otherwise queues explode.",
+        "apm2_mapping": "APM2 already implements backpressure in resource governance for pulse subscriptions and in budgets for sessions. Push it everywhere: tool execution pools, replication streams, CI import, gate evaluation. Also: treat “cannot accept work” as a normal outcome, not an error.",
+        "connections": [
+          "PRIN-009",
+          "PRIN-025",
+          "PRIN-027"
+        ]
+      },
+      {
+        "id": "PRIN-054",
+        "name": "Circuit Breakers",
+        "title": "Prevent cascading failures",
+        "formal": "open circuit after repeated failures; half-open to test recovery.",
+        "apm2_mapping": "apply to external dependencies (LLM providers, GitHub API, artifact stores). The breaker state should be visible in the ledger or in a projection so it can be audited and tuned, not hidden in logs.",
+        "connections": [
+          "PRIN-063",
+          "PRIN-064"
+        ]
+      },
+      {
+        "id": "PRIN-055",
+        "name": "Bulkheads/compartmentalization",
+        "title": "Bound blast radius across partitions",
+        "formal": "isolate resources so failure doesn’t spread.",
+        "apm2_mapping": "enforce partitions at **network**, **identity**, and **capability** layers. Work DAG partitioning (PRIN-024) gives you a natural bulkhead boundary; enforce it mechanically, not socially.",
+        "connections": [
+          "PRIN-038",
+          "PRIN-039",
+          "PRIN-062"
+        ]
+      },
+      {
+        "id": "PRIN-056",
+        "name": "Graceful Degradation",
+        "title": "Preserve core functions under failure",
+        "formal": "drop optional features first; preserve invariants.",
+        "apm2_mapping": "under control-plane distress, the system must remain **readable**: ledger and evidence retrieval should keep working even if scheduling and tool orchestration degrade. That’s “content plane readable when control plane unhealthy.”",
+        "connections": [
+          "PRIN-025",
+          "PRIN-066"
+        ]
+      },
+      {
+        "id": "PRIN-057",
+        "name": "Fair Scheduling + Weighted Queuing",
+        "title": "Prevent starvation",
+        "formal": "allocate service according to weights; avoid head-of-line blocking.",
+        "apm2_mapping": "APM2 should weight by **risk tier**, **SLO**, and **tenant**. “One noisy agent” must not starve governance-critical loops (leases, capability revocation, ledger append). Encode fairness in schedulers and in HEF drop policy priorities.",
+        "connections": [
+          "PRIN-025",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-058",
+        "name": "Deterministic Builds + Hermetic Environments",
+        "title": "Reproducibility is security",
+        "formal": "build output must be a pure function of inputs; hermeticity removes hidden dependencies.",
+        "apm2_mapping": "this is foundational for evidence credibility. Without determinism, you cannot reproduce a receipt. Treat hermeticity as a gate requirement for high-stakes promotions.",
+        "connections": [
+          "PRIN-031",
+          "PRIN-044",
+          "PRIN-092"
+        ]
+      },
+      {
+        "id": "PRIN-059",
+        "name": "Declarative Reconciliation Loops",
+        "title": "Desired vs observed state",
+        "formal": "controllers compute (diff(desired, observed)) and apply corrections until convergence.",
+        "apm2_mapping": "reducers are “observed state,” PRDs/RFCs/tickets are “desired state,” and gates are reconciliation checks. Extend reconciliation to infrastructure: policy bundles, schema registries, key distribution.",
+        "connections": [
+          "PRIN-047",
+          "PRIN-060"
+        ]
+      },
+      {
+        "id": "PRIN-060",
+        "name": "Configuration Drift",
+        "title": "Is inevitable; detect and remediate continuously",
+        "formal": "drift = observed ≠ desired; remediation must be audited.",
+        "apm2_mapping": "in global deployments, drift is both reliability and security risk. Drift remediation must emit evidence (what changed, why, by whom, which capability).",
+        "connections": [
+          "PRIN-092",
+          "PRIN-093"
+        ]
+      },
+      {
+        "id": "PRIN-061",
+        "name": "Bare Metal Provisioning",
+        "title": "You need a substrate API (BMC/Redfish/PXE/golden images)",
+        "formal": "if you own hardware, provisioning is control theory + security.",
+        "apm2_mapping": "Phase‑4/5 require fleet control. Define a rack substrate API early, or you’ll re-invent cloud primitives badly.",
+        "connections": [
+          "PRIN-036",
+          "PRIN-037"
+        ]
+      },
+      {
+        "id": "PRIN-062",
+        "name": "Failure Domains Define Correlated Risk Schedule With Failure Domain Awareness",
+        "title": "Failure domains define correlated risk; schedule with failure-domain awareness",
+        "formal": "correlated failures violate independence assumptions; replication must straddle domains.",
+        "apm2_mapping": "for consensus and evidence replication, spread across domains (rack, ToR switch, power feed). For work scheduling, avoid placing all parents/children in same failure domain.",
+        "connections": [
+          "PRIN-024",
+          "PRIN-049"
+        ]
+      },
+      {
+        "id": "PRIN-063",
+        "name": "Slos + Error Budgets",
+        "title": "Reliability becomes an optimization constraint",
+        "formal": "error budget = allowed failures within window; treat reliability as spendable.",
+        "apm2_mapping": "APM2’s autonomy levels should “spend” reliability budget. High-risk autonomous actions must require more budget headroom (i.e., be conservative when budget is low). Encode this into gates and policies.",
+        "connections": [
+          "PRIN-064",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-064",
+        "name": "Burn-rate Alerting",
+        "title": "Page on budget consumption, not raw errors",
+        "formal": "burn rate = current error rate / allowed error rate; page if sustained > threshold.",
+        "apm2_mapping": "incident holons should trigger on “budget being consumed too fast.” This applies to: CI flakes, tool errors, policy denials, replication failures. It’s the correct control signal.",
+        "connections": [
+          "PRIN-029",
+          "PRIN-067"
+        ]
+      },
+      {
+        "id": "PRIN-065",
+        "name": "Tracing With Correlation Ids",
+        "title": "Make causality observable",
+        "formal": "propagate trace context end-to-end; reconstruct causality graph.",
+        "apm2_mapping": "every work item, tool request, gate receipt, and deploy should carry a trace ID. This is required for record/replay (PRIN-031) and for causal debugging under concurrency.",
+        "connections": [
+          "PRIN-030",
+          "PRIN-050"
+        ]
+      },
+      {
+        "id": "PRIN-066",
+        "name": "Sampling + Aggregation",
+        "title": "Mandatory at scale; policies must be risk-aware",
+        "formal": "logging everything is an economic DoS; sampling must preserve critical signals.",
+        "apm2_mapping": "classify telemetry by risk tier and data classification. High-risk events get durable evidence; low-risk gets sampled stats. Encode sampling policy as signed bundles (PRIN-093) so enforcement is uniform.",
+        "connections": [
+          "PRIN-042",
+          "PRIN-087"
+        ]
+      },
+      {
+        "id": "PRIN-067",
+        "name": "Chaos Engineering",
+        "title": "Validate assumptions under controlled failure",
+        "formal": "inject faults to test resilience, not just correctness.",
+        "apm2_mapping": "use fault injection as continuous safety tests: partitions, message drops, clock skew, corrupted artifacts, revoked capabilities. APM2’s event sourcing makes postmortems crisp because you can replay history.",
+        "connections": [
+          "PRIN-031",
+          "PRIN-099"
+        ]
+      },
+      {
+        "id": "PRIN-068",
+        "name": "Tla+/model Checking",
+        "title": "Catch distributed bugs early",
+        "formal": "specify state machines; model-check safety/liveness; find counterexamples.",
+        "apm2_mapping": "core protocols (lease issuance, capability delegation, ledger append/replication, gate promotion) are *absolutely* worth formal modeling. The cost of a distributed safety bug is existential.",
+        "connections": [
+          "PRIN-049",
+          "PRIN-050",
+          "PRIN-051",
+          "PRIN-082"
+        ]
+      },
+      {
+        "id": "PRIN-069",
+        "name": "Type/effect Systems",
+        "title": "Encode allowed actions in types",
+        "formal": "effects annotate functions: (f : A \\to B ; !{net, fs, deploy}).",
+        "apm2_mapping": "protobuf tool schemas + validation is a runtime approximation of effect systems. Push further: tool APIs should surface effects explicitly and require capabilities per effect class.",
+        "connections": [
+          "PRIN-090",
+          "PRIN-091"
+        ]
+      },
+      {
+        "id": "PRIN-070",
+        "name": "Refinement Types/contracts",
+        "title": "Checked invariants at boundaries",
+        "formal": "types with predicates: ({x:\\text{String} \\mid len(x)\\le256}).",
+        "apm2_mapping": "APM2 already enforces strict bounds (IDs, sizes, paths). This is what stops DoS and injection. Keep pushing: schemas should deny unknown fields; contracts should be explicit and validated at every boundary.",
+        "connections": [
+          "PRIN-089",
+          "PRIN-090"
+        ]
+      },
+      {
+        "id": "PRIN-071",
+        "name": "Lattice Theory + Monotone Frameworks",
+        "title": "Explain convergence and termination",
+        "formal": "if (f) is monotone on a complete lattice, iterating from (\\bot) converges to (\\mathrm{lfp}(f)).",
+        "apm2_mapping": "permissions and delegation are lattices; CRDTs are semilattices; policy evaluation should be monotone and terminating. This is not abstract math—it’s how you guarantee no permission propagation loops and no non-terminating reconciliation.",
+        "connections": [
+          "PRIN-038",
+          "PRIN-051",
+          "PRIN-072"
+        ]
+      },
+      {
+        "id": "PRIN-072",
+        "name": "Fixed-point Semantics",
+        "title": "Recursive definitions as least fixed points",
+        "formal": "holonic nesting and recursion must be specified as fixed points to avoid ambiguity.",
+        "apm2_mapping": "“holon supervising holon” is recursion. Define nesting semantics so that delegation, budgets, and stop conditions compose and terminate. Otherwise you get spawn storms.",
+        "connections": [
+          "PRIN-053",
+          "PRIN-080"
+        ]
+      },
+      {
+        "id": "PRIN-073",
+        "name": "Category Theory",
+        "title": "Compositional interfaces with identity + associativity",
+        "formal": "morphisms compose; identities exist; compositionality reduces complexity.",
+        "apm2_mapping": "holon interfaces should compose: work intake → episode execution → artifact emission → escalation. Tool invocations should also be composable pipelines with explicit handlers (PRIN-074). The point is to build large systems from small verified pieces without “glue code entropy.”",
+        "connections": [
+          "PRIN-074",
+          "PRIN-095"
+        ]
+      },
+      {
+        "id": "PRIN-074",
+        "name": "Monads/algebraic Effects",
+        "title": "Disciplined sequencing of side effects",
+        "formal": "effects are explicit; handlers interpret them; sequencing becomes structured.",
+        "apm2_mapping": "treat tool usage as effectful computation: requests are effect values; the kernel is the handler enforcing policy and budgets. This is how you prevent “agent prose” from being an implicit effect system.",
+        "connections": [
+          "PRIN-069",
+          "PRIN-070",
+          "PRIN-089",
+          "PRIN-090"
+        ]
+      },
+      {
+        "id": "PRIN-075",
+        "name": "Convex Optimization",
+        "title": "Global guarantees under constraints",
+        "formal": "many allocation problems can be posed as convex programs with reliable solvers.",
+        "apm2_mapping": "scheduling, budgeting, placement, and admission are optimization problems under constraints (SLOs, risk tiers, failure domains). Start with convex relaxations; only go heuristic when necessary. The key is that convex programs produce *auditable* decisions and sensitivities.",
+        "connections": [
+          "PRIN-027",
+          "PRIN-028",
+          "PRIN-083"
+        ]
+      },
+      {
+        "id": "PRIN-076",
+        "name": "Bayesian Inference",
+        "title": "Belief updating, not confidence prose",
+        "formal": "[\nP(H\\mid D)\\propto P(D\\mid H)P(H)\n]",
+        "apm2_mapping": "“agent confidence” must become explicit uncertainty state: beliefs over whether a change is correct, whether a tool output is trustworthy, whether a regression is real. Use evidence as likelihood updates. This aligns with gates: a gate receipt is a high-weight observation.",
+        "connections": [
+          "PRIN-079",
+          "PRIN-092"
+        ]
+      },
+      {
+        "id": "PRIN-077",
+        "name": "Stochastic Processes",
+        "title": "Distinguish drift/regime changes from noise",
+        "formal": "treat metrics as stochastic processes; detect change points vs transient outliers.",
+        "apm2_mapping": "avoid thrashing policies due to transient CI flakes or provider outages. Maintain change detection with robust statistics (PRIN-087) and explicit “regime state” in projections.",
+        "connections": [
+          "PRIN-029",
+          "PRIN-087"
+        ]
+      },
+      {
+        "id": "PRIN-078",
+        "name": "Mdps",
+        "title": "Sequential decision-making optimizing long-run cost",
+        "formal": "state (s), actions (a), transitions (P(s'|s,a)), reward (R).",
+        "apm2_mapping": "the factory loop is an MDP: choose next action (tool call, gate, escalation) to optimize long-run “verified progress per cost” under constraints. But don’t let RL “optimize” without governance: it will Goodhart metrics.",
+        "connections": [
+          "PRIN-084",
+          "PRIN-085",
+          "PRIN-086",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-079",
+        "name": "Pomdps",
+        "title": "Partial observability requires belief states",
+        "formal": "maintain belief (b(s)) over hidden state; update with observations.",
+        "apm2_mapping": "agents do not observe the world fully; tool outputs are partial and sometimes adversarial. Maintain belief states tied to evidence, not narratives. This is exactly why APM2 treats tool outputs as untrusted until verified/hashed/stored.",
+        "connections": [
+          "PRIN-076",
+          "PRIN-088",
+          "PRIN-089",
+          "PRIN-090"
+        ]
+      },
+      {
+        "id": "PRIN-080",
+        "name": "Hierarchical RL",
+        "title": "Delegation as options with initiation/termination",
+        "formal": "options (o) have policies (\\pi_o), initiation sets (I_o), termination (\\beta_o).",
+        "apm2_mapping": "holons supervising sub-holons are options. Encode initiation/termination conditions as contracts and stop conditions in the holon trait context. Delegation without termination conditions is how you get infinite recursion and runaway autonomy.",
+        "connections": [
+          "PRIN-072",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-081",
+        "name": "Skill Discovery + Option Libraries",
+        "title": "Store verified playbooks as callable skills",
+        "formal": "convert experience into reusable policies with known preconditions and effects.",
+        "apm2_mapping": "this is literally the “skills” directory philosophy: executable specifications. But the key word is **verified**: store not just the steps but the evidence patterns and the gates that validate them.",
+        "connections": [
+          "PRIN-092",
+          "PRIN-098"
+        ]
+      },
+      {
+        "id": "PRIN-082",
+        "name": "Sat/smt",
+        "title": "Encode hard invariants as satisfiable constraints",
+        "formal": "constraints are boolean/first-order; solver finds model or proves UNSAT.",
+        "apm2_mapping": "deployment and security policy should be constraints, not ad-hoc checks: “no tool call with net=true unless capability X,” “no merge unless evidence bundle contains Y,” “no downgrade of classification.” Where possible, compile policy into SAT/SMT for decidability and audit.",
+        "connections": [
+          "PRIN-068",
+          "PRIN-093"
+        ]
+      },
+      {
+        "id": "PRIN-083",
+        "name": "Distributed Constraint Optimization + Auctions",
+        "title": "Scalable allocation mechanisms",
+        "formal": "agents bid; allocation solves approximate global objective under limited coordination.",
+        "apm2_mapping": "use market-like allocation for compute slots, inference tokens, and CI capacity across holons, but only for *non-authority* resources. Authority allocation is governance, not an auction.",
+        "connections": [
+          "PRIN-084",
+          "PRIN-085"
+        ]
+      },
+      {
+        "id": "PRIN-084",
+        "name": "Game Theory",
+        "title": "Assume strategic or misaligned sub-agents",
+        "formal": "model agents as utility maximizers; equilibria can be bad if incentives mis-specified.",
+        "apm2_mapping": "treat internal agents as potentially adversarial (this is in the threat model). Therefore: (a) verify claims mechanically (PRIN-092), (b) bound authority (PRIN-038), (c) use audits and witnesses, (d) don’t reward narrative.",
+        "connections": [
+          "PRIN-085",
+          "PRIN-089"
+        ]
+      },
+      {
+        "id": "PRIN-085",
+        "name": "Mechanism Design",
+        "title": "Make truthful reporting stable",
+        "formal": "design incentives so truthful reporting is a dominant strategy or equilibrium.",
+        "apm2_mapping": "“reward” should mean “advance work state” only when evidence checks pass. If an agent can progress by persuasion, you’ve built a lying machine. Gates and receipts are the incentive mechanism.",
+        "connections": [
+          "PRIN-092",
+          "PRIN-094"
+        ]
+      },
+      {
+        "id": "PRIN-086",
+        "name": "Causal Inference",
+        "title": "Don’t remediate based on spurious correlation",
+        "formal": "distinguish (P(Y|X)) from (P(Y|do(X))); interventions matter.",
+        "apm2_mapping": "auto-remediation must be intervention-driven: test a change, observe the counterfactual, roll back if not causal. Canarying and controlled experiments are the causal tool.",
+        "connections": [
+          "PRIN-067",
+          "PRIN-099"
+        ]
+      },
+      {
+        "id": "PRIN-087",
+        "name": "Robust Statistics",
+        "title": "Resist outliers and adversarial noise",
+        "formal": "prefer estimators with high breakdown point (median, trimmed mean, Huber loss).",
+        "apm2_mapping": "metrics and telemetry are attack surfaces. Use robust estimators for burn-rate decisions and anomaly detection; otherwise a single malicious/buggy holon can steer the controller.",
+        "connections": [
+          "PRIN-077",
+          "PRIN-084"
+        ]
+      },
+      {
+        "id": "PRIN-088",
+        "name": "Adversarial ML",
+        "title": "Treat inputs as attack surfaces",
+        "formal": "optimize worst-case loss under bounded perturbations; in practice, treat all model inputs as untrusted.",
+        "apm2_mapping": "prompts, retrieved context, tool outputs are *untrusted*. The safe design is: strict schemas, capability separation, hermetic sandboxes, and denial-by-default tools.",
+        "connections": [
+          "PRIN-089",
+          "PRIN-090",
+          "PRIN-091"
+        ]
+      },
+      {
+        "id": "PRIN-089",
+        "name": "Prompt Injection",
+        "title": "Is confused deputy; robust mitigation is capability separation + deny-by-default",
+        "formal": "confused deputy: an untrusted party tricks a privileged actor into misusing authority.",
+        "apm2_mapping": "the tool protocol is the deputy boundary. The only real fix is that the agent never has ambient authority: it must present explicit capabilities, and tools must validate strict schemas and scopes. Everything else is theater.",
+        "connections": [
+          "PRIN-038",
+          "PRIN-090",
+          "PRIN-091"
+        ]
+      },
+      {
+        "id": "PRIN-090",
+        "name": "Typed Tool Schemas + Structured Outputs",
+        "title": "Validate and parse, don’t “interpret” prose",
+        "formal": "schemas define admissible messages; parsing failures are denials.",
+        "apm2_mapping": "protobuf + validation is exactly right. The next step is ensuring every tool response is also structured and content-addressed, so downstream reasoning is about hashes and receipts, not uncontrolled text.",
+        "connections": [
+          "PRIN-031",
+          "PRIN-092"
+        ]
+      },
+      {
+        "id": "PRIN-091",
+        "name": "Sandboxing With Deny-by-default Network/filesystem Scopes",
+        "title": "Bounds damage",
+        "formal": "confinement is a safety invariant; capability grants are exceptions.",
+        "apm2_mapping": "make sandboxing non-optional for executors. Policy is not enough; enforce at OS boundary (PRIN-032). Capability grants should be narrow, time-bounded, and logged.",
+        "connections": [
+          "PRIN-034",
+          "PRIN-035",
+          "PRIN-043"
+        ]
+      },
+      {
+        "id": "PRIN-092",
+        "name": "Evidence-carrying Actions",
+        "title": "Every merge/deploy requires machine-checkable receipts",
+        "formal": "action validity predicate:\n[\nValid(Output,Receipt,Evidence)=VerifyReceipt \\wedge EvidenceSatisfies(contract) \\wedge DigestBindingsHold\n]\n(Exactly the direction APM2’s unified theory pushes.)",
+        "apm2_mapping": "AAT bundles, merge receipts, CI attestations—these are not “docs,” they are the core security boundary. Anything not bound to evidence is not real.",
+        "connections": [
+          "PRIN-044",
+          "PRIN-045",
+          "PRIN-046",
+          "PRIN-047",
+          "PRIN-085"
+        ]
+      },
+      {
+        "id": "PRIN-093",
+        "name": "Policy-as-code With Signed Bundles",
+        "title": "Distributable governance with consistent enforcement",
+        "formal": "policy hash (h(P)) is the governance identity; enforcement requires exact match.",
+        "apm2_mapping": "every holon must enforce the same policy hash for a given risk tier before acting. Signed policy bundles prevent drift and downgrade.",
+        "connections": [
+          "PRIN-041",
+          "PRIN-060"
+        ]
+      },
+      {
+        "id": "PRIN-094",
+        "name": "Risk Classes + Autonomy Levels",
+        "title": "Gate authority by evidence and risk",
+        "formal": "define an authority lattice and a promotion function:\n[\nauthority = f(risk, evidence, budget_headroom)\n]",
+        "apm2_mapping": "APM2 already encodes risk tiers in factory logic; make it universal: suggest → patch → merge → deploy are different “effect classes” requiring escalating receipts and isolation.",
+        "connections": [
+          "PRIN-063",
+          "PRIN-089",
+          "PRIN-090",
+          "PRIN-091",
+          "PRIN-092"
+        ]
+      },
+      {
+        "id": "PRIN-095",
+        "name": "Work Graphs As Dags",
+        "title": "Ordering must be explicit and replayable",
+        "formal": "represent work as state machines + DAG edges; replay derives state.",
+        "apm2_mapping": "the work module already includes parent_work_ids and immutable spec_snapshot_hash. The right posture is: **work is a replayable automaton**, not a chat log. “Conversation” is a projection; the ledger is truth.",
+        "connections": [
+          "PRIN-047",
+          "PRIN-050"
+        ]
+      },
+      {
+        "id": "PRIN-096",
+        "name": "Cognitive Memory Hierarchy Maps To Caches And Stores",
+        "title": "Tier memory explicitly",
+        "formal": "working memory (fast/volatile), episodic memory (append-only), semantic memory (index).",
+        "apm2_mapping": "working context is lossy and budgeted; episodic memory is ledger; semantic memory is future index, but must be versioned and invalidated like caches.",
+        "connections": [
+          "PRIN-021",
+          "PRIN-097"
+        ]
+      },
+      {
+        "id": "PRIN-097",
+        "name": "Rag Is Cache Coherence",
+        "title": "Versioning, invalidation, budgets",
+        "formal": "coherence requires: versions, invalidation rules, bounded staleness.",
+        "apm2_mapping": "retrieval must be content-addressed, version-pinned, and budgeted. ContextPack compilation is coherence: it pins roots and resolves transitive dependencies deterministically. Treat “stale context” as a coherence bug, not “model weirdness.”",
+        "connections": [
+          "PRIN-004",
+          "PRIN-005",
+          "PRIN-014",
+          "PRIN-015"
+        ]
+      },
+      {
+        "id": "PRIN-098",
+        "name": "Differential Testing + Continuous Red-teaming",
+        "title": "Find regressions and exploit paths",
+        "formal": "compare behaviors across implementations/versions; adversarial suites probe weak spots.",
+        "apm2_mapping": "red-team the tool protocol, policy engine, and gate semantics continuously. Differentially test canonicalization, hashing, schema validation, and replay determinism. These are the parts attackers target because they define truth.",
+        "connections": [
+          "PRIN-067",
+          "PRIN-088",
+          "PRIN-089",
+          "PRIN-090"
+        ]
+      },
+      {
+        "id": "PRIN-099",
+        "name": "Sociotechnical Incident Response",
+        "title": "Convert failure into stronger contracts and rollback triggers",
+        "formal": "postmortems produce actionable countermeasures; automate rollback based on SLO/budget triggers.",
+        "apm2_mapping": "incidents should mint new defects and new gates. If a failure mode happens twice, governance failed. Tie rollback triggers to burn-rate and to explicit receipts, not human panic. This is how Phase‑1 recursion becomes monotonic improvement.",
+        "connections": [
+          "PRIN-063",
+          "PRIN-064",
+          "PRIN-067",
+          "PRIN-092"
+        ]
+      },
+      {
+        "id": "PRIN-100",
+        "name": "Ashby’s Law Of Requisite Variety",
+        "title": "Only variety can destroy variety",
+        "formal": "For a controller to remain stable, the variety of its control actions must equal or exceed the variety of the disturbances it manages.",
+        "apm2_mapping": "Holons must match the variety of their environment (inputs) with sufficient internal state or control options. However, **HB-05** inverts this: we constrain the *interface* variety via schemas so the internal controller doesn’t need infinite variety. **Context Discipline** acts as a variety filter, reducing the state space the agent must handle.",
+        "connections": [
+          "PRIN-007"
+        ],
+        "law_refs": [
+          "LAW-05"
+        ],
+        "mechanism_refs": [
+          "MECH-SCHEMAS",
+          "MECH-WORK-DECOMPOSITION"
+        ]
+      },
+      {
+        "id": "PRIN-101",
+        "name": "Goodhart’s Law",
+        "title": "When a measure becomes a target, it ceases to be a good measure",
+        "formal": "Any observed statistical regularity will tend to collapse once pressure is placed upon it for control purposes.",
+        "apm2_mapping": "If you grade agents solely on \"tickets closed\", they will close invalid tickets. **MECH-MONITOR-ISOLATION** and **MECH-EVALUATOR-AUDIT** exist to prevent this. Metrics used for reward/training must be structurally separated from metrics used for oversight/audit (Law 8).",
+        "connections": [
+          "PRIN-084",
+          "PRIN-085",
+          "PRIN-099"
+        ],
+        "law_refs": [
+          "LAW-08"
+        ],
+        "mechanism_refs": [
+          "MECH-MONITOR-ISOLATION",
+          "MECH-EVALUATOR-AUDIT"
+        ]
+      },
+      {
+        "id": "PRIN-102",
+        "name": "Gall’s Law",
+        "title": "Complex systems must evolve from working simple systems",
+        "formal": "A complex system designed from scratch never works and cannot be patched to make it work. You have to start over with a working simple system.",
+        "apm2_mapping": "Do not build the \"Grand Unified Agent\" from day one. Build the **Primitive Holon** that correctly handles a simple loop (Law 1). Then compose them (Law 5). Recurrence loops (Loop 3) evolve the system by densifying patterns that work into primitives, not by designing complexity a priori.",
+        "connections": [
+          "PRIN-047",
+          "PRIN-072",
+          "PRIN-099"
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-04"
+        ],
+        "mechanism_refs": [
+          "LOOP-RECURRENCE",
+          "MECH-WORK-DECOMPOSITION"
+        ]
+      }
+    ]
+  }
+}

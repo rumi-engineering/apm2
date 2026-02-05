@@ -29,7 +29,7 @@
     },
     "ctx": [
       "documents/skills/rfc-council/references/exploratory-mode.md",
-      "documents/skills/modes-of-reasoning/artifacts/selector.json"
+      "documents/skills/modes-of-reasoning/assets/selector.json"
     ],
     "lex": {
       "E1": "Load v0 context; extract codebase questions from open questions.",

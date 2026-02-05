@@ -1,0 +1,15 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0012"
+  title: "RoleSpecV1 evidence (hash-addressed role instructions + conformance)"
+  category: "UNIT_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that RoleSpecV1 exists as a canonical, CAS-addressed artifact; episodes/receipts are attributed
+    by role_spec_hash; and a conformance harness validates RoleSpecs (tools/budgets/output schemas).
+  requirement_ids:
+    - "REQ-0012"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0012.yaml"
+    - "documents/rfcs/RFC-0019/10_fac_efficiency_and_role_specs.md"
+  artifacts: []

@@ -1,0 +1,176 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/debiasing-epistemic-hygiene@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z",
+    "updated_at": "2026-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 80,
+    "name": "debiasing-epistemic-hygiene",
+    "cat": "meta",
+    "core": "Constraint layer applying pre-commitment checks to any reasoning mode output. Five mandatory steps: base-rate anchoring, alternative-hypothesis generation, premortem analysis, disconfirmation search, and bias audit. Not a reasoning mode itself but a quality gate that wraps other modes.",
+
+    "out": [
+      {"name": "base_rate_anchor", "desc": "External reference rate with source citation, written before any inside-view analysis begins"},
+      {"name": "alternative_hypothesis_list", "desc": "≥3 competing explanations with plausibility estimates (high/medium/low or numeric)"},
+      {"name": "premortem_report", "desc": "Top 3 reasons the favored conclusion could be wrong, with ≥1 internal/controllable cause"},
+      {"name": "disconfirmation_evidence", "desc": "Specific evidence actually sought (not hypothetical) that would falsify the favored view"},
+      {"name": "bias_audit_log", "desc": "3-item checklist: anchoring (pass/fail + rationale), availability (pass/fail + rationale), confirmation (pass/fail + rationale)"},
+      {"name": "cognitive_load_flag", "desc": "Green/Yellow/Red indicator of decision-maker fatigue, time pressure, or emotional involvement"},
+      {"name": "residual_uncertainty", "desc": "Statement classifying remaining uncertainty as reducible (more data helps) or irreducible (fundamental)"}
+    ],
+
+    "proc": [
+      {
+        "step": 1,
+        "name": "Anchor on base rate",
+        "action": "Before analyzing the specific case, find an external reference class and its base rate. Write it down with source.",
+        "test": "Can you cite a source for the base rate? Is it written before your inside-view analysis?",
+        "example": "Software projects: 70% overrun schedule (Standish Group). Medical: 10% of ER chest pain is cardiac (NEJM study)."
+      },
+      {
+        "step": 2,
+        "name": "Generate ≥3 alternatives",
+        "action": "List at least 3 competing hypotheses/options. Include one 'mundane' explanation and one 'structural' explanation. Assign plausibility (H/M/L or %).",
+        "test": "Are there genuinely distinct alternatives, not strawmen? Could a reasonable person favor each?",
+        "example": "Project delay: (H) scope creep, (M) key person sick, (L) vendor bankruptcy, (L) requirements misunderstood."
+      },
+      {
+        "step": 3,
+        "name": "Run premortem",
+        "action": "Assume your favored conclusion is wrong. List top 3 reasons why. At least one must be something you control.",
+        "test": "Is there ≥1 internal cause (not 'bad luck' or 'market crashed')? Would this list surprise you in hindsight?",
+        "example": "Launch fails because: (1) we underestimated integration time [internal], (2) customer needs shifted [external], (3) team burned out [internal]."
+      },
+      {
+        "step": 4,
+        "name": "Search for disconfirmation",
+        "action": "Identify evidence that would falsify your view. Actually look for it (run query, check data, ask skeptic). Document what you found.",
+        "test": "Did you actually search, or just imagine what you would find? What specific asset proves you searched?",
+        "example": "Favored view: users want feature X. Disconfirmation: searched support tickets for 'X'—only 3 mentions in 6 months."
+      },
+      {
+        "step": 5,
+        "name": "Audit for biases",
+        "action": "Check three specific biases with pass/fail and rationale:",
+        "sub_checks": [
+          {"bias": "Anchoring", "question": "Did my first number unduly influence my final estimate?", "pass_example": "Initial estimate 2wk, revised to 4wk after scope review—anchor didn't dominate."},
+          {"bias": "Availability", "question": "Am I overweighting recent/vivid examples?",  "pass_example": "Recent outage made me worried, but checked: 2 outages in 3 years, not systemic."},
+          {"bias": "Confirmation", "question": "Did I seek/weight evidence that confirms my view?", "pass_example": "Read 3 articles against my position, found 1 compelling counter-argument."}
+        ],
+        "test": "Each bias has explicit pass/fail with rationale, not just 'checked'."
+      },
+      {
+        "step": 6,
+        "name": "Assess cognitive load",
+        "action": "Flag decision-maker state: Green (fresh, no pressure), Yellow (moderate fatigue or time pressure), Red (exhausted, emotional, or <24h deadline).",
+        "test": "If Red, defer decision or get second opinion. If Yellow, timebox and revisit.",
+        "example": "Yellow: 10 PM after full workday, deadline tomorrow. Action: sleep, revisit at 9 AM."
+      },
+      {
+        "step": 7,
+        "name": "Document residual uncertainty",
+        "action": "State what you still don't know. Classify as reducible (more data would help) or irreducible (fundamental unknowability).",
+        "test": "Is there a next step for reducible uncertainty? Is irreducible uncertainty acknowledged in confidence level?",
+        "example": "Reducible: customer intent (survey would help). Irreducible: competitor response (can't know until launch)."
+      }
+    ],
+
+    "check": [
+      "Base rate written with source citation before inside-view analysis",
+      "≥3 alternatives listed with plausibility, including mundane option",
+      "Premortem has ≥1 internal/controllable cause",
+      "Disconfirmation evidence actually searched (asset/link provided)",
+      "Bias audit: 3 items with pass/fail + rationale each",
+      "Cognitive load flag set (Green/Yellow/Red) with action if not Green",
+      "Residual uncertainty classified (reducible vs irreducible)",
+      "If any bias failed or load is Red: decision deferred or second opinion obtained"
+    ],
+
+    "diff": {
+      "meta-reasoning": {
+        "boundary": "Meta-reasoning selects which mode to use; debiasing audits the output of whatever mode was used.",
+        "test": "Are you choosing an approach (meta) or checking an answer (debiasing)?"
+      },
+      "calibration": {
+        "boundary": "Calibration tracks accuracy across many judgments over time; debiasing intervenes on a single judgment now.",
+        "test": "Are you updating a track record (calibration) or fixing this decision (debiasing)?"
+      },
+      "adversarial-red-team": {
+        "boundary": "Red-team simulates an external adversary attacking your system; debiasing audits your own cognition.",
+        "test": "Are you roleplaying an attacker (red-team) or checking your own thinking (debiasing)?"
+      },
+      "reference-class-outside-view": {
+        "boundary": "Reference-class is one technique (step 1 of debiasing); debiasing is a broader discipline with 7 steps.",
+        "test": "Did you only anchor on base rate, or did you also do premortem + disconfirmation + audit?"
+      },
+      "abductive": {
+        "boundary": "Abduction generates hypotheses; debiasing prevents story bias when selecting among them.",
+        "test": "Are you creating explanations (abductive) or checking you didn't fall in love with one (debiasing)?"
+      }
+    },
+
+    "best_for": [
+      "High-stakes one-shot decisions (hiring, investment, launch)",
+      "Forecasting and estimation where you have skin in the game",
+      "Incident postmortems to avoid blame-driven narratives",
+      "Hypothesis selection after abductive reasoning",
+      "Strategic planning under uncertainty",
+      "Any decision you cannot easily reverse"
+    ],
+
+    "fail": {
+      "mode": "Ritualized checklist",
+      "desc": "Checklist completed mechanically without genuine consideration—no conclusions ever change, alternatives are strawmen, premortem lists only external causes.",
+      "signals": [
+        "Zero decisions reversed or modified in past quarter",
+        "Checklist copy-pasted from previous analysis",
+        "Alternatives are obviously inferior (strawmen)",
+        "Premortem lists only 'bad luck' or external factors",
+        "Disconfirmation search is hypothetical ('we would look at...')",
+        "Debiasing takes <5 minutes for high-stakes decision",
+        "Base rates 'estimated' rather than sourced"
+      ],
+      "mitigations": [
+        {"m": "Require ≥1 judgment change per quarter", "test": "Can you name a decision debiasing actually changed?"},
+        {"m": "Rotate devil's advocate role", "test": "Different person challenges each major decision?"},
+        {"m": "Blind elicitation before group discussion", "test": "Initial estimates collected before anyone speaks?"},
+        {"m": "Timebox 10-15 minutes minimum for high stakes", "test": "Is there a calendar block for debiasing?"},
+        {"m": "Require asset of disconfirmation search", "test": "Is there a link/screenshot/query proving you looked?"},
+        {"m": "Audit past debiasing assets for accuracy", "test": "Did the premortem predict the actual failure mode?"},
+        {"m": "External reviewer spot-checks random decisions", "test": "Someone outside the team reviews 1 in 10 analyses?"}
+      ]
+    },
+
+    "rel": [
+      {"id": 75, "name": "meta-reasoning", "role": "Selects which mode to apply; debiasing audits mode outputs"},
+      {"id": 76, "name": "calibration", "role": "Tracks long-run accuracy; complements single-judgment debiasing"},
+      {"id": 79, "name": "adversarial-red-team", "role": "External attack simulation; debiasing is internal audit"},
+      {"id": 18, "name": "reference-class-outside-view", "role": "Base-rate anchoring technique (step 1)"},
+      {"id": 13, "name": "abductive", "role": "Hypothesis generation; debiasing prevents story bias in selection"},
+      {"id": 11, "name": "bayesian-probabilistic", "role": "Normative standard; debiasing catches departures from it"},
+      {"id": 45, "name": "decision-theoretic", "role": "Computes optimal action; debiasing checks input quality"},
+      {"id": 51, "name": "satisficing", "role": "Good-enough decisions; can skip debiasing for low stakes"},
+      {"id": 36, "name": "assurance-case", "role": "Documents why claims hold; debiasing audits the claim-evidence links"},
+      {"id": 77, "name": "reflective-equilibrium", "role": "Coherence between beliefs and principles; debiasing focuses on single judgments"}
+    ],
+
+    "ex": {
+      "situation": "Tech lead recommends rewriting legacy auth service (3 months, 2 engineers).",
+      "steps": [
+        "BASE RATE: 65% of rewrites exceed estimate by >50% (Source: Accelerate).",
+        "ALTERNATIVES: (H) Rewrite, (M) Strangler pattern incremental, (L) Buy SaaS, (L) Do nothing + workarounds.",
+        "PREMORTEM: (1) Scope creep from undocumented edge cases [internal], (2) Key engineer leaves mid-project [internal], (3) New requirements arrive during rewrite [external].",
+        "DISCONFIRMATION: Searched for teams who regretted rewrites: found 2 HN threads, both cited integration surprises. Strengthened strangler-pattern option.",
+        "BIAS AUDIT: Anchoring: PASS (tech lead's 3mo didn't dominate—added 50% buffer). Availability: FAIL (recent outage made rewrite feel urgent—checked: 1 outage/year, not catastrophic). Confirmation: PASS (actively sought rewrite-failure stories).",
+        "LOAD: Yellow (deadline pressure from upcoming audit). Action: present options to CTO before committing.",
+        "RESIDUAL: Reducible: effort estimate (spike would help). Irreducible: whether vendor SaaS will meet compliance."
+      ],
+      "outcome": "Chose strangler pattern after debiasing; rewrite option was availability-biased."
+    }
+  }
+}

@@ -1,0 +1,156 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/multi-criteria-decision-analysis@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 46,
+    "name": "multi-criteria-decision-analysis",
+    "cat": "decision",
+    "core": "Evaluate alternatives against multiple conflicting objectives using weights, outranking, or Pareto frontiers to make tradeoffs explicit rather than collapsing into single metric.",
+    "out": [
+      "criteria_hierarchy (tree: goal → sub-criteria → measurable attributes)",
+      "weight_vector (normalized, with elicitation method cited)",
+      "performance_matrix (alternatives × criteria scores)",
+      "tradeoff_surface (Pareto frontier if incommensurable)",
+      "pareto_efficient_set (dominated alternatives removed)",
+      "scoring_model (method: AHP | ELECTRE | TOPSIS | weighted-sum)",
+      "sensitivity_report (weight perturbation → rank changes)"
+    ],
+    "methods": {
+      "weighted_sum": "multiply scores by weights, sum → single rank; fast but hides tradeoffs",
+      "ahp": "pairwise comparisons → eigenvector weights; good for stakeholder elicitation",
+      "electre": "outranking with concordance/discordance; handles incomparability",
+      "topsis": "distance to ideal/anti-ideal points; geometric interpretation",
+      "pareto_frontier": "no aggregation; display non-dominated set for human choice"
+    },
+    "proc": [
+      "1. enumerate alternatives (≥3; include status-quo baseline)",
+      "2. define criteria hierarchy (max 3 levels; leaf nodes must be measurable)",
+      "3. elicit weights via structured method (AHP pairwise, swing weights, or rank-order centroid)",
+      "4. score alternatives per criterion on common scale (0-1 or 1-5; document source)",
+      "5. check consistency: AHP CR < 0.10; rank reversals flagged",
+      "6. aggregate: weighted-sum for commensurable; Pareto frontier if weights contested",
+      "7. sensitivity analysis: vary each weight ±20%; report rank-change thresholds",
+      "8. present tradeoff surface + sensitivity to decision-maker for final selection"
+    ],
+    "check": [
+      "criteria cover all stakeholder concerns (verify via stakeholder sign-off)",
+      "weights sum to 1.0 and elicitation method documented",
+      "scoring scales consistent across criteria (no apples-to-oranges)",
+      "AHP consistency ratio < 0.10 if pairwise used",
+      "Pareto frontier computed if criteria truly incommensurable",
+      "sensitivity on weights performed; threshold weights documented",
+      "dominated alternatives explicitly excluded with justification",
+      "weight sources documented (who assigned, what method, when)"
+    ],
+    "diff": {
+      "decision-theoretic": "decision-theoretic collapses to single expected utility; MCDA keeps tradeoffs visible for stakeholder deliberation",
+      "optimization": "optimization solves for single objective; MCDA surfaces multi-objective frontier and lets human choose",
+      "argumentation-theory": "argumentation deliberates qualitatively on pros/cons; MCDA provides quantitative scored comparisons",
+      "means-end": "means-end links goals to actions linearly; MCDA compares across conflicting goals with explicit weights",
+      "robust-worst-case": "robust optimizes worst outcome; MCDA balances multiple objectives without worst-case focus",
+      "satisficing": "satisficing stops at first good-enough option; MCDA compares all alternatives systematically"
+    },
+    "confusions": [
+      {
+        "pair": "mcda vs decision-theoretic",
+        "symptom": "forcing single utility when stakeholders disagree on weights",
+        "fix": "if weight disagreement > 20%, use MCDA Pareto frontier; show tradeoff surface rather than false precision"
+      },
+      {
+        "pair": "mcda vs satisficing",
+        "symptom": "using MCDA when one option obviously meets all thresholds",
+        "fix": "if clear threshold-based winner exists, use satisficing (faster); reserve MCDA for genuine multi-objective conflicts"
+      },
+      {
+        "pair": "mcda vs robust-worst-case",
+        "symptom": "weighting risk criterion heavily instead of using robust analysis",
+        "fix": "if protecting against worst-case is primary goal, use robust-worst-case; MCDA balances, it does not guarantee floors"
+      }
+    ],
+    "fail": {
+      "mode": "arbitrary_weights",
+      "signals": [
+        "weights chosen by analyst without stakeholder input",
+        "false precision in scores (3 decimal places on subjective ratings)",
+        "political bias hidden in weights (inflating favored criteria)",
+        "criteria omitted to force predetermined outcome",
+        "stakeholder disagreement on weights papered over"
+      ],
+      "mit": [
+        "require documented elicitation session with ≥2 stakeholders before finalizing weights",
+        "bound subjective scores to integer scales (1-5); flag any sub-integer precision as suspect",
+        "run sensitivity analysis: if result changes when any single weight varies ±15%, flag as fragile",
+        "require explicit sign-off that criteria set is complete; track criteria additions/deletions with rationale",
+        "when stakeholders disagree on weights by >20%, present Pareto frontier instead of forcing consensus",
+        "audit trail: record who assigned each weight, method used, and date; reject undocumented weights",
+        "premortem: before finalizing, ask 'how could these weights be gamed?' and document defenses"
+      ]
+    },
+    "use": [
+      "strategic planning (multiple objectives: growth, risk, cost)",
+      "procurement evaluation (cost, quality, delivery, support)",
+      "roadmap prioritization (impact, effort, risk, alignment)",
+      "governance decisions (compliance, cost, stakeholder value)",
+      "multi-stakeholder negotiations (surfacing value differences)",
+      "policy analysis (equity, efficiency, feasibility)",
+      "vendor selection (price, capability, risk, relationship)",
+      "site selection (cost, talent, infrastructure, incentives)"
+    ],
+    "rel": [
+      "decision-theoretic",
+      "optimization",
+      "argumentation-theory",
+      "robust-worst-case",
+      "game-theoretic-strategic",
+      "value-of-information",
+      "satisficing"
+    ],
+    "micro_example": {
+      "context": "Select CI/CD platform; stakeholders: DevOps (weights speed), Security (weights compliance), Finance (weights cost)",
+      "criteria_hierarchy": {
+        "goal": "best_ci_cd_platform",
+        "sub_criteria": ["speed", "security_compliance", "cost", "ecosystem"]
+      },
+      "weight_elicitation": "AHP pairwise with 3 stakeholders; CR = 0.07",
+      "weights": {"speed": 0.30, "security_compliance": 0.35, "cost": 0.20, "ecosystem": 0.15},
+      "performance_matrix": {
+        "platform_a": {"speed": 0.9, "security_compliance": 0.7, "cost": 0.6, "ecosystem": 0.8},
+        "platform_b": {"speed": 0.7, "security_compliance": 0.9, "cost": 0.8, "ecosystem": 0.6},
+        "platform_c": {"speed": 0.8, "security_compliance": 0.8, "cost": 0.9, "ecosystem": 0.7}
+      },
+      "weighted_scores": {"platform_a": 0.755, "platform_b": 0.785, "platform_c": 0.815},
+      "sensitivity": "platform_c wins; but if security_compliance weight > 0.42, platform_b wins",
+      "asset_output": "present sensitivity chart to stakeholders; decision: platform_c with security_compliance monitoring clause"
+    },
+    "ex": {
+      "situation": "Select cloud vendor across cost, security, latency, vendor-lock-in",
+      "criteria": ["cost", "security", "latency", "lock_in_risk"],
+      "weights": [0.3, 0.35, 0.2, 0.15],
+      "alternatives": ["vendor_a", "vendor_b", "vendor_c"],
+      "scores": {
+        "vendor_a": [0.8, 0.9, 0.6, 0.5],
+        "vendor_b": [0.6, 0.7, 0.9, 0.8],
+        "vendor_c": [0.9, 0.6, 0.7, 0.7]
+      },
+      "result": "vendor_a ranks highest but sensitivity shows vendor_b wins if latency weight exceeds 0.35"
+    },
+    "quick_checklist": [
+      "[ ] ≥3 alternatives including status-quo",
+      "[ ] criteria hierarchy ≤3 levels, leaves measurable",
+      "[ ] weights elicited via documented method (AHP/swing/ROC)",
+      "[ ] weights sum to 1.0 ± 0.01",
+      "[ ] AHP consistency ratio < 0.10",
+      "[ ] all scores on same scale with source cited",
+      "[ ] dominated alternatives marked and excluded",
+      "[ ] sensitivity: ±15% weight variation tested",
+      "[ ] stakeholder sign-off on criteria completeness",
+      "[ ] audit trail: who, what method, when for weights"
+    ]
+  }
+}

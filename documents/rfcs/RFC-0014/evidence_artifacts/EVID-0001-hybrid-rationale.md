@@ -48,6 +48,6 @@ OPT-HYBRID was selected because:
 - [ ] Review meeting notes (pending)
 
 ## References
-- documents/skills/laws-of-holonic-agent-systems/references/unified-theory.md (PHY-04)
-- documents/skills/laws-of-holonic-agent-systems/references/law_03.md
-- documents/skills/laws-of-holonic-agent-systems/references/law_10.md
+- documents/theory/unified_theory.json (PHY-04)
+- documents/theory/laws.json
+- documents/theory/laws.json

@@ -1,60 +1,64 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00326"
-    title: "ContextPack sealing + broker firewall initialization (end-to-end)"
+    id: TCK-00326
+    title: ContextPack sealing + broker firewall initialization (end-to-end)
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0008"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0008.yaml#requirement"
+    - requirement_id: REQ-0008
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0008.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0008"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0008.yaml#evidence_artifact"
+    - evidence_id: EVID-0008
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0008.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
-      - "DOMAIN_SECURITY"
+    - DOMAIN_DAEMON
+    - DOMAIN_SECURITY
   dependencies:
     tickets:
-      - ticket_id: "TCK-00255"
-        reason: "Context pack sealing pattern exists; this ticket makes it CAS-backed and wired into broker enforcement"
-      - ticket_id: "TCK-00316"
-        reason: "Session tool execution must be kernel-side so the firewall is mechanically enforceable"
-      - ticket_id: "TCK-00317"
-        reason: "Capability manifests must be real; context firewall must compose with capability enforcement"
+    - ticket_id: TCK-00316
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
+    - ticket_id: TCK-00317
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Seal ContextPacks as CAS artifacts and reference them by hash (context_pack_hash)"
-      - "Surface context_pack_hash to the broker/session execution boundary (no hidden/ambient context)"
-      - "Initialize ToolBroker context firewall from context_pack_hash before any tool actuation"
-      - "Fail closed on missing/unsealable/unresolvable ContextPack (emit ReviewBlockedRecorded or termination per policy)"
-      - "Embed capability_manifest_hash and context_pack_hash into review artifacts/receipts (authority binding)"
-      - "Add tests proving out-of-pack reads are denied and recorded"
+    - Seal ContextPacks as CAS artifacts and reference them by hash
+    - Initialize broker context firewall from context_pack_hash for every episode
+    - Fail closed on missing/unsealable ContextPack (ReviewBlockedRecorded)
+    - Embed capability_manifest_hash and context_pack_hash into review artifacts/receipts (authority
+      binding)
     out_of_scope:
-      - "Cross-org policy governance and pack distribution/anti-entropy (future)"
+    - Cross-org policy governance (future)
   plan:
     steps:
-      - "Audit existing context pack sealing in policy resolution (crates/apm2-daemon/src/protocol/dispatch.rs)"
-      - "Store sealed ContextPack bytes in CAS and ensure the returned context_pack_hash is the CAS content address"
-      - "Expose context_pack_hash on the episode/session boundary (SpawnEpisode/ClaimWork responses and runtime wiring)"
-      - "Load ContextPackManifest from CAS by hash and initialize ToolBroker context_manifest (fail closed on retrieval/verification errors)"
-      - "Add broker-side enforcement tests: allowlisted reads pass; out-of-pack reads terminate/deny and are recorded"
-      - "Bind capability_manifest_hash + context_pack_hash into review artifact bundle (v2 or binding sub-artifact) and verify fail-closed behavior when missing"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Seal ContextPacks as CAS artifacts and reference them by hash'
+    - 'Implement: Initialize broker context firewall from context_pack_hash for every episode'
+    - 'Implement: Fail closed on missing/unsealable ContextPack (ReviewBlockedRecorded)'
+    - 'Implement: Embed capability_manifest_hash and context_pack_hash into review artifacts/receipts
+      (authority binding)'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0008"
+    - EVID-0008
     criteria:
-      - "ContextPacks are stored in CAS and loaded by hash."
-      - "Broker context firewall is initialized from sealed ContextPack for each episode."
-      - "Reads/tool requests outside ContextPack are denied/terminated and recorded."
-      - "Review artifacts include capability_manifest_hash and context_pack_hash bindings."
+    - ContextPacks stored in CAS and loaded by hash
+    - Context firewall initialized from sealed ContextPack for each episode
+    - Reads/tool requests outside ContextPack are denied and recorded
+    - Review artifacts include capability_manifest_hash and context_pack_hash bindings
   notes:
-    security: "Context firewall is mechanical: deny-by-default, fail closed on pack miss or pack retrieval failure."
-    verification: "Include negative tests (pack miss, out-of-pack read) and confirm durable blocked/termination outcomes."
-    general: "Required to prevent prompt injection/context poisoning via ambient filesystem reads."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

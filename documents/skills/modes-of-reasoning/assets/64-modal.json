@@ -1,0 +1,154 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/modal@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 64,
+    "name": "modal",
+    "cat": "formal",
+    "core": "Reason with necessity (box), possibility (diamond), knowledge (K), belief (B), and dynamic action ([alpha]) operators; distinguish what must be true in all accessible worlds from what happens to be true in the actual world; track accessibility relations whose properties (reflexive, transitive, symmetric) determine the modal system.",
+    "out": [
+      {"type": "possibility_space", "form": "set of possible worlds with accessibility relation R", "test": "R properties match declared system: K=none, T=reflexive, S4=reflexive+transitive, S5=equivalence"},
+      {"type": "knowledge_attribution", "form": "K_agent(phi) with accessibility justification", "test": "factivity holds (K(p) implies p); positive introspection if S4+ (K(p) implies K(K(p)))"},
+      {"type": "belief_attribution", "form": "B_agent(phi) with consistency check", "test": "belief need not be factive; consistency: not(B(p) and B(not-p)) unless paraconsistent"},
+      {"type": "action_effects", "form": "[alpha]phi (after alpha, phi holds) or <alpha>phi (alpha possible and then phi)", "test": "preconditions checked; postconditions propagated to successor worlds only"},
+      {"type": "modality_verdicts", "form": "box(phi)/diamond(phi) with world enumeration", "test": "box: phi in ALL R-accessible worlds; diamond: phi in AT LEAST ONE R-accessible world"}
+    ],
+    "proc": [
+      "1. CLASSIFY MODALITY: determine operator type: alethic (necessary/possible), epistemic (knows), doxastic (believes), dynamic (after action), or hybrid; each requires different accessibility semantics",
+      "2. SELECT SYSTEM: choose modal system based on domain: K (minimal, no special properties), T (reflexive: what is necessary is true), S4 (reflexive+transitive: introspection), S5 (equivalence: fully transparent necessity), or domain-specific (epistemic, dynamic)",
+      "3. DEFINE WORLDS: enumerate relevant possible worlds; for epistemic, worlds are information states; for dynamic, worlds are program states; for alethic, worlds are metaphysically possible scenarios",
+      "4. SPECIFY ACCESSIBILITY: define which worlds are R-accessible from which; document why these connections hold (observation equivalence, action reachability, logical consistency)",
+      "5. EVALUATE LOCALLY: determine truth of atomic propositions at each world independently",
+      "6. EVALUATE MODALLY: for box(phi), check phi in all R-accessible worlds; for diamond(phi), check phi in at least one; for K_a(phi), check phi in all worlds agent a cannot distinguish",
+      "7. VALIDATE AXIOMS: verify conclusions respect chosen system axioms: T-axiom (box(p)->p), 4-axiom (box(p)->box(box(p))), 5-axiom (diamond(p)->box(diamond(p)))",
+      "8. OUTPUT VERDICTS: state modality verdicts with explicit world analysis; distinguish 'necessarily true' from 'contingently true' from 'possibly true'"
+    ],
+    "check": [
+      "modal system explicitly declared with justification (why K vs T vs S4 vs S5?)",
+      "accessibility relation properties documented and matched to system",
+      "worlds enumerated or characterized (not left implicit)",
+      "necessity (all worlds) vs possibility (some world) correctly applied",
+      "possibility not conflated with probability (possible != likely)",
+      "contingent truth not inflated to necessity (true here != true everywhere)",
+      "epistemic K satisfies factivity (K(p) -> p); belief B need not",
+      "dynamic operators check preconditions before applying",
+      "nested modalities handled correctly per system (S4 collapses box-box)"
+    ],
+    "diff": {
+      "deductive-1": "deductive has no modal operators; derives what follows from premises in actual world. Modal adds necessity/possibility operators to reason across worlds. Use deductive for single-world entailment; modal for multi-world analysis.",
+      "deontic-65": "deontic uses modal structure for norms (O=ought, P=permitted, F=forbidden); alethic modal is about metaphysical truth/necessity. Deontic accessibility is 'ideal worlds'; alethic is 'possible worlds'. Use deontic for normative reasoning; alethic modal for possibility/necessity.",
+      "temporal-66": "temporal is modal logic specialized for time: G=always, F=eventually, X=next. Temporal accessibility is 'reachable future states'. General modal is broader, covering knowledge, belief, action, and abstract possibility. Use temporal for time-indexed properties; modal for non-temporal modalities.",
+      "probabilistic-11": "probabilistic assigns numeric measures P(phi) in [0,1]; modal is qualitative (possible vs necessary). Diamond(phi) means P(phi)>0; box(phi) means P(phi)=1. But modal doesn't distinguish P=0.01 from P=0.99. Use probabilistic for graded uncertainty; modal for all-or-nothing modality.",
+      "counterfactual-39": "counterfactual evaluates 'what would have happened if X' using causal models and interventions. Modal possibility is 'exists accessible world where phi'; counterfactual is 'in closest world where X, does Y hold?'. Counterfactual requires causal structure; modal requires accessibility. Use counterfactual for causal attribution; modal for logical possibility."
+    },
+    "confusions": [
+      {
+        "pair": ["modal", "counterfactual"],
+        "symptom": "saying 'possibly X caused Y' when you mean 'if X had not occurred, Y would not have occurred'",
+        "resolution": "modal possibility is about accessible worlds without causal structure; counterfactual requires explicit causal model with intervention. If asking 'would Y have happened without X?', use counterfactual (#39). If asking 'is there a consistent world where X and not-Y?', use modal."
+      },
+      {
+        "pair": ["modal", "probabilistic"],
+        "symptom": "inferring 'X is likely' from 'X is possible' or 'X is certain' from 'X is necessary'",
+        "resolution": "possible means exists-one-world (could be rare); necessary means all-worlds (not about confidence). A 1-in-million event is possible but not likely. Use probabilistic (#11) for graded likelihood; modal for categorical possibility/necessity."
+      },
+      {
+        "pair": ["epistemic-modal", "belief-revision"],
+        "symptom": "using K_a(phi) when modeling how agent's beliefs change upon learning new information",
+        "resolution": "epistemic modal (K) captures static knowledge state at a moment; belief revision (#33) models dynamic change when new evidence arrives. If asking 'what does agent know now?', use epistemic modal. If asking 'how should agent update upon learning E?', use belief revision."
+      }
+    ],
+    "fail": {
+      "mode": "conflating_possibility_probability_necessity",
+      "desc": "treating 'possible' as 'likely', 'true' as 'necessary', or applying wrong modal system for domain",
+      "signals": [
+        "claims 'X is possible therefore X is likely' (possible != probable)",
+        "claims 'X is true therefore X must be true' (actual != necessary)",
+        "uses S5 reasoning (box(p)->box(box(p))) when domain only supports K",
+        "applies epistemic operators without specifying agent's information state",
+        "conflates 'logically possible' with 'physically possible' with 'epistemically possible'"
+      ],
+      "mitigations": [
+        {
+          "id": "M1-system-declaration",
+          "trigger": "before any modal reasoning",
+          "action": "explicitly declare modal system (K/T/S4/S5/epistemic/dynamic) with domain justification; state which axioms apply",
+          "test": "system_declaration exists AND system_declaration.axioms.length > 0"
+        },
+        {
+          "id": "M2-world-enumeration",
+          "trigger": "when evaluating box or diamond",
+          "action": "enumerate or characterize the set of R-accessible worlds; do not leave implicit",
+          "test": "accessibility_analysis.worlds.length > 0 OR accessibility_analysis.characterization exists"
+        },
+        {
+          "id": "M3-counterexample-search",
+          "trigger": "when claiming necessity (box(phi))",
+          "action": "actively search for an R-accessible world where phi fails; if found, necessity claim is false",
+          "test": "counterexample_search.attempted == true AND (counterexample_search.found == false OR necessity_claim_retracted)"
+        },
+        {
+          "id": "M4-probability-separation",
+          "trigger": "when possibility claim might be confused with likelihood",
+          "action": "explicitly state: 'possible means exists-accessible-world, not probable'; if likelihood relevant, invoke probabilistic mode",
+          "test": "output.contains('possible') implies output.contains('not probable') OR probability_mode_invoked"
+        },
+        {
+          "id": "M5-factivity-check",
+          "trigger": "when using epistemic K operator",
+          "action": "verify K(p) implies p is true; if p might be false, use belief B instead",
+          "test": "for all K_a(p) claims: p.truth_value == true OR operator_changed_to_B"
+        }
+      ]
+    },
+    "use": [
+      "security protocol verification: what does attacker know? (epistemic K)",
+      "program verification: after action alpha, does phi hold? (dynamic [alpha]phi)",
+      "requirements specification: system must always satisfy phi (alethic box(phi))",
+      "knowledge representation: distinguishing certain from uncertain facts",
+      "access control: agent a knows password iff password true in all a-indistinguishable worlds",
+      "game theory: common knowledge (everyone knows that everyone knows...)",
+      "planning: diamond(goal) means goal is achievable; box(safe) means all paths are safe"
+    ],
+    "rel": [
+      {"id": 1, "name": "deductive", "why": "modal extends classical logic with operators; deductive is the single-world fragment"},
+      {"id": 65, "name": "deontic", "why": "deontic is modal logic with normative operators (ought/permitted) instead of alethic"},
+      {"id": 66, "name": "temporal", "why": "temporal is modal logic with time operators (always/eventually) and time-indexed accessibility"},
+      {"id": 11, "name": "bayesian-probabilistic", "why": "probabilistic is quantitative alternative; modal possibility/necessity are qualitative extremes"},
+      {"id": 39, "name": "counterfactual", "why": "counterfactual uses causal structure for 'closest world'; modal uses accessibility without causal ordering"},
+      {"id": 33, "name": "belief-revision", "why": "epistemic modal is static; belief revision models dynamic knowledge update"}
+    ],
+    "ex": {
+      "ctx": "Security protocol analysis: Agent A sends encrypted message to B. Attacker E observes ciphertext. Question: Does E know the plaintext?",
+      "system": "Epistemic modal logic with S5 for each agent (perfect introspection within agent's knowledge)",
+      "worlds": "W1: key=k1, plaintext=m1; W2: key=k2, plaintext=m2; W3: key=k1, plaintext=m2 (all consistent with observed ciphertext c)",
+      "accessibility": "E cannot distinguish W1, W2, W3 (all produce same ciphertext observation). R_E = {(W1,W2), (W1,W3), (W2,W3), ...reflexive pairs}",
+      "evaluation": "K_E(plaintext=m1) requires plaintext=m1 in all E-accessible worlds. But W2 and W3 have plaintext=m2. So not K_E(plaintext=m1).",
+      "verdict": "E does not know the plaintext. diamond_E(plaintext=m1) is true (possible in W1). diamond_E(plaintext=m2) is true (possible in W2,W3). E has uncertainty, not knowledge.",
+      "asset": "knowledge_attribution: {agent: E, phi: 'plaintext=m1', verdict: false, justification: 'counterexample worlds W2,W3 exist in R_E'}"
+    },
+    "micro_example": {
+      "ctx": "Does the system necessarily satisfy property P, or only contingently?",
+      "system": "T (reflexive: what is necessary is true in actual world)",
+      "analysis": "Actual world w0 satisfies P. Check all accessible worlds. w1 (high load): P holds. w2 (network partition): P fails.",
+      "verdict": "not box(P) because w2 is accessible and P false there. diamond(P) true. P is contingent, not necessary.",
+      "output": "{modality_verdict: {phi: P, box: false, diamond: true, counterexample: w2, contingency: 'P depends on network connectivity'}}"
+    },
+    "quick_check": [
+      "Did I declare which modal system (K/T/S4/S5/epistemic/dynamic) and why?",
+      "Did I specify accessibility relation properties (reflexive? transitive? symmetric?)?",
+      "Did I enumerate or characterize the relevant possible worlds?",
+      "For necessity claims, did I check ALL accessible worlds (or search for counterexample)?",
+      "For possibility claims, did I identify AT LEAST ONE witness world?",
+      "Did I avoid conflating possibility with probability?",
+      "Did I distinguish contingent truth (true here) from necessary truth (true everywhere)?",
+      "For epistemic claims, did I verify factivity (K(p) -> p) holds?"
+    ]
+  }
+}

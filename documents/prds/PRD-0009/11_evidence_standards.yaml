@@ -135,7 +135,7 @@ prd_evidence_standards:
       required_for:
         - FAC-REQ-0100
     - category: RUN_RECEIPT_ARTIFACTS
-      description: "RunReceipt artifacts capturing context sufficiency metrics (bytes, entries, misses, ZTI score)."
+      description: "RunReceipt artifacts capturing context sufficiency metrics (bytes, entries, misses, efficiency score)."
       required_for:
         - FAC-REQ-0100
     - category: MERGE_RECEIPT_ARTIFACTS

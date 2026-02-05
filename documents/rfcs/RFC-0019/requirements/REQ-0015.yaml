@@ -1,0 +1,29 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0015"
+  title: "Refactors: remove dead/unused/unsafe-by-default protocols and bypasses (excluding xtask)"
+  category: "NON_FUNCTIONAL"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    After automated FAC v0 is validated, the codebase MUST remove dead, unused, and unsafe-by-default
+    protocols/patterns/modules that increase bypass surface or maintenance burden (excluding xtask
+    until later stages).
+
+    Minimum removals (required):
+    - any legacy/stub allow paths that permit tool execution without broker mediation
+    - deprecated protocol handlers that are unsafe-by-default or unused by FAC v0
+    - modules that duplicate truth outside ledger/CAS as authoritative state
+
+    Refactors MUST not break xtask or the validated FAC path.
+  rationale: |
+    Once FAC v0 is running, unused/bypass code becomes the main driver of bugs and regressions.
+    Removing it improves velocity and reduces the chance of accidental regressions into unsafe patterns.
+  acceptance_criteria:
+    - "No code path can execute a tool without broker mediation + ledger emission."
+    - "Deprecated protocol handlers are deleted or hard-disabled and covered by regression tests."
+    - "xtask remains functional for development velocity during the transition."
+  evidence_ids:
+    - "EVID-0015"
+  source_refs:
+    - "documents/rfcs/RFC-0019/06_ticket_decomposition.yaml#rfc_ticket_decomposition"

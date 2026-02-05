@@ -1,0 +1,148 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/non-monotonic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 30,
+    "name": "non-monotonic",
+    "cat": "nonmonotonic",
+    "core": "Adding information can retract previous conclusions. Unlike classical logic where more premises yield more conclusions, new facts may invalidate earlier defaults ('birds fly' until 'penguin'). Use when: closed-world assumption applies, defaults must be defeasible, or reasoning proceeds under incomplete information.",
+    "out": [
+      {"n": "default_rule_inventory", "d": "enumerated 'normally X implies Y' rules with explicit scope and source"},
+      {"n": "exception_catalog", "d": "conditions defeating each default, with priority/specificity ranking"},
+      {"n": "tentative_conclusion_set", "d": "current conclusions marked {tentative|stable} with supporting defaults"},
+      {"n": "revision_trigger_map", "d": "fact patterns that would retract specific conclusions"},
+      {"n": "priority_ordering", "d": "total or partial order among conflicting defaults with rationale"},
+      {"n": "retraction_log", "d": "history of conclusions withdrawn, with triggering facts"}
+    ],
+    "proc": [
+      "1. INVENTORY: enumerate all default rules as 'normally X implies Y'; tag source (policy, domain knowledge, heuristic)",
+      "2. SCOPE: for each default, define applicability conditions and closed-world boundaries",
+      "3. EXCEPTION MAP: list known exceptions per default; rank by specificity (subclass > class)",
+      "4. APPLY: in absence of contradicting info, derive tentative conclusions from applicable defaults",
+      "5. CONFLICT CHECK: when multiple defaults fire, check for contradictions; apply priority ordering",
+      "6. RESOLVE: use specificity principle (more specific defeats general) or explicit priority; document choice",
+      "7. RETRACT: when new info matches exception condition, withdraw affected conclusions and re-derive",
+      "8. TRACE: maintain retraction log showing which facts triggered which withdrawals"
+    ],
+    "check": [
+      "every default explicitly stated with 'normally/typically' qualifier, not as universal fact",
+      "each default has source attribution (policy doc, domain expert, etc.)",
+      "exceptions enumerated exhaustively for each default",
+      "priority/specificity ordering documented before conflicts arise",
+      "conclusions labeled {tentative|stable} based on default reliance",
+      "revision behavior testable: given input X, can predict which conclusions retract",
+      "no circular exception chains (A defeats B defeats A)",
+      "retraction log maintained for audit trail"
+    ],
+    "diff": {
+      "deductive": "deductive is monotonic (new premises only add conclusions); non-monotonic allows retraction when exceptions discovered",
+      "belief-revision": "belief-revision restructures entire belief set post-hoc (AGM contraction); non-monotonic handles exceptions at inference time via defaults",
+      "defeasible": "defeasible explicitly models attack/defeat relations between arguments; non-monotonic focuses on default rules with exception conditions",
+      "default-typicality": "default-typicality is one specific non-monotonic mechanism (typically X); non-monotonic is the broader framework encompassing multiple mechanisms",
+      "paraconsistent": "paraconsistent tolerates contradictions locally; non-monotonic resolves them via priority, never holding both conclusions"
+    },
+    "confusions": [
+      {
+        "pair": ["non-monotonic", "belief-revision"],
+        "symptom": "rebuilding entire belief set whenever any fact changes, instead of local retraction",
+        "resolution": "non-monotonic retracts specific conclusions tied to defeated defaults; use belief-revision (#33) only when fundamental beliefs conflict and minimal-change restructuring needed"
+      },
+      {
+        "pair": ["non-monotonic", "defeasible"],
+        "symptom": "conflating 'exception triggers retraction' with 'argument A defeats argument B'",
+        "resolution": "non-monotonic uses exception patterns on rules; defeasible (#32) uses explicit defeat relations between constructed arguments. Use defeasible when you need argument graphs."
+      },
+      {
+        "pair": ["non-monotonic", "deductive"],
+        "symptom": "expecting default conclusions to hold with logical certainty",
+        "resolution": "non-monotonic conclusions are tentative by design; if certainty required, reformulate as strict rules in deductive (#1) mode or accept defeasibility"
+      }
+    ],
+    "fail": {
+      "mode": "priority_ambiguity",
+      "desc": "conflicting defaults with unclear resolution lead to unpredictable conclusions or exception explosion",
+      "signals": [
+        "conflicting defaults with no defined resolution rule",
+        "same premises yield different conclusions on different runs",
+        "users cannot predict which conclusion will be retracted",
+        "exception list grows faster than default list (exception explosion)",
+        "circular exception chains causing infinite retraction loops"
+      ],
+      "mitigations": [
+        {
+          "id": "M1-priority-precommit",
+          "trigger": "before adding new default rule",
+          "action": "define priority relation to all existing defaults that could conflict; document rationale"
+        },
+        {
+          "id": "M2-specificity-default",
+          "trigger": "priority not explicitly defined",
+          "action": "apply specificity principle: more specific rule (subclass) defeats more general (superclass)"
+        },
+        {
+          "id": "M3-retraction-test-suite",
+          "trigger": "after defining exception catalog",
+          "action": "create test cases: for each exception, verify expected retraction occurs and no unintended retractions"
+        },
+        {
+          "id": "M4-exception-ratio-monitor",
+          "trigger": "exception count exceeds 2x default count",
+          "action": "audit defaults for over-generalization; consider splitting into more specific defaults"
+        },
+        {
+          "id": "M5-cycle-detection",
+          "trigger": "before deploying rule set",
+          "action": "check for circular exception chains (A defeats B defeats A); break cycles with explicit priority"
+        }
+      ]
+    },
+    "use": [
+      "rule engines with exceptions (business rules, access control)",
+      "policy interpretation with overrides and carve-outs",
+      "commonsense reasoning in AI systems",
+      "knowledge bases operating under closed-world assumption",
+      "legal reasoning with statutory exceptions",
+      "configuration management with default values and overrides",
+      "diagnostic systems with provisional conclusions"
+    ],
+    "rel": [
+      {"id": 1, "n": "deductive", "r": "monotonic baseline; escalate when certainty required"},
+      {"id": 31, "n": "default-typicality", "r": "specific mechanism for 'typically X' patterns"},
+      {"id": 32, "n": "defeasible", "r": "use when explicit argument defeat relations needed"},
+      {"id": 33, "n": "belief-revision", "r": "use when entire belief set needs restructuring"},
+      {"id": 34, "n": "paraconsistent", "r": "use when contradictions must be tolerated, not resolved"}
+    ],
+    "ex": {
+      "sit": "Policy: employees get standard leave. Exception: contractors get reduced leave. Exception: senior contractors get standard leave. New fact: Bob is actually an intern.",
+      "steps": [
+        "INVENTORY: D1=employee->standard, D2=contractor->reduced, D3=senior-contractor->standard",
+        "SCOPE: applies to leave allocation; closed-world on employment categories",
+        "EXCEPTION MAP: D2 is exception to D1; D3 is exception to D2",
+        "APPLY: Bob is senior contractor, D3 fires, tentative: Bob gets standard leave",
+        "CONFLICT: D2 also fires (contractor), but D3 more specific (senior > contractor)",
+        "RESOLVE: specificity principle selects D3 over D2",
+        "NEW INFO: learn Bob is actually intern (not senior contractor)",
+        "RETRACT: D3 no longer applies, D2 no longer applies, fall back to D1",
+        "TRACE: retraction log: [D3 withdrawn due to 'not senior contractor', D2 withdrawn due to 'not contractor']"
+      ],
+      "insight": "specificity resolves conflicts; new facts retract tentative conclusions; retraction is traceable"
+    },
+    "micro_example": {
+      "defaults": [
+        "D1: birds normally fly",
+        "D2: penguins normally do not fly (exception to D1)"
+      ],
+      "input": "Tweety is a bird",
+      "inference": "D1 applies, tentative: Tweety flies",
+      "new_fact": "Tweety is a penguin",
+      "retraction": "D2 more specific (penguin subclass of bird); retract 'Tweety flies'; conclude 'Tweety does not fly'",
+      "asset": "Retraction log: ['Tweety flies' withdrawn at t2 due to penguin exception]"
+    }
+  }
+}

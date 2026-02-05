@@ -1,0 +1,37 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0011"
+  title: "FAC orchestration loop supports 1..100 revision cycles (crash-only, resumable)"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    The factory MUST support an end-to-end Forge Admission Cycle (FAC) orchestration loop that can
+    iterate implementer + reviewer episodes until merge criteria are satisfied or budgets are exhausted.
+
+    The loop MUST:
+    - support 1..100 revision cycles per work_id (configurable upper bound; MUST support >= 100)
+    - be crash-only and resumable from ledger state (no dependence on agent process memory)
+    - treat receipts + CAS pointers as the only durable "progress" signal
+    - enforce deterministic termination conditions:
+      - PASS (all required reviewer receipts present and gates satisfied)
+      - BLOCKED (misconfiguration / missing prerequisites / policy deny)
+      - BUDGET_EXHAUSTED (token/tool/wall-clock limits)
+      - OPERATOR_STOP (StopOrder / manual adjudication)
+
+    This requirement is about **closed-loop autonomy**: not "run a review once", but "drive revisions
+    until acceptance".
+  rationale: |
+    Without an explicit multi-iteration orchestration loop, FAC v0 is not practically autonomous:
+    it can produce a single receipt but cannot converge a change through repeated revision cycles.
+    The orchestration loop is the minimum plant/controller closure required to validate the factory.
+  acceptance_criteria:
+    - "A single work_id can complete >= 100 orchestrated revision iterations without manual intervention (within configured budgets)."
+    - "Every iteration produces: (1) a ChangeSetBundleV1 (CAS), (2) reviewer receipts (CAS), and (3) ledger events binding artifacts to a ledger anchor."
+    - "After daemon restart, orchestration resumes deterministically from ledger head/checkpoint without duplicating projections or losing iteration count."
+    - "Termination reasons are recorded as authoritative facts; no silent stops."
+  evidence_ids:
+    - "EVID-0011"
+  source_refs:
+    - "documents/rfcs/RFC-0019/06_ticket_decomposition.yaml#rfc_ticket_decomposition"
+    - "documents/rfcs/RFC-0019/01_problem_and_imports.yaml#rfc_problem_and_imports.non_negotiable_constraints"

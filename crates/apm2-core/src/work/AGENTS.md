@@ -420,7 +420,7 @@ This separation allows the reducer to remain focused on state management while t
 - [`apm2_core::reducer`](../reducer/AGENTS.md) - Reducer trait and checkpoint infrastructure
 - [`apm2_core::ledger`](../ledger/AGENTS.md) - Event ledger and `EventRecord` type
 - [`apm2_core::events`](../events/AGENTS.md) - Protobuf event definitions (`WorkEvent`, `WorkOpened`, etc.)
-- [`apm2_holon::work`](../../../../apm2-holon/src/work.rs) - Holon-level `WorkObject` and `WorkLifecycle`
+- [`apm2_holon::work`](../../../apm2-holon/src/work.rs) - Holon-level `WorkObject` and `WorkLifecycle`
 
 ## Holon vs Core Work Types
 

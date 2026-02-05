@@ -108,34 +108,34 @@ rfc_meta:
     laws:
       - id: LAW-01
         name: "Receipt-Backed Gate for Authoritative Promotion"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_01.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-02
         name: "Context Sufficiency Observation"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_02.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-03
         name: "Monotone Ledger vs. Overwritable Projection"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_03.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-04
         name: "Stochastic Stability Contracts"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_04.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-05
         name: "OCAP and Capability Scoping"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_05.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-06
         name: "MDL as Gated Budget"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_06.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-11
         name: "Idempotent Tool Calls"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_11.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-12
         name: "Episode Budget Enforcement"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_12.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-13
         name: "Canonical Encodings"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_13.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-15
         name: "Measurement Integrity"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_15.md"
+        ref: "documents/theory/laws.json"
     related_documents:
       glossary: "documents/skills/glossary/SKILL.md"
       daemon_glossary: "documents/skills/glossary/references/daemon.md"

@@ -1,0 +1,32 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0014"
+  title: "FAC efficiency: role slicing, context deltas, caching, and summary receipts"
+  category: "NON_FUNCTIONAL"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    FAC MUST include efficiency primitives that prevent linear growth of cost across revision cycles.
+
+    Required mechanisms:
+    - Role slicing / horizontal specialization: orchestrator can assign narrowly scoped roles with
+      minimal ContextPacks instead of monolithic generalist agents.
+    - Context delta injection: iteration N+1 context includes only deltas (new diffs, new receipts,
+      new failures) rather than full history.
+    - Tool result caching: repeated reads/searches should hit CAS-backed caches when safe.
+    - Summary receipts as the default cross-iteration/cross-role interface; full evidence is pulled
+      by hash only on demand.
+
+    This requirement is about throughput under bounded budgets, not about security hardening.
+  rationale: |
+    At practical scales, the bottleneck is coordination + context bandwidth + repeated rediscovery.
+    Without systematic deltas, caching, and specialization, FAC will be too expensive and too slow
+    to run continuously, and iteration loops will regress into context overflow.
+  acceptance_criteria:
+    - "Iteration N+1 does not inject full prior tool outputs by default; uses summary receipts + selectors."
+    - "A 20-iteration loop remains within a fixed context budget envelope using deltas and summaries."
+    - "Orchestrator can select specialist role specs for at least 3 reviewer sub-roles based on diff classification."
+  evidence_ids:
+    - "EVID-0014"
+  source_refs:
+    - "documents/rfcs/RFC-0019/01_problem_and_imports.yaml#rfc_problem_and_imports.non_negotiable_constraints"

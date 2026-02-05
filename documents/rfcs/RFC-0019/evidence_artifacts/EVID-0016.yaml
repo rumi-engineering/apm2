@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0016"
+  title: "Security hardening evidence (broker sandboxing, taint tracking, attestation tightening)"
+  category: "SECURITY_REVIEW"
+  status: "PENDING"
+  description: |
+    Evidence that the broker and evidence pipeline are hardened after FAC viability: sandboxing constraints,
+    taint tracking for untrusted inputs, and stronger attestation enforcement by risk tier.
+  requirement_ids:
+    - "REQ-0016"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0016.yaml"
+  artifacts: []

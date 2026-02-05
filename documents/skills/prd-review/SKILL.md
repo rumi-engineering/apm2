@@ -22,7 +22,9 @@ variables:
   MODE_OPTIONAL: "$1"
   PRD_ID: "$2"
 
-references[16]:
+references[17]:
+  - path: "../../theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/prd-review-workflow.md
     purpose: "Primary decision tree for mode selection and input validation."
   - path: references/create-mode.md

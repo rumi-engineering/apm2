@@ -1,0 +1,99 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Glossary Graph",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "glossary.graph"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the term, e.g., 'term:holon'"
+          },
+          "term": {
+            "type": "string",
+            "description": "Display name of the term"
+          },
+          "definition": {
+            "type": "string",
+            "description": "The theoretical definition"
+          },
+          "operationalization": {
+            "type": "string",
+            "description": "How it is implemented in the system"
+          },
+          "theory_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of Law/Principle IDs, e.g., 'LAW-05'"
+          },
+          "implementation_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of file paths to implementation"
+          },
+          "node_class": {
+            "type": "string",
+            "enum": [
+              "NORMATIVE",
+              "EXPLANATORY",
+              "BACKGROUND"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "term",
+          "definition",
+          "node_class"
+        ]
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Source Node ID"
+          },
+          "target": {
+            "type": "string",
+            "description": "Target Node ID"
+          },
+          "relation": {
+            "type": "string",
+            "enum": [
+              "implements",
+              "refines",
+              "governs",
+              "depends_on",
+              "conflicts_with"
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "relation"
+        ]
+      }
+    }
+  },
+  "required": [
+    "kind",
+    "nodes",
+    "edges"
+  ]
+}

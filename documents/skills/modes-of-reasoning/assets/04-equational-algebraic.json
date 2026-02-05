@@ -1,0 +1,98 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/equational-algebraic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 4,
+    "name": "equational-algebraic",
+    "cat": "formal",
+    "core": "Transform expressions using equalities and rewrite rules while preserving meaning; term rewriting rather than logical derivation. The goal is an equivalent form (simplified, normalized, or restructured), not a truth judgment.",
+    "out": [
+      {"type": "equivalent_form", "verify": "Original and result equal under substitution or evaluation"},
+      {"type": "normal_form", "verify": "No further applicable rules; form is canonical for comparison"},
+      {"type": "simplification", "verify": "Fewer operations, terms, or depth than original"},
+      {"type": "invariant_expression", "verify": "Quantity unchanged across transformations; test via symbolic diff = 0"},
+      {"type": "rewrite_trace", "verify": "Each step annotated with rule name and domain precondition"}
+    ],
+    "proc": [
+      {"do": "Identify expression and transformation goal (simplify, normalize, factor, expand)", "out": "expr + goal", "test": "Goal is one of: reduce ops, canonical form, expose structure"},
+      {"do": "List domain constraints (x != 0, n >= 0, real vs complex)", "out": "domain spec", "test": "Every variable has explicit domain or flagged as unbounded"},
+      {"do": "Select rewrite rules from applicable algebra (ring, field, group, lattice)", "out": "rule set", "test": "Each rule has stated precondition"},
+      {"do": "Check rule preconditions against domain constraints before each application", "out": "precondition check", "test": "No rule applied where precondition fails"},
+      {"do": "Apply rules preserving equivalence; record each step", "out": "rewrite trace", "test": "Trace shows rule name per step"},
+      {"do": "Detect termination (normal form reached or goal achieved)", "out": "result", "test": "No applicable rule improves toward goal"},
+      {"do": "Verify result equivalent to original (substitution test, symbolic check, or evaluation)", "out": "equivalence certificate", "test": "At least one verification method applied"}
+    ],
+    "check": [
+      "Every rewrite rule has explicit precondition documented",
+      "Domain restrictions (division, roots, logs) checked before each application",
+      "Boundary values (0, infinity, empty set) tested in verification",
+      "Equivalence validated via back-substitution or symbolic diff",
+      "Trace shows no step where precondition was assumed but not checked",
+      "Normal form is unique for the chosen rule set (confluence property)"
+    ],
+    "diff": {
+      "01-deductive": "Deductive derives truth from premises via inference rules. Equational transforms form while preserving meaning; output is equivalent expression, not truth certificate.",
+      "02-proof-theoretic": "Proof-theoretic produces proof objects as assets. Equational produces expressions; the rewrite trace is a by-product, not the primary output.",
+      "06-constraint-sat": "Constraint finds assignments satisfying equations. Equational transforms between equivalent forms without solving for unknowns.",
+      "07-type-theoretic": "Type-theoretic encodes invariants in types checked at compile time. Equational manipulates symbolic expressions at runtime or analysis time.",
+      "17-simplicity-compression": "Simplicity selects among competing hypotheses by parsimony. Equational transforms within a single expression preserving equivalence, not choosing between alternatives."
+    },
+    "fail": {
+      "mode": "unsound rules",
+      "desc": "Implicit domain restrictions like division by zero, square roots of negatives, or integer overflow; rules that work most of the time fail silently at boundaries.",
+      "detect": [
+        "Result differs from original when evaluated at boundary values (0, -1, MAX_INT)",
+        "Symbolic verification tool reports non-equivalence",
+        "Back-substitution yields different result than forward application",
+        "Rule applied to expression outside its domain (e.g., sqrt(-1) in reals)"
+      ],
+      "mit": [
+        {"do": "Annotate every rule with explicit precondition", "test": "Rule table has no empty precondition cells"},
+        {"do": "Check precondition at each rewrite step before application", "test": "Trace includes precondition-check entry per step"},
+        {"do": "Test boundary values in verification (0, -1, empty, MAX_INT)", "test": "Test suite includes at least 3 boundary cases"},
+        {"do": "Use symbolic equivalence checker when available", "test": "Toolchain includes CAS or SMT verification step"},
+        {"do": "Document domain explicitly at start; flag unbounded variables", "test": "Domain spec section non-empty; unbounded vars listed"}
+      ]
+    },
+    "use": [
+      "Refactoring: restructure code expressions preserving semantics (e.g., De Morgan, distributive law)",
+      "Compiler optimization: algebraic simplification in IR (strength reduction, constant folding)",
+      "Dimensional analysis: unit algebra ensures physical consistency (m/s * s = m)",
+      "Symbolic computation: simplify, factor, or expand expressions in CAS",
+      "Loop invariant manipulation: transform invariant expression to expose structure for proof",
+      "Query optimization: relational algebra rewrites (join reordering, predicate pushdown)",
+      "Cryptographic protocol analysis: algebraic manipulation to detect equivalences or attacks"
+    ],
+    "rel": [
+      {"id": 1, "name": "deductive-reasoning", "link": "Equational is specialized deduction for symbol manipulation"},
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "Proofs may use equational steps; equational traces are simpler than full proofs"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "Constraints can be equational; equational simplifies before solving"},
+      {"id": 7, "name": "type-theoretic", "link": "Type systems may use equational unification (Hindley-Milner)"},
+      {"id": 17, "name": "simplicity-compression", "link": "Simplification is local optimization; compression is global hypothesis selection"}
+    ],
+    "ex": {
+      "prob": "Simplify (a + b)^2 - (a^2 + 2ab + b^2) over reals to verify identity.",
+      "steps": [
+        "Goal: simplify to show equivalence to 0",
+        "Domain: a, b in R (no restrictions needed for polynomial ops)",
+        "Rules: distributive, associative, commutative (all unconditional for R)",
+        "Expand: (a+b)^2 = a^2 + 2ab + b^2 (via binomial rule)",
+        "Subtract: (a^2 + 2ab + b^2) - (a^2 + 2ab + b^2) = 0",
+        "Verify: back-substitute a=1, b=2: (3)^2 - (1+4+4) = 9-9 = 0"
+      ],
+      "result": "0 (identity confirmed)",
+      "confused_with": [
+        {"mode": "01-deductive", "distinguish": "Ask: Am I proving a statement true, or transforming an expression? Equational output is an expression, not a truth judgment."},
+        {"mode": "02-proof-theoretic", "distinguish": "Ask: Is the primary asset a proof object or a transformed expression? Equational produces expressions; proofs are secondary."},
+        {"mode": "06-constraint-sat", "distinguish": "Ask: Am I finding values that satisfy equations, or transforming between equivalent forms? Constraint solves; equational transforms."},
+        {"mode": "17-simplicity-compression", "distinguish": "Ask: Am I choosing among competing hypotheses or transforming within one expression? Equational preserves identity; simplicity selects."}
+      ]
+    }
+  }
+}

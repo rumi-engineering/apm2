@@ -15,8 +15,8 @@ decision_tree:
           purpose: "Security documentation index and quick reference."
         - path: documents/security/SECURITY_POLICY.md
           purpose: "Security invariants and modes."
-        - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/SKILL.md
-          purpose: "Core philosophy and constraints."
+        - path: documents/theory/agent_native_architecture.json
+          purpose: "Core philosophy, architecture, and constraints."
       steps[5]:
         - id: READ_BASELINE_CONTEXT
           action: "Read the context files listed above and note global constraints."

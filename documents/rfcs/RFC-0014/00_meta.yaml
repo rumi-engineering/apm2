@@ -65,19 +65,19 @@ rfc_meta:
     laws:
       - id: LAW-03
         name: "Monotone Ledger vs. Overwritable Projection"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_03.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-10
         name: "Anti-Entropy & Merge Semantics"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_10.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-11
         name: "Conservation of Work and Idempotent Actuation"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_11.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-13
         name: "Semantic Contracting"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_13.md"
+        ref: "documents/theory/laws.json"
       - id: LAW-15
         name: "Measurement Integrity"
-        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_15.md"
+        ref: "documents/theory/laws.json"
   implementation:
     language: Rust
     edition: "2024"

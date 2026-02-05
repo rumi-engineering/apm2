@@ -21,7 +21,7 @@ prd_goals_scope:
       measurable_outcomes:
         - Repo/file reads outside RCP manifest allowlist emit ToolDecided=DENY with rule_id CTX-ALLOWLIST-001.
         - Context misses terminate session with rationale CONTEXT_MISS and trigger refinement.
-        - RunReceipt records context sufficiency metrics (bytes supplied, entries used, misses, denied reads, ZTI score).
+        - RunReceipt records context sufficiency metrics (bytes supplied, entries used, misses, denied reads, efficiency score).
         - Zero unauthorized reads succeed in gate execution sessions.
     - id: FAC-G-0004
       statement: Projection-only GitHub integration - GitHub status checks are projections of internal ledger truth and never inputs to admission decisions.

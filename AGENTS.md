@@ -100,8 +100,8 @@
   "doc_refs": {
     "documents_index": "documents/README.md",
     "skills_root": "documents/skills/",
-    "glossary_root": "documents/skills/glossary/",
-    "holonic_unified_theory": "documents/skills/laws-of-holonic-agent-systems/references/unified-theory.md",
+    "glossary_root": "documents/theory/glossary/",
+    "holonic_unified_theory": "documents/theory/unified_theory.json",
     "security_policy": "SECURITY.md",
     "security_docs_root": "documents/security/",
     "schemas_root": "schemas/apm2/"

@@ -16,7 +16,9 @@ protocol:
   outputs[1]:
     - SkillInstructionSet
 
-references[1]:
+references[2]:
+  - path: "../../theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: documents/standards/instructions/AGENT_INSTRUCTION_AUTHORING_STANDARD.md
     purpose: "Human-readable standard and templates for writing SKILL.md and references/."
 

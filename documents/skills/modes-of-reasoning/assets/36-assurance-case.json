@@ -1,0 +1,304 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/assurance-case@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z",
+    "updated_at": "2026-02-02T00:00:00Z"
+  },
+  "payload": {
+    "id": 36,
+    "name": "assurance-case",
+    "cat": "argumentation",
+    "core": "Structured argument (GSN/CAE tree) decomposing a top-level safety, security, or reliability claim into sub-claims until each leaf is backed by traceable, dated evidence. Goal: demonstrate that system properties hold, not merely that procedures were followed. Key constraint: every claim node must be either (a) decomposed via explicit strategy into sub-claims, or (b) directly supported by a single asset with provenance.",
+
+    "out": [
+      {"name": "safety_case_doc", "desc": "GSN/CAE diagram with goals, strategies, context, evidence nodes", "done": "every goal node either decomposed via strategy or linked to evidence; zero undeveloped nodes"},
+      {"name": "evidence_index", "desc": "registry mapping evidence IDs to assets with provenance and dates", "done": "each entry has asset_id, source, date, hash/version; all dates within freshness policy"},
+      {"name": "hazard_claim_map", "desc": "traceability matrix from identified hazards to claims that address them", "done": "every hazard has >=1 claim branch; every claim traces to >=1 hazard (no orphans)"},
+      {"name": "confidence_assessment", "desc": "per-node confidence rating (high/medium/low) with gap rationale", "done": "every <high node has explicit rationale, remediation plan or risk acceptance; at least one node rated <high (uniform-high is suspect)"},
+      {"name": "rebuttal_log", "desc": "record of challenges raised and how each was resolved or accepted", "done": ">=3 substantive rebuttals logged with disposition (mitigated/accepted/deferred); no empty log"}
+    ],
+
+    "proc": [
+      {
+        "step": 1,
+        "name": "Define top claim",
+        "action": "State the property (safe, secure, reliable) with explicit scope: system boundary, operational envelope (ODD), threat model, and context assumptions.",
+        "test": "Can you answer: What property? What system? Under what conditions? What's assumed true?",
+        "example": "Claim: 'Payment API is secure against OWASP Top 10 attacks when deployed on AWS with WAF enabled, assuming network perimeter is intact.'"
+      },
+      {
+        "step": 2,
+        "name": "Identify hazards/threats",
+        "action": "List what could violate the top claim. Each hazard becomes a branch requiring sub-claims. Use structured methods: HAZOP, FMEA, threat modeling.",
+        "test": "Is every way the claim could fail enumerated? Did you use a systematic method, not just brainstorming?",
+        "example": "Hazards: H1-SQL injection, H2-broken auth, H3-sensitive data exposure. Each requires a sub-claim branch."
+      },
+      {
+        "step": 3,
+        "name": "Choose decomposition strategy",
+        "action": "Select argument pattern (by hazard, by subsystem, by lifecycle phase, by defense layer) and document why this pattern fits.",
+        "test": "Is the strategy named and rationale written? Could someone else follow the same pattern?",
+        "example": "Strategy: decompose by OWASP category because it aligns with auditor expectations and existing test suites."
+      },
+      {
+        "step": 4,
+        "name": "Decompose to evidenceable claims",
+        "action": "Split claims until each leaf is verifiable by a single asset. Rule: if a claim needs two independent evidences, split it into two claims.",
+        "test": "For each leaf: can you name exactly one asset that would prove it? If not, decompose further.",
+        "example": "Claim 'Auth is secure' splits into: 'Passwords hashed with bcrypt' (evidence: code review), 'Session tokens expire in 30min' (evidence: config audit)."
+      },
+      {
+        "step": 5,
+        "name": "Attach evidence",
+        "action": "For each leaf, link a dated asset with provenance: asset_id, source (who produced it), date, hash/version. No 'see test results' hand-waves.",
+        "test": "Can you retrieve the asset right now using the ID? Is the date within your freshness policy?",
+        "example": "Evidence E-042: pen test report by SecureCo, dated 2026-01-15, SHA256=abc123, covers claims C-12 through C-15."
+      },
+      {
+        "step": 6,
+        "name": "Challenge each link",
+        "action": "For every claim-evidence pair, ask: 'Could this evidence be true yet the claim false?' Document gaps and assumptions.",
+        "test": "Did you write down at least one way the evidence could mislead? Is the gap documented or accepted?",
+        "example": "Gap: pen test covered staging, not prod. Assumption: staging mirrors prod config. Risk: config drift. Remediation: add prod config diff check."
+      },
+      {
+        "step": 7,
+        "name": "Assess confidence",
+        "action": "Rate each node high/medium/low. Require remediation plan for medium/low. If all nodes are high, treat as red flag and recheck.",
+        "test": "Is there at least one <high node? (Uniform high is suspect.) Does every <high node have a remediation plan?",
+        "example": "C-15 rated medium: pen test is 6 months old. Remediation: schedule retest by Q2."
+      },
+      {
+        "step": 8,
+        "name": "Conduct adversarial review",
+        "action": "Invite red-team or independent reviewer to attack the structure. They must generate challenges; you log each with disposition.",
+        "test": "Did an independent person review? Are there >=3 logged rebuttals with dispositions (mitigated/accepted/deferred)?",
+        "example": "Rebuttal R-3: 'What if WAF rules are misconfigured?' Disposition: mitigated—added claim C-20 for WAF rule audit evidence."
+      },
+      {
+        "step": 9,
+        "name": "Iterate until complete",
+        "action": "Repeat steps 4-8 until: zero undeveloped nodes, rebuttal log has >=3 entries, all <high nodes have remediation plans.",
+        "test": "Run automated scan for TBD/placeholder nodes. Count rebuttal log entries. Check remediation column for <high nodes.",
+        "example": "Final check: 0 TBD nodes, 5 rebuttals logged, 2 medium nodes with scheduled remediations."
+      }
+    ],
+
+    "quick_checklist": [
+      "Top claim has property + boundary + ODD + assumptions?",
+      "Hazards identified using systematic method (HAZOP/FMEA/threat model)?",
+      "Decomposition strategy named and rationale documented?",
+      "Every leaf has exactly one evidence asset?",
+      "Every evidence has asset_id + date + source + hash?",
+      "All evidence dates within freshness policy (e.g., 12 months)?",
+      "At least one node rated <high (uniform-high triggers review)?",
+      "Every <high node has remediation plan or explicit risk acceptance?",
+      "Rebuttal log has >=3 substantive challenges with dispositions?",
+      "Independent reviewer signed off on structure?"
+    ],
+
+    "check": [
+      "top_claim_scoped: claim states property, boundary, ODD, and context assumptions explicitly",
+      "hazards_systematic: hazards identified via structured method (HAZOP, FMEA, threat model), not ad-hoc brainstorm",
+      "strategy_documented: decomposition pattern named with rationale for fit",
+      "leaves_single_evidence: each leaf verifiable by exactly one asset; multi-evidence claims split",
+      "evidence_provenance: each evidence has asset_id, source, date, hash/version; no hand-waves",
+      "evidence_fresh: all evidence dates within policy window or has recertification note",
+      "gaps_documented: every claim-evidence link has documented gap analysis or explicit 'no gap' statement",
+      "no_undeveloped: zero TBD/placeholder nodes in final case (automated scan passed)",
+      "confidence_calibrated: at least one node rated <high; uniform-high triggers mandatory review",
+      "low_nodes_remediated: every <high node has remediation plan with owner and deadline, or explicit risk acceptance",
+      "rebuttal_log_populated: >=3 logged challenges with disposition (mitigated/accepted/deferred)",
+      "independent_spot_check: reviewer verified >=3 random evidence links are accurate and retrievable"
+    ],
+
+    "diff": {
+      "argumentation-theory": {
+        "boundary": "Assurance requires traceable dated evidence at leaves; argumentation-theory accepts rhetorical support and computes acceptability from attack/defense relations.",
+        "test": "Does every leaf have an asset ID and date? If yes, assurance. If support is rhetorical, argumentation-theory."
+      },
+      "legal": {
+        "boundary": "Assurance argues empirical system properties hold; legal interprets statutes and allocates burden of proof under institutional rules.",
+        "test": "Are you proving a system works (assurance) or interpreting what the law requires (legal)?"
+      },
+      "robust-worst-case": {
+        "boundary": "Robust selects policy to survive worst-case; assurance documents post-hoc why the selected design meets claims.",
+        "test": "Are you choosing a design (robust) or justifying an existing design (assurance)?"
+      },
+      "engineering-design": {
+        "boundary": "Design produces specs and prototypes; assurance justifies that the built system meets safety/security goals.",
+        "test": "Are you creating the system (design) or arguing it meets requirements (assurance)?"
+      },
+      "adversarial-red-team": {
+        "boundary": "Red-team attacks to find weaknesses; assurance is the structured argument that must survive red-team scrutiny.",
+        "test": "Are you attacking (red-team) or defending with evidence (assurance)?"
+      },
+      "defeasible": {
+        "boundary": "Defeasible models formal defeat relations among prioritized rules; assurance builds an evidenced argument tree without priority ordering.",
+        "test": "Are you reasoning about rule exceptions (defeasible) or building an evidence-backed claim tree (assurance)?"
+      },
+      "mechanistic": {
+        "boundary": "Mechanistic explains how a system works causally; assurance argues that properties hold, citing evidence, not explaining internals.",
+        "test": "Are you explaining why the system behaves as it does (mechanistic) or proving it meets a property (assurance)?"
+      },
+      "dialectical": {
+        "boundary": "Dialectical synthesizes thesis-antithesis into synthesis; assurance decomposes a claim into evidenced sub-claims without requiring synthesis.",
+        "test": "Are you resolving opposing views into a new position (dialectical) or decomposing a claim into evidence (assurance)?"
+      },
+      "diagnostic": {
+        "boundary": "Diagnostic identifies root cause of a failure; assurance argues that failures won't occur (or are mitigated).",
+        "test": "Has a failure already happened (diagnostic) or are you arguing it won't (assurance)?"
+      }
+    },
+
+    "common_confusions": [
+      {
+        "confusion": "Assurance-case vs Argumentation-theory: both build argument structures",
+        "resolution": "Argumentation-theory is the abstract framework (attack/defense relations, acceptability semantics). Assurance-case is applied argumentation with mandatory dated evidence at leaves. Assurance is stricter: rhetorical support doesn't count.",
+        "example": "Argumentation: 'Experts agree the system is safe.' Assurance: 'Test report TR-042, dated 2026-01-15, demonstrates safety under ODD.'"
+      },
+      {
+        "confusion": "Assurance-case vs Risk-assessment: both deal with hazards",
+        "resolution": "Risk assessment identifies and ranks hazards by likelihood × impact. Assurance case argues that identified hazards are adequately mitigated with traceable evidence. Risk assessment is input to assurance case.",
+        "example": "Risk assessment: 'SQL injection is high risk (likelihood=3, impact=5).' Assurance: 'SQL injection mitigated by parameterized queries (evidence: code review CR-088).'"
+      },
+      {
+        "confusion": "Assurance-case vs Test-plan: both involve testing",
+        "resolution": "Test plan defines what to test and how. Assurance case consumes test results as evidence for claims. Test plan is a method; assurance case is an argument structure.",
+        "example": "Test plan: 'Run OWASP ZAP against /api/v2 endpoints.' Assurance: 'Claim C-12 supported by ZAP scan report dated 2026-01-20.'"
+      },
+      {
+        "confusion": "Assurance-case vs Compliance-checklist: both support audits",
+        "resolution": "Compliance checklist confirms procedures were followed ('did you do X?'). Assurance case argues properties actually hold ('here's why X is true'). Checklist is necessary but not sufficient for assurance.",
+        "example": "Checklist: '☑ Conducted pen test.' Assurance: 'Pen test found 0 critical vulnerabilities (report PT-2026-03); residual risks documented and accepted.'"
+      }
+    ],
+
+    "fail": {
+      "name": "paper_compliance",
+      "description": "Structure looks complete but evidence is weak, stale, or mismatched to claims—case passes form but fails substance. Auditor might approve; system might still fail.",
+      "signals": [
+        "evidence lacks asset IDs or dates ('see test results' without link)",
+        "multiple claims share single evidence without explicit justification",
+        "uniform high confidence with no gaps flagged (no node rated <high)",
+        "rebuttal log empty or contains only trivial challenges ('Is the font correct?')",
+        "no independent reviewer sign-off",
+        "evidence older than freshness policy with no recertification",
+        "hazards identified by ad-hoc brainstorm, not systematic method",
+        "decomposition strategy not documented—structure emerged organically",
+        "gap analysis column is empty or says 'N/A' for all rows"
+      ],
+      "mitigations": [
+        {
+          "mitigation": "Evidence freshness audit",
+          "test": "Every evidence asset dated within policy window (e.g., 12 months) or has recertification note with rationale.",
+          "threshold": "0 stale evidences without recertification",
+          "example": "Scan evidence index: filter date < (today - 12mo); require recert note for each hit."
+        },
+        {
+          "mitigation": "Evidence uniqueness check",
+          "test": "Each leaf has distinct primary evidence; shared evidence explicitly justified and logged in evidence index.",
+          "threshold": "Shared evidence ratio <20% of leaves; each shared instance has justification",
+          "example": "If TR-042 supports both C-12 and C-15, log: 'TR-042 covers both OWASP-3 and OWASP-7 via scope section 4.2.'"
+        },
+        {
+          "mitigation": "Independent spot-check",
+          "test": "Reviewer sampled >=3 random leaves and verified evidence assets exist, are retrievable, and match claims.",
+          "threshold": "100% of sampled evidences retrievable and claim-matching",
+          "example": "Reviewer selects C-8, C-15, C-22; retrieves each asset; confirms content matches claim wording."
+        },
+        {
+          "mitigation": "Adversarial rebuttal session",
+          "test": "Red-team or independent reviewer generated >=3 substantive attacks; each logged with disposition.",
+          "threshold": ">=3 non-trivial rebuttals (not 'Is the font correct?'); 0 rebuttals with disposition 'unresolved'",
+          "example": "R-1: 'What if config differs in prod?' Disposition: mitigated—added config diff evidence. R-2: 'Pen test scope excludes mobile.' Disposition: accepted—mobile out of scope per ODD."
+        },
+        {
+          "mitigation": "Confidence calibration",
+          "test": "At least one node rated <high with documented rationale; uniform-high triggers mandatory review.",
+          "threshold": ">=1 node is medium or low; if all high, escalate to senior reviewer",
+          "example": "If all 47 nodes are high, flag for review: 'Uniform high confidence is statistically suspect.'"
+        },
+        {
+          "mitigation": "Undeveloped node sweep",
+          "test": "Automated or manual scan confirms zero TBD/placeholder nodes in final case.",
+          "threshold": "0 nodes with status 'undeveloped', 'TBD', or 'TODO'",
+          "example": "Run: grep -E 'TBD|TODO|undeveloped' case.json; expect 0 hits."
+        },
+        {
+          "mitigation": "Gap analysis enforcement",
+          "test": "Every claim-evidence link has documented gap analysis or explicit 'no gap identified' statement.",
+          "threshold": "0 empty gap columns; 'N/A' not accepted without rationale",
+          "example": "For C-12→E-042: gap='pen test on staging; assumption=staging≈prod'; or gap='none identified—evidence directly tests claim in prod.'"
+        },
+        {
+          "mitigation": "Systematic hazard identification",
+          "test": "Hazards identified using named method (HAZOP, FMEA, STRIDE, attack trees); brainstorm alone insufficient.",
+          "threshold": "Method name documented; hazard list traces to method output",
+          "example": "Hazard source: 'STRIDE analysis, 2026-01-10, by security team; see STRIDE-output.xlsx.'"
+        }
+      ]
+    },
+
+    "use": [
+      "safety-critical systems: aviation (DO-178C), automotive (ISO 26262), medical devices (IEC 62304)",
+      "security certification: Common Criteria, SOC 2, FedRAMP authorization packages",
+      "AI/ML governance: model risk documentation, bias and fairness assurance, deployment readiness",
+      "regulatory submissions: pre-market approval, safety case for novel technology",
+      "internal design reviews: architecture decision justification, go/no-go gates",
+      "third-party vendor assessment: proving supplier components meet your security requirements",
+      "incident post-mortem: arguing that corrective actions are sufficient to prevent recurrence"
+    ],
+
+    "rel": [
+      {"id": 35, "name": "argumentation-theory", "role": "theoretical foundation; assurance is applied argumentation with evidence requirements"},
+      {"id": 49, "name": "robust-worst-case", "role": "informs threat envelope and margin analysis; assurance argues margin is sufficient"},
+      {"id": 79, "name": "adversarial-red-team", "role": "challenges assurance case to find gaps; assurance is the target"},
+      {"id": 71, "name": "legal", "role": "regulatory context and compliance framing; assurance argues compliance is met"},
+      {"id": 70, "name": "engineering-design", "role": "produces the assets that become evidence"},
+      {"id": 32, "name": "defeasible", "role": "handles exceptions and overrides in claim logic"},
+      {"id": 40, "name": "mechanistic", "role": "explains system behavior referenced in claims; assurance cites mechanism"},
+      {"id": 41, "name": "diagnostic", "role": "post-failure analysis; assurance argues failures won't occur"},
+      {"id": 80, "name": "debiasing", "role": "audits assurance case for overconfidence and confirmation bias"}
+    ],
+
+    "ex": {
+      "situation": "Autonomous vehicle perception system: argue that pedestrian detection meets ASIL-D safety requirements",
+      "steps": [
+        "DEFINE TOP CLAIM: 'Perception system detects pedestrians with <=10^-8 failure rate per hour under ODD conditions.' Scope: ODD = urban, daylight, dry roads, <50 km/h. Assumption: sensor hardware meets spec.",
+        "IDENTIFY HAZARDS: H1-Sensor occlusion, H2-Adverse lighting, H3-Unusual pedestrian appearance, H4-Sensor failure. Method: HAZOP on perception pipeline.",
+        "CHOOSE STRATEGY: Decompose by hazard category (aligns with HAZOP output and test suite organization).",
+        "DECOMPOSE: H1 branch splits into C-1 'Redundant sensors cover all angles' and C-2 'Sensor fusion handles partial occlusion.'",
+        "ATTACH EVIDENCE: C-1 supported by TR-2025-042 (360-degree coverage test, 2025-01-15, signed by test lead, SHA256=def456).",
+        "CHALLENGE LINK: Gap for C-1: 'Coverage test used mannequins, not real pedestrians.' Assumption: mannequin detection transfers to humans. Risk: edge cases with unusual clothing.",
+        "ASSESS CONFIDENCE: C-1=high (extensive testing), C-2=medium (fusion algorithm newly deployed, limited field data). Remediation for C-2: schedule 1000-hour field validation.",
+        "ADVERSARIAL REVIEW: Red-team raised R-1 'What if both sensors fail simultaneously?', R-2 'Rain degrades lidar accuracy', R-3 'Child-sized pedestrians underrepresented in test data.' Dispositions: R-1 mitigated (added independent failure analysis claim), R-2 accepted (rain outside ODD), R-3 mitigated (added child-detection test evidence).",
+        "ITERATE: Final state: 0 TBD nodes, 5 rebuttals logged, 2 medium nodes with remediation plans."
+      ],
+      "insight": "Assurance case is not a one-time document; it evolves as evidence matures and challenges surface. Each system update triggers re-evaluation of affected branches."
+    },
+
+    "micro_example": {
+      "situation": "Argue that a web API endpoint is protected against SQL injection",
+      "claim": "Endpoint /api/users is immune to SQL injection under normal operation.",
+      "decomposition": [
+        "C-1: All database queries use parameterized statements.",
+        "C-2: Input validation rejects SQL metacharacters."
+      ],
+      "evidence": {
+        "C-1": "Code review CR-2026-015, dated 2026-01-20, reviewer=security lead, finding='all queries parameterized'.",
+        "C-2": "Unit test suite UT-SQL-01, 47 injection payloads tested, 0 passed through, dated 2026-01-18."
+      },
+      "gap_analysis": {
+        "C-1": "Code review is point-in-time; drift possible. Mitigation: require review on each PR touching DB layer.",
+        "C-2": "Payload list may be incomplete. Mitigation: update from OWASP quarterly."
+      },
+      "confidence": "C-1=high, C-2=medium (payload coverage)",
+      "rebuttal": "R-1: 'What about stored procedures?' Disposition: mitigated—added C-3 for stored proc audit."
+    }
+  }
+}

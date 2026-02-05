@@ -45,7 +45,7 @@ Spawn 3 subagents. Their specific focus shifts based on the RFC version:
 
 ### Step 3: Anchored Stochastic Mode Selection
 
-Each subagent uses **2 fixed Anchor Modes** based on their lifecycle role and selects **3 strictly random modes** from `documents/skills/modes-of-reasoning/artifacts/selector.json`.
+Each subagent uses **2 fixed Anchor Modes** based on their lifecycle role and selects **3 strictly random modes** from `documents/skills/modes-of-reasoning/assets/selector.json`.
 
 **Role-Based Anchors:**
 - **SA-1 (Rigorist):** [70] Engineering Design, [44] Means-End Instrumental.

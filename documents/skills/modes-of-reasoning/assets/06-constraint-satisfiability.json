@@ -1,0 +1,146 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/constraint-satisfiability@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 6,
+    "name": "constraint-satisfiability",
+    "cat": "formal",
+    "core": "Encode requirements as constraints over variables; ask a solver whether any assignment satisfies all constraints (SAT) or prove none exists (UNSAT).",
+    "out": [
+      {"id": "sat", "form": "variable bindings {v1=a, v2=b, ...}", "test": "substitute values into every constraint; all evaluate true"},
+      {"id": "unsat", "form": "proof certificate or UNSAT core", "test": "solver verifies no assignment exists; core is subset of constraints"},
+      {"id": "core", "form": "minimal unsat core (subset of constraints)", "test": "removing any constraint from core makes remainder satisfiable"},
+      {"id": "cex", "form": "counterexample assignment", "test": "assignment violates target property while satisfying background constraints"}
+    ],
+    "proc": [
+      {"step": 1, "do": "enumerate variables: slots, flags, quantities, choices", "out": "variable list with names and semantics", "test": "every assignable element in problem appears exactly once"},
+      {"step": 2, "do": "define domains: boolean, integer range, finite enum", "out": "domain spec per variable", "test": "no valid value excluded; no impossible value included"},
+      {"step": 3, "do": "extract explicit constraints from requirements", "out": "constraint set with requirement IDs", "test": "each requirement maps to >= 1 constraint; traceability matrix has no empty rows"},
+      {"step": 4, "do": "surface implicit constraints: mutex, capacity, ordering, physics", "out": "augmented constraint set", "test": "domain expert reviews for unstated background rules"},
+      {"step": 5, "do": "select solver: SAT for boolean, SMT for theories, CSP for finite domains", "out": "solver choice with rationale", "test": "problem class matches solver capability"},
+      {"step": 6, "do": "run solver", "out": "SAT+assignment or UNSAT+core", "test": "solver terminates within resource budget"},
+      {"step": 7, "do": "validate result: SAT->check assignment against original requirements; UNSAT->trace core to requirement conflict", "out": "validation report", "test": "no requirement violated by SAT result; UNSAT core maps to conflicting requirements"},
+      {"step": 8, "do": "iterate if validation fails or encoding incomplete", "out": "refined model", "test": "delta constraints documented; re-solve succeeds"}
+    ],
+    "check": [
+      "traceability: every requirement maps to >= 1 constraint (no orphan requirements)",
+      "completeness: variable domains cover all legal values, exclude all illegal",
+      "explicitness: implicit assumptions (mutex, capacity, physics) encoded as constraints",
+      "validation: SAT result verified on concrete scenario independent of solver",
+      "minimality: UNSAT core is minimal (removing any constraint makes remainder SAT)"
+    ],
+    "quick_checklist": [
+      "Can I list every variable and its domain? (no -> step 1-2 incomplete)",
+      "Does each requirement have >= 1 constraint? (no -> step 3 incomplete)",
+      "Did a domain expert review for hidden constraints? (no -> step 4 incomplete)",
+      "Did I validate SAT result outside the solver? (no -> step 7 incomplete)",
+      "Can I explain UNSAT core in business terms? (no -> traceability weak)"
+    ],
+    "diff": {
+      "48-optimization": {
+        "boundary": "feasibility vs optimality",
+        "use_constraint_sat_when": "you need any valid solution, or must prove no solution exists",
+        "use_other_when": "you need the best solution according to an objective function",
+        "example": "constraint-sat: 'Is there a schedule where no meetings overlap?' vs optimization: 'What schedule minimizes total travel time?'"
+      },
+      "1-deductive": {
+        "boundary": "search vs derivation",
+        "use_constraint_sat_when": "the problem is existential ('does a solution exist?') and search space is combinatorially large",
+        "use_other_when": "you need to derive consequences from premises via inference rules",
+        "example": "constraint-sat: 'Find assignment satisfying all clauses' vs deductive: 'Given P->Q and P, conclude Q'"
+      },
+      "7-type-theoretic": {
+        "boundary": "post-hoc check vs construction-time enforcement",
+        "use_constraint_sat_when": "constraints are discovered after assets exist; validation is batch/offline",
+        "use_other_when": "invariants should be enforced during construction; compiler rejects ill-formed programs",
+        "example": "constraint-sat: 'Does this config satisfy all rules?' vs type-theoretic: 'Make invalid configs unrepresentable'"
+      },
+      "5-model-theoretic": {
+        "boundary": "finding instance vs studying theory properties",
+        "use_constraint_sat_when": "you want a concrete satisfying assignment or proof of impossibility",
+        "use_other_when": "you want to understand what is true in all models vs some models, or study semantic entailment",
+        "example": "constraint-sat: 'Find a model of this formula' vs model-theoretic: 'Is phi entailed by theory T in all models?'"
+      }
+    },
+    "confused": [
+      {
+        "with": "48-optimization",
+        "symptom": "declaring an objective function but only checking feasibility",
+        "distinguish": "Ask: Do I need 'a' solution or 'the best' solution? If you only need feasibility, constraint-sat is simpler and faster."
+      },
+      {
+        "with": "1-deductive",
+        "symptom": "trying to derive conclusions step-by-step when problem is existential search",
+        "distinguish": "Ask: Am I proving a theorem or finding an assignment? If the answer is 'find values such that...', use constraint-sat."
+      },
+      {
+        "with": "7-type-theoretic",
+        "symptom": "encoding constraints that should be types, leading to runtime validation instead of compile-time rejection",
+        "distinguish": "Ask: Is this constraint checkable at construction time? If yes, prefer type-theoretic. If constraints emerge from external data or late-binding, use constraint-sat."
+      }
+    ],
+    "fail": {
+      "name": "poor encoding (missed constraints)",
+      "detect": [
+        "SAT result fails manual validation against original requirements",
+        "stakeholders reject 'valid' solutions as obviously wrong",
+        "small perturbations (adding one meeting, one resource) yield wildly different solutions",
+        "UNSAT result surprises domain experts who believe a solution should exist"
+      ],
+      "mit": [
+        {
+          "do": "maintain requirement-to-constraint traceability matrix",
+          "test": "no requirement row is empty; review matrix with stakeholders",
+          "concrete": "spreadsheet or tool linking REQ-001 -> {C1, C2}; updated after each requirement change"
+        },
+        {
+          "do": "validate SAT results via independent checker",
+          "test": "write a separate script/test that evaluates all original requirements against the assignment",
+          "concrete": "if solver says SAT, run 'validate(assignment, requirements)' -> all pass"
+        },
+        {
+          "do": "adversarial probing: remove constraints, verify known-bad solutions now appear",
+          "test": "for each constraint C, solve without C; confirm previously-rejected bad case now accepted",
+          "concrete": "remove 'no-overlap' constraint; confirm double-booked schedule is now SAT"
+        },
+        {
+          "do": "incremental encoding reviews after each requirement session",
+          "test": "every new/changed requirement triggers constraint review within 24h",
+          "concrete": "PR checklist item: 'constraint model updated?' before merge"
+        },
+        {
+          "do": "domain expert sign-off on implicit constraints",
+          "test": "expert reviews list of 'background' constraints and confirms none missing",
+          "concrete": "meeting notes with expert sign-off on mutex/capacity/ordering constraints"
+        }
+      ]
+    },
+    "use": [
+      "scheduling: discrete time slots + resource mutex + ordering precedence",
+      "configuration: feature dependencies, incompatibilities, variant selection",
+      "verification: existential SAT query for property violation (counterexample search)",
+      "policy enforcement: grant access request iff no rule violated",
+      "feasibility checks: quick SAT/UNSAT before committing to expensive optimization",
+      "resource allocation: capacity constraints + assignment constraints + fairness rules"
+    ],
+    "rel": [1, 5, 7, 8, 48],
+    "ex": {
+      "prob": "Schedule 3 meetings (A,B,C) into 2 rooms (R1,R2) during 2 slots (T1,T2). A/B cannot overlap. C must be in R1.",
+      "steps": [
+        "vars: room_A, room_B, room_C in {R1, R2}; time_A, time_B, time_C in {T1, T2}",
+        "constraint 1 (no overlap A/B): NOT(time_A = time_B AND room_A = room_B)",
+        "constraint 2 (C in R1): room_C = R1",
+        "implicit constraint (one meeting per room-slot): for all pairs (X,Y), NOT(room_X = room_Y AND time_X = time_Y) unless X=Y",
+        "run solver -> SAT",
+        "validate: A@R1/T1, B@R2/T1, C@R1/T2 -> check: A/B don't overlap (different rooms), C in R1, no double-booking"
+      ],
+      "result": "SAT: A@R1/T1, B@R2/T1, C@R1/T2 (validated)"
+    }
+  }
+}

@@ -1,0 +1,985 @@
+{
+  "kind": "glossary.graph",
+  "nodes": [
+    {
+      "id": "term:holon",
+      "term": "Holon",
+      "definition": "A recursive unit of organization that functions simultaneously as an autonomous whole and as a dependent part of a larger aggregate (a Holarchy). It possesses a Markov Blanket separating internal state from external states, interacting only through active outputs and sensory inputs.",
+      "operationalization": "Implemented as the `Holon` trait in `crates/apm2-holon/src/traits.rs`, defining the agent contract (`intake`, `execute_episode`, `should_stop`). The `EpisodeController` in `crates/apm2-holon/src/episode/controller.rs` manages the execution loop, enforcing the Markov Blanket via `EpisodeContext`.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-06",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-holon/src/traits.rs",
+        "crates/apm2-holon/src/skill.rs",
+        "crates/apm2-holon/src/episode/controller.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:lease",
+      "term": "Lease",
+      "definition": "A time-bounded, scope-bounded, revocable authorization to perform work or access resources. It serves as the primary mechanism for Bounded Authority.",
+      "operationalization": "Represented by the `Lease` struct (`crates/apm2-holon/src/resource/lease.rs`) containing `LeaseScope` and `expiration`. Enforced by the `LeaseValidator` trait in `crates/apm2-daemon/src/protocol/dispatch.rs` during tool execution.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-05"
+      ],
+      "implementation_refs": [
+        "crates/apm2-holon/src/resource/lease.rs",
+        "crates/apm2-core/src/lease/state.rs",
+        "crates/apm2-daemon/src/protocol/dispatch.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:budget",
+      "term": "Budget",
+      "definition": "A quantified allowance of resources (Compute, Tokens, Time, Tool Calls) attached to a Lease. It enforces hard stops to prevent runaway agents.",
+      "operationalization": "Implemented as the `EpisodeBudget` struct in `crates/apm2-daemon/src/episode/budget.rs` with 4D limits (tokens, time, actions, episodes). Checked by `EpisodeController` during execution cycles.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-06"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/episode/budget.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:gate",
+      "term": "Gate",
+      "definition": "A Holonic Verification Protocol that enforces quality, security, and compliance standards. It transforms subjective reviews into objective, machine-verifiable proofs (Receipts).",
+      "operationalization": "Implemented as `CapabilityGate` (`crates/apm2-core/src/cac/capability_gate.rs`) and `GateReceiptGenerator`. Verifies `EvidenceBundle` against `GateRequirements` (`crates/apm2-core/src/evidence/receipt.rs`).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/evidence/receipt.rs",
+        "crates/apm2-core/src/cac/capability_gate.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:admission_gate",
+      "term": "Admission Gate",
+      "definition": "A specialized Gate that controls the entry of ChangeSets into the Forge. It ensures that only work meeting strict criteria (e.g., passing AAT, no security regressions) is admitted for merging.",
+      "operationalization": "Implemented as `AdmissionGate` in `crates/apm2-core/src/cac/admission.rs`. Generates `AdmissionReceipt` upon success.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/cac/admission.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:ledger",
+      "term": "Ledger",
+      "definition": "The Topology of Truth. An append-only, cryptographically verifiable log of all significant events. It serves as the single source of truth for the system state.",
+      "operationalization": "Implemented as a SQLite WAL store via `Ledger` struct (`crates/apm2-core/src/ledger/storage.rs`) storing hash-chained `EventRecord`s. Provides a `LedgerReader` for concurrent access and `LedgerBackend` trait for abstraction.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/ledger/storage.rs",
+        "crates/apm2-core/src/ledger/backend.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:event_record",
+      "term": "EventRecord",
+      "definition": "The atomic unit of storage in the Ledger. Contains the event payload, sequence ID, and cryptographic proofs.",
+      "operationalization": "Defined as `EventRecord` struct in `crates/apm2-core/src/ledger/storage.rs`, containing `seq_id`, `event_hash`, `prev_hash`, `signature`, and the serialized event payload.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/ledger/storage.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:episode",
+      "term": "Episode",
+      "definition": "A Bounded Context Window of execution for a Holon. It represents a discrete unit of work (perceive-reason-act-evaluate) within a strictly enforced resource budget.",
+      "operationalization": "Managed by `EpisodeController` (`crates/apm2-holon/src/episode/controller.rs`) and `EpisodeRuntime` (`crates/apm2-daemon/src/episode/runtime.rs`). Lifecycle events like `EpisodeStarted` are emitted to the ledger.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-12"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/episode/runtime.rs",
+        "crates/apm2-holon/src/episode/controller.rs",
+        "crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:context_pack",
+      "term": "ContextPack",
+      "definition": "A pre-compiled, content-addressed, and bounded view of artifacts required for execution. It enforces Context Discipline by serving as a read allowlist.",
+      "operationalization": "Defined by `ContextPackSpec` (`crates/apm2-core/src/cac/pack_spec.rs`) and `ContextPackManifest`. The `ContextPackCompiler` resolves dependencies into a deterministic view.",
+      "theory_refs": [
+        "LAW-02",
+        "LAW-06"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/cac/pack_spec.rs",
+        "crates/apm2-core/src/context/manifest.rs",
+        "crates/apm2-core/src/cac/compiler.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:ocap",
+      "term": "OCAP (Object-Capability)",
+      "definition": "A security model where authority is represented by unforgeable tokens (capabilities). It eliminates ambient authority by requiring explicit capability presentation.",
+      "operationalization": "Implemented via `Capability` structs (`crates/apm2-daemon/src/episode/capability.rs`) and `CapabilityManifest`. The `CapabilityValidator` ensures tools are only invoked with valid capabilities.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-11"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/episode/capability.rs"
+      ],
+      "node_class": "EXPLANATORY"
+    },
+    {
+      "id": "term:evidence",
+      "term": "Evidence",
+      "definition": "A Cryptographic Proof of Work capturing immutable output. It consists of a CAS artifact and signed metadata linking it to a Work item.",
+      "operationalization": "Represented by `Evidence` struct (`crates/apm2-core/src/evidence/state.rs`) and categorized by `EvidenceCategory`. Stored in CAS and referenced by `EvidencePublished` events.",
+      "theory_refs": [
+        "LAW-04",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/evidence/state.rs",
+        "crates/apm2-daemon/src/evidence/artifact.rs",
+        "crates/apm2-core/src/evidence/category.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:receipt",
+      "term": "Receipt",
+      "definition": "A machine-verifiable proof of an outcome (e.g., Gate Pass, Tool Execution). It binds authority/validity to specific evidence.",
+      "operationalization": "Implemented as `GateReceipt` (`crates/apm2-core/src/evidence/receipt.rs`), `ToolReceipt`, and `SummaryReceipt`. Must be signed via `ReceiptSigner` and hash-linked.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-07",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/evidence/receipt.rs",
+        "crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs",
+        "crates/apm2-daemon/src/evidence/signer.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:merge_receipt",
+      "term": "MergeReceipt",
+      "definition": "A proof that a ChangeSet was successfully merged into the canonical branch. It serves as the authoritative record of code evolution, binding the specific Commit ID to the approved ChangeSet.",
+      "operationalization": "Implemented as `MergeReceipt` in `crates/apm2-core/src/fac/merge_receipt.rs`. Recorded on the ledger as a `MergeReceipt` event.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/merge_receipt.rs",
+        "crates/apm2-core/src/events/apm2.kernel.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:review_receipt",
+      "term": "ReviewReceipt",
+      "definition": "A proof that a human or automated reviewer has approved a ChangeSet. It captures the reviewer's identity, the specific artifacts reviewed, and the verdict.",
+      "operationalization": "Implemented as `ReviewReceiptRecorded` in `crates/apm2-core/src/fac/review_receipt.rs`. Includes a `ReviewReceiptRecordedBuilder` for construction.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/review_receipt.rs",
+        "crates/apm2-core/src/events/apm2.kernel.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:aat",
+      "term": "Automated Acceptance Testing (AAT)",
+      "definition": "A rigorous, machine-driven verification process where ChangeSets are subjected to a defined `AatSpec` (suite of tests) to produce an `AatGateReceipt`.",
+      "operationalization": "Defined by `AatSpec` (`crates/apm2-core/src/fac/aat_spec.rs`) and produced as `AatGateReceipt` (`crates/apm2-core/src/fac/aat_receipt.rs`).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-04"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/aat_spec.rs",
+        "crates/apm2-core/src/fac/aat_receipt.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:tool",
+      "term": "Tool",
+      "definition": "A discrete, privileged capability exposed to agents. It is the only mechanism for affecting the outside world, mediated by Policy and Leases.",
+      "operationalization": "Defined via Protocol Buffers in `crates/apm2-core/src/tool/apm2.tool.v1.rs`. Handled by `ToolHandler` implementations in `crates/apm2-daemon/src/episode/tool_handler.rs`, which enforce policy checks.",
+      "theory_refs": [
+        "LAW-11",
+        "LAW-05"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/tool/apm2.tool.v1.rs",
+        "crates/apm2-daemon/src/episode/tool_handler.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:workspace_delta",
+      "term": "Workspace Delta",
+      "definition": "A content-addressed representation of local, uncommitted changes relative to a pinned base state. Allows dirty state to be auditable.",
+      "operationalization": "Modeled as a patch artifact managed by `WorkspaceManager` (`crates/apm2-daemon/src/episode/workspace.rs`). Used in `ContextPack`s for dirty execution.",
+      "theory_refs": [
+        "LAW-09",
+        "LAW-03"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/episode/workspace.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:change_set",
+      "term": "ChangeSet",
+      "definition": "The atomic unit of code evolution. Represents a proposed transition strictly bound to a Plan and validated by Gates.",
+      "operationalization": "A `Work` item type (`WorkType::ChangeSet`). Tracks the lifecycle of a code change on the ledger via `ChangeSetBundleV1` (`crates/apm2-core/src/fac/changeset_bundle.rs`).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-03"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/risk_tier.rs",
+        "crates/apm2-core/src/fac/changeset_bundle.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:coordinator",
+      "term": "Coordinator",
+      "definition": "A specialized agent role responsible for Work Decomposition and Delegation. Manages the lifecycle of complex goals by spawning sub-holons.",
+      "operationalization": "Implemented via `RestartCoordinator` (`crates/apm2-core/src/session/restart_coordinator.rs`) and specific `Holon` logic that delegates work via `EpisodeController`.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-01"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/session/restart_coordinator.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:daemon",
+      "term": "Daemon",
+      "definition": "The APM2 Kernel. Manages state, enforces policy, and orchestrates the IPC protocol between agents and the environment.",
+      "operationalization": "The `apm2-daemon` crate. Holds `DaemonState` (`crates/apm2-daemon/src/state.rs`) and runs the `SessionDispatcher` (`crates/apm2-daemon/src/protocol/session_dispatch.rs`) to handle IPC.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/state.rs",
+        "crates/apm2-daemon/src/main.rs",
+        "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:finding",
+      "term": "Finding",
+      "definition": "A Structured Defect. A typed data object representing a specific issue (Security, Lint) detected by a Gate.",
+      "operationalization": "Struct with Category, Severity, Location, and a `FindingSignature` (`crates/apm2-core/src/fac/echo_trap.rs`) for recurrence tracking.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/echo_trap.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:plan",
+      "term": "Plan",
+      "definition": "The intent structure preceding a ChangeSet. Captures requirements and design decisions, hashed to prevent drift.",
+      "operationalization": "A `Work` item (`WorkType::PrdRefinement`) producing a spec snapshot hash (`crates/apm2-core/src/work/state.rs`).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-09"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/work/state.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:policy",
+      "term": "Policy",
+      "definition": "Governance as Code. A system of rules enforcing Default-Deny constraints on agent behavior (Tools, Network, Filesystem).",
+      "operationalization": "Enforced by `PolicyEngine` (`crates/apm2-core/src/policy/engine.rs`) using `PolicyDocument` (`crates/apm2-core/src/policy/schema.rs`) definitions.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/policy/engine.rs",
+        "crates/apm2-core/src/policy/schema.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:process",
+      "term": "Process",
+      "definition": "The OS-level execution unit of a Holon. Managed by a Supervisor and governed by a ProcessSpec.",
+      "operationalization": "Managed via `ProcessHandle` and configured by `ProcessSpec` in `crates/apm2-core/src/process/mod.rs`.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-11"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/process/mod.rs"
+      ],
+      "node_class": "BACKGROUND"
+    },
+    {
+      "id": "term:reducer",
+      "term": "Reducer",
+      "definition": "A pure function that transitions state by applying an Event. Ensures determinism and auditability.",
+      "operationalization": "Implemented as the `Reducer` trait (`crates/apm2-core/src/reducer/traits.rs`). Used to rebuild state from the Ledger. Can be checkpointed via `CheckpointStore` (`crates/apm2-core/src/reducer/checkpoint.rs`).",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/reducer/traits.rs",
+        "crates/apm2-core/src/session/reducer.rs",
+        "crates/apm2-core/src/reducer/checkpoint.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:checkpoint_store",
+      "term": "CheckpointStore",
+      "definition": "A mechanism to save snapshots of Reducer state to avoid replaying the entire ledger from genesis.",
+      "operationalization": "Implemented as `CheckpointStore` struct in `crates/apm2-core/src/reducer/checkpoint.rs`.",
+      "theory_refs": [
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/reducer/checkpoint.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:session",
+      "term": "Session",
+      "definition": "The Temporal Continuity of an agent's work. Spans episodes and restarts, maintained via SessionState and Ledger replay.",
+      "operationalization": "Tracked by `SessionState` (`crates/apm2-core/src/session/state.rs`). Recoverable via `RestartCoordinator`. Managed by `SessionDispatcher`.",
+      "theory_refs": [
+        "LAW-09",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/session/state.rs",
+        "crates/apm2-daemon/src/session/mod.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:session_dispatcher",
+      "term": "SessionDispatcher",
+      "definition": "The central component in the Daemon that routes IPC messages to the appropriate Session implementation.",
+      "operationalization": "Implemented as `SessionDispatcher` in `crates/apm2-daemon/src/protocol/session_dispatch.rs`.",
+      "theory_refs": [
+        "LAW-05"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:snapshot",
+      "term": "Snapshot",
+      "definition": "A verified, canonical projection of the Ledger at a specific anchor. Reduces replay cost while preserving provenance.",
+      "operationalization": "Implemented as `SessionSnapshot` (`crates/apm2-daemon/src/episode/handle.rs`) or `WorkspaceSnapshot`.",
+      "theory_refs": [
+        "LAW-09",
+        "LAW-03"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/episode/handle.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:supervisor",
+      "term": "Supervisor",
+      "definition": "An infrastructure role managing Lifecycle, Budget Enforcement, and Recovery. Acts as the OS for Holons.",
+      "operationalization": "Implemented by `Supervisor` struct (`crates/apm2-core/src/supervisor/mod.rs`). Manages process handles and enforces leases.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-12"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/supervisor/mod.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:hef",
+      "term": "Holonic Event Fabric (HEF)",
+      "definition": "A non-authoritative Pulse Plane for lossy event notifications, designed to accelerate UX and reduce polling by deriving 'pulses' from the authoritative Truth Plane (Ledger + CAS).",
+      "operationalization": "Implemented via `PulseEnvelopeV1` (proto), `PulsePublisher` (`crates/apm2-daemon/src/protocol/pulse_outbox.rs`), and resource governance logic (`crates/apm2-daemon/src/protocol/resource_governance.rs`).",
+      "theory_refs": [
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol/pulse_outbox.rs",
+        "crates/apm2-daemon/src/protocol/resource_governance.rs",
+        "proto/apm2d_runtime_v1.proto"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:htf",
+      "term": "Holonic Time Fabric (HTF)",
+      "definition": "The protocol substrate defining the time model for APM2. It prohibits wall-clock authority in favor of explicit, verifiable clocks (LedgerTime, MonotonicTicks, CausalTime).",
+      "operationalization": "Implemented via `HtfTick` and `LedgerTime` (`crates/apm2-core/src/htf/types.rs`), `HolonicClock` (`crates/apm2-daemon/src/htf/clock.rs`), and `TimeEnvelope`.",
+      "theory_refs": [
+        "LAW-04",
+        "LAW-09"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/htf/mod.rs",
+        "crates/apm2-daemon/src/htf/clock.rs",
+        "crates/apm2-core/src/htf/types.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:hlc",
+      "term": "HLC (Hybrid Logical Clock)",
+      "definition": "A clock that combines physical time with logical ticks to capture causality across distributed systems.",
+      "operationalization": "Implemented in `crates/apm2-core/src/htf/types.rs` and `crates/apm2-daemon/src/htf/clock.rs`.",
+      "theory_refs": [
+        "LAW-04",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/htf/types.rs",
+        "crates/apm2-daemon/src/htf/clock.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:actor_id",
+      "term": "ActorId",
+      "definition": "The cryptographic identity of an agent or component, typically a hash of a verifying key.",
+      "operationalization": "Implemented in `crates/apm2-daemon/src/projection/divergence_watchdog.rs`.",
+      "theory_refs": [
+        "LAW-05"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/projection/divergence_watchdog.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:ticket",
+      "term": "Ticket",
+      "definition": "The atomic unit of work request/initiation, typically upstream of a Plan. Represents the \"Spec-of-Request\".",
+      "operationalization": "Implemented in `crates/apm2-core/src/ticket_emitter/emitter.rs`.",
+      "theory_refs": [
+        "LAW-01"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/ticket_emitter/emitter.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:work_object",
+      "term": "WorkObject",
+      "definition": "The agent-side stateful representation of a unit of work (ticket, plan, changeset) tracking its lifecycle attempts.",
+      "operationalization": "Implemented in `crates/apm2-holon/src/work.rs`.",
+      "theory_refs": [
+        "LAW-12"
+      ],
+      "implementation_refs": [
+        "crates/apm2-holon/src/work.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:relay",
+      "term": "Relay",
+      "definition": "A node or mechanism that mediates connectivity between Holons to enforce outbound-only security boundaries.",
+      "operationalization": "Implemented in `crates/apm2-core/src/consensus/relay.rs`.",
+      "theory_refs": [
+        "LAW-05"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/consensus/relay.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:handshake",
+      "term": "Handshake",
+      "definition": "The mandatory protocol negotiation (Hello/HelloAck) required before any IPC or network exchange.",
+      "operationalization": "Implemented in `crates/apm2-daemon/src/protocol/handshake.rs`.",
+      "theory_refs": [
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol/handshake.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:impact_map",
+      "term": "ImpactMap",
+      "definition": "A calculated artifact that determines the \"Blast Radius\" of a change, used to assign Risk Tiers.",
+      "operationalization": "Implemented in `crates/apm2-core/src/impact_map`.",
+      "theory_refs": [
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/impact_map"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:schema_registry",
+      "term": "SchemaRegistry",
+      "definition": "The authoritative store for Protocol Buffer schemas and version mappings, enforcing semantic typing.",
+      "operationalization": "Implemented in `crates/apm2-core/src/schema_registry`.",
+      "theory_refs": [
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/schema_registry"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:refactor_radar",
+      "term": "RefactorRadar",
+      "definition": "A subsystem that monitors codebase complexity and churn to generate proactive maintenance recommendations (Refactoring Tickets).",
+      "operationalization": "Implemented in `crates/apm2-core/src/refactor_radar`.",
+      "theory_refs": [
+        "LAW-06",
+        "LAW-01"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/refactor_radar"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:crdt",
+      "term": "CRDT (Conflict-free Replicated Data Type)",
+      "definition": "Data structures that guarantee eventual convergence without global synchronization, used for the Data Plane.",
+      "operationalization": "Implemented in `crates/apm2-core/src/consensus/crdt.rs`.",
+      "theory_refs": [
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/consensus/crdt.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:defect_record",
+      "term": "DefectRecord",
+      "definition": "A machine-readable counterexample that falsifies an intent predicate or contract. It includes an evidence bundle, structured findings, and replay instructions.",
+      "operationalization": "Implemented as `DefectRecord` in `crates/apm2-holon/src/defect.rs` and the `DefectRecorded` event in `events/apm2.kernel.v1.rs`.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08"
+      ],
+      "implementation_refs": [
+        "crates/apm2-holon/src/defect.rs",
+        "crates/apm2-core/src/events/apm2.kernel.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:finding_signature",
+      "term": "FindingSignature",
+      "definition": "A deterministic identifier computed from normalized finding fields (category, rule ID, subsystem, location) used to cluster recurrent defects and trigger countermeasures.",
+      "operationalization": "Implemented as `FindingSignature` in `crates/apm2-core/src/fac/echo_trap.rs`.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/echo_trap.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:work_substrate",
+      "term": "Work Substrate",
+      "definition": "The authoritative coordination plane comprising work-object specs, durable event records, and deterministic projections. It is the 'factory floor' for agent activity.",
+      "operationalization": "Abstract concept realized by the integration of `Ledger`, `CAS`, `WorkObject` state machines, and the `Daemon` event loop.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/work/state.rs",
+        "crates/apm2-core/src/ledger/storage.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:plan_of_record",
+      "term": "Plan-of-Record",
+      "definition": "An approved Plan specification snapshot bound by a content digest. It serves as the immutable reference for downstream implementation and verification.",
+      "operationalization": "Realized as a `Work` object with `WorkType::PrdRefinement` or `RfcRefinement` that has been approved and hashed.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-09"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/work/state.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:spec_snapshot",
+      "term": "Spec Snapshot",
+      "definition": "A deterministic representation of specification content (YAML, attachments, schema versions), canonicalized and hashed to provide stable identity.",
+      "operationalization": "Part of the `Work` state in `crates/apm2-core/src/work/state.rs`, stored as `spec_snapshot_hash`.",
+      "theory_refs": [
+        "LAW-09",
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/work/state.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:gate_run",
+      "term": "GateRun",
+      "definition": "An execution instance of a Gate against a Plan or ChangeSet, producing a decision and a bounded set of Findings. It must emit a verifiable receipt.",
+      "operationalization": "Represented by the `GateRunCompleted` event in `documents/rfcs/RFC-0015/06_ticket_decomposition.yaml` (and likely protocol definitions).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/events/apm2.kernel.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:countermeasure",
+      "term": "Countermeasure",
+      "definition": "Planned work to prevent the recurrence of a FindingSignature by modifying system guardrails. Validated by evidence of reduced recurrence.",
+      "operationalization": "A specific `WorkType` (conceptual) or a `Ticket` triggered by recurrence analysis in `RefactorRadar` or similar subsystems.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08"
+      ],
+      "implementation_refs": [],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:permeability_receipt",
+      "term": "PermeabilityReceipt",
+      "definition": "The only legal path for capabilities to cross a holonic boundary. It grants a narrowly-scoped capability set with TTL and audit bindings.",
+      "operationalization": "Conceptual mechanism defined in `unified_theory.json` (MECH-PERMEABILITY-RECEIPT). Implemented as part of the handshake/capability exchange protocol.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol/handshake.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:oracle_request",
+      "term": "OracleRequest",
+      "definition": "An explicit escalation event for high-entropy specification gaps or irreducible human decisions. Treated as a refinement input, not a silent failure.",
+      "operationalization": "Conceptual mechanism defined in `unified_theory.json` (MECH-ORACLE-REQUEST).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-12"
+      ],
+      "implementation_refs": [],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:holonic_mesh_protocol",
+      "term": "Holonic Mesh Protocol (HMP)",
+      "definition": "The digest-first communication standard for inter-holon messages. It enforces `Discovery -> Handshake -> Work -> Evidence` channel progression.",
+      "operationalization": "Conceptual standard defined in `unified_theory.json` (MECH-HOLON-MESH-PROTOCOL). Partially implemented by the `apm2-daemon` protocol.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-07",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:cell",
+      "term": "Cell",
+      "definition": "An operational and trust boundary that hosts a set of holons with a local ledger namespace, CAS, and policy. It supports federation via anti-entropy.",
+      "operationalization": "Conceptual unit of sharding defined in `unified_theory.json` (Federation Model).",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-05",
+        "LAW-10"
+      ],
+      "implementation_refs": [],
+      "node_class": "NORMATIVE"
+    }
+  ],
+  "edges": [
+    {
+      "source": "term:holon",
+      "target": "term:episode",
+      "relation": "implements"
+    },
+    {
+      "source": "term:lease",
+      "target": "term:holon",
+      "relation": "governs"
+    },
+    {
+      "source": "term:budget",
+      "target": "term:lease",
+      "relation": "refines"
+    },
+    {
+      "source": "term:gate",
+      "target": "term:receipt",
+      "relation": "implements"
+    },
+    {
+      "source": "term:admission_gate",
+      "target": "term:gate",
+      "relation": "implements"
+    },
+    {
+      "source": "term:admission_gate",
+      "target": "term:change_set",
+      "relation": "governs"
+    },
+    {
+      "source": "term:ledger",
+      "target": "term:evidence",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:ledger",
+      "target": "term:event_record",
+      "relation": "implements"
+    },
+    {
+      "source": "term:context_pack",
+      "target": "term:holon",
+      "relation": "governs"
+    },
+    {
+      "source": "term:ocap",
+      "target": "term:tool",
+      "relation": "governs"
+    },
+    {
+      "source": "term:supervisor",
+      "target": "term:process",
+      "relation": "governs"
+    },
+    {
+      "source": "term:coordinator",
+      "target": "term:holon",
+      "relation": "implements"
+    },
+    {
+      "source": "term:daemon",
+      "target": "term:session",
+      "relation": "governs"
+    },
+    {
+      "source": "term:daemon",
+      "target": "term:session_dispatcher",
+      "relation": "implements"
+    },
+    {
+      "source": "term:policy",
+      "target": "term:tool",
+      "relation": "governs"
+    },
+    {
+      "source": "term:reducer",
+      "target": "term:ledger",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:reducer",
+      "target": "term:checkpoint_store",
+      "relation": "implements"
+    },
+    {
+      "source": "term:change_set",
+      "target": "term:plan",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:merge_receipt",
+      "target": "term:change_set",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:review_receipt",
+      "target": "term:change_set",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:aat",
+      "target": "term:gate",
+      "relation": "implements"
+    },
+    {
+      "source": "term:snapshot",
+      "target": "term:ledger",
+      "relation": "refines"
+    },
+    {
+      "source": "term:hef",
+      "target": "term:ledger",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:htf",
+      "target": "term:ledger",
+      "relation": "governs"
+    },
+    {
+      "source": "term:htf",
+      "target": "term:lease",
+      "relation": "governs"
+    },
+    {
+      "source": "term:hlc",
+      "target": "term:htf",
+      "relation": "implements"
+    },
+    {
+      "source": "term:work_object",
+      "target": "term:ticket",
+      "relation": "governs"
+    },
+    {
+      "source": "term:refactor_radar",
+      "target": "term:ticket",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:relay",
+      "target": "term:handshake",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:schema_registry",
+      "target": "term:handshake",
+      "relation": "governs"
+    },
+    {
+      "source": "term:crdt",
+      "target": "term:ledger",
+      "relation": "conflicts_with"
+    },
+    {
+      "source": "term:actor_id",
+      "target": "term:lease",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:impact_map",
+      "target": "term:gate",
+      "relation": "governs"
+    },
+    {
+      "source": "term:defect_record",
+      "target": "term:finding_signature",
+      "relation": "governs"
+    },
+    {
+      "source": "term:finding_signature",
+      "target": "term:countermeasure",
+      "relation": "implements"
+    },
+    {
+      "source": "term:work_substrate",
+      "target": "term:work_object",
+      "relation": "governs"
+    },
+    {
+      "source": "term:plan_of_record",
+      "target": "term:spec_snapshot",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:gate_run",
+      "target": "term:gate",
+      "relation": "implements"
+    },
+    {
+      "source": "term:gate_run",
+      "target": "term:receipt",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:permeability_receipt",
+      "target": "term:ocap",
+      "relation": "implements"
+    },
+    {
+      "source": "term:oracle_request",
+      "target": "term:work_object",
+      "relation": "implements"
+    },
+    {
+      "source": "term:holonic_mesh_protocol",
+      "target": "term:handshake",
+      "relation": "governs"
+    },
+    {
+      "source": "term:cell",
+      "target": "term:federation",
+      "relation": "implements"
+    }
+  ]
+}

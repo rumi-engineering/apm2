@@ -30,7 +30,7 @@
     "ctx": [
       "documents/skills/rfc-council/references/closure-mode.md",
       "documents/skills/rfc-council/references/REVIEW_RUBRIC.md",
-      "documents/skills/modes-of-reasoning/artifacts/selector.json"
+      "documents/skills/modes-of-reasoning/assets/selector.json"
     ],
     "lex": {
       "F1": "Load v2 context; verify open questions resolved.",
