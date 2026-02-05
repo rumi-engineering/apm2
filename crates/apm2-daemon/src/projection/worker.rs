@@ -100,8 +100,8 @@ pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Maximum string length for fields extracted from ledger payloads.
 ///
-/// This prevents unbounded input consumption (denial of service) when deserializing
-/// untrusted payloads. (Blocker fix: Unbounded Input Consumption)
+/// This prevents unbounded input consumption (denial of service) when
+/// deserializing untrusted payloads. (Blocker fix: Unbounded Input Consumption)
 pub const MAX_STRING_LENGTH: usize = 1024;
 
 /// Validates that a string field does not exceed the maximum allowed length.
@@ -1155,13 +1155,25 @@ impl ProjectionWorker {
                 ProjectionWorkerError::InvalidPayload("missing changeset_digest".to_string())
             })?;
 
+        // Validate string length (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("changeset_digest", changeset_digest_hex)?;
+
         let work_id = payload
             .get("work_id")
             .and_then(|v| v.as_str())
             .unwrap_or(&event.work_id);
 
+        // Validate string length (Blocker fix: Unbounded Input Consumption)
+        validate_string_length("work_id", work_id)?;
+
         // Extract commit SHA if present (for GitHub status projection)
         let commit_sha = payload.get("commit_sha").and_then(|v| v.as_str());
+
+        // Validate commit_sha length if present (Blocker fix: Unbounded Input
+        // Consumption)
+        if let Some(sha) = commit_sha {
+            validate_string_length("commit_sha", sha)?;
+        }
 
         // Decode changeset digest
         let digest_bytes = hex::decode(changeset_digest_hex)
