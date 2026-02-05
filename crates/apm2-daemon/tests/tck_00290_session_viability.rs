@@ -102,8 +102,8 @@ fn make_test_manifest(tools: Vec<ToolClass>) -> apm2_daemon::episode::Capability
 // Verification: cargo test -p apm2-daemon session_request_tool_exec
 // =============================================================================
 
-/// Verify `RequestTool` with configured manifest store returns fail-closed error
-/// when tool broker is unavailable.
+/// Verify `RequestTool` with configured manifest store returns fail-closed
+/// error when tool broker is unavailable.
 ///
 /// TCK-00335: Legacy manifest store validation removed; tool broker required.
 #[test]
