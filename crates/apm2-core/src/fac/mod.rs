@@ -255,3 +255,4 @@ pub use transcript_binding::{
     AatTranscriptBinding, MAX_CHUNK_CONTENT_BYTES, MAX_RUN_TRANSCRIPT_HASHES,
     MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
 };
+pub mod view_commitment;

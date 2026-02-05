@@ -310,6 +310,16 @@ pub struct ReviewArtifactBundleV1 {
     pub tool_log_hashes: Vec<String>,
     /// HTF time envelope reference hash (32 bytes, hex-encoded).
     pub time_envelope_ref: String,
+    /// View commitment hash (from CAS).
+    ///
+    /// Represents the materialized workspace state at the time of review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_commitment_hash: Option<String>,
+    /// Policy resolved reference.
+    ///
+    /// The policy resolution binding used for the review session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_resolved_ref: Option<String>,
     /// Optional metadata for review context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ReviewMetadata>,
@@ -405,6 +415,31 @@ impl ReviewArtifactBundleV1 {
             ));
         }
 
+        // Validate view_commitment_hash if present
+        if let Some(ref hash) = self.view_commitment_hash {
+            if hash.len() != 64 {
+                return Err(ReviewReceiptError::InvalidData(
+                    "view_commitment_hash must be 64 hex characters".into(),
+                ));
+            }
+        }
+
+        // Validate policy_resolved_ref if present
+        if let Some(ref reference) = self.policy_resolved_ref {
+            if reference.is_empty() {
+                return Err(ReviewReceiptError::InvalidData(
+                    "policy_resolved_ref must not be empty".into(),
+                ));
+            }
+            if reference.len() > MAX_STRING_LENGTH {
+                return Err(ReviewReceiptError::StringTooLong {
+                    field: "policy_resolved_ref",
+                    len: reference.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
         // Validate metadata if present
         if let Some(ref metadata) = self.metadata {
             metadata.validate()?;
@@ -426,6 +461,8 @@ pub struct ReviewArtifactBundleV1Builder {
     review_text_hash: Option<[u8; 32]>,
     tool_log_hashes: Vec<[u8; 32]>,
     time_envelope_ref: Option<[u8; 32]>,
+    view_commitment_hash: Option<[u8; 32]>,
+    policy_resolved_ref: Option<String>,
     metadata: Option<ReviewMetadata>,
 }
 
@@ -473,6 +510,20 @@ impl ReviewArtifactBundleV1Builder {
         self
     }
 
+    /// Sets the view commitment hash.
+    #[must_use]
+    pub fn view_commitment_hash(mut self, hash: [u8; 32]) -> Self {
+        self.view_commitment_hash = Some(hash);
+        self
+    }
+
+    /// Sets the policy resolved reference.
+    #[must_use]
+    pub fn policy_resolved_ref(mut self, reference: impl Into<String>) -> Self {
+        self.policy_resolved_ref = Some(reference.into());
+        self
+    }
+
     /// Sets the metadata.
     #[must_use]
     pub fn metadata(mut self, metadata: ReviewMetadata) -> Self {
@@ -516,6 +567,8 @@ impl ReviewArtifactBundleV1Builder {
             review_text_hash: hex::encode(review_text_hash),
             tool_log_hashes: self.tool_log_hashes.iter().map(hex::encode).collect(),
             time_envelope_ref: hex::encode(time_envelope_ref),
+            view_commitment_hash: self.view_commitment_hash.map(hex::encode),
+            policy_resolved_ref: self.policy_resolved_ref,
             metadata: self.metadata,
         };
 

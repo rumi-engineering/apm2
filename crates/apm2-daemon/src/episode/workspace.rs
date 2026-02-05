@@ -58,6 +58,7 @@ use apm2_core::fac::{
     ReviewReceiptRecorded, ReviewReceiptRecordedBuilder,
 };
 use apm2_core::htf::TimeEnvelopeRef;
+use apm2_core::fac::view_commitment::ViewCommitmentV1;
 use thiserror::Error;
 
 use super::executor::ContentAddressedStore;
@@ -297,6 +298,8 @@ pub struct ApplyResult {
     pub files_modified: usize,
     /// Timestamp when apply completed (nanoseconds since epoch).
     pub applied_at_ns: u64,
+    /// View commitment hash binding policy to state.
+    pub view_commitment_hash: Option<[u8; 32]>,
     /// HTF time envelope reference for temporal authority.
     pub time_envelope_ref: Option<TimeEnvelopeRef>,
 }
@@ -308,11 +311,13 @@ impl ApplyResult {
         changeset_digest: [u8; 32],
         files_modified: usize,
         applied_at_ns: u64,
+        view_commitment_hash: Option<[u8; 32]>,
     ) -> Self {
         Self {
             changeset_digest,
             files_modified,
             applied_at_ns,
+            view_commitment_hash,
             time_envelope_ref: None,
         }
     }
@@ -893,6 +898,8 @@ pub fn create_artifact_bundle(
     review_text_hash: [u8; 32],
     tool_log_hashes: Vec<[u8; 32]>,
     time_envelope_ref: [u8; 32],
+    view_commitment_hash: Option<[u8; 32]>,
+    policy_resolved_ref: Option<String>,
     metadata: Option<ReviewMetadata>,
 ) -> Result<ReviewArtifactBundleV1, ReviewReceiptError> {
     let mut builder = ReviewArtifactBundleV1::builder()
@@ -901,6 +908,14 @@ pub fn create_artifact_bundle(
         .review_text_hash(review_text_hash)
         .tool_log_hashes(tool_log_hashes)
         .time_envelope_ref(time_envelope_ref);
+
+    if let Some(hash) = view_commitment_hash {
+        builder = builder.view_commitment_hash(hash);
+    }
+
+    if let Some(ref r) = policy_resolved_ref {
+        builder = builder.policy_resolved_ref(r.clone());
+    }
 
     if let Some(meta) = metadata {
         builder = builder.metadata(meta);
@@ -966,6 +981,8 @@ pub struct ReviewCompletionResultBuilder {
     tool_log_hashes: Vec<[u8; 32]>,
     time_envelope_ref: Option<[u8; 32]>,
     reviewer_actor_id: Option<String>,
+    view_commitment_hash: Option<[u8; 32]>,
+    policy_resolved_ref: Option<String>,
     metadata: Option<ReviewMetadata>,
 }
 
@@ -1020,6 +1037,20 @@ impl ReviewCompletionResultBuilder {
         self
     }
 
+    /// Sets the view commitment hash.
+    #[must_use]
+    pub fn view_commitment_hash(mut self, hash: [u8; 32]) -> Self {
+        self.view_commitment_hash = Some(hash);
+        self
+    }
+
+    /// Sets the policy resolved reference.
+    #[must_use]
+    pub fn policy_resolved_ref(mut self, reference: impl Into<String>) -> Self {
+        self.policy_resolved_ref = Some(reference.into());
+        self
+    }
+
     /// Sets the review metadata.
     #[must_use]
     pub fn metadata(mut self, metadata: ReviewMetadata) -> Self {
@@ -1062,6 +1093,8 @@ impl ReviewCompletionResultBuilder {
             review_text_hash,
             self.tool_log_hashes,
             time_envelope_ref,
+            self.view_commitment_hash,
+            self.policy_resolved_ref,
             self.metadata,
         )?;
 
@@ -1230,6 +1263,49 @@ impl WorkspaceManager {
         ))
     }
 
+    /// Commits the current workspace view.
+    ///
+    /// This captures the post-execution state binding it to the policy resolution.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Unique work identifier
+    /// * `policy_resolved_ref` - The policy resolution binding
+    /// * `timestamp_ns` - Optional timestamp in nanoseconds
+    ///
+    /// # Errors
+    ///
+    /// Returns error if commit fails.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn commit_view(
+        &self,
+        work_id: &str,
+        policy_resolved_ref: &str,
+        timestamp_ns: Option<u64>,
+    ) -> Result<ViewCommitmentV1, WorkspaceError> {
+        let committed_at_ns = timestamp_ns.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        });
+
+        // Compute result digest (same logic as snapshot hash for now)
+        let git_head = self.get_git_head();
+        let hash_input = git_head
+            .as_ref()
+            .map_or_else(|| work_id.to_string(), |head| format!("{work_id}:{head}"));
+        let result_digest = *blake3::hash(hash_input.as_bytes()).as_bytes();
+        let result_digest_hex = hex::encode(result_digest);
+
+        Ok(ViewCommitmentV1::new(
+            work_id,
+            result_digest_hex,
+            policy_resolved_ref,
+            committed_at_ns,
+        ))
+    }
+
     /// Applies a changeset bundle to the workspace.
     ///
     /// This is the main entry point for workspace materialization per
@@ -1307,6 +1383,7 @@ impl WorkspaceManager {
             bundle.changeset_digest,
             bundle.file_manifest.len(),
             applied_at_ns,
+            None,
         ))
     }
 
@@ -1387,7 +1464,58 @@ impl WorkspaceManager {
             bundle.changeset_digest,
             bundle.file_manifest.len(),
             applied_at_ns,
+            None,
         ))
+    }
+
+    /// Applies a changeset bundle and captures the view commitment.
+    ///
+    /// This extends `apply_with_timestamp` by creating and storing a
+    /// `ViewCommitmentV1` that binds the policy resolution to the
+    /// materialized state.
+    ///
+    /// # Arguments
+    ///
+    /// * `bundle` - The changeset bundle to apply
+    /// * `work_id` - Unique work identifier
+    /// * `policy_resolved_ref` - The policy resolution binding
+    /// * `timestamp_ns` - Optional timestamp in nanoseconds
+    pub fn apply_with_view_commitment(
+        &self,
+        bundle: &ChangeSetBundleV1,
+        work_id: &str,
+        policy_resolved_ref: &str,
+        timestamp_ns: Option<u64>,
+    ) -> Result<ApplyResult, WorkspaceError> {
+        // Delegate to existing apply logic
+        let mut result = self.apply_with_timestamp(bundle, timestamp_ns)?;
+
+        // Capture view commitment
+        let commitment = self.commit_view(
+            work_id,
+            policy_resolved_ref,
+            Some(result.applied_at_ns),
+        )?;
+
+        // Store in CAS
+        let commitment_hash = self.store_view_commitment(&commitment)?;
+
+        // Update result with commitment hash
+        result.view_commitment_hash = Some(commitment_hash);
+
+        Ok(result)
+    }
+
+    /// Stores the view commitment in CAS.
+    fn store_view_commitment(&self, commitment: &ViewCommitmentV1) -> Result<[u8; 32], WorkspaceError> {
+        if let Some(cas) = &self.cas {
+            let json = serde_json::to_vec(commitment).map_err(|e| WorkspaceError::ApplyFailed(e.to_string()))?;
+            let hash = cas.store(&json);
+            Ok(hash)
+        } else {
+             // If no CAS, just return computed hash (validation mode)
+             Ok(commitment.compute_cas_hash())
+        }
     }
 
     /// Checkouts the workspace to a specific commit.
@@ -2107,7 +2235,7 @@ mod tests {
 
     #[test]
     fn test_apply_result_creation() {
-        let result = ApplyResult::new([0x33; 32], 5, 9_876_543_210);
+        let result = ApplyResult::new([0x33; 32], 5, 9_876_543_210, None);
         assert_eq!(result.changeset_digest, [0x33; 32]);
         assert_eq!(result.files_modified, 5);
         assert!(result.time_envelope_ref.is_none());
@@ -2133,6 +2261,8 @@ mod tests {
             [0x11; 32],
             vec![[0x22; 32], [0x33; 32]],
             [0x44; 32],
+            None, // view_commitment_hash
+            None, // policy_resolved_ref
             None,
         )
         .expect("should create bundle");
@@ -2161,6 +2291,8 @@ mod tests {
             [0x11; 32],
             vec![],
             [0x44; 32],
+            None, // view_commitment_hash
+            None, // policy_resolved_ref
             Some(metadata),
         )
         .expect("should create bundle");
@@ -2550,7 +2682,7 @@ mod tests {
     fn test_apply_result_with_time_envelope() {
         use apm2_core::htf::TimeEnvelopeRef;
 
-        let result = ApplyResult::new([0x33; 32], 5, 9_876_543_210);
+        let result = ApplyResult::new([0x33; 32], 5, 9_876_543_210, None);
         assert!(result.time_envelope_ref.is_none());
 
         let envelope_bytes = [0x44; 32];

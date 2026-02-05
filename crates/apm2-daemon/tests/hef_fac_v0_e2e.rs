@@ -578,6 +578,8 @@ async fn test_review_receipt_ledger_anchoring() {
         review_text_hash,
         vec![tool_log_hash],
         [0u8; 32],
+        None,
+        None,
         Some(metadata),
     )
     .expect("build artifact bundle");
@@ -1555,6 +1557,8 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
         review_text_hash,
         vec![read_log_hash, git_log_hash, artifact_log_hash],
         [0u8; 32],
+        None, // view_commitment_hash
+        None, // policy_resolved_ref
         Some(metadata),
     )
     .expect("build artifact bundle");
