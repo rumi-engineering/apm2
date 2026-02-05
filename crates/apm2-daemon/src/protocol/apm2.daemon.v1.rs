@@ -403,6 +403,41 @@ pub struct ShutdownResponse {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-005: WorkStatus (TCK-00344)
+/// Query the status of a work item from the work queue.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkStatusRequest {
+    /// Work identifier to query.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkStatusResponse {
+    /// Work identifier.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Current work status (UNCLAIMED, CLAIMED, SPAWNED, COMPLETED, FAILED).
+    #[prost(string, tag = "2")]
+    pub status: ::prost::alloc::string::String,
+    /// Actor who claimed this work (if claimed).
+    #[prost(string, optional, tag = "3")]
+    pub actor_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Role of the actor (if claimed).
+    #[prost(enumeration = "WorkRole", optional, tag = "4")]
+    pub role: ::core::option::Option<i32>,
+    /// Associated session ID (if spawned).
+    #[prost(string, optional, tag = "5")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Lease ID (if claimed).
+    #[prost(string, optional, tag = "6")]
+    pub lease_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Work creation timestamp (nanoseconds since epoch).
+    #[prost(uint64, tag = "7")]
+    pub created_at_ns: u64,
+    /// Work claimed timestamp (nanoseconds since epoch, if claimed).
+    #[prost(uint64, optional, tag = "8")]
+    pub claimed_at_ns: ::core::option::Option<u64>,
+}
 /// Generic error response for privileged endpoints.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrivilegedError {
@@ -528,6 +563,44 @@ pub struct StreamTelemetryResponse {
     /// Whether frame was promoted to persistent storage.
     #[prost(bool, tag = "2")]
     pub promoted: bool,
+}
+/// IPC-SESS-005: SessionStatus (TCK-00344)
+/// Query session-scoped status via session.sock.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionStatusRequest {
+    /// Session token for authentication.
+    #[prost(string, tag = "1")]
+    pub session_token: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionStatusResponse {
+    /// Session identifier.
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// Current session state (ACTIVE, SUSPENDED, TERMINATED).
+    #[prost(string, tag = "2")]
+    pub state: ::prost::alloc::string::String,
+    /// Work ID this session is associated with.
+    #[prost(string, tag = "3")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Role of the session.
+    #[prost(enumeration = "WorkRole", tag = "4")]
+    pub role: i32,
+    /// Episode ID (if associated).
+    #[prost(string, optional, tag = "5")]
+    pub episode_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Telemetry summary: total tool calls executed.
+    #[prost(uint32, tag = "6")]
+    pub tool_calls: u32,
+    /// Telemetry summary: total events emitted.
+    #[prost(uint32, tag = "7")]
+    pub events_emitted: u32,
+    /// Session start timestamp (nanoseconds since epoch).
+    #[prost(uint64, tag = "8")]
+    pub started_at_ns: u64,
+    /// Session duration in milliseconds.
+    #[prost(uint64, tag = "9")]
+    pub duration_ms: u64,
 }
 /// Generic error response for session-scoped endpoints.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1531,6 +1604,8 @@ pub enum PrivilegedErrorCode {
     SessionNotFound = 7,
     /// Capability grant denied by policy.
     CapabilityDenied = 8,
+    /// Referenced work item not found.
+    WorkNotFound = 9,
 }
 impl PrivilegedErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1548,6 +1623,7 @@ impl PrivilegedErrorCode {
             Self::SodViolation => "SOD_VIOLATION",
             Self::SessionNotFound => "SESSION_NOT_FOUND",
             Self::CapabilityDenied => "CAPABILITY_DENIED",
+            Self::WorkNotFound => "WORK_NOT_FOUND",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1562,6 +1638,7 @@ impl PrivilegedErrorCode {
             "SOD_VIOLATION" => Some(Self::SodViolation),
             "SESSION_NOT_FOUND" => Some(Self::SessionNotFound),
             "CAPABILITY_DENIED" => Some(Self::CapabilityDenied),
+            "WORK_NOT_FOUND" => Some(Self::WorkNotFound),
             _ => None,
         }
     }

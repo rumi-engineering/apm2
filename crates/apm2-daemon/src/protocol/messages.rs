@@ -335,6 +335,11 @@ impl_bounded_decode_simple!(
     StreamTelemetryRequest,
     StreamTelemetryResponse,
     SessionError,
+    // TCK-00344: Status query endpoints
+    WorkStatusRequest,
+    WorkStatusResponse,
+    SessionStatusRequest,
+    SessionStatusResponse,
     // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
     LeaseRevoked,
     RecoverSessionsRequest,

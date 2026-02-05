@@ -1222,6 +1222,7 @@ async fn protocol_dispatch_cutover_tag_routing() {
 /// This test documents the security invariant that JSON start bytes
 /// are outside the valid message type tag range, ensuring fail-closed
 /// behavior without explicit JSON detection code in the dispatchers.
+/// Updated for TCK-00344: tag 5 is now valid (`WorkStatus` / `SessionStatus`).
 #[test]
 fn protocol_dispatch_cutover_json_tag_validation() {
     use apm2_daemon::protocol::dispatch::PrivilegedMessageType;
@@ -1235,7 +1236,7 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     let json_array_byte: u8 = b'[';
     assert_eq!(json_array_byte, 91);
 
-    // Valid privileged message types are 1-14
+    // Valid privileged message types are 1-15
     // Tags 1-4: Original privileged endpoints
     assert!(PrivilegedMessageType::from_tag(1).is_some()); // ClaimWork
     assert!(PrivilegedMessageType::from_tag(2).is_some()); // SpawnEpisode
@@ -1253,11 +1254,13 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(PrivilegedMessageType::from_tag(12).is_some()); // ConsensusValidators
     assert!(PrivilegedMessageType::from_tag(13).is_some()); // ConsensusByzantineEvidence
     assert!(PrivilegedMessageType::from_tag(14).is_some()); // ConsensusMetrics
-    assert!(PrivilegedMessageType::from_tag(15).is_none()); // Invalid (reserved for future)
+    // Tag 15: TCK-00344 WorkStatus
+    assert!(PrivilegedMessageType::from_tag(15).is_some()); // WorkStatus
+    assert!(PrivilegedMessageType::from_tag(16).is_none()); // Invalid (reserved for future)
     assert!(PrivilegedMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
     assert!(PrivilegedMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
 
-    // Valid session message types are 1-5, plus HEF range 64-68
+    // Valid session message types are 1-6, plus HEF range 64-68
     // Tags 1-4: Original session endpoints
     assert!(SessionMessageType::from_tag(1).is_some()); // RequestTool
     assert!(SessionMessageType::from_tag(2).is_some()); // EmitEvent
@@ -1265,7 +1268,9 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(SessionMessageType::from_tag(4).is_some()); // StreamTelemetry
     // Tag 5: TCK-00342 StreamLogs
     assert!(SessionMessageType::from_tag(5).is_some()); // StreamLogs
-    assert!(SessionMessageType::from_tag(6).is_none()); // Invalid (gap before HEF)
+    // Tag 6: TCK-00344 SessionStatus
+    assert!(SessionMessageType::from_tag(6).is_some()); // SessionStatus
+    assert!(SessionMessageType::from_tag(7).is_none()); // Invalid (gap before HEF)
     // Tags 64-68: HEF Pulse Plane
     assert!(SessionMessageType::from_tag(64).is_some()); // SubscribePulse
     assert!(SessionMessageType::from_tag(66).is_some()); // UnsubscribePulse

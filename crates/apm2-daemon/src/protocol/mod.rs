@@ -177,6 +177,7 @@ pub use dispatch::{
     encode_spawn_episode_request,
     encode_start_process_request,
     encode_stop_process_request,
+    encode_work_status_request,
     generate_lease_id,
     generate_work_id,
 };
@@ -257,6 +258,8 @@ pub use messages::{
     RestartProcessResponse,
     SessionError,
     SessionErrorCode,
+    SessionStatusRequest,
+    SessionStatusResponse,
     ShutdownRequest,
     ShutdownResponse,
     SpawnEpisodeRequest,
@@ -275,6 +278,9 @@ pub use messages::{
     UnsubscribePulseResponse,
     ValidatorInfo,
     WorkRole,
+    // TCK-00344: Status query messages
+    WorkStatusRequest,
+    WorkStatusResponse,
 };
 // CTR-PROTO-010: HEF Pulse ACL (RFC-0018, TCK-00302)
 #[allow(unused_imports)]
@@ -361,8 +367,8 @@ pub use server::{
 #[allow(unused_imports)]
 pub use session_dispatch::{
     SessionDispatcher, SessionMessageType, SessionResponse, encode_emit_event_request,
-    encode_publish_evidence_request, encode_request_tool_request, encode_stream_logs_request,
-    encode_stream_telemetry_request,
+    encode_publish_evidence_request, encode_request_tool_request, encode_session_status_request,
+    encode_stream_logs_request, encode_stream_telemetry_request,
 };
 #[allow(unused_imports)]
 pub use session_token::{SessionToken, SessionTokenError, TokenMinter};

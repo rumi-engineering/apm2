@@ -45,7 +45,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::client::daemon::ErrorCode;
-use crate::client::protocol::{OperatorClient, ProtocolClientError};
+use crate::client::protocol::{OperatorClient, ProtocolClientError, SessionClient};
 use crate::exit_codes::{codes as hef_exit_codes, map_protocol_error};
 
 /// Maximum envelope file size (10 MiB).
@@ -468,14 +468,20 @@ pub struct SpawnResponse {
     pub session_token: String,
 }
 
-/// Response for session-scoped episode status (TCK-00288).
+/// Response for session-scoped episode status (TCK-00288, TCK-00344).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStatusResponse {
     /// Session identifier.
     pub session_id: String,
-    /// Current session state.
+    /// Current session state (ACTIVE, SUSPENDED, TERMINATED).
     pub state: String,
+    /// Work ID this session is associated with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    /// Role of the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Episode ID (if associated).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode_id: Option<String>,
@@ -776,12 +782,12 @@ fn run_spawn(args: &SpawnArgs, socket_path: &std::path::Path, json_output: bool)
     }
 }
 
-/// Execute the session-status command (TCK-00288).
+/// Execute the session-status command (TCK-00288, TCK-00344).
 ///
 /// Uses `SessionClient` for session-scoped operations via session.sock.
 fn run_session_status(
     args: &SessionStatusArgs,
-    _socket_path: &std::path::Path,
+    socket_path: &std::path::Path,
     json_output: bool,
 ) -> u8 {
     // Resolve session token (CWE-214 mitigation: prefer env var over CLI arg)
@@ -798,43 +804,92 @@ fn run_session_status(
         },
     };
 
-    // TODO(TCK-00288): Implement session status query via SessionClient.
-    // The protocol layer does not yet have a QuerySessionStatus message.
-    // For now, return a stub response.
-    //
-    // Future implementation would:
-    // 1. Connect to session_socket via SessionClient
-    // 2. Send a SessionStatusRequest with the session_token
-    // 3. Receive SessionStatusResponse with state and telemetry
-
-    // Parse session token to extract session_id (best effort)
-    let session_id = session_token
-        .split('.')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
-
-    let response = SessionStatusResponse {
-        session_id,
-        state: "PENDING_PROTOCOL_SUPPORT".to_string(),
-        episode_id: None,
-        telemetry: None,
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::ERROR,
+            );
+        },
     };
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Session Status");
-        println!("  Session ID:  {}", response.session_id);
-        println!("  State:       {}", response.state);
-        println!();
-        println!("Note: Session status query requires protocol support (pending).");
-    }
+    // Execute session status query via SessionClient
+    let result = rt.block_on(async {
+        let mut client = SessionClient::connect(socket_path).await?;
+        client.session_status(&session_token).await
+    });
 
-    exit_codes::SUCCESS
+    match result {
+        Ok(proto_response) => {
+            // Convert protocol WorkRole enum to display string
+            let role_str = WorkRole::try_from(proto_response.role)
+                .map(|r| format!("{r:?}"))
+                .ok();
+
+            // Build telemetry summary if any counters are non-zero
+            let telemetry = if proto_response.tool_calls > 0
+                || proto_response.events_emitted > 0
+                || proto_response.duration_ms > 0
+            {
+                Some(TelemetrySummary {
+                    tool_calls: proto_response.tool_calls,
+                    events_emitted: proto_response.events_emitted,
+                    duration_ms: proto_response.duration_ms,
+                })
+            } else {
+                None
+            };
+
+            let response = SessionStatusResponse {
+                session_id: proto_response.session_id,
+                state: proto_response.state,
+                work_id: if proto_response.work_id.is_empty() {
+                    None
+                } else {
+                    Some(proto_response.work_id)
+                },
+                role: role_str,
+                episode_id: proto_response.episode_id,
+                telemetry,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Session Status");
+                println!("  Session ID:  {}", response.session_id);
+                println!("  State:       {}", response.state);
+                if let Some(work_id) = &response.work_id {
+                    println!("  Work ID:     {work_id}");
+                }
+                if let Some(role) = &response.role {
+                    println!("  Role:        {role}");
+                }
+                if let Some(episode_id) = &response.episode_id {
+                    println!("  Episode ID:  {episode_id}");
+                }
+                if let Some(telemetry) = &response.telemetry {
+                    println!("  Telemetry:");
+                    println!("    Tool Calls:     {}", telemetry.tool_calls);
+                    println!("    Events Emitted: {}", telemetry.events_emitted);
+                    println!("    Duration (ms):  {}", telemetry.duration_ms);
+                }
+            }
+
+            exit_codes::SUCCESS
+        },
+        Err(e) => handle_protocol_error(json_output, &e),
+    }
 }
 
 // ============================================================================
@@ -1174,5 +1229,132 @@ mod tests {
         let result = read_bounded_file(&file_path, MAX_ENVELOPE_FILE_SIZE);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), content);
+    }
+
+    // =========================================================================
+    // Session Status Response Tests (TCK-00344)
+    // =========================================================================
+
+    #[test]
+    fn test_session_status_response_serialization() {
+        let response = SessionStatusResponse {
+            session_id: "sess-abc123".to_string(),
+            state: "ACTIVE".to_string(),
+            work_id: Some("work-456".to_string()),
+            role: Some("Implementer".to_string()),
+            episode_id: Some("ep-789".to_string()),
+            telemetry: Some(TelemetrySummary {
+                tool_calls: 5,
+                events_emitted: 3,
+                duration_ms: 12345,
+            }),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let restored: SessionStatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.session_id, "sess-abc123");
+        assert_eq!(restored.state, "ACTIVE");
+        assert_eq!(restored.work_id.as_deref(), Some("work-456"));
+        assert_eq!(restored.role.as_deref(), Some("Implementer"));
+        assert_eq!(restored.episode_id.as_deref(), Some("ep-789"));
+        assert!(restored.telemetry.is_some());
+        let telemetry = restored.telemetry.unwrap();
+        assert_eq!(telemetry.tool_calls, 5);
+        assert_eq!(telemetry.events_emitted, 3);
+        assert_eq!(telemetry.duration_ms, 12345);
+    }
+
+    #[test]
+    fn test_session_status_response_skips_none_fields() {
+        let response = SessionStatusResponse {
+            session_id: "sess-minimal".to_string(),
+            state: "ACTIVE".to_string(),
+            work_id: None,
+            role: None,
+            episode_id: None,
+            telemetry: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("work_id"));
+        assert!(!json.contains("role"));
+        assert!(!json.contains("episode_id"));
+        assert!(!json.contains("telemetry"));
+    }
+
+    /// SECURITY TEST: Verify session status response rejects unknown fields.
+    #[test]
+    fn test_session_status_response_rejects_unknown_fields() {
+        let json = r#"{
+            "session_id": "sess-1",
+            "state": "ACTIVE",
+            "malicious": "value"
+        }"#;
+
+        let result: Result<SessionStatusResponse, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "SessionStatusResponse should reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn test_telemetry_summary_serialization() {
+        let telemetry = TelemetrySummary {
+            tool_calls: 10,
+            events_emitted: 5,
+            duration_ms: 60000,
+        };
+
+        let json = serde_json::to_string(&telemetry).unwrap();
+        let restored: TelemetrySummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tool_calls, 10);
+        assert_eq!(restored.events_emitted, 5);
+        assert_eq!(restored.duration_ms, 60000);
+    }
+
+    /// Tests that session-status validates empty session token.
+    #[test]
+    fn test_session_status_rejects_empty_token() {
+        let args = SessionStatusArgs {
+            session_token: Some(String::new()),
+        };
+        let socket_path = std::path::Path::new("/nonexistent/session.sock");
+        let exit_code = run_session_status(&args, socket_path, true);
+        assert_eq!(
+            exit_code,
+            hef_exit_codes::VALIDATION_ERROR,
+            "Empty session token should return VALIDATION_ERROR"
+        );
+    }
+
+    /// Tests that session-status validates missing session token.
+    #[test]
+    fn test_session_status_rejects_missing_token() {
+        let args = SessionStatusArgs {
+            session_token: None,
+        };
+        let socket_path = std::path::Path::new("/nonexistent/session.sock");
+        let exit_code = run_session_status(&args, socket_path, true);
+        assert_eq!(
+            exit_code,
+            hef_exit_codes::VALIDATION_ERROR,
+            "Missing session token should return VALIDATION_ERROR"
+        );
+    }
+
+    /// Tests that session-status returns daemon unavailable for missing socket.
+    #[test]
+    fn test_session_status_daemon_not_running() {
+        let args = SessionStatusArgs {
+            session_token: Some("valid-token.abc123".to_string()),
+        };
+        let socket_path = std::path::Path::new("/nonexistent/session.sock");
+        let exit_code = run_session_status(&args, socket_path, true);
+        assert_eq!(
+            exit_code,
+            hef_exit_codes::DAEMON_UNAVAILABLE,
+            "Non-existent socket should return DAEMON_UNAVAILABLE"
+        );
     }
 }

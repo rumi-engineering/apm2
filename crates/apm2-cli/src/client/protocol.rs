@@ -84,6 +84,9 @@ use apm2_daemon::protocol::{
     SessionError,
     SessionErrorCode,
     SessionMessageType,
+    // TCK-00344: Status query messages
+    SessionStatusRequest,
+    SessionStatusResponse,
     ShutdownRequest,
     ShutdownResponse,
     SpawnEpisodeRequest,
@@ -97,6 +100,9 @@ use apm2_daemon::protocol::{
     StreamLogsResponse,
     // Work types
     WorkRole,
+    // TCK-00344: Work status messages
+    WorkStatusRequest,
+    WorkStatusResponse,
     encode_claim_work_request,
     // TCK-00345: Consensus query encoding
     encode_consensus_byzantine_evidence_request,
@@ -112,12 +118,15 @@ use apm2_daemon::protocol::{
     encode_reload_process_request,
     encode_request_tool_request,
     encode_restart_process_request,
+    // TCK-00344: Status query encoding
+    encode_session_status_request,
     encode_shutdown_request,
     encode_spawn_episode_request,
     encode_start_process_request,
     encode_stop_process_request,
     // TCK-00342: Log streaming encoding
     encode_stream_logs_request,
+    encode_work_status_request,
     parse_handshake_message,
     serialize_handshake_message,
 };
@@ -1016,6 +1025,43 @@ impl OperatorClient {
         Self::decode_reload_process_response(&response_frame)
     }
 
+    /// Queries the status of a work item (TCK-00344).
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Work identifier to query status for
+    ///
+    /// # Returns
+    ///
+    /// Work status including state, actor, role, and timing information.
+    pub async fn work_status(
+        &mut self,
+        work_id: &str,
+    ) -> Result<WorkStatusResponse, ProtocolClientError> {
+        let request = WorkStatusRequest {
+            work_id: work_id.to_string(),
+        };
+        let request_bytes = encode_work_status_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_work_status_response(&response_frame)
+    }
+
     // =========================================================================
     // TCK-00342: Process Management Response Decoders
     // =========================================================================
@@ -1032,6 +1078,7 @@ impl OperatorClient {
         let payload = &frame[1..];
 
         if tag == 0 {
+            // Error response
             let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
                 .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
             let code = PrivilegedErrorCode::try_from(err.code)
@@ -1393,6 +1440,40 @@ impl OperatorClient {
         ConsensusMetricsResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
+
+    /// Decodes a `WorkStatus` response (TCK-00344).
+    fn decode_work_status_response(
+        frame: &Bytes,
+    ) -> Result<WorkStatusResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::WorkStatus.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected WorkStatus response (tag {}), got tag {tag}",
+                PrivilegedMessageType::WorkStatus.tag()
+            )));
+        }
+
+        WorkStatusResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
 }
 
 // ============================================================================
@@ -1740,6 +1821,43 @@ impl SessionClient {
         Self::decode_stream_logs_response(&response_frame)
     }
 
+    /// Queries the status of a session (TCK-00344).
+    ///
+    /// # Arguments
+    ///
+    /// * `session_token` - Session token for authentication
+    ///
+    /// # Returns
+    ///
+    /// Session status including state, work association, and telemetry summary.
+    pub async fn session_status(
+        &mut self,
+        session_token: &str,
+    ) -> Result<SessionStatusResponse, ProtocolClientError> {
+        let request = SessionStatusRequest {
+            session_token: session_token.to_string(),
+        };
+        let request_bytes = encode_session_status_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_session_status_response(&response_frame)
+    }
+
     /// Decodes a `StreamLogs` response.
     #[allow(dead_code)] // Used by stream_logs which is scaffolding
     fn decode_stream_logs_response(
@@ -1772,6 +1890,40 @@ impl SessionClient {
         }
 
         StreamLogsResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `SessionStatus` response (TCK-00344).
+    fn decode_session_status_response(
+        frame: &Bytes,
+    ) -> Result<SessionStatusResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response
+            let err = SessionError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = SessionErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != SessionMessageType::SessionStatus.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected SessionStatus response (tag {}), got tag {tag}",
+                SessionMessageType::SessionStatus.tag()
+            )));
+        }
+
+        SessionStatusResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 }

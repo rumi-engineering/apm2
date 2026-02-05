@@ -360,6 +360,32 @@ message ShutdownResponse {
   string message = 1;
 }
 
+// IPC-PRIV-005: WorkStatus (TCK-00344)
+// Query the status of a work item from the work queue.
+message WorkStatusRequest {
+  // Work identifier to query.
+  string work_id = 1;
+}
+
+message WorkStatusResponse {
+  // Work identifier.
+  string work_id = 1;
+  // Current work status (UNCLAIMED, CLAIMED, SPAWNED, COMPLETED, FAILED).
+  string status = 2;
+  // Actor who claimed this work (if claimed).
+  optional string actor_id = 3;
+  // Role of the actor (if claimed).
+  optional WorkRole role = 4;
+  // Associated session ID (if spawned).
+  optional string session_id = 5;
+  // Lease ID (if claimed).
+  optional string lease_id = 6;
+  // Work creation timestamp (nanoseconds since epoch).
+  uint64 created_at_ns = 7;
+  // Work claimed timestamp (nanoseconds since epoch, if claimed).
+  optional uint64 claimed_at_ns = 8;
+}
+
 // =============================================================================
 // Error Codes for Privileged Endpoints
 // =============================================================================
@@ -381,6 +407,8 @@ enum PrivilegedErrorCode {
   SESSION_NOT_FOUND = 7;
   // Capability grant denied by policy.
   CAPABILITY_DENIED = 8;
+  // Referenced work item not found.
+  WORK_NOT_FOUND = 9;
 }
 
 // Generic error response for privileged endpoints.
@@ -484,6 +512,34 @@ message StreamTelemetryResponse {
   uint64 ack_seq = 1;
   // Whether frame was promoted to persistent storage.
   bool promoted = 2;
+}
+
+// IPC-SESS-005: SessionStatus (TCK-00344)
+// Query session-scoped status via session.sock.
+message SessionStatusRequest {
+  // Session token for authentication.
+  string session_token = 1;
+}
+
+message SessionStatusResponse {
+  // Session identifier.
+  string session_id = 1;
+  // Current session state (ACTIVE, SUSPENDED, TERMINATED).
+  string state = 2;
+  // Work ID this session is associated with.
+  string work_id = 3;
+  // Role of the session.
+  WorkRole role = 4;
+  // Episode ID (if associated).
+  optional string episode_id = 5;
+  // Telemetry summary: total tool calls executed.
+  uint32 tool_calls = 6;
+  // Telemetry summary: total events emitted.
+  uint32 events_emitted = 7;
+  // Session start timestamp (nanoseconds since epoch).
+  uint64 started_at_ns = 8;
+  // Session duration in milliseconds.
+  uint64 duration_ms = 9;
 }
 
 // =============================================================================
