@@ -600,25 +600,88 @@ async fn async_main(args: Args) -> Result<()> {
         sqlite_conn.clone(),
     ));
 
-    // TCK-00322: Start projection worker if ledger is configured.
+    // TCK-00322: Start projection worker if ledger and projection are configured.
     // The projection worker:
     // - Tails the ledger for ReviewReceiptRecorded events
     // - Maintains work index (changeset -> work_id -> PR)
     // - Projects review results to GitHub (status + comment)
     let projection_worker_handle = if let Some(ref conn) = sqlite_conn {
-        use apm2_daemon::projection::{ProjectionWorker, ProjectionWorkerConfig};
+        use apm2_daemon::projection::{
+            GitHubAdapterConfig, ProjectionWorker, ProjectionWorkerConfig,
+        };
 
         let projection_conn = Arc::clone(conn);
-        let config = ProjectionWorkerConfig::new()
-            .with_poll_interval(std::time::Duration::from_secs(1))
-            .with_batch_size(100);
+        let projection_config = &daemon_config.config.daemon.projection;
+
+        // Build worker configuration from ecosystem config
+        let mut config = ProjectionWorkerConfig::new()
+            .with_poll_interval(Duration::from_secs(projection_config.poll_interval_secs))
+            .with_batch_size(projection_config.batch_size);
+
+        // Enable GitHub projection if configured
+        if projection_config.enabled
+            && !projection_config.github_owner.is_empty()
+            && !projection_config.github_repo.is_empty()
+        {
+            // Build GitHub adapter config
+            match GitHubAdapterConfig::new(
+                &projection_config.github_api_url,
+                &projection_config.github_owner,
+                &projection_config.github_repo,
+            ) {
+                Ok(mut github_config) => {
+                    // Load token from environment if specified
+                    if let Some(ref token_env) = projection_config.github_token_env {
+                        // Strip leading $ if present
+                        let env_var = token_env.strip_prefix('$').unwrap_or(token_env);
+                        if let Ok(token) = std::env::var(env_var) {
+                            if let Err(e) = github_config.clone().with_api_token(token) {
+                                warn!("Invalid GitHub token: {}", e);
+                            } else {
+                                // Re-create with token since with_api_token consumes self
+                                if let Ok(cfg) = GitHubAdapterConfig::new(
+                                    &projection_config.github_api_url,
+                                    &projection_config.github_owner,
+                                    &projection_config.github_repo,
+                                ) {
+                                    if let Ok(cfg) = cfg
+                                        .with_api_token(std::env::var(env_var).unwrap_or_default())
+                                    {
+                                        github_config = cfg;
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "GitHub token env var {} not set, projection will use mock mode",
+                                env_var
+                            );
+                        }
+                    }
+                    config = config.with_github(github_config);
+                    info!(
+                        owner = %projection_config.github_owner,
+                        repo = %projection_config.github_repo,
+                        "GitHub projection enabled"
+                    );
+                },
+                Err(e) => {
+                    warn!("Invalid GitHub adapter config: {}, using mock mode", e);
+                },
+            }
+        } else if projection_config.enabled {
+            warn!("Projection enabled but GitHub owner/repo not configured, using mock mode");
+        }
 
         match ProjectionWorker::new(projection_conn, config) {
             Ok(mut worker) => {
                 let shutdown_flag = worker.shutdown_handle();
                 let worker_state = state.clone();
 
-                info!("Starting projection worker");
+                info!(
+                    github_enabled = projection_config.enabled,
+                    "Starting projection worker"
+                );
                 let worker_task = tokio::spawn(async move {
                     if let Err(e) = worker.run().await {
                         error!("Projection worker error: {}", e);
