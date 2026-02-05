@@ -459,6 +459,16 @@ impl CoordinationController {
         &self.emitted_events
     }
 
+    /// Returns the per-work-item tracking state.
+    ///
+    /// This provides access to actual attempt counts, session IDs, and
+    /// final outcomes for each work item, enabling callers to build
+    /// accurate receipts from real execution data.
+    #[must_use]
+    pub fn work_tracking(&self) -> &[WorkItemState] {
+        &self.work_tracking
+    }
+
     /// Returns the configuration.
     #[must_use]
     pub const fn config(&self) -> &CoordinationConfig {

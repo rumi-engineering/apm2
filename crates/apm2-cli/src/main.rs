@@ -363,9 +363,15 @@ fn main() -> Result<()> {
         Commands::Coordinate(coordinate_args) => {
             // Coordinate commands use specific exit codes per TCK-00153:
             // 0=success (WORK_COMPLETED), 1=aborted, 2=invalid_args
-            // We use std::process::exit to bypass anyhow Result handling
-            // and ensure precise exit codes are returned.
-            let exit_code = commands::coordinate::run_coordinate(&coordinate_args);
+            // TCK-00346: Uses operator_socket for privileged ClaimWork/SpawnEpisode
+            // operations, and session_socket for session observation/polling.
+            // We use std::process::exit to bypass anyhow Result handling and
+            // ensure precise exit codes are returned.
+            let exit_code = commands::coordinate::run_coordinate(
+                &coordinate_args,
+                &operator_socket,
+                &session_socket,
+            );
             std::process::exit(i32::from(exit_code));
         },
         Commands::Episode(episode_cmd) => {

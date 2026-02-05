@@ -21,6 +21,7 @@
 //! - TCK-00153: Implement apm2 coordinate CLI command
 //! - TCK-00247: HTF CLI rendering of ticks/ledger windows with bounded wall
 //!   overlay
+//! - TCK-00346: Wire coordinate command to daemon integration
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 //! - RFC-0016: Hierarchical Time Framework
 //! - CTR-COORD-007: CLI Command (apm2 coordinate)
@@ -40,19 +41,33 @@
 //!
 //! - **No wall-time authority**: Budget exhaustion, stop conditions, and all
 //!   coordination decisions are based on tick deltas, not wall clock readings.
+//!
+//! # Daemon Integration (TCK-00346)
+//!
+//! The coordinate command uses the daemon's operator socket for:
+//! - `ClaimWork`: Claiming work items from the queue
+//! - `SpawnEpisode`: Spawning episodes for work execution
+//!
+//! If the daemon is unavailable, coordination aborts gracefully with exit code
+//! 1.
 
 use std::fmt;
 use std::fs::File;
 use std::io::Read as IoRead;
+use std::path::Path;
 
 use apm2_core::coordination::{
     CoordinationBudget, CoordinationConfig, CoordinationController, DEFAULT_MAX_ATTEMPTS_PER_WORK,
-    MAX_SESSION_IDS_PER_OUTCOME, MAX_WORK_OUTCOMES, MAX_WORK_QUEUE_SIZE,
+    MAX_SESSION_IDS_PER_OUTCOME, MAX_WORK_OUTCOMES, MAX_WORK_QUEUE_SIZE, SessionOutcome,
+    StopCondition, WorkItemOutcome,
 };
 use apm2_core::htf::HtfTick;
+use apm2_daemon::protocol::WorkRole;
 use clap::Args;
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
 
 /// Default tick rate: 1MHz (1 tick = 1 microsecond).
 ///
@@ -249,6 +264,23 @@ pub struct CoordinateArgs {
     /// When set, only outputs the final receipt without progress updates.
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
+
+    // =========================================================================
+    // Daemon Integration Arguments (TCK-00346)
+    // =========================================================================
+    /// Actor ID for work claiming (display hint).
+    ///
+    /// Authoritative ID is derived from the credential. This is used when
+    /// claiming work from the daemon.
+    #[arg(long, default_value = "apm2-coordinator")]
+    pub actor_id: String,
+
+    /// Workspace root directory for spawned episodes.
+    ///
+    /// All file operations within episodes are confined to this directory.
+    /// Defaults to the current working directory.
+    #[arg(long)]
+    pub workspace_root: Option<String>,
 }
 
 /// Coordination receipt output structure.
@@ -367,17 +399,35 @@ enum CoordinateCliError {
     InvalidArgs(String),
     /// Coordination error.
     CoordinationError(String),
+    /// Daemon connection error (TCK-00346).
+    DaemonError(String),
+}
+
+impl std::fmt::Display for CoordinateCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgs(msg) => write!(f, "invalid arguments: {msg}"),
+            Self::CoordinationError(msg) => write!(f, "coordination error: {msg}"),
+            Self::DaemonError(msg) => write!(f, "daemon error: {msg}"),
+        }
+    }
 }
 
 /// Runs the coordinate command, returning an appropriate exit code as u8.
+///
+/// # Arguments
+///
+/// * `args` - Coordination command arguments
+/// * `operator_socket` - Path to operator socket for daemon communication
+/// * `session_socket` - Path to session socket for session observation
 ///
 /// # Exit Codes
 ///
 /// - 0: Coordination completed successfully (`WORK_COMPLETED`)
 /// - 1: Coordination aborted (any other stop condition)
 /// - 2: Invalid arguments
-pub fn run_coordinate(args: &CoordinateArgs) -> u8 {
-    match run_coordinate_inner(args) {
+pub fn run_coordinate(args: &CoordinateArgs, operator_socket: &Path, session_socket: &Path) -> u8 {
+    match run_coordinate_inner(args, operator_socket, session_socket) {
         Ok(receipt) => {
             // Output the receipt as JSON
             output_receipt(&receipt, args.json);
@@ -395,6 +445,10 @@ pub fn run_coordinate(args: &CoordinateArgs) -> u8 {
         },
         Err(CoordinateCliError::CoordinationError(msg)) => {
             eprintln!("Error: Coordination failed - {msg}");
+            exit_codes::ABORTED
+        },
+        Err(CoordinateCliError::DaemonError(msg)) => {
+            eprintln!("Error: Daemon communication failed - {msg}");
             exit_codes::ABORTED
         },
     }
@@ -425,7 +479,18 @@ fn output_receipt(receipt: &CoordinationReceipt, json_output: bool) {
 }
 
 /// Inner implementation that returns Result for easier error handling.
-fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, CoordinateCliError> {
+///
+/// # TCK-00346: Daemon Integration
+///
+/// This function now connects to the daemon via `operator_socket` and uses
+/// `OperatorClient::claim_work` and `OperatorClient::spawn_episode` to
+/// execute the coordination loop. Session observation uses `session_socket`
+/// to poll for session termination and track actual token consumption.
+fn run_coordinate_inner(
+    args: &CoordinateArgs,
+    operator_socket: &Path,
+    session_socket: &Path,
+) -> Result<CoordinationReceipt, CoordinateCliError> {
     // Validate required arguments
     if args.max_episodes == 0 {
         return Err(CoordinateCliError::InvalidArgs(
@@ -468,6 +533,12 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
             args.max_work_queue
         )));
     }
+
+    // Determine and validate workspace root (default to current directory).
+    // Security: canonicalize to resolve symlinks and relative paths, then
+    // verify it is an absolute path that exists and is not a sensitive
+    // system directory.
+    let workspace_root = validate_workspace_root(args.workspace_root.as_deref())?;
 
     // Create budget
     let budget = CoordinationBudget::new(
@@ -523,56 +594,517 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
         );
     }
 
-    // In a real implementation, this would run the coordination loop.
-    // For the CLI MVP, we simulate immediate completion since we don't have
-    // the daemon/session infrastructure wired up yet.
-    //
-    // The actual coordination loop would:
-    // 1. Check stop conditions
-    // 2. Check work freshness
-    // 3. Spawn sessions via SessionSpawner
-    // 4. Observe termination
-    // 5. Record outcomes
-    //
-    // For now, we abort with NO_ELIGIBLE_WORK since we can't actually
-    // spawn sessions without the daemon.
+    // Build async runtime for daemon communication
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            CoordinateCliError::DaemonError(format!("Failed to build tokio runtime: {e}"))
+        })?;
 
-    // Truncation from u128 to u64 is safe: u64 can hold ~584 million years of
-    // nanoseconds
+    // Run the coordination loop with daemon integration (TCK-00346)
+    let result = rt.block_on(run_coordination_loop(
+        &mut controller,
+        &config,
+        &coordination_id,
+        operator_socket,
+        session_socket,
+        &args.actor_id,
+        &workspace_root,
+        args.quiet,
+    ));
+
+    // Get final timestamp
     #[allow(clippy::cast_possible_truncation)]
     let completed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
 
-    // Abort with no eligible work (MVP behavior)
-    let abort_reason = apm2_core::coordination::AbortReason::Error {
-        message: "coordination requires daemon connection (not yet implemented)".to_string(),
+    // Handle the result and build the receipt
+    let (stop_condition_str, final_stop_condition) = match result {
+        Ok(stop_condition) => {
+            let stop_str = format_stop_condition(&stop_condition);
+            (stop_str, Some(stop_condition))
+        },
+        Err(e) => {
+            // Coordination failed, abort with error
+            let abort_tick = current_tick();
+            let abort_reason = apm2_core::coordination::AbortReason::Error {
+                message: e.to_string(),
+            };
+            let _ = controller.abort(abort_reason, abort_tick, completed_at);
+            ("ABORTED".to_string(), None)
+        },
     };
 
-    // Calculate elapsed time in ticks for abort
-    // Since we're aborting immediately, elapsed is roughly 0
-    let abort_tick = HtfTick::new(0, DEFAULT_TICK_RATE_HZ);
-
-    controller
-        .abort(abort_reason, abort_tick, completed_at)
-        .map_err(|e| CoordinateCliError::CoordinationError(e.to_string()))?;
+    // Complete or abort the controller based on the result
+    if let Some(stop_condition) = final_stop_condition {
+        let complete_tick = current_tick();
+        let _ = controller.complete(stop_condition, complete_tick, completed_at);
+    }
 
     // Build receipt from controller state
     let receipt = build_receipt(
         &coordination_id,
         &controller,
         &config,
-        "ABORTED",
+        &stop_condition_str,
         started_at,
         completed_at,
     );
 
     if !args.quiet {
-        eprintln!("Coordination aborted: {coordination_id} (daemon connection required)");
+        eprintln!("Coordination finished: {coordination_id} ({stop_condition_str})");
     }
 
     Ok(receipt)
+}
+
+/// Returns the current tick value based on system time.
+///
+/// Uses nanosecond precision converted to microseconds for 1MHz tick rate.
+fn current_tick() -> HtfTick {
+    #[allow(clippy::cast_possible_truncation)]
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    HtfTick::new(now_us, DEFAULT_TICK_RATE_HZ)
+}
+
+/// Formats a stop condition for display.
+fn format_stop_condition(stop_condition: &StopCondition) -> String {
+    match stop_condition {
+        StopCondition::WorkCompleted => "WORK_COMPLETED".to_string(),
+        StopCondition::BudgetExhausted(budget_type) => {
+            format!("BUDGET_EXHAUSTED_{budget_type:?}").to_uppercase()
+        },
+        StopCondition::CircuitBreakerTriggered { .. } => "CIRCUIT_BREAKER_TRIGGERED".to_string(),
+        StopCondition::MaxAttemptsExceeded { .. } => "MAX_ATTEMPTS_EXCEEDED".to_string(),
+        // StopCondition is non-exhaustive, handle future variants
+        _ => "UNKNOWN_STOP_CONDITION".to_string(),
+    }
+}
+
+/// Interval for polling session status via event emission.
+const SESSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Maximum time to wait for session termination before treating as failure.
+const SESSION_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Conservative token estimation rate: tokens per second of wall-clock time.
+///
+/// When the daemon does not report actual token consumption, we estimate
+/// conservatively based on elapsed wall time. This rate (10 tokens/sec)
+/// is deliberately over-estimated to ensure budget enforcement errs on the
+/// side of caution. A real session may consume fewer tokens, but we must
+/// never report zero (which would bypass budget limits entirely).
+const CONSERVATIVE_TOKENS_PER_SECOND: u64 = 10;
+
+/// Minimum token cost per session, regardless of elapsed time.
+///
+/// Even if a session terminates almost instantly, we charge at least this
+/// many tokens to prevent zero-cost exploitation of budget limits.
+const MIN_TOKENS_PER_SESSION: u64 = 100;
+
+/// Sensitive system directories that must not be used as workspace roots.
+///
+/// These paths are blocked to prevent accidental or malicious operations
+/// against critical system directories.
+const BLOCKED_WORKSPACE_ROOTS: &[&str] = &[
+    "/", "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys", "/var", "/lib",
+    "/lib64", "/root",
+];
+
+/// Runs the coordination loop with daemon integration.
+///
+/// # TCK-00346: This is the core daemon integration logic.
+///
+/// The loop:
+/// 1. Checks stop conditions
+/// 2. Connects to daemon and claims work for each work item
+/// 3. Spawns episodes via `OperatorClient::spawn_episode`
+/// 4. Observes session termination via `SessionClient` event polling
+/// 5. Records actual session outcomes and token consumption
+/// 6. Continues until stop condition is met
+#[allow(clippy::too_many_arguments)]
+async fn run_coordination_loop(
+    controller: &mut CoordinationController,
+    _config: &CoordinationConfig,
+    coordination_id: &str,
+    operator_socket: &Path,
+    session_socket: &Path,
+    actor_id: &str,
+    workspace_root: &str,
+    quiet: bool,
+) -> Result<StopCondition, CoordinateCliError> {
+    // Connect to daemon
+    let mut client = OperatorClient::connect(operator_socket)
+        .await
+        .map_err(|e| map_protocol_error_to_cli(&e))?;
+
+    if !quiet {
+        eprintln!("Connected to daemon at {}", operator_socket.display());
+    }
+
+    // Main coordination loop
+    loop {
+        // Check stop conditions before processing next work item
+        if let Some(stop_condition) = controller.check_stop_condition() {
+            return Ok(stop_condition);
+        }
+
+        // Get current work item
+        let work_id = match controller.current_work_id() {
+            Some(id) => id.to_string(),
+            None => {
+                // Work queue exhausted
+                return Ok(StopCondition::WorkCompleted);
+            },
+        };
+
+        if !quiet {
+            eprintln!("Processing work item: {work_id}");
+        }
+
+        // Claim work from daemon using actor_id (TCK-00346 fix: wire actor_id)
+        // Use empty credential/nonce for now; the daemon enforces manifests.
+        let claim_result = client
+            .claim_work(actor_id, WorkRole::Implementer, &[], &[])
+            .await;
+
+        match &claim_result {
+            Ok(response) => {
+                if !quiet {
+                    eprintln!(
+                        "Claimed work: work_id={}, lease_id={}",
+                        response.work_id, response.lease_id
+                    );
+                }
+            },
+            Err(e) => {
+                if !quiet {
+                    eprintln!("ClaimWork failed for {work_id}: {e}");
+                }
+                // ClaimWork failure is non-fatal; proceed with work freshness
+                // check
+            },
+        }
+
+        // Check work freshness
+        let freshness = controller.check_work_freshness(&work_id, 0, claim_result.is_ok());
+        if !freshness.is_eligible {
+            if !quiet {
+                eprintln!(
+                    "Skipping work item {work_id}: {}",
+                    freshness.skip_reason.unwrap_or_default()
+                );
+            }
+            controller
+                .skip_work_item(&work_id)
+                .map_err(|e| CoordinateCliError::CoordinationError(e.to_string()))?;
+            continue;
+        }
+
+        // Prepare session spawn (generates session ID and binding event)
+        #[allow(clippy::cast_possible_truncation)]
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        let spawn_result = controller
+            .prepare_session_spawn(&work_id, 0, timestamp_ns)
+            .map_err(|e| CoordinateCliError::CoordinationError(e.to_string()))?;
+
+        if !quiet {
+            eprintln!(
+                "Spawning episode {} for work {work_id} (attempt {})",
+                spawn_result.session_id, spawn_result.attempt_number
+            );
+        }
+
+        // Spawn episode via daemon (TCK-00346 fix: use Implementer role, not
+        // Coordinator)
+        let spawn_response = client
+            .spawn_episode(&work_id, WorkRole::Implementer, None, workspace_root)
+            .await;
+
+        // Determine outcome by observing the spawned session
+        let (outcome, tokens_consumed) = match spawn_response {
+            Ok(response) => {
+                if !quiet {
+                    eprintln!("Episode spawned: session_id={}", response.session_id);
+                }
+
+                // Observe session termination via SessionClient polling.
+                // This replaces the previous hardcoded success/1000-token assumption.
+                observe_session_termination(
+                    session_socket,
+                    &response.session_token,
+                    &response.session_id,
+                    coordination_id,
+                    quiet,
+                )
+                .await
+            },
+            Err(e) => {
+                if !quiet {
+                    eprintln!("Episode spawn failed: {e}");
+                }
+                // Spawn itself failed - charge minimum tokens to prevent
+                // zero-cost budget bypass from repeated spawn failures.
+                (SessionOutcome::Failure, MIN_TOKENS_PER_SESSION)
+            },
+        };
+
+        // Record session termination with actual observed outcome and tokens
+        let termination_tick = current_tick();
+        #[allow(clippy::cast_possible_truncation)]
+        let termination_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        controller
+            .record_session_termination(
+                &spawn_result.session_id,
+                &work_id,
+                outcome,
+                tokens_consumed,
+                termination_tick,
+                termination_ns,
+            )
+            .map_err(|e| CoordinateCliError::CoordinationError(e.to_string()))?;
+
+        // Check stop conditions again after recording termination
+        if let Some(stop_condition) = controller.check_stop_condition() {
+            return Ok(stop_condition);
+        }
+    }
+}
+
+/// Observes session termination by polling via the session socket.
+///
+/// **Security: Fail-Closed Design**
+///
+/// This function follows fail-closed principles throughout:
+/// - If the session socket is unavailable, the session is recorded as FAILED
+///   (we cannot verify outcome, so we assume failure).
+/// - If the session becomes unreachable (heartbeat rejected), the session is
+///   recorded as FAILED (unexpected disconnection is not a clean completion).
+/// - If observation times out, the session is recorded as FAILED.
+/// - Only an explicit clean-completion signal from the daemon would warrant
+///   recording SUCCESS. Since the daemon does not yet provide such a signal,
+///   all termination paths currently record FAILURE.
+///
+/// **Token Estimation**
+///
+/// Since the daemon does not yet report actual token consumption, we use a
+/// conservative wall-time-based estimate: `max(elapsed_secs * RATE,
+/// MIN_TOKENS_PER_SESSION)`. This ensures budget tracking never reports zero
+/// tokens (which would bypass budget limits).
+async fn observe_session_termination(
+    session_socket: &Path,
+    session_token: &str,
+    session_id: &str,
+    correlation_id: &str,
+    quiet: bool,
+) -> (SessionOutcome, u64) {
+    use crate::client::protocol::SessionClient;
+
+    let observation_start = std::time::Instant::now();
+
+    // Attempt to connect to session socket for observation
+    let session_client = SessionClient::connect(session_socket).await;
+
+    match session_client {
+        Ok(mut client) => {
+            // Poll for session termination by emitting heartbeat events.
+            // The daemon returns errors once the session has terminated,
+            // which we use as a signal that the session is no longer active.
+            //
+            // SECURITY: A heartbeat rejection means the session became
+            // unreachable. This could be a clean exit, a crash, or an OOM
+            // kill. Without an explicit success signal from the daemon, we
+            // MUST treat this as failure (fail-closed).
+            let mut clean_exit = false;
+
+            while observation_start.elapsed() < SESSION_OBSERVATION_TIMEOUT {
+                tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+
+                // Emit a coordination heartbeat event to check session liveness.
+                // If the session has terminated, the daemon will reject the event
+                // with an error (session not found / token invalid).
+                let poll_result = client
+                    .emit_event(
+                        session_token,
+                        "coordination.session_heartbeat",
+                        b"{}",
+                        correlation_id,
+                    )
+                    .await;
+
+                match poll_result {
+                    Ok(_response) => {
+                        // Session is still alive, continue polling
+                        if !quiet {
+                            eprintln!(
+                                "Session {session_id} still active ({:.1}s elapsed)",
+                                observation_start.elapsed().as_secs_f64()
+                            );
+                        }
+                    },
+                    Err(_e) => {
+                        // Session became unreachable (daemon rejected heartbeat).
+                        // This could be clean exit, crash, or OOM kill.
+                        // FAIL-CLOSED: Without an explicit success signal from
+                        // the daemon, we record as Failure. Only a future
+                        // daemon API providing a "session completed successfully"
+                        // status query would justify recording Success here.
+                        if !quiet {
+                            eprintln!(
+                                "Session {session_id} became unreachable ({:.1}s elapsed); \
+                                 recording as FAILURE (no explicit success signal)",
+                                observation_start.elapsed().as_secs_f64()
+                            );
+                        }
+                        clean_exit = false;
+                        break;
+                    },
+                }
+            }
+
+            // Compute conservative token estimate based on observation duration
+            let estimated_tokens =
+                estimate_token_consumption(observation_start.elapsed().as_secs());
+
+            if clean_exit {
+                // Reserved for future: explicit daemon success signal path
+                (SessionOutcome::Success, estimated_tokens)
+            } else {
+                // FAIL-CLOSED: timeout or unexpected disconnect -> Failure
+                if !quiet && observation_start.elapsed() >= SESSION_OBSERVATION_TIMEOUT {
+                    eprintln!(
+                        "Session {session_id} observation timed out after {}s; \
+                         recording as FAILURE",
+                        SESSION_OBSERVATION_TIMEOUT.as_secs()
+                    );
+                }
+                (SessionOutcome::Failure, estimated_tokens)
+            }
+        },
+        Err(_e) => {
+            // FAIL-CLOSED: Session socket unavailable means we cannot observe
+            // the session outcome. We must assume failure because we have no
+            // evidence of success. Recording Success here would be fail-open.
+            if !quiet {
+                eprintln!(
+                    "Session socket unavailable; recording session \
+                     {session_id} as FAILURE (cannot observe outcome)"
+                );
+            }
+            // Use minimum token cost since we don't know how long the session
+            // ran, but must not report zero.
+            let estimated_tokens =
+                estimate_token_consumption(observation_start.elapsed().as_secs());
+            (SessionOutcome::Failure, estimated_tokens)
+        },
+    }
+}
+
+/// Estimates token consumption based on elapsed wall-clock seconds.
+///
+/// Uses a conservative rate to ensure budget tracking never underestimates.
+/// Returns at least [`MIN_TOKENS_PER_SESSION`] tokens regardless of duration,
+/// preventing zero-cost sessions that would bypass budget limits.
+fn estimate_token_consumption(elapsed_secs: u64) -> u64 {
+    let time_based = elapsed_secs.saturating_mul(CONSERVATIVE_TOKENS_PER_SECOND);
+    time_based.max(MIN_TOKENS_PER_SESSION)
+}
+
+/// Maps a protocol client error to a CLI error.
+fn map_protocol_error_to_cli(error: &ProtocolClientError) -> CoordinateCliError {
+    match error {
+        ProtocolClientError::DaemonNotRunning => {
+            CoordinateCliError::DaemonError("Daemon is not running. Start with: apm2 daemon".into())
+        },
+        ProtocolClientError::Timeout => {
+            CoordinateCliError::DaemonError("Connection to daemon timed out".into())
+        },
+        ProtocolClientError::HandshakeFailed(msg) => {
+            CoordinateCliError::DaemonError(format!("Handshake failed: {msg}"))
+        },
+        ProtocolClientError::DaemonError { code, message } => {
+            CoordinateCliError::DaemonError(format!("Daemon error ({code}): {message}"))
+        },
+        other => CoordinateCliError::DaemonError(format!("Protocol error: {other}")),
+    }
+}
+
+/// Validates and canonicalizes the workspace root path.
+///
+/// # Security (SEC: `workspace_root` injection prevention)
+///
+/// This function ensures the workspace root is safe before passing it to the
+/// daemon:
+/// 1. **Canonicalization**: Resolves symlinks, `..`, and relative paths via
+///    `std::fs::canonicalize`. This prevents symlink-based escapes and path
+///    traversal.
+/// 2. **Absolute path check**: The canonicalized path must be absolute.
+/// 3. **Existence check**: The path must exist and be a directory.
+/// 4. **Sensitive directory blocklist**: Rejects paths that are sensitive
+///    system directories (e.g., `/`, `/etc`, `/usr`).
+///
+/// If `workspace_root` is `None`, defaults to the current working directory
+/// (also canonicalized and validated).
+fn validate_workspace_root(workspace_root: Option<&str>) -> Result<String, CoordinateCliError> {
+    let raw_path = match workspace_root {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::env::current_dir().map_err(|e| {
+            CoordinateCliError::InvalidArgs(format!(
+                "cannot determine current directory for workspace_root: {e}"
+            ))
+        })?,
+    };
+
+    // Canonicalize: resolves symlinks, "..", and relative components
+    let canonical = std::fs::canonicalize(&raw_path).map_err(|e| {
+        CoordinateCliError::InvalidArgs(format!(
+            "workspace_root '{}' cannot be resolved: {e}",
+            raw_path.display()
+        ))
+    })?;
+
+    // Must be absolute (canonicalize guarantees this, but verify defensively)
+    if !canonical.is_absolute() {
+        return Err(CoordinateCliError::InvalidArgs(format!(
+            "workspace_root '{}' is not an absolute path after canonicalization",
+            canonical.display()
+        )));
+    }
+
+    // Must be a directory
+    if !canonical.is_dir() {
+        return Err(CoordinateCliError::InvalidArgs(format!(
+            "workspace_root '{}' is not a directory",
+            canonical.display()
+        )));
+    }
+
+    // Check against sensitive system directory blocklist
+    let canonical_str = canonical.to_string_lossy();
+    for blocked in BLOCKED_WORKSPACE_ROOTS {
+        if canonical_str == *blocked {
+            return Err(CoordinateCliError::InvalidArgs(format!(
+                "workspace_root '{}' is a sensitive system directory and cannot be used",
+                canonical.display()
+            )));
+        }
+    }
+
+    Ok(canonical_str.into_owned())
 }
 
 /// Parses work IDs from command line arguments.
@@ -699,15 +1231,25 @@ fn build_receipt(
     started_at: u64,
     completed_at: u64,
 ) -> CoordinationReceipt {
-    // Build work outcomes from controller's work tracking
-    let work_outcomes: Vec<WorkOutcomeEntry> = config
-        .work_ids
+    // Build work outcomes from controller's actual work tracking state.
+    // Each WorkItemState contains the real attempt count, session IDs,
+    // and final outcome recorded during coordination execution.
+    let work_outcomes: Vec<WorkOutcomeEntry> = controller
+        .work_tracking()
         .iter()
-        .map(|work_id| WorkOutcomeEntry {
-            work_id: work_id.clone(),
-            attempts: 0,
-            final_outcome: "SKIPPED".to_string(),
-            session_ids: Vec::new(),
+        .map(|item| {
+            let final_outcome = match item.final_outcome {
+                Some(WorkItemOutcome::Succeeded) => "SUCCEEDED".to_string(),
+                Some(WorkItemOutcome::Failed) => "FAILED".to_string(),
+                Some(WorkItemOutcome::Skipped) => "SKIPPED".to_string(),
+                None => "IN_PROGRESS".to_string(),
+            };
+            WorkOutcomeEntry {
+                work_id: item.work_id.clone(),
+                attempts: item.attempt_count,
+                final_outcome,
+                session_ids: item.session_ids.clone(),
+            }
         })
         .collect();
 
@@ -770,7 +1312,36 @@ fn count_sessions_from_events(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    /// Helper to create a test socket path (non-existent for validation tests).
+    fn test_socket_path() -> PathBuf {
+        PathBuf::from("/tmp/apm2-test-nonexistent.sock")
+    }
+
+    /// Helper to create default test args with new TCK-00346 fields.
+    fn test_args_with_defaults(
+        work_ids: Option<Vec<String>>,
+        max_episodes: u32,
+        max_duration_ms: u64,
+    ) -> CoordinateArgs {
+        CoordinateArgs {
+            work_ids,
+            work_query: None,
+            max_episodes,
+            max_duration_ms,
+            max_duration_ticks: None,
+            max_tokens: None,
+            max_attempts: 3,
+            max_work_queue: 1000,
+            json: true,
+            quiet: true,
+            actor_id: "test-actor".to_string(),
+            workspace_root: None,
+        }
+    }
 
     // =========================================================================
     // Argument Parsing Tests
@@ -787,20 +1358,9 @@ mod tests {
     /// TCK-00153: Test `work_ids` validation.
     #[test]
     fn test_coordinate_empty_work_ids() {
-        let args = CoordinateArgs {
-            work_ids: None,
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ms: 60_000,
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let args = test_args_with_defaults(None, 10, 60_000);
 
-        let result = run_coordinate_inner(&args);
+        let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
     }
 
@@ -810,20 +1370,10 @@ mod tests {
         // Create work_ids that exceed the max_work_queue
         let work_ids: Vec<String> = (0..10).map(|i| format!("work-{i}")).collect();
 
-        let args = CoordinateArgs {
-            work_ids: Some(work_ids),
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ms: 60_000,
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 5, // Set lower than work_ids count
-            json: true,
-            quiet: true,
-        };
+        let mut args = test_args_with_defaults(Some(work_ids), 10, 60_000);
+        args.max_work_queue = 5; // Set lower than work_ids count
 
-        let result = run_coordinate_inner(&args);
+        let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
         if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
             assert!(
@@ -836,56 +1386,24 @@ mod tests {
     /// TCK-00153: Test zero budget validation.
     #[test]
     fn test_coordinate_zero_budget() {
-        let args = CoordinateArgs {
-            work_ids: Some(vec!["work-1".to_string()]),
-            work_query: None,
-            max_episodes: 0, // Invalid
-            max_duration_ms: 60_000,
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 0, 60_000);
 
-        let result = run_coordinate_inner(&args);
+        let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
 
-        let args = CoordinateArgs {
-            work_ids: Some(vec!["work-1".to_string()]),
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ms: 0, // Invalid
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 0);
 
-        let result = run_coordinate_inner(&args);
+        let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
     }
 
     /// TCK-00153: Test mutually exclusive arguments.
     #[test]
     fn test_coordinate_mutually_exclusive_args() {
-        let args = CoordinateArgs {
-            work_ids: Some(vec!["work-1".to_string()]),
-            work_query: Some("file.txt".to_string()),
-            max_episodes: 10,
-            max_duration_ms: 60_000,
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let mut args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 60_000);
+        args.work_query = Some("file.txt".to_string());
 
-        let result = run_coordinate_inner(&args);
+        let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
         if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
             assert!(
@@ -946,22 +1464,15 @@ mod tests {
     /// TCK-00153: Test `work_ids` comma parsing.
     #[test]
     fn test_parse_work_ids_comma_separated() {
-        let args = CoordinateArgs {
-            work_ids: Some(vec![
+        let args = test_args_with_defaults(
+            Some(vec![
                 "work-1".to_string(),
                 "work-2".to_string(),
                 "work-3".to_string(),
             ]),
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ms: 60_000,
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+            10,
+            60_000,
+        );
 
         let work_ids = parse_work_ids(&args).unwrap();
         assert_eq!(work_ids.len(), 3);
@@ -973,22 +1484,15 @@ mod tests {
     /// TCK-00153: Test `work_ids` with whitespace trimming.
     #[test]
     fn test_parse_work_ids_with_whitespace() {
-        let args = CoordinateArgs {
-            work_ids: Some(vec![
+        let args = test_args_with_defaults(
+            Some(vec![
                 "  work-1  ".to_string(),
                 "work-2".to_string(),
                 String::new(),
             ]),
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ms: 60_000,
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+            10,
+            60_000,
+        );
 
         let work_ids = parse_work_ids(&args).unwrap();
         assert_eq!(work_ids.len(), 2);
@@ -1109,43 +1613,23 @@ mod tests {
     }
 
     /// TCK-00153: Test aborted coordination returns exit code 1.
+    ///
+    /// TCK-00346: Updated to test daemon unavailable scenario.
     #[test]
     fn test_coordinate_aborted_exit_code() {
-        let args = CoordinateArgs {
-            work_ids: Some(vec!["work-1".to_string()]),
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ms: 60_000,
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 60_000);
 
-        // The current implementation aborts since daemon is not implemented
-        let exit_code = run_coordinate(&args);
+        // With no daemon running, coordination should abort
+        let exit_code = run_coordinate(&args, &test_socket_path(), &test_socket_path());
         assert_eq!(exit_code, exit_codes::ABORTED);
     }
 
     /// TCK-00153: Test invalid arguments returns exit code 2.
     #[test]
     fn test_coordinate_invalid_args_exit_code() {
-        let args = CoordinateArgs {
-            work_ids: None,
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ms: 60_000,
-            max_duration_ticks: None,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let args = test_args_with_defaults(None, 10, 60_000);
 
-        let exit_code = run_coordinate(&args);
+        let exit_code = run_coordinate(&args, &test_socket_path(), &test_socket_path());
         assert_eq!(exit_code, exit_codes::INVALID_ARGS);
     }
 
@@ -1159,28 +1643,28 @@ mod tests {
     /// Per RFC-0016: Ticks are authoritative for duration/budget enforcement.
     /// When `max_duration_ticks` is provided, it takes precedence over
     /// `max_duration_ms`.
+    ///
+    /// Note: This test verifies the receipt contains correct tick values.
+    /// With TCK-00346 daemon integration, the function always returns a receipt
+    /// (even when daemon is unavailable - it just aborts).
     #[test]
     fn tck_00247_tick_duration_takes_precedence() {
-        let args = CoordinateArgs {
-            work_ids: Some(vec!["work-1".to_string()]),
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ticks: Some(5_000_000), // 5M ticks = 5s at 1MHz
-            max_duration_ms: 1_000,              // 1s (should be ignored)
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let mut args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 1_000);
+        args.max_duration_ticks = Some(5_000_000); // 5M ticks = 5s at 1MHz
 
-        // Should succeed - ticks value takes precedence
-        let result = run_coordinate_inner(&args);
-        assert!(result.is_ok());
+        // With TCK-00346, the function returns Ok(receipt) even when daemon unavailable
+        // The receipt will have ABORTED status but correct budget ceiling values
+        let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
+        assert!(
+            result.is_ok(),
+            "Expected receipt even with daemon unavailable"
+        );
 
         // Verify the receipt uses the tick-based duration
         let receipt = result.unwrap();
         assert_eq!(receipt.budget_ceiling.max_duration_ticks, 5_000_000);
+        // Should be ABORTED due to daemon unavailable
+        assert_eq!(receipt.stop_condition, "ABORTED");
     }
 
     /// TCK-00247: Verify zero ticks is rejected (tick authority validation).
@@ -1188,20 +1672,10 @@ mod tests {
     /// Per RFC-0016: Zero duration is invalid for any authority clock domain.
     #[test]
     fn tck_00247_zero_ticks_rejected() {
-        let args = CoordinateArgs {
-            work_ids: Some(vec!["work-1".to_string()]),
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ticks: Some(0), // Invalid: zero ticks
-            max_duration_ms: 60_000,
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let mut args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 60_000);
+        args.max_duration_ticks = Some(0); // Invalid: zero ticks
 
-        let result = run_coordinate_inner(&args);
+        let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
         if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
             assert!(
@@ -1215,27 +1689,25 @@ mod tests {
     ///
     /// Per RFC-0016: ms input is converted to ticks for internal use.
     /// This maintains backward compatibility while enforcing tick authority.
+    ///
+    /// Note: With TCK-00346 daemon integration, the function always returns a
+    /// receipt (even when daemon is unavailable - it just aborts).
     #[test]
     fn tck_00247_ms_converted_to_ticks() {
-        let args = CoordinateArgs {
-            work_ids: Some(vec!["work-1".to_string()]),
-            work_query: None,
-            max_episodes: 10,
-            max_duration_ticks: None,
-            max_duration_ms: 1_000, // 1 second
-            max_tokens: None,
-            max_attempts: 3,
-            max_work_queue: 1000,
-            json: true,
-            quiet: true,
-        };
+        let args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 1_000);
 
-        let result = run_coordinate_inner(&args);
-        assert!(result.is_ok());
+        // With TCK-00346, the function returns Ok(receipt) even when daemon unavailable
+        let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
+        assert!(
+            result.is_ok(),
+            "Expected receipt even with daemon unavailable"
+        );
 
         // Verify ms was converted to ticks (1000ms * 1000 = 1_000_000 ticks at 1MHz)
         let receipt = result.unwrap();
         assert_eq!(receipt.budget_ceiling.max_duration_ticks, 1_000_000);
+        // Should be ABORTED due to daemon unavailable
+        assert_eq!(receipt.stop_condition, "ABORTED");
     }
 
     /// TCK-00247: Verify receipt includes both ticks (authority) and ms
@@ -1657,5 +2129,141 @@ mod tests {
             restored.budget_ceiling.max_tokens,
             receipt.budget_ceiling.max_tokens
         );
+    }
+
+    // =========================================================================
+    // TCK-00346 Security Hardening Tests
+    // =========================================================================
+
+    /// TCK-00346: Token estimation never returns zero.
+    ///
+    /// BLOCKER 2 fix: Verify that `estimate_token_consumption` always returns
+    /// at least `MIN_TOKENS_PER_SESSION`, even for zero elapsed time.
+    #[test]
+    fn tck_00346_token_estimation_never_zero() {
+        // Zero seconds should return minimum
+        assert_eq!(estimate_token_consumption(0), MIN_TOKENS_PER_SESSION);
+        assert!(estimate_token_consumption(0) > 0);
+
+        // Short duration should return minimum
+        assert_eq!(estimate_token_consumption(1), MIN_TOKENS_PER_SESSION);
+
+        // Longer duration should be time-based (and > minimum)
+        let long_duration = estimate_token_consumption(60);
+        assert_eq!(long_duration, 60 * CONSERVATIVE_TOKENS_PER_SECOND);
+        assert!(long_duration > MIN_TOKENS_PER_SESSION);
+
+        // Very long duration should not overflow
+        let huge = estimate_token_consumption(u64::MAX);
+        assert!(huge > 0);
+    }
+
+    /// TCK-00346: Token estimation uses conservative rate.
+    ///
+    /// BLOCKER 2 fix: Verify the estimation constants are reasonable.
+    #[test]
+    fn tck_00346_token_estimation_constants() {
+        // Conservative rate must be positive
+        const { assert!(CONSERVATIVE_TOKENS_PER_SECOND > 0) };
+        // Minimum must be positive
+        const { assert!(MIN_TOKENS_PER_SESSION > 0) };
+        // Minimum should be at least a few seconds worth
+        const { assert!(MIN_TOKENS_PER_SESSION >= CONSERVATIVE_TOKENS_PER_SECOND) };
+    }
+
+    /// TCK-00346: Workspace root validation rejects sensitive paths.
+    ///
+    /// MAJOR fix: Verify that system-critical directories are blocked.
+    #[test]
+    fn tck_00346_workspace_root_rejects_root() {
+        let result = validate_workspace_root(Some("/"));
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("sensitive system directory"),
+                "Expected sensitive directory error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Workspace root validation rejects /etc.
+    #[test]
+    fn tck_00346_workspace_root_rejects_etc() {
+        let result = validate_workspace_root(Some("/etc"));
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("sensitive system directory"),
+                "Expected sensitive directory error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Workspace root validation rejects non-existent paths.
+    #[test]
+    fn tck_00346_workspace_root_rejects_nonexistent() {
+        let result = validate_workspace_root(Some("/nonexistent/path/that/does/not/exist"));
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("cannot be resolved"),
+                "Expected resolution error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Workspace root validation accepts valid directories.
+    #[test]
+    fn tck_00346_workspace_root_accepts_valid() {
+        // /tmp should be a valid workspace root
+        let result = validate_workspace_root(Some("/tmp"));
+        assert!(result.is_ok(), "Expected /tmp to be valid: {result:?}");
+        let path = result.unwrap();
+        // Should be absolute and canonical
+        assert!(path.starts_with('/'));
+    }
+
+    /// TCK-00346: Workspace root defaults to cwd when None.
+    #[test]
+    fn tck_00346_workspace_root_defaults_to_cwd() {
+        let result = validate_workspace_root(None);
+        assert!(result.is_ok(), "Expected cwd to be valid: {result:?}");
+        let path = result.unwrap();
+        // Should be absolute
+        assert!(path.starts_with('/'));
+    }
+
+    /// TCK-00346: Workspace root rejects files (not directories).
+    #[test]
+    fn tck_00346_workspace_root_rejects_files() {
+        use std::io::Write;
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        write!(&temp_file, "not a directory").ok();
+
+        let result = validate_workspace_root(Some(temp_file.path().to_str().unwrap()));
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("not a directory"),
+                "Expected directory error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Blocked workspace root list includes critical paths.
+    #[test]
+    fn tck_00346_blocked_workspace_roots_comprehensive() {
+        // Verify all expected paths are in the blocklist
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/etc"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/usr"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/bin"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/sbin"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/boot"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/dev"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/proc"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/sys"));
+        assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/var"));
     }
 }
