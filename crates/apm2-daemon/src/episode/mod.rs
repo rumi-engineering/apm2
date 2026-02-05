@@ -201,10 +201,10 @@ pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal}
 #[cfg(test)]
 #[allow(deprecated)]
 pub use handlers::register_stub_handlers;
-// Re-export handler types (TCK-00291, TCK-00315, TCK-00319)
+// Re-export handler types (TCK-00291, TCK-00315, TCK-00319, TCK-00338)
 pub use handlers::{
     ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
-    SearchHandler, WriteFileHandler, register_handlers_with_root,
+    SandboxConfig, SearchHandler, WriteFileHandler, register_handlers_with_root,
 };
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};

@@ -3,7 +3,7 @@ evidence_artifact:
   id: "EVID-0016"
   title: "Security hardening evidence (broker sandboxing, taint tracking, attestation tightening)"
   category: "SECURITY_REVIEW"
-  status: "PENDING"
+  status: "PARTIAL"
   description: |
     Evidence that the broker and evidence pipeline are hardened after FAC viability: sandboxing constraints,
     taint tracking for untrusted inputs, and stronger attestation enforcement by risk tier.
@@ -11,4 +11,30 @@ evidence_artifact:
     - "REQ-0016"
   source_refs:
     - "documents/rfcs/RFC-0019/requirements/REQ-0016.yaml"
-  artifacts: []
+  artifacts:
+    - artifact_type: "CODE"
+      path: "crates/apm2-daemon/src/episode/handlers.rs"
+      description: |
+        TCK-00338: Broker sandboxing implementation (SEC-CTRL-FAC-0016)
+        - SandboxConfig struct with shell allowlist, env passthrough, stall timeout
+        - ExecuteHandler uses env_clear() + selective restoration of safe vars
+        - ENV_PASSTHROUGH allowlist: PATH, HOME, USER, SHELL, TERM, LANG, etc.
+        - ENV_BLOCKLIST_PATTERNS: API_KEY, TOKEN, SECRET, PASSWORD, AUTH, etc.
+        - Shell command allowlist validation with fail-closed semantics
+        - Tests for allowlist validation, env scrubbing, and blocklist override
+    - artifact_type: "TEST"
+      path: "crates/apm2-daemon/src/episode/handlers.rs"
+      description: |
+        Unit tests for SandboxConfig and ExecuteHandler security hardening:
+        - test_sandbox_config_default_is_fail_closed
+        - test_sandbox_config_permissive_allows_all
+        - test_sandbox_config_shell_allowlist_exact_match
+        - test_sandbox_config_shell_allowlist_wildcard
+        - test_sandbox_config_env_passthrough_defaults
+        - test_sandbox_config_env_blocklist_patterns
+        - test_sandbox_config_custom_env_passthrough
+        - test_sandbox_config_blocklist_overrides_passthrough
+        - test_execute_handler_command_allowlist_blocks_disallowed
+        - test_execute_handler_command_allowlist_allows_matching
+        - test_execute_handler_env_scrubbing
+        - test_execute_handler_default_env_passthrough

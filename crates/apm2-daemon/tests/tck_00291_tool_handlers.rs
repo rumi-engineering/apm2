@@ -106,7 +106,8 @@ async fn tool_handlers_real_io_write_atomic_and_parents() {
 async fn tool_handlers_real_io_execute() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().to_path_buf();
-    let handler = ExecuteHandler::with_root(root.clone());
+    // Use permissive mode for test that needs to execute arbitrary commands
+    let handler = ExecuteHandler::with_root_permissive(root.clone());
 
     // 1. Simple echo
     let args = ToolArgs::Execute(ExecuteArgs {
@@ -159,7 +160,8 @@ async fn tool_handlers_real_io_execute() {
 async fn tool_handlers_real_io_execute_timeout() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().to_path_buf();
-    let handler = ExecuteHandler::with_root(root.clone());
+    // Use permissive mode for test that needs to execute sleep command
+    let handler = ExecuteHandler::with_root_permissive(root.clone());
 
     let args = ToolArgs::Execute(ExecuteArgs {
         command: "sleep".to_string(),
@@ -205,7 +207,9 @@ async fn tool_handlers_execute_rejects_cwd_symlink_escape() {
     let escape_link = root.join("escape");
     symlink("/tmp", &escape_link).expect("failed to create symlink");
 
-    let handler = ExecuteHandler::with_root(root.clone());
+    // Use permissive mode for this test since we're testing symlink rejection, not
+    // allowlist
+    let handler = ExecuteHandler::with_root_permissive(root.clone());
 
     // Attempt to execute with cwd set to the symlink
     let args = ToolArgs::Execute(ExecuteArgs {
@@ -317,7 +321,9 @@ async fn tool_handlers_write_rejects_symlink_escape() {
 async fn tool_handlers_execute_nonexistent_cwd() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().to_path_buf();
-    let handler = ExecuteHandler::with_root(root.clone());
+    // Use permissive mode for this test since we're testing cwd handling, not
+    // allowlist
+    let handler = ExecuteHandler::with_root_permissive(root.clone());
 
     let args = ToolArgs::Execute(ExecuteArgs {
         command: "ls".to_string(),

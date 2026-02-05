@@ -30,7 +30,7 @@ use crate::episode::capability::{InMemoryCasManifestLoader, StubManifestLoader};
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::handlers::{
     ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
-    SearchHandler, WriteFileHandler,
+    SandboxConfig, SearchHandler, WriteFileHandler,
 };
 use crate::episode::{
     CapabilityManifest, EpisodeRuntime, EpisodeRuntimeConfig, InMemorySessionRegistry,
@@ -332,8 +332,16 @@ impl DispatcherState {
                     Box::new(WriteFileHandler::with_root(root))
                 })
                 // ExecuteHandler - executes commands within workspace
+                // TCK-00338: Env scrubbing + stall detection are always active.
+                // Shell allowlist uses permissive() because the ToolBroker already
+                // enforces shell allowlists via CapabilityManifest before the
+                // handler is invoked. The handler-level allowlist is defense-in-depth
+                // for non-brokered contexts only.
                 .with_rooted_handler_factory(|root| {
-                    Box::new(ExecuteHandler::with_root(root))
+                    Box::new(ExecuteHandler::with_root_and_sandbox(
+                        root,
+                        SandboxConfig::permissive(),
+                    ))
                 })
                 // GitOperationHandler - git operations within workspace
                 .with_rooted_handler_factory(|root| {
@@ -489,8 +497,13 @@ impl DispatcherState {
                 Box::new(WriteFileHandler::with_root(root))
             })
             // ExecuteHandler - executes commands within workspace
+            // TCK-00338: Env scrubbing + stall detection always active.
+            // Shell allowlist permissive (ToolBroker enforces manifest allowlists).
             .with_rooted_handler_factory(|root| {
-                Box::new(ExecuteHandler::with_root(root))
+                Box::new(ExecuteHandler::with_root_and_sandbox(
+                    root,
+                    SandboxConfig::permissive(),
+                ))
             })
             // GitOperationHandler - git operations within workspace
             .with_rooted_handler_factory(|root| {
