@@ -163,8 +163,15 @@ pub use dispatch::{
     // Request encoding helpers
     encode_claim_work_request,
     encode_issue_capability_request,
+    // TCK-00342: Process management encoding helpers
+    encode_list_processes_request,
+    encode_process_status_request,
+    encode_reload_process_request,
+    encode_restart_process_request,
     encode_shutdown_request,
     encode_spawn_episode_request,
+    encode_start_process_request,
+    encode_stop_process_request,
     generate_lease_id,
     generate_work_id,
 };
@@ -207,23 +214,42 @@ pub use messages::{
     // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
     LeaseRevoked,
     LeaseRevokedReason,
+    // CTR-PROTO-011: Process Management Endpoints (TCK-00342)
+    ListProcessesRequest,
+    ListProcessesResponse,
+    LogEntry,
     PatternRejection,
     PrivilegedError,
     PrivilegedErrorCode,
+    ProcessErrorCode,
+    ProcessInfo,
+    ProcessStateEnum,
+    ProcessStatusRequest,
+    ProcessStatusResponse,
     PublishEvidenceRequest,
     PublishEvidenceResponse,
     PulseEnvelopeV1,
     PulseEvent,
     RecoverSessionsRequest,
     RecoverSessionsResponse,
+    ReloadProcessRequest,
+    ReloadProcessResponse,
     RequestToolRequest,
     RequestToolResponse,
+    RestartProcessRequest,
+    RestartProcessResponse,
     SessionError,
     SessionErrorCode,
     ShutdownRequest,
     ShutdownResponse,
     SpawnEpisodeRequest,
     SpawnEpisodeResponse,
+    StartProcessRequest,
+    StartProcessResponse,
+    StopProcessRequest,
+    StopProcessResponse,
+    StreamLogsRequest,
+    StreamLogsResponse,
     StreamTelemetryRequest,
     StreamTelemetryResponse,
     SubscribePulseRequest,
@@ -317,7 +343,8 @@ pub use server::{
 #[allow(unused_imports)]
 pub use session_dispatch::{
     SessionDispatcher, SessionMessageType, SessionResponse, encode_emit_event_request,
-    encode_publish_evidence_request, encode_request_tool_request, encode_stream_telemetry_request,
+    encode_publish_evidence_request, encode_request_tool_request, encode_stream_logs_request,
+    encode_stream_telemetry_request,
 };
 #[allow(unused_imports)]
 pub use session_token::{SessionToken, SessionTokenError, TokenMinter};

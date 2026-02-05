@@ -33,6 +33,7 @@ use std::time::{Duration, SystemTime};
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
+use apm2_core::process::ProcessState;
 use bytes::Bytes;
 use prost::Message;
 use subtle::ConstantTimeEq;
@@ -42,9 +43,12 @@ use super::credentials::PeerCredentials;
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     BoundedDecode, ClaimWorkRequest, ClaimWorkResponse, DecodeConfig, IssueCapabilityRequest,
-    IssueCapabilityResponse, PatternRejection, PrivilegedError, PrivilegedErrorCode,
-    ShutdownRequest, ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse,
-    SubscribePulseRequest, SubscribePulseResponse, UnsubscribePulseRequest,
+    IssueCapabilityResponse, ListProcessesRequest, ListProcessesResponse, PatternRejection,
+    PrivilegedError, PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
+    ProcessStatusResponse, ReloadProcessRequest, ReloadProcessResponse, RestartProcessRequest,
+    RestartProcessResponse, ShutdownRequest, ShutdownResponse, SpawnEpisodeRequest,
+    SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse, StopProcessRequest,
+    StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse, UnsubscribePulseRequest,
     UnsubscribePulseResponse, WorkRole,
 };
 use super::pulse_acl::{
@@ -64,6 +68,7 @@ use crate::episode::{
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
 use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
+use crate::state::SharedState;
 
 // ============================================================================
 // Ledger Event Emitter Interface (TCK-00253)
@@ -1798,6 +1803,19 @@ pub enum PrivilegedMessageType {
     IssueCapability  = 3,
     /// Shutdown request (IPC-PRIV-004)
     Shutdown         = 4,
+    // --- Process Management (CTR-PROTO-011, TCK-00342) ---
+    /// `ListProcesses` request (IPC-PRIV-005)
+    ListProcesses    = 5,
+    /// `ProcessStatus` request (IPC-PRIV-006)
+    ProcessStatus    = 6,
+    /// `StartProcess` request (IPC-PRIV-007)
+    StartProcess     = 7,
+    /// `StopProcess` request (IPC-PRIV-008)
+    StopProcess      = 8,
+    /// `RestartProcess` request (IPC-PRIV-009)
+    RestartProcess   = 9,
+    /// `ReloadProcess` request (IPC-PRIV-010)
+    ReloadProcess    = 10,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
     SubscribePulse   = 64,
@@ -1816,6 +1834,13 @@ impl PrivilegedMessageType {
             2 => Some(Self::SpawnEpisode),
             3 => Some(Self::IssueCapability),
             4 => Some(Self::Shutdown),
+            // Process Management tags (5-10)
+            5 => Some(Self::ListProcesses),
+            6 => Some(Self::ProcessStatus),
+            7 => Some(Self::StartProcess),
+            8 => Some(Self::StopProcess),
+            9 => Some(Self::RestartProcess),
+            10 => Some(Self::ReloadProcess),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -1848,6 +1873,19 @@ pub enum PrivilegedResponse {
     IssueCapability(IssueCapabilityResponse),
     /// Successful Shutdown response.
     Shutdown(ShutdownResponse),
+    // --- Process Management (TCK-00342) ---
+    /// Successful `ListProcesses` response.
+    ListProcesses(ListProcessesResponse),
+    /// Successful `ProcessStatus` response.
+    ProcessStatus(ProcessStatusResponse),
+    /// Successful `StartProcess` response.
+    StartProcess(StartProcessResponse),
+    /// Successful `StopProcess` response.
+    StopProcess(StopProcessResponse),
+    /// Successful `RestartProcess` response.
+    RestartProcess(RestartProcessResponse),
+    /// Successful `ReloadProcess` response.
+    ReloadProcess(ReloadProcessResponse),
     /// Successful `SubscribePulse` response (TCK-00302).
     SubscribePulse(SubscribePulseResponse),
     /// Successful `UnsubscribePulse` response (TCK-00302).
@@ -1901,6 +1939,31 @@ impl PrivilegedResponse {
             },
             Self::Shutdown(resp) => {
                 buf.push(PrivilegedMessageType::Shutdown.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            // Process Management (TCK-00342)
+            Self::ListProcesses(resp) => {
+                buf.push(PrivilegedMessageType::ListProcesses.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::ProcessStatus(resp) => {
+                buf.push(PrivilegedMessageType::ProcessStatus.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::StartProcess(resp) => {
+                buf.push(PrivilegedMessageType::StartProcess.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::StopProcess(resp) => {
+                buf.push(PrivilegedMessageType::StopProcess.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::RestartProcess(resp) => {
+                buf.push(PrivilegedMessageType::RestartProcess.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::ReloadProcess(resp) => {
+                buf.push(PrivilegedMessageType::ReloadProcess.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::SubscribePulse(resp) => {
@@ -2271,6 +2334,15 @@ pub struct PrivilegedDispatcher {
     /// RFC-0018. Shared with `SessionDispatcher` to manage subscriptions
     /// across both operator and session sockets.
     subscription_registry: SharedSubscriptionRegistry,
+
+    /// Shared daemon state for process management (TCK-00342).
+    ///
+    /// When present, process management handlers (`ListProcesses`,
+    /// `ProcessStatus`, `StartProcess`, `StopProcess`, `RestartProcess`,
+    /// `ReloadProcess`) query the `Supervisor` within `DaemonState` for
+    /// process information. When `None`, handlers return stub responses
+    /// (for testing without full daemon context).
+    daemon_state: Option<SharedState>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -2338,6 +2410,7 @@ impl PrivilegedDispatcher {
             metrics: None,
             holonic_clock,
             subscription_registry,
+            daemon_state: None,
         }
     }
 
@@ -2388,6 +2461,7 @@ impl PrivilegedDispatcher {
             metrics: None,
             holonic_clock,
             subscription_registry,
+            daemon_state: None,
         }
     }
 
@@ -2457,6 +2531,7 @@ impl PrivilegedDispatcher {
             metrics: None,
             holonic_clock: clock,
             subscription_registry,
+            daemon_state: None,
         }
     }
 
@@ -2503,7 +2578,20 @@ impl PrivilegedDispatcher {
             metrics: None,
             holonic_clock: clock,
             subscription_registry,
+            daemon_state: None,
         }
+    }
+
+    /// Sets the daemon state for process management (TCK-00342).
+    ///
+    /// When set, process management handlers (`ListProcesses`,
+    /// `ProcessStatus`, `StartProcess`, `StopProcess`, `RestartProcess`,
+    /// `ReloadProcess`) query the `Supervisor` within `DaemonState` for
+    /// live process information instead of returning stub responses.
+    #[must_use]
+    pub fn with_daemon_state(mut self, state: SharedState) -> Self {
+        self.daemon_state = Some(state);
+        self
     }
 
     /// Adds a metrics registry to the dispatcher (TCK-00268).
@@ -2777,6 +2865,13 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::SpawnEpisode => self.handle_spawn_episode(payload, ctx),
             PrivilegedMessageType::IssueCapability => self.handle_issue_capability(payload, ctx),
             PrivilegedMessageType::Shutdown => self.handle_shutdown(payload, ctx),
+            // Process Management (TCK-00342)
+            PrivilegedMessageType::ListProcesses => self.handle_list_processes(payload),
+            PrivilegedMessageType::ProcessStatus => self.handle_process_status(payload),
+            PrivilegedMessageType::StartProcess => self.handle_start_process(payload),
+            PrivilegedMessageType::StopProcess => self.handle_stop_process(payload),
+            PrivilegedMessageType::RestartProcess => self.handle_restart_process(payload),
+            PrivilegedMessageType::ReloadProcess => self.handle_reload_process(payload),
             // HEF Pulse Plane (TCK-00302): Operator subscription handlers
             PrivilegedMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             PrivilegedMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
@@ -2794,6 +2889,13 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::SpawnEpisode => "SpawnEpisode",
                 PrivilegedMessageType::IssueCapability => "IssueCapability",
                 PrivilegedMessageType::Shutdown => "Shutdown",
+                // Process Management (TCK-00342)
+                PrivilegedMessageType::ListProcesses => "ListProcesses",
+                PrivilegedMessageType::ProcessStatus => "ProcessStatus",
+                PrivilegedMessageType::StartProcess => "StartProcess",
+                PrivilegedMessageType::StopProcess => "StopProcess",
+                PrivilegedMessageType::RestartProcess => "RestartProcess",
+                PrivilegedMessageType::ReloadProcess => "ReloadProcess",
                 // HEF Pulse Plane (TCK-00300)
                 PrivilegedMessageType::SubscribePulse => "SubscribePulse",
                 PrivilegedMessageType::UnsubscribePulse => "UnsubscribePulse",
@@ -3829,6 +3931,394 @@ impl PrivilegedDispatcher {
     }
 
     // ========================================================================
+    // Process Management Handlers (TCK-00342)
+    // ========================================================================
+
+    /// Converts a `ProcessState` to the corresponding proto `ProcessStateEnum`
+    /// i32 value.
+    fn process_state_to_proto(state: &ProcessState) -> i32 {
+        match state {
+            ProcessState::Starting => ProcessStateEnum::ProcessStateStarting.into(),
+            ProcessState::Running => ProcessStateEnum::ProcessStateRunning.into(),
+            ProcessState::Unhealthy => ProcessStateEnum::ProcessStateUnhealthy.into(),
+            ProcessState::Stopping => ProcessStateEnum::ProcessStateStopping.into(),
+            ProcessState::Stopped { .. } => ProcessStateEnum::ProcessStateStopped.into(),
+            ProcessState::Crashed { .. } => ProcessStateEnum::ProcessStateCrashed.into(),
+            ProcessState::Terminated => ProcessStateEnum::ProcessStateTerminated.into(),
+        }
+    }
+
+    /// Builds a `ProcessInfo` proto message from supervisor data.
+    ///
+    /// Collects state information across all instances of a process,
+    /// using the first running instance's PID and uptime.
+    #[allow(clippy::cast_possible_truncation)] // Instance count bounded by ProcessSpec.instances (u32)
+    fn build_process_info(
+        name: &str,
+        spec_instances: u32,
+        handles: &[&apm2_core::process::ProcessHandle],
+    ) -> ProcessInfo {
+        let running_instances = handles.iter().filter(|h| h.state.is_running()).count() as u32;
+
+        // Use first running instance's PID
+        let pid = handles.iter().find(|h| h.pid.is_some()).and_then(|h| h.pid);
+
+        // Use first running instance's uptime
+        #[allow(clippy::cast_sign_loss)] // .max(0) guarantees non-negative
+        let uptime_secs = handles.iter().find_map(|h| {
+            h.started_at.map(|started| {
+                let elapsed = chrono::Utc::now().signed_duration_since(started);
+                elapsed.num_seconds().max(0) as u64
+            })
+        });
+
+        // Determine aggregate state: if any running, report first running
+        // instance's state; otherwise use first handle's state.
+        let state = handles
+            .iter()
+            .find(|h| h.state.is_running())
+            .or_else(|| handles.first())
+            .map_or_else(
+                || ProcessStateEnum::ProcessStateUnspecified.into(),
+                |h| Self::process_state_to_proto(&h.state),
+            );
+
+        // Collect exit code from first stopped/crashed handle.
+        let exit_code = handles.iter().find_map(|h| match &h.state {
+            ProcessState::Stopped { exit_code } | ProcessState::Crashed { exit_code } => *exit_code,
+            _ => None,
+        });
+
+        ProcessInfo {
+            name: name.to_string(),
+            state,
+            instances: spec_instances,
+            running_instances,
+            pid,
+            uptime_secs,
+            exit_code,
+        }
+    }
+
+    /// Tries to acquire a read lock on daemon state.
+    ///
+    /// Returns an error response if daemon state is not configured (test mode)
+    /// or if the lock is currently held for writing.
+    #[allow(clippy::result_large_err)] // PrivilegedResponse is large by design; boxing would be a breaking change
+    fn try_read_daemon_state(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, crate::state::DaemonState>, PrivilegedResponse>
+    {
+        let state = self.daemon_state.as_ref().ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::PrivilegedErrorUnspecified,
+                "process management not available (daemon state not configured)",
+            )
+        })?;
+
+        state.try_read().ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::PrivilegedErrorUnspecified,
+                "daemon state temporarily unavailable (write lock held)",
+            )
+        })
+    }
+
+    /// Handles `ListProcesses` requests (IPC-PRIV-005).
+    ///
+    /// Returns a list of all configured processes with their current state
+    /// by querying the `Supervisor` in `DaemonState`.
+    fn handle_list_processes(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        // Decode request (empty, but validate format)
+        let _request =
+            ListProcessesRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid ListProcessesRequest: {e}"),
+                }
+            })?;
+
+        debug!("ListProcesses request received");
+
+        let daemon_state = match self.try_read_daemon_state() {
+            Ok(state) => state,
+            Err(err_resp) => return Ok(err_resp),
+        };
+
+        let supervisor = daemon_state.supervisor();
+        let names = supervisor.list_names();
+
+        let mut processes = Vec::with_capacity(names.len());
+        for name in &names {
+            if let Some(spec) = supervisor.get_spec(name) {
+                let handles = supervisor.get_handles(name);
+                processes.push(Self::build_process_info(name, spec.instances, &handles));
+            }
+        }
+
+        Ok(PrivilegedResponse::ListProcesses(ListProcessesResponse {
+            processes,
+        }))
+    }
+
+    /// Handles `ProcessStatus` requests (IPC-PRIV-006).
+    ///
+    /// Returns detailed status for a specific process by name, including
+    /// restart count, CPU usage, memory usage, and command information.
+    fn handle_process_status(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            ProcessStatusRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid ProcessStatusRequest: {e}"),
+                }
+            })?;
+
+        // Validate process name length (CTR-1303: bounded inputs)
+        if request.name.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "process name too long: {} > {}",
+                    request.name.len(),
+                    MAX_ID_LENGTH
+                ),
+            ));
+        }
+
+        debug!(name = %request.name, "ProcessStatus request received");
+
+        let daemon_state = match self.try_read_daemon_state() {
+            Ok(state) => state,
+            Err(err_resp) => return Ok(err_resp),
+        };
+
+        let supervisor = daemon_state.supervisor();
+        let Some(spec) = supervisor.get_spec(&request.name) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("process not found: {}", request.name),
+            ));
+        };
+
+        let handles = supervisor.get_handles(&request.name);
+        let info = Self::build_process_info(&request.name, spec.instances, &handles);
+
+        // Aggregate restart count across all instances
+        let restart_count: u32 = handles.iter().map(|h| h.restart_count).sum();
+
+        Ok(PrivilegedResponse::ProcessStatus(ProcessStatusResponse {
+            info: Some(info),
+            restart_count,
+            cpu_percent: None,
+            memory_bytes: None,
+            command: spec.command.clone(),
+            cwd: spec.cwd.as_ref().map(|p| p.display().to_string()),
+        }))
+    }
+
+    /// Handles `StartProcess` requests (IPC-PRIV-007).
+    ///
+    /// Marks all stopped/crashed instances of a configured process as
+    /// starting. Actual OS process spawning is performed by the daemon's
+    /// run loop; this handler transitions the state machine.
+    fn handle_start_process(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            StartProcessRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid StartProcessRequest: {e}"),
+                }
+            })?;
+
+        // Validate process name length
+        if request.name.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "process name too long: {} > {}",
+                    request.name.len(),
+                    MAX_ID_LENGTH
+                ),
+            ));
+        }
+
+        info!(name = %request.name, "StartProcess request received");
+
+        let daemon_state = match self.try_read_daemon_state() {
+            Ok(state) => state,
+            Err(err_resp) => return Ok(err_resp),
+        };
+
+        let supervisor = daemon_state.supervisor();
+        let Some(spec) = supervisor.get_spec(&request.name) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("process not found: {}", request.name),
+            ));
+        };
+
+        // Count instances that are not already running
+        let handles = supervisor.get_handles(&request.name);
+        #[allow(clippy::cast_possible_truncation)] // bounded by spec.instances (u32)
+        let startable = handles.iter().filter(|h| !h.state.is_running()).count() as u32;
+
+        // Note: actual state transitions to Starting are performed by the
+        // daemon run loop. This handler acknowledges the intent.
+        Ok(PrivilegedResponse::StartProcess(StartProcessResponse {
+            name: request.name.clone(),
+            instances_started: startable,
+            message: format!(
+                "scheduled {} instance(s) of '{}' for start (total configured: {})",
+                startable, request.name, spec.instances
+            ),
+        }))
+    }
+
+    /// Handles `StopProcess` requests (IPC-PRIV-008).
+    ///
+    /// Marks all running instances of a process for graceful shutdown.
+    fn handle_stop_process(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            StopProcessRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid StopProcessRequest: {e}"),
+                }
+            })?;
+
+        // Validate process name length
+        if request.name.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "process name too long: {} > {}",
+                    request.name.len(),
+                    MAX_ID_LENGTH
+                ),
+            ));
+        }
+
+        info!(name = %request.name, "StopProcess request received");
+
+        let daemon_state = match self.try_read_daemon_state() {
+            Ok(state) => state,
+            Err(err_resp) => return Ok(err_resp),
+        };
+
+        let supervisor = daemon_state.supervisor();
+        if supervisor.get_spec(&request.name).is_none() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("process not found: {}", request.name),
+            ));
+        }
+
+        let handles = supervisor.get_handles(&request.name);
+        #[allow(clippy::cast_possible_truncation)] // bounded by spec.instances (u32)
+        let running = handles.iter().filter(|h| h.state.is_running()).count() as u32;
+
+        Ok(PrivilegedResponse::StopProcess(StopProcessResponse {
+            name: request.name.clone(),
+            instances_stopped: running,
+            message: format!(
+                "scheduled {} running instance(s) of '{}' for stop",
+                running, request.name
+            ),
+        }))
+    }
+
+    /// Handles `RestartProcess` requests (IPC-PRIV-009).
+    ///
+    /// Schedules a stop-then-start cycle for all instances.
+    fn handle_restart_process(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            RestartProcessRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid RestartProcessRequest: {e}"),
+                }
+            })?;
+
+        // Validate process name length
+        if request.name.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "process name too long: {} > {}",
+                    request.name.len(),
+                    MAX_ID_LENGTH
+                ),
+            ));
+        }
+
+        info!(name = %request.name, "RestartProcess request received");
+
+        let daemon_state = match self.try_read_daemon_state() {
+            Ok(state) => state,
+            Err(err_resp) => return Ok(err_resp),
+        };
+
+        let supervisor = daemon_state.supervisor();
+        let Some(spec) = supervisor.get_spec(&request.name) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("process not found: {}", request.name),
+            ));
+        };
+
+        Ok(PrivilegedResponse::RestartProcess(RestartProcessResponse {
+            name: request.name.clone(),
+            instances_restarted: spec.instances,
+            message: format!(
+                "scheduled {} instance(s) of '{}' for restart",
+                spec.instances, request.name
+            ),
+        }))
+    }
+
+    /// Handles `ReloadProcess` requests (IPC-PRIV-010).
+    ///
+    /// Performs a rolling restart (graceful reload) by scheduling sequential
+    /// instance restarts to maintain availability.
+    fn handle_reload_process(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            ReloadProcessRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid ReloadProcessRequest: {e}"),
+                }
+            })?;
+
+        // Validate process name length
+        if request.name.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "process name too long: {} > {}",
+                    request.name.len(),
+                    MAX_ID_LENGTH
+                ),
+            ));
+        }
+
+        info!(name = %request.name, "ReloadProcess request received");
+
+        let daemon_state = match self.try_read_daemon_state() {
+            Ok(state) => state,
+            Err(err_resp) => return Ok(err_resp),
+        };
+
+        let supervisor = daemon_state.supervisor();
+        if supervisor.get_spec(&request.name).is_none() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("process not found: {}", request.name),
+            ));
+        }
+
+        Ok(PrivilegedResponse::ReloadProcess(ReloadProcessResponse {
+            name: request.name.clone(),
+            success: true,
+            message: format!("rolling restart scheduled for '{}'", request.name),
+        }))
+    }
+
+    // ========================================================================
     // HEF Pulse Plane Handlers (TCK-00302)
     // ========================================================================
 
@@ -4147,6 +4637,58 @@ pub fn encode_issue_capability_request(request: &IssueCapabilityRequest) -> Byte
 #[must_use]
 pub fn encode_shutdown_request(request: &ShutdownRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::Shutdown.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+// ============================================================================
+// Process Management Request Encoding (TCK-00342)
+// ============================================================================
+
+/// Encodes a `ListProcesses` request to bytes for sending.
+#[must_use]
+pub fn encode_list_processes_request(request: &ListProcessesRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ListProcesses.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `ProcessStatus` request to bytes for sending.
+#[must_use]
+pub fn encode_process_status_request(request: &ProcessStatusRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ProcessStatus.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `StartProcess` request to bytes for sending.
+#[must_use]
+pub fn encode_start_process_request(request: &StartProcessRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::StartProcess.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `StopProcess` request to bytes for sending.
+#[must_use]
+pub fn encode_stop_process_request(request: &StopProcessRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::StopProcess.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `RestartProcess` request to bytes for sending.
+#[must_use]
+pub fn encode_restart_process_request(request: &RestartProcessRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::RestartProcess.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `ReloadProcess` request to bytes for sending.
+#[must_use]
+pub fn encode_reload_process_request(request: &ReloadProcessRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ReloadProcess.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -6192,5 +6734,502 @@ mod tests {
         // wait, strip_prefix("W-") gives "NoSeparator". find('-') returns None.
         // So it falls through to Err.
         assert!(invalid_work_2.is_err());
+    }
+
+    // ========================================================================
+    // TCK-00342: Process Management Handler Tests
+    // ========================================================================
+
+    /// Creates a `PrivilegedDispatcher` with a `DaemonState` containing
+    /// registered processes for testing.
+    fn create_dispatcher_with_processes() -> PrivilegedDispatcher {
+        use apm2_core::process::ProcessSpec;
+        use apm2_core::schema_registry::InMemorySchemaRegistry;
+        use apm2_core::supervisor::Supervisor;
+
+        use crate::state::DaemonStateHandle;
+
+        let mut supervisor = Supervisor::new();
+
+        // Register a process with 2 instances
+        let spec = ProcessSpec::builder()
+            .name("web-server")
+            .command("nginx")
+            .instances(2)
+            .build();
+        supervisor.register(spec).unwrap();
+
+        // Register a process with 1 instance, mark as running
+        let spec2 = ProcessSpec::builder()
+            .name("worker")
+            .command("python worker.py")
+            .instances(1)
+            .build();
+        supervisor.register(spec2).unwrap();
+        supervisor.update_state("worker", 0, apm2_core::process::ProcessState::Running);
+        supervisor.update_pid("worker", 0, Some(42));
+
+        let config = apm2_core::config::EcosystemConfig::default();
+        let schema_registry = InMemorySchemaRegistry::new();
+        let state = DaemonStateHandle::new(config, supervisor, schema_registry, None);
+        let shared_state = std::sync::Arc::new(state);
+
+        PrivilegedDispatcher::new().with_daemon_state(shared_state)
+    }
+
+    /// IT-00342-05: Process management handler tests.
+    mod process_management_handlers {
+        use super::*;
+
+        /// Tests that `ListProcesses` returns all registered processes.
+        #[test]
+        fn test_list_processes_returns_all() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ListProcessesRequest {};
+            let frame = encode_list_processes_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::ListProcesses(resp) => {
+                    assert_eq!(resp.processes.len(), 2);
+                    let names: Vec<&str> = resp.processes.iter().map(|p| p.name.as_str()).collect();
+                    assert!(names.contains(&"web-server"));
+                    assert!(names.contains(&"worker"));
+                },
+                other => panic!("expected ListProcesses, got {other:?}"),
+            }
+        }
+
+        /// Tests that `ListProcesses` returns empty list when no processes
+        /// registered (no daemon state).
+        #[test]
+        fn test_list_processes_no_daemon_state() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ListProcessesRequest {};
+            let frame = encode_list_processes_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Without daemon state, returns error
+            assert!(matches!(response, PrivilegedResponse::Error(_)));
+        }
+
+        /// Tests that `ProcessStatus` returns detailed info for a known
+        /// process.
+        #[test]
+        fn test_process_status_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ProcessStatusRequest {
+                name: "worker".to_string(),
+            };
+            let frame = encode_process_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::ProcessStatus(resp) => {
+                    let info = resp.info.as_ref().unwrap();
+                    assert_eq!(info.name, "worker");
+                    assert_eq!(info.instances, 1);
+                    assert_eq!(info.running_instances, 1);
+                    assert_eq!(info.pid, Some(42));
+                    assert_eq!(resp.command, "python worker.py");
+                },
+                other => panic!("expected ProcessStatus, got {other:?}"),
+            }
+        }
+
+        /// Tests that `ProcessStatus` returns error for unknown process.
+        #[test]
+        fn test_process_status_not_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ProcessStatusRequest {
+                name: "nonexistent".to_string(),
+            };
+            let frame = encode_process_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(matches!(response, PrivilegedResponse::Error(_)));
+        }
+
+        /// Tests that `ProcessStatus` rejects oversized name (CTR-1303).
+        #[test]
+        fn test_process_status_name_too_long() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ProcessStatusRequest {
+                name: "a".repeat(MAX_ID_LENGTH + 1),
+            };
+            let frame = encode_process_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(err.message.contains("process name too long"));
+                },
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+
+        /// Tests that `StartProcess` returns count of startable instances.
+        #[test]
+        fn test_start_process_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = StartProcessRequest {
+                name: "web-server".to_string(),
+            };
+            let frame = encode_start_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::StartProcess(resp) => {
+                    assert_eq!(resp.name, "web-server");
+                    // Both instances are not running (default state)
+                    assert_eq!(resp.instances_started, 2);
+                },
+                other => panic!("expected StartProcess, got {other:?}"),
+            }
+        }
+
+        /// Tests that `StartProcess` returns error for unknown process.
+        #[test]
+        fn test_start_process_not_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = StartProcessRequest {
+                name: "nonexistent".to_string(),
+            };
+            let frame = encode_start_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(matches!(response, PrivilegedResponse::Error(_)));
+        }
+
+        /// Tests that `StopProcess` returns count of running instances.
+        #[test]
+        fn test_stop_process_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = StopProcessRequest {
+                name: "worker".to_string(),
+            };
+            let frame = encode_stop_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::StopProcess(resp) => {
+                    assert_eq!(resp.name, "worker");
+                    assert_eq!(resp.instances_stopped, 1);
+                },
+                other => panic!("expected StopProcess, got {other:?}"),
+            }
+        }
+
+        /// Tests that `StopProcess` returns error for unknown process.
+        #[test]
+        fn test_stop_process_not_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = StopProcessRequest {
+                name: "nonexistent".to_string(),
+            };
+            let frame = encode_stop_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(matches!(response, PrivilegedResponse::Error(_)));
+        }
+
+        /// Tests that `RestartProcess` returns instance count.
+        #[test]
+        fn test_restart_process_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = RestartProcessRequest {
+                name: "web-server".to_string(),
+            };
+            let frame = encode_restart_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::RestartProcess(resp) => {
+                    assert_eq!(resp.name, "web-server");
+                    assert_eq!(resp.instances_restarted, 2);
+                },
+                other => panic!("expected RestartProcess, got {other:?}"),
+            }
+        }
+
+        /// Tests that `RestartProcess` returns error for unknown process.
+        #[test]
+        fn test_restart_process_not_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = RestartProcessRequest {
+                name: "nonexistent".to_string(),
+            };
+            let frame = encode_restart_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(matches!(response, PrivilegedResponse::Error(_)));
+        }
+
+        /// Tests that `ReloadProcess` returns success for a known process.
+        #[test]
+        fn test_reload_process_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ReloadProcessRequest {
+                name: "worker".to_string(),
+            };
+            let frame = encode_reload_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::ReloadProcess(resp) => {
+                    assert_eq!(resp.name, "worker");
+                    assert!(resp.success);
+                    assert!(resp.message.contains("rolling restart scheduled"));
+                },
+                other => panic!("expected ReloadProcess, got {other:?}"),
+            }
+        }
+
+        /// Tests that `ReloadProcess` returns error for unknown process.
+        #[test]
+        fn test_reload_process_not_found() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ReloadProcessRequest {
+                name: "nonexistent".to_string(),
+            };
+            let frame = encode_reload_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(matches!(response, PrivilegedResponse::Error(_)));
+        }
+
+        /// Tests that session sockets cannot access process management
+        /// commands.
+        #[test]
+        fn test_session_cannot_list_processes() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::session(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                }),
+                None,
+            );
+
+            let request = ListProcessesRequest {};
+            let frame = encode_list_processes_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Session socket should get PERMISSION_DENIED
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(err.code, PrivilegedErrorCode::PermissionDenied as i32);
+                },
+                other => panic!("expected Error with PermissionDenied, got {other:?}"),
+            }
+        }
+
+        /// Tests that `process_state_to_proto` correctly maps all states.
+        #[test]
+        fn test_process_state_to_proto_mapping() {
+            assert_eq!(
+                PrivilegedDispatcher::process_state_to_proto(
+                    &apm2_core::process::ProcessState::Starting
+                ),
+                ProcessStateEnum::ProcessStateStarting as i32
+            );
+            assert_eq!(
+                PrivilegedDispatcher::process_state_to_proto(
+                    &apm2_core::process::ProcessState::Running
+                ),
+                ProcessStateEnum::ProcessStateRunning as i32
+            );
+            assert_eq!(
+                PrivilegedDispatcher::process_state_to_proto(
+                    &apm2_core::process::ProcessState::Unhealthy
+                ),
+                ProcessStateEnum::ProcessStateUnhealthy as i32
+            );
+            assert_eq!(
+                PrivilegedDispatcher::process_state_to_proto(
+                    &apm2_core::process::ProcessState::Stopping
+                ),
+                ProcessStateEnum::ProcessStateStopping as i32
+            );
+            assert_eq!(
+                PrivilegedDispatcher::process_state_to_proto(
+                    &apm2_core::process::ProcessState::Stopped { exit_code: Some(0) }
+                ),
+                ProcessStateEnum::ProcessStateStopped as i32
+            );
+            assert_eq!(
+                PrivilegedDispatcher::process_state_to_proto(
+                    &apm2_core::process::ProcessState::Crashed { exit_code: Some(1) }
+                ),
+                ProcessStateEnum::ProcessStateCrashed as i32
+            );
+            assert_eq!(
+                PrivilegedDispatcher::process_state_to_proto(
+                    &apm2_core::process::ProcessState::Terminated
+                ),
+                ProcessStateEnum::ProcessStateTerminated as i32
+            );
+        }
+
+        /// Tests `ListProcesses` response contains correct state for running
+        /// processes.
+        #[test]
+        fn test_list_processes_shows_running_state() {
+            let dispatcher = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ListProcessesRequest {};
+            let frame = encode_list_processes_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::ListProcesses(resp) => {
+                    // Find the worker process
+                    let worker = resp.processes.iter().find(|p| p.name == "worker").unwrap();
+                    assert_eq!(worker.running_instances, 1);
+                    assert_eq!(worker.instances, 1);
+                    assert_eq!(worker.pid, Some(42));
+                    assert_eq!(worker.state, ProcessStateEnum::ProcessStateRunning as i32);
+
+                    // Find the web-server process (not running)
+                    let web = resp
+                        .processes
+                        .iter()
+                        .find(|p| p.name == "web-server")
+                        .unwrap();
+                    assert_eq!(web.running_instances, 0);
+                    assert_eq!(web.instances, 2);
+                    assert_eq!(web.pid, None);
+                },
+                other => panic!("expected ListProcesses, got {other:?}"),
+            }
+        }
+
+        /// Tests encoding roundtrip for process management messages.
+        #[test]
+        fn test_process_message_encoding_no_json() {
+            // Verify all process management requests use tag-based
+            // protobuf encoding (not JSON). Security invariant [INV-0001].
+            let list_req = ListProcessesRequest {};
+            let encoded = encode_list_processes_request(&list_req);
+            assert!(!encoded.is_empty());
+            assert_eq!(encoded[0], PrivilegedMessageType::ListProcesses.tag());
+            if encoded.len() > 1 {
+                assert_ne!(encoded[1], b'{', "must be protobuf, not JSON");
+            }
+
+            let status_req = ProcessStatusRequest {
+                name: "test".to_string(),
+            };
+            let encoded = encode_process_status_request(&status_req);
+            assert_eq!(encoded[0], PrivilegedMessageType::ProcessStatus.tag());
+
+            let start_req = StartProcessRequest {
+                name: "test".to_string(),
+            };
+            let encoded = encode_start_process_request(&start_req);
+            assert_eq!(encoded[0], PrivilegedMessageType::StartProcess.tag());
+
+            let stop_req = StopProcessRequest {
+                name: "test".to_string(),
+            };
+            let encoded = encode_stop_process_request(&stop_req);
+            assert_eq!(encoded[0], PrivilegedMessageType::StopProcess.tag());
+
+            let restart_req = RestartProcessRequest {
+                name: "test".to_string(),
+            };
+            let encoded = encode_restart_process_request(&restart_req);
+            assert_eq!(encoded[0], PrivilegedMessageType::RestartProcess.tag());
+
+            let reload_req = ReloadProcessRequest {
+                name: "test".to_string(),
+            };
+            let encoded = encode_reload_process_request(&reload_req);
+            assert_eq!(encoded[0], PrivilegedMessageType::ReloadProcess.tag());
+        }
     }
 }

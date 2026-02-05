@@ -728,6 +728,15 @@ impl DaemonStateHandle {
         self.inner.read().await
     }
 
+    /// Try to get read access to the inner state without blocking (TCK-00342).
+    ///
+    /// Returns `None` if the write lock is currently held. This is used by
+    /// synchronous dispatch handlers that cannot `.await`.
+    #[must_use]
+    pub fn try_read(&self) -> Option<tokio::sync::RwLockReadGuard<'_, DaemonState>> {
+        self.inner.try_read().ok()
+    }
+
     /// Get write access to the inner state.
     pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, DaemonState> {
         self.inner.write().await

@@ -867,3 +867,238 @@ message HefError {
   HefErrorCode code = 1;
   string message = 2;
 }
+
+// =============================================================================
+// CTR-PROTO-011: Process Management Endpoints (TCK-00342)
+// =============================================================================
+// These endpoints provide process lifecycle management via operator.sock.
+// All process management operations (except StreamLogs) require operator
+// credentials. StreamLogs uses session.sock with a valid session_token.
+//
+// ## Message Tag Range
+//
+// Process management messages use tag range 5-15 for privileged endpoints:
+// - 5 = ListProcesses
+// - 6 = ProcessStatus
+// - 7 = StartProcess
+// - 8 = StopProcess
+// - 9 = RestartProcess
+// - 10 = ReloadProcess
+//
+// Session-scoped process messages use tag 5 in session namespace:
+// - 5 = StreamLogs (session.sock)
+
+// -----------------------------------------------------------------------------
+// Process State Enum
+// -----------------------------------------------------------------------------
+
+// Process lifecycle state.
+enum ProcessStateEnum {
+  PROCESS_STATE_UNSPECIFIED = 0;
+  PROCESS_STATE_STARTING = 1;
+  PROCESS_STATE_RUNNING = 2;
+  PROCESS_STATE_UNHEALTHY = 3;
+  PROCESS_STATE_STOPPING = 4;
+  PROCESS_STATE_STOPPED = 5;
+  PROCESS_STATE_CRASHED = 6;
+  PROCESS_STATE_TERMINATED = 7;
+}
+
+// -----------------------------------------------------------------------------
+// IPC-PRIV-005: ListProcesses
+// -----------------------------------------------------------------------------
+
+// Request to list all configured processes.
+message ListProcessesRequest {
+  // No parameters required - lists all processes.
+}
+
+// Information about a single process.
+message ProcessInfo {
+  // Process name (unique identifier).
+  string name = 1;
+  // Current process state.
+  ProcessStateEnum state = 2;
+  // Total number of configured instances.
+  uint32 instances = 3;
+  // Number of currently running instances.
+  uint32 running_instances = 4;
+  // OS process ID (if running, first instance).
+  optional uint32 pid = 5;
+  // Uptime in seconds (if running).
+  optional uint64 uptime_secs = 6;
+  // Exit code (if stopped/crashed).
+  optional int32 exit_code = 7;
+}
+
+// Response containing list of all processes.
+message ListProcessesResponse {
+  // List of all configured processes.
+  repeated ProcessInfo processes = 1;
+}
+
+// -----------------------------------------------------------------------------
+// IPC-PRIV-006: ProcessStatus
+// -----------------------------------------------------------------------------
+
+// Request detailed status for a specific process.
+message ProcessStatusRequest {
+  // Process name to query.
+  string name = 1;
+}
+
+// Detailed status response for a process.
+message ProcessStatusResponse {
+  // Basic process information.
+  ProcessInfo info = 1;
+  // Total restart count across all instances.
+  uint32 restart_count = 2;
+  // CPU usage percentage (0-100, if available).
+  optional float cpu_percent = 3;
+  // Memory usage in bytes (if available).
+  optional uint64 memory_bytes = 4;
+  // Command being executed.
+  string command = 5;
+  // Working directory.
+  optional string cwd = 6;
+}
+
+// -----------------------------------------------------------------------------
+// IPC-PRIV-007: StartProcess
+// -----------------------------------------------------------------------------
+
+// Request to start a configured process.
+message StartProcessRequest {
+  // Process name to start.
+  string name = 1;
+}
+
+// Response after starting a process.
+message StartProcessResponse {
+  // Process name that was started.
+  string name = 1;
+  // Number of instances that were started.
+  uint32 instances_started = 2;
+  // Message describing the result.
+  string message = 3;
+}
+
+// -----------------------------------------------------------------------------
+// IPC-PRIV-008: StopProcess
+// -----------------------------------------------------------------------------
+
+// Request to stop a running process.
+message StopProcessRequest {
+  // Process name to stop.
+  string name = 1;
+}
+
+// Response after stopping a process.
+message StopProcessResponse {
+  // Process name that was stopped.
+  string name = 1;
+  // Number of instances that were stopped.
+  uint32 instances_stopped = 2;
+  // Message describing the result.
+  string message = 3;
+}
+
+// -----------------------------------------------------------------------------
+// IPC-PRIV-009: RestartProcess
+// -----------------------------------------------------------------------------
+
+// Request to restart a process (stop then start).
+message RestartProcessRequest {
+  // Process name to restart.
+  string name = 1;
+}
+
+// Response after restarting a process.
+message RestartProcessResponse {
+  // Process name that was restarted.
+  string name = 1;
+  // Number of instances that were restarted.
+  uint32 instances_restarted = 2;
+  // Message describing the result.
+  string message = 3;
+}
+
+// -----------------------------------------------------------------------------
+// IPC-PRIV-010: ReloadProcess
+// -----------------------------------------------------------------------------
+
+// Request to perform a rolling restart (graceful reload).
+message ReloadProcessRequest {
+  // Process name to reload.
+  string name = 1;
+}
+
+// Response after reload operation.
+message ReloadProcessResponse {
+  // Process name that was reloaded.
+  string name = 1;
+  // Whether the reload was successful.
+  bool success = 2;
+  // Message describing the result.
+  string message = 3;
+}
+
+// -----------------------------------------------------------------------------
+// IPC-SESS-005: StreamLogs (Session Socket)
+// -----------------------------------------------------------------------------
+
+// Request to stream process logs.
+// This endpoint uses session.sock and requires a valid session_token.
+message StreamLogsRequest {
+  // Session token for authentication.
+  string session_token = 1;
+  // Process name to stream logs for.
+  string process_name = 2;
+  // Number of historical lines to return (max 1000).
+  uint32 lines = 3;
+  // Whether to follow (stream new lines). Reserved for future use.
+  bool follow = 4;
+}
+
+// A single log entry.
+message LogEntry {
+  // Timestamp in nanoseconds since epoch.
+  uint64 timestamp_ns = 1;
+  // Log line content.
+  string line = 2;
+  // Stream kind (stdout/stderr).
+  StreamKind stream = 3;
+  // Instance index (for multi-instance processes).
+  uint32 instance = 4;
+}
+
+// Response containing log entries.
+message StreamLogsResponse {
+  // Log entries (most recent last).
+  repeated LogEntry entries = 1;
+  // Whether there are more entries available.
+  bool has_more = 2;
+  // Process name the logs are from.
+  string process_name = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Process Management Error Codes
+// -----------------------------------------------------------------------------
+
+// Error codes for process management operations.
+enum ProcessErrorCode {
+  PROCESS_ERROR_UNSPECIFIED = 0;
+  // Process not found by name.
+  PROCESS_ERROR_NOT_FOUND = 1;
+  // Process is already running (for start).
+  PROCESS_ERROR_ALREADY_RUNNING = 2;
+  // Process is not running (for stop).
+  PROCESS_ERROR_NOT_RUNNING = 3;
+  // Failed to start process.
+  PROCESS_ERROR_START_FAILED = 4;
+  // Failed to stop process.
+  PROCESS_ERROR_STOP_FAILED = 5;
+  // Invalid process name.
+  PROCESS_ERROR_INVALID_NAME = 6;
+}
