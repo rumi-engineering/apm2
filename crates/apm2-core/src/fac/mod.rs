@@ -82,6 +82,7 @@ mod key_policy;
 mod lease;
 pub mod merge_receipt;
 mod policy_resolution;
+pub mod projection_receipt_recorded;
 pub mod quarantine;
 mod receipt;
 pub mod retry_manager;
@@ -149,8 +150,8 @@ pub use domain_separator::{
     GATE_LEASE_ISSUED_PREFIX, GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX,
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, LEASE_REVOKED_PREFIX,
     LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX, POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX,
-    QUARANTINE_EVENT_PREFIX, REVIEW_BLOCKED_RECORDED_PREFIX, REVIEW_RECEIPT_RECORDED_PREFIX,
-    sign_with_domain, verify_with_domain,
+    PROJECTION_RECEIPT_RECORDED_PREFIX, QUARANTINE_EVENT_PREFIX, REVIEW_BLOCKED_RECORDED_PREFIX,
+    REVIEW_RECEIPT_RECORDED_PREFIX, sign_with_domain, verify_with_domain,
 };
 // Re-export echo-trap detection types
 pub use echo_trap::{
@@ -187,6 +188,17 @@ pub use policy_resolution::{
     DeterminismClass, MAX_RCP_PROFILES, MAX_STRING_LENGTH, MAX_VERIFIER_POLICIES,
     PolicyResolutionError, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
     PolicyResolvedForChangeSetProto, RiskTier,
+};
+// Re-export projection receipt recorded types
+pub use projection_receipt_recorded::{
+    MAX_RECEIPT_ID_LENGTH as MAX_PROJECTION_RECEIPT_ID_LENGTH,
+    MAX_STRING_LENGTH as MAX_PROJECTION_RECEIPT_STRING_LENGTH,
+    MAX_WORK_ID_LENGTH as MAX_PROJECTION_WORK_ID_LENGTH, ProjectedStatusCode,
+    ProjectionArtifactBundleV1, ProjectionArtifactBundleV1Builder, ProjectionMetadata,
+    ProjectionReceiptRecorded, ProjectionReceiptRecordedBuilder, ProjectionReceiptRecordedError,
+    ProjectionReceiptRecordedProto, SCHEMA_IDENTIFIER as PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
+    SCHEMA_VERSION as PROJECTION_ARTIFACT_SCHEMA_VERSION,
+    validate_changeset_binding as validate_projection_changeset_binding,
 };
 // Re-export quarantine types
 pub use quarantine::{

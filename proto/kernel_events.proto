@@ -1,5 +1,12 @@
 // APM2 Kernel Event Schema
-// Version: 0.7.0
+// Version: 0.8.0
+//
+// CHANGELOG (0.8.0):
+// - Added ProjectionReceiptRecorded event for FAC projection receipts (RFC-0019, TCK-00323)
+// - Added ProjectionReceiptRecorded to KernelEvent payload (tag 34)
+// - Binds changeset_digest + artifact_bundle_hash + time_envelope_ref for projection outcomes
+// - Enables work.<work_id>.projection topic derivation for successful projections
+// - Supports idempotency via receipt lookup (work_id, changeset_digest, ledger_head)
 //
 // CHANGELOG (0.7.0):
 // - Added ReviewReceiptRecorded event for FAC v0 review receipts (RFC-0018, TCK-00312)
@@ -122,6 +129,7 @@ message KernelEvent {
     DefectRecorded defect_recorded = 31;
     ReviewBlockedRecorded review_blocked_recorded = 32;
     ReviewReceiptRecorded review_receipt_recorded = 33;
+    ProjectionReceiptRecorded projection_receipt_recorded = 34;
   }
 }
 
@@ -1719,5 +1727,46 @@ message ReviewReceiptRecorded {
   string reviewer_actor_id = 5;
   // Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
   bytes reviewer_signature = 6;
+}
+
+// ============================================================
+// PROJECTION RECEIPT EVENTS (TCK-00323)
+// ============================================================
+//
+// ProjectionReceiptRecorded events capture successful projection completion
+// in the FAC pipeline. This event binds the projection artifacts (status,
+// context) to the changeset being projected and provides temporal anchoring.
+//
+// Key properties:
+// - Binds changeset_digest to artifact_bundle_hash for integrity
+// - References ProjectionArtifactBundleV1 stored in CAS
+// - Provides time_envelope_ref for temporal authority
+// - Enables work.<work_id>.projection topic derivation
+// - Idempotency key: (work_id, changeset_digest, ledger_head)
+
+// Emitted when a projection is successfully completed.
+//
+// This event records the successful projection outcome and stores it durably
+// in the ledger. It binds the projection artifacts to the changeset and
+// provides CAS references for verification and idempotency.
+//
+// Security: The signature uses PROJECTION_RECEIPT_RECORDED: domain prefix.
+message ProjectionReceiptRecorded {
+  // Unique identifier for this receipt.
+  // Format: `PR-{uuid}` or similar unique string.
+  string receipt_id = 1;
+  // BLAKE3 digest of the changeset that was projected (32 bytes).
+  // This is the same digest from the ChangeSetPublished event.
+  bytes changeset_digest = 2;
+  // BLAKE3 hash of the ProjectionArtifactBundleV1 stored in CAS (32 bytes).
+  // Contains projection_status, ledger_head, and metadata.
+  bytes artifact_bundle_hash = 3;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the receipt to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 4;
+  // Actor who recorded the receipt (the projector).
+  string projector_actor_id = 5;
+  // Ed25519 signature over canonical bytes with PROJECTION_RECEIPT_RECORDED: domain (64 bytes).
+  bytes projector_signature = 6;
 }
 

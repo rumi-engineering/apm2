@@ -42,7 +42,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -100,6 +100,8 @@ pub mod kernel_event {
         ReviewBlockedRecorded(super::ReviewBlockedRecorded),
         #[prost(message, tag = "33")]
         ReviewReceiptRecorded(super::ReviewReceiptRecorded),
+        #[prost(message, tag = "34")]
+        ProjectionReceiptRecorded(super::ProjectionReceiptRecorded),
     }
 }
 /// ============================================================
@@ -1910,6 +1912,39 @@ pub struct ReviewReceiptRecorded {
     /// Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
     #[prost(bytes = "vec", tag = "6")]
     pub reviewer_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Emitted when a projection is successfully completed.
+///
+/// This event records the successful projection outcome and stores it durably
+/// in the ledger. It binds the projection artifacts to the changeset and
+/// provides CAS references for verification and idempotency.
+///
+/// Security: The signature uses PROJECTION_RECEIPT_RECORDED: domain prefix.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProjectionReceiptRecorded {
+    /// Unique identifier for this receipt.
+    /// Format: `PR-{uuid}` or similar unique string.
+    #[prost(string, tag = "1")]
+    pub receipt_id: ::prost::alloc::string::String,
+    /// BLAKE3 digest of the changeset that was projected (32 bytes).
+    /// This is the same digest from the ChangeSetPublished event.
+    #[prost(bytes = "vec", tag = "2")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the ProjectionArtifactBundleV1 stored in CAS (32 bytes).
+    /// Contains projection_status, ledger_head, and metadata.
+    #[prost(bytes = "vec", tag = "3")]
+    pub artifact_bundle_hash: ::prost::alloc::vec::Vec<u8>,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the receipt to verifiable HTF time.
+    #[prost(message, optional, tag = "4")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Actor who recorded the receipt (the projector).
+    #[prost(string, tag = "5")]
+    pub projector_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with PROJECTION_RECEIPT_RECORDED: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "6")]
+    pub projector_signature: ::prost::alloc::vec::Vec<u8>,
 }
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.
