@@ -14,8 +14,9 @@
 //! 1. **Legacy Mode**: Uses `with_defaults()` for backward compatibility with
 //!    existing tests. This mode is **deprecated** and will be removed.
 //!
-//! 2. **Profile Mode**: Uses `with_profile()` to load an `AgentAdapterProfileV1`
-//!    from CAS by hash. This is the preferred mode for production use.
+//! 2. **Profile Mode**: Uses `with_profile()` to load an
+//!    `AgentAdapterProfileV1` from CAS by hash. This is the preferred mode for
+//!    production use.
 //!
 //! # Usage (Profile Mode - Recommended)
 //!
@@ -150,8 +151,9 @@ impl AdapterRegistry {
     /// # Deprecation Notice (TCK-00328)
     ///
     /// This method uses ambient defaults, which is **deprecated** per RFC-0019
-    /// Addendum. For production use, prefer [`with_profile`](Self::with_profile)
-    /// to load a CAS-addressed profile by hash.
+    /// Addendum. For production use, prefer
+    /// [`with_profile`](Self::with_profile) to load a CAS-addressed profile
+    /// by hash.
     ///
     /// This method is retained for backward compatibility with existing tests.
     ///
@@ -671,7 +673,10 @@ mod tests {
         assert!(registry.has_profile());
         assert_eq!(registry.profile_hash(), Some(&hash));
         assert!(registry.profile().is_some());
-        assert_eq!(registry.profile().unwrap().profile_id, "claude-code-test-v1");
+        assert_eq!(
+            registry.profile().unwrap().profile_id,
+            "claude-code-test-v1"
+        );
 
         // Verify adapters are registered
         assert!(registry.contains(AdapterType::ClaudeCode));
