@@ -593,9 +593,10 @@ impl ToolExecutor {
         let cas_hash = self.store_result_data(&result_data)?;
         debug!(cas_hash = %hex::encode(&cas_hash[..8]), "result stored in CAS");
 
-        // TCK-00335: Update cache for read-only tools (cache_key is only set for Read/Search)
-        // Note: State-modifying tools (Write, Execute, Git) already invalidated the cache
-        // before execution (Step 4), so we don't need to invalidate again here.
+        // TCK-00335: Update cache for read-only tools (cache_key is only set for
+        // Read/Search) Note: State-modifying tools (Write, Execute, Git)
+        // already invalidated the cache before execution (Step 4), so we don't
+        // need to invalidate again here.
         if let Some(cache) = &self.output_cache {
             if let Some(key) = cache_key {
                 if let Ok(bytes) = serde_json::to_vec(&result_data) {
@@ -1521,10 +1522,7 @@ mod tests {
         assert!(result.success, "Read should succeed");
 
         // Verify cache is populated
-        assert!(
-            !cache.is_empty(),
-            "Cache should have entries after Read"
-        );
+        assert!(!cache.is_empty(), "Cache should have entries after Read");
         let cache_size_before = cache.len();
 
         // Second: Execute a failing Execute command

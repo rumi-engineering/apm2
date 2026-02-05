@@ -1050,51 +1050,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             );
         }
 
-        // Legacy fallback: TCK-00260 manifest store validation
-        // This path is used when no broker is configured (for backwards compatibility)
-        if let Some(ref store) = self.manifest_store {
-            if let Some(manifest) = store.get_manifest(&token.session_id) {
-                // Check if tool is in allowlist
-                if !manifest.is_tool_allowed(tool_class) {
-                    warn!(
-                        session_id = %token.session_id,
-                        tool_class = %tool_class,
-                        "Tool not in allowlist"
-                    );
-                    return Ok(SessionResponse::error(
-                        SessionErrorCode::SessionErrorToolNotAllowed,
-                        format!("tool class '{tool_class}' not in allowlist"),
-                    ));
-                }
-
-                info!(
-                    session_id = %token.session_id,
-                    tool_class = %tool_class,
-                    "Tool allowed by manifest (legacy path)"
-                );
-
-                // Tool is allowed - return Allow decision
-                // TCK-00316: Legacy path does not execute tools, so no result_hash
-                return Ok(SessionResponse::RequestTool(RequestToolResponse {
-                    request_id: format!("REQ-{}", uuid::Uuid::new_v4()),
-                    decision: DecisionType::Allow.into(),
-                    rule_id: None,
-                    policy_hash: manifest.digest().to_vec(),
-                    result_hash: None,
-                    inline_result: None,
-                }));
-            }
-            // No manifest found - fail closed (SEC-CTRL-FAC-0015)
-            warn!(
-                session_id = %token.session_id,
-                "No manifest found for session, denying request (fail-closed)"
-            );
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorToolNotAllowed,
-                "capability manifest unavailable",
-            ));
-        }
-
         // INV-TCK-00290-001: Neither broker nor manifest store configured - fail closed
         warn!(
             session_id = %token.session_id,
@@ -2599,11 +2554,19 @@ mod tests {
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
             match response {
-                SessionResponse::RequestTool(resp) => {
-                    assert_eq!(resp.decision, DecisionType::Allow as i32);
-                    assert!(!resp.policy_hash.is_empty());
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED error code (fail-closed)"
+                    );
+                    assert!(
+                        err.message.contains("broker unavailable"),
+                        "Error message should indicate broker unavailable: {}",
+                        err.message
+                    );
                 },
-                _ => panic!("Expected RequestTool response, got: {response:?}"),
+                _ => panic!("Expected Error response, got: {response:?}"),
             }
         }
 
@@ -2635,15 +2598,15 @@ mod tests {
                     assert_eq!(
                         err.code,
                         SessionErrorCode::SessionErrorToolNotAllowed as i32,
-                        "Expected TOOL_NOT_ALLOWED error code"
+                        "Expected TOOL_NOT_ALLOWED error code (fail-closed)"
                     );
                     assert!(
-                        err.message.contains("not in allowlist"),
-                        "Error message should mention allowlist: {}",
+                        err.message.contains("broker unavailable"),
+                        "Error message should indicate broker unavailable: {}",
                         err.message
                     );
                 },
-                _ => panic!("Expected SESSION_ERROR_TOOL_NOT_ALLOWED error, got: {response:?}"),
+                _ => panic!("Expected Error response, got: {response:?}"),
             }
         }
 
@@ -2775,7 +2738,7 @@ mod tests {
             let ctx = make_session_ctx();
             let token = test_token(&minter);
 
-            // All three should be allowed
+            // All three should be denied because broker is not configured (fail-closed)
             for tool_id in ["read", "write", "execute"] {
                 let request = RequestToolRequest {
                     session_token: serde_json::to_string(&token).unwrap(),
@@ -2787,18 +2750,22 @@ mod tests {
 
                 let response = dispatcher.dispatch(&frame, &ctx).unwrap();
                 match response {
-                    SessionResponse::RequestTool(resp) => {
+                    SessionResponse::Error(err) => {
                         assert_eq!(
-                            resp.decision,
-                            DecisionType::Allow as i32,
-                            "Tool {tool_id} should be allowed"
+                            err.code,
+                            SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                            "Tool {tool_id} should be denied (fail-closed)"
+                        );
+                        assert!(
+                            err.message.contains("broker unavailable"),
+                            "Error message should indicate broker unavailable"
                         );
                     },
-                    _ => panic!("Expected Allow for tool {tool_id}"),
+                    _ => panic!("Expected Error for tool {tool_id}"),
                 }
             }
 
-            // Git and Network should be denied
+            // Git and Network should be denied (same reason)
             for tool_id in ["git", "network"] {
                 let request = RequestToolRequest {
                     session_token: serde_json::to_string(&token).unwrap(),
@@ -2815,6 +2782,11 @@ mod tests {
                             err.code,
                             SessionErrorCode::SessionErrorToolNotAllowed as i32,
                             "Tool {tool_id} should be denied"
+                        );
+                        // With legacy path removed, it fails closed due to missing broker
+                        assert!(
+                            err.message.contains("broker unavailable"),
+                            "Error message should indicate broker unavailable"
                         );
                     },
                     _ => panic!("Expected Deny for tool {tool_id}"),
@@ -3257,13 +3229,12 @@ mod tests {
             }
         }
 
-        /// TCK-00316: Verify legacy path (no broker) still returns Allow
-        /// decision for allowed tools.
+        /// TCK-00336: Verify fail-closed behavior when no broker is configured.
         ///
-        /// When no broker is configured, the dispatcher falls back to manifest
-        /// validation only. This test verifies the legacy path still works.
+        /// When no broker is configured, the dispatcher returns a fail-closed
+        /// error rather than falling back to legacy manifest validation.
         #[test]
-        fn test_request_tool_legacy_path_without_broker() {
+        fn test_request_tool_fails_closed_without_broker() {
             let minter = test_minter();
             let store = Arc::new(InMemoryManifestStore::new());
 
@@ -3287,16 +3258,21 @@ mod tests {
             let frame = encode_request_tool_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
-            // Should return Allow on legacy path
+            // Should return Error (fail-closed)
             match response {
-                SessionResponse::RequestTool(resp) => {
+                SessionResponse::Error(err) => {
                     assert_eq!(
-                        resp.decision,
-                        DecisionType::Allow as i32,
-                        "Expected Allow decision on legacy path"
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED error code (fail-closed)"
+                    );
+                    assert!(
+                        err.message.contains("broker unavailable"),
+                        "Error message should indicate broker unavailable: {}",
+                        err.message
                     );
                 },
-                other => panic!("Expected RequestTool response, got: {other:?}"),
+                other => panic!("Expected Error response, got: {other:?}"),
             }
         }
     }
