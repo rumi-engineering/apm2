@@ -2394,7 +2394,10 @@ mod tests {
         let result = runtime.observe(&fake_id).await;
         assert!(matches!(result, Err(EpisodeError::NotFound { .. })));
 
-        let result = runtime.start(&fake_id, "lease-1", test_timestamp()).await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = runtime
+            .start_with_workspace(&fake_id, "lease-1", test_timestamp(), temp_dir.path())
+            .await;
         assert!(matches!(result, Err(EpisodeError::NotFound { .. })));
     }
 
@@ -2431,8 +2434,9 @@ mod tests {
         assert_eq!(runtime.active_count().await, 1);
         assert_eq!(runtime.total_count().await, 1);
 
+        let temp_dir = tempfile::tempdir().unwrap();
         runtime
-            .start(&ep1, "lease-1", test_timestamp() + 1000)
+            .start_with_workspace(&ep1, "lease-1", test_timestamp() + 1000, temp_dir.path())
             .await
             .unwrap();
         assert_eq!(runtime.active_count().await, 1);
@@ -2451,8 +2455,9 @@ mod tests {
 
         // Create and terminate an episode
         let ep1 = runtime.create([1u8; 32], test_timestamp()).await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
         runtime
-            .start(&ep1, "lease-1", test_timestamp() + 1000)
+            .start_with_workspace(&ep1, "lease-1", test_timestamp() + 1000, temp_dir.path())
             .await
             .unwrap();
         runtime
@@ -2481,8 +2486,9 @@ mod tests {
             .await
             .unwrap();
 
+        let temp_dir = tempfile::tempdir().unwrap();
         let result = runtime
-            .start(&episode_id, "", test_timestamp() + 1000)
+            .start_with_workspace(&episode_id, "", test_timestamp() + 1000, temp_dir.path())
             .await;
         assert!(matches!(result, Err(EpisodeError::InvalidLease { .. })));
     }
@@ -2518,8 +2524,10 @@ mod tests {
             .create(test_envelope_hash(), test_timestamp())
             .await
             .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
         runtime
-            .start(&ep, "lease-1", test_timestamp() + 1000)
+            .start_with_workspace(&ep, "lease-1", test_timestamp() + 1000, temp_dir.path())
             .await
             .unwrap();
         runtime
@@ -2641,8 +2649,15 @@ mod tests {
             .create(test_envelope_hash(), test_timestamp())
             .await
             .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start_with_workspace(
+                &episode_id,
+                "lease-123",
+                test_timestamp() + 1000,
+                temp_dir.path(),
+            )
             .await
             .unwrap();
         runtime
@@ -2679,8 +2694,15 @@ mod tests {
             .create(test_envelope_hash(), test_timestamp())
             .await
             .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start_with_workspace(
+                &episode_id,
+                "lease-123",
+                test_timestamp() + 1000,
+                temp_dir.path(),
+            )
             .await
             .unwrap();
         runtime

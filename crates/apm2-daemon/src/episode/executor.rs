@@ -260,7 +260,8 @@ impl ExecutionContext {
 ///
 /// 1. Create executor with budget tracker and CAS
 /// 2. Optionally set clock via `with_clock()` for time envelope stamping
-/// 3. Optionally set isolation key via `with_isolation_key()` for session scoping
+/// 3. Optionally set isolation key via `with_isolation_key()` for session
+///    scoping
 /// 4. Register tool handlers via `register_handler()`
 /// 5. Execute tools via `execute()`
 /// 6. Results are automatically stored in CAS with time envelope refs
@@ -665,9 +666,9 @@ impl ToolExecutor {
     ///
     /// # Security (SEC-CTRL-FAC-0017)
     ///
-    /// When an isolation key is configured, cache keys include the isolation key
-    /// to prevent cross-session information leakage. The isolation key is
-    /// typically the `EpisodeId` to scope caches to the current session.
+    /// When an isolation key is configured, cache keys include the isolation
+    /// key to prevent cross-session information leakage. The isolation key
+    /// is typically the `EpisodeId` to scope caches to the current session.
     fn compute_cache_key(&self, args: &ToolArgs) -> Option<CacheKey> {
         let base_key = match args {
             ToolArgs::Read(read_args) => {
@@ -1370,7 +1371,8 @@ mod tests {
 
     #[test]
     fn test_executor_isolation_prevents_cross_session_cache_access() {
-        // SEC-CTRL-FAC-0017: Verify different isolation keys produce different cache keys
+        // SEC-CTRL-FAC-0017: Verify different isolation keys produce different cache
+        // keys
         let tracker1 = Arc::new(BudgetTracker::from_envelope(test_budget()));
         let cas1 = Arc::new(StubContentAddressedStore::new());
         let executor1 = ToolExecutor::new(tracker1, cas1).with_isolation_key("ep-session-A");
