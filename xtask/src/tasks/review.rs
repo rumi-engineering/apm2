@@ -80,6 +80,8 @@ impl ReviewType {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
@@ -87,8 +89,19 @@ impl ReviewType {
 /// - The PR URL is invalid
 /// - The PR cannot be found
 /// - The review prompt is missing
-pub fn run_security(pr_url: &str, emit_internal: bool) -> Result<()> {
-    run_review(pr_url, ReviewType::Security, emit_internal)
+pub fn run_security(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    run_review(
+        pr_url,
+        ReviewType::Security,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
 }
 
 /// Run a code quality review for a PR.
@@ -104,6 +117,8 @@ pub fn run_security(pr_url: &str, emit_internal: bool) -> Result<()> {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
@@ -111,8 +126,19 @@ pub fn run_security(pr_url: &str, emit_internal: bool) -> Result<()> {
 /// - The PR URL is invalid
 /// - The PR cannot be found
 /// - The review prompt is missing
-pub fn run_quality(pr_url: &str, emit_internal: bool) -> Result<()> {
-    run_review(pr_url, ReviewType::Quality, emit_internal)
+pub fn run_quality(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    run_review(
+        pr_url,
+        ReviewType::Quality,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
 }
 
 /// Run a UAT (User Acceptance Testing) sign-off for a PR.
@@ -126,18 +152,37 @@ pub fn run_quality(pr_url: &str, emit_internal: bool) -> Result<()> {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The PR URL is invalid
 /// - The status update fails
-pub fn run_uat(pr_url: &str, emit_internal: bool) -> Result<()> {
-    run_review(pr_url, ReviewType::Uat, emit_internal)
+pub fn run_uat(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    run_review(
+        pr_url,
+        ReviewType::Uat,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
 }
 
 /// Run a review of the specified type.
-fn run_review(pr_url: &str, review_type: ReviewType, emit_internal: bool) -> Result<()> {
+fn run_review(
+    pr_url: &str,
+    review_type: ReviewType,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
 
     // TCK-00295: Check if internal emission is enabled (flag or env var)
@@ -171,11 +216,27 @@ fn run_review(pr_url: &str, review_type: ReviewType, emit_internal: bool) -> Res
     match review_type {
         ReviewType::Uat => {
             // UAT is a manual sign-off
-            run_uat_signoff(&sh, pr_url, &owner_repo, &head_sha)?;
+            run_uat_signoff(
+                &sh,
+                pr_url,
+                &owner_repo,
+                &head_sha,
+                emit_receipt_only,
+                allow_github_write,
+            )?;
         },
         ReviewType::Security | ReviewType::Quality => {
             // AI reviews use prompts and tools
-            run_ai_review(&sh, pr_url, &owner_repo, &head_sha, &repo_root, review_type)?;
+            run_ai_review(
+                &sh,
+                pr_url,
+                &owner_repo,
+                &head_sha,
+                &repo_root,
+                review_type,
+                emit_receipt_only,
+                allow_github_write,
+            )?;
         },
     }
 
@@ -212,7 +273,57 @@ fn run_review(pr_url: &str, review_type: ReviewType, emit_internal: bool) -> Res
 }
 
 /// Run UAT sign-off.
-fn run_uat_signoff(sh: &Shell, pr_url: &str, owner_repo: &str, head_sha: &str) -> Result<()> {
+fn run_uat_signoff(
+    sh: &Shell,
+    pr_url: &str,
+    owner_repo: &str,
+    head_sha: &str,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    use crate::util::{
+        StatusWriteDecision, check_status_write_with_flags, emit_projection_request_receipt,
+    };
+
+    // TCK-00324: Check status write gating with CLI flags
+    match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
+        StatusWriteDecision::EmitReceiptOnly => {
+            // Emit receipt only, no direct GitHub write
+            let payload = serde_json::json!({
+                "comment": {
+                    "body": "## UAT Review\n\n**Status:** APPROVED\n\nUser acceptance testing has been completed and approved.\n\n---\n*Signed off via `cargo xtask review uat`*"
+                },
+                "status": {
+                    "context": "ai-review/uat",
+                    "state": "success",
+                    "description": "UAT approved"
+                }
+            });
+            let correlation_id = format!("uat-signoff-{head_sha}");
+            emit_projection_request_receipt(
+                "uat_signoff",
+                owner_repo,
+                head_sha,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+            println!("\nUAT review receipt emitted (no direct write).");
+            return Ok(());
+        },
+        StatusWriteDecision::SkipHefProjection => {
+            println!("  [HEF] Skipping UAT signoff (USE_HEF_PROJECTION=true)");
+            return Ok(());
+        },
+        StatusWriteDecision::BlockStrictMode => {
+            anyhow::bail!(
+                "Status writes blocked in strict mode. Set XTASK_ALLOW_STATUS_WRITES=true to allow."
+            );
+        },
+        StatusWriteDecision::Proceed => {
+            // Continue with direct write
+        },
+    }
+
     println!("\n[1/2] Posting UAT approval comment...");
 
     let comment_body = "## UAT Review\n\n\
@@ -235,6 +346,8 @@ fn run_uat_signoff(sh: &Shell, pr_url: &str, owner_repo: &str, head_sha: &str) -
         ReviewType::Uat,
         true,
         "UAT approved",
+        emit_receipt_only,
+        allow_github_write,
     )?;
 
     println!("\nUAT review complete!");
@@ -244,6 +357,7 @@ fn run_uat_signoff(sh: &Shell, pr_url: &str, owner_repo: &str, head_sha: &str) -
 }
 
 /// Run an AI-powered review (security or quality).
+#[allow(clippy::too_many_arguments)]
 fn run_ai_review(
     sh: &Shell,
     pr_url: &str,
@@ -251,7 +365,20 @@ fn run_ai_review(
     head_sha: &str,
     repo_root: &str,
     review_type: ReviewType,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
 ) -> Result<()> {
+    // Note: AI reviews spawn background processes that write their own status.
+    // The cutover flags are checked in update_status when the AI reviewer
+    // completes. For now, we just log that the flags are set.
+    if emit_receipt_only && !allow_github_write {
+        eprintln!(
+            "  [TCK-00324] Note: emit-receipt-only mode active. AI reviewer will handle cutover."
+        );
+    }
+    // Store flags for use in manual status update hint
+    let _ = (emit_receipt_only, allow_github_write);
+
     let prompt_path = review_type
         .prompt_path()
         .expect("AI review types have prompt paths");
@@ -406,6 +533,12 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
 /// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
 /// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
 /// the HEF evidence pipeline.
+///
+/// # Arguments
+///
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
+#[allow(clippy::too_many_arguments)]
 fn update_status(
     sh: &Shell,
     owner_repo: &str,
@@ -413,16 +546,39 @@ fn update_status(
     review_type: ReviewType,
     success: bool,
     description: &str,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
 ) -> Result<()> {
-    use crate::util::{StatusWriteDecision, check_status_write_allowed};
+    use crate::util::{
+        StatusWriteDecision, check_status_write_with_flags, emit_projection_request_receipt,
+    };
 
     let context = review_type.status_context();
 
-    // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
-    match check_status_write_allowed() {
+    // TCK-00324: Check status write gating with CLI flags
+    match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
         StatusWriteDecision::SkipHefProjection => {
             println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
             println!("  [HEF] Status would be: {context} = {success} - {description}");
+            return Ok(());
+        },
+        StatusWriteDecision::EmitReceiptOnly => {
+            // TCK-00324: Emit receipt only, no direct GitHub write
+            let state = if success { "success" } else { "failure" };
+            let payload = serde_json::json!({
+                "context": context,
+                "state": state,
+                "description": description
+            });
+            let correlation_id = format!("status-{context}-{head_sha}");
+            emit_projection_request_receipt(
+                "status_write",
+                owner_repo,
+                head_sha,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+            println!("  [CUTOVER] Status update receipt emitted: {context} = {state}");
             return Ok(());
         },
         StatusWriteDecision::BlockStrictMode => {

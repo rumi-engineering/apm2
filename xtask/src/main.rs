@@ -106,7 +106,29 @@ enum Commands {
     ///
     /// Pushes the current branch, creates a PR if needed,
     /// requests AI reviews, and enables auto-merge.
-    Push,
+    Push {
+        /// Emit receipt only, do NOT write directly to GitHub (TCK-00324).
+        ///
+        /// When enabled, xtask emits a projection request receipt and
+        /// relies on the projection worker to perform the actual GitHub
+        /// API writes (status checks, comments).
+        ///
+        /// Also enabled via `XTASK_EMIT_RECEIPT_ONLY=true` environment
+        /// variable.
+        #[arg(long)]
+        emit_receipt_only: bool,
+
+        /// Allow direct GitHub writes (override emit-receipt-only mode).
+        ///
+        /// When emit-receipt-only is active, this flag provides explicit
+        /// opt-in for direct GitHub writes. Useful for development/debugging
+        /// when the projection worker is not available.
+        ///
+        /// Also enabled via `XTASK_ALLOW_GITHUB_WRITE=true` environment
+        /// variable.
+        #[arg(long)]
+        allow_github_write: bool,
+    },
 
     /// Show ticket and PR status.
     ///
@@ -289,6 +311,16 @@ enum ReviewCommands {
         /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
         #[arg(long)]
         emit_internal: bool,
+        /// Emit receipt only, do NOT write directly to GitHub (TCK-00324).
+        ///
+        /// When enabled, xtask emits a projection request receipt and
+        /// relies on the projection worker to perform the actual GitHub
+        /// API writes.
+        #[arg(long)]
+        emit_receipt_only: bool,
+        /// Allow direct GitHub writes (override emit-receipt-only mode).
+        #[arg(long)]
+        allow_github_write: bool,
     },
 
     /// Run code quality review using Codex.
@@ -310,6 +342,12 @@ enum ReviewCommands {
         /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
         #[arg(long)]
         emit_internal: bool,
+        /// Emit receipt only, do NOT write directly to GitHub (TCK-00324).
+        #[arg(long)]
+        emit_receipt_only: bool,
+        /// Allow direct GitHub writes (override emit-receipt-only mode).
+        #[arg(long)]
+        allow_github_write: bool,
     },
 
     /// Run UAT (User Acceptance Testing) sign-off.
@@ -330,6 +368,12 @@ enum ReviewCommands {
         /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
         #[arg(long)]
         emit_internal: bool,
+        /// Emit receipt only, do NOT write directly to GitHub (TCK-00324).
+        #[arg(long)]
+        emit_receipt_only: bool,
+        /// Allow direct GitHub writes (override emit-receipt-only mode).
+        #[arg(long)]
+        allow_github_write: bool,
     },
 }
 
@@ -346,22 +390,46 @@ fn main() -> Result<()> {
             message,
             skip_checks,
         } => tasks::commit(&message, skip_checks),
-        Commands::Push => tasks::push(),
+        Commands::Push {
+            emit_receipt_only,
+            allow_github_write,
+        } => tasks::push(emit_receipt_only, allow_github_write),
         Commands::Check { watch } => tasks::check(watch),
         Commands::Finish => tasks::finish(),
         Commands::Review { review_type } => match review_type {
             ReviewCommands::Security {
                 pr_url,
                 emit_internal,
-            } => tasks::review_security(&pr_url, emit_internal),
+                emit_receipt_only,
+                allow_github_write,
+            } => tasks::review_security(
+                &pr_url,
+                emit_internal,
+                emit_receipt_only,
+                allow_github_write,
+            ),
             ReviewCommands::Quality {
                 pr_url,
                 emit_internal,
-            } => tasks::review_quality(&pr_url, emit_internal),
+                emit_receipt_only,
+                allow_github_write,
+            } => tasks::review_quality(
+                &pr_url,
+                emit_internal,
+                emit_receipt_only,
+                allow_github_write,
+            ),
             ReviewCommands::Uat {
                 pr_url,
                 emit_internal,
-            } => tasks::review_uat(&pr_url, emit_internal),
+                emit_receipt_only,
+                allow_github_write,
+            } => tasks::review_uat(
+                &pr_url,
+                emit_internal,
+                emit_receipt_only,
+                allow_github_write,
+            ),
         },
         Commands::SecurityReviewExec { action } => match action {
             SecurityReviewExecCommands::Approve {

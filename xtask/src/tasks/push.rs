@@ -29,13 +29,18 @@ use crate::util::{
 /// 5. Creates a PR if one doesn't exist
 /// 6. Enables auto-merge if available
 ///
+/// # Arguments
+///
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - Not on a valid ticket branch
 /// - Rebase fails (conflicts need manual resolution)
 /// - Push or PR creation fails
-pub fn run() -> Result<()> {
+pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
 
     // Get current branch and validate it's a ticket branch
@@ -167,7 +172,7 @@ pub fn run() -> Result<()> {
 
     // Trigger AI reviews
     println!("\nTriggering AI reviews...");
-    trigger_ai_reviews(&sh, &pr_url)?;
+    trigger_ai_reviews(&sh, &pr_url, emit_receipt_only, allow_github_write)?;
 
     println!();
     println!("Push complete!");
@@ -250,7 +255,17 @@ fn create_pr(sh: &Shell, branch_name: &str, ticket_id: &str) -> Result<String> {
 ///
 /// The AI reviewers are responsible for updating their status to
 /// success/failure.
-fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
+///
+/// # Arguments
+///
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
+fn trigger_ai_reviews(
+    sh: &Shell,
+    pr_url: &str,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
     let head_sha = cmd!(sh, "git rev-parse HEAD")
         .read()
         .context("Failed to get HEAD SHA")?
@@ -290,7 +305,13 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
     if owner_repo.is_empty() {
         println!("    Warning: Could not determine owner/repo from remote URL");
     } else {
-        create_pending_statuses(sh, owner_repo, &head_sha);
+        create_pending_statuses(
+            sh,
+            owner_repo,
+            &head_sha,
+            emit_receipt_only,
+            allow_github_write,
+        );
     }
 
     // Try to spawn Gemini for security review
@@ -360,13 +381,44 @@ fn parse_owner_repo(remote_url: &str) -> &str {
 /// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
 /// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
 /// the HEF evidence pipeline.
-fn create_pending_statuses(sh: &Shell, owner_repo: &str, head_sha: &str) {
-    use crate::util::{StatusWriteDecision, check_status_write_allowed};
+///
+/// # Arguments
+///
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
+fn create_pending_statuses(
+    sh: &Shell,
+    owner_repo: &str,
+    head_sha: &str,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) {
+    use crate::util::{
+        StatusWriteDecision, check_status_write_with_flags, emit_projection_request_receipt,
+    };
 
-    // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
-    match check_status_write_allowed() {
+    // TCK-00324: Check status write gating with CLI flags
+    match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
         StatusWriteDecision::SkipHefProjection => {
             println!("    [HEF] Skipping pending status creation (USE_HEF_PROJECTION=true)");
+            return;
+        },
+        StatusWriteDecision::EmitReceiptOnly => {
+            // TCK-00324: Emit receipt only, no direct GitHub write
+            let payload = serde_json::json!({
+                "statuses": [
+                    {"context": "ai-review/security", "state": "pending", "description": "Waiting for security review"},
+                    {"context": "ai-review/code-quality", "state": "pending", "description": "Waiting for code quality review"}
+                ]
+            });
+            let correlation_id = format!("push-pending-{head_sha}");
+            let _ = emit_projection_request_receipt(
+                "status_write_batch",
+                owner_repo,
+                head_sha,
+                &payload.to_string(),
+                &correlation_id,
+            );
             return;
         },
         StatusWriteDecision::BlockStrictMode => {
