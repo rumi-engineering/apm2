@@ -875,22 +875,6 @@ impl ConnectionState {
         Ok(())
     }
 
-    /// Records that a pulse was enqueued (for use after `try_reserve_enqueue`).
-    ///
-    /// NOTE: This method is now a no-op since `try_reserve_enqueue` atomically
-    /// reserves the slot. It is kept for API compatibility but callers should
-    /// use `try_reserve_enqueue` directly.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use try_reserve_enqueue which atomically reserves. This is now a no-op."
-    )]
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn record_enqueue(&self, _payload_size: usize) {
-        // No-op: try_reserve_enqueue already performed the reservation
-        // atomically. This method is kept for backwards compatibility
-        // during migration.
-    }
-
     /// Records that a pulse was delivered/dequeued.
     ///
     /// # Arguments
@@ -1162,22 +1146,6 @@ impl SubscriptionRegistry {
                     connection_id: connection_id.to_string(),
                 })?;
         conn.check_delivery_limits(payload_size)
-    }
-
-    /// Records that a pulse was enqueued for a connection.
-    ///
-    /// NOTE: This method is now a no-op since `try_reserve_enqueue` atomically
-    /// reserves the slot. It is kept for API compatibility but callers should
-    /// use `try_reserve_enqueue` directly.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use try_reserve_enqueue which atomically reserves. This is now a no-op."
-    )]
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn record_enqueue(&self, _connection_id: &str, _payload_size: usize) {
-        // No-op: try_reserve_enqueue already performed the reservation
-        // atomically. This method is kept for backwards compatibility
-        // during migration.
     }
 
     /// Records that a pulse was delivered for a connection.

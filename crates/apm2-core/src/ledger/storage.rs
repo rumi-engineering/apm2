@@ -752,16 +752,6 @@ impl SqliteLedgerBackend {
         Ok(max.unwrap_or(0) as u64)
     }
 
-    /// Alias for `head_sync()` for backward compatibility.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the query fails.
-    #[deprecated(since = "2.0.0", note = "Use head_sync() instead for clarity")]
-    pub fn max_seq_id(&self) -> Result<u64, LedgerError> {
-        self.head_sync()
-    }
-
     /// Gets statistics about the ledger.
     ///
     /// # Errors

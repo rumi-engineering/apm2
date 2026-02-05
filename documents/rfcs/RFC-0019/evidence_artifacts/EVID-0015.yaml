@@ -41,3 +41,15 @@ evidence_artifact:
         - crates/apm2-daemon/tests/common/daemon.rs (test helpers)
         - crates/apm2-daemon/benches/latency_benchmarks.rs (benchmarks)
         - crates/apm2-daemon/tests/tck_00321_episode_event_persistence.rs (integration tests)
+    - artifact_type: "CODE_REMOVAL"
+      description: "TCK-00337: Removed unused deprecated functions"
+      location: "multiple files"
+      notes: |
+        Removed deprecated functions that had zero callers outside their definitions:
+        - crates/apm2-core/src/consensus/relay.rs: process_tunnel_frame() - legacy tunnel frame handler
+        - crates/apm2-core/src/ledger/storage.rs: max_seq_id() - alias for head_sync()
+        - crates/apm2-daemon/src/protocol/pulse_outbox.rs: send_pulse() - legacy blocking send
+        - crates/apm2-daemon/src/protocol/resource_governance.rs: record_enqueue() (2 versions) - no-op methods
+        - crates/apm2-daemon/src/episode/ring_buffer.rs: buffer_size_for_tier() - obsolete byte-size API
+        Also removed re-export from crates/apm2-core/src/consensus/mod.rs and associated test.
+        Total: 140 lines of dead code removed. Build and all tests pass.

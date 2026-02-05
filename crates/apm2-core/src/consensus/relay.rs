@@ -1243,58 +1243,6 @@ fn validate_tunnel_identity(
     Ok(())
 }
 
-/// Processes an incoming control frame from a tunnel (legacy API).
-///
-/// **Deprecated**: Use `process_tunnel_frame_with_identity` instead for
-/// proper identity binding.
-///
-/// # Errors
-///
-/// Returns an error if the frame cannot be processed.
-#[deprecated(
-    since = "0.1.0",
-    note = "Use process_tunnel_frame_with_identity for proper identity binding"
-)]
-pub async fn process_tunnel_frame(
-    registry: &TunnelRegistry,
-    frame: &ControlFrame,
-) -> Result<Option<ControlFrame>, RelayError> {
-    match frame.message_type() {
-        MSG_TUNNEL_HEARTBEAT => {
-            let heartbeat = TunnelHeartbeat::from_bytes(frame.payload())?;
-            registry.touch(&heartbeat.tunnel_id).await?;
-
-            // Send heartbeat ack
-            let ack = TunnelHeartbeat::new(
-                heartbeat.tunnel_id,
-                heartbeat.sequence,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
-            let payload = ack.to_bytes()?;
-            let ack_frame = ControlFrame::new(MSG_TUNNEL_HEARTBEAT_ACK, &payload)?;
-            Ok(Some(ack_frame))
-        },
-        MSG_TUNNEL_CLOSE => {
-            let tunnel_id = std::str::from_utf8(frame.payload())
-                .map_err(|e| RelayError::InvalidMessage(format!("invalid tunnel_id: {e}")))?;
-            registry.unregister(tunnel_id).await;
-            tracing::info!(tunnel_id = %tunnel_id, "Tunnel closed by worker");
-            Ok(None)
-        },
-        MSG_TUNNEL_DATA => {
-            // Data from worker - would be routed to appropriate client
-            // This is typically handled by application-level routing
-            Ok(None)
-        },
-        msg_type => Err(RelayError::InvalidMessage(format!(
-            "unexpected message type on tunnel: {msg_type}"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -148,10 +148,6 @@ pub use qc_aggregator::{
     QcVerificationResult, build_vote_message, compute_quorum_threshold, is_quorum, verify_qc,
     verify_qc_with_message,
 };
-// Note: process_tunnel_frame is deprecated, use the internal identity-bound
-// version instead
-#[allow(deprecated)]
-pub use relay::process_tunnel_frame;
 pub use relay::{
     CLEANUP_INTERVAL, MAX_PENDING_MESSAGES, MAX_RELAY_ID_LEN, ROUTE_TIMEOUT, RelayConfig,
     RelayConfigBuilder, RelayError, RelayHolon, RelayStats, TunnelRegistry,

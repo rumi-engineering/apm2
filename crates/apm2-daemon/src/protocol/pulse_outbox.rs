@@ -214,22 +214,6 @@ pub trait PulseFrameSink: Send + Sync {
     /// internal channel/buffer. Blocking here would cause head-of-line blocking
     /// denial of service across all connections.
     fn try_send_pulse(&self, frame: Bytes) -> TrySendResult;
-
-    /// Legacy blocking send (deprecated, calls `try_send_pulse` internally).
-    ///
-    /// This method is provided for backward compatibility with existing code.
-    /// New code should use `try_send_pulse` directly.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use try_send_pulse() for non-blocking semantics"
-    )]
-    #[allow(clippy::result_unit_err)]
-    fn send_pulse(&self, frame: Bytes) -> Result<(), ()> {
-        match self.try_send_pulse(frame) {
-            TrySendResult::Sent => Ok(()),
-            TrySendResult::BufferFull | TrySendResult::Disconnected => Err(()),
-        }
-    }
 }
 
 /// Type alias for a boxed pulse frame sink.

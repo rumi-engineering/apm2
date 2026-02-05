@@ -223,20 +223,6 @@ pub mod tier_defaults {
             _ => TIER_3_PLUS_CAPACITY, // Tier 3, 4, and any future tiers
         }
     }
-
-    /// Deprecated: Use `buffer_capacity_for_tier` instead.
-    ///
-    /// This function previously returned byte sizes, but `RingBuffer<T>` uses
-    /// item counts. The new function `buffer_capacity_for_tier` returns the
-    /// correct item-count values.
-    #[deprecated(
-        since = "0.1.0",
-        note = "Use buffer_capacity_for_tier() which returns item counts, not byte sizes"
-    )]
-    #[must_use]
-    pub const fn buffer_size_for_tier(tier: u8) -> usize {
-        buffer_capacity_for_tier(tier)
-    }
 }
 
 #[cfg(test)]
@@ -469,18 +455,6 @@ mod tests {
         assert!(rb.is_full());
         assert_eq!(rb.push(2), Some(1)); // Evicts 1
         assert_eq!(rb.front(), Some(&2));
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn test_deprecated_buffer_size_for_tier() {
-        use tier_defaults::*;
-
-        // Verify deprecated function still works and returns same values
-        assert_eq!(buffer_size_for_tier(0), buffer_capacity_for_tier(0));
-        assert_eq!(buffer_size_for_tier(1), buffer_capacity_for_tier(1));
-        assert_eq!(buffer_size_for_tier(2), buffer_capacity_for_tier(2));
-        assert_eq!(buffer_size_for_tier(3), buffer_capacity_for_tier(3));
     }
 
     /// Verify that tier capacities are reasonable for creating `RingBuffer`s.
