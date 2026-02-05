@@ -103,6 +103,45 @@ pub enum BrokerError {
         /// Error message.
         message: String,
     },
+
+    /// Context pack not found in CAS (TCK-00326).
+    ///
+    /// Per RFC-0019, this triggers `ReviewBlockedRecorded` emission
+    /// with `reason_code` `MISSING_ARTIFACT`.
+    #[error("context pack not found in CAS: hash {hash}")]
+    ContextPackNotFound {
+        /// Hex-encoded hash of the missing context pack.
+        hash: String,
+    },
+
+    /// Context pack seal verification failed (TCK-00326).
+    ///
+    /// Per RFC-0019, this triggers `ReviewBlockedRecorded` emission
+    /// with `reason_code` `INVALID_BUNDLE`.
+    #[error("context pack seal invalid: {reason}")]
+    ContextPackSealInvalid {
+        /// Reason for seal verification failure.
+        reason: String,
+    },
+
+    /// Context pack deserialization failed (TCK-00326).
+    #[error("context pack deserialization failed: {reason}")]
+    ContextPackDeserializationFailed {
+        /// Reason for deserialization failure.
+        reason: String,
+    },
+
+    /// Context pack integrity check failed (TCK-00326).
+    ///
+    /// The blake3 hash of the retrieved content does not match the expected
+    /// `context_pack_hash`. This could indicate CAS corruption or tampering.
+    #[error("context pack integrity mismatch: expected {expected}, computed {computed}")]
+    ContextPackIntegrityMismatch {
+        /// Expected hash (from the request).
+        expected: String,
+        /// Computed hash (from blake3 of the retrieved content).
+        computed: String,
+    },
 }
 
 impl BrokerError {
@@ -117,6 +156,10 @@ impl BrokerError {
             Self::BudgetExceeded { .. } => "budget_exceeded",
             Self::ExecutionFailed { .. } => "execution_failed",
             Self::Internal { .. } => "internal",
+            Self::ContextPackNotFound { .. } => "context_pack_not_found",
+            Self::ContextPackSealInvalid { .. } => "context_pack_seal_invalid",
+            Self::ContextPackDeserializationFailed { .. } => "context_pack_deserialization_failed",
+            Self::ContextPackIntegrityMismatch { .. } => "context_pack_integrity_mismatch",
         }
     }
 
@@ -124,6 +167,22 @@ impl BrokerError {
     #[must_use]
     pub const fn is_retriable(&self) -> bool {
         matches!(self, Self::ExecutionFailed { .. })
+    }
+
+    /// Returns `true` if this error should trigger `ReviewBlockedRecorded`
+    /// (TCK-00326).
+    ///
+    /// Per RFC-0019, context pack errors should emit a `ReviewBlockedRecorded`
+    /// event to the ledger for audit and fail-closed behavior.
+    #[must_use]
+    pub const fn should_emit_review_blocked(&self) -> bool {
+        matches!(
+            self,
+            Self::ContextPackNotFound { .. }
+                | Self::ContextPackSealInvalid { .. }
+                | Self::ContextPackDeserializationFailed { .. }
+                | Self::ContextPackIntegrityMismatch { .. }
+        )
     }
 }
 
@@ -1014,6 +1073,149 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         *guard = Some(Arc::new(manifest));
         debug!("broker initialized with context pack manifest");
         Ok(())
+    }
+
+    /// Initializes the broker's context firewall from a CAS-stored context pack
+    /// (TCK-00326).
+    ///
+    /// This method:
+    /// 1. Loads the sealed `ContextPackManifest` from CAS using its hash
+    /// 2. Verifies the seal integrity
+    /// 3. Initializes the context firewall for subsequent tool requests
+    ///
+    /// # Fail-Closed Behavior
+    ///
+    /// Per RFC-0019, this method fails closed on:
+    /// - Missing context pack: [`BrokerError::ContextPackNotFound`]
+    /// - Invalid seal: [`BrokerError::ContextPackSealInvalid`]
+    /// - Deserialization failure:
+    ///   [`BrokerError::ContextPackDeserializationFailed`]
+    ///
+    /// All of these errors should trigger `ReviewBlockedRecorded` emission
+    /// by the caller.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_pack_hash` - BLAKE3 hash of the sealed `ContextPackManifest`
+    ///   in CAS
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context pack cannot be loaded, deserialized,
+    /// or fails seal verification.
+    #[instrument(skip(self), fields(context_pack_hash = %hex::encode(&context_pack_hash[..8])))]
+    pub async fn initialize_context_from_hash(
+        &self,
+        context_pack_hash: &Hash,
+    ) -> Result<(), BrokerError> {
+        // Load from CAS
+        let content = self.cas.retrieve(context_pack_hash).ok_or_else(|| {
+            BrokerError::ContextPackNotFound {
+                hash: hex::encode(context_pack_hash),
+            }
+        })?;
+
+        // TCK-00326: Verify content integrity - compute blake3(content) and assert
+        // it matches context_pack_hash before processing. This prevents CAS poisoning
+        // attacks where a malicious actor could substitute content.
+        let computed_hash = blake3::hash(&content);
+        if computed_hash.as_bytes() != context_pack_hash {
+            return Err(BrokerError::ContextPackIntegrityMismatch {
+                expected: hex::encode(context_pack_hash),
+                computed: hex::encode(computed_hash.as_bytes()),
+            });
+        }
+
+        // Deserialize
+        let mut manifest: ContextPackManifest = serde_json::from_slice(&content).map_err(|e| {
+            BrokerError::ContextPackDeserializationFailed {
+                reason: e.to_string(),
+            }
+        })?;
+
+        // Rebuild index after deserialization
+        manifest.rebuild_index();
+
+        // Verify seal integrity
+        manifest
+            .verify_seal()
+            .map_err(|e| BrokerError::ContextPackSealInvalid {
+                reason: e.to_string(),
+            })?;
+
+        // Initialize firewall with verified manifest
+        self.initialize_with_context_manifest(manifest).await?;
+
+        debug!(
+            context_pack_hash = %hex::encode(context_pack_hash),
+            "context firewall initialized from CAS"
+        );
+        Ok(())
+    }
+
+    /// Seals a `ContextPackManifest` and stores it in CAS (TCK-00326).
+    ///
+    /// This method:
+    /// 1. Verifies the manifest's seal
+    /// 2. Serializes it to canonical JSON
+    /// 3. Stores it in CAS
+    /// 4. Returns the CAS hash for reference
+    ///
+    /// # Authority Binding
+    ///
+    /// The returned hash should be embedded in episode envelopes and review
+    /// artifacts for authority binding per RFC-0019.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - The `ContextPackManifest` to seal and store
+    ///
+    /// # Returns
+    ///
+    /// The CAS hash of the stored manifest (which should match
+    /// `manifest.manifest_hash()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if seal verification fails.
+    #[instrument(skip(self, manifest), fields(manifest_id = %manifest.manifest_id))]
+    pub fn seal_and_store_context_pack(
+        &self,
+        manifest: &ContextPackManifest,
+    ) -> Result<Hash, BrokerError> {
+        // Verify seal is valid
+        manifest
+            .verify_seal()
+            .map_err(|e| BrokerError::ContextPackSealInvalid {
+                reason: e.to_string(),
+            })?;
+
+        // Serialize to JSON (canonical through serde)
+        let content = serde_json::to_vec(manifest).map_err(|e| BrokerError::Internal {
+            message: format!("failed to serialize context pack: {e}"),
+        })?;
+
+        // Store in CAS
+        let hash = self.cas.store(&content);
+
+        debug!(
+            manifest_id = %manifest.manifest_id,
+            cas_hash = %hex::encode(hash),
+            "context pack sealed and stored in CAS"
+        );
+
+        Ok(hash)
+    }
+
+    /// Returns the context pack hash if a context manifest is loaded.
+    ///
+    /// This is useful for embedding the hash in review artifacts and receipts.
+    pub async fn context_pack_hash(&self) -> Option<Hash> {
+        self.context_manifest
+            .read()
+            .await
+            .as_ref()
+            .map(|m| m.manifest_hash())
     }
 
     /// Returns `true` if the broker has been initialized.
@@ -3982,5 +4184,337 @@ policy:
             .unwrap();
 
         assert!(decision.is_allowed());
+    }
+
+    // =========================================================================
+    // TCK-00326: Context Pack Storage Tests
+    //
+    // Tests for `seal_and_store_context_pack` and `initialize_context_from_hash`
+    // methods that enable context pack persistence via CAS.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_seal_and_store_context_pack_success() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+        use crate::episode::executor::ContentAddressedStore as CasTrait;
+
+        // Create a durable CAS
+        let temp_dir = TempDir::new().unwrap();
+        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas = Arc::new(DurableCas::new(cas_config).unwrap());
+
+        // Create broker with durable CAS
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_cas(cas.clone());
+
+        // Create a valid context manifest
+        let manifest = make_context_manifest(
+            vec![("/workspace/file.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // Seal and store should succeed
+        let result = broker.seal_and_store_context_pack(&manifest);
+        assert!(result.is_ok(), "seal_and_store_context_pack should succeed");
+
+        let stored_hash = result.unwrap();
+
+        // The stored hash is the CAS hash (blake3 of serialized JSON),
+        // which differs from manifest_hash() (semantic content hash).
+        // This is intentional: CAS addresses by content, manifest seals by semantics.
+
+        // Verify content is actually in CAS (use trait method explicitly)
+        let retrieved = CasTrait::retrieve(cas.as_ref(), &stored_hash);
+        assert!(
+            retrieved.is_some(),
+            "content should be retrievable from CAS"
+        );
+
+        // Verify the retrieved content deserializes back to the same manifest
+        let retrieved_content = retrieved.unwrap();
+        let mut recovered: apm2_core::context::ContextPackManifest =
+            serde_json::from_slice(&retrieved_content).expect("should deserialize");
+        recovered.rebuild_index();
+
+        assert_eq!(
+            manifest.manifest_hash(),
+            recovered.manifest_hash(),
+            "recovered manifest should have same semantic hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seal_and_store_context_pack_invalid_seal() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+
+        // Create a durable CAS
+        let temp_dir = TempDir::new().unwrap();
+        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas = Arc::new(DurableCas::new(cas_config).unwrap());
+
+        // Create broker with durable CAS
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_cas(cas);
+
+        // Create a manifest with corrupted hash via JSON (simulating tampering)
+        let json = r#"{"manifest_id":"manifest-001","manifest_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"profile_id":"profile-001","entries":[]}"#;
+        let mut tampered_manifest: apm2_core::context::ContextPackManifest =
+            serde_json::from_str(json).unwrap();
+        tampered_manifest.rebuild_index();
+
+        // seal_and_store should fail with ContextPackSealInvalid
+        let result = broker.seal_and_store_context_pack(&tampered_manifest);
+        assert!(
+            matches!(result, Err(BrokerError::ContextPackSealInvalid { .. })),
+            "should fail with ContextPackSealInvalid for tampered manifest, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_context_from_hash_success() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+
+        // Create a durable CAS
+        let temp_dir = TempDir::new().unwrap();
+        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas = Arc::new(DurableCas::new(cas_config).unwrap());
+
+        // Create broker with durable CAS
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_cas(cas.clone());
+
+        // Create and store a valid context manifest
+        let manifest = make_context_manifest(
+            vec![("/workspace/file.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        let stored_hash = broker
+            .seal_and_store_context_pack(&manifest)
+            .expect("store should succeed");
+
+        // Initialize from hash should succeed
+        let result = broker.initialize_context_from_hash(&stored_hash).await;
+        assert!(
+            result.is_ok(),
+            "initialize_context_from_hash should succeed, got {result:?}"
+        );
+
+        // Verify the context firewall is now active by checking manifest is loaded.
+        // Note: context_pack_hash() returns the manifest's semantic hash
+        // (manifest_hash()), not the CAS address. This is intentional - the
+        // manifest doesn't know its CAS address.
+        let context_hash = broker.context_pack_hash().await;
+        assert!(
+            context_hash.is_some(),
+            "context pack should be loaded after initialization"
+        );
+        // The loaded manifest hash should equal the original manifest hash
+        assert_eq!(
+            context_hash.unwrap(),
+            manifest.manifest_hash(),
+            "loaded context pack should have the same semantic hash as the original"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_context_from_hash_not_found() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+
+        // Create a durable CAS (empty)
+        let temp_dir = TempDir::new().unwrap();
+        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas = Arc::new(DurableCas::new(cas_config).unwrap());
+
+        // Create broker with durable CAS
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_cas(cas);
+
+        // Try to initialize from a hash that doesn't exist in CAS
+        let nonexistent_hash = [0xAB; 32];
+        let result = broker.initialize_context_from_hash(&nonexistent_hash).await;
+
+        assert!(
+            matches!(result, Err(BrokerError::ContextPackNotFound { .. })),
+            "should fail with ContextPackNotFound for missing hash, got {result:?}"
+        );
+
+        if let Err(BrokerError::ContextPackNotFound { hash }) = result {
+            assert_eq!(
+                hash,
+                hex::encode(nonexistent_hash),
+                "error should contain the missing hash"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_context_from_hash_integrity_mismatch() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+        use crate::episode::executor::ContentAddressedStore as CasTrait;
+
+        // Define the poisoned CAS struct at the start of the function (before
+        // statements) to simulate a CAS poisoning attack where content doesn't
+        // match the hash.
+        #[derive(Debug)]
+        struct PoisonedCas {
+            inner: Arc<DurableCas>,
+            poison_hash: [u8; 32],
+            poisoned_content: Vec<u8>,
+        }
+
+        impl CasTrait for PoisonedCas {
+            fn store(&self, content: &[u8]) -> Hash {
+                // Use trait method on inner
+                CasTrait::store(self.inner.as_ref(), content)
+            }
+
+            fn retrieve(&self, hash: &Hash) -> Option<Vec<u8>> {
+                if hash == &self.poison_hash {
+                    // Return different content than what the hash represents
+                    Some(self.poisoned_content.clone())
+                } else {
+                    // Use trait method on inner
+                    CasTrait::retrieve(self.inner.as_ref(), hash)
+                }
+            }
+        }
+
+        // Create a durable CAS
+        let temp_dir = TempDir::new().unwrap();
+        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas = Arc::new(DurableCas::new(cas_config).unwrap());
+
+        // Create broker with durable CAS
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_cas(cas.clone());
+
+        // Create and store a valid context manifest
+        let manifest = make_context_manifest(
+            vec![("/workspace/file.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        let stored_hash = broker
+            .seal_and_store_context_pack(&manifest)
+            .expect("store should succeed");
+
+        // Create a poisoned CAS that returns different content for our hash
+        let poisoned_cas = Arc::new(PoisonedCas {
+            inner: cas,
+            poison_hash: stored_hash,
+            poisoned_content: b"totally different content".to_vec(),
+        });
+
+        // Create a new broker with the poisoned CAS
+        let poisoned_broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_cas(poisoned_cas);
+
+        // Try to initialize from the hash - should fail with integrity mismatch
+        let result = poisoned_broker
+            .initialize_context_from_hash(&stored_hash)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(BrokerError::ContextPackIntegrityMismatch { .. })
+            ),
+            "should fail with ContextPackIntegrityMismatch for poisoned CAS, got {result:?}"
+        );
+
+        if let Err(BrokerError::ContextPackIntegrityMismatch { expected, computed }) = result {
+            assert_eq!(
+                expected,
+                hex::encode(stored_hash),
+                "expected hash should match the requested hash"
+            );
+            // Computed hash should be the hash of the poisoned content
+            let expected_computed =
+                hex::encode(blake3::hash(b"totally different content").as_bytes());
+            assert_eq!(
+                computed, expected_computed,
+                "computed hash should be the hash of the poisoned content"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_context_from_hash_invalid_seal() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+        use crate::episode::executor::ContentAddressedStore as CasTrait;
+
+        // Create a durable CAS
+        let temp_dir = TempDir::new().unwrap();
+        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas = Arc::new(DurableCas::new(cas_config).unwrap());
+
+        // Create a tampered manifest JSON with wrong hash
+        let tampered_json = r#"{"manifest_id":"manifest-tampered","manifest_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"profile_id":"profile-001","entries":[]}"#;
+        let tampered_bytes = tampered_json.as_bytes();
+
+        // Store the tampered content directly in CAS (use trait method)
+        let content_hash = CasTrait::store(cas.as_ref(), tampered_bytes);
+
+        // Create broker with the CAS
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_cas(cas);
+
+        // Try to initialize from the hash - should fail with invalid seal
+        let result = broker.initialize_context_from_hash(&content_hash).await;
+
+        assert!(
+            matches!(result, Err(BrokerError::ContextPackSealInvalid { .. })),
+            "should fail with ContextPackSealInvalid for tampered manifest, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_pack_error_kinds() {
+        // Test the error kind strings for context pack errors
+        let not_found = BrokerError::ContextPackNotFound {
+            hash: "abc123".to_string(),
+        };
+        assert_eq!(not_found.kind(), "context_pack_not_found");
+        assert!(not_found.should_emit_review_blocked());
+        assert!(!not_found.is_retriable());
+
+        let seal_invalid = BrokerError::ContextPackSealInvalid {
+            reason: "hash mismatch".to_string(),
+        };
+        assert_eq!(seal_invalid.kind(), "context_pack_seal_invalid");
+        assert!(seal_invalid.should_emit_review_blocked());
+        assert!(!seal_invalid.is_retriable());
+
+        let integrity_mismatch = BrokerError::ContextPackIntegrityMismatch {
+            expected: "abc".to_string(),
+            computed: "def".to_string(),
+        };
+        assert_eq!(integrity_mismatch.kind(), "context_pack_integrity_mismatch");
+        assert!(integrity_mismatch.should_emit_review_blocked());
+        assert!(!integrity_mismatch.is_retriable());
+
+        let deserialization_failed = BrokerError::ContextPackDeserializationFailed {
+            reason: "invalid json".to_string(),
+        };
+        assert_eq!(
+            deserialization_failed.kind(),
+            "context_pack_deserialization_failed"
+        );
+        assert!(deserialization_failed.should_emit_review_blocked());
+        assert!(!deserialization_failed.is_retriable());
     }
 }

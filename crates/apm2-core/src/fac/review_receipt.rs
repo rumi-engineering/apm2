@@ -59,6 +59,8 @@
 //!     bundle_hash,
 //!     [0x44; 32], // time_envelope_ref
 //!     "reviewer-001".to_string(),
+//!     Some([0x55; 32]), // capability_manifest_hash (TCK-00326, optional)
+//!     Some([0x66; 32]), // context_pack_hash (TCK-00326, optional)
 //!     &signer,
 //! )
 //! .expect("valid event");
@@ -687,6 +689,30 @@ pub struct ReviewReceiptRecorded {
     /// domain.
     #[serde(with = "serde_bytes")]
     pub reviewer_signature: [u8; 64],
+    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, TCK-00326).
+    /// Binds the receipt to the authority under which the review was performed.
+    ///
+    /// This field is `Option` for backward compatibility with events created
+    /// before TCK-00326. When `None`, it is not included in `canonical_bytes()`
+    /// to preserve signature verification for historical events.
+    #[serde(
+        with = "crate::fac::serde_helpers::option_hash32",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capability_manifest_hash: Option<[u8; 32]>,
+    /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (32 bytes,
+    /// TCK-00326). Binds the receipt to the context firewall configuration.
+    ///
+    /// This field is `Option` for backward compatibility with events created
+    /// before TCK-00326. When `None`, it is not included in `canonical_bytes()`
+    /// to preserve signature verification for historical events.
+    #[serde(
+        with = "crate::fac::serde_helpers::option_hash32",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_pack_hash: Option<[u8; 32]>,
 }
 
 impl ReviewReceiptRecorded {
@@ -699,17 +725,24 @@ impl ReviewReceiptRecorded {
     /// * `artifact_bundle_hash` - CAS hash of `ReviewArtifactBundleV1`
     /// * `time_envelope_ref` - HTF time envelope reference hash
     /// * `reviewer_actor_id` - ID of the reviewing actor
+    /// * `capability_manifest_hash` - Hash of the `CapabilityManifest` in
+    ///   effect (optional for backward compatibility)
+    /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in
+    ///   effect (optional for backward compatibility)
     /// * `signer` - Signer to authorize the event
     ///
     /// # Errors
     ///
     /// Returns error if any string field exceeds maximum length.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         receipt_id: String,
         changeset_digest: [u8; 32],
         artifact_bundle_hash: [u8; 32],
         time_envelope_ref: [u8; 32],
         reviewer_actor_id: String,
+        capability_manifest_hash: Option<[u8; 32]>,
+        context_pack_hash: Option<[u8; 32]>,
         signer: &Signer,
     ) -> Result<Self, ReviewReceiptError> {
         // Validate inputs
@@ -742,6 +775,8 @@ impl ReviewReceiptRecorded {
             time_envelope_ref,
             reviewer_actor_id,
             reviewer_signature: [0u8; 64],
+            capability_manifest_hash,
+            context_pack_hash,
         };
 
         // Sign
@@ -757,12 +792,15 @@ impl ReviewReceiptRecorded {
     /// # Errors
     ///
     /// Returns error if any string field exceeds maximum length.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_envelope(
         receipt_id: String,
         changeset_digest: [u8; 32],
         artifact_bundle_hash: [u8; 32],
         envelope_ref: &TimeEnvelopeRef,
         reviewer_actor_id: String,
+        capability_manifest_hash: Option<[u8; 32]>,
+        context_pack_hash: Option<[u8; 32]>,
         signer: &Signer,
     ) -> Result<Self, ReviewReceiptError> {
         let time_envelope_ref: [u8; 32] = *envelope_ref.as_bytes();
@@ -772,6 +810,8 @@ impl ReviewReceiptRecorded {
             artifact_bundle_hash,
             time_envelope_ref,
             reviewer_actor_id,
+            capability_manifest_hash,
+            context_pack_hash,
             signer,
         )
     }
@@ -784,6 +824,14 @@ impl ReviewReceiptRecorded {
     /// - `artifact_bundle_hash` (32 bytes)
     /// - `time_envelope_ref` (32 bytes)
     /// - `reviewer_actor_id` (len + bytes)
+    /// - `capability_manifest_hash` (32 bytes, TCK-00326, only if present)
+    /// - `context_pack_hash` (32 bytes, TCK-00326, only if present)
+    ///
+    /// # Backward Compatibility
+    ///
+    /// The `capability_manifest_hash` and `context_pack_hash` fields are only
+    /// included in the canonical encoding when they are `Some`. This preserves
+    /// signature verification for historical events created before TCK-00326.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -805,6 +853,16 @@ impl ReviewReceiptRecorded {
         // 5. reviewer_actor_id
         bytes.extend_from_slice(&(self.reviewer_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.reviewer_actor_id.as_bytes());
+
+        // 6. capability_manifest_hash (TCK-00326, only if present for backward compat)
+        if let Some(ref hash) = self.capability_manifest_hash {
+            bytes.extend_from_slice(hash);
+        }
+
+        // 7. context_pack_hash (TCK-00326, only if present for backward compat)
+        if let Some(ref hash) = self.context_pack_hash {
+            bytes.extend_from_slice(hash);
+        }
 
         bytes
     }
@@ -841,6 +899,8 @@ pub struct ReviewReceiptRecordedBuilder {
     artifact_bundle_hash: Option<[u8; 32]>,
     time_envelope_ref: Option<[u8; 32]>,
     reviewer_actor_id: Option<String>,
+    capability_manifest_hash: Option<[u8; 32]>,
+    context_pack_hash: Option<[u8; 32]>,
 }
 
 #[allow(clippy::missing_const_for_fn)]
@@ -893,11 +953,31 @@ impl ReviewReceiptRecordedBuilder {
         self
     }
 
+    /// Sets the capability manifest hash (TCK-00326).
+    #[must_use]
+    pub fn capability_manifest_hash(mut self, hash: [u8; 32]) -> Self {
+        self.capability_manifest_hash = Some(hash);
+        self
+    }
+
+    /// Sets the context pack hash (TCK-00326).
+    #[must_use]
+    pub fn context_pack_hash(mut self, hash: [u8; 32]) -> Self {
+        self.context_pack_hash = Some(hash);
+        self
+    }
+
     /// Builds the event and signs it.
     ///
     /// # Errors
     ///
     /// Returns error if required fields are missing or validation fails.
+    ///
+    /// # Note
+    ///
+    /// The `capability_manifest_hash` and `context_pack_hash` fields are
+    /// optional for backward compatibility with events created before
+    /// TCK-00326.
     pub fn build_and_sign(
         self,
         signer: &Signer,
@@ -917,6 +997,9 @@ impl ReviewReceiptRecordedBuilder {
         let reviewer_actor_id = self
             .reviewer_actor_id
             .ok_or(ReviewReceiptError::MissingField("reviewer_actor_id"))?;
+        // These are optional for backward compatibility (TCK-00326)
+        let capability_manifest_hash = self.capability_manifest_hash;
+        let context_pack_hash = self.context_pack_hash;
 
         ReviewReceiptRecorded::create(
             receipt_id,
@@ -924,6 +1007,8 @@ impl ReviewReceiptRecordedBuilder {
             artifact_bundle_hash,
             time_envelope_ref,
             reviewer_actor_id,
+            capability_manifest_hash,
+            context_pack_hash,
             signer,
         )
     }
@@ -982,6 +1067,32 @@ impl TryFrom<ReviewReceiptRecordedProto> for ReviewReceiptRecorded {
             ReviewReceiptError::InvalidData("reviewer_signature must be 64 bytes".into())
         })?;
 
+        // TCK-00326: Parse capability_manifest_hash and context_pack_hash
+        // Map empty or all-zero fields to None for backward compatibility.
+        // This ensures signature verification succeeds for historical events.
+        let capability_manifest_hash: Option<[u8; 32]> = if proto
+            .capability_manifest_hash
+            .is_empty()
+        {
+            None
+        } else {
+            let hash: [u8; 32] = proto.capability_manifest_hash.try_into().map_err(|_| {
+                ReviewReceiptError::InvalidData("capability_manifest_hash must be 32 bytes".into())
+            })?;
+            // Treat all-zeros as absent (backward compat)
+            if hash == [0u8; 32] { None } else { Some(hash) }
+        };
+
+        let context_pack_hash: Option<[u8; 32]> = if proto.context_pack_hash.is_empty() {
+            None
+        } else {
+            let hash: [u8; 32] = proto.context_pack_hash.try_into().map_err(|_| {
+                ReviewReceiptError::InvalidData("context_pack_hash must be 32 bytes".into())
+            })?;
+            // Treat all-zeros as absent (backward compat)
+            if hash == [0u8; 32] { None } else { Some(hash) }
+        };
+
         Ok(Self {
             receipt_id: proto.receipt_id,
             changeset_digest,
@@ -989,6 +1100,8 @@ impl TryFrom<ReviewReceiptRecordedProto> for ReviewReceiptRecorded {
             time_envelope_ref,
             reviewer_actor_id: proto.reviewer_actor_id,
             reviewer_signature,
+            capability_manifest_hash,
+            context_pack_hash,
         })
     }
 }
@@ -1007,6 +1120,13 @@ impl From<ReviewReceiptRecorded> for ReviewReceiptRecordedProto {
             }),
             reviewer_actor_id: event.reviewer_actor_id,
             reviewer_signature: event.reviewer_signature.to_vec(),
+            // TCK-00326: Authority binding fields (empty Vec if None)
+            capability_manifest_hash: event
+                .capability_manifest_hash
+                .map_or_else(Vec::new, |h| h.to_vec()),
+            context_pack_hash: event
+                .context_pack_hash
+                .map_or_else(Vec::new, |h| h.to_vec()),
         }
     }
 }
@@ -1155,6 +1275,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -1172,6 +1294,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -1192,10 +1316,14 @@ mod tests {
             .artifact_bundle_hash([0x22; 32])
             .time_envelope_ref([0x33; 32])
             .reviewer_actor_id("reviewer-002")
+            .capability_manifest_hash([0x55; 32]) // TCK-00326
+            .context_pack_hash([0x66; 32])        // TCK-00326
             .build_and_sign(&signer)
             .expect("valid event");
 
         assert_eq!(event.receipt_id, "RR-002");
+        assert_eq!(event.capability_manifest_hash, Some([0x55; 32]));
+        assert_eq!(event.context_pack_hash, Some([0x66; 32]));
         assert!(event.verify_signature(&signer.verifying_key()).is_ok());
     }
 
@@ -1209,6 +1337,8 @@ mod tests {
             .artifact_bundle_hash([0x22; 32])
             .time_envelope_ref([0x33; 32])
             .reviewer_actor_id("reviewer-002")
+            .capability_manifest_hash([0x55; 32])
+            .context_pack_hash([0x66; 32])
             .build_and_sign(&signer);
         assert!(matches!(
             result,
@@ -1221,11 +1351,28 @@ mod tests {
             .changeset_digest([0x11; 32])
             .time_envelope_ref([0x33; 32])
             .reviewer_actor_id("reviewer-002")
+            .capability_manifest_hash([0x55; 32])
+            .context_pack_hash([0x66; 32])
             .build_and_sign(&signer);
         assert!(matches!(
             result,
             Err(ReviewReceiptError::MissingField("artifact_bundle_hash"))
         ));
+
+        // capability_manifest_hash and context_pack_hash are now optional for backward
+        // compat so they should NOT cause MissingField errors
+        let result = ReviewReceiptRecordedBuilder::new()
+            .receipt_id("RR-002")
+            .changeset_digest([0x11; 32])
+            .artifact_bundle_hash([0x22; 32])
+            .time_envelope_ref([0x33; 32])
+            .reviewer_actor_id("reviewer-002")
+            // No capability_manifest_hash or context_pack_hash
+            .build_and_sign(&signer);
+        assert!(result.is_ok());
+        let event = result.unwrap();
+        assert!(event.capability_manifest_hash.is_none());
+        assert!(event.context_pack_hash.is_none());
     }
 
     #[test]
@@ -1239,6 +1386,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         );
 
@@ -1260,6 +1409,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -1270,6 +1421,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -1291,6 +1444,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -1301,6 +1456,80 @@ mod tests {
         // Should fail with mismatched digest
         let wrong_digest = [0xFF; 32];
         assert!(validate_changeset_binding(&event, &wrong_digest).is_err());
+    }
+
+    #[test]
+    fn test_authority_binding_fields_in_receipt_signature() {
+        // TCK-00326: Verify that capability_manifest_hash and context_pack_hash
+        // are included in the signature
+        let signer = Signer::generate();
+        let event1 = ReviewReceiptRecorded::create(
+            "RR-001".to_string(),
+            [0x42; 32],
+            [0x33; 32],
+            [0x44; 32],
+            "reviewer-001".to_string(),
+            Some([0x55; 32]), // capability_manifest_hash
+            Some([0x66; 32]), // context_pack_hash
+            &signer,
+        )
+        .expect("valid event");
+
+        let event2 = ReviewReceiptRecorded::create(
+            "RR-001".to_string(),
+            [0x42; 32],
+            [0x33; 32],
+            [0x44; 32],
+            "reviewer-001".to_string(),
+            Some([0xAA; 32]), // Different capability_manifest_hash
+            Some([0x66; 32]), // Same context_pack_hash
+            &signer,
+        )
+        .expect("valid event");
+
+        // Different authority binding produces different canonical bytes and signature
+        assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
+        assert_ne!(event1.reviewer_signature, event2.reviewer_signature);
+    }
+
+    #[test]
+    fn test_backward_compat_none_fields() {
+        // TCK-00326: Events without capability_manifest_hash/context_pack_hash
+        // should have shorter canonical bytes and verify correctly
+        let signer = Signer::generate();
+        let event_with = ReviewReceiptRecorded::create(
+            "RR-001".to_string(),
+            [0x42; 32],
+            [0x33; 32],
+            [0x44; 32],
+            "reviewer-001".to_string(),
+            Some([0x55; 32]),
+            Some([0x66; 32]),
+            &signer,
+        )
+        .expect("valid event");
+
+        let event_without = ReviewReceiptRecorded::create(
+            "RR-001".to_string(),
+            [0x42; 32],
+            [0x33; 32],
+            [0x44; 32],
+            "reviewer-001".to_string(),
+            None,
+            None,
+            &signer,
+        )
+        .expect("valid event");
+
+        // Events without optional fields have shorter canonical bytes
+        assert!(event_without.canonical_bytes().len() < event_with.canonical_bytes().len());
+        // Both should verify correctly
+        assert!(event_with.verify_signature(&signer.verifying_key()).is_ok());
+        assert!(
+            event_without
+                .verify_signature(&signer.verifying_key())
+                .is_ok()
+        );
     }
 
     #[test]
