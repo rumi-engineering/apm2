@@ -270,6 +270,76 @@
             "normative": false,
             "purpose": "Evidence-backed defect records feeding improvement loops.",
             "schema_id": "cac.defect_record.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.agents_index_document",
+            "normative": true,
+            "purpose": "Machine-readable index of APM2 security documents and trust boundary notes.",
+            "schema_id": "apm2.security.agents_index_doc.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.policy_document",
+            "normative": true,
+            "purpose": "Normative security policy controls, invariants, and enforcement posture.",
+            "schema_id": "apm2.security.policy_doc.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.threat_model_document",
+            "normative": true,
+            "purpose": "Threat assumptions, attack classes, and defense expectations.",
+            "schema_id": "apm2.security.threat_model_doc.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.incident_response_document",
+            "normative": true,
+            "purpose": "Incident severity model, containment targets, playbooks, and evidence handling.",
+            "schema_id": "apm2.security.incident_response_doc.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.checklist_document",
+            "normative": true,
+            "purpose": "Operational security checklist controls for merge and release gates.",
+            "schema_id": "apm2.security.checklist_doc.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.secrets_management_document",
+            "normative": true,
+            "purpose": "Secret custody, rotation, and disclosure controls.",
+            "schema_id": "apm2.security.secrets_management_doc.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.threat_matrix",
+            "normative": true,
+            "purpose": "Network and distributed threat matrix mapped to security controls.",
+            "schema_id": "apm2.security.network_defense_matrix.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.signing_verification_document",
+            "normative": true,
+            "purpose": "Release signing and verification controls for supply-chain integrity.",
+            "schema_id": "apm2.security.signing_verification_doc.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.release_procedure_document",
+            "normative": true,
+            "purpose": "High-assurance release workflow with security gates and incident hooks.",
+            "schema_id": "apm2.security.release_procedure_doc.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "security.consensus_runbook_document",
+            "normative": true,
+            "purpose": "Consensus-layer incident, continuity, and recovery runbook with stop-path SLOs.",
+            "schema_id": "apm2.security.consensus_runbook_doc.v1"
           }
         ],
         "notes": [

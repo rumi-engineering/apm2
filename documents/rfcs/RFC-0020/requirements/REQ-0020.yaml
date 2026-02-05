@@ -1,0 +1,23 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0020"
+  title: "Optional VDF delay profile correctness"
+  category: "SECURITY"
+  priority: "P2"
+  status: "PROPOSED"
+  statement: |
+    When enabled, VDF profiles MUST derive deterministic challenges from cell_id, prior_epoch_root, and quorum_anchor and produce verifiable outputs bound into epoch seals.
+
+    Primary delivery ticket: TCK-00366
+  rationale: |
+    Optional delay hardening must remain deterministic and non-disruptive while increasing adversarial cost.
+  acceptance_criteria:
+    - "VDF profile can be enabled per-link/per-cell policy"
+    - "Forged/non-monotone VDF evidence is rejected deterministically"
+    - "Epoch seal verification remains bounded when VDF is enabled"
+    - "Primary implementation ticket TCK-00366 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0020"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.9"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 7.5"

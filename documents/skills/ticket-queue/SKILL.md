@@ -41,7 +41,7 @@ references[11]:
     purpose: "LAW-01: Loop Closure & Gated Promotion"
   - path: "@documents/theory/laws.json"
     purpose: "LAW-02: Observable Context Sufficiency"
-  - path: "@documents/security/AGENTS.md"
+  - path: "@documents/security/AGENTS.cac.json"
     purpose: "Security Documentation"
 
 decision_tree:

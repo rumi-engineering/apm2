@@ -74,7 +74,7 @@ fn escape_for_single_quote(s: &str) -> String {
 
 /// Builds a script command for PTY-wrapped execution.
 ///
-/// The `script` command allocates a pseudo-TTY which gives Gemini access to
+/// The `script` command allocates a pseudo-TTY which gives Codex access to
 /// all tools (including `run_shell_command`). Without PTY allocation, headless
 /// mode filters out shell tools causing "Tool not found in registry" errors.
 ///
@@ -93,12 +93,18 @@ fn escape_for_single_quote(s: &str) -> String {
 ///
 /// With log capture (for health monitoring):
 /// ```text
-/// script -q '<log_path>' -c 'gemini --model <model> --yolo < '\''<prompt_path>'\'''
+/// # macOS:
+/// script -q '<log_path>' sh -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
+/// # Linux:
+/// script -q '<log_path>' -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
 /// ```
 ///
 /// Without log capture (synchronous reviews):
 /// ```text
-/// script -qec 'gemini --model <model> --yolo < '\''<prompt_path>'\''' /dev/null
+/// # macOS:
+/// script -q /dev/null sh -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
+/// # Linux:
+/// script -qec 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\''' /dev/null
 /// ```
 ///
 /// # Example
@@ -108,9 +114,9 @@ fn escape_for_single_quote(s: &str) -> String {
 /// use xtask::shell_escape::build_script_command;
 ///
 /// // Without log capture
-/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), None, Some("gemini-1.5-pro"));
+/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), None, Some("gpt-5.3-codex"));
 /// assert!(cmd.contains("script -qec"));
-/// assert!(cmd.contains("--model gemini-1.5-pro"));
+/// assert!(cmd.contains("--model gpt-5.3-codex"));
 ///
 /// // With log capture
 /// let log_path = Path::new("/tmp/review.log");
@@ -127,14 +133,28 @@ pub fn build_script_command(
         let escaped_m = escape_for_single_quote(m);
         format!("--model {escaped_m} ")
     });
-    let inner_cmd = format!("gemini {model_flag}--yolo < {quoted_prompt}");
+    let inner_cmd = format!(
+        "codex exec {model_flag}--dangerously-bypass-approvals-and-sandbox < {quoted_prompt}"
+    );
     let escaped_inner = escape_for_single_quote(&inner_cmd);
 
+    // macOS `script` uses: script -q file command [args...]
+    // Linux `script` uses: script -qec 'command' file
     log_path.map_or_else(
-        || format!("script -qec '{escaped_inner}' /dev/null"),
+        || {
+            if cfg!(target_os = "macos") {
+                format!("script -q /dev/null sh -c '{escaped_inner}'")
+            } else {
+                format!("script -qec '{escaped_inner}' /dev/null")
+            }
+        },
         |log| {
             let quoted_log = quote_path(log);
-            format!("script -q {quoted_log} -c '{escaped_inner}'")
+            if cfg!(target_os = "macos") {
+                format!("script -q {quoted_log} sh -c '{escaped_inner}'")
+            } else {
+                format!("script -q {quoted_log} -c '{escaped_inner}'")
+            }
         },
     )
 }
@@ -157,12 +177,15 @@ pub fn build_script_command(
 ///
 /// # Returns
 ///
-/// A shell command string that runs Gemini with log capture.
+/// A shell command string that runs Codex with log capture.
 ///
 /// # Format
 ///
 /// ```text
-/// script -q '<log_path>' -c 'gemini --model <model> --yolo < '\''<prompt_path>'\'''
+/// # macOS:
+/// script -q '<log_path>' sh -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
+/// # Linux:
+/// script -q '<log_path>' -c 'codex exec --model <model> --dangerously-bypass-approvals-and-sandbox < '\''<prompt_path>'\'''
 /// ```
 pub fn build_script_command_with_cleanup(
     prompt_path: &Path,
@@ -321,22 +344,22 @@ mod tests {
         let prompt = Path::new("/tmp/prompt.txt");
         let cmd = build_script_command(prompt, None, None);
 
-        // Verify command structure
+        // Verify command structure (platform-dependent)
         assert!(
-            cmd.contains("script -qec"),
-            "Command without log should use script -qec: {cmd}"
+            cmd.contains("script -q"),
+            "Command without log should use script -q: {cmd}"
         );
         assert!(
-            cmd.contains("gemini"),
-            "Command should invoke gemini: {cmd}"
+            cmd.contains("codex exec"),
+            "Command should invoke codex exec: {cmd}"
         );
         assert!(
-            cmd.contains("--yolo"),
-            "Command should include --yolo flag: {cmd}"
+            cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "Command should include non-interactive bypass flag: {cmd}"
         );
         assert!(
-            cmd.ends_with("/dev/null"),
-            "Command without log should redirect to /dev/null: {cmd}"
+            cmd.contains("/dev/null"),
+            "Command without log should reference /dev/null: {cmd}"
         );
         assert!(
             cmd.contains("< "),
@@ -356,16 +379,12 @@ mod tests {
             "Command with log should use script -q: {cmd}"
         );
         assert!(
-            !cmd.contains("-qec"),
-            "Command with log should not use -qec (uses -q ... -c): {cmd}"
+            cmd.contains("sh -c '") || cmd.contains("-c '"),
+            "Command with log should invoke shell with single quotes: {cmd}"
         );
         assert!(
-            cmd.contains("-c '"),
-            "Command with log should use -c flag with single quotes: {cmd}"
-        );
-        assert!(
-            cmd.contains("gemini"),
-            "Command should invoke gemini: {cmd}"
+            cmd.contains("codex exec"),
+            "Command should invoke codex exec: {cmd}"
         );
         assert!(
             !cmd.ends_with("/dev/null"),
@@ -376,11 +395,11 @@ mod tests {
     #[test]
     fn test_build_script_command_with_model() {
         let prompt = Path::new("/tmp/prompt.txt");
-        let model = "gemini-3-flash-preview";
+        let model = "gpt-5.3-codex";
         let cmd = build_script_command(prompt, None, Some(model));
 
         assert!(
-            cmd.contains("--model gemini-3-flash-preview"),
+            cmd.contains("--model gpt-5.3-codex"),
             "Command should include --model flag: {cmd}"
         );
     }
@@ -433,8 +452,8 @@ mod tests {
             "Command should use script -q: {cmd}"
         );
         assert!(
-            cmd.contains("gemini"),
-            "Command should invoke gemini: {cmd}"
+            cmd.contains("codex exec"),
+            "Command should invoke codex exec: {cmd}"
         );
         // Note: rm -f is no longer used - cleanup is handled via state tracking
         assert!(
@@ -491,16 +510,28 @@ mod tests {
     fn test_command_format_matches_expected_pattern() {
         // Test that the generated commands match the documented patterns
 
-        // Without log: script -qec 'gemini --yolo < '\''<prompt_path>'\''' /dev/null
+        // Without log:
+        //   - Linux: script -qec 'codex exec ...' /dev/null
+        //   - macOS: script -q /dev/null sh -c 'codex exec ...'
         let prompt = Path::new("/tmp/simple.txt");
         let cmd = build_script_command(prompt, None, None);
-        assert!(cmd.starts_with("script -qec"));
-        assert!(cmd.ends_with("/dev/null"));
+        if cfg!(target_os = "macos") {
+            assert!(cmd.starts_with("script -q /dev/null sh -c '"));
+        } else {
+            assert!(cmd.starts_with("script -qec"));
+            assert!(cmd.ends_with("/dev/null"));
+        }
 
-        // With log: script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''
+        // With log:
+        //   - Linux: script -q '<log_path>' -c 'codex exec ...'
+        //   - macOS: script -q '<log_path>' sh -c 'codex exec ...'
         let log = Path::new("/tmp/log.txt");
         let cmd = build_script_command(prompt, Some(log), None);
         assert!(cmd.starts_with("script -q"));
-        assert!(cmd.contains("-c 'gemini"));
+        if cfg!(target_os = "macos") {
+            assert!(cmd.contains("sh -c 'codex exec"));
+        } else {
+            assert!(cmd.contains("-c 'codex exec"));
+        }
     }
 }

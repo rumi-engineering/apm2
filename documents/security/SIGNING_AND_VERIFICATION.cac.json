@@ -1,0 +1,152 @@
+{
+  "schema": "apm2.security.signing_verification_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "security.signing_verification_document",
+  "meta": {
+    "stable_id": "dcp://apm2.security/doc/signing-and-verification@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "source_of_truth_refs": [
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/security/SECURITY_POLICY.cac.json"
+    ],
+    "last_aligned_rfc": "RFC-0020",
+    "replaces": "documents/security/SIGNING_AND_VERIFICATION.md",
+    "created_at": "2026-02-05T00:00:00Z",
+    "updated_at": "2026-02-05T00:00:00Z",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-SECURITY-GOVERNANCE",
+      "work_id": "DOC-SECURITY-RFC0020-ALIGN-20260205",
+      "source_receipts": []
+    }
+  },
+  "payload": {
+    "title": "Signing and Verification",
+    "scope_boundary": {
+      "document_scope": "Release artifact signing and verification integrity model.",
+      "runtime_boundary_note": "Runtime and inter-holon fact authentication uses RFC-0020 identity proofs, freshness policy, and signature or authority-seal validation; CI signing certs are not runtime authority proofs."
+    },
+    "objectives": [
+      "Provide strong authenticity and provenance without long-lived signing keys.",
+      "Make released artifacts independently verifiable by downstream consumers.",
+      "Bind signatures to CI workload identity rather than manual key custody."
+    ],
+    "trust_chain": [
+      {
+        "stage_id": "SIG-STAGE-01",
+        "name": "OIDC Identity Acquisition",
+        "description": "GitHub Actions obtains an OIDC token representing workflow identity and execution context."
+      },
+      {
+        "stage_id": "SIG-STAGE-02",
+        "name": "Fulcio Certificate Issuance",
+        "description": "OIDC token is exchanged with Fulcio for a short-lived signing certificate bound to workflow identity."
+      },
+      {
+        "stage_id": "SIG-STAGE-03",
+        "name": "Cosign Ephemeral Signing",
+        "description": "Cosign signs artifact digests using ephemeral keys bound to issued certificate identity."
+      },
+      {
+        "stage_id": "SIG-STAGE-04",
+        "name": "Transparency Logging",
+        "description": "Signing events are recorded in Rekor for append-only auditability and non-repudiation support."
+      }
+    ],
+    "workflow_permissions": [
+      {
+        "name": "id-token: write",
+        "required": true,
+        "purpose": "OIDC token minting for keyless certificate issuance."
+      },
+      {
+        "name": "contents: write",
+        "required": true,
+        "purpose": "Publish release assets including signatures and certificates."
+      },
+      {
+        "name": "attestations: write",
+        "required": true,
+        "purpose": "Generate and publish provenance attestations."
+      }
+    ],
+    "signing_profiles": [
+      {
+        "profile_id": "SIG-PROFILE-BLOB",
+        "artifact_type": "binary_blob",
+        "sign_command": "cosign sign-blob",
+        "outputs": [
+          ".sig",
+          ".pem"
+        ]
+      },
+      {
+        "profile_id": "SIG-PROFILE-IMAGE",
+        "artifact_type": "container_image",
+        "sign_command": "cosign sign",
+        "outputs": [
+          "registry_signature"
+        ]
+      }
+    ],
+    "verification_requirements": {
+      "binary_verification_command": "cosign verify-blob",
+      "image_verification_command": "cosign verify",
+      "oidc_issuer_constraint": "https://token.actions.githubusercontent.com",
+      "certificate_identity_constraint": "must constrain signatures to expected repository and workflow identity (regex/policy-bound)",
+      "identity_policy_notes": [
+        "Identity-constrained verification prevents accepting signatures from unrelated repositories and workflows.",
+        "Signed alone is insufficient; the signer identity must match intended release workflow identity."
+      ]
+    },
+    "provenance_requirements": [
+      "SLSA provenance verification is required in addition to signature verification.",
+      "Provenance must prove artifact origin from expected repository and build pipeline.",
+      "Signatures establish integrity and signer identity, while provenance establishes build-origin claims."
+    ],
+    "terminology": {
+      "attestation_definition": "Attestation refers to build and release provenance and workload identity claims.",
+      "runtime_fact_authentication_definition": "Runtime authoritative facts are authenticated by direct signatures or authority seals over Merkle roots with RFC-0020 trust and freshness semantics."
+    },
+    "transparency_and_audit": [
+      "Rekor transparency log entries are part of release integrity and forensic workflows.",
+      "Transparency allows third parties to correlate published artifacts with recorded signing events.",
+      "Verification policies should inspect issuer, subject identity, repository, ref, and workflow SHA constraints in Fulcio certificates."
+    ],
+    "failure_modes": [
+      {
+        "condition": "Expired signing certificate",
+        "interpretation": "Expected for short-lived keyless certs; validity is evaluated with transparency evidence.",
+        "response": "Validate Rekor inclusion and event integrity instead of expecting long-lived cert validity."
+      },
+      {
+        "condition": "Identity mismatch",
+        "interpretation": "Policy constraints do not match repo, workflow, or ref assumptions.",
+        "response": "Treat as non-compliant artifact and correct identity constraints or workflow configuration."
+      },
+      {
+        "condition": "Missing transparency entry",
+        "interpretation": "Possible signing misconfiguration or policy violation.",
+        "response": "Fail closed for release acceptance and investigate CI signing path."
+      }
+    ],
+    "scale_profile": {
+      "capacity_target": "multi-exabyte",
+      "verification_cost_controls": [
+        "Use digest-addressed verification and provenance references rather than raw payload duplication.",
+        "Apply policy-driven issuer and identity filtering before deep verification to constrain verifier work.",
+        "Use transparency-log and provenance indexes to support high-volume, auditable verification workflows."
+      ]
+    },
+    "cryptography_posture": {
+      "long_lived_private_keys": "REJECTED_BY_DESIGN",
+      "pqc_status": "DEFERRED",
+      "pqc_note": "PQC migration is deferred; current release integrity model remains Sigstore keyless with transparency-backed verification."
+    }
+  }
+}

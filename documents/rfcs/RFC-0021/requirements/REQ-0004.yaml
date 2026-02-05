@@ -1,0 +1,19 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0004"
+  title: "Work admission linkage for venture-routed work"
+  category: "INTEGRATION"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Work items sourced from venture signals MUST be admitted through existing FAC-compatible
+    work paths and MUST include provenance links to originating signal and attention decision receipts.
+  rationale: |
+    Maintains a single authoritative work/admission substrate and preserves traceability.
+  acceptance_criteria:
+    - "WorkOpened created with venture provenance fields"
+    - "No venture-routed work bypasses PolicyResolvedForChangeSet ordering"
+    - "Promotion traces resolve to source signal IDs"
+  evidence_ids: ["EVID-0003"]
+  source_refs:
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §5"

@@ -1105,17 +1105,31 @@ fn validate_workspace_root(workspace_root: Option<&str>) -> Result<String, Coord
     // `Path::starts_with("/")` is true for *every* absolute path.
     for blocked in BLOCKED_WORKSPACE_ROOTS {
         let blocked_path = std::path::Path::new(blocked);
-        let is_blocked = if blocked_path == std::path::Path::new("/") {
-            canonical == blocked_path
-        } else {
-            canonical.starts_with(blocked_path)
-        };
-        if is_blocked {
-            return Err(CoordinateCliError::InvalidArgs(format!(
-                "workspace_root '{}' is inside a sensitive system directory ('{}') and cannot be used",
-                canonical.display(),
-                blocked,
-            )));
+        let mut candidates = vec![blocked_path.to_path_buf()];
+
+        // Some platforms canonicalize sensitive roots through aliases
+        // (for example, `/etc` -> `/private/etc` on macOS). Check both the
+        // literal blocked root and its canonicalized form when available.
+        if let Ok(canonical_blocked) = std::fs::canonicalize(blocked_path) {
+            if canonical_blocked != blocked_path {
+                candidates.push(canonical_blocked);
+            }
+        }
+
+        for candidate in candidates {
+            let is_blocked = if candidate == std::path::Path::new("/") {
+                canonical == candidate
+            } else {
+                canonical.starts_with(&candidate)
+            };
+
+            if is_blocked {
+                return Err(CoordinateCliError::InvalidArgs(format!(
+                    "workspace_root '{}' is inside a sensitive system directory ('{}') and cannot be used",
+                    canonical.display(),
+                    blocked,
+                )));
+            }
         }
     }
 

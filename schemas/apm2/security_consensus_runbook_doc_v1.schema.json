@@ -1,0 +1,1041 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/security_consensus_runbook_doc_v1.schema.json",
+  "title": "SecurityConsensusRunbookDocumentV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "meta",
+    "payload"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.security.consensus_runbook_doc.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "kind": {
+      "type": "string",
+      "const": "security.consensus_runbook_document"
+    },
+    "meta": {
+      "type": "object",
+      "required": [
+        "canonicalizer",
+        "classification",
+        "created_at",
+        "source_of_truth_refs",
+        "stable_id",
+        "status"
+      ],
+      "properties": {
+        "stable_id": {
+          "type": "string",
+          "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "DRAFT",
+            "DEPRECATED"
+          ]
+        },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "PUBLIC",
+            "INTERNAL",
+            "CONFIDENTIAL",
+            "RESTRICTED"
+          ]
+        },
+        "source_of_truth_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "replaces": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "last_aligned_rfc": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "canonicalizer": {
+          "type": "object",
+          "required": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "properties": {
+            "canonicalizer_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "canonicalizer_version": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+            },
+            "vectors_ref": {
+              "type": "string",
+              "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "provenance": {
+          "type": "object",
+          "properties": {
+            "actor_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "work_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "source_receipts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "title",
+        "purpose",
+        "rfc_references",
+        "ticket_id",
+        "architecture",
+        "normal_operating_parameters",
+        "alerts",
+        "diagnostic_command_sets",
+        "recovery_procedures",
+        "escalation_paths",
+        "anti_entropy_budget_controls",
+        "continuity_objectives",
+        "stop_path_slos",
+        "scale_profile",
+        "cryptography_posture"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "const": "APM2 Consensus Layer Operations Runbook"
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "rfc_references": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "ticket_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "architecture": {
+          "type": "object",
+          "required": [
+            "planes",
+            "security_invariants",
+            "components"
+          ],
+          "properties": {
+            "planes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/plane"
+              }
+            },
+            "security_invariants": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            },
+            "components": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/component"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "normal_operating_parameters": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/metric_threshold"
+          }
+        },
+        "alerts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/alert"
+          }
+        },
+        "diagnostic_command_sets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/command_set"
+          }
+        },
+        "recovery_procedures": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/recovery_procedure"
+          }
+        },
+        "escalation_paths": {
+          "type": "object",
+          "required": [
+            "severity_matrix",
+            "contacts",
+            "communication_templates"
+          ],
+          "properties": {
+            "severity_matrix": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/severity_matrix_item"
+              }
+            },
+            "contacts": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/contact"
+              }
+            },
+            "communication_templates": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/template"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "anti_entropy_budget_controls": {
+          "$ref": "#/$defs/anti_entropy_budget_controls"
+        },
+        "continuity_objectives": {
+          "$ref": "#/$defs/continuity_objectives"
+        },
+        "stop_path_slos": {
+          "$ref": "#/$defs/stop_path_slos"
+        },
+        "scale_profile": {
+          "type": "object",
+          "required": [
+            "capacity_target",
+            "verification_economics",
+            "anti_entropy_bounds"
+          ],
+          "properties": {
+            "capacity_target": {
+              "type": "string",
+              "const": "multi-exabyte"
+            },
+            "verification_economics": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            },
+            "anti_entropy_bounds": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "cryptography_posture": {
+          "type": "object",
+          "required": [
+            "pqc_status",
+            "pqc_note"
+          ],
+          "properties": {
+            "pqc_status": {
+              "type": "string",
+              "const": "DEFERRED"
+            },
+            "pqc_note": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "plane": {
+      "type": "object",
+      "required": [
+        "name",
+        "description"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "additionalProperties": false
+    },
+    "component": {
+      "type": "object",
+      "required": [
+        "name",
+        "description",
+        "metrics_prefix"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "metrics_prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      },
+      "additionalProperties": false
+    },
+    "metric_threshold": {
+      "type": "object",
+      "required": [
+        "metric",
+        "target",
+        "warning",
+        "critical"
+      ],
+      "properties": {
+        "metric": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "target": {
+          "$ref": "#/$defs/threshold_rule"
+        },
+        "warning": {
+          "$ref": "#/$defs/threshold_rule"
+        },
+        "critical": {
+          "$ref": "#/$defs/threshold_rule"
+        }
+      },
+      "additionalProperties": false
+    },
+    "threshold_rule": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/numeric_threshold_rule"
+        },
+        {
+          "$ref": "#/$defs/symbolic_threshold_rule"
+        }
+      ]
+    },
+    "numeric_threshold_rule": {
+      "type": "object",
+      "required": [
+        "rule_type",
+        "operator",
+        "value",
+        "unit"
+      ],
+      "properties": {
+        "rule_type": {
+          "type": "string",
+          "const": "NUMERIC"
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "LT",
+            "LTE",
+            "GT",
+            "GTE",
+            "EQ"
+          ]
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unit": {
+          "type": "string",
+          "enum": [
+            "milliseconds",
+            "events_per_minute",
+            "events_per_hour",
+            "percent"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "symbolic_threshold_rule": {
+      "type": "object",
+      "required": [
+        "rule_type",
+        "operator",
+        "expression",
+        "variables"
+      ],
+      "properties": {
+        "rule_type": {
+          "type": "string",
+          "const": "SYMBOLIC"
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            "LT",
+            "LTE",
+            "GT",
+            "GTE",
+            "EQ"
+          ]
+        },
+        "expression": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "variables": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z_][a-z0-9_]*$"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "time_target": {
+      "type": "object",
+      "required": [
+        "target_type",
+        "max_duration_ms"
+      ],
+      "properties": {
+        "target_type": {
+          "type": "string",
+          "enum": [
+            "IMMEDIATE",
+            "WITHIN"
+          ]
+        },
+        "max_duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31536000000
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "target_type": {
+                "const": "IMMEDIATE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "max_duration_ms": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "anti_entropy_budget_controls": {
+      "type": "object",
+      "required": [
+        "requirement_ref",
+        "delivery_ticket",
+        "pull_only_enforcement",
+        "budget_scopes",
+        "byzantine_resilience_controls",
+        "convergence_guarantees"
+      ],
+      "properties": {
+        "requirement_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "delivery_ticket": {
+          "type": "string",
+          "pattern": "^TCK-[0-9]{5}$"
+        },
+        "pull_only_enforcement": {
+          "type": "boolean",
+          "const": true
+        },
+        "budget_scopes": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "$ref": "#/$defs/budget_scope"
+          }
+        },
+        "byzantine_resilience_controls": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "convergence_guarantees": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "budget_scope": {
+      "type": "object",
+      "required": [
+        "scope",
+        "exceedance_action"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": [
+            "episode",
+            "cell",
+            "relay"
+          ]
+        },
+        "exceedance_action": {
+          "type": "string",
+          "const": "DENY_ACTUATION_AND_EMIT_DEFECT"
+        }
+      },
+      "additionalProperties": false
+    },
+    "continuity_objectives": {
+      "type": "object",
+      "required": [
+        "requirement_ref",
+        "delivery_ticket",
+        "recovery_targets",
+        "drill_scenarios",
+        "drill_receipt_requirements"
+      ],
+      "properties": {
+        "requirement_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "delivery_ticket": {
+          "type": "string",
+          "pattern": "^TCK-[0-9]{5}$"
+        },
+        "recovery_targets": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "$ref": "#/$defs/recovery_target"
+          }
+        },
+        "drill_scenarios": {
+          "type": "array",
+          "minItems": 4,
+          "items": {
+            "type": "string",
+            "enum": [
+              "network_partition_simulation",
+              "ledger_append_latency_injection",
+              "cas_partial_unavailability",
+              "stop_path_degradation"
+            ]
+          }
+        },
+        "drill_receipt_requirements": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "recovery_target": {
+      "type": "object",
+      "required": [
+        "asset",
+        "rto_ms"
+      ],
+      "properties": {
+        "asset": {
+          "type": "string",
+          "enum": [
+            "ledger",
+            "cas",
+            "policy_root_and_tool_mediation"
+          ]
+        },
+        "rpo_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31536000000
+        },
+        "rto_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31536000000
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "asset": {
+                "enum": [
+                  "ledger",
+                  "cas"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "rpo_ms"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "asset": {
+                "const": "policy_root_and_tool_mediation"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "rpo_ms"
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "stop_path_slos": {
+      "type": "object",
+      "required": [
+        "minimum_tier",
+        "requirement_ref",
+        "targets",
+        "violation_actions"
+      ],
+      "properties": {
+        "minimum_tier": {
+          "type": "string",
+          "const": "Tier3"
+        },
+        "requirement_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "targets": {
+          "$ref": "#/$defs/stop_path_targets"
+        },
+        "violation_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "stop_path_targets": {
+      "type": "object",
+      "required": [
+        "stop_propagation_p99_ms",
+        "stop_uncertainty_deny_ms"
+      ],
+      "properties": {
+        "stop_propagation_p99_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000,
+          "const": 2000
+        },
+        "stop_uncertainty_deny_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000,
+          "const": 250
+        }
+      },
+      "additionalProperties": false
+    },
+    "alert": {
+      "type": "object",
+      "required": [
+        "alert_id",
+        "name",
+        "severity",
+        "description",
+        "symptoms",
+        "investigation_steps",
+        "resolution",
+        "escalation"
+      ],
+      "properties": {
+        "alert_id": {
+          "type": "string",
+          "pattern": "^RUNBOOK-ALERT-[0-9]{2}$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "severity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "symptoms": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "investigation_steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/investigation_step"
+          }
+        },
+        "resolution": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "escalation": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "fault_type_response": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fault_response"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "investigation_step": {
+      "type": "object",
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "fault_response": {
+      "type": "object",
+      "required": [
+        "fault_type",
+        "actions"
+      ],
+      "properties": {
+        "fault_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "command_set": {
+      "type": "object",
+      "required": [
+        "set_id",
+        "title",
+        "commands"
+      ],
+      "properties": {
+        "set_id": {
+          "type": "string",
+          "pattern": "^RUNBOOK-CMDSET-[0-9]{2}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "recovery_procedure": {
+      "type": "object",
+      "required": [
+        "procedure_id",
+        "title",
+        "steps"
+      ],
+      "properties": {
+        "procedure_id": {
+          "type": "string",
+          "pattern": "^RUNBOOK-RECOVERY-[0-9]{2}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/investigation_step"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "severity_matrix_item": {
+      "type": "object",
+      "required": [
+        "severity",
+        "response_time",
+        "escalation"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "response_time": {
+          "$ref": "#/$defs/time_target"
+        },
+        "escalation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false
+    },
+    "contact": {
+      "type": "object",
+      "required": [
+        "role",
+        "channel"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "channel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "additionalProperties": false
+    },
+    "template": {
+      "type": "object",
+      "required": [
+        "template_id",
+        "title",
+        "lines"
+      ],
+      "properties": {
+        "template_id": {
+          "type": "string",
+          "pattern": "^RUNBOOK-TPL-[0-9]{2}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "lines": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "unevaluatedProperties": false
+}

@@ -5,7 +5,8 @@
   "meta": {
     "stable_id": "dcp://apm2.agents/laws/bundle@1",
     "classification": "PUBLIC",
-    "created_at": "2026-02-04T22:14:08.895018Z"
+    "created_at": "2026-02-04T22:14:08.895018Z",
+    "source_of_truth_ref": "HOLONIC_SUBSTRATE_INTERFACE.md"
   },
   "payload": {
     "version": "1.0.0",
@@ -130,7 +131,7 @@
         "operationalization": [
           {
             "rule": "Determinism Classes",
-            "desc": "Every contract MUST specify if it is deterministic or probabilistic."
+            "desc": "Every contract MUST declare a determinism class from {Deterministic, ProbabilisticBounded, NonReplayable}; Tier2+ actuation under NonReplayable class requires explicit higher-gate handling and fail-closed policy on ambiguity."
           },
           {
             "rule": "Flakiness Management",
@@ -138,7 +139,7 @@
           },
           {
             "rule": "Binding",
-            "desc": "Authority is never granted to a claim alone; it must be bound to a signed receipt and the underlying raw evidence."
+            "desc": "Authority is never granted to a claim alone; it must be bound to an authenticated receipt (direct signature or authority seal over a batch root) and the underlying raw evidence."
           },
           {
             "rule": "Causal Determinism (HLC)",
@@ -400,11 +401,11 @@
         "operationalization": [
           {
             "rule": "Risk Tiers",
-            "desc": "Define tiers (e.g., T0: Experimental, T1: Internal, T2: Security-Critical)."
+            "desc": "Define four Unified Theory tiers: T0 Experimental, T1 Internal, T2 Production, T3 Security-Critical, with an explicit lossless mapping to daemon-enforced RiskTier values."
           },
           {
             "rule": "Gate Selection",
-            "desc": "Mechanically select required gates based on the tier (e.g., static analysis for T0, full hypothesis-driven AAT for T2)."
+            "desc": "Mechanically select required gates based on tier (e.g., static analysis for T0, unit/integration for T1, stronger replay/stop + verifier gates for T2, strongest security/formal posture for T3)."
           },
           {
             "rule": "Adaptive Enforcement",
@@ -423,7 +424,7 @@
         "operationalization": [
           {
             "rule": "Tamper-Evidence",
-            "desc": "All receipts must be signed and hash-chained."
+            "desc": "All authoritative receipts/facts must be cryptographically authenticated (direct signature or authority seal over a verifiable root) and anchored to replay-safe commitments."
           },
           {
             "rule": "Mandatory Fields",

@@ -519,7 +519,12 @@ impl PtyRunner {
                 // Set slave as controlling terminal
                 // SAFETY: TIOCSCTTY is a valid ioctl for setting controlling terminal
                 unsafe {
-                    if libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
+                    if libc::ioctl(
+                        pty.slave.as_raw_fd(),
+                        libc::c_ulong::from(libc::TIOCSCTTY),
+                        0,
+                    ) < 0
+                    {
                         // Best effort - continue anyway (some systems don't
                         // require this)
                     }

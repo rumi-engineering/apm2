@@ -60,7 +60,7 @@
   - avoid secret-dependent indexing (memory side channels).
   - avoid secret-dependent `if/match` in crypto or auth paths.
   - acknowledge and bound metadata side channels (e.g., telemetry rate limits).
-[PROVENANCE] THREAT_MODEL.md; CTR-WH001.
+[PROVENANCE] documents/security/THREAT_MODEL.cac.json; CTR-WH001.
 [VERIFICATION] Constant-time harness tests; metadata exfiltration rate analysis (e.g., 10 bps limit check).
 
 [CONTRACT: CTR-1907] Complete Audit and Ledger Data (Anti-Information Loss).

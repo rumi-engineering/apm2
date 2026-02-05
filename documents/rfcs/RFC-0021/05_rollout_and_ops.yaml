@@ -1,0 +1,86 @@
+rfc_rollout_and_ops:
+  schema_version: "2026-02-05"
+  template_version: "2026-01-23"
+
+  rollout_stages:
+    - stage_id: "STAGE-0"
+      name: "Schema + passive ingest"
+      goals:
+        - "Implement VentureSignalBundleV1 validation"
+        - "Store validated signals in CAS"
+      promotion_scope: "none"
+      success_predicates:
+        - "signal_validation_pass_ratio >= 0.99"
+
+    - stage_id: "STAGE-1"
+      name: "Shadow attention routing"
+      goals:
+        - "Emit AttentionDecisionReceiptV1 without enforcing route"
+        - "Measure divergence from human/council routing"
+      promotion_scope: "none"
+      success_predicates:
+        - "attention_route_override_rate <= 0.20"
+
+    - stage_id: "STAGE-2"
+      name: "Active A0/A1 routing"
+      goals:
+        - "Enable direct route for low/medium attention tiers"
+      promotion_scope: "Tier0/Tier1"
+      success_predicates:
+        - "signal_to_work_open_tick_p95 within policy budget"
+
+    - stage_id: "STAGE-3"
+      name: "AAT-BIZ enforcement"
+      goals:
+        - "Enforce GATE-AAT-BIZ for strategy-critical work"
+      promotion_scope: "Tier2+ with full gates"
+      success_predicates:
+        - "aat_biz_required_work_coverage == 1.0"
+        - "tier2plus_biz_source_promotions_without_aat_biz == 0"
+
+    - stage_id: "STAGE-4"
+      name: "Strategy coupling closure"
+      goals:
+        - "Bind Tier2+ venture signals to MSC-03, MSC-05, or MSC-06"
+        - "Export claim-linked strategy summaries and receipts"
+      promotion_scope: "Tier2+ with strategy-coupled evidence"
+      success_predicates:
+        - "msc03_linkage_ratio == 1.0"
+        - "msc05_linkage_ratio == 1.0"
+        - "msc06_linkage_ratio == 1.0"
+
+    - stage_id: "STAGE-5"
+      name: "Scale-envelope and governance hardening"
+      goals:
+        - "Enforce dominance-order and HTF-bound gate evaluator"
+        - "Enforce verifier-economics and anti-entropy boundedness controls"
+      promotion_scope: "all tiers"
+      success_predicates:
+        - "dominance_order_evaluator_coverage == 1.0"
+        - "verification_compute_share <= 0.45"
+        - "anti_entropy_backlog_ticks_p95 <= 1200"
+        - "receipt_fanout_amplification <= 1.15"
+
+  ops_controls:
+    - id: "OPS-0001"
+      statement: "Signal ingestion queues must be bounded and priority-aware by signal type and risk class."
+    - id: "OPS-0002"
+      statement: "All routing policy changes require signed policy bundles and projection visibility."
+    - id: "OPS-0003"
+      statement: "Failure to validate signal freshness triggers reject + defect emission."
+    - id: "OPS-0004"
+      statement: "Gate evaluator enforces containment/security > verification/correctness > liveness/progress and fails closed on unknown state."
+    - id: "OPS-0005"
+      statement: "HTF boundary artifacts are mandatory for gate truth; wall-clock cannot authorize gate outcomes."
+    - id: "OPS-0006"
+      statement: "Scale controls enforce tiered retention manifests, anti-entropy boundedness proofs, and verifier-economics ceilings."
+
+  observability:
+    dashboards:
+      - "vphi.signal.validation"
+      - "vphi.attention.routing"
+      - "vphi.aatbiz.coverage"
+      - "vphi.kpi.countermetric.integrity"
+      - "vphi.strategy.coupling"
+      - "vphi.governance.time_authority"
+      - "vphi.scale.verifier_economics"

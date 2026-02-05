@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0010"
+  title: "Strategy coupling exporter for MSC-03/MSC-05/MSC-06"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    VPHI MUST export machine-checkable summary artifacts that link venture outcomes to strategy
+    claims and business counters for MSC-03, MSC-05, and MSC-06.
+  rationale: |
+    Strategic loop closure requires direct evidence linkage from venture signals to strategy gates.
+  acceptance_criteria:
+    - "Exporter emits claim-linked summary artifacts for MSC-03, MSC-05, and MSC-06"
+    - "Each exported objective includes baseline, quantitative target, HTF boundary ID, owner locus, predicate, and evidence path"
+    - "AAT-BIZ coupling ledger maps signal classes to Stage-5 obligations and promotion outcomes"
+    - "Artifacts satisfy strategy predicate schemas"
+    - "Missing linkage is surfaced as a defect"
+  evidence_ids: ["EVID-0008"]
+  source_refs:
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §0.4"
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §0.3"
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §6.6"
+    - "documents/strategy/MASTER_STRATEGY.json"

@@ -1,0 +1,230 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-02-05"
+  template_version: "2026-01-23"
+  risks:
+    - id: "RSK-0001"
+      statement: "Identity parser differential permits alternate string forms that hash/sign differently."
+      impact: "HIGH - Enables confused-deputy and identity spoofing via non-canonical encodings."
+      likelihood: "MEDIUM - Multi-language parser stacks are prone to edge-case divergence."
+      mitigations:
+        - "Freeze canonical grammar with conformance vectors and reject non-canonical forms."
+        - "Require canonical binary form for hash/sign operations."
+        - "Run parser differential fuzzing in CI across language implementations."
+      evidence_ids: ["EVID-0007", "EVID-0304"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §1.7.5b, §10 S0.9"
+
+    - id: "RSK-0002"
+      statement: "Proof amplification DoS from oversized/malformed directory or multiproof payloads."
+      impact: "HIGH - Can exhaust verifier resources and degrade control-plane liveness."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Enforce pre-decode byte caps and post-decode node/depth caps."
+        - "Fail closed on bound violations and quarantine repeat offenders."
+        - "Require bounded proof profiles and strict profile-hash pinning."
+      evidence_ids: ["EVID-0011", "EVID-0012", "EVID-0106"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §0.1, §1.7.7b, §9.5.2"
+
+    - id: "RSK-0003"
+      statement: "Revocation resurrection by race under partition or Byzantine ordering."
+      impact: "HIGH - Revoked identities may regain authority without explicit policy approval."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Implement revocation-wins signed CRDT merge law."
+        - "Require explicit re-admission anchors for post-revocation activation."
+        - "Run partition/rejoin convergence simulations with adversarial ordering."
+      evidence_ids: ["EVID-0014", "EVID-0105", "EVID-0035"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §2.4.3b"
+
+    - id: "RSK-0004"
+      statement: "Freshness misconfiguration allows stale identity heads for Tier2+ authority operations."
+      impact: "HIGH - Enables replay of revoked or expired identity state."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Use HTF-compatible lag authority only; forbid wall-clock authority."
+        - "Require Tier2+ fail-closed on stale head checks."
+        - "Instrument stale-deny rates and gate stage promotion on violations."
+      evidence_ids: ["EVID-0018", "EVID-0110", "EVID-0309"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §1.8, §1.9"
+
+    - id: "RSK-0005"
+      statement: "Free-floating batch signatures accepted without ledger/quorum anchor."
+      impact: "HIGH - Breaks authoritative freshness and revocation semantics."
+      likelihood: "LOW"
+      mitigations:
+        - "Require AuthoritySeal and/or FactRoot path anchored to ledger or QC."
+        - "Reject authoritative acceptance when anchor is missing."
+        - "Audit receipt pointers for anchor completeness."
+      evidence_ids: ["EVID-0016", "EVID-0024", "EVID-0109"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §0.1(11b), §9.5.0, §9.5.0b"
+
+    - id: "RSK-0006"
+      statement: "Batched verification path exceeds <1% overhead and silently degrades reliability."
+      impact: "HIGH - Violates production economics and may cause incident-level regressions."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Maintain explicit CPU/network overhead contracts with p99 targets."
+        - "Auto-fallback to direct verification when thresholds are exceeded."
+        - "Block stage promotion on contract violations."
+      evidence_ids: ["EVID-0026", "EVID-0306"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §9.5.7, §10 S2.6"
+
+    - id: "RSK-0007"
+      statement: "Delegation meet algorithm bug permits authority widening across recursion depth."
+      impact: "CRITICAL - Breaks strict-subset guarantees and containment posture."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Model authority as explicit lattice dimensions and verify deterministic meet implementation."
+        - "Add negative laundering tests across risk, budget, stop, and classification dimensions."
+        - "Require permeability bindings on envelope and receipt consumption paths."
+      evidence_ids: ["EVID-0027", "EVID-0104"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §8.3.2, §8.3.3"
+
+    - id: "RSK-0008"
+      statement: "Capsule or broker bypass path reintroduces ambient authority."
+      impact: "CRITICAL - Unmediated world effects invalidate proof-carrying model."
+      likelihood: "LOW"
+      mitigations:
+        - "Enforce linux-ns-v1 containment and remove all non-broker actuation paths."
+        - "Fail closed when broker/firewall dependencies are unavailable."
+        - "Run red-team capsule escape and traversal suites continuously."
+      evidence_ids: ["EVID-0028", "EVID-0030", "EVID-0307"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §4, §10 S3/S3.5"
+
+    - id: "RSK-0009"
+      statement: "Lossy summaries without selector coverage influence high-risk decisions."
+      impact: "HIGH - Creates unverifiable narratives and unsafe actuation inputs."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Require selector coverage invariant for all lossy artifacts."
+        - "Fail closed with defect/oracle request when selector coverage cannot be met."
+        - "Require terminal verifier evidence for high-risk operations."
+      evidence_ids: ["EVID-0111", "EVID-0031", "EVID-0032"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §9.3, §9.3.1, §9.3.2"
+
+    - id: "RSK-0010"
+      statement: "Byzantine relay equivocation causes inconsistent routing truth across cells."
+      impact: "HIGH - May amplify stale or conflicting views and degrade coordination."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Use pull-only anti-entropy with bounded fetch and replay protection."
+        - "Issue admission receipts for imported authoritative facts."
+        - "Continuously run byzantine relay and partition/rejoin drills."
+      evidence_ids: ["EVID-0034", "EVID-0035", "EVID-0107"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §2.4.5, §2.4.6, §8.3, §10 S7"
+
+    - id: "RSK-0011"
+      statement: "Epoch seal rollback/equivocation under federation partitions."
+      impact: "HIGH - Freshness guarantees collapse for cross-cell authority."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Enforce monotone epoch sequence checks and conflicting-seal rejection."
+        - "Use optional VDF profile on adversarial links."
+        - "Tier2+ authority admissions fail closed on missing/invalid epoch seals."
+      evidence_ids: ["EVID-0019", "EVID-0020", "EVID-0309"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §1.9, §10 S7.5"
+
+    - id: "RSK-0012"
+      statement: "Formal model drift from implementation allows unsound stage promotion."
+      impact: "HIGH - Proof artifacts may no longer constrain real runtime behavior."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Bind formal artifacts to concrete schema and version hashes."
+        - "Require gate-time checks that implementation and model versions match."
+        - "Block promotion on unresolved model/implementation drift."
+      evidence_ids: ["EVID-0401"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §2.6, §10 Formal verification gates"
+
+    - id: "RSK-0013"
+      statement: "Stop-path SLO or emergency stop uncertainty not enforced at kernel boundary."
+      impact: "CRITICAL - Safety-critical control loop can fail under incident conditions."
+      likelihood: "LOW"
+      mitigations:
+        - "Enforce stop uncertainty deny <=250ms and p99 stop propagation <=2s for Tier3+."
+        - "Run chaos drills covering stop-path degradation."
+        - "Block ratchet promotion on SLO violations."
+      evidence_ids: ["EVID-0036", "EVID-0402"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §11.2.1, §11.3.1"
+
+    - id: "RSK-0014"
+      statement: "Key rotation runbooks insufficiently tested under partial partition."
+      impact: "HIGH - Rotation incident can cause prolonged outage or trust split."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "Run recurring key rotation drills with overlapping validity windows."
+        - "Record drill receipts with recovery outcomes and defects."
+        - "Require governance signoff evidence before production ratchet promotion."
+      evidence_ids: ["EVID-0036", "EVID-0402"]
+      source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md §11.3"
+
+  open_questions:
+    - id: "Q-0001"
+      question: "Which directory ADS profile should be mandatory baseline: sparse Merkle tree, Patricia trie, or profile-negotiated?"
+      decision_needed_by: "TCK-00357 implementation"
+      resolution_plan: "Start with profile-negotiated support and mandate at least one interoperable baseline profile."
+      v2_resolution:
+        status: "PENDING"
+        decision: "Await benchmark + interoperability report from EVID-0011."
+        evidence_ref: "evidence/rfc/RFC-0020/reviews/identity_proof_profile_tradeoff.yaml"
+
+    - id: "Q-0002"
+      question: "What is the optimal K_min threshold for switching to ReceiptMultiProofV1 under varied channel budgets?"
+      decision_needed_by: "TCK-00363 implementation"
+      resolution_plan: "Choose policy-defined threshold from measured fanout traces."
+      v2_resolution:
+        status: "PENDING"
+        decision: "Derive threshold from PF-0003 benchmark envelopes."
+        evidence_ref: "evidence/rfc/RFC-0020/perf/multiproof_threshold_study.yaml"
+
+    - id: "Q-0003"
+      question: "Should optional VDF profiles be enabled by default on all federation links or only adversarial classifications?"
+      decision_needed_by: "TCK-00366 rollout"
+      resolution_plan: "Default off globally; enable per-link policy where threat model warrants delay hardening."
+      v2_resolution:
+        status: "PENDING"
+        decision: "Security council decision required with production latency budget data."
+        evidence_ref: "evidence/rfc/RFC-0020/reviews/vdf_policy_review.yaml"
+
+    - id: "Q-0004"
+      question: "How should long partitions influence delegation expiry semantics when HTF lag remains bounded but governance channel is delayed?"
+      decision_needed_by: "TCK-00381 implementation"
+      resolution_plan: "Prefer conservative deny under uncertainty for Tier2+ and configurable degraded read mode for lower tiers."
+      v2_resolution:
+        status: "PENDING"
+        decision: "Pending partition drill outcomes (CH-0003, CH-0004)."
+        evidence_ref: "evidence/rfc/RFC-0020/chaos/partition_expiry_matrix.yaml"
+
+    - id: "Q-0005"
+      question: "Should KeySetIdV1 be mandatory for all authority roots or optional for non-quorum cells?"
+      decision_needed_by: "Post-S0.75 hardening"
+      resolution_plan: "Require support universally; require active use only where quorum/threshold authorities exist."
+      v2_resolution:
+        status: "PENDING"
+        decision: "Pending architecture council signoff."
+        evidence_ref: "evidence/rfc/RFC-0020/reviews/keysetid_rollout.yaml"
+
+    - id: "Q-0006"
+      question: "Which distortion metrics are acceptable for SummaryReceipt under high-risk policy gates?"
+      decision_needed_by: "S5 rollout gate"
+      resolution_plan: "Allow only metrics backed by deterministic verifier predicates and selector coverage proofs."
+      v2_resolution:
+        status: "PENDING"
+        decision: "Pending policy/risk council rubric publication."
+        evidence_ref: "evidence/rfc/RFC-0020/reviews/summary_distortion_policy.yaml"
+
+    - id: "Q-0007"
+      question: "What is the maximum permitted breakglass duration for G2 gates before mandatory rollback?"
+      decision_needed_by: "S2.6 and S8 production rollout"
+      resolution_plan: "Time-box breakglass windows and require explicit incident receipts with authority signoff."
+      v2_resolution:
+        status: "PENDING"
+        decision: "Pending reliability governance policy update."
+        evidence_ref: "evidence/rfc/RFC-0020/governance/breakglass_duration_policy.yaml"
+
+    - id: "Q-0008"
+      question: "Should governance channel stop/rotation operations require independent out-of-band attestation in addition to AuthoritySeal/QC?"
+      decision_needed_by: "TCK-00382 implementation"
+      resolution_plan: "Evaluate dual-control requirement for critical cells with stricter blast radius constraints."
+      v2_resolution:
+        status: "PENDING"
+        decision: "Pending security architecture review."
+        evidence_ref: "evidence/rfc/RFC-0020/reviews/governance_oob_attestation.yaml"

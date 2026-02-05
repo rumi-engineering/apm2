@@ -1,0 +1,475 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/security_incident_response_doc_v1.schema.json",
+  "title": "SecurityIncidentResponseDocumentV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "meta",
+    "payload"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.security.incident_response_doc.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "kind": {
+      "type": "string",
+      "const": "security.incident_response_document"
+    },
+    "meta": {
+      "type": "object",
+      "required": [
+        "canonicalizer",
+        "classification",
+        "created_at",
+        "source_of_truth_refs",
+        "stable_id",
+        "status"
+      ],
+      "properties": {
+        "stable_id": {
+          "type": "string",
+          "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "DRAFT",
+            "DEPRECATED"
+          ]
+        },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "PUBLIC",
+            "INTERNAL",
+            "CONFIDENTIAL",
+            "RESTRICTED"
+          ]
+        },
+        "source_of_truth_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "last_aligned_rfc": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "replaces": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "canonicalizer": {
+          "type": "object",
+          "required": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "properties": {
+            "canonicalizer_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "canonicalizer_version": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+            },
+            "vectors_ref": {
+              "type": "string",
+              "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "provenance": {
+          "type": "object",
+          "properties": {
+            "actor_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "work_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "source_receipts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "title",
+        "alignment",
+        "severity_model",
+        "universal_rules",
+        "playbooks",
+        "evidence_preservation_checklist",
+        "communication_templates",
+        "closure_criteria",
+        "contacts",
+        "reporting_channel",
+        "scale_and_forensics",
+        "cryptography_posture"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "const": "Incident Response"
+        },
+        "alignment": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "severity_model": {
+          "type": "array",
+          "minItems": 4,
+          "items": {
+            "$ref": "#/$defs/severity_level"
+          }
+        },
+        "universal_rules": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "playbooks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/playbook"
+          }
+        },
+        "evidence_preservation_checklist": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "communication_templates": {
+          "type": "object",
+          "required": [
+            "internal_notification",
+            "external_advisory"
+          ],
+          "properties": {
+            "internal_notification": {
+              "$ref": "#/$defs/template"
+            },
+            "external_advisory": {
+              "$ref": "#/$defs/template"
+            }
+          },
+          "additionalProperties": false
+        },
+        "closure_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "contacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/contact"
+          }
+        },
+        "reporting_channel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "scale_and_forensics": {
+          "$ref": "#/$defs/scale_and_forensics"
+        },
+        "cryptography_posture": {
+          "$ref": "#/$defs/cryptography_posture"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "severity_level": {
+      "type": "object",
+      "required": [
+        "level",
+        "description",
+        "examples",
+        "containment_target"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "Critical",
+            "High",
+            "Medium",
+            "Low"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "examples": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "containment_target": {
+          "$ref": "#/$defs/time_target"
+        }
+      },
+      "additionalProperties": false
+    },
+    "time_target": {
+      "type": "object",
+      "required": [
+        "target_type",
+        "max_duration_ms"
+      ],
+      "properties": {
+        "target_type": {
+          "type": "string",
+          "enum": [
+            "IMMEDIATE",
+            "WITHIN"
+          ]
+        },
+        "max_duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31536000000
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "target_type": {
+                "const": "IMMEDIATE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "max_duration_ms": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "playbook": {
+      "type": "object",
+      "required": [
+        "playbook_id",
+        "title",
+        "triggers",
+        "immediate_actions"
+      ],
+      "properties": {
+        "playbook_id": {
+          "type": "string",
+          "pattern": "^IR-[A-Z0-9-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 192
+        },
+        "triggers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "immediate_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "containment_checks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "containment_goal": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "additionalProperties": false
+    },
+    "template": {
+      "type": "object",
+      "required": [
+        "template_id",
+        "required_fields"
+      ],
+      "properties": {
+        "template_id": {
+          "type": "string",
+          "pattern": "^IR-TPL-[A-Z0-9-]+$"
+        },
+        "required_fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "contact": {
+      "type": "object",
+      "required": [
+        "role",
+        "responsibility"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "responsibility": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "additionalProperties": false
+    },
+    "scale_and_forensics": {
+      "type": "object",
+      "required": [
+        "capacity_target",
+        "evidence_strategy",
+        "verification_cost_controls"
+      ],
+      "properties": {
+        "capacity_target": {
+          "type": "string",
+          "const": "multi-exabyte"
+        },
+        "evidence_strategy": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "verification_cost_controls": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "cryptography_posture": {
+      "type": "object",
+      "required": [
+        "pqc_status",
+        "pqc_note"
+      ],
+      "properties": {
+        "pqc_status": {
+          "type": "string",
+          "const": "DEFERRED"
+        },
+        "pqc_note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "unevaluatedProperties": false
+}

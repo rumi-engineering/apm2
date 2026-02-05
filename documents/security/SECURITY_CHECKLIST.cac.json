@@ -1,0 +1,356 @@
+{
+  "schema": "apm2.security.checklist_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "security.checklist_document",
+  "meta": {
+    "stable_id": "dcp://apm2.security/doc/security-checklist@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "source_of_truth_refs": [
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/security/SECURITY_POLICY.cac.json"
+    ],
+    "last_aligned_rfc": "RFC-0020",
+    "replaces": "documents/security/SECURITY_CHECKLIST.md",
+    "created_at": "2026-02-05T00:00:00Z",
+    "updated_at": "2026-02-05T00:00:00Z",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-SECURITY-GOVERNANCE",
+      "work_id": "DOC-SECURITY-RFC0020-ALIGN-20260205",
+      "source_receipts": []
+    }
+  },
+  "payload": {
+    "title": "Security Checklist",
+    "alignment_ref": "HOLONIC_SUBSTRATE_INTERFACE.md",
+    "sections": [
+      {
+        "section_id": "CHK-BOUNDARY-AUTHORITY",
+        "title": "Boundary and Authority Checks",
+        "checks": [
+          {
+            "check_id": "CHK-BOUNDARY-AUTHORITY-01",
+            "statement": "No ambient authority path is introduced; all side effects remain daemon-mediated.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-BOUNDARY-AUTHORITY-02",
+            "statement": "Authoritative outcomes are receipt-bound and evidence-bound.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-BOUNDARY-AUTHORITY-03",
+            "statement": "Delegation strict-subset constraints hold across scope, budgets, stop predicates, and classification constraints.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-BOUNDARY-AUTHORITY-04",
+            "statement": "Missing or unverifiable delegation and trust artifacts fail closed.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-IDENTITY-FRESHNESS",
+        "title": "Identity and Freshness Checks",
+        "checks": [
+          {
+            "check_id": "CHK-IDENTITY-FRESHNESS-01",
+            "statement": "Authority-bearing identities are self-certifying or losslessly mapped to canonical forms.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-IDENTITY-FRESHNESS-02",
+            "statement": "Identity verification uses proof-carrying objects, not linear scans.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-IDENTITY-FRESHNESS-03",
+            "statement": "Tier2+ actuation paths enforce freshness policy and deny on stale or unverifiable trust state.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-IDENTITY-FRESHNESS-04",
+            "statement": "Stop-state freshness uncertainty fails closed before actuation.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-RECEIPT-AUTH",
+        "title": "Receipt Authentication Checks",
+        "checks": [
+          {
+            "check_id": "CHK-RECEIPT-AUTH-01",
+            "statement": "Fact authentication is explicit via direct signature or authority-seal verification.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-RECEIPT-AUTH-02",
+            "statement": "When batching is used, inclusion proof verification and root anchoring are implemented.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-RECEIPT-AUTH-03",
+            "statement": "Proof bytes and decoder bounds are enforced before acceptance.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-RECEIPT-AUTH-04",
+            "statement": "Verification failures emit defects and cannot silently downgrade to allow.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-TOOL-CONTEXT",
+        "title": "Tool and Context Containment",
+        "checks": [
+          {
+            "check_id": "CHK-TOOL-CONTEXT-01",
+            "statement": "No raw tool-string bypass exists around typed mediation.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-TOOL-CONTEXT-02",
+            "statement": "Context reads are allowlist-bound and out-of-policy reads deny by default.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-TOOL-CONTEXT-03",
+            "statement": "Tier3+ paths use hard-fail firewall semantics (terminate or deny, not warn-and-continue).",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-TOOL-CONTEXT-04",
+            "statement": "Idempotency and preconditions are present for side-effecting tools.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-INJECTION-CONFIDENTIALITY",
+        "title": "Injection and Confidentiality Controls",
+        "checks": [
+          {
+            "check_id": "CHK-INJECTION-CONFIDENTIALITY-01",
+            "statement": "Taint and integrity labels propagate across tool and summary paths.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-INJECTION-CONFIDENTIALITY-02",
+            "statement": "Confidentiality labels propagate and are enforced on boundary emissions.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-INJECTION-CONFIDENTIALITY-03",
+            "statement": "External or untrusted inputs cannot directly drive high-impact actuators without verifier or sanitizer policy requirements.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-INJECTION-CONFIDENTIALITY-04",
+            "statement": "Logs and error messages avoid sensitive leakage and preserve redaction invariants.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-FILES-ATOMICITY",
+        "title": "Path, File, and Atomicity Hygiene",
+        "checks": [
+          {
+            "check_id": "CHK-FILES-ATOMICITY-01",
+            "statement": "External path components are validated and normalized.",
+            "severity": "MUST",
+            "surface": "REPOSITORY"
+          },
+          {
+            "check_id": "CHK-FILES-ATOMICITY-02",
+            "statement": "Resolved target paths remain inside allowlisted roots after symlink resolution.",
+            "severity": "MUST",
+            "surface": "REPOSITORY"
+          },
+          {
+            "check_id": "CHK-FILES-ATOMICITY-03",
+            "statement": "Critical files use write-then-rename semantics.",
+            "severity": "MUST",
+            "surface": "REPOSITORY"
+          },
+          {
+            "check_id": "CHK-FILES-ATOMICITY-04",
+            "statement": "Temporary files are same-filesystem and cleaned on failure.",
+            "severity": "SHOULD",
+            "surface": "REPOSITORY"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-CRYPTO-SERIALIZATION",
+        "title": "Cryptographic and Serialization Discipline",
+        "checks": [
+          {
+            "check_id": "CHK-CRYPTO-SERIALIZATION-01",
+            "statement": "Canonicalization is deterministic for all signed and hashed artifacts.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-CRYPTO-SERIALIZATION-02",
+            "statement": "Collection ordering is deterministic before hash or sign operations.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-CRYPTO-SERIALIZATION-03",
+            "statement": "Unknown-field behavior follows policy with fail-closed semantics where required.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-CRYPTO-SERIALIZATION-04",
+            "statement": "Enforcement-affecting quantities are unitful and unambiguous.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-RISK-TIER",
+        "title": "Runtime Risk Tier Alignment",
+        "checks": [
+          {
+            "check_id": "CHK-RISK-TIER-01",
+            "statement": "Risk-tier assumptions match policy mapping from UT T0..T3 to daemon Tier0..Tier4.",
+            "severity": "MUST",
+            "surface": "GOVERNANCE"
+          },
+          {
+            "check_id": "CHK-RISK-TIER-02",
+            "statement": "Tier3+ behavior includes mandatory sandbox boundary and stricter containment enforcement.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-RISK-TIER-03",
+            "statement": "Tier2+ paths deny on freshness or identity ambiguity.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-CONTINUITY-STOP",
+        "title": "Continuity and Stop-Path Safety",
+        "checks": [
+          {
+            "check_id": "CHK-CONTINUITY-STOP-01",
+            "statement": "Anti-entropy authority flow remains pull-only and budget-bound across episode, cell, and relay scopes; budget exceedance denies actuation and emits defects.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-CONTINUITY-STOP-02",
+            "statement": "Tier3+ stop path enforces stop propagation p99 <= 2000ms and stop uncertainty deny <= 250ms with fail-safe kernel-boundary behavior.",
+            "severity": "MUST",
+            "surface": "RUNTIME"
+          },
+          {
+            "check_id": "CHK-CONTINUITY-STOP-03",
+            "statement": "Ledger and CAS RPO/RTO objectives and DrillReceiptV1 chaos/partition evidence are recorded and auditable before stage promotion.",
+            "severity": "MUST",
+            "surface": "GOVERNANCE"
+          }
+        ]
+      },
+      {
+        "section_id": "CHK-SUPPLY-CHAIN",
+        "title": "Supply Chain and Release Integrity",
+        "checks": [
+          {
+            "check_id": "CHK-SUPPLY-CHAIN-01",
+            "statement": "Security CI gates (clippy -D warnings, cargo deny, cargo audit) pass for release commit.",
+            "severity": "MUST",
+            "surface": "CI"
+          },
+          {
+            "check_id": "CHK-SUPPLY-CHAIN-02",
+            "statement": "Sigstore identity-constrained verification procedure is intact.",
+            "severity": "MUST",
+            "surface": "RELEASE"
+          },
+          {
+            "check_id": "CHK-SUPPLY-CHAIN-03",
+            "statement": "Provenance and SBOM outputs are present and verifiable.",
+            "severity": "MUST",
+            "surface": "RELEASE"
+          },
+          {
+            "check_id": "CHK-SUPPLY-CHAIN-04",
+            "statement": "Dependency changes are reviewed as security-relevant changes.",
+            "severity": "MUST",
+            "surface": "REPOSITORY"
+          }
+        ]
+      }
+    ],
+    "quick_merge_gate": [
+      {
+        "gate_id": "CHK-GATE-01",
+        "statement": "Boundary and authority checks complete."
+      },
+      {
+        "gate_id": "CHK-GATE-02",
+        "statement": "Identity, freshness, and fail-closed behavior verified."
+      },
+      {
+        "gate_id": "CHK-GATE-03",
+        "statement": "Tool/context containment and injection controls verified."
+      },
+      {
+        "gate_id": "CHK-GATE-04",
+        "statement": "Serialization and cryptographic discipline verified."
+      },
+      {
+        "gate_id": "CHK-GATE-05",
+        "statement": "Release and supply-chain checks verified."
+      }
+    ],
+    "scale_readiness_checks": [
+      "Batch verification and cache contracts are used to avoid linear verification collapse at large volume.",
+      "Decode and collection bounds are enforced before trust decisions.",
+      "Digest-first boundaries are maintained to avoid raw payload fanout at multi-exabyte scale.",
+      "REQ-0035 and REQ-0036 controls are codified in the consensus runbook and Security Policy with explicit ticket and requirement references.",
+      "RFC-0020 requirement closure is tracked in primary artifacts; unresolved gaps: REQ-0007 (TCK-00371), REQ-0009 (TCK-00373), REQ-0014 (TCK-00378), REQ-0021 (TCK-00376), REQ-0022 (TCK-00377), REQ-0026 (TCK-00380).",
+      "Verification paths preserve logarithmic proof economics for identity and receipt checks."
+    ],
+    "cryptography_posture": {
+      "pqc_status": "DEFERRED",
+      "pqc_note": "PQC migration is deferred; checklist enforces current RFC-0020 signature and authority-seal controls."
+    }
+  }
+}

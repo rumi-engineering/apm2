@@ -1025,7 +1025,7 @@ pub mod tests {
     #[test]
     fn test_classify_sensitive_pattern_security() {
         let changeset = ChangeSet {
-            files_changed: vec!["documents/security/THREAT_MODEL.md".to_string()],
+            files_changed: vec!["documents/security/THREAT_MODEL.cac.json".to_string()],
             lines_changed: 10,
             dependency_fanout: 1,
         };

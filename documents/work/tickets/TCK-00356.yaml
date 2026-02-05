@@ -1,0 +1,59 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: TCK-00356
+    title: Directory head and identity proof artifact family
+  binds:
+    prd_id: PRD-0010
+    rfc_id: RFC-0020
+    requirements:
+    - requirement_id: REQ-0010
+      requirement_ref: documents/rfcs/RFC-0020/requirements/REQ-0010.yaml#requirement
+    evidence_artifacts:
+    - evidence_id: EVID-0010
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0010.yaml#evidence_artifact
+    - evidence_id: EVID-0303
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0303.yaml#evidence_artifact
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_PROTOCOL
+    - DOMAIN_SECURITY
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00355
+      reason: Prerequisite per RFC-0020 ticket decomposition ordering
+  scope:
+    in_scope:
+    - Implement HolonDirectoryHeadV1, IdentityProofV1, and DirectoryProofV1
+    - Require proof-carrying pointers for identity-bearing boundary messages
+    - Bind directory head to authority seals and freshness policy references
+    out_of_scope:
+    - Proof-profile economics and caching policy (TCK-00358, TCK-00359)
+  plan:
+    steps:
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep
+      beyond out_of_scope list.
+    - 'Implement: Implement HolonDirectoryHeadV1, IdentityProofV1, and DirectoryProofV1'
+    - 'Implement: Require proof-carrying pointers for identity-bearing boundary messages'
+    - 'Implement: Bind directory head to authority seals and freshness policy references'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression
+      risks per RFC-0020/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding
+      EVID-* artifact with concrete artifact pointers.
+  definition_of_done:
+    evidence_ids:
+    - EVID-0010
+    - EVID-0303
+    criteria:
+    - Identity-bearing messages include identity_proof_hash pointers
+    - Directory head hashes resolve to signed/authenticated head artifacts
+    - Unproofed identity values rejected for authoritative operations
+  notes:
+    security: Fail-closed, least privilege, and explicit authority proofs are mandatory.
+    verification: Prefer deterministic tests, replay/CAS evidence, and bounded-resource
+      checks; avoid process-local assumptions.
+    general: Keep scope atomic to this ticket, preserve explicit dependency ordering,
+      and avoid introducing semantic drift from RFC-0020.

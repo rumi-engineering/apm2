@@ -1,0 +1,692 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/security_policy_doc_v1.schema.json",
+  "title": "SecurityPolicyDocumentV1",
+  "description": "Structured, machine-actionable security policy artifact aligned to RFC-0020.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "meta",
+    "payload"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.security.policy_doc.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "kind": {
+      "type": "string",
+      "const": "security.policy_document"
+    },
+    "meta": {
+      "type": "object",
+      "required": [
+        "canonicalizer",
+        "classification",
+        "created_at",
+        "source_of_truth_refs",
+        "stable_id",
+        "status"
+      ],
+      "properties": {
+        "stable_id": {
+          "type": "string",
+          "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "DRAFT",
+            "DEPRECATED"
+          ]
+        },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "PUBLIC",
+            "INTERNAL",
+            "CONFIDENTIAL",
+            "RESTRICTED"
+          ]
+        },
+        "owners": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "source_of_truth_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "last_aligned_rfc": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "replaces": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "canonicalizer": {
+          "type": "object",
+          "required": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "properties": {
+            "canonicalizer_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "canonicalizer_version": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+            },
+            "vectors_ref": {
+              "type": "string",
+              "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "provenance": {
+          "type": "object",
+          "properties": {
+            "actor_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "work_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "source_receipts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "title",
+        "authority_model",
+        "posture",
+        "policy_modes",
+        "invariants",
+        "identity_and_freshness",
+        "risk_tier_model",
+        "runtime_controls",
+        "release_integrity",
+        "dependency_and_build_governance",
+        "secrets_and_disclosure",
+        "cross_document_bindings",
+        "scale_profile",
+        "cryptography_posture"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "const": "Security Policy"
+        },
+        "authority_model": {
+          "type": "object",
+          "required": [
+            "precedence_rule",
+            "authoritative_sources",
+            "translation_scope"
+          ],
+          "properties": {
+            "precedence_rule": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "authoritative_sources": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/source_ref"
+              }
+            },
+            "translation_scope": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "repository",
+                  "ci_cd",
+                  "incident_response",
+                  "release_operations"
+                ]
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "posture": {
+          "type": "object",
+          "required": [
+            "enforcement_mode",
+            "core_principles"
+          ],
+          "properties": {
+            "enforcement_mode": {
+              "type": "string",
+              "enum": [
+                "FAIL_CLOSED"
+              ]
+            },
+            "core_principles": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/control_statement"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "policy_modes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/policy_mode"
+          }
+        },
+        "invariants": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/control_statement"
+          }
+        },
+        "identity_and_freshness": {
+          "type": "object",
+          "required": [
+            "requirements",
+            "fact_authentication_methods"
+          ],
+          "properties": {
+            "requirements": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/control_statement"
+              }
+            },
+            "fact_authentication_methods": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/authentication_method"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "risk_tier_model": {
+          "type": "object",
+          "required": [
+            "unified_theory_tiers",
+            "daemon_risk_tiers",
+            "mapping_requirements"
+          ],
+          "properties": {
+            "unified_theory_tiers": {
+              "type": "array",
+              "minItems": 4,
+              "items": {
+                "$ref": "#/$defs/unified_tier"
+              }
+            },
+            "daemon_risk_tiers": {
+              "type": "array",
+              "minItems": 5,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "Tier0",
+                  "Tier1",
+                  "Tier2",
+                  "Tier3",
+                  "Tier4"
+                ]
+              }
+            },
+            "mapping_requirements": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/control_statement"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "runtime_controls": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/control_statement"
+          }
+        },
+        "release_integrity": {
+          "type": "object",
+          "required": [
+            "requirements"
+          ],
+          "properties": {
+            "requirements": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/control_statement"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "dependency_and_build_governance": {
+          "type": "object",
+          "required": [
+            "security_gates",
+            "dependency_policies"
+          ],
+          "properties": {
+            "security_gates": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/security_gate"
+              }
+            },
+            "dependency_policies": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/control_statement"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "secrets_and_disclosure": {
+          "type": "object",
+          "required": [
+            "secrets_controls",
+            "vulnerability_process"
+          ],
+          "properties": {
+            "secrets_controls": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/control_statement"
+              }
+            },
+            "vulnerability_process": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/control_statement"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "cross_document_bindings": {
+          "type": "object",
+          "required": [
+            "incident_response",
+            "threat_model",
+            "signing_and_verification",
+            "security_checklist"
+          ],
+          "properties": {
+            "incident_response": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "threat_model": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "signing_and_verification": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "security_checklist": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "additionalProperties": false
+        },
+        "scale_profile": {
+          "type": "object",
+          "required": [
+            "capacity_target",
+            "verification_economics",
+            "bounded_decoding"
+          ],
+          "properties": {
+            "capacity_target": {
+              "type": "string",
+              "const": "multi-exabyte"
+            },
+            "verification_economics": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            },
+            "bounded_decoding": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "cryptography_posture": {
+          "type": "object",
+          "required": [
+            "pqc_status",
+            "pqc_note"
+          ],
+          "properties": {
+            "pqc_status": {
+              "type": "string",
+              "const": "DEFERRED"
+            },
+            "pqc_note": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "source_ref": {
+      "type": "object",
+      "required": [
+        "artifact",
+        "applies_to"
+      ],
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "applies_to": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "protocol_semantics",
+              "runtime_security_semantics",
+              "risk_tier_mapping",
+              "freshness_policy",
+              "authority_fact_authentication"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "control_statement": {
+      "type": "object",
+      "required": [
+        "control_id",
+        "statement",
+        "normative_level",
+        "surfaces",
+        "failure_action",
+        "verification"
+      ],
+      "properties": {
+        "control_id": {
+          "type": "string",
+          "pattern": "^SP-[A-Z0-9-]+$"
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "normative_level": {
+          "type": "string",
+          "enum": [
+            "MUST",
+            "SHOULD",
+            "MAY"
+          ]
+        },
+        "surfaces": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": [
+              "REPOSITORY",
+              "RUNTIME",
+              "CI",
+              "RELEASE",
+              "INCIDENT_RESPONSE",
+              "GOVERNANCE"
+            ]
+          }
+        },
+        "minimum_risk_tier": {
+          "type": "string",
+          "enum": [
+            "Tier0",
+            "Tier1",
+            "Tier2",
+            "Tier3",
+            "Tier4"
+          ]
+        },
+        "failure_action": {
+          "type": "string",
+          "enum": [
+            "DENY",
+            "TERMINATE",
+            "BLOCK_RELEASE",
+            "ESCALATE"
+          ]
+        },
+        "verification": {
+          "type": "object",
+          "required": [
+            "method"
+          ],
+          "properties": {
+            "method": {
+              "type": "string",
+              "enum": [
+                "POLICY_REVIEW",
+                "RECEIPT_VERIFICATION",
+                "CI_GATE",
+                "RELEASE_GATE",
+                "INCIDENT_AUDIT"
+              ]
+            },
+            "evidence_refs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "policy_mode": {
+      "type": "object",
+      "required": [
+        "mode_id",
+        "intent",
+        "constraints"
+      ],
+      "properties": {
+        "mode_id": {
+          "type": "string",
+          "enum": [
+            "MODE_HIGH_ASSURANCE",
+            "MODE_DEVELOPER"
+          ]
+        },
+        "intent": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "constraints": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "authentication_method": {
+      "type": "object",
+      "required": [
+        "method",
+        "constraints"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
+            "DIRECT_SIGNATURE",
+            "AUTHORITY_SEAL_V1"
+          ]
+        },
+        "constraints": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "unified_tier": {
+      "type": "object",
+      "required": [
+        "tier",
+        "label"
+      ],
+      "properties": {
+        "tier": {
+          "type": "string",
+          "enum": [
+            "T0",
+            "T1",
+            "T2",
+            "T3"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      },
+      "additionalProperties": false
+    },
+    "security_gate": {
+      "type": "object",
+      "required": [
+        "gate_id",
+        "command",
+        "failure_action"
+      ],
+      "properties": {
+        "gate_id": {
+          "type": "string",
+          "pattern": "^SP-GATE-[A-Z0-9-]+$"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "failure_action": {
+          "type": "string",
+          "const": "BLOCK_RELEASE"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "unevaluatedProperties": false
+}

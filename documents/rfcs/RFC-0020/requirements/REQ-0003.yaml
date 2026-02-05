@@ -1,0 +1,26 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0003"
+  title: "Session-state, enum decoding, and bounded parser hardening"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Authority-bearing operations MUST require valid session-state progression; decoders MUST enforce bounded payload size before decode and bounded collections after decode; unknown/invalid enum values MUST fail closed without truncation or default coercion; unknown fields in signed/hashed JSON artifacts MUST be rejected, and unknown fields in signed/hashed protobuf artifacts MUST be dropped before canonicalization/signing and MUST NOT be forwarded across holonic boundaries.
+
+    Primary delivery ticket: TCK-00349
+  rationale: |
+    Session and state decode hardening close a primary attack surface for bypassing enforcement.
+  acceptance_criteria:
+    - "No privileged route reachable before validated session-open state"
+    - "Bound violations reject requests with structured defects"
+    - "Invalid enum values never coerce to permissive defaults"
+    - "Signed/hashed JSON rejects unknown fields; signed/hashed protobuf drops unknown fields before hashing and does not forward them"
+    - "Primary implementation ticket TCK-00349 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0003"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.2.3"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §0.1"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.5.1"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §2.1.1"

@@ -1,0 +1,23 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0030"
+  title: "No bypass actuation paths"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Tool execution paths MUST always traverse broker, capability, and context firewall checks; missing enforcement dependencies MUST deny actuation by default.
+
+    Primary delivery ticket: TCK-00376
+  rationale: |
+    Any bypass path invalidates proof-carrying security guarantees.
+  acceptance_criteria:
+    - "No actuation path bypasses broker and policy checks"
+    - "Unavailable enforcement dependency causes deny, never permissive fallback"
+    - "Regression suite prevents bypass reintroduction"
+    - "Primary implementation ticket TCK-00376 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0030"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 3.5"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §0.1"

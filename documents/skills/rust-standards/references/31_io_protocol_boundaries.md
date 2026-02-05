@@ -76,7 +76,7 @@ pub fn read_stream_bounded<R: io::Read>(mut r: R, out: &mut Vec<u8>, max: usize)
   - strictly increasing cursors/sequence numbers.
   - non-reusable nonces for sensitive commands.
   - explicit minimum supported version policy.
-[PROVENANCE] THREAT_MODEL.md; INV-2615.
+[PROVENANCE] documents/security/THREAT_MODEL.cac.json; INV-2615.
 
 [CONTRACT: CTR-1607] Ledger and Persistence Integrity.
 - REJECT IF: ledger writes can rewrite history or events are non-deterministically ordered.

@@ -1,0 +1,162 @@
+rfc_meta:
+  schema_version: "2026-02-05"
+  template_version: "2026-01-23"
+
+  rfc:
+    id: "RFC-0020"
+    title: "Holonic Substrate Interface (HSI)"
+    full_title: "RFC-0020 — Holonic Substrate Interface (HSI): identity-safe, proof-carrying, digest-first microkernel interface for recursive holarchies"
+    status: "DRAFT"
+    version: "v0.4"
+    created_date: "2026-02-05"
+    last_updated_date: "2026-02-05"
+    source_of_truth:
+      path: "HOLONIC_SUBSTRATE_INTERFACE.md"
+      role: "authoritative normative specification"
+      resolution_hint: "Repository-resolved file path: documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
+    assumptions:
+      - "TCK-00326..TCK-00340 are implemented (or treated as landed assumptions for planning)."
+      - "Single-OS/runtime support (Ubuntu/Linux) is acceptable for current phase."
+      - "PQC is explicitly out of scope for RFC-0020."
+
+  source_drafts:
+    - id: "HOLONIC_SUBSTRATE_INTERFACE"
+      path: "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
+      role: "master normative draft"
+      note: "YAML decomposition is lossless-by-reference: any wording conflict resolves to the master draft."
+
+  lossless_conversion_contract:
+    objective: "No technical detail loss during decomposition into YAML artifacts."
+    normative_rule: |
+      RFC-0020 YAML files are structured projections of the master RFC text.
+      Any omitted prose detail remains normative via source references.
+      Decomposition MUST preserve section coverage, requirement traceability,
+      and rollout/test/gate semantics without semantic weakening.
+    canonical_source_ref: "HOLONIC_SUBSTRATE_INTERFACE.md"
+    source_ref_aliases:
+      - logical_ref: "HOLONIC_SUBSTRATE_INTERFACE.md"
+        resolves_to: "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
+    section_coverage_policy:
+      mode: "FULL_COVERAGE_REQUIRED"
+      section_map:
+        - section: "§0 Executive summary + constraints"
+          yaml_file: "01_problem_and_imports.yaml"
+        - section: "§1 Normative definitions"
+          yaml_file: "02_design_decisions.yaml"
+        - section: "§2 System model"
+          yaml_file: "02_design_decisions.yaml"
+        - section: "§3 HSI contracts"
+          yaml_file: "04_contracts_and_versioning.yaml"
+        - section: "§4 Agent capsule"
+          yaml_file: "03_trust_boundaries.yaml"
+        - section: "§5 Syscall families"
+          yaml_file: "04_contracts_and_versioning.yaml"
+        - section: "§6 ToolKinds"
+          yaml_file: "04_contracts_and_versioning.yaml"
+        - section: "§7 FAC/HMP integration"
+          yaml_file: "04_contracts_and_versioning.yaml"
+        - section: "§8 Observability + defects + permeability"
+          yaml_file: "03_trust_boundaries.yaml"
+        - section: "§9 Exabyte-scale verification economics"
+          yaml_file: "04_contracts_and_versioning.yaml"
+        - section: "§10 Milestones"
+          yaml_file: "05_rollout_and_ops.yaml"
+        - section: "§11 Business continuity"
+          yaml_file: "05_rollout_and_ops.yaml"
+        - section: "§12 References"
+          yaml_file: "01_problem_and_imports.yaml"
+
+  module_contract:
+    spine_role: "Interface boundary + verification economics + recursive composition safety"
+    laws_upheld_minimum:
+      - "LAW-01"
+      - "LAW-02"
+      - "LAW-03"
+      - "LAW-04"
+      - "LAW-05"
+      - "LAW-06"
+      - "LAW-07"
+      - "LAW-09"
+      - "LAW-10"
+      - "LAW-11"
+      - "LAW-12"
+      - "LAW-13"
+      - "LAW-15"
+    core_invariants_minimum:
+      - id: "HSI-INV-IDENTITY"
+        summary: "Self-certifying identity with O(log n) membership/non-membership proofs and bounded verifier work."
+      - id: "HSI-INV-PROOF-CARRYING"
+        summary: "No effect exists without receipt + envelope + capability + evidence hash + view commitment bindings."
+      - id: "HSI-INV-FAIL-CLOSED"
+        summary: "Mismatch/staleness/unknown/constraint violations deny actuation by default."
+      - id: "HSI-INV-RECURSION"
+        summary: "Bisimulation gate for N<=12; functorial observation law under composition rewrites."
+      - id: "HSI-INV-TIME"
+        summary: "HTF authority only: ledger lag and HTF envelopes govern freshness; wall time is non-authoritative."
+
+  binds_to_prd:
+    prd_id: "PRD-0010"
+    prd_base_path: "documents/prds/PRD-0010/"
+    requirement_registry_ref: "07_traceability.yaml#prd_traceability.requirement_registry"
+    evidence_bundle_ref: "12_evidence_bundle.yaml#prd_evidence_bundle.bundle"
+    prd_meta_ref: "00_meta.yaml#prd_meta"
+    secondary_prds:
+      - prd_id: "PRD-0009"
+        prd_base_path: "documents/prds/PRD-0009/"
+        rationale: "FAC orchestration and review economics integration."
+      - prd_id: "PRD-0001"
+        prd_base_path: "documents/prds/PRD-0001/"
+        rationale: "Foundational runtime and safety invariants."
+
+  protocol_profile:
+    id: "HSI-PROTOCOL-001"
+    applies: true
+    inherited_from_prd: false
+    profile_ref: "HOLONIC_SUBSTRATE_INTERFACE.md"
+
+  custody:
+    producing_agent_roles:
+      - "AGENT_AUTHOR"
+      - "AGENT_ARCHITECT"
+      - "AGENT_SECURITY_REVIEWER"
+    responsible_domains:
+      - "DOMAIN_KERNEL"
+      - "DOMAIN_DAEMON"
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_CONSENSUS"
+      - "DOMAIN_RELIABILITY"
+      - "DOMAIN_PROTOCOL"
+    authority_signoffs_required:
+      - "AUTH_ARCHITECTURE"
+      - "AUTH_SECURITY"
+      - "AUTH_RELIABILITY"
+
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"
+    related_rfcs:
+      - id: "RFC-0014"
+        relationship: "COMPOSES_WITH"
+        rationale: "BFT quorum-certified control-plane and checkpoint semantics."
+      - id: "RFC-0016"
+        relationship: "COMPOSES_WITH"
+        rationale: "HTF authority matrix and time-envelope semantics."
+      - id: "RFC-0019"
+        relationship: "BUILDS_ON"
+        rationale: "FAC/HMP artifacts and proof-carrying loop semantics."
+
+  implementation:
+    language: "Rust"
+    edition: "2024"
+    primary_crates:
+      - "apm2-core"
+      - "apm2-daemon"
+      - "apm2-cli"
+      - "apm2-holon"
+      - "xtask"

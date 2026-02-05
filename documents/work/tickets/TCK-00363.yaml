@@ -1,0 +1,62 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: TCK-00363
+    title: ReceiptPointerV1 and ReceiptMultiProofV1 default pointer path
+  binds:
+    prd_id: PRD-0010
+    rfc_id: RFC-0020
+    requirements:
+    - requirement_id: REQ-0017
+      requirement_ref: documents/rfcs/RFC-0020/requirements/REQ-0017.yaml#requirement
+    evidence_artifacts:
+    - evidence_id: EVID-0017
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0017.yaml#evidence_artifact
+    - evidence_id: EVID-0306
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0306.yaml#evidence_artifact
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_PROTOCOL
+    - DOMAIN_SECURITY
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00362
+      reason: Prerequisite per RFC-0020 ticket decomposition ordering
+  scope:
+    in_scope:
+    - Implement ReceiptPointerV1 with direct-signature or batch/FactRoot paths
+    - Implement ReceiptMultiProofV1 for compact multi-receipt membership proofs
+    - Update verifier and auditor tooling to accept equivalent direct vs batched semantics
+    out_of_scope:
+    - Hierarchy root-of-roots batching (TCK-00371)
+  plan:
+    steps:
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep
+      beyond out_of_scope list.
+    - 'Implement: Implement ReceiptPointerV1 with direct-signature or batch/FactRoot
+      paths'
+    - 'Implement: Implement ReceiptMultiProofV1 for compact multi-receipt membership
+      proofs'
+    - 'Implement: Update verifier and auditor tooling to accept equivalent direct
+      vs batched semantics'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression
+      risks per RFC-0020/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding
+      EVID-* artifact with concrete artifact pointers.
+  definition_of_done:
+    evidence_ids:
+    - EVID-0017
+    - EVID-0306
+    criteria:
+    - Cross-holon authoritative receipt references use ReceiptPointer by default
+    - Multiproof validation yields deterministic membership results
+    - Behavioral acceptance equivalence documented and tested
+  notes:
+    security: Fail-closed, least privilege, and explicit authority proofs are mandatory.
+    verification: Prefer deterministic tests, replay/CAS evidence, and bounded-resource
+      checks; avoid process-local assumptions.
+    general: Keep scope atomic to this ticket, preserve explicit dependency ordering,
+      and avoid introducing semantic drift from RFC-0020.

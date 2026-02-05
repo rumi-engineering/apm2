@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0012"
+  title: "Scale-envelope verifier-economics and anti-entropy controls"
+  category: "PERFORMANCE"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    VPHI MUST remain admissible at multi-exabyte to zettabyte evidence scale by
+    enforcing digest-first contracts, bounded anti-entropy behavior, tiered retention
+    manifests, and verifier-economics ceilings for compute share and receipt fanout.
+  rationale: |
+    At global scale, verification work and fanout costs become primary failure modes;
+    implicit scale assumptions are unsafe and non-auditable.
+  acceptance_criteria:
+    - "Anti-entropy boundedness proofs are present for required synchronization paths"
+    - "Verification compute share and receipt fanout remain within policy ceilings"
+    - "Tiered retention manifests preserve replay-equivalence integrity"
+    - "Unknown scale-control state is fail-closed for promotion paths"
+  evidence_ids: ["EVID-0010"]
+  source_refs:
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §0.6"
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §10.1"
+    - "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"

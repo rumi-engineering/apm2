@@ -1,0 +1,45 @@
+{
+  "schema": "cac.strategy.markdown_deprecation.v1",
+  "schema_version": "1.0.0",
+  "kind": "strategy.markdown_deprecation",
+  "meta": {
+    "deprecation_id": "STRAT-MD-DEPRECATION-0001",
+    "created_at": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+    "status": "active"
+  },
+  "payload": {
+    "policy": "Markdown strategy artifacts are deprecated and non-authoritative. CAC JSON artifacts are normative.",
+    "deprecated_artifacts": [
+      {
+        "legacy_path": "documents/strategy/README.md",
+        "replacement_path": "documents/strategy/MANIFEST.json",
+        "status": "deprecated"
+      },
+      {
+        "legacy_path": "documents/strategy/MASTER_STRATEGY.md",
+        "replacement_path": "documents/strategy/MASTER_STRATEGY.json",
+        "status": "deprecated"
+      },
+      {
+        "legacy_path": "documents/strategy/NORTH_STAR.md",
+        "replacement_path": "documents/strategy/NORTH_STAR.json",
+        "status": "deprecated"
+      },
+      {
+        "legacy_path": "documents/strategy/ROADMAP.md",
+        "replacement_path": "documents/strategy/ROADMAP.json",
+        "status": "deprecated"
+      },
+      {
+        "legacy_path": "documents/strategy/BUSINESS_PLAN.md",
+        "replacement_path": "documents/strategy/BUSINESS_PLAN.json",
+        "status": "deprecated"
+      },
+      {
+        "legacy_path": "documents/strategy/CAC_VALIDATION_REPORT.md",
+        "replacement_path": "documents/strategy/CAC_VALIDATION_REPORT.json",
+        "status": "deprecated"
+      }
+    ]
+  }
+}

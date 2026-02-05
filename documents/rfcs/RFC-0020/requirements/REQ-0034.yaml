@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0034"
+  title: "Digest-first HMP classes and admission receipts"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Inter-holon messaging MUST preserve WORK, EVIDENCE, and GOVERNANCE class semantics, default to digest-first payload references, and require AdmissionReceiptV1 (or ImportReceiptV1) for imported authoritative claims binding source cell_id, source anchor/range, verification method, and imported root/hash commitments.
+
+    Primary delivery ticket: TCK-00380
+  rationale: |
+    Separation of routing facts and acceptance facts is foundational for federated trust.
+  acceptance_criteria:
+    - "Routing facts and acceptance facts are operationally distinct"
+    - "Authoritative imports require typed AdmissionReceiptV1/ImportReceiptV1 objects bound to evidence and source verification metadata"
+    - "Unsolicited large payloads are dropped with bounded resource use"
+    - "Primary implementation ticket TCK-00380 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0034"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §7.3"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §2.4.0b"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §8.3"

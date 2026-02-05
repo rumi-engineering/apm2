@@ -1,0 +1,37 @@
+rfc_readme:
+  schema_version: "2026-02-05"
+  template_version: "2026-01-23"
+  description: |
+    RFC-0021 specifies the Venture Proving Holon Interface (VPHI): a parallel,
+    bounded subsystem that tests APM2 end-to-end by having a holon attempt to
+    build a profitable software company and emit machine-verifiable signals.
+
+    VPHI introduces a three-source intake model bound to Forge Admission Cycle (FAC):
+    - DEFECT: evidence-backed failures from venture operation,
+    - INTENT: feature requests/opportunities from venture operation,
+    - DRIFT: non-failure regressions in dependencies, model behavior, policy, or economics.
+
+    The RFC defines signal schemas, attention routing, FAC integration, and a
+    strategic AAT extension (AAT-BIZ) so business-domain feedback becomes
+    replayable gate evidence rather than narrative guidance.
+
+  primary_document:
+    path: "HOLONIC_VENTURE_PROVING_INTERFACE.md"
+    role: "Master normative specification"
+    resolution_hint: "Repository-resolved file path: documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+
+  decomposition:
+    - "00_meta.yaml: RFC metadata, strategy bindings, custody domains"
+    - "01_problem_and_imports.yaml: problem statement and imported constraints"
+    - "02_design_decisions.yaml: core architectural and protocol decisions"
+    - "03_trust_boundaries.yaml: trust model, isolation, anti-gaming boundaries"
+    - "04_contracts_and_versioning.yaml: signal/receipt schemas and compatibility rules"
+    - "05_rollout_and_ops.yaml: staged rollout and operational controls"
+    - "06_ticket_decomposition.yaml: initial implementation tickets"
+    - "07_test_and_evidence.yaml: test matrix and evidence artifacts"
+    - "08_risks_and_open_questions.yaml: key risks and unresolved questions"
+    - "09_governance_and_gates.yaml: gate portfolio and approval policy"
+
+  attachments:
+    - "requirements/: per-requirement files for traceability"
+    - "evidence_artifacts/: per-evidence artifact definitions"

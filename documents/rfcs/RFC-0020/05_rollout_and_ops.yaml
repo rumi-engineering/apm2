@@ -1,0 +1,181 @@
+rfc_rollout_and_ops:
+  schema_version: "2026-02-05"
+  template_version: "2026-01-23"
+
+  rollout_plan:
+    phases:
+      - id: "ROL-0001"
+        name: "S0 Contract manifest + observability"
+        steps:
+          - "Generate HSIContractManifestV1 from dispatch registry"
+          - "Bind cli_contract_hash in handshake/session start"
+          - "Enable mismatch telemetry and risk-tier gate behavior"
+        guardrails:
+          - "Tier0-1 warn/waive"
+          - "Tier2+ deny by default"
+        rollback_steps:
+          - "Revert to prior approved contract hash"
+          - "Force read-only mode for non-matching clients"
+        evidence_ids: ["EVID-0301"]
+
+      - id: "ROL-0002"
+        name: "S0.5 AdapterProfile + RoleSpec binding"
+        steps:
+          - "Require adapter_profile_hash + role_spec_hash in envelope/receipts"
+          - "Conformance harness for profile/role drift"
+        guardrails:
+          - "No authoritative actuation on profile drift"
+        rollback_steps:
+          - "pin last-known-good profile set"
+        evidence_ids: ["EVID-0302"]
+
+      - id: "ROL-0003"
+        name: "S0.75 Identity/certificates/directory foundations"
+        steps:
+          - "Land PublicKeyIdV1, KeySetIdV1, CellIdV1, HolonIdV1"
+          - "Implement Cell/Holon genesis and certificate artifacts"
+          - "Enforce identity proof on session open"
+        guardrails:
+          - "Tier2+ denies non-discovery messages without verified identity"
+        rollback_steps:
+          - "disable cross-cell authority routing, retain local read-only mode"
+        evidence_ids: ["EVID-0303"]
+
+      - id: "ROL-0004"
+        name: "S0.9 Identity grammar + proof economics"
+        steps:
+          - "Freeze parser grammar and cross-language conformance vectors"
+          - "Introduce IdentityProofProfileV1 and verifier cache rules"
+          - "Adopt revocation-wins CRDT convergence law"
+        guardrails:
+          - "bounded proof bytes and node counts enforced pre-decode"
+        rollback_steps:
+          - "reject unsupported proof profiles and downgrade routing"
+        evidence_ids: ["EVID-0304"]
+
+      - id: "ROL-0005"
+        name: "S1/S2 Episode + capability enforcement"
+        steps:
+          - "Require EpisodeEnvelopeV1 and pre-tool stop/budget checks"
+          - "Enforce policy-resolved capability manifests in broker"
+        guardrails:
+          - "no requester-minted capabilities"
+        rollback_steps:
+          - "revert to prior policy resolver with deny-default behavior"
+        evidence_ids: ["EVID-0305"]
+
+      - id: "ROL-0006"
+        name: "S2.5/S2.6 Attestation batching and overhead gating"
+        steps:
+          - "Enable AuthoritySealV1 and ReceiptPointerV1 defaults"
+          - "Compose batch roots with RFC-0014 checkpoints (FactRoot path)"
+          - "Deploy hierarchical batch forests and multiproofs"
+        guardrails:
+          - "<1% p99 CPU/network overhead contract"
+          - "automatic fallback to direct verification on degradation"
+        rollback_steps:
+          - "disable batch path and revert to direct receipt signature verification"
+        evidence_ids: ["EVID-0306"]
+
+      - id: "ROL-0007"
+        name: "S3/S3.5 Capsule + no-bypass hardening"
+        steps:
+          - "Enforce linux-ns-v1 profile and context firewall"
+          - "Remove bypass paths for tool execution"
+        guardrails:
+          - "Tier3+ hard-fail on firewall violations"
+        rollback_steps:
+          - "containment-preserving rollback to prior hardened profile only"
+        evidence_ids: ["EVID-0307"]
+
+      - id: "ROL-0008"
+        name: "S4-S6.5 Tool hardening + policy inheritance"
+        steps:
+          - "Typed ToolKinds + shell allowlist"
+          - "Taint/classification propagation enforcement"
+          - "Delegation lattice meet enforcement for multi-holon inheritance"
+        guardrails:
+          - "Tier3+ rejects inputs below attestation/integrity floor"
+        rollback_steps:
+          - "freeze Tier3+ actuation and fall back to read-only supervisory mode"
+        evidence_ids: ["EVID-0308"]
+
+      - id: "ROL-0009"
+        name: "S7/S7.5/S8 Federation and epoch freshness"
+        steps:
+          - "Deploy signed CRDT directory + pull-only anti-entropy"
+          - "Issue EpochSealV1 with HTF anchors (optional VDF profile)"
+          - "Promote relay governance channels with strict budgets"
+        guardrails:
+          - "Tier2+ cross-cell authority fails closed on invalid/missing epoch seal"
+        rollback_steps:
+          - "degrade federation to read-only import cache; stop authority admissions"
+        evidence_ids: ["EVID-0309"]
+
+  operability:
+    runbooks:
+      - "Identity directory revocation/rotation runbook"
+      - "Batch verifier degradation fallback runbook"
+      - "Epoch seal replay/equivocation incident runbook"
+      - "Capsule escape containment and emergency stop runbook"
+      - "Cross-cell partition and anti-entropy recovery runbook"
+    alarms:
+      - "identity_staleness_denials_rate"
+      - "proof_decode_bound_violations"
+      - "batch_overhead_budget_breach"
+      - "governance_stop_path_latency_p99"
+      - "relay_unsolicited_payload_drops"
+    automated_response_notes:
+      - "On stop uncertainty: deny actuation within configured kernel-bound deadline"
+      - "On repeated proof failures: quarantine peer/cell route and require re-admission"
+      - "On overhead breach: auto-switch to direct verification mode"
+
+  observability:
+    metrics:
+      - "contract_mismatch_total"
+      - "identity_proof_verify_ms"
+      - "identity_head_lag_by_risk_tier"
+      - "authority_seal_verify_ms"
+      - "batch_proof_hash_ops"
+      - "factroot_qc_verify_ms"
+      - "selector_coverage_violation_total"
+      - "anti_entropy_roundtrip_ms"
+      - "stop_propagation_p99_ms"
+      - "evidence_bytes_emitted_total"
+    logs:
+      - "canonicalization_failures"
+      - "unknown_field_rejections"
+      - "delegation_meet_mismatch"
+      - "epoch_seal_monotonicity_violation"
+    traces:
+      - "session_open_identity_path"
+      - "tool_request_stop_budget_path"
+      - "receipt_pointer_verification_path"
+      - "federation_admission_path"
+    audit_events:
+      - "DirectoryHeadPublished"
+      - "IdentityProofRejected"
+      - "PermeabilityDelegationDenied"
+      - "BatchVerificationFallbackActivated"
+      - "EpochSealRejected"
+      - "EmergencyStopIssued"
+
+  business_continuity_bindings:
+    source_section_refs:
+      - "HOLONIC_SUBSTRATE_INTERFACE.md §11.1"
+      - "HOLONIC_SUBSTRATE_INTERFACE.md §11.2"
+      - "HOLONIC_SUBSTRATE_INTERFACE.md §11.3"
+      - "HOLONIC_SUBSTRATE_INTERFACE.md §11.4"
+    required_receipt_artifacts:
+      - "DrillReceiptV1 (apm2.drill_receipt.v1)"
+      - "EmergencyStopReceiptV1 (or equivalent governance stop receipt schema)"
+    rpo_rto_targets:
+      ledger:
+        rpo: "<= 5 minutes"
+        rto: "<= 30 minutes"
+      cas:
+        rpo: "<= 15 minutes"
+        rto: "<= 60 minutes"
+    stop_path_slos:
+      tier3_plus_stop_propagation_p99: "<= 2s"
+      stop_uncertainty_deny_deadline: "<= 250ms"

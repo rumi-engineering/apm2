@@ -619,6 +619,12 @@ mod tests {
     // Integration test that reads from actual /proc
     #[test]
     fn test_proc_reader_self() {
+        // `/proc` is Linux-specific; skip this integration check on platforms
+        // where procfs is unavailable.
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+
         // Read metrics for current process
         // Note: process::id() returns u32, we use try_into to safely convert
         let pid_raw: i32 = std::process::id().try_into().expect("PID overflow");

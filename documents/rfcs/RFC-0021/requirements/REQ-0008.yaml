@@ -1,0 +1,20 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0008"
+  title: "Kernel event provenance extension for venture defects"
+  category: "INTEGRATION"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    The kernel event model MUST support explicit provenance for venture-origin defect emissions,
+    either via DefectSource enum extension or equivalent authenticated event envelope metadata.
+  rationale: |
+    Provenance clarity is required for routing policy, audit, and strategic attribution.
+  acceptance_criteria:
+    - "Venture-origin defects are distinguishable from other defect sources"
+    - "Existing reducers remain backward-compatible"
+    - "Replay semantics remain deterministic"
+  evidence_ids: ["EVID-0004"]
+  source_refs:
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §5.1"
+    - "proto/kernel_events.proto"

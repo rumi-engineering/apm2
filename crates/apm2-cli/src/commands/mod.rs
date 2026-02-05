@@ -29,8 +29,8 @@
 /// # Reference
 ///
 /// - CWE-214: Invocation of Process Using Visible Sensitive Information
-/// - `SECRETS_MANAGEMENT.md`: "secrets are not passed via command-line
-///   arguments"
+/// - `documents/security/SECRETS_MANAGEMENT.cac.json`: "secrets are not passed
+///   via command-line arguments"
 // Note: This constant is not used programmatically (clap's `env` attribute reads
 // the env var directly). It is exposed for documentation and external callers.
 #[allow(dead_code)]

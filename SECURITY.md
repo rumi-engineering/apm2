@@ -6,13 +6,20 @@
     "url": "https://github.com/Anveio/apm2/security/advisories/new"
   },
   "response_times": {
-    "critical": "24h",
-    "high": "7d",
-    "medium": "30d"
+    "critical": "immediate",
+    "high": "24h",
+    "medium": "7d",
+    "low": "30d"
+  },
+  "source_of_truth": {
+    "runtime_semantics": "HOLONIC_SUBSTRATE_INTERFACE.md",
+    "operational_policy": "documents/security/SECURITY_POLICY.cac.json",
+    "incident_playbook": "documents/security/INCIDENT_RESPONSE.cac.json"
   },
   "refs": {
     "security_docs_root": "documents/security/",
-    "threat_model": "documents/security/THREAT_MODEL.md",
-    "signing_and_verification": "documents/security/SIGNING_AND_VERIFICATION.md"
+    "security_policy": "documents/security/SECURITY_POLICY.cac.json",
+    "threat_model": "documents/security/THREAT_MODEL.cac.json",
+    "signing_and_verification": "documents/security/SIGNING_AND_VERIFICATION.cac.json"
   }
 }

@@ -29,7 +29,7 @@ references[37]:
     purpose: "Mode #59: Dialectical Reasoning"
   - path: "@AGENTS.md"
     purpose: "Global Agent Instructions"
-  - path: "@documents/security/SECURITY_POLICY.md"
+  - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security Policy"
   - path: "@documents/theory/unified_theory.json"
     purpose: "Holonic Unified Theory"

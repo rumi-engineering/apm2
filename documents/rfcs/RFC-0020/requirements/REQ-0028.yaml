@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0028"
+  title: "Capsule containment with no ambient authority"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Tier3+ actuation MUST execute within admitted capsule profiles with namespace, seccomp, cgroup, and deny-by-default egress controls and no ambient OS authority.
+
+    Primary delivery ticket: TCK-00374
+  rationale: |
+    Containment boundaries are mandatory for safe autonomous actuation.
+  acceptance_criteria:
+    - "Tier3+ actuation executes only inside admitted capsule profile"
+    - "Capsule egress defaults to deny unless policy grants explicit route"
+    - "Escape attempts become blocking defects"
+    - "Primary implementation ticket TCK-00374 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0028"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §4"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §4.3"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 3"

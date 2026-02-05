@@ -1,0 +1,93 @@
+rfc_trust_boundaries:
+  schema_version: "2026-02-05"
+  template_version: "2026-01-23"
+
+  boundary_model:
+    - id: "TB-0001"
+      name: "VPH to SIAR"
+      trust_level: "UNTRUSTED_CLAIMS"
+      statement: "All inbound venture signals are non-authoritative until signature/schema/freshness/evidence checks pass."
+      required_controls:
+        - "schema validation"
+        - "signature verification"
+        - "time envelope freshness verification"
+        - "artifact digest resolution in CAS"
+
+    - id: "TB-0002"
+      name: "SIAR to FAC"
+      trust_level: "POLICY_CONSTRAINED"
+      statement: "SIAR can route and open work, but cannot authorize promotion, merge, or policy downgrade."
+      required_controls:
+        - "attention anti-downgrade checks"
+        - "work metadata integrity checks"
+        - "mandatory policy hash binding"
+
+    - id: "TB-0003"
+      name: "FAC to Promotion"
+      trust_level: "AUTHORITATIVE_IF_RECEIPT_BOUND"
+      statement: "Promotion is authoritative only when all required FAC and VPHI gate receipts are valid."
+      required_controls:
+        - "terminal verifier enforcement"
+        - "AAT-BIZ enforcement where required"
+        - "quorum and signature verification"
+
+  threat_model:
+    - id: "THR-0001"
+      name: "Signal forgery"
+      mechanism: "Injected or replayed venture signal artifacts"
+      mitigation:
+        - "domain-separated signatures"
+        - "freshness policy and replay windows"
+        - "CAS evidence binding"
+
+    - id: "THR-0002"
+      name: "Attention DoS"
+      mechanism: "High-volume low-quality signal flooding"
+      mitigation:
+        - "ingest rate limits"
+        - "budgeted queue partitioning"
+        - "source-scoped backpressure"
+
+    - id: "THR-0003"
+      name: "Policy downgrade"
+      mechanism: "Routing policy adjusted to force lower scrutiny"
+      mitigation:
+        - "anti-downgrade policy hashing"
+        - "dual-control approvals"
+        - "visibility via projection receipts"
+
+    - id: "THR-0004"
+      name: "Goodhart gaming"
+      mechanism: "Primary business KPI optimization while degrading countermetrics"
+      mitigation:
+        - "mandatory countermetric predicates"
+        - "independent verifier channels"
+        - "automatic fail on countermetric violation"
+
+    - id: "THR-0005"
+      name: "Time-authority spoofing"
+      mechanism: "Gate truth attempts using wall-clock or stale boundary artifacts"
+      mitigation:
+        - "HTF boundary signature verification"
+        - "wall-clock display-only enforcement"
+        - "automatic deny on stale or invalid authority artifacts"
+
+    - id: "THR-0006"
+      name: "Verifier-economics collapse at scale"
+      mechanism: "Receipt fanout and verification load exceed bounded policy envelopes"
+      mitigation:
+        - "compute share ceilings"
+        - "fanout amplification budgets"
+        - "anti-entropy boundedness proofs"
+
+  invariants:
+    - id: "INV-TB-001"
+      statement: "No direct VPH-to-merge path exists."
+    - id: "INV-TB-002"
+      statement: "Unknown or stale signal state cannot be routed to lower scrutiny."
+    - id: "INV-TB-003"
+      statement: "For strategy-critical work, absence of AAT-BIZ receipt is promotion-blocking."
+    - id: "INV-TB-004"
+      statement: "Gate truth is HTF-authoritative; wall-clock fields never authorize promotion."
+    - id: "INV-TB-005"
+      statement: "Scale-control unknown states are fail-closed for Tier2+ promotion paths."

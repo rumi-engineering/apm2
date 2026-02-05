@@ -1,0 +1,15 @@
+evidence_artifact:
+  schema_version: "2026-02-05"
+  id: "EVID-0008"
+  title: "Strategy coupling export and ledger evidence"
+  category: "INTEGRATION_TEST"
+  status: "PLANNED"
+  description: "Evidence that venture-derived summaries and coupling ledgers populate MSC-03, MSC-05, and MSC-06 strategy paths."
+  requirement_ids: ["REQ-0010"]
+  ticket_ids: ["TCK-VPHI-0008"]
+  expected_contents:
+    - "exported claim-linked summary artifacts for MSC-03, MSC-05, and MSC-06"
+    - "AAT-BIZ coupling ledger with signal-class obligations and promotion outcomes"
+    - "objective contract records with baseline/target/boundary/owner/predicate/evidence fields"
+    - "predicate evaluation logs for strategy paths"
+    - "missing-linkage defect emission traces"

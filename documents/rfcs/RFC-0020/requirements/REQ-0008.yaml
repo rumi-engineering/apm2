@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0008"
+  title: "Stable self-certifying cell and holon identity derivation"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    CellIdV1 and HolonIdV1 MUST derive from CellGenesisV1 and HolonGenesisV1 commitments such that operational key rotation preserves identity continuity.
+
+    Primary delivery ticket: TCK-00354
+  rationale: |
+    Stable IDs preserve audit graph continuity and delegation chain integrity.
+  acceptance_criteria:
+    - "ID derivation deterministic and collision-resistant under declared hash profile"
+    - "Rotation events preserve stable IDs"
+    - "Genesis artifacts are hash-addressed in CAS"
+    - "Primary implementation ticket TCK-00354 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0008"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.7.3"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.7.4"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.7.4b"

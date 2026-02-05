@@ -88,7 +88,7 @@ Guarantee:
   - `Semaphore` or bounded channel for task pools.
   - mandatory `timeout()` on all network/IPC futures.
   - explicit per-peer task budget.
-[PROVENANCE] THREAT_MODEL.md; RSK-1601.
+[PROVENANCE] documents/security/THREAT_MODEL.cac.json; RSK-1601.
 
 [CONTRACT: CTR-1005] Async Cancellation Safety.
 - REJECT IF: cancellation of a future can leave durable state (files, ledgers) in a corrupted or partial state.

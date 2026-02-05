@@ -1,0 +1,59 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: TCK-00360
+    title: Revocation-wins signed CRDT merge law
+  binds:
+    prd_id: PRD-0010
+    rfc_id: RFC-0020
+    requirements:
+    - requirement_id: REQ-0014
+      requirement_ref: documents/rfcs/RFC-0020/requirements/REQ-0014.yaml#requirement
+    evidence_artifacts:
+    - evidence_id: EVID-0014
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0014.yaml#evidence_artifact
+    - evidence_id: EVID-0304
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0304.yaml#evidence_artifact
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_CONSENSUS
+    - DOMAIN_SECURITY
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00359
+      reason: Prerequisite per RFC-0020 ticket decomposition ordering
+  scope:
+    in_scope:
+    - Implement signed CRDT directory merges with revocation-wins semantics
+    - Require explicit re-admission anchors for post-revocation activation
+    - Run partition/rejoin simulations with Byzantine reordering
+    out_of_scope:
+    - Anti-entropy transport protocol mechanics (TCK-00381)
+  plan:
+    steps:
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep
+      beyond out_of_scope list.
+    - 'Implement: Implement signed CRDT directory merges with revocation-wins semantics'
+    - 'Implement: Require explicit re-admission anchors for post-revocation activation'
+    - 'Implement: Run partition/rejoin simulations with Byzantine reordering'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression
+      risks per RFC-0020/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding
+      EVID-* artifact with concrete artifact pointers.
+  definition_of_done:
+    evidence_ids:
+    - EVID-0014
+    - EVID-0304
+    criteria:
+    - Concurrent updates converge deterministically
+    - Revoked identities cannot resurrect without explicit re-admission proof
+    - Byzantine ordering does not violate revocation-wins law
+  notes:
+    security: Fail-closed, least privilege, and explicit authority proofs are mandatory.
+    verification: Prefer deterministic tests, replay/CAS evidence, and bounded-resource
+      checks; avoid process-local assumptions.
+    general: Keep scope atomic to this ticket, preserve explicit dependency ordering,
+      and avoid introducing semantic drift from RFC-0020.

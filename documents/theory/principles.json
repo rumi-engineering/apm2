@@ -6,7 +6,8 @@
     "stable_id": "dcp://apm2.agents/principles/bundle@1",
     "classification": "PUBLIC",
     "created_at": "2026-02-04T22:30:00Z",
-    "description": "Operational principles for holonic design, providing guidance and best practices for agent-native systems."
+    "description": "Operational principles for holonic design, providing guidance and best practices for agent-native systems.",
+    "source_of_truth_ref": "HOLONIC_SUBSTRATE_INTERFACE.md"
   },
   "payload": {
     "version": "1.0.0",
@@ -121,7 +122,7 @@
         "name": "Batching",
         "title": "Amortize overhead but trade for tail latency",
         "formal": "batching lowers per-request fixed cost, increases waiting time. Queueing theory: batching inflates (W) even if service time drops.",
-        "apm2_mapping": "APM2 already batches ledger reads in reducer replay and rate-limits/paces pulses. But you need explicit **batch policies by risk tier**: high-risk actions (deploy, key ops) should *not* wait for throughput optimization. Low-risk telemetry can batch aggressively. Encode these policies as part of resource governance and gate scheduling.",
+        "apm2_mapping": "APM2 already batches ledger reads in reducer replay and rate-limits/paces pulses. But you need explicit **batch policies by risk tier**: use four Unified Theory tiers (T0 Experimental, T1 Internal, T2 Production, T3 Security-Critical) with explicit mapping to daemon Tier0..Tier4. High-risk actions (deploy, key ops) should *not* wait for throughput optimization, and Tier2+ authority checks must remain freshness/fail-closed. Low-risk telemetry can batch aggressively. Encode these policies as part of resource governance and gate scheduling.",
         "connections": [
           "PRIN-009",
           "PRIN-026",
@@ -452,7 +453,7 @@
         "name": "Containers Share A Kernel High Risk Executors May Need Microvms",
         "title": "Containers share a kernel; high-risk executors may need microVMs",
         "formal": "container isolation is weaker than VM isolation; kernel bugs and side channels remain.",
-        "apm2_mapping": "default should be: low-risk tools in containers; higher-risk actions in microVMs with stricter boundaries. Map “risk tier” directly to isolation class. If you don’t, prompt injection becomes “get root in shared kernel.”",
+        "apm2_mapping": "default should be: low-risk tools in containers; higher-risk actions in microVMs with stricter boundaries. Map risk tier directly to isolation class with explicit floors: Tier3+ MUST require sandbox isolation and hard-fail context firewall behavior; Tier1-Tier2 MAY be softer for developer ergonomics but remain OCAP + receipt-bound. If you don’t, prompt injection becomes “get root in shared kernel.”",
         "connections": [
           "PRIN-035",
           "PRIN-091",
@@ -1141,7 +1142,7 @@
         "name": "Policy-as-code With Signed Bundles",
         "title": "Distributable governance with consistent enforcement",
         "formal": "policy hash (h(P)) is the governance identity; enforcement requires exact match.",
-        "apm2_mapping": "every holon must enforce the same policy hash for a given risk tier before acting. Signed policy bundles prevent drift and downgrade.",
+        "apm2_mapping": "every holon must enforce the same policy hash and freshness policy for a given risk tier before acting. Signed policy bundles prevent drift and downgrade; stale/unverifiable policy state in Tier2+ must fail closed.",
         "connections": [
           "PRIN-041",
           "PRIN-060"
@@ -1152,7 +1153,7 @@
         "name": "Risk Classes + Autonomy Levels",
         "title": "Gate authority by evidence and risk",
         "formal": "define an authority lattice and a promotion function:\n[\nauthority = f(risk, evidence, budget_headroom)\n]",
-        "apm2_mapping": "APM2 already encodes risk tiers in factory logic; make it universal: suggest → patch → merge → deploy are different “effect classes” requiring escalating receipts and isolation.",
+        "apm2_mapping": "APM2 already encodes risk tiers in factory logic; make it universal with explicit four-tier Unified Theory semantics (T0..T3) and lossless mapping to daemon tiers (Tier0..Tier4): suggest → patch → merge → deploy are different effect classes requiring escalating receipts and isolation.",
         "connections": [
           "PRIN-063",
           "PRIN-089",

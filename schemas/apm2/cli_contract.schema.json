@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/cli_contract.schema.json",
+  "title": "CliContractManifestV1",
+  "description": "Content-addressed manifest describing the apm2 CLI syscall surface.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "generated_at",
+    "cli_version",
+    "commands",
+    "receipts"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.cli_contract.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "generated_at": {
+      "type": "string",
+      "description": "RFC3339 timestamp",
+      "maxLength": 64
+    },
+    "cli_version": {
+      "type": "object",
+      "required": [
+        "semver",
+        "build_hash"
+      ],
+      "properties": {
+        "semver": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "build_hash": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "route",
+          "stability",
+          "request_schema",
+          "response_schema",
+          "semantics"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "route": {
+            "type": "string",
+            "description": "Canonical command route e.g. 'hsi.context.malloc'",
+            "maxLength": 128
+          },
+          "stability": {
+            "type": "string",
+            "enum": [
+              "EXPERIMENTAL",
+              "STABLE",
+              "DEPRECATED"
+            ]
+          },
+          "request_schema": {
+            "type": "string",
+            "description": "Schema id or $ref path",
+            "maxLength": 256
+          },
+          "response_schema": {
+            "type": "string",
+            "description": "Schema id or $ref path",
+            "maxLength": 256
+          },
+          "semantics": {
+            "type": "object",
+            "required": [
+              "authoritative",
+              "idempotency"
+            ],
+            "properties": {
+              "authoritative": {
+                "type": "boolean"
+              },
+              "idempotency": {
+                "type": "string",
+                "enum": [
+                  "REQUIRED",
+                  "OPTIONAL",
+                  "FORBIDDEN"
+                ]
+              },
+              "side_effects": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                "default": []
+              },
+              "notes": {
+                "type": "string",
+                "maxLength": 4096
+              }
+            },
+            "unevaluatedProperties": false
+          }
+        },
+        "unevaluatedProperties": false
+      }
+    },
+    "receipts": {
+      "type": "object",
+      "required": [
+        "required_for_authoritative_commands"
+      ],
+      "properties": {
+        "required_for_authoritative_commands": {
+          "type": "boolean",
+          "const": true
+        },
+        "receipt_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "default": []
+        }
+      },
+      "unevaluatedProperties": false
+    }
+  },
+  "unevaluatedProperties": false
+}

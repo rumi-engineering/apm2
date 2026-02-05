@@ -4,7 +4,7 @@
   "title": "SecurityPolicy",
   "description": "Token-efficient security policy summary for agents (kept as SECURITY.md containing JSON).",
   "type": "object",
-  "required": ["schema", "schema_version", "reporting", "response_times", "refs"],
+  "required": ["schema", "schema_version", "reporting", "response_times", "source_of_truth", "refs"],
   "properties": {
     "schema": { "type": "string", "const": "apm2.security_policy.v1" },
     "schema_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
@@ -19,11 +19,22 @@
     },
     "response_times": {
       "type": "object",
-      "required": ["critical", "high", "medium"],
+      "required": ["critical", "high", "medium", "low"],
       "properties": {
         "critical": { "type": "string", "minLength": 1, "maxLength": 16 },
         "high": { "type": "string", "minLength": 1, "maxLength": 16 },
-        "medium": { "type": "string", "minLength": 1, "maxLength": 16 }
+        "medium": { "type": "string", "minLength": 1, "maxLength": 16 },
+        "low": { "type": "string", "minLength": 1, "maxLength": 16 }
+      },
+      "additionalProperties": false
+    },
+    "source_of_truth": {
+      "type": "object",
+      "required": ["runtime_semantics", "operational_policy", "incident_playbook"],
+      "properties": {
+        "runtime_semantics": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "operational_policy": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "incident_playbook": { "type": "string", "minLength": 1, "maxLength": 256 }
       },
       "additionalProperties": false
     },
@@ -32,6 +43,7 @@
       "required": ["security_docs_root"],
       "properties": {
         "security_docs_root": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "security_policy": { "type": "string", "minLength": 1, "maxLength": 256 },
         "threat_model": { "type": "string", "minLength": 1, "maxLength": 256 },
         "signing_and_verification": { "type": "string", "minLength": 1, "maxLength": 256 }
       },

@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0029"
+  title: "Context firewall and TOCTOU integrity"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Context access MUST be constrained by ContextPack commitments and TOCTOU hash checks; Tier3+ violations MUST terminate execution and emit defects.
+
+    Primary delivery ticket: TCK-00375
+  rationale: |
+    Prompt-injection and context-poisoning resistance requires strict contextual integrity controls.
+  acceptance_criteria:
+    - "Out-of-pack context access always denied and logged"
+    - "TOCTOU mismatches are detected before tool execution"
+    - "Tier3+ violations terminate with mandatory defect emission"
+    - "Primary implementation ticket TCK-00375 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0029"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §4.5"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §5.3"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 3"

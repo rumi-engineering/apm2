@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0032"
+  title: "Dual lattice taint and confidentiality enforcement"
+  category: "SECURITY"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    Runtime policy MUST propagate taint and confidentiality labels through context, tool, and evidence flows and require explicit declassification receipts for confidentiality downgrades.
+
+    Primary delivery ticket: TCK-00378
+  rationale: |
+    Dual-lattice semantics preserve integrity and confidentiality simultaneously under recursion.
+  acceptance_criteria:
+    - "Tier3+ actuators reject untrusted or over-confidential inputs"
+    - "Declassification requires explicit policy and receipt emission"
+    - "Secret leakage adversarial tests pass"
+    - "Primary implementation ticket TCK-00378 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0032"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §6.4.1"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §6.4.1c"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 6"

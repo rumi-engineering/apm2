@@ -1,0 +1,20 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0007"
+  title: "Attention anti-downgrade invariant"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Attention routing MUST enforce anti-downgrade semantics: risk/uncertainty ambiguity can only
+    preserve or increase scrutiny tier unless an explicit waiver with required authority is present.
+  rationale: |
+    Downgrade attacks can silently route high-risk work through weak gates.
+  acceptance_criteria:
+    - "Ambiguous signals route upward"
+    - "Unauthorized tier downgrades are rejected"
+    - "Authorized waivers are explicit, signed, and time-bounded"
+  evidence_ids: ["EVID-0002"]
+  source_refs:
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §4.2"
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §8.3"

@@ -1,0 +1,651 @@
+{
+  "schema": "apm2.security.policy_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "security.policy_document",
+  "meta": {
+    "stable_id": "dcp://apm2.security/doc/security-policy@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "owners": [
+      "security",
+      "platform"
+    ],
+    "source_of_truth_refs": [
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/security/THREAT_MODEL.cac.json",
+      "documents/security/INCIDENT_RESPONSE.cac.json"
+    ],
+    "last_aligned_rfc": "RFC-0020",
+    "replaces": "documents/security/SECURITY_POLICY.md",
+    "created_at": "2026-02-05T00:00:00Z",
+    "updated_at": "2026-02-05T00:00:00Z",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-SECURITY-GOVERNANCE",
+      "work_id": "DOC-SECURITY-RFC0020-ALIGN-20260205",
+      "source_receipts": []
+    }
+  },
+  "payload": {
+    "title": "Security Policy",
+    "authority_model": {
+      "precedence_rule": "Protocol and runtime security semantics defined by HOLONIC_SUBSTRATE_INTERFACE.md (RFC-0020) are authoritative on conflict.",
+      "authoritative_sources": [
+        {
+          "artifact": "HOLONIC_SUBSTRATE_INTERFACE.md",
+          "applies_to": [
+            "protocol_semantics",
+            "runtime_security_semantics",
+            "risk_tier_mapping",
+            "freshness_policy",
+            "authority_fact_authentication"
+          ]
+        }
+      ],
+      "translation_scope": [
+        "repository",
+        "ci_cd",
+        "incident_response",
+        "release_operations"
+      ]
+    },
+    "posture": {
+      "enforcement_mode": "FAIL_CLOSED",
+      "core_principles": [
+        {
+          "control_id": "SP-POSTURE-001",
+          "statement": "Ambiguity at enforcement boundaries denies or terminates authority-bearing actions.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RUNTIME",
+            "RELEASE"
+          ],
+          "failure_action": "DENY",
+          "verification": {
+            "method": "POLICY_REVIEW",
+            "evidence_refs": [
+              "documents/security/SECURITY_CHECKLIST.cac.json"
+            ]
+          }
+        },
+        {
+          "control_id": "SP-POSTURE-002",
+          "statement": "Security controls are release-blocking requirements, not advisory guidance.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "CI",
+            "RELEASE"
+          ],
+          "failure_action": "BLOCK_RELEASE",
+          "verification": {
+            "method": "CI_GATE"
+          }
+        },
+        {
+          "control_id": "SP-POSTURE-003",
+          "statement": "Claims are non-authoritative unless backed by authenticated receipts and evidence commitments.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RUNTIME",
+            "GOVERNANCE"
+          ],
+          "failure_action": "DENY",
+          "verification": {
+            "method": "RECEIPT_VERIFICATION",
+            "evidence_refs": [
+              "documents/rfcs/RFC-0020/requirements/REQ-0004.yaml",
+              "documents/rfcs/RFC-0020/requirements/REQ-0016.yaml"
+            ]
+          }
+        }
+      ]
+    },
+    "policy_modes": [
+      {
+        "mode_id": "MODE_HIGH_ASSURANCE",
+        "intent": "Default mode for release and any shipping change.",
+        "constraints": [
+          "Mandatory controls are enforced.",
+          "No discretionary bypass is allowed."
+        ]
+      },
+      {
+        "mode_id": "MODE_DEVELOPER",
+        "intent": "Local developer ergonomics only.",
+        "constraints": [
+          "May reduce local friction only.",
+          "Cannot weaken CI or release acceptance criteria."
+        ]
+      }
+    ],
+    "invariants": [
+      {
+        "control_id": "SP-INV-001",
+        "statement": "No ambient authority: side effects flow through daemon-mediated, capability-gated paths only.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION"
+        }
+      },
+      {
+        "control_id": "SP-INV-002",
+        "statement": "Proof-carrying effects: unproven effects are treated as non-existent.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME",
+          "GOVERNANCE"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION"
+        }
+      },
+      {
+        "control_id": "SP-INV-003",
+        "statement": "Digest-first boundaries: hashes plus selectors are used over raw payload propagation.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "POLICY_REVIEW"
+        }
+      },
+      {
+        "control_id": "SP-INV-004",
+        "statement": "Canonicalization and bounded decoding are required before trust decisions.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME",
+          "CI"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "POLICY_REVIEW",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0002.yaml",
+            "documents/rfcs/RFC-0020/requirements/REQ-0003.yaml"
+          ]
+        }
+      },
+      {
+        "control_id": "SP-INV-005",
+        "statement": "Delegation is strict-subset across scope, budgets, stop predicates, attestation floor, and classification constraints.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME",
+          "GOVERNANCE"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0027.yaml"
+          ]
+        }
+      },
+      {
+        "control_id": "SP-INV-006",
+        "statement": "Freshness enforcement is risk-aware across identity, policy, and stop-state authority.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME",
+          "GOVERNANCE"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0015.yaml",
+            "documents/rfcs/RFC-0020/requirements/REQ-0018.yaml"
+          ]
+        }
+      }
+    ],
+    "identity_and_freshness": {
+      "requirements": [
+        {
+          "control_id": "SP-ID-001",
+          "statement": "Authority-bearing identities are self-certifying and proof-carrying, including IdentityProofV1 and authenticated directory heads.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RUNTIME"
+          ],
+          "failure_action": "DENY",
+          "verification": {
+            "method": "RECEIPT_VERIFICATION",
+            "evidence_refs": [
+              "documents/rfcs/RFC-0020/requirements/REQ-0010.yaml",
+              "documents/rfcs/RFC-0020/requirements/REQ-0011.yaml"
+            ]
+          }
+        },
+        {
+          "control_id": "SP-ID-002",
+          "statement": "Tier2+ actuation fails closed on stale or unverifiable identity, policy, or stop-state authority per FreshnessPolicyV1.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RUNTIME"
+          ],
+          "minimum_risk_tier": "Tier2",
+          "failure_action": "DENY",
+          "verification": {
+            "method": "RECEIPT_VERIFICATION",
+            "evidence_refs": [
+              "documents/rfcs/RFC-0020/requirements/REQ-0018.yaml"
+            ]
+          }
+        }
+      ],
+      "fact_authentication_methods": [
+        {
+          "method": "DIRECT_SIGNATURE",
+          "constraints": [
+            "Receipt verification must remain anchored to trusted authority roots."
+          ]
+        },
+        {
+          "method": "AUTHORITY_SEAL_V1",
+          "constraints": [
+            "Merkle-batched proof paths are allowed.",
+            "Verification remains ledger or quorum anchored for freshness and revocation semantics."
+          ]
+        }
+      ]
+    },
+    "risk_tier_model": {
+      "unified_theory_tiers": [
+        {
+          "tier": "T0",
+          "label": "Experimental"
+        },
+        {
+          "tier": "T1",
+          "label": "Internal"
+        },
+        {
+          "tier": "T2",
+          "label": "Production"
+        },
+        {
+          "tier": "T3",
+          "label": "Security-Critical"
+        }
+      ],
+      "daemon_risk_tiers": [
+        "Tier0",
+        "Tier1",
+        "Tier2",
+        "Tier3",
+        "Tier4"
+      ],
+      "mapping_requirements": [
+        {
+          "control_id": "SP-TIER-001",
+          "statement": "Mappings between Unified Theory tiers and daemon RiskTier values must be explicit and lossless at policy boundaries.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "GOVERNANCE",
+            "RUNTIME"
+          ],
+          "failure_action": "DENY",
+          "verification": {
+            "method": "POLICY_REVIEW"
+          }
+        }
+      ]
+    },
+    "runtime_controls": [
+      {
+        "control_id": "SP-RUNTIME-001",
+        "statement": "Tier3+ actions require sandbox isolation and hard-fail context firewall behavior.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME"
+        ],
+        "minimum_risk_tier": "Tier3",
+        "failure_action": "TERMINATE",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0028.yaml",
+            "documents/rfcs/RFC-0020/requirements/REQ-0029.yaml"
+          ]
+        }
+      },
+      {
+        "control_id": "SP-RUNTIME-002",
+        "statement": "Tier2+ authority checks require verified identity freshness and stop-state freshness before actuation.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME"
+        ],
+        "minimum_risk_tier": "Tier2",
+        "failure_action": "DENY",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0005.yaml",
+            "documents/rfcs/RFC-0020/requirements/REQ-0015.yaml"
+          ]
+        }
+      },
+      {
+        "control_id": "SP-RUNTIME-003",
+        "statement": "Integrity and confidentiality gates are both enforced on boundary emissions using dual-lattice control.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "POLICY_REVIEW",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0032.yaml"
+          ]
+        }
+      },
+      {
+        "control_id": "SP-RUNTIME-004",
+        "statement": "Prompt-injection resilience is mandatory at tool and context boundaries with policy-enforced taint and classification propagation.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "POLICY_REVIEW",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0030.yaml",
+            "documents/rfcs/RFC-0020/requirements/REQ-0032.yaml"
+          ]
+        }
+      },
+      {
+        "control_id": "SP-RUNTIME-005",
+        "statement": "Anti-entropy authority flow remains pull-only and budget-bound across episode, cell, and relay scopes; byzantine relays cannot force authority admission.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME",
+          "GOVERNANCE"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0035.yaml",
+            "documents/security/consensus-runbook.cac.json"
+          ]
+        }
+      },
+      {
+        "control_id": "SP-RUNTIME-006",
+        "statement": "Anti-entropy budget exceedance is fail-closed: authority-bearing actuation is denied and a defect record is emitted.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME"
+        ],
+        "failure_action": "DENY",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0035.yaml",
+            "documents/security/consensus-runbook.cac.json"
+          ]
+        }
+      },
+      {
+        "control_id": "SP-RUNTIME-007",
+        "statement": "Tier3+ stop-path safety loop enforces stop propagation p99 <= 2000ms and stop uncertainty deny <= 250ms; violations emit defects and block ratchet promotion.",
+        "normative_level": "MUST",
+        "surfaces": [
+          "RUNTIME",
+          "GOVERNANCE"
+        ],
+        "minimum_risk_tier": "Tier3",
+        "failure_action": "TERMINATE",
+        "verification": {
+          "method": "RECEIPT_VERIFICATION",
+          "evidence_refs": [
+            "documents/rfcs/RFC-0020/requirements/REQ-0036.yaml",
+            "documents/security/consensus-runbook.cac.json"
+          ]
+        }
+      }
+    ],
+    "release_integrity": {
+      "requirements": [
+        {
+          "control_id": "SP-REL-001",
+          "statement": "Release artifacts are signed using Sigstore keyless signing via GitHub Actions OIDC, publishing .sig and .pem for each artifact.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RELEASE",
+            "CI"
+          ],
+          "failure_action": "BLOCK_RELEASE",
+          "verification": {
+            "method": "RELEASE_GATE"
+          }
+        },
+        {
+          "control_id": "SP-REL-002",
+          "statement": "SLSA provenance generation and verification are required for releases.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RELEASE",
+            "CI"
+          ],
+          "failure_action": "BLOCK_RELEASE",
+          "verification": {
+            "method": "RELEASE_GATE"
+          }
+        },
+        {
+          "control_id": "SP-REL-003",
+          "statement": "SBOM outputs in SPDX and CycloneDX formats are required for releases.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RELEASE",
+            "CI"
+          ],
+          "failure_action": "BLOCK_RELEASE",
+          "verification": {
+            "method": "RELEASE_GATE"
+          }
+        },
+        {
+          "control_id": "SP-REL-004",
+          "statement": "Accepted release artifacts require identity-constrained verification using issuer and certificate identity constraints.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RELEASE"
+          ],
+          "failure_action": "BLOCK_RELEASE",
+          "verification": {
+            "method": "RELEASE_GATE"
+          }
+        }
+      ]
+    },
+    "dependency_and_build_governance": {
+      "security_gates": [
+        {
+          "gate_id": "SP-GATE-CLIPPY",
+          "command": "cargo clippy --all-targets -- -D warnings",
+          "failure_action": "BLOCK_RELEASE"
+        },
+        {
+          "gate_id": "SP-GATE-DENY",
+          "command": "cargo deny check",
+          "failure_action": "BLOCK_RELEASE"
+        },
+        {
+          "gate_id": "SP-GATE-AUDIT",
+          "command": "cargo audit",
+          "failure_action": "BLOCK_RELEASE"
+        }
+      ],
+      "dependency_policies": [
+        {
+          "control_id": "SP-DEP-001",
+          "statement": "No known RustSec vulnerabilities are allowed without explicit mitigation or waiver workflow.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "CI",
+            "RELEASE"
+          ],
+          "failure_action": "BLOCK_RELEASE",
+          "verification": {
+            "method": "CI_GATE"
+          }
+        },
+        {
+          "control_id": "SP-DEP-002",
+          "statement": "Dependency graph changes must comply with license policy and banned-crate policy.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "CI",
+            "REPOSITORY"
+          ],
+          "failure_action": "BLOCK_RELEASE",
+          "verification": {
+            "method": "CI_GATE"
+          }
+        },
+        {
+          "control_id": "SP-DEP-003",
+          "statement": "Unexpected lockfile drift is treated as a security-relevant event.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "CI",
+            "REPOSITORY"
+          ],
+          "failure_action": "ESCALATE",
+          "verification": {
+            "method": "POLICY_REVIEW"
+          }
+        }
+      ]
+    },
+    "secrets_and_disclosure": {
+      "secrets_controls": [
+        {
+          "control_id": "SP-SECRET-001",
+          "statement": "Plaintext secret storage in the repository is prohibited.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "REPOSITORY",
+            "CI"
+          ],
+          "failure_action": "ESCALATE",
+          "verification": {
+            "method": "CI_GATE"
+          }
+        },
+        {
+          "control_id": "SP-SECRET-002",
+          "statement": "Secret material must not appear in logs, error surfaces, or release artifacts.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RUNTIME",
+            "RELEASE",
+            "CI"
+          ],
+          "failure_action": "ESCALATE",
+          "verification": {
+            "method": "INCIDENT_AUDIT"
+          }
+        },
+        {
+          "control_id": "SP-SECRET-003",
+          "statement": "Runtime secrets come from platform stores and CI secrets come from controlled secret managers only.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "RUNTIME",
+            "CI"
+          ],
+          "failure_action": "DENY",
+          "verification": {
+            "method": "POLICY_REVIEW"
+          }
+        }
+      ],
+      "vulnerability_process": [
+        {
+          "control_id": "SP-VULN-001",
+          "statement": "Security reports are acknowledged within 48 hours.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "INCIDENT_RESPONSE"
+          ],
+          "failure_action": "ESCALATE",
+          "verification": {
+            "method": "INCIDENT_AUDIT"
+          }
+        },
+        {
+          "control_id": "SP-VULN-002",
+          "statement": "Severity handling follows the containment targets defined in INCIDENT_RESPONSE.cac.json.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "INCIDENT_RESPONSE"
+          ],
+          "failure_action": "ESCALATE",
+          "verification": {
+            "method": "INCIDENT_AUDIT",
+            "evidence_refs": [
+              "documents/security/INCIDENT_RESPONSE.cac.json"
+            ]
+          }
+        },
+        {
+          "control_id": "SP-VULN-003",
+          "statement": "Coordinated disclosure is handled through GitHub Security Advisories and public disclosure follows patch readiness.",
+          "normative_level": "MUST",
+          "surfaces": [
+            "INCIDENT_RESPONSE",
+            "RELEASE"
+          ],
+          "failure_action": "ESCALATE",
+          "verification": {
+            "method": "INCIDENT_AUDIT"
+          }
+        }
+      ]
+    },
+    "cross_document_bindings": {
+      "incident_response": "documents/security/INCIDENT_RESPONSE.cac.json",
+      "threat_model": "documents/security/THREAT_MODEL.cac.json",
+      "signing_and_verification": "documents/security/SIGNING_AND_VERIFICATION.cac.json",
+      "security_checklist": "documents/security/SECURITY_CHECKLIST.cac.json"
+    },
+    "scale_profile": {
+      "capacity_target": "multi-exabyte",
+      "verification_economics": [
+        "Batch authentication paths are preferred where high-volume authoritative receipts are emitted.",
+        "Identity proofs and receipt membership proofs must remain logarithmic under active policy constraints.",
+        "RFC-0020 requirement traceability is embedded in control verification evidence_refs to keep coverage inside primary policy artifacts.",
+        "Verifier cache contracts are required to prevent repeated full-cost verification."
+      ],
+      "bounded_decoding": [
+        "All boundary decoders apply pre-decode size bounds and post-decode collection bounds.",
+        "Decode ambiguity or overflow is fail-closed for authority-bearing paths.",
+        "Unknown-field handling follows strict policy by artifact type and trust surface."
+      ]
+    },
+    "cryptography_posture": {
+      "pqc_status": "DEFERRED",
+      "pqc_note": "Post-quantum cryptography migration is deferred; current controls follow RFC-0020 trust, freshness, and authority-seal/signature semantics."
+    }
+  }
+}

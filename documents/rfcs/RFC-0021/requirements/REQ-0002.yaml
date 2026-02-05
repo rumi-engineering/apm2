@@ -1,0 +1,19 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0002"
+  title: "Deterministic attention scoring and tier routing"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    SIAR MUST compute attention tiers deterministically from typed signal inputs and
+    signed policy bundles. Equivalent inputs MUST produce equivalent route outputs.
+  rationale: |
+    Non-deterministic routing undermines replayability and enables hidden policy drift.
+  acceptance_criteria:
+    - "Identical input bundles produce identical attention_tier and route_type"
+    - "Policy version/hash is captured in AttentionDecisionReceiptV1"
+    - "Routing decisions are replayable from persisted artifacts"
+  evidence_ids: ["EVID-0002"]
+  source_refs:
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §4"

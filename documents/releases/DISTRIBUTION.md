@@ -128,7 +128,7 @@ slsa-verifier verify-artifact \
   apm2-linux-x86_64
 ```
 
-See [../security/SIGNING_AND_VERIFICATION.md](../security/SIGNING_AND_VERIFICATION.md) for complete verification details.
+See [../security/SIGNING_AND_VERIFICATION.cac.json](../security/SIGNING_AND_VERIFICATION.cac.json) for complete verification details.
 
 ## Quick Download Scripts
 
@@ -273,5 +273,5 @@ gh release download dev --repo USER/apm2 --pattern 'apm2-linux-x86_64'
 
 - [Release Channels](RELEASE_CHANNELS.md) - Channel details and comparison
 - [Artifact Promotion](ARTIFACT_PROMOTION.md) - How artifacts flow through channels
-- [Signing & Verification](../security/SIGNING_AND_VERIFICATION.md) - Sigstore details
-- [Release Procedure](../security/RELEASE_PROCEDURE.md) - Stable release process
+- [Signing & Verification](../security/SIGNING_AND_VERIFICATION.cac.json) - Sigstore details
+- [Release Procedure](../security/RELEASE_PROCEDURE.cac.json) - Stable release process

@@ -1,0 +1,193 @@
+{
+  "schema": "apm2.security.threat_model_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "security.threat_model_document",
+  "meta": {
+    "stable_id": "dcp://apm2.security/doc/threat-model@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "source_of_truth_refs": [
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/security/NETWORK_DEFENSE.cac.json"
+    ],
+    "last_aligned_rfc": "RFC-0020",
+    "replaces": "documents/security/THREAT_MODEL.md",
+    "created_at": "2026-02-05T00:00:00Z",
+    "updated_at": "2026-02-05T00:00:00Z",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-SECURITY-GOVERNANCE",
+      "work_id": "DOC-SECURITY-RFC0020-ALIGN-20260205",
+      "source_receipts": []
+    }
+  },
+  "payload": {
+    "title": "Threat Model",
+    "source_of_truth": {
+      "artifact": "HOLONIC_SUBSTRATE_INTERFACE.md",
+      "scope": "Holonic boundary authority, truth admission, and side-effect safety semantics."
+    },
+    "adversary_assumptions": [
+      "Heterogeneous peers include honest, buggy, malicious, and partitioned nodes.",
+      "Byzantine relays and federation peers are possible.",
+      "Supply-chain and CI identity compromise attempts occur.",
+      "Prompt-injection and metric-gaming attacks target control loops."
+    ],
+    "security_boundary": "Trust only what is cryptographically and procedurally provable at holon boundaries.",
+    "primary_attack_surfaces": [
+      {
+        "surface_id": "TM-SURFACE-01",
+        "name": "Channel Misuse",
+        "description": "Misuse across DISCOVERY, HANDSHAKE, WORK, EVIDENCE, and GOVERNANCE channels."
+      },
+      {
+        "surface_id": "TM-SURFACE-02",
+        "name": "Identity and Authentication",
+        "description": "Session open, delegation, directory proof, and freshness-check paths."
+      },
+      {
+        "surface_id": "TM-SURFACE-03",
+        "name": "Tool and Context Mediation",
+        "description": "Capsule and tool mediation boundaries where ambient execution could bypass controls."
+      },
+      {
+        "surface_id": "TM-SURFACE-04",
+        "name": "Cross-Cell Replication",
+        "description": "Anti-entropy admission, replay, and equivocation surfaces across cells/federation."
+      },
+      {
+        "surface_id": "TM-SURFACE-05",
+        "name": "Release Supply Chain",
+        "description": "Signing identity, provenance, and dependency graph integrity surfaces."
+      }
+    ],
+    "threat_classes": [
+      {
+        "class_id": "TM-CLASS-01",
+        "name": "Identity, Replay, and Revocation Failures",
+        "threats": [
+          "Identity spoofing and stale identity acceptance.",
+          "Replay of authority-bearing claims.",
+          "Revocation ambiguity under partitions."
+        ],
+        "required_controls": [
+          "Self-certifying identities with proof-carrying membership via IdentityProofV1.",
+          "Authenticated directory heads with bounded verification economics.",
+          "FreshnessPolicyV1 enforcement with Tier2+ fail-closed denial on stale or unverifiable identity state.",
+          "Session keys bound through explicit SessionKeyDelegationV1 handshake bindings."
+        ]
+      },
+      {
+        "class_id": "TM-CLASS-02",
+        "name": "Delegation and Confused-Deputy Escalation",
+        "threats": [
+          "Capability laundering and scope widening.",
+          "Stop predicate weakening.",
+          "Over-broad delegated authority propagation."
+        ],
+        "required_controls": [
+          "PermeabilityReceiptV1 is the only admissible delegation entrance.",
+          "Strict-subset delegation via authority meet semantics across constrained dimensions.",
+          "Mandatory receipt and envelope binding for delegated episodes and authoritative emissions.",
+          "Deny-by-default on missing, expired, or revoked permeability receipts."
+        ]
+      },
+      {
+        "class_id": "TM-CLASS-03",
+        "name": "Fact Forgery and Verification-Cost Exhaustion",
+        "threats": [
+          "Forged receipts and unverifiable narrative claims.",
+          "Verification DoS by proof amplification."
+        ],
+        "required_controls": [
+          "Authoritative facts authenticated by direct signatures or AuthoritySealV1.",
+          "Batch roots anchored to ledger, quorum, or time commitments.",
+          "Identity proofs and receipt membership proofs that satisfy bounded logarithmic verification costs.",
+          "Verifier cache contracts with bounded decoding before trust decisions."
+        ]
+      },
+      {
+        "class_id": "TM-CLASS-04",
+        "name": "Byzantine Federation and Anti-Entropy Abuse",
+        "threats": [
+          "Equivocation and malicious forwarding.",
+          "Unsolicited payload floods.",
+          "Replay of stale seals."
+        ],
+        "required_controls": [
+          "Pull-based anti-entropy with bounded range and proof sizes.",
+          "Signed and admitted control-plane facts; data-plane bytes are non-authoritative until admitted.",
+          "Admission receipts required for cross-cell imports.",
+          "EpochSealV1 or equivalent VDF-backed validation on adversarial federation links."
+        ]
+      },
+      {
+        "class_id": "TM-CLASS-05",
+        "name": "Prompt Injection and Data Exfiltration",
+        "threats": [
+          "Untrusted content steering high-impact actuators.",
+          "Confidential leakage via logs, tools, and cross-holon messages."
+        ],
+        "required_controls": [
+          "Tool mediation only with no raw ambient execution path.",
+          "Dual-lattice taint and confidentiality enforcement at boundary emissions.",
+          "Context firewall and allowlist-bound reads with higher-tier hard-fail behavior.",
+          "Strict egress controls plus selector-based digest-first retrieval."
+        ]
+      },
+      {
+        "class_id": "TM-CLASS-06",
+        "name": "Availability and Economic Attacks",
+        "threats": [
+          "Parser and resource exhaustion.",
+          "Recursive spawn storms and throughput collapse."
+        ],
+        "required_controls": [
+          "Pre-decode byte caps and post-decode collection bounds.",
+          "Per-episode, per-cell, and per-relay budgets with deny and receipt emission on exceedance.",
+          "Idempotency keys and precondition guards for side effects.",
+          "Backpressure and fanout caps to constrain recursive amplification."
+        ]
+      }
+    ],
+    "high_value_security_properties": [
+      "No actuation without verified capability, stop state, and Tier2+ fresh identity authority.",
+      "No unsigned or unauthenticated facts admitted as truth.",
+      "No delegation widening.",
+      "No bypass around daemon, tool broker, or capsule policy boundary."
+    ],
+    "operational_priorities": [
+      "Immediate containment for active compromise or Byzantine evidence.",
+      "Preservation of forensic evidence as signed or hashed artifacts with receipt pointers.",
+      "Fail-closed degradation under trust ambiguity.",
+      "Promotion of remediations only with regression and adversarial negative coverage."
+    ],
+    "scale_profile": {
+      "capacity_target": "multi-exabyte",
+      "verification_economics": {
+        "identity_proof_complexity": "O(log n)",
+        "receipt_membership_complexity": "O(log B)",
+        "batch_signature_or_quorum_amortization": "O(1) per batch family"
+      },
+      "bounded_decoding": [
+        "Apply pre-decode byte bounds for all boundary payloads.",
+        "Apply post-decode repeated-field and collection bounds.",
+        "Treat bound violations as fail-closed denials, not partial acceptance."
+      ],
+      "proof_size_controls": [
+        "Bound identity proof bytes and Merkle path lengths by policy.",
+        "Bound anti-entropy proof ranges and reject oversized proofs.",
+        "Prefer batched authority seal verification over per-receipt signature fanout at high volume."
+      ]
+    },
+    "cryptography_posture": {
+      "current_profile": "Current RFC-0020 profile uses self-certifying identities, signature or authority-seal fact authentication, and freshness policy enforcement.",
+      "pqc_status": "DEFERRED",
+      "pqc_note": "Post-quantum cryptography migration is explicitly deferred and out of RFC-0020 scope for current enforcement design."
+    }
+  }
+}

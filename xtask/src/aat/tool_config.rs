@@ -7,7 +7,7 @@
 //!
 //! 1. CLI flag `--ai-tool` (highest priority)
 //! 2. Environment variable `AAT_AI_TOOL`
-//! 3. Default: Gemini
+//! 3. Default: Codex
 
 use std::str::FromStr;
 use std::{env, fmt};
@@ -15,9 +15,9 @@ use std::{env, fmt};
 /// AI tool backends supported by AAT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AiTool {
-    /// Gemini CLI (default).
+    /// Codex CLI (default).
     #[default]
-    Gemini,
+    Codex,
     /// Claude Code CLI.
     ClaudeCode,
 }
@@ -27,7 +27,7 @@ impl AiTool {
     #[must_use]
     pub const fn command(&self) -> &'static str {
         match self {
-            Self::Gemini => "gemini",
+            Self::Codex => "codex",
             Self::ClaudeCode => "claude",
         }
     }
@@ -36,7 +36,7 @@ impl AiTool {
 impl fmt::Display for AiTool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Gemini => write!(f, "gemini"),
+            Self::Codex => write!(f, "codex"),
             Self::ClaudeCode => write!(f, "claude-code"),
         }
     }
@@ -52,7 +52,7 @@ impl fmt::Display for ParseAiToolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "invalid AI tool '{}': expected 'gemini' or 'claude-code'",
+            "invalid AI tool '{}': expected 'codex' or 'claude-code'",
             self.value
         )
     }
@@ -65,7 +65,7 @@ impl FromStr for AiTool {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "gemini" => Ok(Self::Gemini),
+            "codex" | "gemini" => Ok(Self::Codex),
             "claude-code" | "claude" => Ok(Self::ClaudeCode),
             _ => Err(ParseAiToolError {
                 value: s.to_string(),
@@ -85,11 +85,11 @@ impl AatToolConfig {
     /// Creates a new configuration from environment variables.
     ///
     /// Reads the `AAT_AI_TOOL` environment variable. Supported values:
-    /// - `gemini` (default)
+    /// - `codex` (default)
     /// - `claude-code` or `claude`
     ///
     /// If the environment variable is not set or contains an invalid value,
-    /// falls back to the default (Gemini).
+    /// falls back to the default (Codex).
     #[must_use]
     pub fn from_env() -> Self {
         let ai_tool = env::var("AAT_AI_TOOL")
@@ -126,27 +126,34 @@ mod tests {
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_ai_tool_default_is_gemini() {
-        assert_eq!(AiTool::default(), AiTool::Gemini);
+    fn test_ai_tool_default_is_codex() {
+        assert_eq!(AiTool::default(), AiTool::Codex);
     }
 
     #[test]
     fn test_ai_tool_command() {
-        assert_eq!(AiTool::Gemini.command(), "gemini");
+        assert_eq!(AiTool::Codex.command(), "codex");
         assert_eq!(AiTool::ClaudeCode.command(), "claude");
     }
 
     #[test]
     fn test_ai_tool_display() {
-        assert_eq!(format!("{}", AiTool::Gemini), "gemini");
+        assert_eq!(format!("{}", AiTool::Codex), "codex");
         assert_eq!(format!("{}", AiTool::ClaudeCode), "claude-code");
     }
 
     #[test]
-    fn test_ai_tool_from_str_gemini() {
-        assert_eq!("gemini".parse::<AiTool>().unwrap(), AiTool::Gemini);
-        assert_eq!("GEMINI".parse::<AiTool>().unwrap(), AiTool::Gemini);
-        assert_eq!("Gemini".parse::<AiTool>().unwrap(), AiTool::Gemini);
+    fn test_ai_tool_from_str_codex() {
+        assert_eq!("codex".parse::<AiTool>().unwrap(), AiTool::Codex);
+        assert_eq!("CODEX".parse::<AiTool>().unwrap(), AiTool::Codex);
+        assert_eq!("Codex".parse::<AiTool>().unwrap(), AiTool::Codex);
+    }
+
+    #[test]
+    fn test_ai_tool_from_str_legacy_gemini_alias() {
+        assert_eq!("gemini".parse::<AiTool>().unwrap(), AiTool::Codex);
+        assert_eq!("GEMINI".parse::<AiTool>().unwrap(), AiTool::Codex);
+        assert_eq!("Gemini".parse::<AiTool>().unwrap(), AiTool::Codex);
     }
 
     #[test]
@@ -167,7 +174,7 @@ mod tests {
     #[test]
     fn test_aat_tool_config_default() {
         let config = AatToolConfig::default();
-        assert_eq!(config.ai_tool, AiTool::Gemini);
+        assert_eq!(config.ai_tool, AiTool::Codex);
     }
 
     // Note: The following tests modify environment variables, which requires unsafe
@@ -182,18 +189,33 @@ mod tests {
             std::env::remove_var("AAT_AI_TOOL");
         }
         let config = AatToolConfig::from_env();
-        assert_eq!(config.ai_tool, AiTool::Gemini);
+        assert_eq!(config.ai_tool, AiTool::Codex);
     }
 
     #[test]
-    fn test_aat_tool_config_from_env_gemini() {
+    fn test_aat_tool_config_from_env_codex() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Mutex held, exclusive access to env var.
+        unsafe {
+            std::env::set_var("AAT_AI_TOOL", "codex");
+        }
+        let config = AatToolConfig::from_env();
+        assert_eq!(config.ai_tool, AiTool::Codex);
+        // SAFETY: Mutex held, exclusive access to env var.
+        unsafe {
+            std::env::remove_var("AAT_AI_TOOL");
+        }
+    }
+
+    #[test]
+    fn test_aat_tool_config_from_env_legacy_gemini_alias() {
         let _guard = ENV_MUTEX.lock().unwrap();
         // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::set_var("AAT_AI_TOOL", "gemini");
         }
         let config = AatToolConfig::from_env();
-        assert_eq!(config.ai_tool, AiTool::Gemini);
+        assert_eq!(config.ai_tool, AiTool::Codex);
         // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::remove_var("AAT_AI_TOOL");
@@ -223,7 +245,7 @@ mod tests {
             std::env::set_var("AAT_AI_TOOL", "invalid-tool");
         }
         let config = AatToolConfig::from_env();
-        assert_eq!(config.ai_tool, AiTool::Gemini);
+        assert_eq!(config.ai_tool, AiTool::Codex);
         // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::remove_var("AAT_AI_TOOL");
@@ -233,7 +255,7 @@ mod tests {
     #[test]
     fn test_aat_tool_config_with_override_none() {
         let config = AatToolConfig::default().with_override(None);
-        assert_eq!(config.ai_tool, AiTool::Gemini);
+        assert_eq!(config.ai_tool, AiTool::Codex);
     }
 
     #[test]
@@ -247,7 +269,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
-            std::env::set_var("AAT_AI_TOOL", "gemini");
+            std::env::set_var("AAT_AI_TOOL", "codex");
         }
         let config = AatToolConfig::from_env().with_override(Some(AiTool::ClaudeCode));
         assert_eq!(config.ai_tool, AiTool::ClaudeCode);

@@ -23,7 +23,8 @@
       "notes": [
         "Grand unified theory for APM2 agent-native holonic SDLC.",
         "Designed for high information compression: structured claims + explicit mappings to laws, mechanisms, and metrics.",
-        "All statements are intended to be operationalizable as contracts, gates, reducers, and defect counterexamples."
+        "All statements are intended to be operationalizable as contracts, gates, reducers, and defect counterexamples.",
+        "When this document conflicts with glossary-grounded HSI terms and contracts, the glossary is the source of truth and this document MUST be updated via explicit mapping or versioned migration notes."
       ],
       "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001"
     },
@@ -114,7 +115,7 @@
         "ENF-ORACLE-01": {
           "node_class": "NORMATIVE",
           "statement": "Open design questions (Q-*) MUST remain EXPLANATORY until resolved by an OracleRequest/Adjudication with receipt-backed evidence. Any resulting enforceable rule must be recorded as a new NORMATIVE node that references the adjudication resolution and evidence.",
-          "violation_class": "POLICY_VIOLATION",
+          "violation_class": "GOVERNANCE",
           "law_refs": [
             "LAW-01",
             "LAW-15"
@@ -137,33 +138,13 @@
             "LAW-05"
           ]
         },
-        "ENF-HMP-01": {
+        "ENF-HSI-ALIGN-01": {
           "node_class": "NORMATIVE",
-          "statement": "ASPIRATIONAL (until machine-checkable enforcement is implemented): Inter-holon messages MUST conform to the Holonic Mesh Protocol (HMP): envelope fields (protocol_id+version, message_class, message_id, hlc_timestamp, and any required commitments/receipts) MUST be present and schema-validated; unknown message classes or schema versions MUST be rejected (fail-closed).",
+          "statement": "Daemon-enforced semantics and schema contracts represented in the theory glossary are operational truth. Unified Theory abstractions MUST map losslessly; if semantics diverge, this document MUST either align or explicitly version the divergent abstraction and migration path.",
           "violation_class": "SCHEMA_VIOLATION",
           "law_refs": [
+            "LAW-01",
             "LAW-13",
-            "LAW-15",
-            "LAW-16"
-          ]
-        },
-        "ENF-COMPOSITION-01": {
-          "node_class": "NORMATIVE",
-          "statement": "ASPIRATIONAL (until machine-checkable enforcement is implemented): Holonic boundaries MUST be closed under composition: cross-boundary interaction MUST use the canonical channel classes and versioned schemas/contracts. New ad-hoc boundary primitives (including raw chat logs as interfaces) are prohibited; interface changes require explicit governance and a versioned contract reference.",
-          "violation_class": "INTERFACE_PROLIFERATION",
-          "law_refs": [
-            "LAW-05",
-            "LAW-07",
-            "LAW-16"
-          ]
-        },
-        "ENF-SUMMARY-01": {
-          "node_class": "NORMATIVE",
-          "statement": "ASPIRATIONAL (until machine-checkable enforcement is implemented): All SummaryReceipts MUST declare a loss profile and provide selectors that deterministically address omitted facts/evidence by hash or range. Summaries without zoom-in affordances MUST be treated as narrative and are non-authoritative for high-risk promotion.",
-          "violation_class": "MEASUREMENT_INTEGRITY",
-          "law_refs": [
-            "LAW-07",
-            "LAW-14",
             "LAW-15"
           ]
         }
@@ -289,16 +270,6 @@
             "LAW-06",
             "LAW-07",
             "LAW-15"
-          ],
-          "node_class": "EXPLANATORY"
-        },
-        "SEP-05": {
-          "name": "Interface closure over implementation freedom",
-          "statement": "Holonic boundaries are the engineering surface: keep boundary primitives fixed and minimal, while allowing unlimited internal complexity. A holon-of-holons MUST present the same boundary contract as a leaf holon (closure under composition), so recursion does not create new protocol primitives.",
-          "law_refs": [
-            "LAW-05",
-            "LAW-07",
-            "LAW-16"
           ],
           "node_class": "EXPLANATORY"
         }
@@ -645,28 +616,6 @@
           "LAW-15"
         ],
         "node_class": "BACKGROUND"
-      },
-      "PHY-10": {
-        "name": "Scale invariance: coarse-grained boundary signals are mandatory under recursion",
-        "statement": "Holarchies only scale if boundaries coarse-grain. A holon (leaf or aggregate) MUST communicate via stable, low-variety boundary signals (digests, commitments, receipts, summaries + selectors). If an interaction requires more detail than the boundary allows, the correct response is recursion (spawn/decompose) plus zoom-in by hash under capability—not widening the interface or exporting internal traces.",
-        "derived_rules": [
-          "treat cross-boundary bandwidth/attention as the scarce resource; optimize for digest-first exchange",
-          "never treat internal chat logs, scratchpads, or private state as boundary artifacts",
-          "prefer SummaryReceipts + selectors for routing and escalation; pull raw evidence only when demanded by risk tier",
-          "interface growth with holarchy depth is a scalability defect; composition must not add primitives"
-        ],
-        "mechanisms": [
-          "MECH-HOLON-MESH-PROTOCOL",
-          "MECH-INDEX-LAYERS",
-          "MECH-CONTEXTPACK",
-          "MECH-PERMEABILITY-RECEIPT"
-        ],
-        "law_refs": [
-          "LAW-07",
-          "LAW-10",
-          "LAW-16"
-        ],
-        "node_class": "BACKGROUND"
       }
     },
     "truth_topology": {
@@ -782,7 +731,7 @@
         "node_class": "NORMATIVE"
       },
       "monotone_vs_projection": {
-        "monotone_substrate": {
+      "monotone_substrate": {
           "statement": "Facts are monotone additions within a declared join-semilattice; truth is the least-upper-bound of all observed events and evidence.",
           "merge_algebra_requirements": [
             "Every domain MUST define a join operator (⊔) that is idempotent, commutative, and associative.",
@@ -836,33 +785,25 @@
           "name": "Interface Variety Control",
           "statement": "Supervisors control interface variety (typed signals/contracts), not internal complexity; this resolves Ashby's requisite variety at boundaries.",
           "node_class": "NORMATIVE"
-        },
-        "HB-06": {
-          "name": "Compositional Closure",
-          "statement": "Holonic interfaces are closed under composition: aggregates compress and summarize; they do not invent new boundary primitives. Boundary traffic is commitments/receipts/summaries with selectors; details are fetched by hash under delegated capability.",
-          "node_class": "NORMATIVE"
         }
       },
       "channels": {
         "notes": [
-          "Channel classes follow Principia Holonica: discovery/handshake/work/evidence/governance.",
-          "Discovery does not convey capabilities or authoritative claims; capabilities cross only via explicit handshake/permeability receipts.",
+          "Channel classes follow Principia Holonica: discovery/handshake/work/evidence.",
           "Each channel has distinct semantics, budgets, retention, and trust posture."
         ],
         "classes": {
           "CH-01": {
             "name": "discovery",
-            "trust": "low (unauthenticated)",
+            "trust": "low",
             "bandwidth": "low",
             "primary_value": [
-              "directory discovery (identity/locator/routing hints)",
-              "uncertainty reduction",
-              "routing hints"
+              "capability discovery",
+              "uncertainty reduction"
             ],
             "risks": [
-              "spoofing",
-              "spam",
-              "downgrade/impersonation attempts"
+              "malformed/malicious inputs",
+              "representation attacks"
             ],
             "governance": [
               "bounded by lease/budget",
@@ -912,25 +853,6 @@
               "tamper-evident receipts"
             ],
             "node_class": "NORMATIVE"
-          },
-          "CH-05": {
-            "name": "governance",
-            "trust": "high (signed/policy-bound)",
-            "bandwidth": "low",
-            "primary_value": [
-              "stop-order propagation",
-              "policy and interface-contract update notifications",
-              "ratchet coordination (enforce-with-waiver -> enforce-hard)"
-            ],
-            "risks": [
-              "downgrade attacks",
-              "unauthorized policy mutation"
-            ],
-            "governance": [
-              "MUST be signed and hash-bound to an attested policy bundle",
-              "audited + rate limited; prefer broadcast via commitments, not payload flooding"
-            ],
-            "node_class": "NORMATIVE"
           }
         },
         "node_class": "NORMATIVE"
@@ -964,9 +886,6 @@
       "stack_model": {
         "statement": "APM2 is a stack of nested control loops: (1) episode loop, (2) work substrate lifecycle loop, (3) recurrence/self-improvement loop.",
         "principle": "Each outer loop treats the inner loop as a plant with measurable outputs and controllable inputs; governance adjusts constraints based on feedback.",
-        "notes": [
-          "Aligns with the agentic-reasoning split between in-context (test-time orchestration) and post-training (policy optimization): the episode loop is in-context; the recurrence loop is post-training and must itself be governed and evidence-bearing."
-        ],
         "law_refs": [
           "LAW-01",
           "LAW-08",
@@ -1250,11 +1169,12 @@
       },
       "MECH-RECEIPTS": {
         "name": "Receipts (gate, merge, execution, summary)",
-        "role": "Signed, machine-readable acceptance proofs binding claims to evidence and inputs/outputs in an attested environment (command transcript/tool versions/env digest or their hashes).",
+        "role": "Authenticated, machine-readable acceptance proofs binding claims to evidence and inputs/outputs in an attested environment (command transcript/tool versions/env digest or their hashes). Authentication MAY be a direct signature or an AuthoritySeal over a Merkle batch root.",
         "properties": [
-          "tamper-evident (signed + hash-chained)",
+          "tamper-evident (direct signature OR authority seal; ledger/quorum anchored)",
           "binds decision to bundle_hash and input/output digests",
-          "includes replay/attestation metadata (toolchain versions, runner image digest, policy version)",
+          "includes replay and environment-attestation metadata (toolchain versions, runner image digest, policy version)",
+          "supports proof-compression via batched attestations with inclusion proofs",
           "required for authoritative promotion"
         ],
         "node_class": "NORMATIVE",
@@ -1284,11 +1204,11 @@
       },
       "MECH-DETERMINISM-ENVELOPE": {
         "name": "Determinism envelope",
-        "role": "Explicit boundary for replayability; nondeterminism is recorded as an input dimension (seed/versions) or treated as a defect.",
+        "role": "Explicit boundary for replayability; nondeterminism is recorded as an input dimension (seed/versions) and governs admissibility/escalation policy by risk tier.",
         "classes": [
-          "deterministic",
-          "probabilistic_bounded",
-          "non_replayable (treated as verification defect until stabilized)"
+          "Deterministic",
+          "ProbabilisticBounded",
+          "NonReplayable (allowed when explicitly declared; Tier2+ actuation requires strengthened gating/receipts)"
         ],
         "node_class": "NORMATIVE",
         "fact_bindings": {
@@ -1487,18 +1407,25 @@
       },
       "MECH-PERMEABILITY-RECEIPT": {
         "name": "PermeabilityReceipt (capability delegation across holonic boundaries)",
-        "role": "The only legal path for capabilities to cross a holonic boundary. A PermeabilityReceipt grants a narrowly-scoped capability set with TTL, budgets, and audit bindings, signed by the delegator and recorded as a fact.",
+        "role": "The only legal path for capabilities to cross a holonic boundary. A PermeabilityReceipt grants a narrowly-scoped capability set with typed budgets, stop/freshness constraints, view bindings, and audit commitments. Delegation is admissible only when the delegated authority is a strict subset (meet) of parent authority across all constrained dimensions.",
         "required_fields": [
           "permeability_id",
           "from_holon_id",
           "to_holon_id",
+          "work_id_or_scoped_wildcard",
+          "lease_id_or_scoped_wildcard",
           "capability_set",
-          "scope",
+          "scope_or_overlay",
           "budgets",
+          "stop_condition_hash",
           "issued_at",
           "expires_at",
+          "view_commitment_hash",
+          "context_pack_hash_or_refs_commitment",
+          "authority_overlay_hash_or_inline_overlay",
+          "delegation_chain_hash (optional)",
           "policy_version",
-          "signature"
+          "signature_or_quorum_attestation"
         ],
         "law_refs": [
           "LAW-05",
@@ -1708,22 +1635,11 @@
       },
       "MECH-WORK-DECOMPOSITION": {
         "name": "Holonic decomposition + routing",
-        "role": "Decomposes a large work objective into smaller work objects with explicit dependencies; binds decompositions to budgets and verification strategy (risk tier); the decomposition output is a WorkGraph (DAG of WorkIDs with explicit edges), enabling recursion without widening interfaces.",
-        "properties": [
-          "outputs a WorkGraph: nodes are WorkIDs with typed specs; edges encode dependencies/parent_work_ids",
-          "each node declares stop conditions, budgets, and required receipts (risk-tiered)",
-          "interfaces between nodes are typed boundary signals (no implicit shared context)",
-          "upward progress is summarized as SummaryReceipts + receipts; downward requests are scoped and capability-limited"
-        ],
+        "role": "Coordinator holons decompose goals into low-coupling work graphs; parallelism economics managed via backpressure and verification cost.",
         "math_refs": [
           "Amdahl_law",
           "queueing_theory",
           "backpressure"
-        ],
-        "law_refs": [
-          "LAW-06",
-          "LAW-12",
-          "LAW-16"
         ],
         "node_class": "NORMATIVE",
         "fact_bindings": {
@@ -1779,19 +1695,16 @@
           "sender_holon_id + sender_cell_id",
           "recipient_holon_id + recipient_cell_id (optional; directory-resolved)",
           "work_id (or work_graph_id)",
-          "message_id (idempotency key) + hlc_timestamp + causal_parent_ids",
-          "message_class (discovery/handshake/work/evidence/governance)",
+          "message_id (idempotency key) + causal_parent_ids",
           "ledger_commitment (checkpoint/head hash) for any claims",
           "context_pack_digest (optional) + selectors for omitted facts",
-          "receipt_digests (optional) + evidence_manifests (optional)",
-          "interface_contract_ref (optional; stable ID of the boundary contract/schema)"
+          "receipt_digests (optional) + evidence_manifests (optional)"
         ],
         "message_classes": [
-          "discovery (ping, directory_query, directory_reply)",
           "handshake (hello, capability_request, capability_grant)",
           "work (offer, accept, result, escalation)",
           "evidence (advertise, request, transfer_by_hash)",
-          "governance (stop_order propagation, policy update notification, contract negotiation)"
+          "governance (stop_order propagation, policy update notification)"
         ],
         "non_goals": [
           "does not mandate a transport (gRPC/HTTP/queues are projections)",
@@ -1802,8 +1715,7 @@
           "LAW-06",
           "LAW-07",
           "LAW-11",
-          "LAW-15",
-          "LAW-16"
+          "LAW-15"
         ],
         "node_class": "NORMATIVE",
         "fact_bindings": {
@@ -2305,15 +2217,6 @@
             "LAW-14",
             "LAW-15"
           ]
-        },
-        "INV-F-16": {
-          "node_class": "NORMATIVE",
-          "statement": "Holonic interfaces are closed under composition: any holon (leaf or aggregate) MUST communicate using the same boundary channel classes and HMP envelope. Cross-boundary artifacts MUST be commitments/receipts/summaries with selectors; internal traces and private state are not valid boundary objects.",
-          "law_refs": [
-            "LAW-05",
-            "LAW-07",
-            "LAW-16"
-          ]
         }
       },
       "pragmatic_compromises": {
@@ -2359,16 +2262,6 @@
             "measure escape rates",
             "compute verifier ROI",
             "stage enforce-with-waiver -> enforce-hard"
-          ],
-          "node_class": "EXPLANATORY"
-        },
-        "CMP-07": {
-          "statement": "Interface-closure enforcement SHOULD start as cheap schema/lint checks to preserve Forge Admission Cycle throughput; ratchet to merge-blocking only after the HMP/schema toolchain is stable and false-positive rates are low.",
-          "improvement_path": [
-            "schema registry + version negotiation",
-            "daemon-level fail-closed decoding for unknown schema/message_class",
-            "linter rules for boundary artifacts (SummaryReceipt required for cross-boundary narrative)",
-            "governance ratchet: warn -> enforce-with-waiver -> enforce-hard"
           ],
           "node_class": "EXPLANATORY"
         },
@@ -2497,10 +2390,15 @@
       },
       "risk_tier": {
         "node_class": "NORMATIVE",
+        "notes": [
+          "Unified Theory uses a coarse four-tier model (T0..T3).",
+          "Daemon enforcement uses RiskTier Tier0..Tier4; mapping MUST be lossless at policy boundaries per the glossary RiskTier term."
+        ],
         "enum": {
           "T0": {
             "name": "Experimental",
             "blast_radius": "local/sandbox",
+            "daemon_mapping": "Tier0-Tier1",
             "notes": [
               "low-risk exploratory work"
             ]
@@ -2508,6 +2406,7 @@
           "T1": {
             "name": "Internal",
             "blast_radius": "factory-internal",
+            "daemon_mapping": "Tier1-Tier2",
             "notes": [
               "default internal work"
             ]
@@ -2515,6 +2414,7 @@
           "T2": {
             "name": "Production",
             "blast_radius": "user-facing/runtime",
+            "daemon_mapping": "Tier3",
             "notes": [
               "requires stronger gates"
             ]
@@ -2522,6 +2422,7 @@
           "T3": {
             "name": "Security-Critical",
             "blast_radius": "secrets/capabilities/identity",
+            "daemon_mapping": "Tier4",
             "notes": [
               "highest rigor; fail-closed"
             ]
@@ -2617,9 +2518,97 @@
         "node_class": "NORMATIVE",
         "schema_id": "apm2.attestation.v1",
         "json_schema_path": "schemas/apm2/attestation.schema.json",
+        "role": "Environment/runner attestation object (workload integrity, runtime provenance). Distinct from fact authentication.",
         "law_refs": [
           "LAW-01",
           "LAW-14",
+          "LAW-15"
+        ]
+      },
+      "authority_seal": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.authority_seal.v1",
+        "role": "Authenticates authoritative facts/roots either directly or via Merkle-batched attestations with ledger/quorum/time anchors.",
+        "law_refs": [
+          "LAW-03",
+          "LAW-14",
+          "LAW-15"
+        ]
+      },
+      "cell_certificate": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.cell_certificate.v1",
+        "role": "Binds cell identity, trust domain, and policy root/quorum verification material.",
+        "law_refs": [
+          "LAW-05",
+          "LAW-10",
+          "LAW-15"
+        ]
+      },
+      "holon_certificate": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.holon_certificate.v1",
+        "role": "Binds holon identity key material to a cell-scoped self-certifying holon identity.",
+        "law_refs": [
+          "LAW-05",
+          "LAW-15"
+        ]
+      },
+      "holon_directory_head": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.holon_directory_head.v1",
+        "role": "Signed/attested authenticated-directory head enabling O(log n) membership, revocation, and cacheable verification.",
+        "law_refs": [
+          "LAW-05",
+          "LAW-10",
+          "LAW-15"
+        ]
+      },
+      "identity_proof_profile": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.identity_proof_profile.v1",
+        "role": "Declares verifier economics and proof byte/depth bounds for identity proofs at large scale.",
+        "law_refs": [
+          "LAW-13",
+          "LAW-14",
+          "LAW-15"
+        ]
+      },
+      "identity_proof": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.identity_proof.v1",
+        "role": "Proof-carrying identity object binding certificate hashes, directory head hash, membership proof, and as-of anchor.",
+        "law_refs": [
+          "LAW-05",
+          "LAW-15"
+        ]
+      },
+      "freshness_policy": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.freshness_policy.v1",
+        "role": "Defines risk-tiered staleness bounds and mandatory fail-closed actions for identity/policy/stop freshness.",
+        "law_refs": [
+          "LAW-04",
+          "LAW-05",
+          "LAW-14"
+        ]
+      },
+      "session_key_delegation": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.session_key_delegation.v1",
+        "role": "Binds short-lived session keys to holon identity keys for replay-safe session authentication.",
+        "law_refs": [
+          "LAW-05",
+          "LAW-15"
+        ]
+      },
+      "epoch_seal": {
+        "node_class": "NORMATIVE",
+        "schema_id": "apm2.epoch_seal.v1",
+        "role": "HTF-anchored epoch freshness commitment (optionally VDF-sealed) for anti-rollback and anti-equivocation in federation.",
+        "law_refs": [
+          "LAW-04",
+          "LAW-10",
           "LAW-15"
         ]
       },
@@ -2646,7 +2635,8 @@
     },
     "risk_model": {
       "node_class": "NORMATIVE",
-      "model_id": "RISK-MODEL-V0",
+      "model_id": "RISK-MODEL-V1-HSI-ALIGNED",
+      "source_of_truth_ref": "documents/theory/glossary/glossary.json#term:risk_tier",
       "risk_tier_enum_ref": "types.risk_tier",
       "gate_catalog": {
         "GATE-STATIC": {
@@ -3007,325 +2997,6 @@
         }
       }
     },
-    "open_design_questions": {
-      "Q-01": {
-        "question": "What are the minimal non-negotiable invariants to enforce at runtime (the smallest LAW/INV set everything composes around)?",
-        "why_it_matters": "Defines the hard boundary of correctness and safety; everything else is optimization.",
-        "provisional_default": [
-          "INV-F-01..INV-F-10"
-        ],
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-01",
-          "question_id": "Q-01",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-02": {
-        "question": "What is the canonical unit of trust for downstream holons: EventRecord only, or EvidenceBundle+Verifier attestation, and when is each required?",
-        "why_it_matters": "Defines transitive trust; impacts storage, verification cost, and audit completeness.",
-        "provisional_default": "Treat EventRecord as routing fact; treat EvidenceBundle+Receipt as acceptance fact for any authoritative transition.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-02",
-          "question_id": "Q-02",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-03": {
-        "question": "How is 'context sufficiency' operationalized and measured (beyond subjective judgment)?",
-        "why_it_matters": "Bounded context is a primary failure driver; must be controlled via measurable surrogates.",
-        "provisional_default": "Adopt LAW-02 control objectives: pack-miss, unplanned tool calls, defect escape correlation, stuck proxies.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-03",
-          "question_id": "Q-03",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-04": {
-        "question": "What is the freshness policy: which artifacts must be temporally pinned, and where is pinning stored/verified (ledger fields vs evidence artifacts)?",
-        "why_it_matters": "Non-stationarity creates silent invalidation; pinning is required for replay and correctness.",
-        "provisional_default": "Pin per episode: repo digest + dependency locks + toolchain versions + policy version; store pins in evidence + reference from events.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-04",
-          "question_id": "Q-04",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-05": {
-        "question": "Where should gated promotion live: reducers, daemon handlers, tool-policy, or explicit GateRun work objects?",
-        "why_it_matters": "Defines who can block/allow authoritative transitions and how proofs are attached.",
-        "provisional_default": "Represent verification as explicit GateRun objects that emit receipts; reducers enforce that transitions require receipts by risk tier.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-05",
-          "question_id": "Q-05",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-06": {
-        "question": "What is the merge semantics model: are conflicts first-class events with explicit merge receipts, and what is the minimal audit-complete merge receipt?",
-        "why_it_matters": "Convergence and non-repudiation depend on explicit merge semantics.",
-        "provisional_default": "MergeReceipt binds (Plan-of-Record digest, ChangeSet digest, GateRun receipt digests, approver identity) -> output repo state digest.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-06",
-          "question_id": "Q-06",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-07": {
-        "question": "Which tool executions must be exactly-once vs at-least-once, and how is dedupe keyed?",
-        "why_it_matters": "Retry safety and external side effects require idempotency and accounting.",
-        "provisional_default": "Assume at-least-once delivery; require dedupe keys and execution receipts for all external effects.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-07",
-          "question_id": "Q-07",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-08": {
-        "question": "What is the budget model: per episode, per session, per work object, and what triggers escalation vs termination?",
-        "why_it_matters": "Bounded search and termination discipline are foundational; budgets encode priorities and risk posture.",
-        "provisional_default": "Episode budgets enforce immediate termination; session/work budgets govern escalation and scheduling (hardening, countermeasures).",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-08",
-          "question_id": "Q-08",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-09": {
-        "question": "How is verifier economics managed: how do you prevent Goodharting gates and decide when a verifier becomes mandatory?",
-        "why_it_matters": "Proxy gaps are exploited under optimization pressure; gating must be defendable and cost-effective.",
-        "provisional_default": "Separate safety invariants from performance; maintain holdouts/adversarial suites; ratchet based on measured escape rates and verifier ROI.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-09",
-          "question_id": "Q-09",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-10": {
-        "question": "How do you define defect closure: what constitutes 'closed loop' remediation and who can waive it?",
-        "why_it_matters": "Without closure rules, defects become narrative; recurrence remains high.",
-        "provisional_default": "Defect closes only with strengthened verifier passing on original counterexample; waivers are explicit Decision objects with expiry.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-10",
-          "question_id": "Q-10",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-11": {
-        "question": "What are the top expected defect classes early and which countermeasures should be pre-built?",
-        "why_it_matters": "Early-stage defects are predictable (context omission, stale projections, tool misuse, prompt injection) and are best addressed systemically.",
-        "provisional_default": [
-          "context_pack_miss tracking and compiler feedback",
-          "capability overgrant detection",
-          "flakiness stabilization gates",
-          "merge conflict recording"
-        ],
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-11",
-          "question_id": "Q-11",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-12": {
-        "question": "What is the trust boundary between adapter observations and ledger truth: can adapters emit events directly or only propose observations that must be verified?",
-        "why_it_matters": "Adapters sit on untrusted surfaces; event authority must not be compromised by observation noise.",
-        "provisional_default": "Adapters propose observations; authoritative events require verification/attestation or trusted identity tier.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-12",
-          "question_id": "Q-12",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-13": {
-        "question": "How strict is OCAP in practice: are tools always default-deny with explicit leases, and is read-only mode first-class?",
-        "why_it_matters": "Capability containment is the primary security primitive; read-only sessions reduce blast radius.",
-        "provisional_default": "Default-deny always; read-only lease profiles are first-class and the default for review/audit.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-13",
-          "question_id": "Q-13",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-14": {
-        "question": "Where do humans enter the loop by design (explicit adjudication points)?",
-        "why_it_matters": "Human bandwidth is scarce; the system must request adjudication only at sharp points with bounded options and attached evidence.",
-        "provisional_default": [
-          "policy changes",
-          "high-risk gate waivers",
-          "merge approvals for high tiers",
-          "credential/profile changes",
-          "incident response decisions"
-        ],
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-14",
-          "question_id": "Q-14",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-15": {
-        "question": "What is the primary success metric for early stages: throughput, correctness, safety, replayability?",
-        "why_it_matters": "Metric choice shapes incentives and gate design; premature throughput optimization is a common failure mode.",
-        "provisional_default": "Prioritize recurrence reduction and replayability (stability) before raw throughput.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-15",
-          "question_id": "Q-15",
-          "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0001",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      },
-      "Q-16": {
-        "question": "How do holons evolve boundary contracts (HMP schemas/interface_contract_ref) across federated cells without lockstep upgrades or interface proliferation?",
-        "why_it_matters": "LAW-16 requires compositional closure and stable primitives, but civilizational-scale deployment demands long-lived multi-version interoperability and safe deprecation. Poor versioning creates fragmentation or unsafe downgrade paths.",
-        "provisional_default": "Prefer monotone, backward-compatible schema evolution with explicit version negotiation via governance channel; support N-2 versions; treat breaking changes as new protocol_id and require migration receipts.",
-        "node_class": "EXPLANATORY",
-        "oracle_request": {
-          "schema_id": "apm2.oracle_request.v1",
-          "oracle_request_id": "ORQ-Q-16",
-          "question_id": "Q-16",
-          "work_id": "WORK-000",
-          "request_type": "BOUNDED_CHOICE",
-          "inputs": {},
-          "options": {},
-          "decision_deadline": null,
-          "fallback_policy": "ESCALATE",
-          "impact_scope": {},
-          "evidence_refs": []
-        }
-      }
-    },
     "provisional_defaults": {
       "DEF-01": {
         "name": "Unit of truth",
@@ -3382,6 +3053,254 @@
         "status": "provisional",
         "node_class": "NORMATIVE",
         "maturity": "PROVISIONAL"
+      },
+      "DEF-09": {
+        "name": "Downstream trust unit",
+        "statement": "Event records are routing facts only. Any authoritative acceptance of world effects or state transitions MUST be justified by receipt-addressable evidence and verifier authentication (direct signature or AuthoritySeal-backed inclusion proof), with envelope/view commitments available for replay.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-01",
+          "LAW-03",
+          "LAW-07",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:proof_obligation_checklist",
+          "documents/theory/glossary/glossary.json#term:admission_receipt_v1",
+          "documents/theory/glossary/glossary.json#term:receipt_pointer_v1"
+        ]
+      },
+      "DEF-10": {
+        "name": "Freshness surfaces and pinset location",
+        "statement": "Freshness is dual-surface: (A) immutable episode pinsets for reproducibility (repo/locks/policy/toolchain/model + contract/profile bindings) stored as CAS artifacts referenced from envelopes/receipts, and (B) runtime authority freshness checks (identity/policy/stop-state) enforced by risk tier using ledger-anchor/HTF witnesses.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-03",
+          "LAW-09",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:freshness_policy_v1",
+          "documents/theory/glossary/glossary.json#term:episode_envelope_v1",
+          "documents/theory/glossary/glossary.json#term:session_identity_binding"
+        ]
+      },
+      "DEF-11": {
+        "name": "Runtime invariant kernel",
+        "statement": "The minimal non-negotiable runtime kernel is {INV-F-01, INV-F-02, INV-F-03, INV-F-05, INV-F-08, INV-F-09, INV-F-11, INV-F-14, INV-F-15}. Any Tier2+ authoritative transition MUST fail-closed when any kernel invariant is missing, unverifiable, or violated.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-01",
+          "LAW-03",
+          "LAW-05",
+          "LAW-09",
+          "LAW-12",
+          "LAW-13",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:hsi_non_negotiable_constraints",
+          "documents/theory/glossary/glossary.json#term:proof_obligation_checklist",
+          "documents/theory/glossary/glossary.json#term:freshness_policy_v1",
+          "documents/theory/glossary/glossary.json#term:session_identity_binding",
+          "documents/theory/glossary/glossary.json#term:stop_path_slo"
+        ]
+      },
+      "DEF-12": {
+        "name": "Adapter trust boundary",
+        "statement": "Adapters and external runtimes MAY propose observations/intents only. Authoritative events/facts MUST be minted only by daemon mediation after schema, identity, freshness, capability, and receipt checks.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-01",
+          "LAW-05",
+          "LAW-13",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:hsi_daemon_alignment",
+          "documents/theory/glossary/glossary.json#term:tool_intent_v1",
+          "documents/theory/glossary/glossary.json#term:defect_ingestion"
+        ]
+      },
+      "DEF-13": {
+        "name": "Promotion control placement",
+        "statement": "GateRuns are explicit verification objects that emit gate receipts; reducers are the authoritative promotion guard by risk tier and MUST deny authoritative transitions without required receipts. Daemon handlers enforce admission/preconditions but do not replace promotion receipts.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-01",
+          "LAW-03",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:proof_obligation_checklist",
+          "documents/theory/glossary/glossary.json#term:hsi_daemon_alignment",
+          "documents/theory/glossary/glossary.json#term:enforcement_ratchet_stage_model"
+        ]
+      },
+      "DEF-14": {
+        "name": "Actuation delivery and dedupe semantics",
+        "statement": "Tool delivery is at-least-once. Side-effecting ToolKinds MUST provide at-most-once kernel effects using idempotency keys scoped at minimum to (episode_id, tool_kind, idempotency_key), plus precondition guards and execution receipts.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-11",
+          "LAW-12",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:idempotency_keyed_actuation",
+          "documents/theory/glossary/glossary.json#term:proof_obligation_checklist",
+          "documents/theory/glossary/glossary.json#term:backpressure_admission_control"
+        ]
+      },
+      "DEF-15": {
+        "name": "Hierarchical budget model",
+        "statement": "Budgets are three-level: episode budgets are hard actuation bounds, session budgets are throughput/admission bounds, and work budgets govern multi-episode allocation and escalation. Tier2+ budget or stop uncertainty MUST deny actuation fail-closed.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-05",
+          "LAW-12",
+          "LAW-13",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:typed_budget_vector",
+          "documents/theory/glossary/glossary.json#term:backpressure_admission_control",
+          "documents/theory/glossary/glossary.json#term:escalation_artifact"
+        ]
+      },
+      "DEF-16": {
+        "name": "Strict OCAP profile",
+        "statement": "OCAP is strict default-deny: all tool/context authority requires explicit lease/manifest/permeability grant. Read-only mode is first-class baseline and bounded-uncertainty fallback for lower tiers; Tier2+ uncertainty denies actuation.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-05",
+          "LAW-12",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:hsi_non_negotiable_constraints",
+          "documents/theory/glossary/glossary.json#term:permeability_receipt_v1",
+          "documents/theory/glossary/glossary.json#term:session_identity_binding"
+        ]
+      },
+      "DEF-17": {
+        "name": "Human adjudication cutpoints",
+        "statement": "Human intervention is limited to typed OracleRequest/Decision/Waiver/Breakglass artifacts at bounded governance cutpoints (policy changes, high-risk waivers, authority expansion, incident/stop operations, key rotation), each evidence-bound, signed, expiry-bounded, and ledger-recorded.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-01",
+          "LAW-05",
+          "LAW-12",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:escalation_artifact",
+          "documents/theory/glossary/glossary.json#term:enforcement_ratchet_stage_model",
+          "documents/theory/glossary/glossary.json#term:enforcement_ratchet_stage_model"
+        ]
+      },
+      "DEF-18": {
+        "name": "Early-stage objective priority",
+        "statement": "Primary early success objective is stability: recurrence reduction, replayability coverage, and measurement integrity under containment. Throughput is secondary and may be optimized only without regression on stability/safety signals.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-01",
+          "LAW-08",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/unified_theory.json#metrics_and_signals.recurrence_reduction",
+          "documents/theory/unified_theory.json#metrics_and_signals.verification_economics",
+          "documents/theory/glossary/glossary.json#term:enforcement_ratchet_stage_model"
+        ]
+      },
+      "DEF-19": {
+        "name": "Context sufficiency operationalization",
+        "statement": "Context sufficiency is measured by MET-CTX-01..06 and selector-coverage obligations. If required claims cannot be supported within context budgets, the system MUST request refinement/escalation and fail-closed for high-risk actuation.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-02",
+          "LAW-06",
+          "LAW-07",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/unified_theory.json#metrics_and_signals.context_sufficiency",
+          "documents/theory/glossary/glossary.json#term:selector_coverage_invariant",
+          "documents/theory/glossary/glossary.json#term:escalation_artifact"
+        ]
+      },
+      "DEF-20": {
+        "name": "Merge semantics and minimal MergeReceipt",
+        "statement": "Merge semantics are conflict-first: conflicts are explicit facts/defects, never silent resolution. Minimal audit-complete MergeReceipt MUST bind parent/input digests, merge operator or conflict rule, changeset digest set, required gate receipt digests, conflict-set commitment (or empty commitment), output state digest, approver authority identity, policy version, and authoritative authentication.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-03",
+          "LAW-10",
+          "LAW-13",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:proof_obligation_checklist",
+          "documents/theory/glossary/glossary.json#term:compaction_receipt",
+          "documents/theory/glossary/glossary.json#term:defect_ingestion"
+        ]
+      },
+      "DEF-21": {
+        "name": "Prebuilt early defect-class kits",
+        "statement": "Early operation MUST prebuild defect-class countermeasure kits for at least: context insufficiency, adapter/contract drift, capability overgrant/delegation widening, freshness staleness, idempotency/precondition failure, stop-path uncertainty, merge/convergence conflict, and lossy-summary selector gaps. Each class requires detector, stable fingerprint, receipt binding, and remediation workflow.",
+        "status": "adjudicated",
+        "node_class": "NORMATIVE",
+        "maturity": "ADJUDICATED",
+        "law_refs": [
+          "LAW-02",
+          "LAW-05",
+          "LAW-08",
+          "LAW-09",
+          "LAW-10",
+          "LAW-11",
+          "LAW-12",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "evidence_refs": [
+          "documents/theory/glossary/glossary.json#term:defect_ingestion",
+          "documents/theory/glossary/glossary.json#term:defect_ingestion",
+          "documents/theory/glossary/glossary.json#term:enforcement_ratchet_stage_model"
+        ]
       }
     },
     "metrics_and_signals": {
@@ -3481,11 +3400,6 @@
         }
       },
       "merge_and_convergence": {
-        "MET-INT-01": {
-          "name": "interface_surface_area",
-          "definition": "Count of distinct boundary contract/schema versions used in cross-holon communication for a given holon/cell over a window. Growth with depth is a scalability/attack-surface signal; target is bounded growth (prefer zero).",
-          "node_class": "NORMATIVE"
-        },
         "MET-MRG-01": {
           "name": "merge_conflict_rate",
           "definition": "Frequency of merge conflicts by subsystem/interface; informs decomposition and interface stabilization work.",
@@ -3545,7 +3459,7 @@
         "DOC-SPINE-05": {
           "title": "Laws as Corollaries",
           "contents": [
-            "LAW-01..LAW-16 mapping to mechanisms and invariants"
+            "LAW-01..LAW-15 mapping to mechanisms and invariants"
           ],
           "node_class": "EXPLANATORY"
         },
@@ -3575,7 +3489,15 @@
         ],
         "goal": "Every AGENTS.md begins by stating which part of the spine it implements and which laws it enforces.",
         "node_class": "NORMATIVE"
-      }
+      },
+      "doc_spine_order": [
+        "DOC-SPINE-01",
+        "DOC-SPINE-02",
+        "DOC-SPINE-03",
+        "DOC-SPINE-04",
+        "DOC-SPINE-05",
+        "DOC-SPINE-06"
+      ]
     },
     "law_alignment": {
       "laws": {
@@ -3681,18 +3603,25 @@
           "node_class": "NORMATIVE",
           "amendments": ["Evaluator Validity", "Evaluator Brittleness as Defect"],
           "defect_classes": ["EVALUATOR_DRIFT"]
-        },
-        "LAW-16": {
-          "name": "Closure Under Composition & Boundary Contracts",
-          "reference_path": "laws.json",
-          "role": "Ensures recursion scales: holon boundaries use stable primitives regardless of internal scale. Aggregates summarize (SummaryReceipts/commitments/selectors) and delegate detail work downward; zoom-in is by hash under capability. Prevents interface proliferation, chat-log coupling, and boundary-based attacks.",
-          "node_class": "NORMATIVE",
-          "defect_classes": [
-            "INTERFACE_PROLIFERATION",
-            "ABSTRACTION_BREAK"
-          ]
         }
-      }
+      },
+      "law_order": [
+        "LAW-01",
+        "LAW-02",
+        "LAW-03",
+        "LAW-04",
+        "LAW-05",
+        "LAW-06",
+        "LAW-07",
+        "LAW-08",
+        "LAW-09",
+        "LAW-10",
+        "LAW-11",
+        "LAW-12",
+        "LAW-13",
+        "LAW-14",
+        "LAW-15"
+      ]
     },
     "glossary_alignment": {
       "canonical_terms": {
@@ -3705,7 +3634,7 @@
           "node_class": "BACKGROUND"
         },
         "Work Substrate": {
-          "ref": "documents/theory/glossary/glossary.json#term:work_substrate",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Plan": {
@@ -3781,19 +3710,11 @@
           "node_class": "BACKGROUND"
         },
         "Summary Receipt": {
-          "ref": "documents/theory/glossary/glossary.json#term:summary_receipt",
+          "ref": "documents/theory/glossary/glossary.json",
           "node_class": "BACKGROUND"
         },
         "Commitment Filter": {
           "ref": "documents/theory/glossary/glossary.json",
-          "node_class": "BACKGROUND"
-        },
-        "WorkGraph": {
-          "ref": "documents/theory/glossary/glossary.json#term:work_graph",
-          "node_class": "BACKGROUND"
-        },
-        "Work Graph": {
-          "ref": "documents/theory/glossary/glossary.json#term:work_graph",
           "node_class": "BACKGROUND"
         },
         "Oracle": {
@@ -3802,6 +3723,56 @@
         },
         "Interface Variety": {
           "ref": "documents/theory/glossary/glossary.json",
+          "node_class": "BACKGROUND"
+        }
+      }
+    },
+    "references": {
+      "primary_documents": {
+        "theory": {
+          "ref": "documents/theory/AGENTS.md",
+          "node_class": "BACKGROUND"
+        },
+        "agent-native-software (holonic-agent-network)": {
+          "ref": "documents/theory/agent_native_architecture.json",
+          "node_class": "BACKGROUND"
+        },
+        "agent-native-software (industry textbook)": {
+          "ref": "documents/theory/agent_native_architecture.json",
+          "node_class": "BACKGROUND"
+        },
+        "defects textbook": {
+          "ref": "documents/theory/defects.json",
+          "node_class": "BACKGROUND"
+        },
+        "glossary": {
+          "ref": "documents/theory/glossary/glossary.json",
+          "node_class": "BACKGROUND"
+        }
+      },
+      "research_papers": {
+        "SWE-bench": {
+          "ref": "https://www.swebench.com/",
+          "node_class": "BACKGROUND"
+        },
+        "SWE-bench Verified (OpenAI)": {
+          "ref": "https://openai.com/index/swe-bench-verified/",
+          "node_class": "BACKGROUND"
+        },
+        "SWE-agent": {
+          "ref": "https://github.com/princeton-nlp/SWE-agent",
+          "node_class": "BACKGROUND"
+        },
+        "Reflexion (self-reflection agents)": {
+          "ref": "https://arxiv.org/abs/2303.11366",
+          "node_class": "BACKGROUND"
+        },
+        "Agentic Reasoning for LLMs (survey)": {
+          "ref": "https://arxiv.org/abs/2601.12538",
+          "node_class": "BACKGROUND"
+        },
+        "Hierarchical RL with explicit state abstractions": {
+          "ref": "https://arxiv.org/abs/2601.09858",
           "node_class": "BACKGROUND"
         }
       }

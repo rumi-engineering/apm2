@@ -255,6 +255,10 @@ pub struct CompiledSeccompFilter;
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 impl CompiledSeccompFilter {
     /// No-op apply on non-Linux platforms.
+    ///
+    /// # Errors
+    ///
+    /// This stub implementation never returns an error on non-Linux platforms.
     pub fn apply(&self) -> Result<SeccompResult, SeccompError> {
         Ok(SeccompResult {
             applied: false,
@@ -267,7 +271,11 @@ impl CompiledSeccompFilter {
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 /// No-op compile on non-Linux platforms.
-pub fn compile_seccomp_filter(
+///
+/// # Errors
+///
+/// This stub implementation never returns an error on non-Linux platforms.
+pub const fn compile_seccomp_filter(
     _profile: &SeccompProfile,
 ) -> Result<Option<CompiledSeccompFilter>, SeccompError> {
     Ok(None)
