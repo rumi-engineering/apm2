@@ -3,7 +3,7 @@ evidence_artifact:
   id: "EVID-0015"
   title: "Refactor evidence (remove dead/unused/unsafe-by-default paths)"
   category: "CODE_REVIEW"
-  status: "PENDING"
+  status: "COMPLETE"
   description: |
     Evidence that deprecated and unsafe-by-default protocol handlers and bypass paths are removed or hard-disabled
     after FAC stabilization, without regressing xtask or the validated FAC v0 path.
@@ -11,4 +11,33 @@ evidence_artifact:
     - "REQ-0015"
   source_refs:
     - "documents/rfcs/RFC-0019/requirements/REQ-0015.yaml"
-  artifacts: []
+  artifacts:
+    - artifact_type: "TEST_OUTPUT"
+      description: "TCK-00336 broker mediation regression tests"
+      location: "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+      notes: |
+        Added 5 regression tests in the `tck_00336_broker_mediation_regression` module:
+        - test_all_tool_classes_require_broker: Verifies ALL tool classes fail closed without broker
+        - test_fails_closed_without_manifest_store_or_broker: Verifies fail-closed with no config
+        - test_manifest_allowlist_insufficient_without_broker: Verifies manifest alone is NOT sufficient
+        - test_broker_allow_requires_episode_runtime: Verifies broker + runtime required for execution
+        - test_unknown_tool_class_fails_closed: Verifies unknown tools fail closed
+    - artifact_type: "CODE_CHANGE"
+      description: "Deprecated CWD-rooted handler factories with #[deprecated] attribute"
+      location: "crates/apm2-daemon/src/episode/runtime.rs"
+      notes: |
+        Added formal #[deprecated] attribute to:
+        - with_handler_factory(): CWD-rooted handler factory (builder pattern)
+        - register_tool_handler_factory(): CWD-rooted handler factory (async)
+        - start(): Episode start without workspace isolation
+        Added runtime warning when CWD-rooted handlers are used without workspace root.
+    - artifact_type: "CODE_CHANGE"
+      description: "Intentional deprecated usage with #[allow(deprecated)]"
+      location: "multiple test files"
+      notes: |
+        Added #[allow(deprecated)] with TCK-00336 justification to:
+        - crates/apm2-daemon/src/episode/runtime.rs (tests module)
+        - crates/apm2-daemon/src/state.rs (ArtifactFetchHandler - legitimate non-filesystem use)
+        - crates/apm2-daemon/tests/common/daemon.rs (test helpers)
+        - crates/apm2-daemon/benches/latency_benchmarks.rs (benchmarks)
+        - crates/apm2-daemon/tests/tck_00321_episode_event_persistence.rs (integration tests)

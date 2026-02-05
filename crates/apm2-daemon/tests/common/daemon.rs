@@ -181,6 +181,12 @@ impl TestDaemon {
     /// Advances the timestamp by 1ms before starting.
     ///
     /// Returns the session handle on success.
+    ///
+    /// # TCK-00336: Deprecated Method Usage
+    ///
+    /// This test helper uses the deprecated `start` method intentionally.
+    /// Production code should use `start_with_workspace` for proper isolation.
+    #[allow(deprecated)]
     pub async fn start_episode(
         &self,
         episode_id: &EpisodeId,
@@ -193,6 +199,12 @@ impl TestDaemon {
     /// Starts an episode with a specific lease ID.
     ///
     /// Advances the timestamp by 1ms before starting.
+    ///
+    /// # TCK-00336: Deprecated Method Usage
+    ///
+    /// This test helper uses the deprecated `start` method intentionally.
+    /// Production code should use `start_with_workspace` for proper isolation.
+    #[allow(deprecated)]
     pub async fn start_episode_with_lease(
         &self,
         episode_id: &EpisodeId,
