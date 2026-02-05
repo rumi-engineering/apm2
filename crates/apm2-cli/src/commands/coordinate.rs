@@ -696,11 +696,13 @@ const SESSION_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// Conservative token estimation rate: tokens per second of wall-clock time.
 ///
 /// When the daemon does not report actual token consumption, we estimate
-/// conservatively based on elapsed wall time. This rate (10 tokens/sec)
+/// conservatively based on elapsed wall time. This rate (100 tokens/sec)
 /// is deliberately over-estimated to ensure budget enforcement errs on the
-/// side of caution. A real session may consume fewer tokens, but we must
-/// never report zero (which would bypass budget limits entirely).
-const CONSERVATIVE_TOKENS_PER_SECOND: u64 = 10;
+/// side of caution — modern LLM agents routinely achieve 50-100+ tokens/sec,
+/// so this upper bound ensures Safe-Fail behavior. A real session may consume
+/// fewer tokens, but we must never undercount (which would bypass budget
+/// limits).
+const CONSERVATIVE_TOKENS_PER_SECOND: u64 = 100;
 
 /// Minimum token cost per session, regardless of elapsed time.
 ///
@@ -1093,18 +1095,31 @@ fn validate_workspace_root(workspace_root: Option<&str>) -> Result<String, Coord
         )));
     }
 
-    // Check against sensitive system directory blocklist
-    let canonical_str = canonical.to_string_lossy();
+    // Check against sensitive system directory blocklist.
+    //
+    // Uses `Path::starts_with` (component-aware) to block both exact matches
+    // AND subdirectories — e.g., "/var/log" is blocked because it starts
+    // with the blocked root "/var".
+    //
+    // The filesystem root "/" is checked with exact equality because
+    // `Path::starts_with("/")` is true for *every* absolute path.
     for blocked in BLOCKED_WORKSPACE_ROOTS {
-        if canonical_str == *blocked {
+        let blocked_path = std::path::Path::new(blocked);
+        let is_blocked = if blocked_path == std::path::Path::new("/") {
+            canonical == blocked_path
+        } else {
+            canonical.starts_with(blocked_path)
+        };
+        if is_blocked {
             return Err(CoordinateCliError::InvalidArgs(format!(
-                "workspace_root '{}' is a sensitive system directory and cannot be used",
-                canonical.display()
+                "workspace_root '{}' is inside a sensitive system directory ('{}') and cannot be used",
+                canonical.display(),
+                blocked,
             )));
         }
     }
 
-    Ok(canonical_str.into_owned())
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 /// Parses work IDs from command line arguments.
@@ -2265,5 +2280,40 @@ mod tests {
         assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/proc"));
         assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/sys"));
         assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/var"));
+    }
+
+    /// TCK-00346: Workspace root validation blocks subdirectories of sensitive
+    /// paths.
+    ///
+    /// Security fix: `starts_with` (path-component-aware) blocks `/var/log`,
+    /// `/etc/ssh`, etc. — not just the exact blocked roots.
+    #[test]
+    fn tck_00346_workspace_root_rejects_subdirectories_of_blocked() {
+        // /var/log exists on virtually all Linux systems and is a subdirectory
+        // of the blocked root "/var".
+        let result = validate_workspace_root(Some("/var/log"));
+        assert!(
+            result.is_err(),
+            "Expected /var/log to be blocked as subdirectory of /var: {result:?}"
+        );
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("sensitive system directory"),
+                "Expected sensitive directory error, got: {msg}"
+            );
+            assert!(
+                msg.contains("/var"),
+                "Error message should mention the blocked root '/var', got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00346: Token estimation rate is a strict upper bound.
+    ///
+    /// Security fix: The conservative rate must be >= 100 tokens/sec to act
+    /// as a Safe-Fail upper bound for modern LLM agents (50-100+ tok/sec).
+    #[test]
+    fn tck_00346_token_rate_is_strict_upper_bound() {
+        const { assert!(CONSERVATIVE_TOKENS_PER_SECOND >= 100) };
     }
 }
