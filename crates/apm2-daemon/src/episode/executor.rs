@@ -542,7 +542,20 @@ impl ToolExecutor {
             "budget charged"
         );
 
-        // Step 4: Execute handler
+        // Step 4: Pre-invalidate cache for state-modifying tools (TCK-00335 fix)
+        //
+        // State-modifying tools (Write, Execute, Git, Artifact) may modify the
+        // workspace even if they return an error. For example, a partial `git pull`
+        // or a failed shell command might have already changed files on disk.
+        // To prevent stale cache entries, we invalidate BEFORE execution for these
+        // tool classes, not just on success.
+        if tool_class.can_mutate() {
+            if let Some(cache) = &self.output_cache {
+                self.invalidate_cache(args, cache);
+            }
+        }
+
+        // Step 5: Execute handler
         let result_data = match handler.execute(args, credential).await {
             Ok(data) => data,
             Err(err) => {
@@ -558,7 +571,7 @@ impl ToolExecutor {
             },
         };
 
-        // Step 5: Reconcile budget
+        // Step 6: Reconcile budget
         if let Err(reconcile_err) = self
             .budget_tracker
             .reconcile(&estimated_delta, &result_data.budget_consumed)
@@ -576,21 +589,22 @@ impl ToolExecutor {
             "budget reconciled"
         );
 
-        // Step 6: Store result in CAS
+        // Step 7: Store result in CAS
         let cas_hash = self.store_result_data(&result_data)?;
         debug!(cas_hash = %hex::encode(&cas_hash[..8]), "result stored in CAS");
 
-        // TCK-00335: Update cache and invalidate
+        // TCK-00335: Update cache for read-only tools (cache_key is only set for Read/Search)
+        // Note: State-modifying tools (Write, Execute, Git) already invalidated the cache
+        // before execution (Step 4), so we don't need to invalidate again here.
         if let Some(cache) = &self.output_cache {
             if let Some(key) = cache_key {
                 if let Ok(bytes) = serde_json::to_vec(&result_data) {
                     let _ = cache.store(&key, &bytes);
                 }
             }
-            self.invalidate_cache(args, cache);
         }
 
-        // Step 7: Build result
+        // Step 8: Build result
         let duration = start_time.elapsed();
         #[allow(clippy::cast_possible_truncation)]
         let duration_ns = duration.as_nanos() as u64;
@@ -605,7 +619,7 @@ impl ToolExecutor {
         )
         .with_result_hash(cas_hash);
 
-        // Step 8: Stamp time envelope
+        // Step 9: Stamp time envelope
         if let Some(ref clock) = self.clock {
             let notes = format!("tool.executed:{}", ctx.request_id);
             let (envelope, envelope_ref) = clock.stamp_envelope(Some(notes)).await?;
@@ -1404,6 +1418,200 @@ mod tests {
             key1.as_string(),
             key2.as_string(),
             "full cache key strings should differ to prevent cross-session access"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00335 Fix: Cache Invalidation on Handler Failure
+    // =========================================================================
+
+    // Mock Execute handler that always fails (simulates failed command)
+    #[derive(Debug)]
+    struct MockExecuteHandler {
+        should_fail: bool,
+    }
+
+    impl MockExecuteHandler {
+        fn failing() -> Self {
+            Self { should_fail: true }
+        }
+
+        fn succeeding() -> Self {
+            Self { should_fail: false }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolHandler for MockExecuteHandler {
+        fn tool_class(&self) -> ToolClass {
+            ToolClass::Execute
+        }
+
+        async fn execute(
+            &self,
+            _args: &ToolArgs,
+            _credential: Option<&Credential>,
+        ) -> Result<ToolResultData, ToolHandlerError> {
+            if self.should_fail {
+                return Err(ToolHandlerError::ExecutionFailed {
+                    message: "command failed with exit code 1".to_string(),
+                });
+            }
+            Ok(ToolResultData::success(
+                b"output".to_vec(),
+                BudgetDelta::single_call().with_bytes_io(6),
+                Duration::from_millis(100),
+            ))
+        }
+
+        fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
+            if !matches!(args, ToolArgs::Execute(_)) {
+                return Err(ToolHandlerError::InvalidArgs {
+                    reason: "expected Execute args".to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "MockExecuteHandler"
+        }
+
+        fn estimate_budget(&self, _args: &ToolArgs) -> BudgetDelta {
+            BudgetDelta::single_call().with_bytes_io(1000)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidated_on_state_modifying_tool_failure() {
+        // TCK-00335 Fix: Verify that cache is invalidated BEFORE execution
+        // for state-modifying tools, so even failed executions clear stale data.
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{ToolOutputCache, ToolOutputCacheConfig};
+
+        // Setup executor with cache
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let cache_cas = Arc::new(MemoryCas::new());
+        let cache = ToolOutputCache::new(ToolOutputCacheConfig::default(), cache_cas);
+
+        let mut executor = ToolExecutor::new(tracker, cas)
+            .with_output_cache(cache.clone())
+            .with_isolation_key("test-session");
+
+        // Register both Read and Execute handlers
+        executor
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+        executor
+            .register_handler(Box::new(MockExecuteHandler::failing()))
+            .unwrap();
+
+        // First: Execute a Read to populate the cache
+        let read_args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let result = executor
+            .execute(&test_context(), &read_args, None)
+            .await
+            .unwrap();
+        assert!(result.success, "Read should succeed");
+
+        // Verify cache is populated
+        assert!(
+            !cache.is_empty(),
+            "Cache should have entries after Read"
+        );
+        let cache_size_before = cache.len();
+
+        // Second: Execute a failing Execute command
+        // This should invalidate the cache BEFORE execution (even though it fails)
+        let execute_args = ToolArgs::Execute(crate::episode::tool_handler::ExecuteArgs {
+            command: "failing-command".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: None,
+        });
+
+        let result = executor
+            .execute(&test_context(), &execute_args, None)
+            .await
+            .unwrap();
+
+        // The Execute should fail (return failure result, not error)
+        assert!(
+            !result.success,
+            "Execute should fail (handler configured to fail)"
+        );
+
+        // Critical assertion: Cache should be cleared even though Execute failed
+        // This is the bug fix - previously cache was only cleared on success
+        assert!(
+            cache.is_empty(),
+            "Cache should be cleared on state-modifying tool failure \
+            (was {} entries before Execute)",
+            cache_size_before
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidated_before_state_modifying_tool_success() {
+        // Verify that cache is also invalidated on success for state-modifying tools
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{ToolOutputCache, ToolOutputCacheConfig};
+
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let cache_cas = Arc::new(MemoryCas::new());
+        let cache = ToolOutputCache::new(ToolOutputCacheConfig::default(), cache_cas);
+
+        let mut executor = ToolExecutor::new(tracker, cas)
+            .with_output_cache(cache.clone())
+            .with_isolation_key("test-session");
+
+        executor
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+        executor
+            .register_handler(Box::new(MockExecuteHandler::succeeding()))
+            .unwrap();
+
+        // Populate cache with Read
+        let read_args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        executor
+            .execute(&test_context(), &read_args, None)
+            .await
+            .unwrap();
+        assert!(!cache.is_empty(), "Cache should have entries after Read");
+
+        // Execute a successful Execute command
+        let execute_args = ToolArgs::Execute(crate::episode::tool_handler::ExecuteArgs {
+            command: "successful-command".to_string(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            timeout_ms: None,
+        });
+
+        let result = executor
+            .execute(&test_context(), &execute_args, None)
+            .await
+            .unwrap();
+        assert!(result.success, "Execute should succeed");
+
+        // Cache should be cleared
+        assert!(
+            cache.is_empty(),
+            "Cache should be cleared on state-modifying tool success"
         );
     }
 }
