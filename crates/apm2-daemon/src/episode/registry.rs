@@ -849,6 +849,15 @@ impl SessionRegistry for InMemorySessionRegistry {
         let session_id = state.by_handle.get(handle)?;
         state.by_id.get(session_id).cloned()
     }
+
+    fn get_session_by_work_id(&self, work_id: &str) -> Option<SessionState> {
+        let state = self.state.read().expect("lock poisoned");
+        state
+            .by_id
+            .values()
+            .find(|s| s.work_id == work_id)
+            .cloned()
+    }
 }
 
 impl InMemorySessionRegistry {
@@ -1521,6 +1530,10 @@ impl SessionRegistry for PersistentSessionRegistry {
 
     fn get_session_by_handle(&self, handle: &str) -> Option<SessionState> {
         self.inner.get_session_by_handle(handle)
+    }
+
+    fn get_session_by_work_id(&self, work_id: &str) -> Option<SessionState> {
+        self.inner.get_session_by_work_id(work_id)
     }
 }
 

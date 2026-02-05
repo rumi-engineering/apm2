@@ -130,6 +130,13 @@ pub trait SessionRegistry: Send + Sync {
 
     /// Queries a session by ephemeral handle.
     fn get_session_by_handle(&self, handle: &str) -> Option<SessionState>;
+
+    /// Queries a session by work ID (TCK-00344).
+    ///
+    /// Returns the first session associated with the given `work_id`, or `None`
+    /// if no session matches. This is an O(n) scan; a production implementation
+    /// could add a secondary index for efficiency.
+    fn get_session_by_work_id(&self, work_id: &str) -> Option<SessionState>;
 }
 
 /// Error type for session registry operations.

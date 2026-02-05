@@ -187,7 +187,7 @@ impl DispatcherState {
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
-            session_registry,
+            Arc::clone(&session_registry),
             clock,
             Arc::clone(&subscription_registry),
         );
@@ -204,9 +204,11 @@ impl DispatcherState {
         // - Tokens minted during SpawnEpisode can be validated
         // - Manifests registered during SpawnEpisode are visible for tool validation
         // TCK-00303: Share subscription registry for HEF resource governance
+        // TCK-00344: Wire session registry for SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
-                .with_subscription_registry(subscription_registry);
+                .with_subscription_registry(subscription_registry)
+                .with_session_registry(session_registry);
 
         Self {
             privileged_dispatcher,
@@ -255,7 +257,7 @@ impl DispatcherState {
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
-            session_registry,
+            Arc::clone(&session_registry),
             clock,
             Arc::clone(&subscription_registry),
         );
@@ -270,9 +272,11 @@ impl DispatcherState {
         // TCK-00287: Create session dispatcher with same token minter and manifest
         // store
         // TCK-00303: Share subscription registry for HEF resource governance
+        // TCK-00344: Wire session registry for SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
-                .with_subscription_registry(subscription_registry);
+                .with_subscription_registry(subscription_registry)
+                .with_session_registry(session_registry);
 
         Self {
             privileged_dispatcher,
@@ -303,6 +307,10 @@ impl DispatcherState {
         // TCK-00303: Create shared subscription registry for HEF resource governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
+
+        // TCK-00344: Clone session_registry before it is moved into the
+        // privileged dispatcher so we can also wire it into the session dispatcher.
+        let session_registry_for_session = Arc::clone(&session_registry);
 
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
@@ -397,9 +405,11 @@ impl DispatcherState {
         };
 
         // TCK-00303: Share subscription registry for HEF resource governance
+        // TCK-00344: Wire session registry for SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
-                .with_subscription_registry(subscription_registry);
+                .with_subscription_registry(subscription_registry)
+                .with_session_registry(session_registry_for_session);
 
         Self {
             privileged_dispatcher,
@@ -446,6 +456,10 @@ impl DispatcherState {
         // TCK-00303: Create shared subscription registry for HEF resource governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
+
+        // TCK-00344: Clone session_registry before it is moved into the
+        // privileged dispatcher so we can also wire it into the session dispatcher.
+        let session_registry_for_session = Arc::clone(&session_registry);
 
         // TCK-00316: Create durable CAS
         let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
@@ -552,9 +566,11 @@ impl DispatcherState {
         };
 
         // TCK-00316: Wire SessionDispatcher with all production dependencies
+        // TCK-00344: Wire session registry for SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
+                .with_session_registry(session_registry_for_session)
                 .with_ledger(event_emitter)
                 .with_cas(cas)
                 .with_clock(clock)

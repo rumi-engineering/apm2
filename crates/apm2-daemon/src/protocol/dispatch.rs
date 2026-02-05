@@ -4118,19 +4118,12 @@ impl PrivilegedDispatcher {
     }
 
     /// Finds a session by `work_id`.
-    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    fn find_session_by_work_id(&self, _work_id: &str) -> Option<SessionState> {
-        // Note: This is an O(n) scan which is inefficient for large registries.
-        // A production implementation would add an index by work_id to SessionRegistry.
-        // For now, we check if there's a session that matches the work_id
-        // by looking at all active sessions.
-        //
-        // Since SessionRegistry trait doesn't expose iteration, and this is a
-        // status query (not performance critical), we return None and rely on
-        // the work claims registry instead.
-        //
-        // TODO(TCK-00344): Add `get_session_by_work_id` to SessionRegistry trait
-        None
+    ///
+    /// Delegates to `SessionRegistry::get_session_by_work_id` which performs
+    /// an O(n) scan. This is acceptable for status queries which are not
+    /// performance-critical.
+    fn find_session_by_work_id(&self, work_id: &str) -> Option<SessionState> {
+        self.session_registry.get_session_by_work_id(work_id)
     }
 
     // ========================================================================
