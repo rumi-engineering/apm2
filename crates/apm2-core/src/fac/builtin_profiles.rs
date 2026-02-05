@@ -868,4 +868,688 @@ mod tests {
             );
         }
     }
+
+    // =========================================================================
+    // TCK-00330: Comprehensive Conformance Tests for AgentAdapterProfileV1
+    // =========================================================================
+
+    /// Test module for profile conformance testing per TCK-00330.
+    ///
+    /// These tests verify that each profile:
+    /// 1. Can be instantiated correctly
+    /// 2. Has valid CAS hash (deterministic)
+    /// 3. Has proper `permission_mode_map` entries
+    /// 4. Has valid `capability_map` entries
+    /// 5. Supports non-interactive receipt production
+    mod conformance {
+        use super::*;
+        use crate::fac::AGENT_ADAPTER_PROFILE_V1_SCHEMA;
+
+        /// Conformance test: Claude Code profile instantiation and validation.
+        #[test]
+        fn conformance_claude_code_instantiation() {
+            let profile = claude_code_profile();
+
+            // Verify instantiation succeeds
+            assert_eq!(profile.profile_id, CLAUDE_CODE_PROFILE_ID);
+            assert_eq!(profile.schema, AGENT_ADAPTER_PROFILE_V1_SCHEMA);
+
+            // Verify validation passes
+            assert!(profile.validate().is_ok(), "Profile validation should pass");
+        }
+
+        /// Conformance test: Claude Code profile CAS hash stability.
+        #[test]
+        fn conformance_claude_code_cas_hash() {
+            let cas = MemoryCas::new();
+            let profile = claude_code_profile();
+
+            // Hash should be computable
+            let hash = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
+            assert_ne!(hash, [0u8; 32], "CAS hash should be non-zero");
+
+            // Hash should be deterministic (call twice)
+            let hash2 = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
+            assert_eq!(hash, hash2, "CAS hash should be deterministic");
+
+            // Profile should be storable in CAS
+            let stored_hash = profile
+                .store_in_cas(&cas)
+                .expect("Store in CAS should succeed");
+            assert_eq!(hash, stored_hash, "Stored hash should match computed hash");
+        }
+
+        /// Conformance test: Claude Code profile permission modes.
+        #[test]
+        fn conformance_claude_code_permission_modes() {
+            let profile = claude_code_profile();
+
+            // Must have all three standard permission modes
+            assert!(
+                profile.permission_mode_map.contains_key("restricted"),
+                "Must have 'restricted' mode"
+            );
+            assert!(
+                profile.permission_mode_map.contains_key("standard"),
+                "Must have 'standard' mode"
+            );
+            assert!(
+                profile.permission_mode_map.contains_key("elevated"),
+                "Must have 'elevated' mode"
+            );
+        }
+
+        /// Conformance test: Claude Code profile capability map.
+        #[test]
+        fn conformance_claude_code_capability_map() {
+            let profile = claude_code_profile();
+
+            // Must have core capability mappings
+            assert!(
+                profile.capability_map.contains_key("read_file"),
+                "Must map read_file"
+            );
+            assert!(
+                profile.capability_map.contains_key("write_file"),
+                "Must map write_file"
+            );
+            assert!(
+                profile.capability_map.contains_key("exec_command"),
+                "Must map exec_command"
+            );
+
+            // Mappings must be to kernel tool classes
+            for (key, value) in &profile.capability_map {
+                assert!(
+                    value.starts_with("kernel."),
+                    "Capability '{key}' must map to kernel tool class, got '{value}'"
+                );
+            }
+        }
+
+        /// Conformance test: Gemini CLI profile instantiation and validation.
+        #[test]
+        fn conformance_gemini_cli_instantiation() {
+            let profile = gemini_cli_profile();
+
+            assert_eq!(profile.profile_id, GEMINI_CLI_PROFILE_ID);
+            assert_eq!(profile.schema, AGENT_ADAPTER_PROFILE_V1_SCHEMA);
+            assert!(profile.validate().is_ok(), "Profile validation should pass");
+        }
+
+        /// Conformance test: Gemini CLI profile CAS hash stability.
+        #[test]
+        fn conformance_gemini_cli_cas_hash() {
+            let cas = MemoryCas::new();
+            let profile = gemini_cli_profile();
+
+            let hash = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
+            assert_ne!(hash, [0u8; 32], "CAS hash should be non-zero");
+
+            let hash2 = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
+            assert_eq!(hash, hash2, "CAS hash should be deterministic");
+
+            let stored_hash = profile
+                .store_in_cas(&cas)
+                .expect("Store in CAS should succeed");
+            assert_eq!(hash, stored_hash, "Stored hash should match computed hash");
+        }
+
+        /// Conformance test: Gemini CLI profile permission modes.
+        #[test]
+        fn conformance_gemini_cli_permission_modes() {
+            let profile = gemini_cli_profile();
+
+            assert!(
+                profile.permission_mode_map.contains_key("restricted"),
+                "Must have 'restricted' mode"
+            );
+            assert!(
+                profile.permission_mode_map.contains_key("standard"),
+                "Must have 'standard' mode"
+            );
+            assert!(
+                profile.permission_mode_map.contains_key("elevated"),
+                "Must have 'elevated' mode"
+            );
+        }
+
+        /// Conformance test: Gemini CLI profile capability map.
+        #[test]
+        fn conformance_gemini_cli_capability_map() {
+            let profile = gemini_cli_profile();
+
+            assert!(
+                profile.capability_map.contains_key("read_file"),
+                "Must map read_file"
+            );
+
+            for (key, value) in &profile.capability_map {
+                assert!(
+                    value.starts_with("kernel."),
+                    "Capability '{key}' must map to kernel tool class, got '{value}'"
+                );
+            }
+        }
+
+        /// Conformance test: Codex CLI profile instantiation and validation.
+        #[test]
+        fn conformance_codex_cli_instantiation() {
+            let profile = codex_cli_profile();
+
+            assert_eq!(profile.profile_id, CODEX_CLI_PROFILE_ID);
+            assert_eq!(profile.schema, AGENT_ADAPTER_PROFILE_V1_SCHEMA);
+            assert!(profile.validate().is_ok(), "Profile validation should pass");
+        }
+
+        /// Conformance test: Codex CLI profile CAS hash stability.
+        #[test]
+        fn conformance_codex_cli_cas_hash() {
+            let cas = MemoryCas::new();
+            let profile = codex_cli_profile();
+
+            let hash = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
+            assert_ne!(hash, [0u8; 32], "CAS hash should be non-zero");
+
+            let hash2 = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
+            assert_eq!(hash, hash2, "CAS hash should be deterministic");
+
+            let stored_hash = profile
+                .store_in_cas(&cas)
+                .expect("Store in CAS should succeed");
+            assert_eq!(hash, stored_hash, "Stored hash should match computed hash");
+        }
+
+        /// Conformance test: Codex CLI profile permission modes.
+        #[test]
+        fn conformance_codex_cli_permission_modes() {
+            let profile = codex_cli_profile();
+
+            assert!(
+                profile.permission_mode_map.contains_key("restricted"),
+                "Must have 'restricted' mode"
+            );
+            assert!(
+                profile.permission_mode_map.contains_key("standard"),
+                "Must have 'standard' mode"
+            );
+            assert!(
+                profile.permission_mode_map.contains_key("elevated"),
+                "Must have 'elevated' mode"
+            );
+
+            // Codex specific: standard/restricted modes should disable shell
+            let standard = profile.permission_mode_map.get("standard").unwrap();
+            assert!(
+                standard.iter().any(|f| f.contains("shell_tool=false")),
+                "Standard mode should disable shell"
+            );
+        }
+
+        /// Conformance test: Codex CLI profile capability map.
+        #[test]
+        fn conformance_codex_cli_capability_map() {
+            let profile = codex_cli_profile();
+
+            assert!(
+                profile.capability_map.contains_key("read_file"),
+                "Must map read_file"
+            );
+            assert!(
+                profile.capability_map.contains_key("write_file"),
+                "Must map write_file"
+            );
+
+            for (key, value) in &profile.capability_map {
+                assert!(
+                    value.starts_with("kernel."),
+                    "Capability '{key}' must map to kernel tool class, got '{value}'"
+                );
+            }
+        }
+
+        /// Conformance test: Local inference profile instantiation and
+        /// validation.
+        #[test]
+        fn conformance_local_inference_instantiation() {
+            let profile = local_inference_profile();
+
+            assert_eq!(profile.profile_id, LOCAL_INFERENCE_PROFILE_ID);
+            assert_eq!(profile.schema, AGENT_ADAPTER_PROFILE_V1_SCHEMA);
+            assert!(profile.validate().is_ok(), "Profile validation should pass");
+        }
+
+        /// Conformance test: Local inference profile CAS hash stability.
+        #[test]
+        fn conformance_local_inference_cas_hash() {
+            let cas = MemoryCas::new();
+            let profile = local_inference_profile();
+
+            let hash = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
+            assert_ne!(hash, [0u8; 32], "CAS hash should be non-zero");
+
+            let hash2 = profile
+                .compute_cas_hash()
+                .expect("CAS hash should be computable");
+            assert_eq!(hash, hash2, "CAS hash should be deterministic");
+
+            let stored_hash = profile
+                .store_in_cas(&cas)
+                .expect("Store in CAS should succeed");
+            assert_eq!(hash, stored_hash, "Stored hash should match computed hash");
+        }
+
+        /// Conformance test: Local inference profile permission modes.
+        #[test]
+        fn conformance_local_inference_permission_modes() {
+            let profile = local_inference_profile();
+
+            assert!(
+                profile.permission_mode_map.contains_key("restricted"),
+                "Must have 'restricted' mode"
+            );
+            assert!(
+                profile.permission_mode_map.contains_key("standard"),
+                "Must have 'standard' mode"
+            );
+            assert!(
+                profile.permission_mode_map.contains_key("elevated"),
+                "Must have 'elevated' mode"
+            );
+        }
+
+        /// Conformance test: Local inference profile capability map.
+        #[test]
+        fn conformance_local_inference_capability_map() {
+            let profile = local_inference_profile();
+
+            assert!(
+                profile.capability_map.contains_key("read_file"),
+                "Must map read_file"
+            );
+
+            for (key, value) in &profile.capability_map {
+                assert!(
+                    value.starts_with("kernel."),
+                    "Capability '{key}' must map to kernel tool class, got '{value}'"
+                );
+            }
+        }
+
+        /// Conformance test: All profiles have unique CAS hashes.
+        #[test]
+        fn conformance_all_profiles_unique_hashes() {
+            let profiles = all_builtin_profiles();
+            let mut hashes: Vec<[u8; 32]> = Vec::new();
+
+            for profile in &profiles {
+                let hash = profile
+                    .compute_cas_hash()
+                    .expect("CAS hash should be computable");
+                assert!(
+                    !hashes.contains(&hash),
+                    "Profile '{}' has duplicate CAS hash",
+                    profile.profile_id
+                );
+                hashes.push(hash);
+            }
+        }
+
+        /// Conformance test: All profiles pass full validation.
+        #[test]
+        fn conformance_all_profiles_valid() {
+            for profile in all_builtin_profiles() {
+                assert!(
+                    profile.validate().is_ok(),
+                    "Profile '{}' should pass validation",
+                    profile.profile_id
+                );
+            }
+        }
+
+        /// Conformance test: All profiles have `tool_bridge` with TI1 protocol.
+        #[test]
+        fn conformance_all_profiles_tool_bridge() {
+            for profile in all_builtin_profiles() {
+                let tb = profile.tool_bridge.as_ref().unwrap_or_else(|| {
+                    panic!("Profile '{}' should have tool_bridge", profile.profile_id)
+                });
+
+                assert!(
+                    tb.enabled,
+                    "Profile '{}' tool_bridge should be enabled",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    tb.protocol_version, "TI1",
+                    "Profile '{}' should use TI1 protocol",
+                    profile.profile_id
+                );
+                assert!(
+                    tb.max_args_size > 0,
+                    "Profile '{}' max_args_size should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    tb.max_result_size > 0,
+                    "Profile '{}' max_result_size should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    tb.tool_timeout_ms > 0,
+                    "Profile '{}' tool_timeout_ms should be > 0",
+                    profile.profile_id
+                );
+            }
+        }
+
+        /// Conformance test: All profiles have valid version probe.
+        #[test]
+        fn conformance_all_profiles_version_probe() {
+            for profile in all_builtin_profiles() {
+                let probe = &profile.version_probe;
+
+                // Command must be non-empty
+                assert!(
+                    !probe.command.is_empty(),
+                    "Profile '{}' version_probe.command must be non-empty",
+                    profile.profile_id
+                );
+
+                // Regex must be valid
+                let regex_result = regex::Regex::new(&probe.regex);
+                assert!(
+                    regex_result.is_ok(),
+                    "Profile '{}' has invalid version probe regex: {}",
+                    profile.profile_id,
+                    probe.regex
+                );
+
+                // Regex must have at least one capture group for version
+                let regex = regex_result.unwrap();
+                assert!(
+                    regex.captures_len() >= 2, // Full match + at least 1 capture group
+                    "Profile '{}' version probe regex should have capture group for version",
+                    profile.profile_id
+                );
+            }
+        }
+
+        /// Conformance test: All profiles have valid health checks.
+        #[test]
+        fn conformance_all_profiles_health_checks() {
+            for profile in all_builtin_profiles() {
+                let hc = &profile.health_checks;
+
+                assert!(
+                    hc.startup_timeout_ms > 0,
+                    "Profile '{}' startup_timeout_ms should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    hc.heartbeat_interval_ms > 0,
+                    "Profile '{}' heartbeat_interval_ms should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    hc.heartbeat_timeout_ms > 0,
+                    "Profile '{}' heartbeat_timeout_ms should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    hc.stall_threshold_ms > 0,
+                    "Profile '{}' stall_threshold_ms should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    hc.max_stalls > 0,
+                    "Profile '{}' max_stalls should be > 0",
+                    profile.profile_id
+                );
+
+                // Heartbeat timeout should be greater than interval
+                assert!(
+                    hc.heartbeat_timeout_ms > hc.heartbeat_interval_ms,
+                    "Profile '{}' heartbeat_timeout should be > heartbeat_interval",
+                    profile.profile_id
+                );
+            }
+        }
+
+        /// Conformance test: All profiles have valid budget defaults.
+        #[test]
+        fn conformance_all_profiles_budget_defaults() {
+            for profile in all_builtin_profiles() {
+                let bd = &profile.budget_defaults;
+
+                assert!(
+                    bd.max_tool_calls > 0,
+                    "Profile '{}' max_tool_calls should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    bd.max_tokens > 0,
+                    "Profile '{}' max_tokens should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    bd.max_wall_clock_ms > 0,
+                    "Profile '{}' max_wall_clock_ms should be > 0",
+                    profile.profile_id
+                );
+                assert!(
+                    bd.max_evidence_bytes > 0,
+                    "Profile '{}' max_evidence_bytes should be > 0",
+                    profile.profile_id
+                );
+            }
+        }
+
+        /// Conformance test: All profiles have valid evidence policy.
+        #[test]
+        fn conformance_all_profiles_evidence_policy() {
+            for profile in all_builtin_profiles() {
+                let ep = &profile.evidence_policy;
+
+                // Max recorded output should be > 0 if recording is enabled
+                if ep.record_full_output {
+                    assert!(
+                        ep.max_recorded_output_bytes > 0,
+                        "Profile '{}' max_recorded_output_bytes should be > 0 if record_full_output is true",
+                        profile.profile_id
+                    );
+                }
+
+                // redact_sensitive should be true for security (all builtin profiles)
+                assert!(
+                    ep.redact_sensitive,
+                    "Profile '{}' should have redact_sensitive = true",
+                    profile.profile_id
+                );
+            }
+        }
+
+        /// Conformance test: Profile CAS roundtrip preserves all fields.
+        #[test]
+        fn conformance_cas_roundtrip_field_preservation() {
+            let cas = MemoryCas::new();
+
+            for profile in all_builtin_profiles() {
+                let hash = profile
+                    .store_in_cas(&cas)
+                    .unwrap_or_else(|_| panic!("Store '{}' should succeed", profile.profile_id));
+
+                let loaded = AgentAdapterProfileV1::load_from_cas(&cas, &hash)
+                    .unwrap_or_else(|_| panic!("Load '{}' should succeed", profile.profile_id));
+
+                // Field-by-field comparison
+                assert_eq!(
+                    profile.profile_id, loaded.profile_id,
+                    "profile_id mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.adapter_mode, loaded.adapter_mode,
+                    "adapter_mode mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.command, loaded.command,
+                    "command mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.args_template, loaded.args_template,
+                    "args_template mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.env_template, loaded.env_template,
+                    "env_template mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.cwd, loaded.cwd,
+                    "cwd mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.requires_pty, loaded.requires_pty,
+                    "requires_pty mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.input_mode, loaded.input_mode,
+                    "input_mode mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.output_mode, loaded.output_mode,
+                    "output_mode mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.permission_mode_map, loaded.permission_mode_map,
+                    "permission_mode_map mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.tool_bridge, loaded.tool_bridge,
+                    "tool_bridge mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.capability_map, loaded.capability_map,
+                    "capability_map mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.version_probe, loaded.version_probe,
+                    "version_probe mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.health_checks, loaded.health_checks,
+                    "health_checks mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.budget_defaults, loaded.budget_defaults,
+                    "budget_defaults mismatch for '{}'",
+                    profile.profile_id
+                );
+                assert_eq!(
+                    profile.evidence_policy, loaded.evidence_policy,
+                    "evidence_policy mismatch for '{}'",
+                    profile.profile_id
+                );
+
+                // Full equality check
+                assert_eq!(
+                    profile, loaded,
+                    "Full profile mismatch for '{}'",
+                    profile.profile_id
+                );
+            }
+        }
+
+        /// Conformance test: Non-interactive receipt production simulation.
+        ///
+        /// This test demonstrates that profiles can be used for non-interactive
+        /// receipt production by:
+        /// 1. Loading a profile from CAS by hash
+        /// 2. Using profile data to construct a simulated receipt
+        /// 3. Verifying receipt includes profile attribution
+        #[test]
+        fn conformance_non_interactive_receipt_production() {
+            let cas = MemoryCas::new();
+
+            for profile in all_builtin_profiles() {
+                // Store profile in CAS
+                let profile_hash = profile
+                    .store_in_cas(&cas)
+                    .unwrap_or_else(|_| panic!("Store '{}' should succeed", profile.profile_id));
+
+                // Simulate non-interactive receipt production
+                // In real usage, this would be a ToolExecutionReceipt or similar
+                let simulated_receipt = serde_json::json!({
+                    "work_id": format!("work-{}", uuid::Uuid::new_v4()),
+                    "episode_id": format!("episode-{}", uuid::Uuid::new_v4()),
+                    "session_id": format!("session-{}", uuid::Uuid::new_v4()),
+                    "adapter_profile_hash": hex::encode(profile_hash),
+                    "profile_id": profile.profile_id,
+                    "adapter_mode": profile.adapter_mode.to_string(),
+                    "tool_bridge_protocol": profile.tool_bridge.as_ref().map(|tb| &tb.protocol_version),
+                    "timestamp_ns": 1_704_067_200_000_000_000_u64,
+                });
+
+                // Verify receipt contains profile hash attribution
+                let receipt_hash = simulated_receipt
+                    .get("adapter_profile_hash")
+                    .and_then(|v| v.as_str())
+                    .expect("Receipt should have adapter_profile_hash");
+
+                assert_eq!(
+                    receipt_hash,
+                    hex::encode(profile_hash),
+                    "Receipt should contain correct profile hash for '{}'",
+                    profile.profile_id
+                );
+
+                // Verify profile can be recovered from receipt
+                let recovered_hash =
+                    hex::decode(receipt_hash).expect("Profile hash should be valid hex");
+                let recovered_hash: [u8; 32] = recovered_hash
+                    .try_into()
+                    .expect("Profile hash should be 32 bytes");
+
+                let recovered_profile = AgentAdapterProfileV1::load_from_cas(&cas, &recovered_hash)
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "Profile '{}' should be recoverable from receipt hash",
+                            profile.profile_id
+                        )
+                    });
+
+                assert_eq!(
+                    profile.profile_id, recovered_profile.profile_id,
+                    "Recovered profile should match original"
+                );
+            }
+        }
+    }
 }

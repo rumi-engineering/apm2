@@ -346,6 +346,42 @@ pub trait LedgerEventEmitter: Send + Sync {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits an `EpisodeRunAttributed` event to the ledger (TCK-00330).
+    ///
+    /// This method records attribution for an episode run, binding:
+    /// - `work_id`: The work item this run is associated with
+    /// - `episode_id`: The episode identifier
+    /// - `session_id`: The session that executed the run
+    /// - `adapter_profile_hash`: CAS hash of the `AgentAdapterProfileV1` used
+    ///
+    /// Per REQ-0009, ledger events must include `adapter_profile_hash`
+    /// attribution to enable audit trail reconstruction and
+    /// profile-specific analysis.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - The work ID this run is associated with
+    /// * `episode_id` - The episode ID for this run
+    /// * `session_id` - The session ID that executed the run
+    /// * `adapter_profile_hash` - CAS hash of the `AgentAdapterProfileV1`
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_episode_run_attributed(
+        &self,
+        work_id: &str,
+        episode_id: &str,
+        session_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
 }
 
 /// Domain separation prefix for `WorkClaimed` events.
@@ -360,6 +396,13 @@ pub const DEFECT_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.defect_recorded:";
 ///
 /// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
 pub const EPISODE_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.episode:";
+
+/// Domain separation prefix for episode run attribution events (TCK-00330).
+///
+/// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
+/// This prefix is used for events that attribute episode runs to specific
+/// adapter profiles via their CAS hash.
+pub const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
 
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
 // to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
@@ -1044,6 +1087,105 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             episode_id = %episode_id,
             receipt_id = %receipt_id,
             "ReviewReceiptRecorded event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_episode_run_attributed(
+        &self,
+        work_id: &str,
+        episode_id: &str,
+        session_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with run attribution data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
+        // TCK-00330: adapter_profile_hash provides ledger attribution for profile-based
+        // auditing
+        let payload_json = serde_json::json!({
+            "event_type": "episode_run_attributed",
+            "work_id": work_id,
+            "episode_id": episode_id,
+            "session_id": session_id,
+            "adapter_profile_hash": hex::encode(adapter_profile_hash),
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // Use JCS (RFC 8785) canonicalization for deterministic signing
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(EPISODE_RUN_ATTRIBUTED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(EPISODE_RUN_ATTRIBUTED_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "episode_run_attributed".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: session_id.to_string(), // Session is the actor for run attribution
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(work_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            work_id = %work_id,
+            episode_id = %episode_id,
+            session_id = %session_id,
+            adapter_profile_hash = %hex::encode(adapter_profile_hash),
+            "EpisodeRunAttributed event signed and persisted"
         );
 
         Ok(signed_event)

@@ -632,6 +632,100 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         Ok(signed_event)
     }
+
+    fn emit_episode_run_attributed(
+        &self,
+        work_id: &str,
+        episode_id: &str,
+        session_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // TCK-00330: Domain prefix for episode run attribution events.
+        // This is imported from dispatch.rs and used to ensure domain separation.
+        const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with run attribution data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
+        // TCK-00330: adapter_profile_hash provides ledger attribution for profile-based
+        // auditing
+        let payload = serde_json::json!({
+            "event_type": "episode_run_attributed",
+            "work_id": work_id,
+            "episode_id": episode_id,
+            "session_id": session_id,
+            "adapter_profile_hash": hex::encode(adapter_profile_hash),
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // TCK-00330: Use JCS (RFC 8785) canonicalization for signing.
+        // This ensures deterministic JSON representation per RFC-0016.
+        let payload_json = payload.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(EPISODE_RUN_ATTRIBUTED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(EPISODE_RUN_ATTRIBUTED_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "episode_run_attributed".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: session_id.to_string(), // Session is the actor for run attribution
+            payload: payload_bytes.clone(),
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // Persist to SQLite
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns
+            ],
+        ).map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+
+        info!(
+            event_id = %event_id,
+            work_id = %work_id,
+            episode_id = %episode_id,
+            session_id = %session_id,
+            adapter_profile_hash = %hex::encode(adapter_profile_hash),
+            "Persisted EpisodeRunAttributed event"
+        );
+
+        Ok(signed_event)
+    }
 }
 
 /// Durable work registry backed by `SQLite`.
