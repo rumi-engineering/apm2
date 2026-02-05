@@ -905,10 +905,13 @@
         "name": "Category Theory",
         "title": "Compositional interfaces with identity + associativity",
         "formal": "morphisms compose; identities exist; compositionality reduces complexity.",
-        "apm2_mapping": "holon interfaces should compose: work intake → episode execution → artifact emission → escalation. Tool invocations should also be composable pipelines with explicit handlers (PRIN-074). The point is to build large systems from small verified pieces without “glue code entropy.”",
+        "apm2_mapping": "holon interfaces should compose: work intake → episode execution → artifact emission → escalation. Tool invocations should also be composable pipelines with explicit handlers (PRIN-074). The point is to build large systems from small verified pieces without “glue code entropy.” This is codified as LAW-16: closure under composition at holonic boundaries.",
         "connections": [
           "PRIN-074",
           "PRIN-095"
+        ],
+        "law_refs": [
+          "LAW-16"
         ]
       },
       {

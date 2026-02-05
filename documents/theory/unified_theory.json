@@ -114,7 +114,7 @@
         "ENF-ORACLE-01": {
           "node_class": "NORMATIVE",
           "statement": "Open design questions (Q-*) MUST remain EXPLANATORY until resolved by an OracleRequest/Adjudication with receipt-backed evidence. Any resulting enforceable rule must be recorded as a new NORMATIVE node that references the adjudication resolution and evidence.",
-          "violation_class": "GOVERNANCE",
+          "violation_class": "POLICY_VIOLATION",
           "law_refs": [
             "LAW-01",
             "LAW-15"
@@ -135,6 +135,36 @@
           "violation_class": "POLICY_VIOLATION",
           "law_refs": [
             "LAW-05"
+          ]
+        },
+        "ENF-HMP-01": {
+          "node_class": "NORMATIVE",
+          "statement": "ASPIRATIONAL (until machine-checkable enforcement is implemented): Inter-holon messages MUST conform to the Holonic Mesh Protocol (HMP): envelope fields (protocol_id+version, message_class, message_id, hlc_timestamp, and any required commitments/receipts) MUST be present and schema-validated; unknown message classes or schema versions MUST be rejected (fail-closed).",
+          "violation_class": "SCHEMA_VIOLATION",
+          "law_refs": [
+            "LAW-13",
+            "LAW-15",
+            "LAW-16"
+          ]
+        },
+        "ENF-COMPOSITION-01": {
+          "node_class": "NORMATIVE",
+          "statement": "ASPIRATIONAL (until machine-checkable enforcement is implemented): Holonic boundaries MUST be closed under composition: cross-boundary interaction MUST use the canonical channel classes and versioned schemas/contracts. New ad-hoc boundary primitives (including raw chat logs as interfaces) are prohibited; interface changes require explicit governance and a versioned contract reference.",
+          "violation_class": "INTERFACE_PROLIFERATION",
+          "law_refs": [
+            "LAW-05",
+            "LAW-07",
+            "LAW-16"
+          ]
+        },
+        "ENF-SUMMARY-01": {
+          "node_class": "NORMATIVE",
+          "statement": "ASPIRATIONAL (until machine-checkable enforcement is implemented): All SummaryReceipts MUST declare a loss profile and provide selectors that deterministically address omitted facts/evidence by hash or range. Summaries without zoom-in affordances MUST be treated as narrative and are non-authoritative for high-risk promotion.",
+          "violation_class": "MEASUREMENT_INTEGRITY",
+          "law_refs": [
+            "LAW-07",
+            "LAW-14",
+            "LAW-15"
           ]
         }
       },
@@ -259,6 +289,16 @@
             "LAW-06",
             "LAW-07",
             "LAW-15"
+          ],
+          "node_class": "EXPLANATORY"
+        },
+        "SEP-05": {
+          "name": "Interface closure over implementation freedom",
+          "statement": "Holonic boundaries are the engineering surface: keep boundary primitives fixed and minimal, while allowing unlimited internal complexity. A holon-of-holons MUST present the same boundary contract as a leaf holon (closure under composition), so recursion does not create new protocol primitives.",
+          "law_refs": [
+            "LAW-05",
+            "LAW-07",
+            "LAW-16"
           ],
           "node_class": "EXPLANATORY"
         }
@@ -605,6 +645,28 @@
           "LAW-15"
         ],
         "node_class": "BACKGROUND"
+      },
+      "PHY-10": {
+        "name": "Scale invariance: coarse-grained boundary signals are mandatory under recursion",
+        "statement": "Holarchies only scale if boundaries coarse-grain. A holon (leaf or aggregate) MUST communicate via stable, low-variety boundary signals (digests, commitments, receipts, summaries + selectors). If an interaction requires more detail than the boundary allows, the correct response is recursion (spawn/decompose) plus zoom-in by hash under capability—not widening the interface or exporting internal traces.",
+        "derived_rules": [
+          "treat cross-boundary bandwidth/attention as the scarce resource; optimize for digest-first exchange",
+          "never treat internal chat logs, scratchpads, or private state as boundary artifacts",
+          "prefer SummaryReceipts + selectors for routing and escalation; pull raw evidence only when demanded by risk tier",
+          "interface growth with holarchy depth is a scalability defect; composition must not add primitives"
+        ],
+        "mechanisms": [
+          "MECH-HOLON-MESH-PROTOCOL",
+          "MECH-INDEX-LAYERS",
+          "MECH-CONTEXTPACK",
+          "MECH-PERMEABILITY-RECEIPT"
+        ],
+        "law_refs": [
+          "LAW-07",
+          "LAW-10",
+          "LAW-16"
+        ],
+        "node_class": "BACKGROUND"
       }
     },
     "truth_topology": {
@@ -720,7 +782,7 @@
         "node_class": "NORMATIVE"
       },
       "monotone_vs_projection": {
-      "monotone_substrate": {
+        "monotone_substrate": {
           "statement": "Facts are monotone additions within a declared join-semilattice; truth is the least-upper-bound of all observed events and evidence.",
           "merge_algebra_requirements": [
             "Every domain MUST define a join operator (⊔) that is idempotent, commutative, and associative.",
@@ -774,25 +836,33 @@
           "name": "Interface Variety Control",
           "statement": "Supervisors control interface variety (typed signals/contracts), not internal complexity; this resolves Ashby's requisite variety at boundaries.",
           "node_class": "NORMATIVE"
+        },
+        "HB-06": {
+          "name": "Compositional Closure",
+          "statement": "Holonic interfaces are closed under composition: aggregates compress and summarize; they do not invent new boundary primitives. Boundary traffic is commitments/receipts/summaries with selectors; details are fetched by hash under delegated capability.",
+          "node_class": "NORMATIVE"
         }
       },
       "channels": {
         "notes": [
-          "Channel classes follow Principia Holonica: discovery/handshake/work/evidence.",
+          "Channel classes follow Principia Holonica: discovery/handshake/work/evidence/governance.",
+          "Discovery does not convey capabilities or authoritative claims; capabilities cross only via explicit handshake/permeability receipts.",
           "Each channel has distinct semantics, budgets, retention, and trust posture."
         ],
         "classes": {
           "CH-01": {
             "name": "discovery",
-            "trust": "low",
+            "trust": "low (unauthenticated)",
             "bandwidth": "low",
             "primary_value": [
-              "capability discovery",
-              "uncertainty reduction"
+              "directory discovery (identity/locator/routing hints)",
+              "uncertainty reduction",
+              "routing hints"
             ],
             "risks": [
-              "malformed/malicious inputs",
-              "representation attacks"
+              "spoofing",
+              "spam",
+              "downgrade/impersonation attempts"
             ],
             "governance": [
               "bounded by lease/budget",
@@ -842,6 +912,25 @@
               "tamper-evident receipts"
             ],
             "node_class": "NORMATIVE"
+          },
+          "CH-05": {
+            "name": "governance",
+            "trust": "high (signed/policy-bound)",
+            "bandwidth": "low",
+            "primary_value": [
+              "stop-order propagation",
+              "policy and interface-contract update notifications",
+              "ratchet coordination (enforce-with-waiver -> enforce-hard)"
+            ],
+            "risks": [
+              "downgrade attacks",
+              "unauthorized policy mutation"
+            ],
+            "governance": [
+              "MUST be signed and hash-bound to an attested policy bundle",
+              "audited + rate limited; prefer broadcast via commitments, not payload flooding"
+            ],
+            "node_class": "NORMATIVE"
           }
         },
         "node_class": "NORMATIVE"
@@ -875,6 +964,9 @@
       "stack_model": {
         "statement": "APM2 is a stack of nested control loops: (1) episode loop, (2) work substrate lifecycle loop, (3) recurrence/self-improvement loop.",
         "principle": "Each outer loop treats the inner loop as a plant with measurable outputs and controllable inputs; governance adjusts constraints based on feedback.",
+        "notes": [
+          "Aligns with the agentic-reasoning split between in-context (test-time orchestration) and post-training (policy optimization): the episode loop is in-context; the recurrence loop is post-training and must itself be governed and evidence-bearing."
+        ],
         "law_refs": [
           "LAW-01",
           "LAW-08",
@@ -1616,11 +1708,22 @@
       },
       "MECH-WORK-DECOMPOSITION": {
         "name": "Holonic decomposition + routing",
-        "role": "Coordinator holons decompose goals into low-coupling work graphs; parallelism economics managed via backpressure and verification cost.",
+        "role": "Decomposes a large work objective into smaller work objects with explicit dependencies; binds decompositions to budgets and verification strategy (risk tier); the decomposition output is a WorkGraph (DAG of WorkIDs with explicit edges), enabling recursion without widening interfaces.",
+        "properties": [
+          "outputs a WorkGraph: nodes are WorkIDs with typed specs; edges encode dependencies/parent_work_ids",
+          "each node declares stop conditions, budgets, and required receipts (risk-tiered)",
+          "interfaces between nodes are typed boundary signals (no implicit shared context)",
+          "upward progress is summarized as SummaryReceipts + receipts; downward requests are scoped and capability-limited"
+        ],
         "math_refs": [
           "Amdahl_law",
           "queueing_theory",
           "backpressure"
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-12",
+          "LAW-16"
         ],
         "node_class": "NORMATIVE",
         "fact_bindings": {
@@ -1676,16 +1779,19 @@
           "sender_holon_id + sender_cell_id",
           "recipient_holon_id + recipient_cell_id (optional; directory-resolved)",
           "work_id (or work_graph_id)",
-          "message_id (idempotency key) + causal_parent_ids",
+          "message_id (idempotency key) + hlc_timestamp + causal_parent_ids",
+          "message_class (discovery/handshake/work/evidence/governance)",
           "ledger_commitment (checkpoint/head hash) for any claims",
           "context_pack_digest (optional) + selectors for omitted facts",
-          "receipt_digests (optional) + evidence_manifests (optional)"
+          "receipt_digests (optional) + evidence_manifests (optional)",
+          "interface_contract_ref (optional; stable ID of the boundary contract/schema)"
         ],
         "message_classes": [
+          "discovery (ping, directory_query, directory_reply)",
           "handshake (hello, capability_request, capability_grant)",
           "work (offer, accept, result, escalation)",
           "evidence (advertise, request, transfer_by_hash)",
-          "governance (stop_order propagation, policy update notification)"
+          "governance (stop_order propagation, policy update notification, contract negotiation)"
         ],
         "non_goals": [
           "does not mandate a transport (gRPC/HTTP/queues are projections)",
@@ -1696,7 +1802,8 @@
           "LAW-06",
           "LAW-07",
           "LAW-11",
-          "LAW-15"
+          "LAW-15",
+          "LAW-16"
         ],
         "node_class": "NORMATIVE",
         "fact_bindings": {
@@ -2198,6 +2305,15 @@
             "LAW-14",
             "LAW-15"
           ]
+        },
+        "INV-F-16": {
+          "node_class": "NORMATIVE",
+          "statement": "Holonic interfaces are closed under composition: any holon (leaf or aggregate) MUST communicate using the same boundary channel classes and HMP envelope. Cross-boundary artifacts MUST be commitments/receipts/summaries with selectors; internal traces and private state are not valid boundary objects.",
+          "law_refs": [
+            "LAW-05",
+            "LAW-07",
+            "LAW-16"
+          ]
         }
       },
       "pragmatic_compromises": {
@@ -2243,6 +2359,16 @@
             "measure escape rates",
             "compute verifier ROI",
             "stage enforce-with-waiver -> enforce-hard"
+          ],
+          "node_class": "EXPLANATORY"
+        },
+        "CMP-07": {
+          "statement": "Interface-closure enforcement SHOULD start as cheap schema/lint checks to preserve Forge Admission Cycle throughput; ratchet to merge-blocking only after the HMP/schema toolchain is stable and false-positive rates are low.",
+          "improvement_path": [
+            "schema registry + version negotiation",
+            "daemon-level fail-closed decoding for unknown schema/message_class",
+            "linter rules for boundary artifacts (SummaryReceipt required for cross-boundary narrative)",
+            "governance ratchet: warn -> enforce-with-waiver -> enforce-hard"
           ],
           "node_class": "EXPLANATORY"
         },
@@ -3179,6 +3305,25 @@
           "impact_scope": {},
           "evidence_refs": []
         }
+      },
+      "Q-16": {
+        "question": "How do holons evolve boundary contracts (HMP schemas/interface_contract_ref) across federated cells without lockstep upgrades or interface proliferation?",
+        "why_it_matters": "LAW-16 requires compositional closure and stable primitives, but civilizational-scale deployment demands long-lived multi-version interoperability and safe deprecation. Poor versioning creates fragmentation or unsafe downgrade paths.",
+        "provisional_default": "Prefer monotone, backward-compatible schema evolution with explicit version negotiation via governance channel; support N-2 versions; treat breaking changes as new protocol_id and require migration receipts.",
+        "node_class": "EXPLANATORY",
+        "oracle_request": {
+          "schema_id": "apm2.oracle_request.v1",
+          "oracle_request_id": "ORQ-Q-16",
+          "question_id": "Q-16",
+          "work_id": "WORK-000",
+          "request_type": "BOUNDED_CHOICE",
+          "inputs": {},
+          "options": {},
+          "decision_deadline": null,
+          "fallback_policy": "ESCALATE",
+          "impact_scope": {},
+          "evidence_refs": []
+        }
       }
     },
     "provisional_defaults": {
@@ -3336,6 +3481,11 @@
         }
       },
       "merge_and_convergence": {
+        "MET-INT-01": {
+          "name": "interface_surface_area",
+          "definition": "Count of distinct boundary contract/schema versions used in cross-holon communication for a given holon/cell over a window. Growth with depth is a scalability/attack-surface signal; target is bounded growth (prefer zero).",
+          "node_class": "NORMATIVE"
+        },
         "MET-MRG-01": {
           "name": "merge_conflict_rate",
           "definition": "Frequency of merge conflicts by subsystem/interface; informs decomposition and interface stabilization work.",
@@ -3395,7 +3545,7 @@
         "DOC-SPINE-05": {
           "title": "Laws as Corollaries",
           "contents": [
-            "LAW-01..LAW-15 mapping to mechanisms and invariants"
+            "LAW-01..LAW-16 mapping to mechanisms and invariants"
           ],
           "node_class": "EXPLANATORY"
         },
@@ -3539,6 +3689,16 @@
           "node_class": "NORMATIVE",
           "amendments": ["Evaluator Validity", "Evaluator Brittleness as Defect"],
           "defect_classes": ["EVALUATOR_DRIFT"]
+        },
+        "LAW-16": {
+          "name": "Closure Under Composition & Boundary Contracts",
+          "reference_path": "laws.json",
+          "role": "Ensures recursion scales: holon boundaries use stable primitives regardless of internal scale. Aggregates summarize (SummaryReceipts/commitments/selectors) and delegate detail work downward; zoom-in is by hash under capability. Prevents interface proliferation, chat-log coupling, and boundary-based attacks.",
+          "node_class": "NORMATIVE",
+          "defect_classes": [
+            "INTERFACE_PROLIFERATION",
+            "ABSTRACTION_BREAK"
+          ]
         }
       },
       "law_order": [
@@ -3547,6 +3707,7 @@
         "LAW-03",
         "LAW-04",
         "LAW-05",
+        "LAW-16",
         "LAW-06",
         "LAW-07",
         "LAW-08",
@@ -3570,7 +3731,7 @@
           "node_class": "BACKGROUND"
         },
         "Work Substrate": {
-          "ref": "documents/theory/glossary/glossary.json",
+          "ref": "documents/theory/glossary/glossary.json#term:work_substrate",
           "node_class": "BACKGROUND"
         },
         "Plan": {
@@ -3646,11 +3807,19 @@
           "node_class": "BACKGROUND"
         },
         "Summary Receipt": {
-          "ref": "documents/theory/glossary/glossary.json",
+          "ref": "documents/theory/glossary/glossary.json#term:summary_receipt",
           "node_class": "BACKGROUND"
         },
         "Commitment Filter": {
           "ref": "documents/theory/glossary/glossary.json",
+          "node_class": "BACKGROUND"
+        },
+        "WorkGraph": {
+          "ref": "documents/theory/glossary/glossary.json#term:work_graph",
+          "node_class": "BACKGROUND"
+        },
+        "Work Graph": {
+          "ref": "documents/theory/glossary/glossary.json#term:work_graph",
           "node_class": "BACKGROUND"
         },
         "Oracle": {
@@ -3692,7 +3861,7 @@
           "node_class": "BACKGROUND"
         },
         "SWE-bench Verified (OpenAI)": {
-          "ref": "https://openai.com/index/swe-bench-verified/",
+          "ref": "https://openai.com/index/introducing-swe-bench-verified/",
           "node_class": "BACKGROUND"
         },
         "SWE-agent": {
