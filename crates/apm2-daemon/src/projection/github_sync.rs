@@ -727,6 +727,45 @@ impl IdempotencyCache {
         Ok(())
     }
 
+    /// Async version of `register_digest_sha_mapping` that uses
+    /// `spawn_blocking`.
+    ///
+    /// Major fix: Thread blocking in async context - wraps the sync `SQLite`
+    /// operation in `spawn_blocking` to avoid blocking the Tokio executor
+    /// threads.
+    #[allow(clippy::cast_possible_wrap)] // Timestamp won't overflow until year 2554
+    async fn register_digest_sha_mapping_async(
+        &self,
+        digest: [u8; 32],
+        sha: String,
+    ) -> Result<(), ProjectionError> {
+        let conn = Arc::clone(&self.conn);
+
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn
+                .lock()
+                .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            conn_guard
+                .execute(
+                    "INSERT OR REPLACE INTO digest_sha_mappings
+                     (changeset_digest, commit_sha, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![digest.as_slice(), &sha, now as i64],
+                )
+                .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ProjectionError::DatabaseError(format!("spawn_blocking failed: {e}")))?
+    }
+
     /// Looks up the commit SHA for a changeset digest.
     fn get_commit_sha(&self, digest: &[u8; 32]) -> Result<Option<String>, ProjectionError> {
         let conn = self
@@ -1429,6 +1468,21 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
     ) -> Result<(), ProjectionError> {
         self.cache
             .register_digest_sha_mapping(changeset_digest, commit_sha)
+    }
+
+    /// Async version of `register_commit_sha` that uses `spawn_blocking`.
+    ///
+    /// Major fix: Thread blocking in async context - wraps the sync `SQLite`
+    /// operation in `spawn_blocking` to avoid blocking the Tokio executor
+    /// threads.
+    pub async fn register_commit_sha_async(
+        &self,
+        changeset_digest: [u8; 32],
+        commit_sha: String,
+    ) -> Result<(), ProjectionError> {
+        self.cache
+            .register_digest_sha_mapping_async(changeset_digest, commit_sha)
+            .await
     }
 
     /// Looks up the commit SHA for a changeset digest.

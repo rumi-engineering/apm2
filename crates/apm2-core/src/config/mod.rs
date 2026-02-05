@@ -127,6 +127,7 @@ pub struct DaemonConfig {
 /// Disabled by default; enable by setting `enabled = true` and providing
 /// GitHub API credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectionConfig {
     /// Whether projection is enabled.
     #[serde(default)]

@@ -607,7 +607,10 @@ const DEFAULT_TAILER_ID: &str = "projection_worker";
 /// The polling query uses `(timestamp_ns, event_id) > (last_ns, last_id)`
 /// to correctly handle timestamp collisions.
 pub struct LedgerTailer {
-    conn: Arc<Mutex<Connection>>,
+    /// Database connection for ledger access.
+    /// Made `pub(crate)` to allow async handlers to wrap operations in
+    /// `spawn_blocking`.
+    pub(crate) conn: Arc<Mutex<Connection>>,
     /// Last processed event timestamp (for ordering).
     last_processed_ns: u64,
     /// Last processed event ID (for deterministic ordering within same
@@ -1385,7 +1388,7 @@ impl ProjectionWorker {
             .await?;
 
         for event in events {
-            match self.handle_work_pr_associated(&event) {
+            match self.handle_work_pr_associated(&event).await {
                 Ok(()) => {
                     // Only acknowledge after successful processing
                     // (Blocker fix: Fail-Open Auto-Ack on Crash)
@@ -1410,8 +1413,13 @@ impl ProjectionWorker {
     }
 
     /// Handles a single `WorkPrAssociated` event.
+    ///
+    /// # Async I/O (Major fix: Thread blocking in async context)
+    ///
+    /// This method is async and wraps all `SQLite` `WorkIndex` operations in
+    /// `spawn_blocking` to avoid blocking the Tokio executor threads.
     #[allow(clippy::cast_sign_loss)] // PR numbers are always positive
-    fn handle_work_pr_associated(
+    async fn handle_work_pr_associated(
         &self,
         event: &SignedLedgerEvent,
     ) -> Result<(), ProjectionWorkerError> {
@@ -1462,27 +1470,81 @@ impl ProjectionWorker {
         // Validate string lengths (Blocker fix: Unbounded Input Consumption)
         validate_string_length("head_sha", head_sha)?;
 
-        // Register PR metadata
-        self.work_index
-            .register_pr(work_id, pr_number, repo_owner, repo_name, head_sha)?;
+        // Extract and validate changeset_digest if present
+        let changeset_digest_opt: Option<[u8; 32]> =
+            match payload.get("changeset_digest").and_then(|v| v.as_str()) {
+                Some(changeset_digest_hex) => {
+                    // Validate string length (Blocker fix: Unbounded Input Consumption)
+                    validate_string_length("changeset_digest", changeset_digest_hex)?;
 
-        // Also register commit SHA for status projection if changeset_digest is present
-        if let Some(changeset_digest_hex) = payload.get("changeset_digest").and_then(|v| v.as_str())
-        {
-            // Validate string length (Blocker fix: Unbounded Input Consumption)
-            validate_string_length("changeset_digest", changeset_digest_hex)?;
+                    hex::decode(changeset_digest_hex)
+                        .ok()
+                        .and_then(|digest_bytes| {
+                            if digest_bytes.len() == 32 {
+                                let mut changeset_digest = [0u8; 32];
+                                changeset_digest.copy_from_slice(&digest_bytes);
+                                Some(changeset_digest)
+                            } else {
+                                None
+                            }
+                        })
+                },
+                None => None,
+            };
 
-            if let Ok(digest_bytes) = hex::decode(changeset_digest_hex) {
-                if digest_bytes.len() == 32 {
-                    let mut changeset_digest = [0u8; 32];
-                    changeset_digest.copy_from_slice(&digest_bytes);
-                    self.work_index
-                        .register_commit_sha(&changeset_digest, head_sha)?;
-                }
+        // Major fix: Thread blocking in async context
+        // Wrap SQLite operations in spawn_blocking to avoid blocking the Tokio runtime
+        let conn = self.work_index.connection();
+        let work_id_owned = work_id.to_string();
+        let repo_owner_owned = repo_owner.to_string();
+        let repo_name_owned = repo_name.to_string();
+        let head_sha_owned = head_sha.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| {
+                ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
+            })?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Register PR metadata
+            #[allow(clippy::cast_possible_wrap)]
+            conn_guard
+                .execute(
+                    "INSERT OR REPLACE INTO work_pr_index
+                     (work_id, pr_number, repo_owner, repo_name, head_sha, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        &work_id_owned,
+                        pr_number as i64,
+                        &repo_owner_owned,
+                        &repo_name_owned,
+                        &head_sha_owned,
+                        now as i64
+                    ],
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            // Also register commit SHA for status projection if changeset_digest is present
+            if let Some(changeset_digest) = changeset_digest_opt {
+                #[allow(clippy::cast_possible_wrap)]
+                conn_guard
+                    .execute(
+                        "INSERT OR REPLACE INTO changeset_sha_index
+                         (changeset_digest, commit_sha, created_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![changeset_digest.as_slice(), &head_sha_owned, now as i64],
+                    )
+                    .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
+        .await
+        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
     }
 
     /// Processes `ReviewReceiptRecorded` events for projection.
@@ -1567,6 +1629,12 @@ impl ProjectionWorker {
     }
 
     /// Handles a single `ReviewReceiptRecorded` event.
+    ///
+    /// # Async I/O (Major fix: Thread blocking in async context)
+    ///
+    /// This method wraps all synchronous `SQLite` operations (`WorkIndex` and
+    /// adapter's `register_commit_sha`) in `spawn_blocking` to avoid blocking
+    /// the Tokio executor threads.
     async fn handle_review_receipt(
         &self,
         event: &SignedLedgerEvent,
@@ -1630,13 +1698,37 @@ impl ProjectionWorker {
             ));
         }
 
-        // Look up PR metadata using the authoritative work_id from the event envelope.
-        // This prevents cross-PR review leakage via digest collision.
-        // NACK/Retry: return NoPrAssociation if not yet indexed.
-        let pr_metadata = self.work_index.get_pr_metadata(work_id).ok_or_else(|| {
-            ProjectionWorkerError::NoPrAssociation {
-                work_id: work_id.clone(),
-            }
+        // Major fix: Thread blocking in async context
+        // Look up PR metadata using spawn_blocking to avoid blocking the Tokio runtime
+        let work_index_conn = self.work_index.connection();
+        let work_id_owned = work_id.clone();
+        let pr_metadata = tokio::task::spawn_blocking(move || {
+            let conn_guard = work_index_conn.lock().map_err(|e| {
+                ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
+            })?;
+
+            #[allow(clippy::cast_sign_loss)]
+            conn_guard
+                .query_row(
+                    "SELECT pr_number, repo_owner, repo_name, head_sha
+                     FROM work_pr_index WHERE work_id = ?1",
+                    params![&work_id_owned],
+                    |row| {
+                        Ok(PrMetadata {
+                            pr_number: row.get::<_, i64>(0)? as u64,
+                            repo_owner: row.get(1)?,
+                            repo_name: row.get(2)?,
+                            head_sha: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))
+        })
+        .await
+        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))??
+        .ok_or_else(|| ProjectionWorkerError::NoPrAssociation {
+            work_id: work_id.clone(),
         })?;
 
         // Parse review verdict to determine status (Major fix: hardcoded success)
@@ -1668,14 +1760,44 @@ impl ProjectionWorker {
 
         // Project to GitHub if adapter is configured
         if let Some(ref adapter) = self.adapter {
-            // Register commit SHA for status projection (in case it wasn't in changeset
-            // event)
+            // Major fix: Thread blocking in async context
+            // Register commit SHA for status projection using async method with
+            // spawn_blocking
             adapter
-                .register_commit_sha(&changeset_digest, &pr_metadata.head_sha)
+                .register_commit_sha_async(changeset_digest, pr_metadata.head_sha.clone())
+                .await
                 .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
 
-            // Get ledger head for idempotency key
-            let ledger_head = self.review_tailer.get_ledger_head()?.unwrap_or([0u8; 32]);
+            // Major fix: Thread blocking in async context
+            // Get ledger head for idempotency key using spawn_blocking
+            let tailer_conn = Arc::clone(&self.review_tailer.conn);
+            let ledger_head = tokio::task::spawn_blocking(move || {
+                let conn_guard = tailer_conn.lock().map_err(|e| {
+                    ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
+                })?;
+
+                #[allow(clippy::cast_sign_loss)]
+                let result: Option<String> = conn_guard
+                    .query_row(
+                        "SELECT event_id FROM ledger_events ORDER BY timestamp_ns DESC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+                Ok(result.map(|event_id| {
+                    let mut hash = [0u8; 32];
+                    let digest = blake3::hash(event_id.as_bytes());
+                    hash.copy_from_slice(digest.as_bytes());
+                    hash
+                }))
+            })
+            .await
+            .map_err(|e| {
+                ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}"))
+            })??
+            .unwrap_or([0u8; 32]);
 
             // Project status (uses parsed verdict, not hardcoded success)
             let projection_receipt = adapter
@@ -1693,7 +1815,30 @@ impl ProjectionWorker {
             // Post PR comment (idempotent - check before posting)
             // Blocker fix: Comment projection is now idempotent
             let comment_receipt_id = format!("{receipt_id}-comment");
-            if self.work_index.is_comment_posted(&comment_receipt_id) {
+
+            // Major fix: Thread blocking in async context
+            // Check if comment was already posted using spawn_blocking
+            let work_index_conn = self.work_index.connection();
+            let comment_id_for_check = comment_receipt_id.clone();
+            let is_posted = tokio::task::spawn_blocking(move || {
+                let Ok(conn_guard) = work_index_conn.lock() else {
+                    return false;
+                };
+
+                conn_guard
+                    .query_row(
+                        "SELECT 1 FROM comment_receipts WHERE receipt_id = ?1",
+                        params![&comment_id_for_check],
+                        |_| Ok(()),
+                    )
+                    .is_ok()
+            })
+            .await
+            .map_err(|e| {
+                ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}"))
+            })?;
+
+            if is_posted {
                 debug!(
                     receipt_id = %receipt_id,
                     "Skipping comment post (already posted - idempotency)"
@@ -1710,13 +1855,45 @@ impl ProjectionWorker {
                     .await
                     .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
 
-                // Record that comment was posted for idempotency
-                self.work_index.record_comment_posted(
-                    &comment_receipt_id,
-                    work_id,
-                    pr_metadata.pr_number,
-                    "review",
-                )?;
+                // Major fix: Thread blocking in async context
+                // Record that comment was posted using spawn_blocking
+                let work_index_conn = self.work_index.connection();
+                let comment_id = comment_receipt_id.clone();
+                let work_id_for_record = work_id.clone();
+                let pr_number = pr_metadata.pr_number;
+
+                tokio::task::spawn_blocking(move || {
+                    let conn_guard = work_index_conn.lock().map_err(|e| {
+                        ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
+                    })?;
+
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    #[allow(clippy::cast_possible_wrap)]
+                    conn_guard
+                        .execute(
+                            "INSERT OR REPLACE INTO comment_receipts
+                             (receipt_id, work_id, pr_number, comment_type, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![
+                                &comment_id,
+                                &work_id_for_record,
+                                pr_number as i64,
+                                "review",
+                                now as i64
+                            ],
+                        )
+                        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+                    Ok::<(), ProjectionWorkerError>(())
+                })
+                .await
+                .map_err(|e| {
+                    ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}"))
+                })??;
 
                 info!(
                     receipt_id = %receipt_id,
