@@ -490,10 +490,11 @@ impl ToolExecutor {
         let duration_ns = duration.as_nanos() as u64;
         let completed_at_ns = ctx.started_at_ns.saturating_add(duration_ns);
 
-        // SEC-CTRL-FAC-0015 BLOCKER FIX: Set CAS hash for evidence integrity.
-        // The CAS hash references the full ToolResultData (output, error_output,
+        // TCK-00320: Set CAS result hash for evidence integrity.
+        // The result_hash references the full ToolResultData (output, error_output,
         // budget) so clients can retrieve complete execution data when inline
-        // results are size-limited.
+        // results are size-limited. Per SEC-CTRL-FAC-0015, all success paths
+        // MUST populate this field.
         let mut result = ToolResult::success(
             &ctx.request_id,
             result_data.output,
@@ -501,7 +502,7 @@ impl ToolExecutor {
             duration,
             completed_at_ns,
         )
-        .with_cas_hash(cas_hash);
+        .with_result_hash(cas_hash);
 
         // Step 8: Stamp time envelope (RFC-0016 HTF, TCK-00240)
         // Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
@@ -1054,6 +1055,108 @@ mod tests {
         assert!(
             result.time_envelope.is_some(),
             "ToolResult should have time_envelope preimage when clock is configured"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00320: Tool Result Hash Propagation Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_executor_sets_result_hash() {
+        // TCK-00320: Verify that executor sets result_hash after CAS store
+        let mut executor = test_executor();
+        executor
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.result_hash.is_some(),
+            "ToolResult must have result_hash set by executor (TCK-00320)"
+        );
+
+        // Verify the hash is 32 bytes (BLAKE3)
+        let hash = result.result_hash.unwrap();
+        assert_eq!(hash.len(), 32, "result_hash must be 32 bytes (BLAKE3)");
+    }
+
+    #[tokio::test]
+    async fn test_executor_result_hash_is_deterministic() {
+        // TCK-00320: Same inputs should produce the same result_hash
+        let tracker1 = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas1 = Arc::new(StubContentAddressedStore::new());
+        let mut executor1 = ToolExecutor::new(tracker1, cas1);
+        executor1
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+
+        let tracker2 = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas2 = Arc::new(StubContentAddressedStore::new());
+        let mut executor2 = ToolExecutor::new(tracker2, cas2);
+        executor2
+            .register_handler(Box::new(MockReadHandler::new()))
+            .unwrap();
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let result1 = executor1
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
+        let result2 = executor2
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
+
+        // Result hashes should be deterministic based on ToolResultData content
+        // (Since MockReadHandler returns fixed output, hashes should match)
+        assert_eq!(
+            result1.result_hash, result2.result_hash,
+            "result_hash must be deterministic for same inputs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_executor_failure_result_can_have_result_hash() {
+        // TCK-00320: Failure results may not have result_hash (handled by
+        // build_failure_result_with_stamp which doesn't store in CAS)
+        let mut executor = test_executor();
+        executor
+            .register_handler(Box::new(MockReadHandler::failing()))
+            .unwrap();
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("nonexistent"),
+            offset: None,
+            limit: None,
+        });
+
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
+
+        // Failure results don't go through CAS store, so no result_hash
+        assert!(!result.success);
+        assert!(
+            result.result_hash.is_none(),
+            "Failed execution may not have result_hash"
         );
     }
 }

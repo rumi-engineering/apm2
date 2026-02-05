@@ -190,6 +190,37 @@ pub enum EpisodeEvent {
         /// The full `TimeEnvelope` preimage for verification.
         time_envelope: Option<TimeEnvelope>,
     },
+    /// Tool execution completed (TCK-00320).
+    ///
+    /// Per SEC-CTRL-FAC-0015, this event is emitted after each tool execution
+    /// completes, providing the CAS result hash for evidence linking.
+    ///
+    /// # Evidence Integrity
+    ///
+    /// The `result_hash` field provides a verifiable reference to the full
+    /// `ToolResultData` stored in CAS. This enables:
+    /// - Downstream indexing (TCK-00327: `ToolLogIndexV1`)
+    /// - Receipt verification
+    /// - Audit trail integrity
+    ToolExecuted {
+        /// Episode identifier (typed for safety).
+        episode_id: EpisodeId,
+        /// Request ID for this execution.
+        request_id: String,
+        /// CAS hash of the full `ToolResultData`.
+        ///
+        /// This is the BLAKE3 hash of the serialized `ToolResultData` stored
+        /// in CAS. All success paths MUST populate this field.
+        result_hash: Hash,
+        /// Whether the execution succeeded.
+        success: bool,
+        /// Timestamp when execution completed (nanoseconds since epoch).
+        executed_at_ns: u64,
+        /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
+        time_envelope_ref: Option<TimeEnvelopeRef>,
+        /// The full `TimeEnvelope` preimage for verification.
+        time_envelope: Option<TimeEnvelope>,
+    },
 }
 
 /// Reason for lease issuance denial.
@@ -263,7 +294,8 @@ impl EpisodeEvent {
             Self::Created { episode_id, .. }
             | Self::Started { episode_id, .. }
             | Self::Stopped { episode_id, .. }
-            | Self::Quarantined { episode_id, .. } => Some(episode_id),
+            | Self::Quarantined { episode_id, .. }
+            | Self::ToolExecuted { episode_id, .. } => Some(episode_id),
             Self::ClockProfilePublished { .. } | Self::LeaseIssueDenied { .. } => None,
         }
     }
@@ -278,6 +310,7 @@ impl EpisodeEvent {
             Self::Quarantined { .. } => "episode.quarantined",
             Self::ClockProfilePublished { .. } => "clock.profile_published",
             Self::LeaseIssueDenied { .. } => "lease.issue_denied",
+            Self::ToolExecuted { .. } => "tool.executed",
         }
     }
 
@@ -302,6 +335,9 @@ impl EpisodeEvent {
             }
             | Self::LeaseIssueDenied {
                 time_envelope_ref, ..
+            }
+            | Self::ToolExecuted {
+                time_envelope_ref, ..
             } => time_envelope_ref.as_ref(),
         }
     }
@@ -318,7 +354,8 @@ impl EpisodeEvent {
             | Self::Stopped { time_envelope, .. }
             | Self::Quarantined { time_envelope, .. }
             | Self::ClockProfilePublished { time_envelope, .. }
-            | Self::LeaseIssueDenied { time_envelope, .. } => time_envelope.as_ref(),
+            | Self::LeaseIssueDenied { time_envelope, .. }
+            | Self::ToolExecuted { time_envelope, .. } => time_envelope.as_ref(),
         }
     }
 
@@ -378,6 +415,18 @@ impl EpisodeRuntimeConfig {
     }
 }
 
+/// Maximum number of tool result hashes per episode (TCK-00320).
+/// Maximum tool result hashes per episode (TCK-00320).
+///
+/// This limit prevents unbounded memory growth per CTR-1303. Episodes
+/// exceeding this limit will have their oldest result hashes evicted.
+///
+/// The limit is chosen to bound aggregate memory:
+/// - `MAX_CONCURRENT_EPISODES` (10,000) * `MAX_RESULT_HASHES_PER_EPISODE`
+///   (1,000) * 32 bytes
+/// - = 320 MB worst-case, well under the 1.5 GB safety threshold.
+pub const MAX_RESULT_HASHES_PER_EPISODE: usize = 1_000;
+
 /// Internal state for a tracked episode.
 struct EpisodeEntry {
     /// Current state.
@@ -386,6 +435,12 @@ struct EpisodeEntry {
     handle: Option<SessionHandle>,
     /// Tool executor if initialized.
     executor: Option<SharedToolExecutor>,
+    /// Accumulated tool result hashes in execution order (TCK-00320).
+    ///
+    /// Per SEC-CTRL-FAC-0015, this accumulates CAS hashes of all
+    /// `ToolResultData` in deterministic tool sequence order. Used for
+    /// downstream indexing (TCK-00327: `ToolLogIndexV1`).
+    result_hashes: Vec<Hash>,
 }
 
 /// Episode runtime for managing daemon-hosted episodes.
@@ -808,6 +863,7 @@ impl EpisodeRuntime {
                     state,
                     handle: None,
                     executor: None,
+                    result_hashes: Vec::new(), // TCK-00320: Accumulate result hashes
                 },
             );
         }
@@ -1289,15 +1345,22 @@ impl EpisodeRuntime {
 
     /// Executes a tool in the context of an episode.
     ///
+    /// Per TCK-00320, this method:
+    /// 1. Executes the tool via the executor
+    /// 2. Records the CAS result hash in the episode's accumulator
+    /// 3. Emits a `ToolExecuted` event for downstream indexing
+    ///
     /// # Arguments
     ///
     /// * `episode_id` - The episode to execute the tool in
     /// * `args` - The tool arguments
     /// * `credential` - Optional credential for authenticated operations
+    /// * `timestamp_ns` - Current timestamp in nanoseconds since epoch
+    /// * `request_id` - Unique request ID for tracking
     ///
     /// # Returns
     ///
-    /// The tool result.
+    /// The tool result with `result_hash` populated.
     ///
     /// # Errors
     ///
@@ -1311,38 +1374,167 @@ impl EpisodeRuntime {
         timestamp_ns: u64,
         request_id: &str,
     ) -> Result<ToolResult, EpisodeError> {
-        let episodes = self.episodes.read().await;
-        let entry = episodes
-            .get(episode_id.as_str())
-            .ok_or_else(|| EpisodeError::NotFound {
-                id: episode_id.as_str().to_string(),
-            })?;
+        // Step 1: Read lock to get executor and validate state
+        let executor = {
+            let episodes = self.episodes.read().await;
+            let entry =
+                episodes
+                    .get(episode_id.as_str())
+                    .ok_or_else(|| EpisodeError::NotFound {
+                        id: episode_id.as_str().to_string(),
+                    })?;
 
-        if !entry.state.is_running() {
-            return Err(EpisodeError::InvalidTransition {
-                id: episode_id.as_str().to_string(),
-                from: entry.state.state_name(),
-                to: "execute_tool",
-            });
-        }
-
-        let executor = entry.executor.as_ref().ok_or_else(|| {
-            warn!(episode_id = %episode_id, "executor not available (CAS missing?)");
-            EpisodeError::Internal {
-                message: "executor not available".to_string(),
+            if !entry.state.is_running() {
+                return Err(EpisodeError::InvalidTransition {
+                    id: episode_id.as_str().to_string(),
+                    from: entry.state.state_name(),
+                    to: "execute_tool",
+                });
             }
-        })?;
 
+            entry.executor.clone().ok_or_else(|| {
+                warn!(episode_id = %episode_id, "executor not available (CAS missing?)");
+                EpisodeError::Internal {
+                    message: "executor not available".to_string(),
+                }
+            })?
+        };
+
+        // Step 2: Execute the tool
         let ctx = ExecutionContext::new(episode_id.clone(), request_id, timestamp_ns);
-
         let executor_guard = executor.write().await;
-        executor_guard
+        let result = executor_guard
             .execute(&ctx, args, credential)
             .await
             .map_err(|e| EpisodeError::ExecutionFailed {
                 id: episode_id.as_str().to_string(),
                 message: e.to_string(),
-            })
+            })?;
+        drop(executor_guard); // Release executor lock before acquiring episodes write lock
+
+        // Step 3: Record result hash and emit event (TCK-00320)
+        if let Some(result_hash) = result.result_hash {
+            self.record_tool_result(
+                episode_id,
+                request_id,
+                result_hash,
+                result.success,
+                result.completed_at_ns,
+            )
+            .await?;
+        }
+
+        Ok(result)
+    }
+
+    /// Records a tool result hash and emits a `ToolExecuted` event (TCK-00320).
+    ///
+    /// Per SEC-CTRL-FAC-0015, this method:
+    /// 1. Accumulates the result hash in the episode's ordered collection
+    /// 2. Emits a `ToolExecuted` event for downstream indexing
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode that executed the tool
+    /// * `request_id` - Request ID for the tool execution
+    /// * `result_hash` - CAS hash of the `ToolResultData`
+    /// * `success` - Whether the execution succeeded
+    /// * `executed_at_ns` - Timestamp when execution completed
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the episode is not found.
+    #[instrument(skip(self))]
+    pub async fn record_tool_result(
+        &self,
+        episode_id: &EpisodeId,
+        request_id: &str,
+        result_hash: Hash,
+        success: bool,
+        executed_at_ns: u64,
+    ) -> Result<(), EpisodeError> {
+        // Step 1: Write lock to update result_hashes
+        {
+            let mut episodes = self.episodes.write().await;
+            let entry =
+                episodes
+                    .get_mut(episode_id.as_str())
+                    .ok_or_else(|| EpisodeError::NotFound {
+                        id: episode_id.as_str().to_string(),
+                    })?;
+
+            // Enforce boundedness per CTR-1303
+            if entry.result_hashes.len() >= MAX_RESULT_HASHES_PER_EPISODE {
+                // Evict oldest hash (FIFO)
+                entry.result_hashes.remove(0);
+                debug!(
+                    episode_id = %episode_id,
+                    "evicted oldest result hash (limit {})",
+                    MAX_RESULT_HASHES_PER_EPISODE
+                );
+            }
+
+            entry.result_hashes.push(result_hash);
+            debug!(
+                episode_id = %episode_id,
+                request_id = %request_id,
+                result_hash = %hex::encode(&result_hash[..8]),
+                count = entry.result_hashes.len(),
+                "recorded tool result hash"
+            );
+        }
+
+        // Step 2: Emit ToolExecuted event
+        if self.config.emit_events {
+            // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
+            let (time_envelope, time_envelope_ref) = match self
+                .stamp_envelope(Some(format!(
+                    "tool.executed:{}:{}",
+                    episode_id.as_str(),
+                    request_id
+                )))
+                .await?
+            {
+                Some((env, env_ref)) => (Some(env), Some(env_ref)),
+                None => (None, None),
+            };
+
+            let event = EpisodeEvent::ToolExecuted {
+                episode_id: episode_id.clone(),
+                request_id: request_id.to_string(),
+                result_hash,
+                success,
+                executed_at_ns,
+                time_envelope_ref,
+                time_envelope,
+            };
+
+            self.emit_event(event).await;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the accumulated result hashes for an episode (TCK-00320).
+    ///
+    /// The result hashes are returned in deterministic tool sequence order.
+    /// This is used for downstream indexing (TCK-00327: `ToolLogIndexV1`).
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode to get result hashes for
+    ///
+    /// # Returns
+    ///
+    /// A clone of the result hashes vector, or empty if episode not found.
+    #[must_use]
+    pub async fn get_result_hashes(&self, episode_id: &EpisodeId) -> Vec<Hash> {
+        let episodes = self.episodes.read().await;
+        episodes
+            .get(episode_id.as_str())
+            .map(|e| e.result_hashes.clone())
+            .unwrap_or_default()
     }
 
     /// Emits a `LeaseIssueDenied` event for `SoD` violations and other spawn

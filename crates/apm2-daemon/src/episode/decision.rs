@@ -1243,6 +1243,15 @@ impl BudgetDelta {
 /// Per RFC-0016 (HTF) and TCK-00240, tool results include an optional
 /// `time_envelope_ref` for temporal ordering and causality tracking.
 ///
+/// # CAS Result Hash (TCK-00320)
+///
+/// Per SEC-CTRL-FAC-0015, the `result_hash` field provides a CAS reference to
+/// the full `ToolResultData`. This is distinct from `output_hash` (truncation
+/// hash) and enables:
+/// - Verifiable evidence linking in receipts
+/// - Retrieval of full execution data when inline results are size-limited
+/// - Per-episode accumulation of tool result hashes for audit indexing
+///
 /// # Security
 ///
 /// Uses `deny_unknown_fields` to prevent field injection attacks when
@@ -1268,8 +1277,27 @@ pub struct ToolResult {
     /// Bounded by `MAX_TOOL_OUTPUT_SIZE`.
     pub output: Vec<u8>,
 
-    /// Hash of the full output if truncated.
+    /// Hash of the full output if truncated (truncation hash).
+    ///
+    /// This hash is set when `output` exceeds `MAX_TOOL_OUTPUT_SIZE` and
+    /// represents the BLAKE3 hash of the complete output before truncation.
+    /// Distinct from `result_hash` which is the CAS hash of the full
+    /// `ToolResultData`.
     pub output_hash: Option<Hash>,
+
+    /// CAS hash of the full `ToolResultData` (TCK-00320).
+    ///
+    /// This is the BLAKE3 hash of the serialized `ToolResultData` stored in
+    /// the content-addressed store. Clients can use this hash to retrieve
+    /// the complete execution data (output, `error_output`, budget) from CAS.
+    ///
+    /// # SEC-CTRL-FAC-0015 Evidence Integrity
+    ///
+    /// The CAS result hash provides a verifiable reference to the full
+    /// execution record, ensuring audit trail integrity even when inline
+    /// responses are size-limited. All success paths MUST populate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_hash: Option<Hash>,
 
     /// Error message if execution failed.
     pub error_message: Option<String>,
@@ -1324,6 +1352,7 @@ impl ToolResult {
             success: true,
             output,
             output_hash,
+            result_hash: None, // TCK-00320: Set via with_result_hash() after CAS store
             error_message: None,
             exit_code: Some(0),
             budget_consumed,
@@ -1354,6 +1383,7 @@ impl ToolResult {
             success: false,
             output: Vec::new(),
             output_hash: None,
+            result_hash: None, // TCK-00320: Set via with_result_hash() after CAS store
             error_message: Some(error),
             exit_code,
             budget_consumed,
@@ -1398,7 +1428,7 @@ impl ToolResult {
         self.time_envelope.as_ref()
     }
 
-    /// Sets the CAS hash for this result.
+    /// Sets the CAS result hash for this result (TCK-00320).
     ///
     /// This is the hash of the full `ToolResultData` stored in the content-
     /// addressed store, which includes output, `error_output`, and budget.
@@ -1407,13 +1437,33 @@ impl ToolResult {
     ///
     /// # SEC-CTRL-FAC-0015 Evidence Integrity
     ///
-    /// The CAS hash provides a verifiable reference to the full execution
-    /// record, ensuring audit trail integrity even when inline responses
-    /// are size-limited.
+    /// The CAS result hash provides a verifiable reference to the full
+    /// execution record, ensuring audit trail integrity even when inline
+    /// responses are size-limited. All success paths MUST call this method.
     #[must_use]
-    pub const fn with_cas_hash(mut self, hash: Hash) -> Self {
-        self.output_hash = Some(hash);
+    pub const fn with_result_hash(mut self, hash: Hash) -> Self {
+        self.result_hash = Some(hash);
         self
+    }
+
+    /// Returns the CAS result hash for this result (TCK-00320).
+    ///
+    /// The result hash is the BLAKE3 hash of the serialized `ToolResultData`
+    /// stored in CAS. Use this to retrieve the full execution data or to
+    /// include in evidence bindings.
+    #[must_use]
+    pub const fn result_hash(&self) -> Option<&Hash> {
+        self.result_hash.as_ref()
+    }
+
+    /// Returns the truncation hash if the output was truncated.
+    ///
+    /// This is distinct from `result_hash` (CAS hash of full `ToolResultData`).
+    /// The `output_hash` is only present when `output` exceeded
+    /// `MAX_TOOL_OUTPUT_SIZE` and was truncated.
+    #[must_use]
+    pub const fn output_hash(&self) -> Option<&Hash> {
+        self.output_hash.as_ref()
     }
 }
 
@@ -1439,6 +1489,9 @@ struct ToolResultProto {
     // Tag 9: time_envelope_ref - INCLUDED for temporal ordering (RFC-0016 HTF)
     #[prost(bytes = "vec", optional, tag = "9")]
     time_envelope_ref: Option<Vec<u8>>,
+    // Tag 10: result_hash - CAS hash of ToolResultData (TCK-00320)
+    #[prost(bytes = "vec", optional, tag = "10")]
+    result_hash: Option<Vec<u8>>,
 }
 
 impl ToolResult {
@@ -1478,6 +1531,8 @@ impl ToolResult {
                 .time_envelope_ref
                 .as_ref()
                 .map(|r| r.as_bytes().to_vec()),
+            // Include result_hash for CAS reference (TCK-00320)
+            result_hash: self.result_hash.map(|h| h.to_vec()),
         };
         proto.encode_to_vec()
     }
@@ -2347,5 +2402,144 @@ mod tests {
                 panic!("Expected GitOp for operation '{op}'");
             }
         }
+    }
+
+    // =========================================================================
+    // TCK-00320: Tool Result Hash Propagation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_tool_result_with_result_hash() {
+        let cas_hash = [0xab; 32];
+        let result = ToolResult::success(
+            "req-001",
+            b"output data".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(50),
+            1_704_067_200_000_000_000,
+        )
+        .with_result_hash(cas_hash);
+
+        assert!(result.success);
+        assert_eq!(result.result_hash(), Some(&cas_hash));
+        // output_hash should be None (no truncation)
+        assert!(result.output_hash().is_none());
+    }
+
+    #[test]
+    fn test_tool_result_result_hash_distinct_from_output_hash() {
+        let large_output = vec![0u8; MAX_TOOL_OUTPUT_SIZE + 1000];
+        let expected_output_hash = *blake3::hash(&large_output).as_bytes();
+        let cas_hash = [0xcd; 32];
+
+        let result = ToolResult::success(
+            "req-002",
+            large_output,
+            BudgetDelta::single_call(),
+            Duration::from_millis(100),
+            1000,
+        )
+        .with_result_hash(cas_hash);
+
+        // Both hashes should be present but distinct
+        assert!(result.output_hash().is_some());
+        assert!(result.result_hash().is_some());
+        assert_eq!(result.output_hash(), Some(&expected_output_hash));
+        assert_eq!(result.result_hash(), Some(&cas_hash));
+        assert_ne!(result.output_hash(), result.result_hash());
+    }
+
+    #[test]
+    fn test_tool_result_canonical_bytes_includes_result_hash() {
+        let result_no_hash = ToolResult::success(
+            "req-001",
+            b"output".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(100),
+            1000,
+        );
+
+        let result_with_hash = result_no_hash.clone().with_result_hash([0xef; 32]);
+
+        let bytes_no_hash = result_no_hash.canonical_bytes();
+        let bytes_with_hash = result_with_hash.canonical_bytes();
+
+        assert_ne!(
+            bytes_no_hash, bytes_with_hash,
+            "canonical bytes must differ when result_hash is present"
+        );
+        assert!(
+            bytes_with_hash.len() > bytes_no_hash.len(),
+            "result with result_hash should be larger"
+        );
+        assert_ne!(
+            result_no_hash.digest(),
+            result_with_hash.digest(),
+            "digests must differ"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_result_hash_determinism() {
+        let cas_hash = [0x11; 32];
+        let result1 = ToolResult::success(
+            "req-001",
+            b"output".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(100),
+            1000,
+        )
+        .with_result_hash(cas_hash);
+
+        let result2 = ToolResult::success(
+            "req-001",
+            b"output".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(100),
+            1000,
+        )
+        .with_result_hash(cas_hash);
+
+        assert_eq!(result1.canonical_bytes(), result2.canonical_bytes());
+        assert_eq!(result1.digest(), result2.digest());
+    }
+
+    #[test]
+    fn test_tool_result_failure_with_result_hash() {
+        let cas_hash = [0x22; 32];
+        let result = ToolResult::failure(
+            "req-003",
+            "execution failed",
+            Some(1),
+            BudgetDelta::single_call(),
+            Duration::from_millis(10),
+            1000,
+        )
+        .with_result_hash(cas_hash);
+
+        assert!(!result.success);
+        assert_eq!(result.result_hash(), Some(&cas_hash));
+        assert!(result.error_message.is_some());
+    }
+
+    #[test]
+    fn test_tool_result_serde_roundtrip_with_result_hash() {
+        let cas_hash = [0x33; 32];
+        let original = ToolResult::success(
+            "req-serde",
+            b"serde test".to_vec(),
+            BudgetDelta::single_call(),
+            Duration::from_millis(50),
+            1000,
+        )
+        .with_result_hash(cas_hash);
+
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: ToolResult = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(original.request_id, deserialized.request_id);
+        assert_eq!(original.success, deserialized.success);
+        assert_eq!(original.output, deserialized.output);
+        assert_eq!(original.result_hash, deserialized.result_hash);
     }
 }
