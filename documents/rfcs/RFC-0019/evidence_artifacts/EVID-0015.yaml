@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0015"
+  title: "Refactor evidence (remove dead/unused/unsafe-by-default paths)"
+  category: "CODE_REVIEW"
+  status: "PENDING"
+  description: |
+    Evidence that deprecated and unsafe-by-default protocol handlers and bypass paths are removed or hard-disabled
+    after FAC stabilization, without regressing xtask or the validated FAC v0 path.
+  requirement_ids:
+    - "REQ-0015"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0015.yaml"
+  artifacts: []

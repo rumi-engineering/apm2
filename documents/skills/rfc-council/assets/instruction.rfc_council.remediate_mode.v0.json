@@ -33,7 +33,7 @@
     },
     "ctx": [
       "documents/skills/rfc-council/references/remediate-mode.md",
-      "documents/skills/modes-of-reasoning/artifacts/selector.json"
+      "documents/skills/modes-of-reasoning/assets/selector.json"
     ],
     "lex": {
       "R1": "Load Evidence: Identify the latest evidence bundle at `evidence/rfc/{RFC_ID}/reviews/rfc_review_*.yaml`; load ALL findings associated with this verdict into the remediation session (do not filter by severity).",

@@ -1,51 +1,56 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00329"
-    title: "Adapter profiles for claude-code, gemini-cli, codex-cli, local-inference"
+    id: TCK-00329
+    title: Adapter profiles for claude-code, gemini-cli, codex-cli, local-inference
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0009"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0009.yaml#requirement"
+    - requirement_id: REQ-0009
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0009.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0009"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+    - evidence_id: EVID-0009
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0009.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
+    - DOMAIN_DAEMON
   dependencies:
     tickets:
-      - ticket_id: "TCK-00328"
-        reason: "Profiles must be schema-defined and hash-selectable before provisioning concrete profiles"
+    - ticket_id: TCK-00328
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Provide AgentAdapterProfileV1 artifacts for claude-code, gemini-cli, codex-cli, and local-inference"
-      - "Default to black_box ledger-mediated driver where possible (ToolIntent grammar + kernel mediation)"
-      - "Define permission_mode_map and capability_map per profile"
-      - "Define version_probe and health_checks per profile (fail closed on drift/misconfiguration)"
+    - Provide AgentAdapterProfileV1 artifacts for claude-code, gemini-cli, codex-cli, local-inference
+    - Default to black_box ledger-mediated driver where possible
+    - Define permission_mode_map and capability_map per profile
     out_of_scope:
-      - "Automated installation/configuration of vendor CLIs"
-      - "Interactive/TTY-only workflows (profiles must support non-interactive execution for conformance)"
+    - Automated installation/configuration of vendor CLIs
   plan:
     steps:
-      - "For each target CLI, define command/args/env templates and input/output modes"
-      - "Define minimal ToolIntent grammar and tool_bridge mode per profile (prefer black_box)"
-      - "Define permission_mode_map and capability_map to kernel tool classes"
-      - "Add version_probe and health_checks (timeouts/stall thresholds) and set conservative defaults"
-      - "Store profiles in CAS and record the resulting hashes for selection"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Provide AgentAdapterProfileV1 artifacts for claude-code, gemini-cli, codex-cli,
+      local-inference'
+    - 'Implement: Default to black_box ledger-mediated driver where possible'
+    - 'Implement: Define permission_mode_map and capability_map per profile'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0009"
+    - EVID-0009
     criteria:
-      - "Profiles exist for all target CLIs and are hash-addressed."
-      - "Each profile can run a non-interactive episode under kernel tool mediation."
+    - Profiles exist for all target CLIs and are hash-addressed
+    - Each profile runs a non-interactive episode under kernel tool mediation
   notes:
-    security: "Disable or restrict native CLI tools; kernel mediation must remain authoritative."
-    verification: "Profiles must fail closed on parse errors, timeouts, or unexpected output modes."
-    general: "Profiles are the bridge from RFC spec to runnable automation across heterogeneous agent runtimes."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

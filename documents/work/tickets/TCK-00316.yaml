@@ -1,67 +1,55 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00316"
-    title: "Session dispatcher viability closure"
+    id: TCK-00316
+    title: Session dispatcher viability closure
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0001"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0001.yaml#requirement"
+    - requirement_id: REQ-0001
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0001.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0001"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0001.yaml#evidence_artifact"
+    - evidence_id: EVID-0001
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0001.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
-      - "DOMAIN_KERNEL"
+    - DOMAIN_DAEMON
+    - DOMAIN_KERNEL
   dependencies:
-    tickets:
-      - ticket_id: "TCK-00289"
-        reason: "Ledger persistence wiring required for EmitEvent and durable lifecycle signals"
-      - ticket_id: "TCK-00290"
-        reason: "ToolBroker mediation required for capability/policy/firewall checks"
-      - ticket_id: "TCK-00293"
-        reason: "CAS required for PublishEvidence and tool result storage"
-      - ticket_id: "TCK-00303"
-        reason: "Subscription registry shared state is used by session dispatch"
-      - ticket_id: "TCK-00315"
-        reason: "Reviewer navigation tools exist; session dispatch must execute them kernel-side"
+    tickets: []
   scope:
     in_scope:
-      - "Wire SessionDispatcher with CAS, ledger, HolonicClock, ToolBroker, and tool execution path in daemon production construction (crates/apm2-daemon/src/state.rs)"
-      - "Upgrade session RequestTool semantics to kernel-side execution: allow => execute => return durable result reference (result_hash and/or tool receipt hash)"
-      - "Gate/remove legacy manifest-store allow path in production mode (crates/apm2-daemon/src/protocol/session_dispatch.rs)"
-      - "Ensure PublishEvidence stores artifact bytes in CAS and returns content hash (no stub success)"
-      - "Ensure EmitEvent appends canonical event bytes to ledger (no in-memory success)"
-      - "Add/extend integration test proving RequestTool executes a kernel tool handler and persists evidence"
+    - Wire SessionDispatcher with CAS, ledger, clock, broker
+    - Remove legacy allow path in production
+    - Implement real PublishEvidence and EmitEvent
     out_of_scope:
-      - "ToolExecutionReceipt + ToolLogIndexV1 generation (TCK-00327)"
-      - "ViewCommitment + ContextPack bindings in artifacts (TCK-00325, TCK-00326)"
+    - Capability manifest implementation (separate ticket)
   plan:
     steps:
-      - "Audit current SessionDispatcher construction in crates/apm2-daemon/src/state.rs and enumerate production paths"
-      - "Instantiate DurableCas + SqliteLedgerEventEmitter and inject into SessionDispatcher via with_cas/with_ledger/with_clock/with_broker"
-      - "Define a production-mode guard (config or constructor visibility) that forbids the legacy manifest-only allow path"
-      - "Extend session RequestTool protocol to return execution output reference (proto/apm2d_runtime_v1.proto RequestToolResponse) and regenerate bindings"
-      - "Connect allow decisions to kernel tool execution (EpisodeRuntime/ToolExecutor) and return result_hash"
-      - "Plumb PublishEvidence and EmitEvent to real CAS/ledger components and enforce fail-closed behavior"
-      - "Add integration tests: fail-closed when broker/cas/ledger/clock absent; success path stores CAS artifacts and emits ledger events"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Wire SessionDispatcher with CAS, ledger, clock, broker'
+    - 'Implement: Remove legacy allow path in production'
+    - 'Implement: Implement real PublishEvidence and EmitEvent'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0001"
+    - EVID-0001
     criteria:
-      - "SessionDispatcher is constructed with CAS+ledger+clock+broker in production."
-      - "RequestTool executes kernel tool handlers and returns a durable result reference (CAS hash)."
-      - "Legacy manifest-store allow path is denied in production mode."
-      - "PublishEvidence stores bytes in CAS and returns hash."
-      - "EmitEvent persists to ledger with canonical bytes."
+    - SessionDispatcher constructed with full dependencies in production path
+    - RequestTool returns kernel-executed, CAS-backed results
+    - Legacy allow path denied in production mode
   notes:
-    security: "Fail closed: no ambient tool execution; deny if broker/cas/ledger/clock unavailable in production."
-    verification: "Exercise broker-present and broker-absent paths; ensure no ALLOW decisions are emitted without an execution artifact."
-    general: "Closes the core 'sessions are not viable' blocker for automated FAC v0."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

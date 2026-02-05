@@ -1,0 +1,188 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/negotiation-coalition@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 57,
+    "name": "negotiation-coalition",
+    "cat": "strategic",
+    "core": "Reason about acceptable agreements and coalition formation under constraints and asymmetric information. Focus on reaching mutually beneficial outcomes, not just predicting equilibria. Key insight: negotiation is joint problem-solving, not zero-sum combat.",
+    "out": [
+      {"type": "offer_set", "valid": "within ZOPA, respects constraints, Pareto-improving over BATNA"},
+      {"type": "concession_path", "valid": "monotonic toward agreement zone, reciprocity maintained"},
+      {"type": "coalition_structure", "valid": "stable (no blocking coalition via Shapley or core test)"},
+      {"type": "pareto_improvement", "valid": "no party worse off vs BATNA, gains distributed per contribution"},
+      {"type": "agreement_zone", "valid": "BATNA-bounded for all parties, ZOPA >0 or proven empty"},
+      {"type": "implementation_plan", "valid": "enforcement mechanism, renegotiation triggers, monitoring"}
+    ],
+    "proc": [
+      "1. MAP PARTIES: list all stakeholders including hidden veto players and affected non-participants",
+      "2. SEPARATE POSITIONS FROM INTERESTS: stated demands vs underlying needs (ask 'why' 5 times)",
+      "3. CALCULATE BATNAs: each party's best alternative if no deal; this sets reservation prices",
+      "4. FIND ZOPA: overlap of reservation prices; if empty, either expand pie or acknowledge no deal",
+      "5. ASSESS INFORMATION: what does each party know? what signals can reveal/conceal?",
+      "6. GENERATE OPTIONS: brainstorm integrative solutions that create value before claiming it",
+      "7. EVALUATE TRADEOFFS: which issues are high-value to them but low-cost to you (and vice versa)?",
+      "8. SEQUENCE CONCESSIONS: start with easy wins, build momentum, reciprocate to establish trust",
+      "9. TEST COALITION STABILITY: can any subgroup improve by defecting? use Shapley value for fair splits",
+      "10. FORMALIZE: write agreement with enforcement (escrow, reputation, legal), exit clauses, review dates"
+    ],
+    "decision_points": {
+      "distributive_vs_integrative": "Use distributive (claim value) when: fixed pie proven, one-shot interaction, BATNA strong. Use integrative (create value) when: multiple issues tradeable, ongoing relationship, information asymmetry exploitable through disclosure.",
+      "anchor_or_wait": "Anchor first when: your prep is strong, their BATNA is weak, range uncertainty benefits you. Wait when: information asymmetry favors learning, relationship is nascent, their anchor reveals constraints.",
+      "walk_away_test": "Walk away when: best offer < BATNA, trust is broken, implementation risk exceeds value, relationship cost exceeds deal value."
+    },
+    "quick_checklist": [
+      "[ ] All parties with veto power identified?",
+      "[ ] BATNA calculated for self (not hoped-for outcome)?",
+      "[ ] BATNA estimated for counterparty (validated if possible)?",
+      "[ ] Interests vs positions distinguished for all parties?",
+      "[ ] At least 3 integrative options generated?",
+      "[ ] Tradeoff matrix built (issue x party value)?",
+      "[ ] Coalition stability tested (no profitable defection)?",
+      "[ ] Agreement includes enforcement and renegotiation terms?",
+      "[ ] Relationship impact on future interactions assessed?"
+    ],
+    "check": [
+      "all stakeholders identified including hidden influencers",
+      "BATNAs estimated with evidence (not wishful thinking)",
+      "ZOPA calculated numerically or proven empty",
+      "interests vs positions distinguished for each party",
+      "at least 3 value-creating options explored",
+      "coalition stability verified via blocking-coalition test",
+      "implementation risks identified with mitigations",
+      "enforcement mechanism specified (legal, reputation, escrow)",
+      "relationship NPV included in payoff calculation"
+    ],
+    "diff": {
+      "game-theoretic": "GT predicts equilibria from payoffs; negotiation seeks agreement through process, norms, and relationship. Use GT to prep (model counterparty), use negotiation to execute (build deal).",
+      "theory-of-mind": "ToM infers beliefs and intentions; negotiation applies those inferences to craft acceptable offers. ToM is diagnostic; negotiation is prescriptive.",
+      "mechanism-design": "MD designs rules ex ante (auctions, voting); negotiation operates within existing rules or informal settings. MD is architect; negotiation is player.",
+      "rhetorical": "rhetoric persuades audience to adopt belief; negotiation trades concessions for mutual gain. Rhetoric is one-way influence; negotiation is two-way exchange.",
+      "mcda": "MCDA evaluates alternatives against criteria; negotiation involves strategic counterparties who adapt. MCDA assumes fixed options; negotiation creates them."
+    },
+    "common_confusions": [
+      {
+        "confused_with": "game-theoretic-strategic",
+        "symptom": "modeling negotiation as pure equilibrium prediction, ignoring relationship and process",
+        "resolution": "GT informs prep (payoff analysis); negotiation adds trust-building, creative option generation, implementation planning"
+      },
+      {
+        "confused_with": "rhetorical",
+        "symptom": "trying to persuade counterparty instead of finding mutually acceptable trade",
+        "resolution": "rhetoric changes minds; negotiation exchanges value. If counterparty won't move, generate new options rather than pushing harder"
+      },
+      {
+        "confused_with": "mechanism-design",
+        "symptom": "designing the negotiation process when you should be participating in it",
+        "resolution": "MD requires authority to set rules; negotiation works within given constraints. Use MD when you control the process, negotiation when you're a participant"
+      }
+    ],
+    "fail": {
+      "mode": "winning the negotiation but losing the relationship and long-term incentives",
+      "signals": [
+        "counterparty disengages or retaliates in future dealings",
+        "agreement unravels during implementation (foot-dragging, reinterpretation)",
+        "reputation damage visible in network (fewer incoming deals)",
+        "pattern of short-term gains followed by long-term losses",
+        "coalition partners defect at first opportunity"
+      ],
+      "mit": [
+        {
+          "strategy": "include relationship NPV in payoff function",
+          "test": "calculate: would I accept this deal if roles reversed? if no, relationship cost exceeds apparent gain",
+          "asset": "payoff_matrix with relationship_value row"
+        },
+        {
+          "strategy": "stress-test agreement durability under adversity",
+          "test": "scenario-plan: if market shifts 20%, does agreement still hold? if counterparty gets better offer, do they honor commitment?",
+          "asset": "durability_scenarios with trigger conditions"
+        },
+        {
+          "strategy": "model as repeated game, not one-shot",
+          "test": "calculate shadow of the future: probability of future interaction x value of future deals > short-term extraction gain?",
+          "asset": "repeated_game_analysis with cooperation threshold"
+        },
+        {
+          "strategy": "build in renegotiation triggers",
+          "test": "agreement includes explicit clauses: 'if X changes by Y%, parties reconvene to adjust terms'",
+          "asset": "agreement_terms with renegotiation_clauses"
+        },
+        {
+          "strategy": "verify coalition stability under stress",
+          "test": "for each possible subcoalition, calculate: can they improve by excluding others? if yes, unstable",
+          "asset": "coalition_stability_matrix with blocking_coalition_analysis"
+        }
+      ]
+    },
+    "anti_patterns": [
+      {"name": "positional bargaining", "desc": "anchoring on positions rather than exploring interests; leads to impasse or suboptimal deals", "fix": "ask 'why is that important?' to uncover underlying interests"},
+      {"name": "winner's curse", "desc": "counterparty accepts too quickly, signaling you left value on table", "fix": "slow down, explore why they agreed; consider whether you missed something"},
+      {"name": "BATNA bluffing", "desc": "overstating walkaway option; damages trust when called", "fix": "know your true BATNA; signal strength through confidence, not false claims"},
+      {"name": "coalition instability blindness", "desc": "ignoring that subgroups may defect post-agreement", "fix": "test each possible subcoalition for profitable deviation before finalizing"}
+    ],
+    "use": [
+      "partnerships and joint ventures (equity splits, governance)",
+      "sales and procurement (price, terms, SLAs)",
+      "cross-team alignment and resource allocation",
+      "contract negotiation (employment, vendor, licensing)",
+      "alliance and coalition formation (multi-party agreements)",
+      "M&A deal structuring (valuation, earnouts, representations)",
+      "labor relations and collective bargaining",
+      "international diplomacy and treaty negotiation"
+    ],
+    "rel": [
+      {"id": 55, "name": "game-theoretic-strategic", "note": "analytical framework for modeling counterparty incentives"},
+      {"id": 56, "name": "theory-of-mind", "note": "inferring counterparty beliefs, needs, constraints"},
+      {"id": 58, "name": "mechanism-design", "note": "designing negotiation structures when you have authority"},
+      {"id": 60, "name": "rhetorical", "note": "framing and persuasion tactics within negotiation"},
+      {"id": 46, "name": "multi-criteria-decision-analysis", "note": "evaluating tradeoffs across multiple deal dimensions"},
+      {"id": 49, "name": "robust-worst-case", "note": "stress-testing agreements against adverse scenarios"}
+    ],
+    "ex": {
+      "problem": "Two teams need shared infrastructure budget; total available less than combined asks",
+      "parties": ["Team A (needs compute for ML training)", "Team B (needs storage for data lake)"],
+      "step_1_interests": {
+        "A_position": "we need $100k compute budget",
+        "A_interest": "run ML training jobs within 2-week cycle time",
+        "B_position": "we need $80k storage budget",
+        "B_interest": "store 18 months of data for compliance and analytics"
+      },
+      "step_2_batnas": {
+        "A": "use legacy on-prem cluster (slower, 4-week cycle time, $0 new spend)",
+        "B": "defer data lake 6 months, delete data >6 months ($0 new spend, compliance risk)"
+      },
+      "step_3_zopa": "total budget $120k; combined asks $180k; ZOPA exists if prioritized spend < $120k",
+      "step_4_integrative_options": [
+        "time-share compute: A uses nights/weekends, B uses business hours",
+        "tiered storage: hot tier for recent data, cold archive for compliance",
+        "spot instances for non-urgent ML jobs (50% cost reduction)"
+      ],
+      "step_5_tradeoff_matrix": {
+        "compute_timing_flexibility": {"A_value": "low (can batch jobs)", "B_value": "high (real-time queries)"},
+        "storage_latency": {"A_value": "irrelevant", "B_value": "medium (archive ok for old data)"}
+      },
+      "step_6_coalition_test": "neither team gains by escalating to VP alone (VP will impose 50/50 split worse for both)",
+      "agreement": {
+        "allocation": "A: $70k compute (spot + time-share), B: $50k storage (tiered)",
+        "enforcement": "quarterly usage review with Finance",
+        "renegotiation": "if either team's project scope changes >25%, reconvene",
+        "relationship": "joint presentation to VP on cost savings builds shared credibility"
+      }
+    },
+    "micro_example": {
+      "situation": "You're negotiating salary for a new role. Offered $150k, you want $175k.",
+      "batna": "current job at $140k with promotion path",
+      "counterparty_batna": "second-choice candidate at $145k, 2-week delay",
+      "zopa": "$145k-$175k (your reservation: $145k, theirs: likely $175k ceiling)",
+      "integrative_move": "trade salary for signing bonus, equity, or start date flexibility",
+      "test": "if they accept $175k instantly, you left money on table (winner's curse)",
+      "agreement": "$165k + $10k signing bonus + 1 week earlier start (total value ~$177k)"
+    }
+  }
+}

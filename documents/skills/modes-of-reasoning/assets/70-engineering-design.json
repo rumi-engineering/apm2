@@ -1,0 +1,202 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/engineering-design@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 70,
+    "name": "engineering-design",
+    "cat": "domain",
+    "core": "Iterate from requirements through architecture to validated prototypes, making tradeoffs explicit, encoding constraints formally, and building evidence that the design will survive real-world stresses. Output is buildable assets with traced verification, not just decisions or rankings.",
+    "out": [
+      {"a": "requirements_spec", "s": "numbered list with priority (must/should/may), acceptance test, and source (user story/incident/regulation)", "done": "every requirement has ID, verification method, and traceable origin"},
+      {"a": "adr", "s": "context, decision, alternatives considered, tradeoffs, consequences, prototype reference", "done": ">=2 alternatives documented with rejection rationale; prototype results cited"},
+      {"a": "interface_contract", "s": "inputs, outputs, preconditions, postconditions, error modes, versioning policy", "done": "machine-checkable or has test harness; breaking changes flagged"},
+      {"a": "tradeoff_matrix", "s": "options x criteria (<=7) with scores, weights, weight rationale, stakeholder sign-off", "done": "weights agreed before scoring; sensitivity on +/-15% weight change documented"},
+      {"a": "fmea", "s": "component, failure mode, severity (1-10), probability (1-10), detection (1-10), RPN, mitigation, residual RPN", "done": "top-N RPNs (cutoff documented) have mitigations reducing residual RPN below threshold"},
+      {"a": "test_plan", "s": "requirement ID, test case, pass/fail criteria, responsible party, schedule", "done": "coverage matrix shows every must-have verified; no requirement without test"},
+      {"a": "prototype", "s": "executable or physical asset exercising riskiest assumptions with measured outcomes", "done": "key unknowns reduced to acceptable confidence; results documented in ADR"}
+    ],
+    "proc": [
+      {"step": 1, "do": "Elicit requirements from stakeholders, incidents, and regulations", "out": "requirements list", "gate": "each requirement has source link (who requested, what incident, which regulation)"},
+      {"step": 2, "do": "Classify requirements: must (blocking), should (important), may (nice-to-have); flag conflicts", "out": "prioritized requirements", "gate": "conflict list reviewed with stakeholders; resolution documented"},
+      {"step": 3, "do": "Generate >=2 structurally different candidate architectures", "out": "architecture sketches", "gate": "candidates differ in at least one structural dimension (data flow, deployment, tech stack)"},
+      {"step": 4, "do": "Evaluate candidates against must-haves (binary pass/fail) and should-haves (margin score)", "out": "feasibility matrix", "gate": "any candidate failing a must-have is eliminated with rationale"},
+      {"step": 5, "do": "Build tradeoff matrix: criteria <=7, elicit weights via stakeholder session, score after weights locked", "out": "tradeoff matrix", "gate": "weights signed off before scoring; sensitivity analysis on +/-15% weight variation"},
+      {"step": 6, "do": "Select architecture; write ADR with alternatives, rejection rationale, and consequences", "out": "ADR", "gate": "ADR references prototype results for riskiest assumption"},
+      {"step": 7, "do": "Run FMEA: enumerate failure modes, compute RPN = severity x probability x detection, set cutoff", "out": "FMEA", "gate": "top-N (cutoff justified) have mitigations; residual RPN recalculated"},
+      {"step": 8, "do": "Prototype riskiest elements: build minimal asset exercising highest-uncertainty assumptions", "out": "prototype + results", "gate": "unknowns reduced to quantified confidence; results inform ADR before commit"},
+      {"step": 9, "do": "Define interface contracts: inputs, outputs, preconditions, postconditions, error modes", "out": "interface specs", "gate": "contracts are machine-checkable or have automated test harness"},
+      {"step": 10, "do": "Create test plan mapping every must-have to test case with pass/fail criteria", "out": "test plan + coverage matrix", "gate": "coverage matrix has no empty rows (every must-have has test)"},
+      {"step": 11, "do": "Validate: execute tests, compare results to acceptance criteria, iterate if failures", "out": "validation report", "gate": "all must-haves pass; should-have failures have risk acceptance or redesign"}
+    ],
+    "quick_checklist": [
+      "[ ] Every requirement has ID, priority (must/should/may), acceptance test, and source link",
+      "[ ] >=2 architecturally distinct candidates generated and documented",
+      "[ ] Tradeoff matrix has <=7 criteria with weights signed off before scoring",
+      "[ ] Sensitivity analysis performed: +/-15% weight variation documented",
+      "[ ] ADR references prototype results for riskiest assumption",
+      "[ ] FMEA has explicit RPN cutoff with rationale; top-N mitigated",
+      "[ ] Interface contracts are machine-checkable or have test harness",
+      "[ ] Test coverage matrix shows every must-have has test case",
+      "[ ] Prototype exercised highest-uncertainty assumption before architecture commit"
+    ],
+    "check": [
+      "Every requirement has numbered ID, acceptance test, and traceable source",
+      "At least 2 structurally different architectures explicitly considered",
+      "Tradeoff weights agreed with stakeholders before scoring; sensitivity documented",
+      "Top failure modes (per RPN cutoff) have documented mitigations with residual RPN",
+      "Interfaces have explicit contracts (pre/post conditions, error handling)",
+      "Prototype exercised riskiest assumption; results referenced in ADR",
+      "Test coverage matrix shows every must-have verified; no orphan requirements"
+    ],
+    "diff": {
+      "optimization": {
+        "contrast": "engineering-design satisfies many constraints and produces buildable assets; optimization maximizes single objective on fixed structure",
+        "use_engineering_design_when": "you need to choose structure, validate against multiple stakeholder constraints, and produce specs/tests",
+        "use_other_when": "structure is fixed and you need to tune parameters to minimize/maximize a metric",
+        "test": "Are you choosing structure or tuning parameters? Structure choice = engineering-design; parameter tuning = optimization"
+      },
+      "mcda": {
+        "contrast": "engineering-design produces buildable assets (specs, prototypes, tests) and validates; MCDA produces decision/ranking only",
+        "use_engineering_design_when": "you need verified, buildable output (code, hardware, specs) not just a decision",
+        "use_other_when": "you need to rank options or make a selection without building/validating assets",
+        "test": "Does output need to be built and tested? Yes = engineering-design; No, just ranking = MCDA"
+      },
+      "constraint-satisfiability": {
+        "contrast": "engineering-design iterates encode-solve-prototype-revise across phases; constraint-sat solves a fixed constraint set once",
+        "use_engineering_design_when": "constraints evolve, prototyping reveals new constraints, iteration is expected",
+        "use_other_when": "constraints are fixed and you need SAT/UNSAT answer or counterexample",
+        "test": "Will constraints change as you learn? Yes = engineering-design loop; No, fixed constraints = constraint-sat"
+      },
+      "systems-thinking": {
+        "contrast": "engineering-design produces specs, prototypes, and tests; systems-thinking produces causal loop diagrams and dynamic hypotheses",
+        "use_engineering_design_when": "you need testable, buildable assets with verification",
+        "use_other_when": "you need to understand emergent behavior, feedback loops, or why interventions fail over time",
+        "test": "Output is specs/prototypes/tests = engineering-design; output is CLD/dynamic hypothesis = systems-thinking"
+      },
+      "scientific": {
+        "contrast": "engineering-design goal is working asset that meets requirements; scientific goal is validated theory explaining phenomena",
+        "use_engineering_design_when": "success = asset works and passes tests",
+        "use_other_when": "success = theory is validated and explains observations",
+        "test": "Is success a working thing or a validated explanation? Working thing = engineering-design; explanation = scientific"
+      },
+      "assurance-case": {
+        "contrast": "engineering-design produces the assets; assurance-case argues post-hoc that assets meet safety/security claims",
+        "use_engineering_design_when": "you are creating the design and validation evidence",
+        "use_other_when": "design exists and you must argue it meets safety/regulatory claims with traced evidence",
+        "test": "Are you building or arguing? Building = engineering-design; arguing claims hold = assurance-case"
+      },
+      "experimental-design": {
+        "contrast": "engineering-design builds assets to requirements; experimental-design plans interventions to identify causal effects",
+        "use_engineering_design_when": "you know what to build and need to validate it meets requirements",
+        "use_other_when": "you need to learn causal relationships via controlled experiments before knowing what to build",
+        "test": "Do you know what to build? Yes = engineering-design; No, need causal learning = experimental-design"
+      }
+    },
+    "confusions": [
+      {
+        "with": "optimization",
+        "symptom": "Tuning parameters on a fixed structure while calling it 'design'",
+        "distinguish": "If structure is already chosen and you are adjusting parameters (buffer sizes, timeouts, weights), that is optimization. Engineering-design chooses structure by evaluating architectural alternatives against multi-stakeholder constraints.",
+        "resolution": "Ask: 'Am I choosing between structurally different approaches, or tuning knobs on an existing structure?' Structure choice = engineering-design."
+      },
+      {
+        "with": "systems-thinking",
+        "symptom": "Drawing influence diagrams without producing testable specs or buildable prototypes",
+        "distinguish": "Systems-thinking outputs causal loop diagrams and dynamic hypotheses about emergent behavior. Engineering-design outputs requirements specs, ADRs, interface contracts, FMEAs, and prototypes with validation.",
+        "resolution": "Use systems-thinking first to understand the environment (feedback loops, delays). Then switch to engineering-design to produce assets that survive that environment."
+      },
+      {
+        "with": "mcda",
+        "symptom": "Stopping after tradeoff matrix selection without producing buildable assets or validation",
+        "distinguish": "MCDA produces a ranked decision. Engineering-design uses MCDA as one step but continues to ADR, prototype, interface specs, FMEA, and test plan with validation.",
+        "resolution": "If you have a ranking but no prototype, no test plan, no interface contracts, you did MCDA not engineering-design. Continue to build and validate."
+      },
+      {
+        "with": "assurance-case",
+        "symptom": "Conflating design-time tradeoffs with post-hoc safety argumentation",
+        "distinguish": "Engineering-design makes forward decisions and produces evidence assets. Assurance-case consumes those assets to build a structured argument that safety/security claims hold.",
+        "resolution": "Engineering-design is input to assurance-case. Run engineering-design to produce validated assets, then run assurance-case to argue claims with those assets as evidence."
+      }
+    ],
+    "fail": {
+      "mode": "premature optimization or over-engineering",
+      "desc": "Design addresses unlikely failure modes, requirements sprawl without prioritization, architecture committed without prototype validation, tradeoff matrix sprawls with too many equally-weighted criteria",
+      "signals": [
+        "design addresses failure modes with no evidence from similar systems or incidents",
+        "requirements grow without source links (user story, incident, regulation)",
+        "architecture committed before prototype reduces key uncertainty",
+        "tradeoff matrix has >7 criteria or all weights are equal (no prioritization)",
+        "FMEA has no RPN cutoff; all failure modes treated equally",
+        "ADR written without alternatives section or rejection rationale"
+      ],
+      "mitigations": [
+        {"m": "require evidence for each must-have", "test": "every must-have links to user story, incident, or regulation; link is verifiable", "concrete": "requirements table has 'source' column; no empty cells in must-have rows"},
+        {"m": "time-box architecture exploration", "test": "ADR published by deadline (calendar date in project plan)", "concrete": "deadline in project schedule; ADR merged before deadline"},
+        {"m": "prototype before committing", "test": "ADR references prototype results section with quantified findings", "concrete": "ADR contains 'Prototype Results' heading with measured outcomes"},
+        {"m": "limit tradeoff criteria to 7", "test": "matrix has <=7 columns excluding option name", "concrete": "count columns; reject matrices with >7 criteria without explicit waiver"},
+        {"m": "failure mode triage by RPN", "test": "FMEA has explicit RPN cutoff (e.g., 'mitigate if RPN > 100') with rationale", "concrete": "FMEA header states cutoff; mitigations present for all rows above cutoff"},
+        {"m": "require alternatives in ADR", "test": "ADR has >=2 alternatives with rejection rationale", "concrete": "ADR template enforces 'Alternatives Considered' section; PR checklist verifies"},
+        {"m": "stakeholder sign-off on weights before scoring", "test": "tradeoff matrix has dated sign-off row before scores populated", "concrete": "weight sign-off timestamp precedes score timestamp in document history"}
+      ]
+    },
+    "use": [
+      "product development: hardware, software, mixed systems with multi-stakeholder requirements",
+      "architecture decisions: choices with long-lived consequences requiring explicit tradeoff documentation",
+      "safety-critical systems: where FMEA, interface contracts, and traced verification are required",
+      "reliability-critical systems: where failure mode analysis and prototype validation reduce risk",
+      "multi-stakeholder projects: where conflicting priorities require explicit tradeoff matrices with sign-off",
+      "high-cost domains: where build-and-see is too expensive; upfront validation reduces rework"
+    ],
+    "rel": [
+      {"mode": "constraint-satisfiability", "id": 6, "how": "encode must-haves as constraints; design loop feeds back constraint updates as requirements evolve"},
+      {"mode": "mcda", "id": 46, "how": "tradeoff matrices are embedded MCDA; engineering-design continues past decision to build and validate"},
+      {"mode": "robust-worst-case", "id": 49, "how": "safety margins and FMEA draw on worst-case thinking for severity/detection scoring"},
+      {"mode": "optimization", "id": 48, "how": "once structure fixed, parameters may be optimized; optimization is a sub-step"},
+      {"mode": "systems-thinking", "id": 43, "how": "understand environment (feedback loops, delays) the design must survive; input to requirements"},
+      {"mode": "assurance-case", "id": 36, "how": "engineering-design produces assets that become evidence in assurance-case arguments"},
+      {"mode": "experimental-design", "id": 69, "how": "when uncertainty is high, experimental-design plans prototypes; results feed engineering-design decisions"}
+    ],
+    "micro_example": {
+      "context": "API gateway service: 3 stakeholders (Product: latency, Security: auth, Ops: observability)",
+      "requirements": [
+        {"id": "R1", "text": "p99 latency < 50ms", "priority": "must", "source": "SLA-2025-001"},
+        {"id": "R2", "text": "mTLS for all internal traffic", "priority": "must", "source": "SEC-POL-42"},
+        {"id": "R3", "text": "structured logs with trace ID", "priority": "should", "source": "OPS-REQ-17"}
+      ],
+      "candidates": ["A: Envoy sidecar", "B: Custom Go proxy", "C: Cloud-managed gateway"],
+      "feasibility": {"A": "pass", "B": "pass", "C": "fail R2 (no mTLS control)"},
+      "tradeoff": {
+        "criteria": ["latency", "security_control", "ops_burden", "cost"],
+        "weights": [0.35, 0.30, 0.20, 0.15],
+        "scores": {"A": [0.9, 0.8, 0.6, 0.7], "B": [0.7, 0.9, 0.4, 0.8]},
+        "winner": "A (Envoy)"
+      },
+      "prototype": "Load test Envoy sidecar: measured p99 = 42ms under 10k RPS (passes R1)",
+      "adr": "ADR-007: Select Envoy; rejected B (higher ops burden); prototype confirmed latency",
+      "fmea_top": {"mode": "sidecar crash", "RPN": 120, "mitigation": "liveness probe + auto-restart", "residual_RPN": 40},
+      "interface": "Contract: POST /route returns 200 + body or 4xx/5xx + error schema; precondition: valid JWT",
+      "test_coverage": "R1 -> load test; R2 -> mTLS cert validation test; R3 -> log schema test"
+    },
+    "ex": {
+      "situation": "Design database replication strategy for multi-region e-commerce platform",
+      "steps": [
+        "Elicit: R1 (must): RPO < 1 min; R2 (must): RTO < 5 min; R3 (should): read latency < 20ms in each region",
+        "Candidates: A: synchronous multi-master; B: async primary-replica; C: conflict-free replicated data types",
+        "Feasibility: A fails R3 (cross-region sync adds latency); B and C pass must-haves",
+        "Tradeoff: criteria = [RPO_margin, RTO_margin, read_latency, complexity]; weights = [0.30, 0.25, 0.25, 0.20]",
+        "Score: B = 0.78, C = 0.72; B wins on complexity",
+        "Prototype: simulate network partition; measure actual RPO = 45s, RTO = 3 min (passes)",
+        "ADR-012: Select async primary-replica; rejected A (latency), C (complexity); prototype confirmed RPO/RTO",
+        "FMEA: top mode = replica lag > 1 min, RPN = 150, mitigation = lag alerting + auto-failover, residual = 60",
+        "Interface: replication API contract with idempotent writes, conflict resolution policy documented",
+        "Test plan: R1 -> partition test; R2 -> failover drill; R3 -> regional latency benchmark"
+      ]
+    }
+  }
+}

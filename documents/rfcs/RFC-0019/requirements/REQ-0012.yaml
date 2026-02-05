@@ -1,0 +1,41 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0012"
+  title: "RoleSpecV1: hash-addressed role instructions + tool-call allowlists + conformance"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    FAC MUST define RoleSpecV1 as a CAS-addressed artifact that specifies role instructions and
+    constraints used to run an episode.
+
+    RoleSpecV1 MUST include:
+    - role_id (stable string)
+    - system_prompt_template (inline or file reference)
+    - required context inputs (ContextPack selectors / required receipt hashes)
+    - allowed_tool_classes + per-tool budgets
+    - expected outputs (receipt kinds / artifact kinds)
+    - evaluation hooks (conformance checks; schema validation for outputs)
+
+    Every episode MUST record role_spec_hash in ledger events and in terminal receipts.
+    Role instructions MUST NOT be ambient defaults; they must be hash-addressed by RoleSpecV1.
+
+    Minimum initial roles (required):
+    - orchestrator
+    - implementer
+    - code_quality_reviewer
+    - security_reviewer
+  rationale: |
+    Agent performance improves materially with specialization, but specialization creates drift:
+    instruction changes silently alter behavior and are hard to audit. Hash-addressed RoleSpecV1
+    makes role behavior reproducible and reviewable, and enables systematic evolution via defects.
+  acceptance_criteria:
+    - "RoleSpecV1 is defined, canonicalized, stored in CAS, and referenced by hash."
+    - "Episode start events and terminal receipts include role_spec_hash."
+    - "A conformance harness validates RoleSpecV1 consistency (unknown tools rejected; budgets required; output schema required)."
+    - "At least 4 role specs exist for the minimum roles listed above."
+  evidence_ids:
+    - "EVID-0012"
+  source_refs:
+    - "documents/rfcs/RFC-0019/04_contracts_and_versioning.yaml#rfc_contracts_and_versioning"
+    - "documents/rfcs/RFC-0019/01_problem_and_imports.yaml#rfc_problem_and_imports.holarchy_protocol_v1"

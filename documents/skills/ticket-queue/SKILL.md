@@ -20,24 +20,26 @@ protocol:
 variables:
   TARGET_RFC: "$1"
 
-references[10]:
+references[11]:
+  - path: "@documents/theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/ticket-queue-workflow.md
     purpose: "Decision tree: select ticket, dispatch implementer, loop."
   - path: references/commands.md
     purpose: "Command reference: RFC discovery, reviewer state, subagent logs."
-  - path: "@documents/skills/modes-of-reasoning/artifacts/44-means-end-instrumental.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/44-means-end-instrumental.json"
     purpose: "Mode #44: Means-End / Instrumental Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/artifacts/47-planning-policy.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/47-planning-policy.json"
     purpose: "Mode #47: Planning / Policy Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/artifacts/52-value-of-information.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/52-value-of-information.json"
     purpose: "Mode #52: Value-of-Information Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/artifacts/75-meta-reasoning.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/75-meta-reasoning.json"
     purpose: "Mode #75: Meta-Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/artifacts/13-abductive.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/13-abductive.json"
     purpose: "Mode #13: Abductive (Hypothesis) Reasoning"
-  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_01.md"
+  - path: "@documents/theory/laws.json"
     purpose: "LAW-01: Loop Closure & Gated Promotion"
-  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_02.md"
+  - path: "@documents/theory/laws.json"
     purpose: "LAW-02: Observable Context Sufficiency"
   - path: "@documents/security/AGENTS.md"
     purpose: "Security Documentation"

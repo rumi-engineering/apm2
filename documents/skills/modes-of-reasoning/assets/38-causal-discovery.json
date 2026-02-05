@@ -1,0 +1,168 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/causal-discovery@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 38,
+    "name": "causal-discovery",
+    "cat": "causal",
+    "core": "Infer causal graph structure from data and assumptions. Output is a set of candidate DAGs (often a Markov equivalence class), not a single confirmed structure. Discovery learns what might cause what; inference (mode 37) then quantifies effects given that structure.",
+    "out": [
+      {"n": "assumption_register", "d": "explicit list: faithfulness, causal sufficiency, no selection bias, acyclicity, with justification for each", "done": "all 4 assumptions addressed with domain rationale"},
+      {"n": "candidate_graphs", "d": "DAGs or CPDAGs representing structures consistent with data; include skeleton and v-structures", "done": "graphs enumerated or equivalence class characterized"},
+      {"n": "equivalence_class", "d": "set of DAGs indistinguishable from observational data; specify which edges are oriented vs undetermined", "done": "oriented edges listed separately from undetermined"},
+      {"n": "testable_predictions", "d": "interventions or conditional independence tests that would distinguish between candidate graphs", "done": ">=2 discriminating tests identified with expected outcomes"},
+      {"n": "sensitivity_report", "d": "how conclusions change if assumptions violated (hidden confounder, faithfulness failure)", "done": "at least 1 sensitivity scenario analyzed"}
+    ],
+    "proc": [
+      "GATE 1 - Data audit: check sample size (rule of thumb: >=10 observations per variable); if insufficient, flag as underpowered and document limitations",
+      "GATE 2 - Assumption declaration: explicitly state faithfulness (no path cancellation), causal sufficiency (no hidden confounders), no selection bias, acyclicity; document which are testable vs assumed",
+      "STEP 3 - Algorithm selection: constraint-based (PC, FCI) for interpretable structure with explicit tests, score-based (GES, FGES) for large variable sets, hybrid (GFCI) when hidden confounders suspected",
+      "STEP 4 - Skeleton discovery: identify undirected edges via conditional independence tests (constraint-based) or edge addition/deletion (score-based); record significance thresholds used",
+      "STEP 5 - Orientation: orient edges using v-structure detection (X-Y-Z where X,Z independent given empty set but dependent given Y), Meek rules, or background knowledge; mark oriented vs undetermined",
+      "GATE 6 - Equivalence class: output CPDAG (completed partially directed acyclic graph) representing all DAGs consistent with data; count and characterize members if feasible",
+      "STEP 7 - Domain integration: incorporate known causal directions (time precedence, mechanism knowledge) as constraints; document source of each constraint",
+      "STEP 8 - Intervention planning: identify edges whose direction could be resolved by specific interventions; prioritize by cost and information value",
+      "GATE 9 - Validation design: propose at least 2 experiments or natural experiments that would discriminate between candidate structures"
+    ],
+    "check": [
+      "all 4 core assumptions explicitly addressed with domain justification",
+      "sample size documented with adequacy assessment (>=10n rule or power analysis)",
+      "algorithm choice justified given data type (continuous, discrete, mixed) and assumption set",
+      "equivalence class reported, not single graph treated as definitive",
+      "oriented vs undetermined edges clearly distinguished in output",
+      "hidden confounder possibility addressed (FCI used if suspected, or sensitivity analysis)",
+      "at least 2 discriminating interventions identified for ambiguous edges",
+      "outputs labeled 'candidate structure' not 'true causal graph'",
+      "sensitivity to assumption violations assessed"
+    ],
+    "diff": {
+      "causal-inference": {
+        "boundary": "discovery learns graph structure from data; inference uses known structure to estimate effects",
+        "discovery_when": "causal structure unknown or uncertain; need to identify what causes what",
+        "inference_when": "DAG already specified; need to estimate P(Y|do(X)) or identify adjustment sets"
+      },
+      "abductive": {
+        "boundary": "discovery outputs graph structures encoding causal relations; abductive outputs explanatory hypotheses for specific observations",
+        "discovery_when": "goal is systematic structure learning across variables",
+        "abductive_when": "goal is explaining specific surprising observations with candidate causes"
+      },
+      "statistical-frequentist": {
+        "boundary": "discovery infers directional causation via conditional independence patterns; statistics measures association strength",
+        "discovery_when": "need to know if X causes Y vs Y causes X vs common cause",
+        "statistical_when": "direction known or irrelevant; need to quantify association"
+      },
+      "bayesian-probabilistic": {
+        "boundary": "discovery learns DAG structure; Bayesian network learning also learns DAG but may focus on predictive accuracy rather than causal interpretation",
+        "discovery_when": "causal interpretation required; interventional predictions needed",
+        "bayesian_when": "predictive accuracy sufficient; no intervention planned"
+      },
+      "inductive": {
+        "boundary": "discovery infers directional causal structure via formal algorithms; inductive generalizes patterns informally",
+        "discovery_when": "need formal structure with edges and directions",
+        "inductive_when": "informal pattern sufficient ('X seems related to Y')"
+      },
+      "experimental-design": {
+        "boundary": "discovery proposes what to test to resolve structure; experimental design plans how to test it",
+        "chain": "discovery outputs candidate interventions -> experimental design operationalizes them"
+      }
+    },
+    "confusions": [
+      {
+        "pair": ["causal-discovery", "causal-inference"],
+        "trap": "treating discovered structure as known structure and immediately estimating effects",
+        "symptom": "computing adjustment sets or causal effects from discovery output without acknowledging equivalence class uncertainty",
+        "correction": "discovery outputs candidate structures with ambiguity; inference requires committing to one structure (or averaging over equivalence class). Either (1) design intervention to resolve ambiguity first, or (2) report effect estimates conditional on each candidate structure, or (3) use bounds that hold across equivalence class"
+      },
+      {
+        "pair": ["causal-discovery", "bayesian-network-learning"],
+        "trap": "using structure learning for prediction then interpreting edges causally",
+        "symptom": "edges learned for predictive accuracy treated as causal directions; network has edge X->Y but X doesn't cause Y",
+        "correction": "standard BN learning optimizes likelihood/prediction, not causal validity. For causal interpretation, use algorithms designed for causal discovery (PC, FCI) with explicit causal assumptions, not purely predictive BN learning"
+      },
+      {
+        "pair": ["causal-discovery", "correlation-analysis"],
+        "trap": "running correlations and drawing arrows from stronger to weaker correlations",
+        "symptom": "edges drawn based on correlation magnitude or p-values; no conditional independence testing",
+        "correction": "correlation is symmetric and confounded; discovery uses conditional independence patterns to infer direction. A->B->C can have zero A-C correlation (if B absorbs) or strong A-C correlation (marginal); correlation magnitude doesn't indicate direction"
+      }
+    ],
+    "fail": {
+      "mode": "overtrusting_discovered_structure",
+      "desc": "treating discovered graph as ground truth rather than hypothesis; ignoring equivalence class, assumption sensitivity, and validation requirement",
+      "signals": [
+        "single DAG reported without equivalence class acknowledgment",
+        "no documentation of faithfulness/sufficiency assumptions",
+        "discovered structure immediately used for effect estimation without validation",
+        "edges drawn between variables with <10 observations per variable",
+        "hidden confounders dismissed without FCI or sensitivity analysis",
+        "algorithm applied without checking data requirements (e.g., PC on non-Gaussian data without nonparanormal correction)",
+        "no experimental validation proposed for ambiguous edges"
+      ],
+      "mitigations": [
+        {"m": "report equivalence class size or CPDAG", "test": "output includes count of equivalent DAGs or CPDAG with undirected edges marked", "threshold": "100% of discovery outputs"},
+        {"m": "document all 4 core assumptions with domain rationale", "test": "assumption_register asset complete with justification for each", "threshold": "100% of analyses"},
+        {"m": "flag underpowered discovery", "test": "if n/p < 10, explicit 'underpowered' warning in output", "threshold": "zero silent underpowered analyses"},
+        {"m": "sensitivity analysis for hidden confounders", "test": "either FCI used or sensitivity scenario documented showing impact of adding confounder", "threshold": "100% of analyses where causal sufficiency assumed"},
+        {"m": "propose discriminating interventions", "test": ">=2 experiments identified that would orient ambiguous edges", "threshold": "all CPDAGs with undirected edges"},
+        {"m": "separate discovery from inference", "test": "effect estimates (if any) explicitly conditioned on structure choice with uncertainty propagated", "threshold": "zero unconditional effect estimates from discovery output"}
+      ]
+    },
+    "use": [
+      "early-stage science: unknown mechanisms, need hypothesis generation for causal structure",
+      "experiment prioritization: which intervention would be most informative for resolving structure",
+      "observational data analysis: learning structure when experiments infeasible (epidemiology, economics)",
+      "automated hypothesis generation: systematic structure search across many variables",
+      "model specification: generating candidate DAGs for subsequent causal inference"
+    ],
+    "rel": [
+      {"id": 37, "n": "causal-inference", "r": "downstream: uses discovered structure for effect estimation"},
+      {"id": 69, "n": "experimental-design", "r": "downstream: designs experiments to validate/refine discovered structure"},
+      {"id": 13, "n": "abductive", "r": "parallel: both generate causal hypotheses; abductive for specific observations, discovery for systematic structure"},
+      {"id": 10, "n": "statistical-frequentist", "r": "upstream: provides association data that discovery interprets causally"},
+      {"id": 11, "n": "bayesian-probabilistic", "r": "parallel: Bayesian structure learning related but may prioritize prediction over causation"},
+      {"id": 39, "n": "counterfactual", "r": "downstream: counterfactual reasoning requires causal model that discovery can provide"}
+    ],
+    "ex": {
+      "sit": "Gene expression data: 50 genes, 200 samples. Goal: discover regulatory network structure to prioritize gene knockout experiments.",
+      "steps": [
+        "GATE 1: n/p = 200/50 = 4 < 10. Flag as potentially underpowered; proceed with regularization and conservative thresholds.",
+        "GATE 2: Assumptions documented: (1) Faithfulness: assumed, biological regulation typically faithful; (2) Causal sufficiency: violated - unmeasured transcription factors likely; use FCI not PC; (3) No selection bias: samples random from cell population; (4) Acyclicity: assumed for this timescale (instantaneous measurement).",
+        "STEP 3: Algorithm = FCI (handles hidden confounders) with Gaussian conditional independence tests; significance threshold = 0.01 (conservative given underpowering).",
+        "STEP 4: Skeleton discovered with 78 edges among 50 genes after conditional independence testing.",
+        "STEP 5: Orientation via v-structure detection yields 23 oriented edges; 55 edges undetermined in CPDAG.",
+        "GATE 6: Equivalence class contains ~10^12 DAGs (estimated); CPDAG output with oriented/undetermined edges marked.",
+        "STEP 7: Domain constraints: genes on known pathway (MAPK) constrained by literature; adds 8 oriented edges.",
+        "STEP 8: Priority interventions: gene G17 appears in 4 ambiguous edges with high downstream impact; knockout would resolve most uncertainty.",
+        "GATE 9: Discriminating experiments: (1) G17 knockout would orient 4 edges; (2) G42/G43 double knockout distinguishes between two major structure hypotheses."
+      ],
+      "assets": {
+        "assumption_register": "faithfulness: assumed (standard for regulatory networks); sufficiency: violated, FCI used; selection: satisfied; acyclicity: assumed for instantaneous measurement",
+        "equivalence_class": "CPDAG with 23 oriented, 55 undetermined edges; ~10^12 equivalent DAGs",
+        "priority_intervention": "G17 knockout: resolves 4 ambiguous edges, estimated information value highest",
+        "output_label": "candidate regulatory network structure; not validated causal graph"
+      },
+      "insight": "Large equivalence class reflects genuine uncertainty from observational data. G17 knockout prioritized because it resolves most structural ambiguity per experiment. Structure used as hypothesis generator, not ground truth."
+    },
+    "micro_ex": {
+      "sit": "Three variables: smoking (S), tar deposits (T), lung cancer (C). Observational data shows S-T correlated, T-C correlated, S-C correlated.",
+      "discovery": "PC algorithm: S-T-C skeleton. V-structure test: S and C independent given T? No (marginal and conditional both dependent). No v-structure. Result: S-T-C chain, direction undetermined.",
+      "equivalence_class": "3 DAGs: S->T->C, S<-T<-C, S<-T->C. Cannot distinguish from observational data.",
+      "intervention": "Intervene on T (tar reduction): if C changes, T->C edge confirmed; if S changes, T->S edge confirmed.",
+      "lesson": "Observational data constrains structure to 3 candidates; intervention needed to distinguish. Do not claim 'smoking causes cancer via tar' from observational discovery alone."
+    },
+    "quick_check": [
+      "Did I document all 4 assumptions (faithfulness, sufficiency, no selection bias, acyclicity)?",
+      "Did I report the equivalence class, not just one DAG?",
+      "Is my sample size adequate (>=10 per variable)?",
+      "Did I use FCI or sensitivity analysis if hidden confounders are possible?",
+      "Did I identify at least 2 experiments that would discriminate between candidate structures?",
+      "Am I treating the output as 'candidate structure' not 'true causal graph'?"
+    ]
+  }
+}

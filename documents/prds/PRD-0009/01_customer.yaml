@@ -37,12 +37,12 @@ prd_customer:
         - Global episode limit must be enforced to prevent runaway loops.
     - id: CUST-0004
       name: Context Compiler Team
-      description: Engineers building CCP/RCP compilation, impact expansion, and ZTI scoring.
+      description: Engineers building CCP/RCP compilation, impact expansion, and Context Efficiency scoring.
       holon_id: HOLON-CONTEXT-COMPILER
       primary_jobs_to_be_done:
         - Compile Review Context Packs (RCPs) for each gate role.
         - Perform deterministic impact expansion for changesets.
-        - Score ZTI (Zero Trust Information) for consumption holons.
+        - Score Context Efficiency (Context Discipline) for consumption holons.
       constraints:
         - RCP compilation must be deterministic for identical inputs.
         - Impact expansion must use pinned toolchains; non-deterministic tools prohibited.

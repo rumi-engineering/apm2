@@ -1,0 +1,183 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/scientific@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 68,
+    "name": "scientific",
+    "cat": "domain",
+    "core": "Hypothetico-deductive cycle: abduce hypotheses from observations, deduce testable predictions, run experiments with statistical rigor, revise beliefs/theories based on evidence. Key commitment: knowledge advances through systematic falsification attempts, not confirmation accumulation. Terminates with updated theory plus next testable prediction, never with 'proven' claims.",
+    "out": [
+      {"a": "hypothesis", "s": "falsifiable claim with observable predictions", "done": "at least one prediction can be tested with available resources; negation is meaningful"},
+      {"a": "prediction", "s": "if hypothesis true, then observable outcome X under conditions Y", "done": "prediction specific enough to fail; success/failure criteria defined before observation"},
+      {"a": "experiment", "s": "protocol, controls, sample size, statistical test, pre-registration", "done": "power analysis shows test can detect expected effect; confounds addressed"},
+      {"a": "result", "s": "data, statistical analysis, confidence intervals, effect sizes, p-values", "done": "analysis pre-registered or exploratory clearly labeled; nulls reported"},
+      {"a": "revised_belief", "s": "updated probability or theory modification with magnitude justification", "done": "update proportional to evidence strength; revision triggers for next cycle stated"}
+    ],
+    "proc": [
+      "OBSERVE: gather initial data, note patterns or anomalies; if observations ambiguous, refine measurement before proceeding",
+      "GATE 1 - ABDUCE: generate >=2 candidate hypotheses (including null); if only one hypothesis considered, halt and seek alternatives",
+      "DEDUCE: derive specific, falsifiable predictions from each hypothesis; predictions must differ between hypotheses",
+      "GATE 2 - DESIGN: choose controls, sample size (via power analysis), statistical test; pre-register if possible; if power <80% for minimum meaningful effect, increase n or accept limited sensitivity",
+      "EXECUTE: collect data according to protocol; document deviations; do not peek at results before completion",
+      "ANALYZE: apply pre-specified tests, compute effect sizes and intervals; if exploratory analysis performed, label it clearly",
+      "GATE 3 - REVISE: update credences proportional to evidence strength; if result contradicts hypothesis, do not discard without replication attempt",
+      "ITERATE: state next testable prediction; identify what would strengthen or weaken revised belief; cycle continues"
+    ],
+    "quick_check": [
+      "Is hypothesis falsifiable? (what observation would refute it?)",
+      "Do I have >=2 competing hypotheses including a null?",
+      "Did I derive predictions BEFORE seeing data?",
+      "Is my experiment powered to detect the effect I care about?",
+      "Is my analysis plan pre-registered or clearly marked exploratory?",
+      "Am I reporting null results alongside significant ones?",
+      "Is my belief update proportional to evidence strength?",
+      "Have I stated what would change my mind next?"
+    ],
+    "check": [
+      "hypotheses are falsifiable with specified observations",
+      "predictions derive logically from hypothesis (not just correlated)",
+      ">=2 hypotheses compared (including null or alternative)",
+      "experiment has adequate power (>=80%) to detect expected effect",
+      "analysis plan specified before data collection or exploratory analysis flagged",
+      "confidence intervals and effect sizes reported alongside p-values",
+      "null and negative results reported, not suppressed",
+      "belief update magnitude justified by evidence strength and prior",
+      "next testable prediction stated for continued inquiry"
+    ],
+    "diff": {
+      "abductive": {
+        "boundary": "scientific embeds abduction in full cycle (generate, predict, test, revise); abductive stops at candidate explanation",
+        "when_scientific": "need validated theory, not just plausible explanation; have resources to test",
+        "when_other": "generating hypotheses from surprising observations; test design comes later"
+      },
+      "statistical-frequentist": {
+        "boundary": "scientific uses stats as one phase in inquiry loop; frequentist focuses on testing procedure alone",
+        "when_scientific": "building or revising theory through systematic experimentation",
+        "when_other": "analyzing existing data; need error rate guarantees without theory-building context"
+      },
+      "bayesian-probabilistic": {
+        "boundary": "scientific uses Bayesian update as belief revision step; Bayesian is pure probability calculus",
+        "when_scientific": "full inquiry cycle with experiments; iterative theory refinement",
+        "when_other": "updating beliefs from evidence without experimental intervention; parameter estimation"
+      },
+      "experimental-design": {
+        "boundary": "experimental-design structures the test; scientific embeds design in hypothesis-prediction-revision cycle",
+        "when_scientific": "need full inquiry workflow from observation to revised theory",
+        "when_other": "have hypothesis, need to plan data collection and controls"
+      },
+      "engineering-design": {
+        "boundary": "scientific produces validated theory; engineering produces working asset",
+        "when_scientific": "goal is generalizable knowledge about how things work",
+        "when_other": "goal is a functional solution meeting requirements"
+      },
+      "mechanistic": {
+        "boundary": "scientific tests whether effect exists; mechanistic explains how it works internally",
+        "when_scientific": "establishing that X causes Y through controlled experiment",
+        "when_other": "tracing step-by-step causal pathway to understand mechanism"
+      },
+      "inductive": {
+        "boundary": "scientific actively tests predictions via intervention; inductive passively generalizes observed patterns",
+        "when_scientific": "can run experiments; want causal knowledge",
+        "when_other": "observational data only; seeking patterns without causal claims"
+      },
+      "calibration-epistemic-humility": {
+        "boundary": "scientific advances knowledge; calibration audits accuracy of belief-forming processes",
+        "when_scientific": "running inquiry cycle to test hypotheses",
+        "when_other": "evaluating whether your predictions have been accurate over time"
+      }
+    },
+    "confusions": [
+      {
+        "trap": "using scientific method for questions that cannot be falsified",
+        "symptom": "hypothesis has no conceivable observation that would refute it; moving goalposts when predictions fail",
+        "correction": "if no observation can refute hypothesis, it is not testable. Use abductive for explanation-seeking or philosophical analysis for conceptual questions."
+      },
+      {
+        "trap": "treating statistical significance as scientific confirmation",
+        "symptom": "p<0.05 declared as 'hypothesis confirmed'; single experiment treated as conclusive",
+        "correction": "significance indicates evidence strength, not truth. Replication across conditions and populations required. Report effect sizes and intervals, not just p-values."
+      },
+      {
+        "trap": "conflating scientific with abductive",
+        "symptom": "generating plausible explanations but never testing them; declaring 'best explanation' as established science",
+        "correction": "abduction generates candidates; scientific tests them. If you haven't run an experiment or made a falsifiable prediction, you're still in abductive mode."
+      },
+      {
+        "trap": "conflating scientific with experimental-design",
+        "symptom": "designing rigorous experiment without hypothesis generation or belief revision phases; treating experiment as complete inquiry",
+        "correction": "experimental-design is one phase of scientific method. Scientific also includes hypothesis generation (abductive) and belief revision (Bayesian). Full cycle is observe -> hypothesize -> predict -> experiment -> analyze -> revise -> iterate."
+      }
+    ],
+    "fail": {
+      "mode": "confirmation bias, underpowered experiments, publication bias, HARKing",
+      "signals": [
+        "only evidence supporting hypothesis is sought or reported",
+        "sample size chosen for convenience, not power",
+        "negative results discarded or unreported",
+        "post-hoc hypotheses presented as pre-registered (HARKing)",
+        "single study treated as definitive confirmation",
+        "failed replications dismissed without investigation",
+        "hypothesis modified after data to 'explain' unexpected results"
+      ],
+      "mitigations": [
+        {"m": "pre-register hypotheses and analysis plans", "test": "registration timestamp precedes data collection; plan specifies primary outcome"},
+        {"m": "power analysis before experiment", "test": "sample size justified by effect size and power target (>=80%)"},
+        {"m": "report all results including nulls", "test": "results section includes non-significant findings; file drawer is empty"},
+        {"m": "seek disconfirming evidence", "test": "at least one prediction designed to falsify hypothesis; auxiliary hypotheses constrained"},
+        {"m": "require replication before strong claims", "test": "conclusion strength scaled to number of independent replications"},
+        {"m": "separate exploratory from confirmatory analysis", "test": "exploratory findings explicitly labeled; not presented as pre-planned tests"},
+        {"m": "document all hypothesis modifications", "test": "if hypothesis changed post-data, original hypothesis and change rationale recorded"},
+        {"m": "blind analysis where possible", "test": "analyst blinded to condition labels until analysis complete; or preregistered analysis script runs on blinded data"}
+      ]
+    },
+    "use": [
+      "R&D and product experimentation with theory-building goals",
+      "A/B testing with hypothesis-driven learning (not just metric optimization)",
+      "academic and industrial research programs",
+      "measurement culture building in data-driven organizations",
+      "medical and clinical trials with pre-registration",
+      "causal learning from systematic intervention"
+    ],
+    "rel": [
+      {"id": 13, "n": "abductive", "r": "hypothesis generation step is abductive inference; use abductive first, then scientific"},
+      {"id": 10, "n": "statistical-frequentist", "r": "experiment analysis uses frequentist tests; embedded within scientific cycle"},
+      {"id": 11, "n": "bayesian-probabilistic", "r": "belief revision can use Bayesian updating; posterior becomes prior for next cycle"},
+      {"id": 69, "n": "experimental-design", "r": "experiment step applies design principles; scientific embeds design in full cycle"},
+      {"id": 37, "n": "causal-inference", "r": "experiments aim to establish causal claims; scientific uses causal logic in design and interpretation"},
+      {"id": 40, "n": "mechanistic", "r": "scientific establishes that effect exists; mechanistic explains how"},
+      {"id": 76, "n": "calibration-epistemic-humility", "r": "tracks accuracy of scientific predictions over time; feedback loop for method improvement"}
+    ],
+    "ex": {
+      "sit": "Engineering team suspects new caching layer reduces API latency, but unclear if effect is real or measurement noise.",
+      "steps": [
+        "OBSERVE: latency metrics show 15% reduction after cache deploy, but high variance day-to-day",
+        "ABDUCE: H1=cache reduces latency; H2=measurement asset; H0=no real effect (random variation)",
+        "DEDUCE: H1 predicts consistent reduction under controlled A/B; H2 predicts effect disappears with improved measurement; H0 predicts no significant difference in controlled test",
+        "DESIGN: A/B test with 50/50 traffic split, n=10,000 requests per arm (power analysis: 95% power to detect 5% latency difference), pre-registered primary metric (p95 latency), 7-day duration to capture weekly patterns",
+        "EXECUTE: run test, document one incident (brief outage on day 3, excluded from analysis per pre-registration)",
+        "ANALYZE: cache arm p95 latency 142ms vs control 168ms; difference 26ms (15.5%), 95% CI [18ms, 34ms], p<0.001; effect size Cohen's d=0.42",
+        "REVISE: strong evidence for H1; update belief: cache likely causes ~15-20% latency reduction; H2 and H0 effectively refuted by controlled test",
+        "ITERATE: next question: does effect persist under 2x load? Prediction: if cache-bound, effect diminishes at high load"
+      ],
+      "asset": {
+        "hypothesis": "H1: caching layer reduces p95 API latency by >=5%",
+        "prediction": "under controlled A/B, cache arm shows statistically significant latency reduction",
+        "experiment": "A/B test, n=20,000, 7 days, pre-registered primary outcome",
+        "result": "15.5% reduction [11%, 20%] CI, p<0.001, d=0.42",
+        "revised_belief": "high confidence cache reduces latency; next test: load-sensitivity"
+      },
+      "insight": "controlled experiment distinguished real effect from noise; pre-registration prevented post-hoc hypothesis shifting"
+    },
+    "micro_ex": {
+      "bad": "We deployed caching and latency dropped 15%. Caching works!",
+      "good": "We hypothesized caching reduces latency. A/B test (n=20k, 7d, pre-registered): 15.5% reduction [11%, 20%], p<0.001. Effect replicated across 3 service types. Next test: load-sensitivity.",
+      "why": "Bad: no controlled test, no alternatives considered, no uncertainty quantified. Good: falsifiable hypothesis, controlled experiment, effect size with interval, replication, next prediction stated."
+    }
+  }
+}

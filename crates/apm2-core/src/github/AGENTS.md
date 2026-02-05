@@ -323,7 +323,7 @@ assert!(lease.is_terminal());
 
 - [`apm2_core::lease`](../lease/AGENTS.md) - Core lease infrastructure (GateLease pattern)
 - [`apm2_core::events`](../events/AGENTS.md) - Proto event types including GitHubLeaseEvent
-- [`apm2_holon::resource::Lease`](../../../../apm2-holon/src/resource/lease.rs) - Holonic lease with scope/budget
+- [`apm2_holon::resource::Lease`](../../../apm2-holon/src/resource/lease.rs) - Holonic lease with scope/budget
 
 ## References
 

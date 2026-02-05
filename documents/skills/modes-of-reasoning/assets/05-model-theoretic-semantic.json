@@ -1,0 +1,213 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/model-theoretic-semantic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z",
+    "updated_at": "2026-02-02T00:00:00Z"
+  },
+  "payload": {
+    "id": 5,
+    "name": "model-theoretic-semantic",
+    "cat": "formal",
+    "core": "Reason by constructing mathematical structures (models) that interpret a theory's symbols; determine validity (formula true in ALL models of theory T), satisfiability (true in SOME model), or independence (neither provable nor refutable). The key insight: a claim's meaning is its truth conditions across possible interpretations, not its derivation path. Tarski semantics: truth of compound formulas is computed recursively from atomic truth under an interpretation.",
+    "out": [
+      {"id": "validity_proof", "form": "argument that phi holds in every model of T", "test": "no countermodel constructible; or compactness/completeness argument applies", "asset": "semantic entailment certificate: T |= phi"},
+      {"id": "satisfiability_witness", "form": "concrete model M + variable assignment v such that M,v |= phi", "test": "for each axiom A in T: evaluate A under M,v and confirm true; then evaluate phi", "asset": "interpretation table: {domain, symbol->denotation, valuation}"},
+      {"id": "countermodel", "form": "structure M where theory T holds but target claim phi fails", "test": "all axioms of T evaluate true under M; phi evaluates false", "asset": "countermodel specification + failed formula trace"},
+      {"id": "independence_result", "form": "two models: M1 where T+phi holds, M2 where T+not-phi holds", "test": "both M1 and M2 satisfy all axioms of T", "asset": "independence certificate with both model specs"},
+      {"id": "semantic_entailment", "form": "T |= phi verdict with justification", "test": "every model of T is a model of phi (or countermodel found)", "asset": "entailment proof or countermodel"}
+    ],
+    "proc": [
+      {"step": 1, "do": "specify signature: sorts (types of objects), function symbols with arities, relation symbols with arities", "out": "vocabulary Sigma", "test": "every symbol in theory T and target phi appears in Sigma; no undeclared symbols", "decide": "if signature unclear, list all non-logical symbols in formulas first"},
+      {"step": 2, "do": "enumerate axioms/constraints the model must satisfy (theory T)", "out": "theory T as formula set", "test": "axioms are closed formulas (no free variables); each axiom is well-formed under Sigma", "decide": "include implicit axioms (e.g., equality axioms if = used)"},
+      {"step": 3, "do": "construct candidate model: choose domain (carrier set per sort), assign interpretations to function/relation symbols", "out": "structure M = (D, I)", "test": "domain non-empty for each sort; each function symbol maps D^n -> D; each relation symbol is subset of D^n", "decide": "start with minimal finite models; expand only if needed"},
+      {"step": 4, "do": "verify model satisfies theory: for each axiom A in T, evaluate A in M", "out": "axiom satisfaction table", "test": "every axiom evaluates to TRUE under Tarski semantics; document evaluation trace for non-trivial axioms"},
+      {"step": 5, "do": "evaluate target formula phi in M", "out": "truth value of phi in M", "test": "compositional evaluation: phi AND psi true iff both true; EXISTS x.P(x) true iff some domain element satisfies P"},
+      {"step": 6, "do": "interpret result: phi true in M -> satisfiable; phi false in M but T satisfied -> countermodel found; need all-model argument for validity", "out": "semantic verdict", "test": "distinguish 'true in this model' from 'valid (true in all models)'", "decide": "for validity, either construct schematic argument covering all models, or invoke compactness/completeness if available"},
+      {"step": 7, "do": "for independence: construct second model where opposite truth value holds while T still satisfied", "out": "independence proof or dependency proof", "test": "both models satisfy T; one satisfies phi, other satisfies not-phi", "decide": "if second model impossible, phi is entailed or contradicted by T"}
+    ],
+    "check": [
+      "signature complete: every symbol in formulas has declared interpretation?",
+      "domain non-trivial: non-empty carrier set (avoids vacuous truth where 'forall x.P(x)' is trivially true)?",
+      "interpretation well-typed: functions return correct sort; relations have correct arity?",
+      "axiom satisfaction: each axiom of T evaluates TRUE under interpretation I?",
+      "compositional evaluation: truth of compound formulas computed recursively per Tarski (not guessed)?",
+      "countermodel minimal: smallest structure exhibiting failure (aids understanding)?",
+      "scope clarity: conclusion states 'valid in all models' vs 'satisfiable in some model' vs 'true in this specific model'?",
+      "semantic vs syntactic: conclusion is about truth-in-models, not derivability (use #2 for derivability)?"
+    ],
+    "quick_checklist": [
+      "Did I define the signature (sorts, functions, relations) before building the model?",
+      "Is my domain non-empty for each sort? (empty domain causes vacuous universal truths)",
+      "Have I checked ALL axioms, not just the obvious ones? (list each, check each)",
+      "Does my countermodel actually satisfy the background theory T, not just violate phi?",
+      "Am I conflating 'true in this model' with 'valid in all models'? (validity requires all-model argument)",
+      "For validity claims: did I rule out all countermodels, or just fail to find one?",
+      "For independence: do I have two models (one satisfying phi, one satisfying not-phi), both satisfying T?"
+    ],
+    "diff": {
+      "02-proof-theoretic": {
+        "boundary": "truth-in-structures vs derivability-via-rules",
+        "use_model_theoretic_when": "asking 'what structures make this true?' or 'can I find a counterexample?'",
+        "use_other_when": "asking 'can I derive this from axioms?' or 'what is the proof object?'",
+        "soundness_bridge": "soundness: derivable -> valid; completeness: valid -> derivable (may not hold for all systems)",
+        "example": "model-theoretic: 'exhibit a group where commutativity fails' vs proof-theoretic: 'derive theorem T from group axioms'"
+      },
+      "06-constraint-sat": {
+        "boundary": "studying theory properties vs finding concrete assignments",
+        "use_model_theoretic_when": "asking 'is phi true in ALL models?' or 'does this axiom follow from others?'",
+        "use_other_when": "asking 'give me ONE satisfying assignment' for a scheduling/config problem",
+        "example": "model-theoretic: 'does T semantically entail phi?' vs constraint-sat: 'find a meeting schedule satisfying all constraints'"
+      },
+      "08-counterexample-guided": {
+        "boundary": "single model analysis vs iterative abstraction-refinement",
+        "use_model_theoretic_when": "constructing one (counter)model to answer a semantic question",
+        "use_other_when": "state space too large; need abstraction + refinement loop (CEGAR)",
+        "example": "model-theoretic: 'does this formula have a model of size 3?' vs CEGAR: 'verify property across 10^6 states via iterative refinement'"
+      },
+      "01-deductive": {
+        "boundary": "semantic entailment (T |= phi) vs syntactic derivation (T |- phi)",
+        "use_model_theoretic_when": "asking 'is phi true whenever T is true?' (truth-based)",
+        "use_other_when": "asking 'can I derive phi from T using inference rules?' (proof-based)",
+        "completeness_note": "in complete systems, |= and |- coincide; in incomplete systems, valid formulas may be underivable"
+      },
+      "64-modal": {
+        "boundary": "classical interpretation vs possible-worlds semantics with accessibility",
+        "use_model_theoretic_when": "no modal operators (necessity, possibility, knowledge) involved",
+        "use_other_when": "reasoning about what is necessary/possible/known across accessible worlds",
+        "example": "model-theoretic: 'interpret P(a) in structure M' vs modal: 'is P(a) true in all accessible worlds?'"
+      },
+      "03-constructive": {
+        "boundary": "classical truth (true or false in each model) vs constructive witness requirement",
+        "use_model_theoretic_when": "classical logic acceptable; existence proofs via contradiction allowed",
+        "use_other_when": "need computational witness for existence claims; excluded middle disallowed",
+        "example": "model-theoretic: 'some model satisfies phi' (may be non-constructive) vs constructive: 'exhibit algorithm producing witness'"
+      }
+    },
+    "confusions": [
+      {
+        "pair": ["model-theoretic", "constraint-satisfiability"],
+        "symptom": "treating SAT solver output as semantic validity proof, or conflating 'found one model' with 'true in all models'",
+        "clarification": "SAT gives ONE witness (satisfiability); model-theoretic validity requires ALL models. 'SAT result SATISFIABLE' means 'at least one model exists', not 'true in every model'. To prove validity, you must rule out all countermodels, not just find one satisfying model.",
+        "test": "ask yourself: 'am I claiming phi holds in SOME model or ALL models?' If ALL, SAT alone is insufficient."
+      },
+      {
+        "pair": ["model-theoretic", "proof-theoretic"],
+        "symptom": "assuming 'I cannot prove P' means 'P is false in some model', or conflating derivability with truth",
+        "clarification": "soundness + completeness required to equate derivability with validity. In incomplete systems (like arithmetic), unprovable does NOT imply countermodel exists. Godel's incompleteness: some true statements are underivable.",
+        "test": "ask yourself: 'is my system complete?' If uncertain, keep semantic and syntactic conclusions separate."
+      },
+      {
+        "pair": ["model-theoretic", "modal"],
+        "symptom": "using single-world model when question involves necessity/possibility/knowledge",
+        "clarification": "standard model theory interprets formulas in ONE structure; modal logic requires MULTIPLE worlds with accessibility relations. If your question is 'is phi necessarily true?' or 'does agent know phi?', you need Kripke models (modal), not single structures.",
+        "test": "ask yourself: 'does my question involve necessity (box), possibility (diamond), or knowledge (K)?' If yes, use modal (#64)."
+      },
+      {
+        "pair": ["model-theoretic", "counterexample-guided"],
+        "symptom": "manually constructing models when state space is too large for exhaustive analysis",
+        "clarification": "model-theoretic is for small, hand-constructed interpretations or meta-theoretic arguments. If you have 10^6+ states and need property verification, use CEGAR (#8) for abstraction-refinement. Model-theoretic won't scale to verify all behaviors.",
+        "test": "ask yourself: 'can I enumerate all relevant models by hand?' If no (state explosion), use counterexample-guided."
+      }
+    ],
+    "fail": {
+      "name": "semantic mismatch",
+      "desc": "mathematical model satisfies the formal theory but diverges from the real system in important ways; the model is 'technically correct' but practically misleading",
+      "signals": [
+        "stakeholders reject 'valid' model as unrealistic ('that's not how the system actually works')",
+        "model permits behaviors the real system cannot exhibit (overgenerous interpretation)",
+        "model excludes behaviors the real system does exhibit (overly restrictive interpretation)",
+        "finite model used where infinite domain is required (e.g., integers modeled as bounded range)",
+        "abstraction removes causally relevant distinctions (e.g., treating all users as equivalent)",
+        "model validates spec but system fails in deployment (semantic gap between spec and reality)"
+      ],
+      "mitigations": [
+        {
+          "id": "M1-domain-expert-review",
+          "action": "domain expert reviews carrier set and symbol interpretations before validity analysis",
+          "test": "expert sign-off document: for each relation R, expert confirms 'R maps to concept X in real system' with example",
+          "trigger": "before step 6 (interpret result)"
+        },
+        {
+          "id": "M2-diverse-models",
+          "action": "construct at least 2 structurally different models satisfying T; compare behaviors",
+          "test": "two models with different domain sizes or different denotations for key symbols; document behavioral differences",
+          "trigger": "after first model constructed"
+        },
+        {
+          "id": "M3-axiom-traceability",
+          "action": "trace each axiom to a requirements document or real-world constraint",
+          "test": "traceability matrix: each axiom row has requirement ID; no orphan axioms (axioms not tied to requirements)",
+          "trigger": "during step 2 (enumerate axioms)"
+        },
+        {
+          "id": "M4-historical-validation",
+          "action": "test model predictions against >= 3 known historical scenarios from real system",
+          "test": "for each historical scenario: encode inputs, run through model, compare output to actual outcome; document match/mismatch",
+          "trigger": "after model construction, before drawing conclusions"
+        },
+        {
+          "id": "M5-pathological-model-catalog",
+          "action": "explicitly document 'pathological' models that satisfy T but violate intended behavior",
+          "test": "written list of unintended models with explanation of why each is unrealistic; consider adding axioms to exclude them",
+          "trigger": "after validity analysis"
+        },
+        {
+          "id": "M6-boundary-assumptions",
+          "action": "list environmental assumptions (e.g., 'network is reliable', 'clocks are synchronized') that model depends on",
+          "test": "assumption list reviewed; each assumption has operational validation method or acknowledged risk",
+          "trigger": "before publishing conclusions"
+        }
+      ]
+    },
+    "use": [
+      "consistency check: does a model satisfying all axioms exist? (satisfiability of theory T)",
+      "independence proof: show axiom X cannot be derived by exhibiting models with X and without X (both satisfying other axioms)",
+      "specification analysis: what behaviors does this formal spec actually permit? (enumerate satisfying models)",
+      "hidden assumption discovery: find minimal models revealing implicit constraints (what did we forget to specify?)",
+      "semantic entailment: does T |= phi without constructing syntactic derivation? (truth-based reasoning)",
+      "counterexample generation: refute universal claims by exhibiting concrete structure where claim fails",
+      "completeness analysis: are there true statements our proof system cannot derive? (semantic truth vs syntactic provability)",
+      "abstraction validation: does abstract model preserve relevant properties of concrete system?"
+    ],
+    "rel": [
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "soundness/completeness bridges semantic validity to syntactic derivability"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "SAT/SMT solvers are computational tools for model finding; constraint-sat uses them for assignment search"},
+      {"id": 8, "name": "counterexample-guided", "link": "CEGAR uses countermodels in refinement loop; model-theoretic provides single-model analysis"},
+      {"id": 1, "name": "deductive-reasoning", "link": "deductive derives conclusions syntactically; model-theoretic validates semantically (T |= phi vs T |- phi)"},
+      {"id": 64, "name": "modal", "link": "modal logic extends model theory to possible-worlds semantics with accessibility relations (Kripke models)"},
+      {"id": 3, "name": "constructive-intuitionistic", "link": "constructive requires computational witness; model-theoretic allows classical (non-constructive) existence"}
+    ],
+    "ex": {
+      "prob": "Prove that commutativity of + is independent of group axioms (cannot be derived from group axioms alone).",
+      "steps": [
+        "step 1: signature Sigma = {sort G, binary function +: G x G -> G, constant 0: G, unary function inv: G -> G}",
+        "step 2: theory T (group axioms) = {associativity: forall x,y,z. (x+y)+z = x+(y+z), identity: forall x. x+0 = x AND 0+x = x, inverse: forall x. x+inv(x) = 0 AND inv(x)+x = 0}",
+        "step 3a: model M1 (commutative) = domain: integers Z, +: standard integer addition, 0: zero, inv: negation",
+        "step 3b: model M2 (non-commutative) = domain: 2x2 invertible real matrices, +: matrix multiplication (relabeled), 0: identity matrix, inv: matrix inverse",
+        "step 4: verify both M1 and M2 satisfy all group axioms (associativity, identity, inverse) - they do",
+        "step 5a: evaluate commutativity (forall x,y. x+y = y+x) in M1: TRUE (integer addition commutes)",
+        "step 5b: evaluate commutativity in M2: FALSE (matrix multiplication does not commute: AB != BA in general)",
+        "step 6: conclusion: commutativity is INDEPENDENT of T. Not valid (M2 is countermodel to validity). Not contradicted (M1 satisfies it). Neither derivable nor refutable from T alone."
+      ],
+      "assets": ["M1 interpretation table", "M2 interpretation table", "independence verdict certificate"]
+    },
+    "micro_example": {
+      "ctx": "Does the theory T = {P(a), forall x. P(x) -> Q(x)} entail Q(a)?",
+      "signature": "constant a, unary predicates P, Q",
+      "semantic_question": "Is Q(a) true in EVERY model where T is true?",
+      "analysis": [
+        "Take arbitrary model M satisfying T.",
+        "T satisfied implies: (1) P(a) true in M, (2) forall x. P(x)->Q(x) true in M.",
+        "From (2) with x=a: P(a)->Q(a) true in M.",
+        "From (1) and modus ponens semantically: Q(a) true in M.",
+        "Since M was arbitrary model of T, Q(a) is true in ALL models of T."
+      ],
+      "verdict": "T |= Q(a) (semantic entailment holds)",
+      "contrast_with_satisfiability": "We did NOT just find one model where Q(a) is true; we argued it holds in ALL models of T. That's validity, not mere satisfiability."
+    }
+  }
+}

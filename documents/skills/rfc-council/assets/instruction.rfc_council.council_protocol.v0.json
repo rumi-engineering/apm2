@@ -30,7 +30,7 @@
     "ctx": [
       "documents/skills/rfc-council/references/COUNCIL_PROTOCOL.md",
       "documents/skills/modes-of-reasoning/SKILL.md",
-      "documents/skills/modes-of-reasoning/artifacts/selector.json"
+      "documents/skills/modes-of-reasoning/assets/selector.json"
     ],
     "lex": {
       "C1": "Spawn 3 subagents with Anchor Roles: SA-1 (Rigorist: 70+44), SA-2 (Feasibility: 40+51), SA-3 (Guardian: 79+36).",

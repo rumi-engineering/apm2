@@ -1,0 +1,190 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/sensemaking-frame-building@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 63,
+    "name": "sensemaking-frame-building",
+    "cat": "domain",
+    "core": "Determine 'what kind of situation is this?' by building frames that organize signals, priorities, and actions under ambiguity. Precedes most other modes by selecting what counts as relevant evidence and what questions to ask. A frame is not a hypothesis about cause—it is a lens that determines which hypotheses are even worth considering.",
+    "out": [
+      {"n": "situation_frame", "d": "named pattern characterizing the situation type (e.g., 'competitive threat', 'execution breakdown', 'market shift')", "test": "frame has a name, 1-sentence definition, and explicit scope boundaries"},
+      {"n": "frame_candidates", "d": "2-4 alternative frames considered before selection with fit rationale for each", "test": "each candidate has: name, what it explains, what it ignores"},
+      {"n": "working_assumptions", "d": "3-5 key assumptions the selected frame requires to hold", "test": "each assumption is falsifiable and linked to a revision trigger"},
+      {"n": "relevance_filter", "d": "criteria for what signals matter under this frame vs noise", "test": "can classify new observation as relevant/irrelevant with explicit rationale"},
+      {"n": "action_implications", "d": "what questions to ask, data to gather, and stakeholders to involve given this frame", "test": ">=3 concrete next steps that follow logically from frame"},
+      {"n": "revision_triggers", "d": "specific observable signals that would force reframing", "test": "each trigger names: signal, threshold, and which alternative frame it suggests"}
+    ],
+    "proc": [
+      "SIGNAL INVENTORY: list anomalies, constraints, stakeholder concerns, and available data without interpretation; flag signals that don't fit existing mental models; note what is confusing, not just what is clear",
+      "FRAME GENERATION: name 2-4 candidate situation types this could be; include (a) most obvious frame, (b) frame that explains the most puzzling signal, (c) frame stakeholders would resist; each frame needs a name and 1-sentence characterization",
+      "FIT TESTING: for each candidate frame, explicitly list (1) signals it explains well, (2) signals it ignores or struggles with, (3) what actions it would suggest; score each frame 1-3 on explanatory coverage",
+      "FRAME SELECTION: choose best-fit frame; if top two frames are within 1 point, either (a) gather discriminating signal, or (b) hold both frames provisionally and note which actions differ",
+      "ASSUMPTION SURFACING: for selected frame, state 3-5 key assumptions it requires; for each assumption, define what observable evidence would falsify it",
+      "IMPLICATION DERIVATION: derive concrete next actions, questions to pursue, and evidence to gather that follow from this frame; if actions are identical across multiple frames, frame selection may not matter yet",
+      "TRIGGER SETTING: define specific signals (with thresholds where possible) that would force frame revision; schedule explicit frame-check moments (e.g., 'reassess frame after first stakeholder meeting')"
+    ],
+    "check": [
+      ">=2 candidate frames articulated before any frame selected",
+      "selected frame explicitly named with 1-sentence characterization",
+      ">=3 frame assumptions documented with falsification criteria",
+      "relevance filter stated: what signals matter vs noise under this frame",
+      ">=3 concrete actions derived that follow from frame (not generic 'gather more data')",
+      "revision triggers defined with specific signals and thresholds",
+      "stakeholders can articulate frame in their own words (shared mental model test)",
+      "frame is a situation type, not a causal hypothesis (if it's a hypothesis, use abductive)"
+    ],
+    "quick_check": [
+      "Can I name my current frame in 3 words or fewer?",
+      "Did I consider at least one frame stakeholders would resist?",
+      "Can I state what evidence would make me reframe?",
+      "Are my next actions specific to this frame, or would they be the same under any frame?",
+      "If I'm explaining why something happened, am I doing sensemaking or abductive? (Sensemaking = situation type; abductive = causal explanation)"
+    ],
+    "diff": {
+      "abductive": {
+        "contrast": "abductive generates hypotheses about specific causes; sensemaking selects which problem space to hypothesize within",
+        "boundary": "frame = 'this is a competitive threat situation'; hypothesis = 'competitor X launched product Y causing our decline'",
+        "test": "if you're asking 'why did X happen?', use abductive. If you're asking 'what kind of situation is this?', use sensemaking"
+      },
+      "hermeneutic": {
+        "contrast": "hermeneutic interprets meaning of existing signals; sensemaking decides which signals to attend to",
+        "boundary": "hermeneutic asks 'what does this memo mean?'; sensemaking asks 'is this memo even relevant to our situation?'",
+        "test": "if you have a specific text/asset to interpret, use hermeneutic. If you're deciding what to focus on, use sensemaking"
+      },
+      "meta-reasoning": {
+        "contrast": "meta-reasoning selects reasoning mode; sensemaking establishes what problem is before mode selection",
+        "boundary": "sensemaking: 'this is a crisis, not a routine issue'; meta-reasoning: 'for crises, use satisficing + heuristic mode'",
+        "test": "sensemaking answers 'what situation?'; meta-reasoning answers 'how to reason about it?'; sensemaking typically precedes meta-reasoning"
+      },
+      "diagnostic": {
+        "contrast": "diagnostic identifies root cause within an established frame; sensemaking chooses the frame that defines what counts as a cause",
+        "boundary": "sensemaking: 'this is a people problem, not a technology problem'; diagnostic: 'which person/process failed?'",
+        "test": "if fault taxonomy is known and you're localizing within it, use diagnostic. If you're unsure what taxonomy applies, use sensemaking"
+      },
+      "narrative": {
+        "contrast": "narrative builds coherent story from events; sensemaking builds interpretive frame that determines which events belong in the story",
+        "boundary": "sensemaking: 'this is a story about market disruption'; narrative: 'here's the timeline of how the disruption unfolded'",
+        "test": "if you're constructing a causal chain of events, use narrative. If you're deciding what kind of story this is, use sensemaking"
+      },
+      "systems-thinking": {
+        "contrast": "systems-thinking maps feedback loops and emergent behavior; sensemaking decides whether systems-level framing is even appropriate",
+        "boundary": "sensemaking: 'this is a systemic issue, not a one-time failure'; systems-thinking: 'here are the reinforcing loops causing it'",
+        "test": "if you're mapping loops and delays, use systems-thinking. If you're deciding whether to zoom out to system level, use sensemaking"
+      }
+    },
+    "confusions": [
+      {
+        "trap": "using sensemaking when abductive is needed",
+        "symptom": "frame keeps shifting because you're actually trying to explain a specific anomaly, not characterize a situation type",
+        "correction": "if your 'frame' is really a causal hypothesis (e.g., 'competitor sabotage'), switch to abductive. Frames are situation types (e.g., 'competitive threat'), not explanations"
+      },
+      {
+        "trap": "skipping sensemaking and jumping to diagnostic",
+        "symptom": "elegant root cause analysis that solves the wrong problem; stakeholders say 'that's not what this is about'",
+        "correction": "before diagnostic, confirm frame alignment with stakeholders. If stakeholders have different implicit frames, sensemaking first"
+      },
+      {
+        "trap": "treating frame selection as permanent",
+        "symptom": "defending frame against disconfirming evidence; 'I already decided this is a technology problem'",
+        "correction": "frames are provisional working hypotheses about situation type. Schedule explicit reframe checkpoints; frames should be held lightly"
+      },
+      {
+        "trap": "conflating sensemaking with brainstorming",
+        "symptom": "generating many frames without fit-testing or selection criteria; analysis paralysis",
+        "correction": "limit to 2-4 frames; score each on explanatory coverage; select and commit (provisionally) rather than holding all possibilities"
+      }
+    ],
+    "fail": {
+      "name": "premature frame lock-in",
+      "desc": "Adopting first plausible frame without considering alternatives; defending frame against disconfirming evidence; reasoning correctly within wrong frame",
+      "signals": [
+        "first frame adopted without articulating alternatives",
+        "disconfirming evidence dismissed as noise or exception",
+        "perfect reasoning inside frame yielding answers stakeholders reject",
+        "stakeholders using incompatible implicit frames without awareness",
+        "frame assumptions never stated or tested",
+        "no revision triggers defined; frame treated as fact"
+      ],
+      "mitigations": [
+        {"m": "require >=2 candidate frames before selection", "test": "frame_candidates.length >= 2 with fit rationale for each"},
+        {"m": "name current frame explicitly so it can be questioned", "test": "situation_frame has name and 1-sentence definition"},
+        {"m": "state frame assumptions with falsification criteria", "test": "working_assumptions.length >= 3 with observable falsifiers"},
+        {"m": "define revision triggers before proceeding", "test": "revision_triggers non-empty with specific signals and thresholds"},
+        {"m": "schedule frame-check at defined intervals", "test": "explicit checkpoint scheduled (e.g., 'recheck frame after X')"},
+        {"m": "test frame with outsider or red team", "test": "at least one person outside core team asked 'does this frame fit?'"},
+        {"m": "ask 'what would make us reframe?' before major decisions", "test": "revision triggers reviewed before committing resources"},
+        {"m": "track frame-action coupling: if actions would be same under different frame, frame may not matter yet", "test": "action_implications differ across top candidate frames"}
+      ]
+    },
+    "use": [
+      "crisis leadership under novel conditions: 'is this a PR crisis, a safety crisis, or a legal crisis?'",
+      "early-stage strategy formulation: 'is this a growth problem, a competition problem, or a capability problem?'",
+      "ambiguous competitive landscapes: 'is this market converging, fragmenting, or being disrupted?'",
+      "novel situations lacking precedent: 'what historical situations is this most like?'",
+      "problem formulation before solution search: 'what kind of problem are we actually solving?'",
+      "cross-functional alignment: 'do engineering, product, and sales see this the same way?'",
+      "post-incident framing: 'was this a technology failure, a process failure, or a communication failure?'"
+    ],
+    "rel": [
+      {"id": 13, "name": "abductive", "role": "generates candidate frames; use abductive within frame to generate causal hypotheses"},
+      {"id": 61, "name": "hermeneutic-interpretive", "role": "interprets signals within established frame"},
+      {"id": 75, "name": "meta-reasoning", "role": "selects reasoning approach after framing established"},
+      {"id": 41, "name": "diagnostic", "role": "localizes fault within frame; sensemaking chooses which fault model applies"},
+      {"id": 62, "name": "narrative-causal-storytelling", "role": "builds causal story within frame; sensemaking determines what kind of story"},
+      {"id": 43, "name": "systems-thinking", "role": "maps system dynamics; sensemaking decides whether systemic framing appropriate"}
+    ],
+    "micro_ex": {
+      "sit": "Team velocity dropped 40% over two sprints; no obvious cause",
+      "frames_considered": [
+        {"name": "technical debt crisis", "explains": "slowdown correlates with legacy module work", "ignores": "team morale signals"},
+        {"name": "team dynamics breakdown", "explains": "recent tension in retros, key departure", "ignores": "objective code metrics"},
+        {"name": "scope creep", "explains": "PRDs keep expanding", "ignores": "team said scope is stable"}
+      ],
+      "selected_frame": "team dynamics breakdown",
+      "key_assumptions": ["departure created knowledge gap", "tension is cause not symptom", "metrics lag reality"],
+      "revision_trigger": "if 1:1s reveal technical blockers as primary complaint, reframe to technical debt",
+      "next_actions": ["1:1s focused on team health", "skip-level with departed person's collaborators", "pause technical metrics investigation"]
+    },
+    "ex": {
+      "situation": "Sales suddenly down 30% in key region, no obvious cause",
+      "signal_inventory": [
+        "revenue drop concentrated in enterprise segment",
+        "deal cycle length increased 2x",
+        "competitor mentioned in 3 lost deals (but also mentioned last quarter)",
+        "new regulation announced 6 weeks ago (uncertain impact)",
+        "sales team says 'buyers are confused'",
+        "no product changes in 90 days"
+      ],
+      "frames_considered": [
+        {"name": "competitor disruption", "explains": "competitor mentions", "ignores": "competitor was mentioned before without this impact", "score": 2},
+        {"name": "internal execution failure", "explains": "cycle length increase", "ignores": "no process changes, team is same", "score": 1},
+        {"name": "market shift / regulatory", "explains": "timing with regulation, buyer confusion, enterprise concentration", "ignores": "regulation impact unconfirmed", "score": 3},
+        {"name": "data asset", "explains": "sudden onset", "ignores": "multiple corroborating signals", "score": 1}
+      ],
+      "selected_frame": "market shift (new regulation changing buyer behavior)",
+      "key_assumptions": [
+        "regulation impact is structural, not temporary",
+        "buyer confusion stems from compliance uncertainty, not our messaging",
+        "enterprise concentration is because regulation hits large buyers first"
+      ],
+      "revision_triggers": [
+        {"signal": "competitor analysis shows new product launch", "threshold": "launched within 60 days", "reframe_to": "competitor disruption"},
+        {"signal": "sales team identifies internal process blocker", "threshold": ">=3 reps cite same issue", "reframe_to": "internal execution failure"},
+        {"signal": "regulation guidance clarifies no material impact", "threshold": "official guidance published", "reframe_to": "revisit all frames"}
+      ],
+      "action_implications": [
+        "interview 5 enterprise buyers about compliance concerns",
+        "map regulation requirements to product capabilities",
+        "draft compliance positioning for sales team",
+        "pause sales process investigation (low priority under this frame)"
+      ],
+      "outcome": "frame validated; buyers confirmed compliance uncertainty; pivoted product positioning to new requirements; sales recovered in 6 weeks"
+    }
+  }
+}

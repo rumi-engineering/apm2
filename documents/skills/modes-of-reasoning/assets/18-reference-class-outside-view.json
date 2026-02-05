@@ -1,0 +1,115 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/reference-class-outside-view@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 18,
+    "name": "reference-class-outside-view",
+    "cat": "ampliative",
+    "core": "Predict by anchoring on base-rate distribution of similar past cases rather than inside-view analysis of unique details. Primary antidote to planning fallacy. Key insight: your case is probably not special.",
+    "out": [
+      "reference class definition: name, inclusion criteria, exclusion criteria, source",
+      "base rate table: N, mean, median, SD, P10, P90, failure rate with time period",
+      "similarity scorecard: 3-5 factors rated above/at/below average with rationale",
+      "adjustment record: direction, magnitude (%), specific justification, cap check",
+      "forecast asset: point estimate, 80% CI, conditions for revision"
+    ],
+    "proc": [
+      "1. BEFORE analyzing project specifics, name candidate reference classes (prevents motivated reasoning)",
+      "2. select class: specific enough for relevance (same domain/scale), broad enough for data (N >= 10)",
+      "3. gather ACTUAL outcomes only: exclude plans, forecasts, self-reports; prefer post-mortems, audits, registries",
+      "4. compute distribution: mean, median, SD, P10/P90, failure rate; flag if mean >> median (right-skewed)",
+      "5. score similarity: list 3-5 key factors; rate each above/at/below average; justify each rating",
+      "6. adjust conservatively: start at median; shift toward mean if skewed; cap total adjustment at 25%",
+      "7. state uncertainty: 80% confidence interval; list 2-3 conditions that would trigger re-estimation"
+    ],
+    "check": [
+      "reference class named BEFORE examining project details?",
+      "N >= 10 cases with documented actual outcomes?",
+      "data source is outcomes, not plans or intentions?",
+      "distribution statistics include median AND spread (not just mean)?",
+      "similarity factors explicit with per-factor ratings?",
+      "total adjustment <= 25% OR strong documented justification?",
+      "forecast includes interval, not just point estimate?",
+      "inside-view estimate documented for comparison?"
+    ],
+    "diff": {
+      "vs_case_based": "aggregate statistics over many cases vs retrieving individual cases and adapting their solutions; reference-class ignores case-specific details that case-based reasoning exploits",
+      "vs_bayesian": "provides the prior that Bayesian updating starts from; reference-class = prior source, Bayesian = update mechanism; use together: RC for prior, Bayes for evidence integration",
+      "vs_analogical": "statistical regularities vs structural mapping; reference-class robust to surface similarity traps; analogical maps causal structure, reference-class applies distributional facts",
+      "vs_fermi": "anchors to empirical base rates vs decomposes from first principles; Fermi builds up, reference-class anchors down; use Fermi when no reference class exists, RC when data available",
+      "vs_inductive": "consumes generalizations as priors vs produces generalizations from observations; inductive generates the base rates that reference-class applies"
+    },
+    "confusions": [
+      {
+        "trap": "using reference-class when you need causal understanding",
+        "example": "knowing 60% of startups fail doesn't tell you WHY or which levers matter",
+        "fix": "combine with mechanistic (mode 40) or causal inference (mode 37) for actionable insight"
+      },
+      {
+        "trap": "treating reference-class as Fermi estimation",
+        "example": "decomposing project into tasks and estimating each vs anchoring to completed similar projects",
+        "fix": "RC requires empirical base rates from actual outcomes; Fermi builds estimates from components"
+      }
+    ],
+    "fail": {
+      "mode": "wrong reference class",
+      "desc": "Too broad obscures relevant variation; too narrow lacks data; motivated choice confirms priors.",
+      "signals": [
+        "class chosen after seeing project details (motivated selection)",
+        "N < 10 cases or unclear sample source",
+        "using planned durations instead of actual durations",
+        "ignoring structural differences (e.g., regulatory vs non-regulatory)",
+        "adjustment exceeds 25% without documented exceptional factors",
+        "no distribution spread reported (only mean)"
+      ],
+      "mitigations": [
+        "pre-register reference class before project analysis; document choice rationale",
+        "require N >= 10 with explicit data source; if unavailable, switch to Fermi or expert elicitation",
+        "verify outcome data: actual completion dates, actual costs, post-mortems; reject forecasts/plans",
+        "test alternative classes: compute estimate under 2-3 plausible classes; report range if divergent",
+        "enforce adjustment cap: flag any adjustment > 25%; require second-opinion review if exceeded",
+        "compare inside vs outside view: document both; if gap > 50%, escalate for review"
+      ]
+    },
+    "use": [
+      "project timeline estimation (software, construction, R&D)",
+      "budget and cost forecasting with historical anchoring",
+      "risk and failure rate prediction for portfolios",
+      "debiasing optimistic inside-view estimates",
+      "M&A due diligence (acquisition success rates)",
+      "startup success probability by stage/sector",
+      "medical prognosis anchoring (survival rates by condition/stage)",
+      "policy cost estimation (infrastructure, programs)"
+    ],
+    "rel": [
+      {"id": 15, "name": "case-based", "link": "retrieves specific cases; reference-class uses aggregate statistics"},
+      {"id": 11, "name": "bayesian-probabilistic", "link": "base rates serve as priors for Bayesian updating"},
+      {"id": 76, "name": "calibration-epistemic-humility", "link": "tracks forecast accuracy over time"},
+      {"id": 9, "name": "inductive", "link": "generalization that produces the base rates used here"},
+      {"id": 19, "name": "fermi-order-of-magnitude", "link": "complementary: Fermi when no base rates exist, RC when they do"},
+      {"id": 40, "name": "mechanistic", "link": "explains WHY base rates are what they are; combine for causal insight"}
+    ],
+    "micro_example": {
+      "context": "estimating time to hire a senior engineer",
+      "inside_view": "team says 4 weeks (we have great brand, clear role)",
+      "outside_view_steps": [
+        "reference class: senior SWE hires at Series B startups in same metro",
+        "base rate: N=47, median 11 weeks, mean 14 weeks, SD 6, P90=22 weeks, 15% fail to fill",
+        "similarity: compensation at median, role clarity above average, employer brand below average",
+        "adjustment: +1 week (net slightly below average) -> 12 weeks point estimate",
+        "forecast: 12 weeks, 80% CI [7, 20], revise if candidate pipeline < 5 after week 4"
+      ],
+      "gap": "inside-view 4 weeks vs outside-view 12 weeks; 3x optimism bias typical"
+    },
+    "ex": {
+      "scenario": "estimating time to complete backend API rewrite",
+      "approach": "reference class: API rewrites at mid-size companies (N=23); base rate: median 9mo, mean 12mo, SD 5mo, P90 18mo, 30% exceed 18mo; similarity: scope average, dependencies above average (bad), team experience above average (good); net: at average; adjustment: 0%; forecast: 9mo point, 80% CI [5, 16]; compare: inside-view was 6mo, outside-view is 9mo with wide uncertainty"
+    }
+  }
+}

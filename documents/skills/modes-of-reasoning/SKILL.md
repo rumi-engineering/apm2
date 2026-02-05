@@ -7,12 +7,13 @@ argument-hint: "[<mode-number> | <keyword> | recommend <problem-type> | empty]"
 
 # Modes of Reasoning
 
-A practical taxonomy of 81 reasoning modes stored as CAC artifacts. For background on how these modes relate and when to combine them, see `artifacts/selector.json`.
+A practical taxonomy of 81 reasoning modes stored as CAC assets. For background on how these modes relate and when to combine them, see `assets/selector.json`.
 
-## Artifact References
+## Asset References
 
-- **Mode artifacts**: `artifacts/{NN}-{name}.json` (e.g., `artifacts/58-mechanism-design.json`)
-- **Selector artifact**: `artifacts/selector.json` - contains axes, patterns, and heuristics for mode selection
+- **Glossary**: `documents/theory/glossary/glossary.json` - REQUIRED READING: APM2 terminology and ontology
+- **Mode assets**: `assets/{NN}-{name}.json` (e.g., `assets/58-mechanism-design.json`)
+- **Selector asset**: `assets/selector.json` - contains axes, patterns, and heuristics for mode selection
 - **Stable IDs**: `dcp://apm2.agents/mor/mode/{name}@1`
 
 ## Invocation
@@ -28,14 +29,14 @@ A practical taxonomy of 81 reasoning modes stored as CAC artifacts. For backgrou
 
 Parse `$ARGUMENTS`:
 
-- **Empty or omitted** → Load `artifacts/selector.json` and display quick reference table
-- **Number (1-80)** → Read and return the corresponding mode artifact
+- **Empty or omitted** → Load `assets/selector.json` and display quick reference table
+- **Number (1-80)** → Read and return the corresponding mode asset
 - **`recommend <problem-type>`** → Use selector heuristics and patterns to suggest relevant modes
 - **Keyword** → Search mode names/cores and return matching entries
 
 ## Quick Reference Table
 
-| # | Mode | Category | Artifact |
+| # | Mode | Category | Asset |
 |---|------|----------|----------|
 | 1 | Deductive reasoning | formal | `01-deductive-reasoning.json` |
 | 2 | Mathematical / proof-theoretic | formal | `02-mathematical-proof-theoretic.json` |
@@ -121,7 +122,7 @@ Parse `$ARGUMENTS`:
 
 ## Hybrid Reasoning Patterns
 
-The selector artifact contains common patterns for combining modes:
+The selector asset contains common patterns for combining modes:
 
 - **science_experimentation**: [13, 1, 69, 10, 33, 76] - abduction → deduction → experimental design → stats → belief revision → calibration
 - **incident_response**: [74, 13, 40, 52, 39] - clinical + abduction + mechanistic + VoI + counterfactual

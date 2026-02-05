@@ -1,50 +1,55 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00328"
-    title: "AgentAdapterProfileV1 schema + registry selection by hash"
+    id: TCK-00328
+    title: AgentAdapterProfileV1 schema + registry selection by hash
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0009"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0009.yaml#requirement"
+    - requirement_id: REQ-0009
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0009.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0009"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+    - evidence_id: EVID-0009
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0009.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
-      - "DOMAIN_KERNEL"
+    - DOMAIN_DAEMON
+    - DOMAIN_KERNEL
   dependencies:
     tickets: []
   scope:
     in_scope:
-      - "Define AgentAdapterProfileV1 schema + canonicalization rules"
-      - "Store profiles as CAS artifacts and select profiles by hash (no ambient defaults)"
-      - "Implement AdapterRegistry lookup by profile hash and fail-closed behavior on misconfiguration"
-      - "Enforce kernel-side tool execution invariants for all adapter modes (agent outputs are untrusted hints)"
+    - Define AgentAdapterProfileV1 schema + canonicalization
+    - Store profiles as CAS artifacts and load by hash
+    - AdapterRegistry selects profiles by hash (no ambient defaults)
     out_of_scope:
-      - "Vendor-specific deep integrations beyond profile-based execution"
+    - Vendor-specific deep integrations beyond profile-based execution
   plan:
     steps:
-      - "Define AgentAdapterProfileV1 fields per RFC (adapter_mode, command/templates, tool bridge, capability map, budgets, evidence policy)"
-      - "Implement canonical serialization + hash computation and CAS storage for profiles"
-      - "Add AdapterRegistry that resolves adapter_profile_hash -> runnable adapter configuration"
-      - "Enforce fail-closed behavior: missing/invalid profile yields ReviewBlockedRecorded(reason=ADAPTER_MISCONFIGURED)"
-      - "Add unit tests for canonicalization stability and misconfiguration fail-closed behavior"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Define AgentAdapterProfileV1 schema + canonicalization'
+    - 'Implement: Store profiles as CAS artifacts and load by hash'
+    - 'Implement: AdapterRegistry selects profiles by hash (no ambient defaults)'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0009"
+    - EVID-0009
     criteria:
-      - "AgentAdapterProfileV1 is stored in CAS and selected by hash."
-      - "Misconfigured profile fails closed with ReviewBlockedRecorded(reason=ADAPTER_MISCONFIGURED)."
-      - "Kernel-side tool execution is enforced for all profiles."
+    - AgentAdapterProfileV1 stored in CAS and selected by hash
+    - Misconfigured profile fails closed with ReviewBlockedRecorded(reason=ADAPTER_MISCONFIGURED)
+    - Kernel-side tool execution enforced for all profiles
   notes:
-    security: "Adapters are untrusted; kernel remains the only authority for tool execution and evidence emission."
-    verification: "Add tests for hash selection and negative cases (bad schema, missing fields, version probe failure)."
-    general: "This is the reproducible integration contract needed for real-world heterogeneous CLIs."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

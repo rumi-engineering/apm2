@@ -3,7 +3,7 @@ rfc_design_decisions:
   template_version: "2026-01-27"
 
   design_space_exploration:
-    doctrine_ref: "documents/skills/laws-of-holonic-agent-systems/references/unified-theory.md"
+    doctrine_ref: "documents/theory/unified_theory.json"
     options:
       - option_id: OPT-A
         name: "External process manager (systemd/supervisord)"

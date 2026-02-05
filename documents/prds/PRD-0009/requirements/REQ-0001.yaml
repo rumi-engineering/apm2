@@ -12,7 +12,7 @@ prd_requirement:
     - "Denied reads emit ToolDecided=DENY with rule_id CTX-ALLOWLIST-001. Verified by: Test that repo.read or file.read operations outside the ContextPackManifest allowlist emit ToolDecided event with decision=DENY and rule_id=CTX-ALLOWLIST-001."
     - "SessionTerminated rationale=CONTEXT_MISS occurs when required context absent; GateRunCompleted is not emitted. Verified by: Test that missing required context triggers SessionTerminated with rationale CONTEXT_MISS and no GateRunCompleted event is recorded."
     - "Context refinement is triggered after CONTEXT_MISS termination. Verified by: Test that CONTEXT_MISS triggers ContextRefinementRequest and coordinator reissues lease after refined pack is produced."
-    - "RunReceipt records context sufficiency metrics (bytes supplied, entries used, misses, denied reads, ZTI score). Verified by: Test that RunReceipt schema includes all required context sufficiency fields and they are populated correctly."
+    - "RunReceipt records context sufficiency metrics (bytes supplied, entries used, misses, denied reads, efficiency score). Verified by: Test that RunReceipt schema includes all required context sufficiency fields and they are populated correctly."
     - "Excessive zoom/refinement requests emit ECHO_TRAP and escalate. Verified by: Test that repeated ContextRefinementRequest beyond threshold triggers DefectRecord with code ECHO_TRAP and SessionTerminated rationale=REASONING_DEGENERATION, with OracleRequest or AdjudicationRequested."
   evidence:
     evidence_ids:

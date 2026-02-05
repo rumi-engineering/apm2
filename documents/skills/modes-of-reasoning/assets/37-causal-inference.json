@@ -1,0 +1,209 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/causal-inference@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 37,
+    "name": "causal-inference",
+    "cat": "causal",
+    "core": "Estimate causal effects of interventions by distinguishing P(Y|X) (observational) from P(Y|do(X)) (interventional). Requires explicit causal structure (DAG), identification strategy, and confounder adjustment. Key commitment: conclusions about 'what happens if we intervene' require causal assumptions beyond observed data.",
+    "out": [
+      {"n": "causal_dag", "d": "directed acyclic graph with treatment, outcome, confounders, mediators", "fmt": "node list + edge list with justification for each edge"},
+      {"n": "target_estimand", "d": "formal causal quantity being estimated", "fmt": "ATE, ATT, CATE, or do-calculus expression"},
+      {"n": "identification_result", "d": "whether effect is identifiable from observational data", "fmt": "identifiable/non-identifiable + strategy (backdoor, frontdoor, IV)"},
+      {"n": "adjustment_set", "d": "variables to condition on for unbiased estimation", "fmt": "minimal sufficient set with rationale"},
+      {"n": "causal_effect_estimate", "d": "point estimate of causal effect with uncertainty", "fmt": "estimate +/- CI, or bounds if partially identified"},
+      {"n": "sensitivity_analysis", "d": "robustness to unmeasured confounding", "fmt": "E-value, Rosenbaum bounds, or bias factor thresholds"}
+    ],
+    "proc": [
+      "GATE 1 - Define causal question: specify treatment (X), outcome (Y), target population; state estimand (ATE, ATT, CATE)",
+      "GATE 2 - Construct causal DAG: list all relevant variables; draw directed edges with domain justification for each; DAG must be explicit, not implicit",
+      "GATE 3 - Identify confounders: variables causing both X and Y; if any confounder unmeasured, flag and quantify potential bias",
+      "GATE 4 - Check identifiability: apply backdoor criterion (no unblocked backdoor paths after adjustment) or frontdoor criterion; if non-identifiable, use bounds or instrumental variables",
+      "GATE 5 - Select adjustment strategy: backdoor adjustment, inverse probability weighting, matching, or regression; justify choice based on data structure",
+      "GATE 6 - Estimate effect: compute P(Y|do(X)) using chosen method; report point estimate with confidence/credible interval",
+      "GATE 7 - Sensitivity analysis: compute E-value or Rosenbaum bounds; ask 'how strong would unmeasured confounding need to be to explain away the effect?'",
+      "GATE 8 - Validate assumptions: check covariate balance, positivity (overlap), and model specification; document untestable assumptions"
+    ],
+    "quick_check": [
+      "Causal question explicit? (treatment, outcome, estimand named)",
+      "DAG drawn before estimation? (not post-hoc rationalization)",
+      "Every edge in DAG justified? (domain knowledge, not data-driven)",
+      "Confounders identified and measured? (or acknowledged as unmeasured)",
+      "Backdoor/frontdoor criterion applied? (not just 'controlled for covariates')",
+      "Effect identifiable? (if not, using bounds or IV)",
+      "Sensitivity analysis done? (E-value or similar)",
+      "Positivity checked? (P(treatment|covariates) > 0 for all strata)"
+    ],
+    "check": [
+      "causal DAG explicit with justification for each edge direction",
+      "estimand formally specified (ATE/ATT/CATE) before analysis",
+      "confounders enumerated with measured/unmeasured status",
+      "identification strategy named (backdoor, frontdoor, IV, bounds)",
+      "adjustment set derived from DAG, not from stepwise regression",
+      "effect estimate includes uncertainty quantification",
+      "sensitivity analysis quantifies robustness to hidden confounding",
+      "positivity assumption checked: treatment probability > 0 in all strata",
+      "no conditioning on colliders or mediators (unless explicitly intended)"
+    ],
+    "diff": {
+      "statistical-frequentist": {
+        "boundary": "statistical estimates P(Y|X) from data; causal-inference estimates P(Y|do(X)) which requires causal assumptions beyond data",
+        "when_causal": "need to know effect of intervention, policy change, or action",
+        "when_other": "only need association, prediction, or description without intervention"
+      },
+      "counterfactual": {
+        "boundary": "causal-inference estimates forward intervention effects; counterfactual asks backward 'what would have happened' for specific units",
+        "when_causal": "planning future interventions; population-level effect estimation",
+        "when_other": "assigning blame/credit; explaining individual outcomes; asking 'what if X had been different'"
+      },
+      "causal-discovery": {
+        "boundary": "causal-inference assumes DAG is known and estimates effects; causal-discovery learns DAG structure from data",
+        "when_causal": "DAG structure established from domain knowledge or prior discovery",
+        "when_other": "causal structure unknown; need to learn what causes what before estimating effects"
+      },
+      "bayesian-probabilistic": {
+        "boundary": "Bayesian updates beliefs about parameters; causal-inference reasons about interventions. Bayesian P(H|E) is still observational; causal P(Y|do(X)) is interventional",
+        "when_causal": "need to predict effect of changing X, not just observing X",
+        "when_other": "updating beliefs from evidence without intervention; parameter estimation"
+      },
+      "mechanistic": {
+        "boundary": "causal-inference estimates effect size statistically; mechanistic explains how the effect works internally",
+        "when_causal": "need to quantify 'how much' effect, not 'how it works'",
+        "when_other": "need to understand internal mechanism for design, debugging, or intervention point selection"
+      }
+    },
+    "confusions": [
+      {
+        "pair": ["causal-inference", "statistical-frequentist"],
+        "error": "controlling for all measured variables to 'remove confounding'",
+        "correction": "adjustment set must be derived from causal DAG; controlling for colliders or mediators introduces bias. Use backdoor criterion, not 'throw everything in'."
+      },
+      {
+        "pair": ["causal-inference", "counterfactual"],
+        "error": "using causal-inference to answer 'would this patient have survived with treatment X?'",
+        "correction": "causal-inference gives population ATE; individual counterfactuals require unit-level model. ATE answers 'does X help on average?', not 'would X have helped this person?'"
+      },
+      {
+        "pair": ["causal-inference", "causal-discovery"],
+        "error": "learning DAG from data then using same data to estimate effects",
+        "correction": "DAG learned from data inherits uncertainty; using it for inference compounds errors. Either use domain knowledge for DAG, or report results as conditional on discovered structure."
+      },
+      {
+        "pair": ["causal-inference", "mechanistic"],
+        "error": "claiming causal effect without mechanism constitutes weak evidence",
+        "correction": "randomized experiments establish causation without mechanism (RCTs predate understanding). Mechanism strengthens plausibility but isn't required for valid causal inference from well-designed studies."
+      }
+    ],
+    "fail": {
+      "mode": "confounded_causal_claims",
+      "desc": "drawing causal conclusions without valid identification strategy; treating regression coefficients as causal effects",
+      "signals": [
+        "no explicit causal DAG before analysis",
+        "adjustment set chosen by statistical criteria (p-values, R-squared) rather than causal structure",
+        "language switches between 'associated with' and 'causes' without justification",
+        "conditioning on post-treatment variables (mediators, colliders)",
+        "no sensitivity analysis for unmeasured confounding",
+        "treatment effect from observational data reported without identification strategy"
+      ],
+      "mitigations": [
+        {
+          "action": "require DAG before data analysis",
+          "test": "causal DAG documented with timestamp before estimation code runs",
+          "threshold": "100% of causal claims have pre-specified DAG"
+        },
+        {
+          "action": "justify every edge in DAG",
+          "test": "each directed edge has one-sentence domain justification; no 'data-driven' edges",
+          "threshold": "zero unjustified edges"
+        },
+        {
+          "action": "explicit identification strategy",
+          "test": "report names backdoor/frontdoor/IV/bounds; shows criterion is satisfied",
+          "threshold": "100% of effect estimates have named strategy"
+        },
+        {
+          "action": "sensitivity analysis for hidden confounding",
+          "test": "E-value or Rosenbaum gamma reported; interpretation of 'how strong confounder would need to be'",
+          "threshold": "all observational studies include sensitivity analysis"
+        },
+        {
+          "action": "separate causal and associational language",
+          "test": "claims using 'causes', 'effect of', 'leads to' only appear with identification strategy; otherwise use 'associated with', 'predicts'",
+          "threshold": "zero causal language without causal justification"
+        },
+        {
+          "action": "check for collider and mediator conditioning",
+          "test": "adjustment set reviewed against DAG for colliders (creates bias) and mediators (blocks direct effect)",
+          "threshold": "no unintended collider conditioning"
+        }
+      ]
+    },
+    "use": [
+      "A/B test analysis: estimating treatment effect with proper randomization check",
+      "policy evaluation: what happens if we change this rule/incentive",
+      "epidemiology: treatment effects from observational health data",
+      "product impact analysis: did feature X cause metric Y to change",
+      "program evaluation: does intervention improve outcomes",
+      "root cause analysis: which factor caused the outcome (requires causal structure)"
+    ],
+    "rel": [
+      {"id": 38, "n": "causal-discovery", "r": "learns DAG structure that causal-inference consumes"},
+      {"id": 39, "n": "counterfactual", "r": "individual what-if queries; causal-inference is population-level"},
+      {"id": 10, "n": "statistical-frequentist", "r": "estimates associations; causal-inference adds interventional interpretation"},
+      {"id": 40, "n": "mechanistic", "r": "explains how effect works; causal-inference quantifies effect size"},
+      {"id": 69, "n": "experimental-design", "r": "designs studies that enable valid causal inference"},
+      {"id": 11, "n": "bayesian-probabilistic", "r": "updates beliefs; causal-inference adds do-operator for interventions"}
+    ],
+    "ex": {
+      "problem": "Does a new onboarding flow (X) increase 30-day retention (Y)?",
+      "dag": {
+        "nodes": ["onboarding_flow (X)", "retention_30d (Y)", "user_segment (C1)", "signup_channel (C2)", "first_session_engagement (M)"],
+        "edges": [
+          {"from": "user_segment", "to": "onboarding_flow", "why": "segments assigned different flows"},
+          {"from": "user_segment", "to": "retention_30d", "why": "segments have different baseline retention"},
+          {"from": "signup_channel", "to": "onboarding_flow", "why": "channel affects flow assignment"},
+          {"from": "signup_channel", "to": "retention_30d", "why": "organic vs paid users differ in retention"},
+          {"from": "onboarding_flow", "to": "first_session_engagement", "why": "flow affects initial engagement"},
+          {"from": "first_session_engagement", "to": "retention_30d", "why": "engagement predicts retention"},
+          {"from": "onboarding_flow", "to": "retention_30d", "why": "direct effect of flow on retention"}
+        ]
+      },
+      "identification": {
+        "estimand": "ATE = E[Y|do(X=new)] - E[Y|do(X=old)]",
+        "strategy": "backdoor adjustment",
+        "adjustment_set": ["user_segment", "signup_channel"],
+        "note": "do NOT adjust for first_session_engagement (mediator) - would block indirect effect"
+      },
+      "estimation": {
+        "method": "inverse probability weighting with propensity scores",
+        "result": "ATE = +3.2pp retention",
+        "ci": "95% CI: [1.8pp, 4.6pp]",
+        "sample": "n=50,000 users over 60 days"
+      },
+      "sensitivity": {
+        "e_value": "E-value = 1.9",
+        "interpretation": "unmeasured confounder would need OR >= 1.9 with both treatment and outcome to explain away effect; plausible confounders (device type, time of day) unlikely this strong"
+      },
+      "asset": {
+        "causal_dag": "documented above with edge justifications",
+        "target_estimand": "ATE of new vs old onboarding on 30-day retention",
+        "identification_result": "identifiable via backdoor criterion adjusting for {user_segment, signup_channel}",
+        "adjustment_set": "{user_segment, signup_channel}; mediator excluded",
+        "causal_effect_estimate": "+3.2pp [1.8, 4.6] 95% CI",
+        "sensitivity_analysis": "E-value 1.9; robust to plausible unmeasured confounding"
+      },
+      "conclusion": "New onboarding flow causally increases 30-day retention by ~3pp. Effect robust to unmeasured confounding unless confounder has OR >= 1.9 with both treatment and outcome."
+    },
+    "micro_ex": {
+      "bad": "Regression shows users who completed new onboarding have 5% higher retention (p<0.01). Therefore, the new flow causes better retention.",
+      "good": "After adjusting for user_segment and signup_channel (backdoor criterion satisfied per DAG), new onboarding increases retention by 3.2pp [1.8, 4.6]. E-value of 1.9 suggests effect robust to unmeasured confounding. Note: users self-selecting into flow completion would bias naive comparison; we used intent-to-treat on flow assignment.",
+      "why": "Bad version: no DAG, no identification strategy, conflates completion (post-treatment) with assignment, no sensitivity analysis. Good version: explicit causal structure, identified estimand, appropriate adjustment, sensitivity quantified."
+    }
+  }
+}

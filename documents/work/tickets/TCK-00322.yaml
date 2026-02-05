@@ -1,57 +1,59 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00322"
-    title: "Projection worker (daemon integration)"
+    id: TCK-00322
+    title: Projection worker (daemon integration)
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0006"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0006.yaml#requirement"
+    - requirement_id: REQ-0006
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0006.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0006"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+    - evidence_id: EVID-0006
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0006.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
-      - "DOMAIN_PROJECTION"
+    - DOMAIN_DAEMON
+    - DOMAIN_PROJECTION
   dependencies:
     tickets:
-      - ticket_id: "TCK-00289"
-        reason: "Ledger tailer requires durable ledger store"
-      - ticket_id: "TCK-00321"
-        reason: "Projection worker is driven by durable ReviewReceiptRecorded events"
+    - ticket_id: TCK-00321
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Wire projection module into the daemon runtime as a long-running background task"
-      - "Tail the ledger using a cursor and derive projection actions from ReviewReceiptRecorded"
-      - "Build a work index: changeset_digest -> work_id (ChangeSetPublished), work_id -> PR metadata (WorkPrAssociated or config)"
-      - "Fetch review artifacts from CAS by hash and project to GitHub (status + single comment)"
-      - "Store durable projection receipts in CAS and enforce idempotency across restarts"
+    - Wire projection module into daemon
+    - Ledger tailer for projection decisions
+    - 'Work index: changeset -> work_id -> PR'
+    - GitHub adapter for status + comment
     out_of_scope:
-      - "ProjectionReceiptRecorded kernel event (TCK-00323)"
-      - "Advanced GitHub UX (threaded comments, inline suggestions)"
+    - Projection receipt event (TCK-00323)
   plan:
     steps:
-      - "Audit projection module entry points (crates/apm2-daemon/src/projection/) and identify missing daemon wiring"
-      - "Add daemon task startup/shutdown wiring for projection worker"
-      - "Implement ledger tail loop + cursor persistence and build the minimal work index"
-      - "Implement GitHub adapter write path for status + single comment derived from review receipt"
-      - "Persist projection receipt to CAS and use idempotency keys to avoid duplicate writes on replay"
-      - "Add integration test: restart projection worker and verify no duplicate GitHub writes are attempted"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Wire projection module into daemon'
+    - 'Implement: Ledger tailer for projection decisions'
+    - 'Implement: Work index: changeset -> work_id -> PR'
+    - 'Implement: GitHub adapter for status + comment'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0006"
+    - EVID-0006
     criteria:
-      - "Projection worker runs as a daemon task and tails the ledger."
-      - "ReviewReceiptRecorded triggers GitHub projection (status + comment)."
-      - "Projection receipts are stored durably in CAS and idempotency prevents duplicate projections."
+    - Projection worker runs as daemon task
+    - ReviewReceiptRecorded triggers GitHub projection
+    - Status + comment posted to PR
   notes:
-    security: "GitHub is output-only; projection derives solely from ledger+CAS truth."
-    verification: "Test idempotency on replay and verify projection outputs match internal review receipt."
-    general: "Completes the end-to-end FAC loop by turning internal receipts into external projections."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

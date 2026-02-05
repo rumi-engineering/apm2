@@ -58,7 +58,7 @@ prd_meta:
       lint_spec: standards/lint/LINT_SPEC.yaml#lint_spec
     related_documents:
       glossary: documents/skills/glossary/SKILL.md
-      laws: documents/skills/laws-of-holonic-agent-systems/SKILL.md
+      laws: documents/theory/AGENTS.md
       fac_prd: documents/prds/PRD-0009/
       work_substrate: documents/prds/PRD-0004/
       daemon_glossary: documents/skills/glossary/references/daemon.md

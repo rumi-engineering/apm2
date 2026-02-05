@@ -1,0 +1,112 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/analogical@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 14,
+    "name": "analogical",
+    "cat": "ampliative",
+    "core": "Transfer relational structure from a known domain/case to a new one, focusing on structural correspondence rather than surface similarity.",
+    "key_principle": "Structure > surface: valid analogies preserve causal/functional relations, not perceptual features or labels.",
+    "out": [
+      "candidate inferences (with confidence tied to mapping quality)",
+      "adapted solutions (source solution + target-specific modifications)",
+      "structural mapping table (source element → target element + justification)",
+      "conceptual models/metaphors (for teaching or framing)",
+      "design patterns (abstracted from successful source)"
+    ],
+    "proc": [
+      "1. SELECT SOURCE: Choose domain where (a) structure is well-understood, (b) problem was solved, (c) you can articulate causal/functional relations—not just outcomes.",
+      "2. EXTRACT STRUCTURE: List entities, relations, and causal links in source. Ask: what causes what? What depends on what?",
+      "3. MAP TO TARGET: For each source element, propose target correspondent. Test: does the relation hold in target? (A causes B in source → A' causes B' in target?)",
+      "4. IDENTIFY GAPS: Mark unmapped elements in both domains. Gaps in target = unknowns; gaps in source = potential disanalogy.",
+      "5. TRANSFER INFERENCES: Import conclusions from source only where mapping is justified. Tag confidence: strong (causal match), moderate (functional match), weak (structural match only).",
+      "6. VALIDATE: Check transferred inference against target-domain evidence. Does prediction hold? If not, mapping may be flawed."
+    ],
+    "quick_checklist": [
+      "Source structure articulated (not just 'it worked there')?",
+      "Mapping is relation-to-relation, not just noun-to-noun?",
+      "Causal direction preserved (A→B maps to A'→B', not B'→A')?",
+      "Unmapped elements explicitly flagged?",
+      "Transferred inference testable in target domain?",
+      "Surface similarities NOT used as evidence (only as retrieval cue)?"
+    ],
+    "check": [
+      "structural correspondence verified at relation level?",
+      "causal mechanisms similar, not just surface traits?",
+      "unmapped elements identified and assessed for disanalogy risk?",
+      "transferred inference falsifiable in target domain?",
+      "source domain expertise sufficient to extract structure?"
+    ],
+    "diff": {
+      "vs_case_based": "Analogical = structural mapping between domains; Case-based (#15) adds retrieval index, adaptation rules, and case library. Use case-based when you have many past cases and need systematic retrieval; use analogical for one-off cross-domain insight.",
+      "vs_abductive": "Analogical transfers existing structure particular→particular; Abductive (#13) generates new hypotheses to explain observations. Analogy often seeds abductive candidates, but abduction then evaluates explanatory power.",
+      "vs_prototype_similarity": "Analogical maps relations; Prototype/similarity-based (#28) classifies by feature overlap with exemplars. Analogy asks 'do the relations match?'; prototype asks 'does it look like the category center?'",
+      "vs_inductive": "Analogical transfers from one case to another; Inductive (#9) generalizes from many cases to a rule. Analogy: A worked → B might work. Induction: A1,A2,A3 worked → all A's work.",
+      "vs_metaphor": "Metaphor highlights selective similarities for communication/framing; analogical reasoning requires systematic structural alignment and supports inference transfer. Metaphors can mislead if taken as analogies."
+    },
+    "common_confusions": [
+      {
+        "confusion": "Treating surface similarity as evidence",
+        "example": "Atoms have orbiting electrons like planets orbiting the sun → electrons must follow Kepler's laws. (Wrong: different force laws, quantum effects.)",
+        "fix": "Surface cues help retrieve candidates; structural analysis determines validity."
+      },
+      {
+        "confusion": "Assuming bidirectional transfer",
+        "example": "If A is analogous to B, then everything about B applies to A. (Wrong: analogies are often asymmetric.)",
+        "fix": "Specify transfer direction. Test each inference independently."
+      }
+    ],
+    "fail": {
+      "mode": "false-analogy",
+      "desc": "Shared surface traits but different causal structure leads to invalid transfers.",
+      "mitigations": [
+        "Require explicit structural mapping table before transferring any inference.",
+        "List at least 2 disanalogies (structural differences) and assess whether they affect the transferred inference.",
+        "Test transferred inference with target-domain evidence before acting on it.",
+        "If source expertise is shallow, flag analogy as heuristic only—seek domain expert review.",
+        "Distinguish 'analogy as hypothesis generator' from 'analogy as justification'—never use analogy alone as proof."
+      ]
+    },
+    "micro_example": {
+      "target": "Designing a software deployment pipeline",
+      "candidate_source": "Factory assembly line",
+      "structural_mapping": {
+        "raw_materials → source_code": "Input to process",
+        "assembly_stations → build/test_stages": "Sequential transformation steps",
+        "quality_checkpoints → automated_tests": "Defect detection before next stage",
+        "inventory_buffers → asset_repositories": "Holding area between stages",
+        "defect_rate_metrics → build_failure_rate": "Quality signal"
+      },
+      "valid_transfer": "Adding quality checkpoints earlier in assembly reduces downstream rework → adding tests earlier in pipeline reduces late-stage failures.",
+      "invalid_transfer": "Assembly lines benefit from worker specialization → pipeline stages should be owned by separate teams. (Disanalogy: software stages share context; handoffs costly.)",
+      "lesson": "Validate each transferred inference against target-domain constraints."
+    },
+    "use": [
+      "innovation: import solutions from distant domains",
+      "design: apply patterns from mature fields to new problems",
+      "teaching: explain unfamiliar concepts via familiar structures",
+      "cross-domain problem solving: when target domain lacks established methods",
+      "understanding unfamiliar systems: bootstrap mental model from known domain"
+    ],
+    "rel": [
+      {"id": 15, "name": "case-based", "link": "operational version with retrieval, adaptation, and case libraries"},
+      {"id": 13, "name": "abductive", "link": "analogy seeds hypotheses; abduction evaluates explanatory fit"},
+      {"id": 16, "name": "explanation-based-learning", "link": "explains why the analogy works by tracing causal chains"},
+      {"id": 28, "name": "prototype-similarity-based", "link": "contrast: prototype uses feature overlap, analogy uses relational structure"},
+      {"id": 9, "name": "inductive", "link": "contrast: induction generalizes many→rule, analogy transfers one→one"}
+    ],
+    "ex": {
+      "scenario": "Designing a distributed intrusion detection system by analogy to biological immune systems",
+      "source_structure": "Immune system: decentralized detectors (lymphocytes), pattern recognition (antibodies), memory (B-cells), coordinated response (cytokines), self/non-self discrimination.",
+      "target_mapping": "Network nodes = lymphocytes, signature matching = antibody binding, threat database = immunological memory, alert propagation = cytokine signaling, whitelist = self-recognition.",
+      "transferred_inference": "Immune system effectiveness comes from redundant, distributed detection with local response + global memory update → IDS should have per-node detectors that share learned signatures.",
+      "validation_needed": "Does decentralized detection scale in network context? Are false-positive rates manageable? (Test against target-domain data.)"
+    }
+  }
+}

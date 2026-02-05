@@ -19,22 +19,24 @@ protocol:
 variables:
   TICKET_ID_OPTIONAL: "$1"
 
-references[19]:
+references[20]:
+  - path: "@documents/theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/ticket-workflow.md
     purpose: "Primary decision tree for new ticket vs existing PR follow-up."
   - path: references/commands.md
     purpose: "Command reference with flags and examples."
   - path: references/one-off-workflow.md
     purpose: "Ad-hoc ticket creation for urgent fixes or improvements outside the normal queue."
-  - path: "@documents/skills/modes-of-reasoning/artifacts/07-type-theoretic.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json"
     purpose: "Mode #07: Type-Theoretic Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/artifacts/49-robust-worst-case.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/49-robust-worst-case.json"
     purpose: "Mode #49: Robust / Worst-Case Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/artifacts/08-counterexample-guided.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/08-counterexample-guided.json"
     purpose: "Mode #08: Counterexample-Guided Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/artifacts/65-deontic.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/65-deontic.json"
     purpose: "Mode #65: Deontic (Authority) Reasoning"
-  - path: "@documents/skills/modes-of-reasoning/artifacts/80-debiasing-epistemic-hygiene.json"
+  - path: "@documents/skills/modes-of-reasoning/assets/80-debiasing-epistemic-hygiene.json"
     purpose: "Mode #80: Debiasing / Epistemic Hygiene"
   - path: "@documents/security/AGENTS.md"
     purpose: "Security Documentation"

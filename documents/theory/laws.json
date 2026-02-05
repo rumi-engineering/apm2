@@ -1,0 +1,449 @@
+{
+  "schema": "cac.holonic_law_bundle.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.law_bundle",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/laws/bundle@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-04T22:14:08.895018Z"
+  },
+  "payload": {
+    "version": "1.0.0",
+    "law_count": 15,
+    "laws": [
+      {
+        "id": "LAW-01",
+        "name": "Loop Closure & Recursive Improvement",
+        "effective_date": "2026-02-04",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Exploratory actions may be open-loop within a sandbox, but **no state transition becomes authoritative until it is verified under the appropriate gate set.** Furthermore, the system must **evolve** by converting loop failures into stronger primitives.",
+        "operationalization": [
+          {
+            "rule": "Risk-Tiered Closure",
+            "desc": "",
+            "subrules": [
+              "**Low-Risk:** Batched sensing/verification for throughput.",
+              "**High-Risk:** Promotion to \"shared truth\" requires explicit, receipt-backed gates."
+            ]
+          },
+          {
+            "rule": "Receipts",
+            "desc": "Every successful gate must produce a machine-readable receipt stored in CAS and linked via the ledger."
+          },
+          {
+            "rule": "Hierarchical Gate Separation",
+            "desc": "Planners and Executors operate under distinct gate sets. Planner outputs are verified against capability constraints before Executor admission."
+          },
+          {
+            "rule": "Recursive Improvement (Gall's Law)",
+            "desc": "",
+            "subrules": [
+              "**Defect-Driven Evolution:** Failures are not just stops; they are specification requests. Every loop closure failure must eventually result in a strengthened gate or a new primitive.",
+              "**Primitive Densification:** Recurring successful patterns must be compiled into optimized, lower-MDL primitives (tools/libraries) to free up cognitive context for higher-order problems."
+            ]
+          }
+        ],
+        "rationale": "In a stochastic agent environment, unverified transitions lead to state divergence. However, mere stability is insufficient; the system must *improve*. By treating failures as signals to strengthen the \"factory\" (gates/primitives), the system obeys Gall's Law: complex working systems evolve from simple working systems."
+      },
+      {
+        "id": "LAW-02",
+        "name": "Observable Context Sufficiency",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "\"Mutual Information\" in the context channel is optimized via **measurable surrogates**, as sufficiency cannot be tested directly.",
+        "operationalization": [
+          {
+            "rule": "General",
+            "desc": "The system must track and optimize for the following control objectives:"
+          },
+          {
+            "rule": "Pack-Miss Rate",
+            "desc": "Frequency of agents requesting context not present in their ContextPack."
+          },
+          {
+            "rule": "Unplanned Tool Calls",
+            "desc": "Unauthorized discovery actions taken to compensate for missing information."
+          },
+          {
+            "rule": "Defect Escape Rate",
+            "desc": "Correlating missing context with downstream logic errors."
+          },
+          {
+            "rule": "Agent \"Stuck\" Proxies",
+            "desc": "Tracking rollbacks and task resets as indicators of context poverty."
+          },
+          {
+            "rule": "Subtask Isolation",
+            "desc": "Decomposed subtasks MUST receive scoped ContextPacks; monolithic trace injection across subtask boundaries is a context defect (CONTEXT_BLEED)."
+          },
+          {
+            "rule": "Explicit Inter-Subtask Interface",
+            "desc": "State shared between subtasks flows via typed summaries/receipts (LAW-07), not implicit context bleed."
+          }
+        ],
+        "rationale": "Since context windows are finite and precious, the \"quality\" of a context pack is not subjective. It is a measurable engineering parameter that determines the probability of task success."
+      },
+      {
+        "id": "LAW-03",
+        "name": "Monotone Ledger vs. Overwritable Projection",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "The **substrate ledger of facts** (patches, receipts, decisions) is monotone and commutative within a declared merge algebra; the **system state** (codebase, workspace) is a non-monotone projection.",
+        "operationalization": [
+          {
+            "rule": "Fact Submission",
+            "desc": "Agents produce patches and evidence, not final state rewrites."
+          },
+          {
+            "rule": "Merge Algebra",
+            "desc": "Every fact MUST declare its merge operator or conflict rule class to eliminate hidden ordering dependencies."
+          },
+          {
+            "rule": "Compaction/GC",
+            "desc": "The system must implement periodic compaction to keep the ledger within the context window ($W$) limits while preserving provenance."
+          },
+          {
+            "rule": "Memory Mutation as Ledger Events",
+            "desc": "Agent-controlled memory updates (linking, evolution, decay) MUST be recorded as ledger events, not silent state mutations (SILENT_MEMORY_MUTATION defect)."
+          },
+          {
+            "rule": "Retrieval as Tool Call",
+            "desc": "Memory retrieval operations are auditable tool invocations subject to capability policy (LAW-05)."
+          },
+          {
+            "rule": "BFT Consensus Quorum",
+            "desc": "Shared authority facts (promotions, capability grants, policy changes) MUST be quorum-attested via BFT consensus to prevent malicious single-node rewriting."
+          }
+        ],
+        "rationale": "Separating the append-only substrate from the derived projection allows for perfect auditability and recovery. It transforms \"editing\" into a series of verifiable additions, which is more robust for distributed agents."
+      },
+      {
+        "id": "LAW-04",
+        "name": "Stochastic Stability",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Since both transducers (agents) and verifiers (tests) are stochastic, stability is achieved only through the binding of three elements: **Stability = (Contract + Receipt + Evidence).**",
+        "operationalization": [
+          {
+            "rule": "Determinism Classes",
+            "desc": "Every contract MUST specify if it is deterministic or probabilistic."
+          },
+          {
+            "rule": "Flakiness Management",
+            "desc": "Nondeterministic (flaky) failures are treated as first-class defects that puncture the determinism envelope."
+          },
+          {
+            "rule": "Binding",
+            "desc": "Authority is never granted to a claim alone; it must be bound to a signed receipt and the underlying raw evidence."
+          },
+          {
+            "rule": "Causal Determinism (HLC)",
+            "desc": "Event ordering MUST rely on Hybrid Logical Clocks (HLC) to preserve causal determinism across distributed nodes, preventing state divergence during network partitions."
+          }
+        ],
+        "rationale": "Trusting the \"word\" of an agent is mathematically unsound. Stability requires grounding cognitive outputs in deterministic, repeatable evidence."
+      },
+      {
+        "id": "LAW-05",
+        "name": "Dual-Axis Containment & Variety Control",
+        "effective_date": "2026-02-04",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Containment requires both **Authority (Capabilities)** and **Accountability (Identity/Audit)**, and stability requires **Interface Variety Control**.",
+        "operationalization": [
+          {
+            "rule": "ContextRead Firewalls",
+            "desc": "Access to context must be as strictly controlled as access to tools."
+          },
+          {
+            "rule": "Confused-Deputy Prevention",
+            "desc": "Agents must not be able to \"know\" things they are not authorized to \"act\" upon."
+          },
+          {
+            "rule": "Interface Variety Control (Ashby's Law)",
+            "desc": "",
+            "subrules": [
+              "**Schema Constraints:** Supervisors must constrain the variety of inputs (schemas) and outputs (capabilities) exposed to sub-holons to match their internal control capacity.",
+              "**Variety Matching:** A holon cannot control an environment with more variety than itself; therefore, we restrict the *interface* to make the environment controllable."
+            ]
+          },
+          {
+            "rule": "Relay-Mediated Connectivity",
+            "desc": "Connectivity for contained agents MUST use authenticated management tunnels (Relays) to preserve the outbound-only security boundary."
+          }
+        ],
+        "rationale": "Limiting what an agent can *do* (OCAP) is insufficient if the agent can *know* everything (Context) or is overwhelmed by input complexity (Variety). Security and Stability in a holonic system require controlling the information flow and complexity entering the cognitive process."
+      },
+      {
+        "id": "LAW-06",
+        "name": "MDL as a Gated Budget",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Minimal Description Length (MDL) is a hard resource constraint enforced by gates. If the description of \"how to work\" exceeds the context window ($W$), the agent will fail.",
+        "operationalization": [
+          {
+            "rule": "API Brief Limits",
+            "desc": "Public API surfaces must be describable in $\\le X$ tokens."
+          },
+          {
+            "rule": "ContextPack Ceilings",
+            "desc": "Total token count for a ContextPack must not exceed $Y$."
+          },
+          {
+            "rule": "Triggered Refactoring",
+            "desc": "When MDL exceeds budget, the system MUST emit a refactoring task to decompose the primitive or optimize the interface."
+          }
+        ],
+        "rationale": "In agent-native engineering, \"clean code\" is not aesthetic; it is a functional requirement for cognitive reach. A codebase that cannot fit in a context window is effectively broken."
+      },
+      {
+        "id": "LAW-07",
+        "name": "Verifiable Summaries",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Hierarchical summaries are lossy claims and must be treated as **\"Summary Receipts\" with explicit evidence pointers.**",
+        "operationalization": [
+          {
+            "rule": "Evidence Pointers",
+            "desc": "Every summary must contain stable-ID pointers to the atomic facts it represents."
+          },
+          {
+            "rule": "Deterministic Zoom-In",
+            "desc": "A consumer holon must be able to verify any summary part by following pointers to the raw evidence."
+          },
+          {
+            "rule": "Claim Status",
+            "desc": "Summaries are treated as claims until their pointers are validated."
+          }
+        ],
+        "rationale": "Hierarchies compress information, but compression introduces distortion. To prevent error propagation, the path back to the \"ground truth\" must always be deterministic and traversable."
+      },
+      {
+        "id": "LAW-08",
+        "name": "Verifier Economics (Goodhart Resistance)",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Optimization pressure will exploit proxy gaps; therefore, **only gate what you can defend.**",
+        "operationalization": [
+          {
+            "rule": "Adversarial Suites",
+            "desc": "Use rotating evaluation sets and adversarial tests to prevent \"gaming\" the gates."
+          },
+          {
+            "rule": "Hard Constraints",
+            "desc": "Separate safety and SoD invariants from performance objectives."
+          },
+          {
+            "rule": "Holdouts",
+            "desc": "Maintain out-of-band evaluation samples to detect model overfitting to specific codebase patterns."
+          },
+          {
+            "rule": "Monitorability Conservation",
+            "desc": "Oversight and interpretability signals MUST NOT be directly incorporated into optimization objectives. Monitor channels must be structurally isolated from reward/training signals. Violation produces MONITOR_GAMING defect."
+          },
+          {
+            "rule": "Audit Channel Integrity",
+            "desc": "If a monitor is used for accountability/safety (not performance), its features must be excluded from gradient updates."
+          }
+        ],
+        "rationale": "\"When a measure becomes a target, it ceases to be a good measure.\" The system must assume the agent network will optimize for whatever proxies are set, requiring robust, non-gameable verification. Monitoring channels are themselves optimization targets; training that rewards monitor evasion destroys the very interpretability needed for oversight."
+      },
+      {
+        "id": "LAW-09",
+        "name": "Temporal Pinning & Freshness",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "The universe is non-stationary (dependencies update, model behavior drifts). **All authoritative artifacts are versioned and time-scoped; freshness is a policy.**",
+        "operationalization": [
+          {
+            "rule": "Source Snapshots",
+            "desc": "Agents must reason against a \"frozen\" moment in time using content-addressed snapshots."
+          },
+          {
+            "rule": "Freshness Policy",
+            "desc": "Define explicit expiration dates or drift thresholds for different artifact kinds."
+          },
+          {
+            "rule": "Drift Deltas",
+            "desc": "Explicitly manage the gap between \"frozen truth\" and \"current reality\" when reconciling state."
+          }
+        ],
+        "rationale": "Agent reasoning is brittle across time if the environment shifts during an episode. Stability requires pinning the world state so reasoning remains valid throughout the plan execution."
+      },
+      {
+        "id": "LAW-10",
+        "name": "Anti-Entropy & Merge Semantics",
+        "effective_date": "2026-02-04",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Convergence in a distributed holarchy requires an **explicit anti-entropy protocol** to resolve forked truths, distinguishing between **Control** and **Data** planes.",
+        "operationalization": [
+          {
+            "rule": "Consensus Scoping (PRIN-049)",
+            "desc": "",
+            "subrules": [
+              "**Control Plane:** Use BFT consensus for small, critical shared-authority state (membership, policy roots, key rotation).",
+              "**Data Plane:** Use convergent replication (CRDTs, anti-entropy, merkle-sync) for the bulk event/evidence store. Global consensus on every event is a liveness hazard."
+            ]
+          },
+          {
+            "rule": "Merge Operators",
+            "desc": "Define how conflicting facts are resolved (e.g., LWW, authority-tier selection)."
+          },
+          {
+            "rule": "Conflict Recording",
+            "desc": "Reconciliation failures must be recorded as explicit defects, not silent drops."
+          },
+          {
+            "rule": "Consistency Tiers",
+            "desc": "Allow local divergence but mandate periodic global reconciliation to maintain a single source of truth."
+          }
+        ],
+        "rationale": "In a system of billions of holons, local copies of state will inevitably drift. Attempting to force global consensus on every data byte creates a \"stop-the-world\" coordination cost. The elegant solution is to minimize what *requires* consensus (Control) and allow the rest to converge (Data)."
+      },
+      {
+        "id": "LAW-11",
+        "name": "Conservation of Work and Idempotent Actuation",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Actuation must be safe under retries, duplication, and partial failure.",
+        "operationalization": [
+          {
+            "rule": "Idempotency",
+            "desc": "Every external side effect MUST be idempotent or have an explicit compensation/rollback contract."
+          },
+          {
+            "rule": "Replay Safety",
+            "desc": "Every command MUST be replay-safe under at-least-once delivery using dedupe keys."
+          },
+          {
+            "rule": "Execution Receipts",
+            "desc": "Tools must emit receipts that bind \"this effect happened exactly once\" to a specific transaction ID."
+          }
+        ],
+        "rationale": "Distributed systems are prone to message duplication and partial success. Making actions idempotent ensures that the network can safely retry failed tasks without corrupting state or double-spending resources."
+      },
+      {
+        "id": "LAW-12",
+        "name": "Bounded Search and Termination Discipline",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Any exploration MUST run under a lease with a termination policy; failure to converge within budget is a defect.",
+        "operationalization": [
+          {
+            "rule": "Budgets",
+            "desc": "Every plan carries a hard resource budget (time, tokens, cost)."
+          },
+          {
+            "rule": "Progress Signals",
+            "desc": "Periodic telemetry to detect \"looping\" or stagnant reasoning."
+          },
+          {
+            "rule": "Stop Conditions",
+            "desc": "Explicit criteria for success or \"give up\" states."
+          },
+          {
+            "rule": "Defect Tracking",
+            "desc": "Non-convergent loops produce a `UNBOUNDED_SEARCH` DefectRecord."
+          },
+          {
+            "rule": "Repetition Detection",
+            "desc": "Progress telemetry MUST detect template-like repetitive reasoning (entropy collapse, reward variance flatlining) as a termination trigger and defect signal."
+          },
+          {
+            "rule": "Degeneration as Defect",
+            "desc": "Detected echo-trap patterns produce `REASONING_DEGENERATION` DefectRecords."
+          }
+        ],
+        "rationale": "Stochastic planners can easily enter infinite feedback loops or unproductive search paths. Forcing termination discipline protects the system's resource availability."
+      },
+      {
+        "id": "LAW-13",
+        "name": "Semantic Contracting",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "All quantitative and protocol-relevant fields MUST be typed, unitful, and canonicalized; ambiguous strings are defects at the boundary.",
+        "operationalization": [
+          {
+            "rule": "Typed Quantities",
+            "desc": "Use standard (value + unit + scale) encoding for all numbers."
+          },
+          {
+            "rule": "Stable Enums",
+            "desc": "Protocol states must use versioned enums, not free-form text."
+          },
+          {
+            "rule": "Canonicalization",
+            "desc": "Objects must be canonicalized (e.g., JCS) before hashing or signing to avoid spurious diffs."
+          }
+        ],
+        "rationale": "Ambiguity is the enemy of automation. By forcing strict semantic typing, the system reduces the probability of misinterpretation between different agents and tools."
+      },
+      {
+        "id": "LAW-14",
+        "name": "Proportionality and Risk-Weighted Evidence",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Gate set strength must be a function of risk and blast radius, not tradition.",
+        "operationalization": [
+          {
+            "rule": "Risk Tiers",
+            "desc": "Define tiers (e.g., T0: Experimental, T1: Internal, T2: Security-Critical)."
+          },
+          {
+            "rule": "Gate Selection",
+            "desc": "Mechanically select required gates based on the tier (e.g., static analysis for T0, full hypothesis-driven AAT for T2)."
+          },
+          {
+            "rule": "Adaptive Enforcement",
+            "desc": "Adjust gating rigor based on measured escape rates."
+          }
+        ],
+        "rationale": "Universal gating is inefficient. By making evidence requirements proportional to risk, the system maximizes throughput without compromising safety on critical paths."
+      },
+      {
+        "id": "LAW-15",
+        "name": "Measurement Integrity",
+        "effective_date": "2026-01-27",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Measurements and receipts MUST be tamper-evident; omission of required evidence is a defect.",
+        "operationalization": [
+          {
+            "rule": "Tamper-Evidence",
+            "desc": "All receipts must be signed and hash-chained."
+          },
+          {
+            "rule": "Mandatory Fields",
+            "desc": "Admission fails if mandatory evidence fields are empty."
+          },
+          {
+            "rule": "Fail-Closed",
+            "desc": "If the measurement pipeline itself is compromised or offline, high-risk transitions must be blocked."
+          },
+          {
+            "rule": "Evaluator Validity",
+            "desc": "Gate evaluators MUST be periodically audited for false negatives (cases where correct work is rejected) and instruction-checker alignment."
+          },
+          {
+            "rule": "Evaluator Brittleness as Defect",
+            "desc": "Non-deterministic or misaligned evaluators produce `EVALUATOR_DRIFT` DefectRecords; measured performance deltas must account for evaluator uncertainty."
+          }
+        ],
+        "rationale": "If the evidence can be forged or selectively ignored, the entire holonic SDLC becomes gameable. Measurement integrity is the ultimate substrate of trust."
+      }
+    ]
+  }
+}

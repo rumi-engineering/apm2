@@ -1,0 +1,164 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/historical-investigative@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 73,
+    "name": "historical-investigative",
+    "cat": "domain",
+    "core": "Reconstruct what actually happened from incomplete, potentially biased sources. Triangulate evidence across independent sources; assess credibility, provenance, and bias; compare competing hypotheses under uncertainty. Terminates with best available reconstruction plus explicit confidence bounds and evidence gaps—never with certainty about unobserved events.",
+    "out": [
+      {"n": "source_inventory", "d": "all consulted sources with provenance (origin, date, author, access chain) and independence assessment"},
+      {"n": "credibility_matrix", "d": "each source rated on: proximity to event, potential bias, corroboration status, internal consistency"},
+      {"n": "timeline_reconstruction", "d": "chronological sequence of events with source citations per claim; gaps marked explicitly"},
+      {"n": "hypothesis_set", "d": ">=2 competing reconstructions of contested events with supporting/refuting evidence for each"},
+      {"n": "evidence_chains", "d": "for each key claim: source(s), corroboration level (single/multiple/independent), confidence (low/medium/high)"},
+      {"n": "gap_register", "d": "known unknowns: events without sources, periods without coverage, questions unanswerable from available evidence"},
+      {"n": "confidence_summary", "d": "overall reconstruction confidence with breakdown: what is well-established, contested, or speculative"}
+    ],
+    "proc": [
+      "SOURCE COLLECTION: enumerate all available sources; for each, record origin, date, author/creator, how you obtained it, and chain of custody if relevant",
+      "INDEPENDENCE CHECK: map source relationships; flag sources that cite each other, share authors, or derive from common parent; only truly independent sources count for triangulation",
+      "CREDIBILITY ASSESSMENT: rate each source on (a) proximity—direct witness vs hearsay vs inference, (b) bias—incentives to distort, (c) track record—prior accuracy on verifiable claims, (d) internal consistency—contradictions within source",
+      "TIMELINE CONSTRUCTION: extract factual claims with timestamps; place on timeline with source citation; mark contested facts where sources disagree; leave explicit gaps for periods without coverage",
+      "TRIANGULATION: for each key claim, count independent sources; require >=2 independent sources for 'established' status; single-source claims labeled 'tentative'; zero-source inferences labeled 'speculative'",
+      "HYPOTHESIS GENERATION: for contested events, generate >=2 competing reconstructions; include (a) version best supported by evidence weight, (b) version that explains source disagreements, (c) null hypothesis (insufficient evidence to determine)",
+      "EVIDENCE WEIGHING: for each hypothesis, tally supporting evidence by source independence and credibility; note disconfirming evidence and how hypothesis explains or fails to explain it",
+      "DISCONFIRMATION SEARCH: actively seek evidence against leading hypothesis; query: what evidence would exist if leading hypothesis were wrong? Is that evidence absent or just not found?",
+      "GAP DOCUMENTATION: list all known unknowns; for each gap, state what type of source would resolve it and whether such source plausibly exists",
+      "CONFIDENCE ASSIGNMENT: classify each claim as established (>=2 independent credible sources, no credible disconfirmation), contested (credible sources disagree), tentative (single source), or speculative (inference without direct source)"
+    ],
+    "check": [
+      "source inventory complete with provenance for each source",
+      "source independence assessed; corroborating sources verified as truly independent",
+      "credibility assessment performed with explicit criteria, not just intuition",
+      ">=2 competing hypotheses generated for contested events",
+      "disconfirming evidence actively sought, not just confirming evidence collected",
+      "each key claim has confidence level with explicit rationale",
+      "gaps documented; speculation clearly separated from evidence-based claims",
+      "timeline cites sources per event; unsourced events marked as inferred",
+      "no single source treated as authoritative without corroboration",
+      "output labeled 'reconstruction' not 'the truth' or 'what happened'"
+    ],
+    "diff": {
+      "abductive-13": "abductive generates hypotheses to explain surprising observations; historical-investigative reconstructs events from fragmentary evidence. Abductive asks 'what would explain this?'; investigative asks 'what actually happened?' Use abductive when observations are anomalous; use investigative when piecing together a factual record.",
+      "counterfactual-39": "counterfactual asks 'what would have happened if X were different'; historical-investigative asks 'what did happen'. Investigative establishes the factual baseline; counterfactual explores alternatives to that baseline. Do investigative first to establish facts, then counterfactual to explore alternatives.",
+      "narrative-causal-storytelling-62": "narrative prioritizes coherent story with causal explanations; investigative prioritizes evidence fidelity over narrative elegance. Narrative may smooth over gaps for coherence; investigative must preserve gaps and mark speculation. Use narrative for communication after investigative establishes evidence base.",
+      "diagnostic-41": "diagnostic identifies cause of observed symptoms using fault models; investigative reconstructs sequence of events without assuming causal structure. Diagnostic asks 'what caused this symptom?'; investigative asks 'what sequence of events occurred?' Use diagnostic for root cause analysis; investigative for timeline reconstruction.",
+      "legal-71": "legal applies rules and precedent to determine liability/compliance; investigative establishes factual predicate for legal analysis. Investigative determines what happened; legal determines what it means under law. Investigative precedes legal reasoning."
+    },
+    "confusions": [
+      {
+        "trap": "treating narrative coherence as evidence of truth",
+        "symptom": "preferring reconstruction that 'makes sense' or 'tells a good story' over reconstruction with stronger evidence",
+        "correction": "coherence is not evidence; a less coherent reconstruction with better-sourced claims trumps a compelling narrative with weak sourcing. Score by evidence weight, not narrative appeal."
+      },
+      {
+        "trap": "conflating historical-investigative with abductive",
+        "symptom": "generating creative hypotheses rather than triangulating from sources; inventing explanations rather than extracting from evidence",
+        "correction": "investigative reconstructs from available evidence; abductive generates hypotheses for unexplained observations. If you're inventing rather than extracting, switch to abductive mode."
+      },
+      {
+        "trap": "using single authoritative source without triangulation",
+        "symptom": "treating one 'reliable' source as ground truth; not seeking independent corroboration",
+        "correction": "no single source is authoritative in investigative mode. Even credible sources have blind spots, biases, and errors. Always seek independent corroboration; mark single-source claims as tentative."
+      },
+      {
+        "trap": "filling gaps with plausible inference and forgetting it's inference",
+        "symptom": "speculation becomes 'fact' in later stages of analysis; inferred events treated as established",
+        "correction": "label all inferences explicitly at time of creation; maintain gap register; when citing reconstruction, distinguish sourced claims from inferences."
+      }
+    ],
+    "fail": {
+      "mode": "narrative_overfit",
+      "desc": "Overfitting to compelling narrative while neglecting disconfirming evidence; filling gaps with speculation; source credibility assessment skipped or superficial",
+      "signals": [
+        "single narrative with no competing hypotheses",
+        "disconfirming evidence dismissed rather than explained",
+        "source bias acknowledged but not weighted in conclusions",
+        "gaps filled with 'must have' or 'probably' without marking as speculation",
+        "confidence stated without evidence chain",
+        "independent corroboration not verified (sources cite each other)",
+        "credibility assessment missing or based on reputation alone"
+      ],
+      "mitigations": [
+        {"m": "require >=2 competing hypotheses for contested events before selecting one", "test": "hypothesis_set.length >= 2 for each contested_event"},
+        {"m": "actively search for disconfirming evidence; document search even if nothing found", "test": "disconfirmation_search.queries.length >= 1 per leading_hypothesis"},
+        {"m": "rate every source on proximity, bias, track record, consistency", "test": "credibility_matrix complete for all sources with 4 dimensions scored"},
+        {"m": "label all gap-filling inferences with 'inferred:' or 'speculative:' prefix", "test": "all non-sourced claims in timeline tagged as inference"},
+        {"m": "verify source independence before counting as corroboration", "test": "independence_check performed; corroboration count excludes dependent sources"},
+        {"m": "state confidence per claim with explicit evidence chain", "test": "each confidence_level has source_count and independence_status"},
+        {"m": "include null hypothesis: 'evidence insufficient to determine'", "test": "hypothesis_set includes insufficient_evidence option when warranted"}
+      ]
+    },
+    "use": [
+      "incident postmortems: reconstruct timeline of failure from logs, alerts, and participant accounts",
+      "audit and compliance: establish factual record from documents and interviews",
+      "due diligence: verify claims about company history, asset provenance, or counterparty background",
+      "fraud investigation: piece together transaction patterns and actor behavior from fragmentary records",
+      "security incident response: reconstruct attacker actions from logs, forensic assets, and network data",
+      "dispute resolution: establish agreed facts before legal or negotiation proceedings",
+      "journalism and research: verify claims through source triangulation before publication"
+    ],
+    "rel": [
+      {"id": 13, "n": "abductive", "r": "generates hypotheses; use when evidence suggests something surprising happened but what is unclear"},
+      {"id": 39, "n": "counterfactual", "r": "explores alternatives; use after investigative establishes factual baseline"},
+      {"id": 62, "n": "narrative-causal-storytelling", "r": "communicates findings; use after investigative to present coherent account"},
+      {"id": 41, "n": "diagnostic", "r": "identifies causes; use investigative for timeline, diagnostic for root cause"},
+      {"id": 71, "n": "legal", "r": "applies rules to facts; investigative establishes facts, legal interprets them"},
+      {"id": 76, "n": "calibration-epistemic-humility", "r": "calibrates confidence; use to check if confidence matches evidence strength"}
+    ],
+    "ex": {
+      "sit": "Security incident: unauthorized access to customer database detected. Need to reconstruct what happened.",
+      "source_inventory": [
+        {"source": "web server access logs", "provenance": "exported from prod 2024-01-15", "independence": "primary/automated"},
+        {"source": "database audit logs", "provenance": "exported from prod 2024-01-15", "independence": "primary/automated"},
+        {"source": "employee interviews (3)", "provenance": "conducted 2024-01-16", "independence": "primary/human, potential recall bias"},
+        {"source": "attacker forum post", "provenance": "archived 2024-01-17", "independence": "adversarial, self-serving"}
+      ],
+      "credibility_matrix": {
+        "access_logs": {"proximity": "direct", "bias": "low", "track_record": "verified against known events", "consistency": "complete for period"},
+        "audit_logs": {"proximity": "direct", "bias": "low", "track_record": "verified", "consistency": "2-hour gap 03:00-05:00"},
+        "interviews": {"proximity": "indirect (memory)", "bias": "medium (reputation)", "track_record": "consistent with logs", "consistency": "minor discrepancies on timing"},
+        "forum_post": {"proximity": "direct (if authentic)", "bias": "high (bragging)", "track_record": "unverified", "consistency": "matches some log patterns"}
+      },
+      "timeline": [
+        {"time": "01:15", "event": "SQL injection probe on /api/search", "source": "access_logs", "confidence": "established"},
+        {"time": "01:30", "event": "successful SQLi exploitation", "source": "access_logs + audit_logs", "confidence": "established"},
+        {"time": "01:45-02:30", "event": "data exfiltration (15K records)", "source": "audit_logs", "confidence": "established"},
+        {"time": "03:00-05:00", "event": "unknown (audit log gap)", "source": "none", "confidence": "gap"},
+        {"time": "06:00", "event": "SOC alert triggered", "source": "interviews + logs", "confidence": "established"}
+      ],
+      "hypotheses": [
+        {"h": "single attacker, opportunistic", "support": "forum post timeline, attack pattern consistent", "against": "log gap unexplained"},
+        {"h": "attacker returned during log gap", "support": "explains gap timing", "against": "no evidence of second session"},
+        {"h": "insufficient evidence for gap period", "support": "honest uncertainty", "against": "none"}
+      ],
+      "gaps": ["03:00-05:00 activity unknown; audit log rotation or attacker log deletion?", "attacker identity unconfirmed; forum post attribution uncertain"],
+      "confidence_summary": "Timeline 01:15-02:30 established (multiple independent automated sources). Gap 03:00-05:00 unresolved. Forum post provides possible attacker perspective but low credibility. Recommend: preserve logs, investigate gap cause, do not attribute to forum poster without corroboration."
+    },
+    "micro_ex": {
+      "sit": "Employee claims expense was pre-approved; manager denies approving. Reconstruct what happened.",
+      "sources": ["expense system logs (automated)", "email thread (employee-provided)", "manager calendar (manager-provided)", "Slack messages (IT export)"],
+      "triangulation": "email shows request sent 3/1; no reply. Slack shows informal 'sounds good' on 3/2 from manager. Expense submitted 3/5. System shows no formal approval.",
+      "hypotheses": ["informal Slack approval, formal process skipped", "Slack message was about different topic", "manager forgot informal approval"],
+      "finding": "Slack 'sounds good' was reply to expense question (thread context confirms). Informal approval given, formal process not followed. Both parties partially correct.",
+      "confidence": "Established: request made, informal positive response given, formal approval absent. Contested: whether Slack response constitutes approval (policy interpretation, not factual question)."
+    },
+    "quick_check": [
+      "Did I inventory all sources with provenance and independence assessment?",
+      "Did I rate source credibility on explicit criteria (proximity, bias, track record, consistency)?",
+      "Did I verify source independence before counting as corroboration?",
+      "Did I generate >=2 competing hypotheses for contested events?",
+      "Did I actively search for disconfirming evidence?",
+      "Did I mark gaps explicitly and separate sourced claims from inferences?",
+      "Did I state confidence levels with evidence chain rationale?",
+      "Is my output labeled 'reconstruction' not 'the truth'?"
+    ]
+  }
+}

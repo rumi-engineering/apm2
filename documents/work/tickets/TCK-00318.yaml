@@ -1,55 +1,56 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00318"
-    title: "Workspace apply implementation (safe patch apply)"
+    id: TCK-00318
+    title: Workspace apply implementation (safe patch apply)
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0003"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0003.yaml#requirement"
+    - requirement_id: REQ-0003
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0003.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0003"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0003.yaml#evidence_artifact"
+    - evidence_id: EVID-0003
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0003.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
+    - DOMAIN_DAEMON
   dependencies:
-    tickets:
-      - ticket_id: "TCK-00310"
-        reason: "ChangeSetBundleV1 is the input artifact for workspace materialization"
-      - ticket_id: "TCK-00311"
-        reason: "Workspace snapshot/apply scaffolding exists; this ticket replaces stubs with real apply"
+    tickets: []
   scope:
     in_scope:
-      - "Implement WorkspaceManager::apply to materialize an isolated workspace for an episode"
-      - "Checkout pinned base commit (from local mirror or configured repo root) before applying diff"
-      - "Apply patch bytes safely with strict path validation (no outside-root writes)"
-      - "Emit ReviewBlockedRecorded on apply failure with reason codes (do not crash)"
+    - Implement WorkspaceManager::apply (changeset apply) with isolated workspace
+    - Base commit checkout from local mirror
+    - Safe patch application with path validation
+    - ReviewBlockedRecorded on failure
     out_of_scope:
-      - "Rooting tool handlers to the workspace (TCK-00319)"
-      - "ViewCommitment production and binding (TCK-00325)"
+    - Tool handler rooting (separate ticket)
   plan:
     steps:
-      - "Audit current WorkspaceManager::apply stub in crates/apm2-daemon/src/episode/workspace.rs"
-      - "Define workspace directory layout and lifecycle (per-episode root + cleanup semantics)"
-      - "Implement base checkout into workspace from pinned ref (prefer local mirror path from config)"
-      - "Implement patch apply using validated file manifest + diff bytes; forbid writes outside workspace_root"
-      - "Map apply failures to ReviewBlockedRecorded reason codes and ensure CAS-before-ledger ordering"
-      - "Add unit/integration tests for safe path validation and apply failure handling"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Implement WorkspaceManager::apply (changeset apply) with isolated workspace'
+    - 'Implement: Base commit checkout from local mirror'
+    - 'Implement: Safe patch application with path validation'
+    - 'Implement: ReviewBlockedRecorded on failure'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0003"
+    - EVID-0003
     criteria:
-      - "Workspace is created per episode and is isolated from daemon CWD."
-      - "Patch paths are validated for root containment; symlink escapes are blocked."
-      - "Failed apply yields ReviewBlockedRecorded (durable blocked outcome), not a crash."
+    - Workspace created per-episode
+    - Patch paths validated for root containment
+    - Failed apply emits ReviewBlockedRecorded
   notes:
-    security: "Workspace is a containment boundary; default deny on suspicious paths; fail closed."
-    verification: "Add tests for path traversal attempts, symlink escapes, and malformed diffs."
-    general: "Required for tools to observe the correct (patched) filesystem state during review episodes."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

@@ -350,7 +350,7 @@ prd_traceability:
       description: "Daemon runtime and session management"
     - ref_id: "LAWS"
       type: "SKILL"
-      path: "documents/skills/laws-of-holonic-agent-systems/SKILL.md"
+      path: "documents/theory/AGENTS.md"
       description: "Laws of Holonic Agent Systems governing FAC behavior"
     - ref_id: "GLOSSARY"
       type: "SKILL"

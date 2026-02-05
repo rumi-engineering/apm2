@@ -66,7 +66,7 @@ prd_constraints_invariants:
     - id: CNS-0008
       statement: |
         Every RunReceipt MUST record context sufficiency metrics (bytes supplied, entries
-        used, misses, denied reads, ZTI score).
+        used, misses, denied reads, efficiency score).
       rationale: |
         Enables measurement of pack quality and systematic improvement. RunReceipt is
         required for GateRunCompleted acceptance.

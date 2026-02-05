@@ -1,0 +1,165 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/probabilistic-logic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 20,
+    "name": "probabilistic-logic",
+    "cat": "probabilistic",
+    "core": "Blend logical structure (entities, relations, rules, quantifiers) with probabilistic uncertainty over ground atoms. Key distinction: probability attaches to propositions being true, not to vagueness of predicates. Formalisms include Markov Logic Networks (MLN), Probabilistic Soft Logic (PSL), and ProbLog. More expressive than flat Bayesian networks for relational domains with repeated structure.",
+    "when_to_use": [
+      "domain has typed entities with relations (graph, ontology, schema)",
+      "rules exist but have exceptions or uncertain applicability",
+      "need to combine symbolic constraints with statistical evidence",
+      "inference requires lifted reasoning over classes, not just individuals",
+      "explanation must trace through logical rule chains, not just conditional probabilities"
+    ],
+    "when_not_to_use": [
+      "domain lacks relational structure (use #11 Bayesian)",
+      "uncertainty is about predicate boundaries, not truth (use #25 fuzzy-logic)",
+      "need hard constraint satisfaction without probability (use #6 constraint-satisfiability)",
+      "data is purely tabular with no entity relationships (use #10 statistical-frequentist)"
+    ],
+    "out": [
+      {"n": "weighted_rule_set", "d": "logical rules with learned or assigned probability weights", "form": "rule: weight, e.g., 0.8: worksFor(X,Y) ^ locatedIn(Y,Z) => likelyIn(X,Z)"},
+      {"n": "marginal_probabilities", "d": "P(atom) for each ground atom of interest", "form": "table: atom -> [0,1]"},
+      {"n": "map_state", "d": "most probable world state (maximum a posteriori)", "form": "set of ground atoms with truth values"},
+      {"n": "inference_trace", "d": "derivation showing which rules fired and how uncertainty propagated", "form": "tree: conclusion <- (rule, premises, weight contribution)"},
+      {"n": "credible_intervals", "d": "confidence bounds on marginal queries", "form": "[P_low, P_high] at specified confidence level"}
+    ],
+    "proc": [
+      {"step": "1. SCHEMA", "do": "define entity types, relations, attributes with domains", "out": "typed schema", "gate": "every relation has arity and type signature"},
+      {"step": "2. RULES", "do": "encode domain rules as weighted first-order clauses", "out": "weighted rule set", "gate": "each rule has source (expert, learned, prior work)"},
+      {"step": "3. GROUND", "do": "instantiate rules over observed entities (grounding)", "out": "ground network", "gate": "grounding size tractable (<10^6 ground atoms typical)"},
+      {"step": "4. EVIDENCE", "do": "attach observations as hard or soft evidence on ground atoms", "out": "evidence set", "gate": "evidence atoms flagged with confidence"},
+      {"step": "5. INFER", "do": "run inference (marginal, MAP, or sampling)", "out": "marginals or MAP state", "gate": "inference completes in budget; no NaN or divergence"},
+      {"step": "6. VALIDATE", "do": "check predictions against held-out ground truth", "out": "validation metrics", "gate": "AUC/F1/calibration above threshold"},
+      {"step": "7. TRACE", "do": "extract explanation for key predictions", "out": "inference trace", "gate": "trace cites rules and evidence, not just numbers"}
+    ],
+    "check": [
+      "schema covers all entity types and relations in domain?",
+      "every rule has explicit weight with justification?",
+      "grounding size estimated before inference?",
+      "evidence distinguished from inferred atoms?",
+      "inference algorithm appropriate for query type (marginal vs MAP)?",
+      "predictions validated on held-out data?",
+      "explanations trace through rules, not black-box scores?"
+    ],
+    "diff": {
+      "bayesian-probabilistic": "prob-logic adds relational structure and quantified rules; Bayesian uses flat variable graphs without first-order templates",
+      "deductive-reasoning": "prob-logic assigns probability to rules/facts; deduction treats premises as certain (true/false)",
+      "fuzzy-logic": "prob-logic: P=0.7 means 70% chance atom is true; fuzzy: 0.7 means partial membership in set (different semantics)",
+      "constraint-satisfiability": "prob-logic: soft constraints with weights, probabilistic solutions; SAT: hard constraints, any satisfying assignment",
+      "statistical-frequentist": "prob-logic reasons over structured relations; frequentist aggregates over flat samples without relational model"
+    },
+    "confusions": [
+      {
+        "pair": ["probabilistic-logic", "fuzzy-logic"],
+        "symptom": "interpreting P(tall(X))=0.7 as 'X is 70% tall' rather than '70% chance X satisfies tall'",
+        "resolution": "prob-logic: uncertainty about crisp truth; fuzzy: vagueness about predicate boundary. If predicate is inherently graded, use fuzzy; if predicate is crisp but evidence is uncertain, use prob-logic."
+      },
+      {
+        "pair": ["probabilistic-logic", "bayesian-probabilistic"],
+        "symptom": "building flat Bayesian net when domain has repeated relational patterns (e.g., social network, knowledge graph)",
+        "resolution": "if you find yourself duplicating CPT structure for each entity, switch to prob-logic with first-order rules that generalize across entities"
+      },
+      {
+        "pair": ["probabilistic-logic", "constraint-satisfiability"],
+        "symptom": "forcing hard SAT when some constraints are soft preferences",
+        "resolution": "if violating a constraint should incur cost rather than instant failure, encode as weighted rule in prob-logic rather than hard clause in SAT"
+      }
+    ],
+    "fail": {
+      "mode": "model_soup",
+      "desc": "model too expressive relative to data; inference intractable or predictions uninterpretable",
+      "signals": [
+        "grounding explodes beyond memory (>10^7 ground atoms)",
+        "inference does not converge or takes hours",
+        "small evidence changes flip many predictions (brittleness)",
+        "cannot explain why a prediction has its probability",
+        "held-out AUC near 0.5 despite complex rules"
+      ]
+    },
+    "mitigations": [
+      {
+        "id": "M1-schema-bound",
+        "trigger": "before grounding",
+        "action": "estimate grounding size: |entities|^max_arity * |rules|; if >10^6, add type constraints or reduce rule scope",
+        "test": "grounding size logged and under threshold"
+      },
+      {
+        "id": "M2-weight-audit",
+        "trigger": "after rule authoring",
+        "action": "for each rule, record source (expert judgment, learned from data, literature); flag rules with no justification",
+        "test": "no rule has weight without recorded source"
+      },
+      {
+        "id": "M3-perturbation-test",
+        "trigger": "after inference",
+        "action": "flip one low-confidence evidence atom; re-run inference; if >20% of predictions change, model is brittle—simplify or add regularization",
+        "test": "perturbation sensitivity <20% prediction flip"
+      },
+      {
+        "id": "M4-trace-audit",
+        "trigger": "before deployment",
+        "action": "for top-10 predictions, generate inference trace; verify trace cites relevant rules and evidence; if trace is 'learned embedding', model is not interpretable",
+        "test": "all top-10 predictions have rule-based trace"
+      },
+      {
+        "id": "M5-holdout-validation",
+        "trigger": "after inference",
+        "action": "reserve 20% of known facts as holdout; evaluate predictions on holdout; AUC <0.6 indicates overfitting or poor rules",
+        "test": "holdout AUC >0.6"
+      }
+    ],
+    "use": [
+      "knowledge graph completion: infer missing links with confidence",
+      "uncertain ontology reasoning: propagate evidence through class hierarchies",
+      "entity resolution: probabilistic matching across databases",
+      "fraud detection: relational patterns with weighted rules",
+      "drug interaction prediction: combine known rules with statistical evidence",
+      "social network analysis: infer attributes from relational structure",
+      "compliance checking: soft policy rules with exceptions"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "underlying probability semantics; use Bayesian for flat domains"},
+      {"id": 1, "n": "deductive-reasoning", "r": "logical structure without uncertainty; escalate to prob-logic when certainty unavailable"},
+      {"id": 25, "n": "fuzzy-logic", "r": "graded predicates vs uncertain truth; clarify semantics before choosing"},
+      {"id": 6, "n": "constraint-satisfiability", "r": "hard constraints; prob-logic for soft weighted constraints"},
+      {"id": 10, "n": "statistical-frequentist", "r": "flat data; prob-logic for relational structure"},
+      {"id": 30, "n": "non-monotonic", "r": "defaults and exceptions; prob-logic handles exceptions via weights"}
+    ],
+    "ex": {
+      "sit": "Knowledge graph with uncertain entity types and relations. Need to infer missing links with confidence.",
+      "steps": [
+        "SCHEMA: Person, Organization; relations: worksFor(Person,Org), locatedIn(Org,City), likelyIn(Person,City)",
+        "RULES: 0.8: worksFor(X,Y) ^ locatedIn(Y,Z) => likelyIn(X,Z); 0.1: Person(X) ^ Org(Y) => worksFor(X,Y) [prior]",
+        "GROUND: 100 persons, 20 orgs, 5 cities => ~10^4 ground atoms (tractable)",
+        "EVIDENCE: worksFor(alice,acme)=0.9, locatedIn(acme,NYC)=0.95 [soft evidence]",
+        "INFER: P(likelyIn(alice,NYC)) via marginal inference",
+        "VALIDATE: compare inferred locations to known residence data; AUC=0.78",
+        "TRACE: likelyIn(alice,NYC) <- rule R1 (weight 0.8) + worksFor(alice,acme) 0.9 + locatedIn(acme,NYC) 0.95"
+      ],
+      "asset": "marginal_probabilities: {likelyIn(alice,NYC): 0.68, likelyIn(bob,SF): 0.42, ...}",
+      "insight": "logical rules propagate uncertainty while preserving relational structure; trace explains each prediction"
+    },
+    "micro_example": {
+      "problem": "Does alice know bob? Given: alice works at acme, bob works at acme, colleagues often know each other.",
+      "schema": "Person, Org; worksFor(Person,Org), knows(Person,Person)",
+      "rules": [
+        "0.6: worksFor(X,Z) ^ worksFor(Y,Z) ^ X!=Y => knows(X,Y)"
+      ],
+      "evidence": [
+        "worksFor(alice,acme)=1.0",
+        "worksFor(bob,acme)=1.0"
+      ],
+      "inference": "P(knows(alice,bob)) = 0.6 (rule fires with weight 0.6)",
+      "asset": "inference_trace: knows(alice,bob) <- R1[0.6] + worksFor(alice,acme)[1.0] + worksFor(bob,acme)[1.0]"
+    }
+  }
+}

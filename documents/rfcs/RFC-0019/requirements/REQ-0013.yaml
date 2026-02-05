@@ -1,0 +1,29 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0013"
+  title: "FAC productivity CLI: status, logs via indices, deterministic context rebuild"
+  category: "FUNCTIONAL"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    Provide productivity scripts/commands to make FAC operation and debugging practical for both
+    operators and orchestration agents, without requiring raw vendor JSONL log inspection.
+
+    The CLI MUST be ledger/CAS oriented and MUST support:
+    - work status summary (current gate state, latest receipt hashes, latest projection receipt)
+    - episode inspection (tool log index entries, receipt pointers, termination reason)
+    - deterministic context rebuild for a role + episode (reconstruct ContextPack selectors)
+    - crash-only resume helpers (restart from ledger head/checkpoint; show next scheduled action)
+  rationale: |
+    If humans cannot quickly inspect and debug FAC runs, autonomy will stall on operational friction.
+    Tool log indices and receipt pointers are the intended query surfaces; the CLI should make them
+    easy to use and should also be usable by agents.
+  acceptance_criteria:
+    - "CLI can render work status without scanning filesystem state."
+    - "CLI can fetch tool execution receipts by hash and show bounded previews."
+    - "CLI can rebuild a role-scoped context pack deterministically for an episode."
+  evidence_ids:
+    - "EVID-0013"
+  source_refs:
+    - "documents/rfcs/RFC-0019/05_rollout_and_ops.yaml#rfc_rollout_and_ops"
+    - "documents/rfcs/RFC-0019/07_test_and_evidence.yaml#rfc_test_and_evidence"

@@ -1,0 +1,205 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/spatial-diagrammatic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 67,
+    "name": "spatial-diagrammatic",
+    "cat": "domain",
+    "core": "Reason using geometry, topology, and diagrams. Primitives: containment (A inside B), adjacency (A touches B), proximity (A near B), flow direction (A -> B), paths (sequence of hops), regions (bounded areas), and boundaries (edges between regions). Exploits visual-spatial representation for inferences cumbersome in symbolic form.",
+    "when_to_use": [
+      "reachability question: can X get to Y given structure?",
+      "containment question: what encloses what?",
+      "segmentation analysis: which zones are isolated?",
+      "layout optimization: placement minimizes distance/crossings",
+      "flow analysis: what path does X take through system?",
+      "boundary verification: does structure match intended partitioning?"
+    ],
+    "when_not_to_use": [
+      "need dynamics over time (use model-based-simulation-42)",
+      "need feedback loops and delays (use systems-thinking-43)",
+      "need directional influence without explicit placement (use qualitative-29)",
+      "need temporal ordering of events (use temporal-66)",
+      "diagram is decorative, not reasoning substrate (just draw, no mode needed)"
+    ],
+    "out": [
+      {"type": "reachability_verdict", "form": "A can/cannot reach B via path [P]", "test": "path verified against topology and gate rules"},
+      {"type": "containment_map", "form": "hierarchical nesting of regions", "test": "every entity assigned to exactly one leaf region"},
+      {"type": "flow_trace", "form": "ordered sequence of hops with gate conditions", "test": "each hop satisfies gate (firewall, permission, physical connection)"},
+      {"type": "boundary_audit", "form": "list of boundary segments with crossing rules", "test": "every crossing rule sourced to policy or config"},
+      {"type": "layout_diagram", "form": "visual with legend, scale, and explicit regions", "test": "diagram reproducible from description; no unlabeled elements"}
+    ],
+    "proc": [
+      "1. ENUMERATE ENTITIES: list all nodes, zones, and connectors with unique IDs",
+      "2. CLASSIFY RELATIONSHIPS: for each entity pair, record containment (A in B), adjacency (A touches B), or separation (no direct connection)",
+      "3. IDENTIFY BOUNDARIES: mark every region edge; note what can/cannot cross",
+      "4. MAP GATES: list all controlled crossings (firewalls, permissions, physical barriers) with allow/deny rules",
+      "5. SELECT REPRESENTATION: choose graph (nodes+edges), map (2D layout), Venn (set overlap), or flow chart (directed paths)",
+      "6. DRAW/DESCRIBE DIAGRAM: place all entities; label all edges and regions; include legend",
+      "7. APPLY INFERENCE RULES: transitivity of containment (A in B, B in C -> A in C), path existence (A->...->Z), reachability through gates",
+      "8. DERIVE CONCLUSIONS: answer spatial query (reachability, containment, isolation)",
+      "9. VERIFY AGAINST CONSTRAINTS: for each conclusion, trace back to source constraint (config, policy, physical reality)",
+      "10. TRANSLATE TO DOMAIN: restate spatial conclusion in domain terms (e.g., 'traffic blocked' not 'no path')"
+    ],
+    "quick_check": [
+      "Every entity has explicit region assignment?",
+      "Every boundary has crossing rule (allow/deny/conditional)?",
+      "Every path claim traces through named gates?",
+      "Diagram has legend explaining symbols?",
+      "At least one constraint verified against source (not assumed)?"
+    ],
+    "check": [
+      "all entities placed with explicit spatial relation to at least one other entity",
+      "boundaries defined with crossing rules (permit X, deny Y)",
+      "flow directions marked with arrowheads and labels",
+      "diagram consistent with stated constraints (firewall config, network policy, physical layout)",
+      "no spatial relationship asserted without source (config file, policy doc, physical inspection)",
+      "legend present: symbol meanings, color coding, scale if applicable",
+      "negative space checked: areas with no entities explicitly identified as empty or out-of-scope"
+    ],
+    "diff": {
+      "model-based-simulation-42": {
+        "contrast": "Simulation runs models forward in time; Spatial reasons from static structure without dynamics",
+        "boundary": "If question involves time evolution, use simulation. If question involves current topology, use spatial",
+        "test": "Does answer change over time? Yes -> simulation. Is answer about current structure? Yes -> spatial"
+      },
+      "systems-thinking-43": {
+        "contrast": "Systems-thinking models feedback loops (R/B), delays, and stocks; Spatial models containment, adjacency, and paths",
+        "boundary": "Systems for behavior patterns; Spatial for structural queries",
+        "test": "Asking 'why does behavior persist?' -> systems. Asking 'can A reach B?' -> spatial"
+      },
+      "qualitative-29": {
+        "contrast": "Qualitative propagates directional influence (+/-) through chains; Spatial tracks geometric arrangement and physical paths",
+        "boundary": "Qualitative for 'if X increases, does Y increase?'; Spatial for 'can X physically connect to Y?'",
+        "test": "Influence direction? -> qualitative. Physical/logical path? -> spatial"
+      },
+      "temporal-66": {
+        "contrast": "Temporal reasons about ordering, duration, and persistence of events over time; Spatial reasons about geometric arrangement at a point in time",
+        "boundary": "Temporal for 'when did X happen relative to Y?'; Spatial for 'where is X relative to Y?'",
+        "test": "Question involves before/after/during? -> temporal. Question involves inside/outside/between? -> spatial"
+      },
+      "engineering-design-70": {
+        "contrast": "Engineering-design produces requirements, ADRs, and test plans; Spatial is one reasoning tool within design for architecture diagrams",
+        "boundary": "Engineering-design is the overall process; Spatial handles the 'draw and verify topology' step",
+        "test": "Building a system? -> engineering-design (which may invoke spatial). Analyzing existing topology? -> spatial directly"
+      }
+    },
+    "confusions": [
+      {
+        "confused_with": "systems-thinking-43",
+        "symptom": "Drawing a box-and-arrow diagram and calling it 'systems thinking'",
+        "resolution": "Systems-thinking requires: (1) closed feedback loops labeled R/B, (2) stocks with units, (3) delay analysis. Spatial has no loops, no dynamics. If your diagram has no feedback arrows returning to origin, you are doing spatial, not systems."
+      },
+      {
+        "confused_with": "qualitative-29",
+        "symptom": "Labeling edges with +/- signs for influence direction",
+        "resolution": "Qualitative edges mean 'if A increases, B increases/decreases'. Spatial edges mean 'A connects to B' or 'A flows to B'. If your edges show causal influence, use qualitative. If edges show physical/logical connection, use spatial."
+      },
+      {
+        "confused_with": "engineering-design-70",
+        "symptom": "Treating an architecture diagram as the complete design asset",
+        "resolution": "A diagram is one component of engineering design. Design also requires: requirements spec, tradeoff analysis, failure mode analysis, test plan. Diagram alone is spatial reasoning; full design process is engineering-design."
+      }
+    ],
+    "fail": {
+      "mode": "Diagram treated as ground truth without verifying constraint coverage",
+      "signal": "Clean diagram hides missing constraints, undocumented gates, or real-world messiness",
+      "anti_patterns": [
+        {"name": "Pretty diagram fallacy", "desc": "Assuming visual clarity implies accurate constraint representation", "fix": "Every boundary must cite source (config, policy, physical measurement)"},
+        {"name": "Missing gate", "desc": "Showing connection without verifying access control allows it", "fix": "List gate rules for every boundary crossing"},
+        {"name": "Static snapshot bias", "desc": "Diagram reflects one moment; topology changes are ignored", "fix": "Date the diagram; note what triggers re-verification"},
+        {"name": "Unlabeled region", "desc": "Areas without explicit entities assumed empty", "fix": "Mark all regions as populated, empty, or out-of-scope"}
+      ],
+      "mitigations": [
+        {
+          "id": "M1",
+          "action": "Create constraint checklist: list every constraint diagram must satisfy before drawing",
+          "test": "Checklist exists with at least 5 constraints; each checked post-diagram"
+        },
+        {
+          "id": "M2",
+          "action": "Negative-space audit: explicitly document what is NOT shown and why",
+          "test": "Section labeled 'Not shown' with at least 3 items and rationale"
+        },
+        {
+          "id": "M3",
+          "action": "Source tracing: every boundary crossing rule must cite source document (firewall config, network policy, physical spec)",
+          "test": "Each gate rule in diagram has [source: <doc>] annotation"
+        },
+        {
+          "id": "M4",
+          "action": "Boundary stress test: for each boundary, ask 'what unexpected traffic/entity could cross?'",
+          "test": "At least 3 boundary stress scenarios documented with verdict (blocked/allowed/unknown)"
+        },
+        {
+          "id": "M5",
+          "action": "Version and timestamp: record when diagram was verified and what would trigger re-verification",
+          "test": "Diagram header includes 'Verified: <date>' and 'Reverify if: <trigger>'"
+        },
+        {
+          "id": "M6",
+          "action": "Cross-check with textual requirements: walk each requirement and confirm diagram supports verification",
+          "test": "Requirements traceability matrix shows each requirement mapped to diagram element"
+        }
+      ]
+    },
+    "use": [
+      "Architecture diagrams: component placement, dependency verification, layer enforcement",
+      "Network security: zone segmentation, firewall rule verification, reachability analysis",
+      "Supply chain mapping: flow of goods, bottleneck identification, alternate path analysis",
+      "UX design: screen flows, navigation paths, state transition diagrams",
+      "Robotics: spatial planning, obstacle avoidance, path finding",
+      "Data flow: GDPR compliance (where does PII flow?), data residency verification",
+      "Physical security: access control zones, camera coverage, escape routes"
+    ],
+    "rel": [
+      {"id": 42, "name": "model-based-simulation", "note": "adds dynamics to spatial models; simulate traffic through topology"},
+      {"id": 43, "name": "systems-thinking", "note": "uses diagrams but adds loops, delays, stocks; for behavior patterns"},
+      {"id": 29, "name": "qualitative", "note": "directional influence (+/-) without explicit spatial layout"},
+      {"id": 66, "name": "temporal", "note": "complements spatial with time dimension; 'where' + 'when'"},
+      {"id": 70, "name": "engineering-design", "note": "spatial is one tool within design process for architecture diagrams"}
+    ],
+    "micro_ex": {
+      "query": "Is database D isolated from public internet?",
+      "entities": ["Internet", "DMZ", "AppServer", "PrivateZone", "Database D"],
+      "topology": "Internet -> DMZ (FW1: allow 443) -> AppServer -> PrivateZone (FW2: deny all external)",
+      "inference": "No path from Internet to D bypassing FW2; FW2 denies external origin",
+      "verdict": "D isolated from public internet (verified against FW2 config v2.3)"
+    },
+    "ex": {
+      "problem": "Can service A reach database D given network segmentation?",
+      "entities": ["Service A", "Service B", "Gateway G", "Database D", "Zone-Public", "Zone-Private"],
+      "containment": [
+        {"entity": "Service A", "region": "Zone-Public"},
+        {"entity": "Service B", "region": "Zone-Public"},
+        {"entity": "Database D", "region": "Zone-Private"}
+      ],
+      "boundaries": [
+        {"edge": "Zone-Public | Zone-Private", "gate": "Gateway G", "rules": "allow TCP 5432 from Zone-Public; deny all else"}
+      ],
+      "relations": [
+        {"type": "containment", "desc": "A in Zone-Public, D in Zone-Private"},
+        {"type": "adjacency", "desc": "Zone-Public adjacent to Gateway G; G adjacent to Zone-Private"},
+        {"type": "flow", "desc": "G allows traffic from Zone-Public to Zone-Private on port 5432 only"}
+      ],
+      "inference_chain": [
+        "A in Zone-Public (by containment)",
+        "Zone-Public -> G (by adjacency, no gate blocking)",
+        "G -> Zone-Private (gate rule: allow TCP 5432)",
+        "D in Zone-Private (by containment)",
+        "Therefore: A can reach D on TCP 5432"
+      ],
+      "constraint_check": {
+        "source": "Firewall config fw-prod-g.yaml, rule #23",
+        "verified_date": "2025-01-15",
+        "reverify_trigger": "Any change to fw-prod-g.yaml or zone assignments"
+      },
+      "negative_space": ["Service B not analyzed (out of scope)", "UDP traffic not shown (denied by default)"]
+    }
+  }
+}

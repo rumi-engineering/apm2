@@ -56,7 +56,9 @@ variables:
   COUNCIL_FLAG: "false"
   DRY_RUN: "false"
 
-references[5]:
+references[6]:
+  - path: ../../theory/glossary/glossary.json
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/prd-to-rfc-workflow.md
     purpose: "Primary decision tree for orchestration flow."
   - path: references/commands.md

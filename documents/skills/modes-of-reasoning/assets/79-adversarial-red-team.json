@@ -1,0 +1,263 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/adversarial-red-team@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z",
+    "updated_at": "2026-02-02T00:00:00Z"
+  },
+  "payload": {
+    "id": 79,
+    "name": "adversarial-red-team",
+    "cat": "meta",
+    "core": "Systematically attack a system, argument, or plan from an adversary's perspective to discover exploitable weaknesses before deployment. Key output: attack paths (sequence of actions leading to adversary goal), not just concerns or risks. Appropriate when: (a) system will face motivated adversaries, (b) failure consequences are severe, (c) assumptions need stress-testing, or (d) assurance case needs adversarial validation.",
+
+    "out": [
+      {"n": "attack_trees", "d": "hierarchical decomposition of adversary goals into sub-goals and leaf actions", "done": "root = adversary objective; leaves = concrete actions; each path is executable sequence"},
+      {"n": "exploit_poc", "d": "proof-of-concept demonstrating exploitability in safe environment", "done": "steps reproducible; impact quantified; environment specified"},
+      {"n": "failure_catalog", "d": "enumerated failures with likelihood, impact, and attack path reference", "done": "severity assigned (critical/high/medium/low); no orphan findings without paths"},
+      {"n": "assumption_hit_list", "d": "assumptions that would cause failure if false, ranked by fragility", "done": "each assumption has owner and validation method"},
+      {"n": "residual_risk_register", "d": "unmitigated vulnerabilities with explicit accept/defer/transfer decision", "done": "each entry has rationale, owner, and review date"}
+    ],
+
+    "proc": [
+      {
+        "step": 1,
+        "name": "Scope and boundary",
+        "action": "Define target system/argument, trust boundaries, and what counts as adversary success. Exclude out-of-scope elements explicitly.",
+        "asset": "scope_statement with in/out boundaries and success criteria"
+      },
+      {
+        "step": 2,
+        "name": "Adversary profiling",
+        "action": "Enumerate >=2 distinct adversary profiles: resources (budget, time), skills (script kiddie to nation-state), motivation (financial, ideological, insider grudge), and access (external, insider, supply chain).",
+        "asset": "adversary_profiles with capability matrix",
+        "gate": "If <2 profiles, brainstorm more before continuing"
+      },
+      {
+        "step": 3,
+        "name": "Objective enumeration",
+        "action": "For each adversary, list concrete objectives (steal data, disrupt service, manipulate decision, discredit argument). Map to adversary motivation.",
+        "asset": "objective_matrix[adversary][objective]"
+      },
+      {
+        "step": 4,
+        "name": "Attack vector generation",
+        "action": "Use structured taxonomy (STRIDE for software, MITRE ATT&CK for enterprise, argument attack patterns for rhetoric) to generate candidate attack vectors. Aim for breadth first.",
+        "asset": "raw_attack_vectors with taxonomy source"
+      },
+      {
+        "step": 5,
+        "name": "Prioritize by risk",
+        "action": "Score each vector: likelihood (1-5 based on adversary capability vs defense) x impact (1-5 based on objective value). Rank top 10.",
+        "asset": "prioritized_attack_list with scores",
+        "gate": "If all scores low, revisit adversary profiles or scope"
+      },
+      {
+        "step": 6,
+        "name": "Exploit validation",
+        "action": "For top 3-5 vectors, attempt exploitation in safe environment (sandbox, isolated copy, paper walkthrough for arguments). Document success/failure.",
+        "asset": "exploit_poc or failed_attempt_log with root cause"
+      },
+      {
+        "step": 7,
+        "name": "Mitigation design",
+        "action": "For each validated exploit, propose specific, testable countermeasure. Estimate implementation cost and residual risk.",
+        "asset": "mitigation_proposals with cost/residual pairs"
+      },
+      {
+        "step": 8,
+        "name": "Residual risk disposition",
+        "action": "For unmitigated or partially mitigated risks, make explicit accept/defer/transfer decision with rationale and owner.",
+        "asset": "residual_risk_register with decisions and review dates"
+      },
+      {
+        "step": 9,
+        "name": "Report and handoff",
+        "action": "Package findings with severity, remediation timeline, and verification criteria. Ensure defender can reproduce and verify fix.",
+        "asset": "red_team_report with executive summary and technical detail"
+      }
+    ],
+
+    "quick_check": [
+      ">=2 distinct adversary profiles defined with capability differences?",
+      "Each finding has concrete attack path (not just 'X is weak')?",
+      "Top 3 risks have exploitation attempt (success or documented failure)?",
+      "Mitigations are specific and testable (not 'improve security')?",
+      "Assumptions beyond obvious surface were challenged?",
+      "Residual risk register has explicit accept/defer/transfer decisions?",
+      "Findings prioritized by likelihood x impact (not just listed)?",
+      "Time allocation roughly 25% generation, 50% validation, 25% reporting?"
+    ],
+
+    "check": [
+      {"item": "adversary_diversity", "test": ">=2 adversary profiles with distinct capabilities (e.g., insider vs external, skilled vs opportunistic)"},
+      {"item": "path_concreteness", "test": "each finding specifies action sequence, not just weakness category"},
+      {"item": "validation_attempted", "test": "top 3 risks have exploit attempt with documented outcome"},
+      {"item": "mitigation_testability", "test": "each countermeasure has verification criteria (how to confirm it works)"},
+      {"item": "assumption_challenge", "test": ">=3 non-obvious assumptions identified and stress-tested"},
+      {"item": "residual_disposition", "test": "every unmitigated risk has accept/defer/transfer decision with rationale"},
+      {"item": "severity_differentiation", "test": "findings span >=2 severity levels; no uniform 'critical' or 'low'"},
+      {"item": "time_balance", "test": "more time spent validating than generating; generation phase was timeboxed"}
+    ],
+
+    "diff": {
+      "robust-worst-case": {
+        "contrast": "robust selects policy to survive worst-case; red-team attacks to find where policy fails",
+        "when_this": "stress-testing an existing design or policy",
+        "when_other": "selecting among candidate designs before building",
+        "complement": "red-team findings inform robust threat envelope"
+      },
+      "assurance-case": {
+        "contrast": "assurance argues system meets claims with evidence; red-team attacks to find evidence gaps or false claims",
+        "when_this": "challenging whether claims actually hold",
+        "when_other": "documenting why system is safe for regulators",
+        "complement": "assurance is the target; red-team is the challenger"
+      },
+      "counterexample-guided": {
+        "contrast": "CEGAR refines formal abstractions using counterexamples; red-team breaks real systems empirically with adversary mindset",
+        "when_this": "system too complex for formal model; need empirical attack",
+        "when_other": "system amenable to formal verification; need exhaustive proof",
+        "complement": "formal counterexamples can seed red-team vectors"
+      },
+      "game-theoretic": {
+        "contrast": "game theory models rational equilibrium strategies; red-team exploits any weakness regardless of equilibrium",
+        "when_this": "adversary may not play rationally; looking for any exploitable gap",
+        "when_other": "need to predict stable adversary strategy",
+        "complement": "game theory predicts what adversary should do; red-team tests what they could do"
+      },
+      "debiasing-epistemic-hygiene": {
+        "contrast": "debiasing audits your own cognition for bias; red-team simulates external adversary attacking your system",
+        "when_this": "threat is external actor, not internal reasoning error",
+        "when_other": "threat is your own overconfidence or blind spots",
+        "complement": "debiasing ensures red-team itself is not biased; red-team stress-tests debiased conclusions"
+      },
+      "diagnostic": {
+        "contrast": "diagnostic reasons backward from symptoms to cause; red-team reasons forward from adversary goal to attack path",
+        "when_this": "proactively finding vulnerabilities before exploitation",
+        "when_other": "reactively investigating after incident occurred",
+        "complement": "diagnostic finds root cause; red-team prevents recurrence by finding similar vectors"
+      }
+    },
+
+    "confusion": {
+      "vs_debiasing": {
+        "symptom": "Using red-team to check your own reasoning instead of simulating external attacker",
+        "diagnostic": "Are you roleplaying an adversary or auditing your cognition?",
+        "resolution": "If checking your own thinking, use debiasing (mode 80). Red-team requires adversary persona with different goals than yours."
+      },
+      "vs_fmea_hazop": {
+        "symptom": "Listing failure modes without adversary intent (e.g., 'component fails' without 'adversary causes component to fail')",
+        "diagnostic": "Are failures accidental (FMEA) or intentionally caused (red-team)?",
+        "resolution": "FMEA covers random failures; red-team covers adversarial exploitation. For safety-critical systems, do both."
+      },
+      "vs_devils_advocate": {
+        "symptom": "Arguing the opposite position without structured attack methodology",
+        "diagnostic": "Are you just disagreeing or following attack taxonomy with exploit validation?",
+        "resolution": "Devil's advocate is informal pushback. Red-team uses STRIDE/MITRE, builds attack trees, and attempts exploitation."
+      },
+      "vs_penetration_testing": {
+        "symptom": "Conflating methodology (red-team) with activity (pentest)",
+        "diagnostic": "Pentest is one application of red-team. Red-team applies to arguments, policies, and plans too.",
+        "resolution": "Use red-team for any domain needing adversarial stress-test, not just security. Pentest is red-team applied to software/network."
+      }
+    },
+
+    "fail": {
+      "name": "cynicism_theater",
+      "desc": "Clever-sounding attacks without validating real risk; long lists of theoretical vulnerabilities that waste defender resources or paralyze action.",
+      "signals": [
+        "Long lists of unvalidated theoretical vulnerabilities (>20 findings, <3 validated)",
+        "Attacks requiring implausible adversary capabilities (nation-state for low-value target)",
+        "No severity differentiation (everything is 'critical' or everything is 'medium')",
+        "Findings are unfixable or irrelevant to actual threat model",
+        "More time spent generating than validating",
+        "Recommendations are vague ('improve security', 'add monitoring')",
+        "Adversary model created after attacks, not before"
+      ],
+      "mitigations": [
+        {"m": "Require exploit proof", "test": "Top 3 findings have reproducible PoC or documented failed attempt with root cause", "fail_if": "Findings accepted without exploitation attempt"},
+        {"m": "Adversary-first generation", "test": "Adversary profiles documented before attack brainstorming began", "fail_if": "Adversary model retrofitted to justify existing attack list"},
+        {"m": "Risk-rank before expanding", "test": "First 10 findings prioritized by likelihood x impact before generating more", "fail_if": "Exhaustive list with uniform priority"},
+        {"m": "Time-box phases", "test": "25% generation, 50% validation, 25% reporting; tracked and enforced", "fail_if": "Validation phase squeezed or skipped"},
+        {"m": "Testable countermeasures", "test": "Each mitigation has verification criteria (how defender confirms fix)", "fail_if": "Mitigations are aspirational ('should improve X')"},
+        {"m": "Adversary capability calibration", "test": "Each adversary profile has realistic budget/skill constraints with evidence", "fail_if": "Adversary assumed to have unlimited capability"},
+        {"m": "Defender resource budget", "test": "Total remediation effort estimated and compared to defender capacity", "fail_if": "Recommendations exceed defender's realistic bandwidth"},
+        {"m": "Finding consolidation", "test": "Similar vulnerabilities grouped into patterns; no duplicate findings with different names", "fail_if": "Finding count inflated by splitting similar issues"}
+      ]
+    },
+
+    "use": [
+      "Security audits: penetration testing, threat modeling, vulnerability assessment",
+      "Safety analysis: FMEA/HAZOP with adversarial lens, fault-tree attack paths",
+      "Policy stress-testing: gaming regulations, circumventing controls, incentive exploitation",
+      "Argument review: finding logical gaps, weak evidence, unstated assumptions in proposals",
+      "Incentive design: identifying exploitation vectors in mechanism design",
+      "Pre-mortems: adversarial project failure analysis",
+      "AI safety: jailbreak testing, prompt injection, adversarial inputs",
+      "Contract review: finding loopholes, escape clauses, ambiguous terms"
+    ],
+
+    "rel": [
+      {"id": 49, "name": "robust-worst-case", "role": "defensive policy selection; red-team informs threat envelope"},
+      {"id": 36, "name": "assurance-case", "role": "structured target for red-team challenges"},
+      {"id": 8, "name": "counterexample-guided", "role": "formal counterpart; provides exhaustive but narrower coverage"},
+      {"id": 55, "name": "game-theoretic-strategic", "role": "models equilibrium; red-team tests exploitability beyond equilibrium"},
+      {"id": 58, "name": "mechanism-design", "role": "designs incentive-compatible systems; red-team finds exploitation vectors"},
+      {"id": 80, "name": "debiasing-epistemic-hygiene", "role": "audits red-team's own cognition; prevents confirmation bias in attack selection"},
+      {"id": 41, "name": "diagnostic", "role": "post-incident root cause; red-team is pre-incident proactive"}
+    ],
+
+    "ex": {
+      "target": "Employee onboarding system with auto-provisioned cloud access",
+      "adversary_profiles": [
+        {"name": "Disgruntled insider", "skills": "moderate (knows internal systems)", "resources": "low (personal time)", "motivation": "revenge/data theft", "access": "valid credentials"},
+        {"name": "External attacker via phishing", "skills": "high (professional)", "resources": "medium", "motivation": "financial", "access": "needs initial foothold"}
+      ],
+      "attack_tree": {
+        "root": "Exfiltrate customer data after departure",
+        "branches": [
+          {
+            "path": ["Submit resignation without IT notification", "Use onboarding API to provision elevated service account", "Use service account post-departure for data access"],
+            "likelihood": 4,
+            "impact": 5
+          },
+          {
+            "path": ["Create shadow admin account during notice period", "Access persists after primary credential revocation"],
+            "likelihood": 3,
+            "impact": 5
+          }
+        ]
+      },
+      "validated_exploit": "Successfully called onboarding API with regular user token to create service account with storage-admin role. No approval workflow triggered.",
+      "finding": "API lacks authorization check for elevated access requests; service accounts not tied to employee lifecycle",
+      "mitigation": {
+        "action": "Add manager-approval workflow for service account creation; link service account expiry to employment termination event",
+        "verification": "Attempt service account creation without approval; should fail with 403 and audit log entry"
+      },
+      "residual": {
+        "risk": "Approved service accounts could still be misused during notice period",
+        "decision": "Accept with monitoring: alert on unusual data access patterns during notice period"
+      }
+    },
+
+    "micro_example": {
+      "context": "Red-teaming a product launch decision argument",
+      "target_argument": "We should launch Product X because: (1) market research shows demand, (2) we have first-mover advantage, (3) engineering says it's ready",
+      "adversary_persona": "Skeptical board member who has seen launches fail",
+      "attacks": [
+        {"claim": "Market research shows demand", "attack": "Sample size 50, all from existing customers; no evidence of broader market", "severity": "high"},
+        {"claim": "First-mover advantage", "attack": "Competitor Y filed patents 6 months ago; may launch first", "severity": "critical"},
+        {"claim": "Engineering says ready", "attack": "No load testing beyond 100 users; launch expects 10,000", "severity": "high"}
+      ],
+      "mitigations": [
+        "Expand market research to 500 respondents including non-customers",
+        "Verify competitor patent status and timeline",
+        "Require load test at 2x expected launch traffic"
+      ],
+      "outcome": "Launch delayed 6 weeks; competitor launched first but with critical bugs; our launch succeeded"
+    }
+  }
+}

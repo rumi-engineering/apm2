@@ -3,7 +3,7 @@ prd_meta:
   template_version: "2026-01-23"
   prd:
     id: PRD-0009
-    title: "Forge Admission Cycle (FAC) v1.1 - Hardened Protocol with Efficient ZTI and Phase-2 Drift Controls"
+    title: "Forge Admission Cycle (FAC) v1.1 - Hardened Protocol with Efficient Context Discipline and Phase-2 Drift Controls"
     status: DRAFT
     created_date: "2026-01-29"
     last_updated_date: "2026-01-29"
@@ -21,7 +21,7 @@ prd_meta:
       - holon_id: HOLON-COORDINATOR
         role: CAS-at-commit orchestration, bounded retries, echo-trap detection
       - holon_id: HOLON-CONTEXT-COMPILER
-        role: CCP/RCP compilation, impact expansion, ZTI scoring
+        role: CCP/RCP compilation, impact expansion, Context Efficiency scoring
       - holon_id: HOLON-GITHUB-ADAPTER
         role: projection-only sync + divergence watchdog
       - holon_id: HOLON-AUDITOR
@@ -57,7 +57,7 @@ prd_meta:
       lint_spec: standards/lint/LINT_SPEC.yaml#lint_spec
     related_documents:
       glossary: documents/skills/glossary/SKILL.md
-      laws: documents/skills/laws-of-holonic-agent-systems/SKILL.md
+      laws: documents/theory/AGENTS.md
       work_substrate: documents/prds/PRD-0004/
       cac_substrate: documents/prds/PRD-0007/
       coordination: documents/rfcs/RFC-0012/

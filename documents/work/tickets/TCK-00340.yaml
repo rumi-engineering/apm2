@@ -1,0 +1,59 @@
+ticket_meta:
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
+  ticket:
+    id: TCK-00340
+    title: 'Security hardening: multi-holon policy inheritance enforcement + attestation tightening'
+  binds:
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
+    requirements:
+    - requirement_id: REQ-0016
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0016.yaml#requirement
+    evidence_artifacts:
+    - evidence_id: EVID-0016
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0016.yaml#evidence_artifact
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_SECURITY
+    - DOMAIN_KERNEL
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00339
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
+  scope:
+    in_scope:
+    - Enforce policy inheritance rules across holonic boundaries (subleases are strict subsets)
+    - Rachet attestation requirements by risk tier for receipts (ToolExecutionReceipt, ReviewReceipt,
+      ProjectionReceipt)
+    - Fail closed for missing attestations in high-risk tiers
+    out_of_scope:
+    - Cross-cell federation protocols
+  plan:
+    steps:
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Enforce policy inheritance rules across holonic boundaries (subleases are strict
+      subsets)'
+    - 'Implement: Rachet attestation requirements by risk tier for receipts (ToolExecutionReceipt,
+      ReviewReceipt, ProjectionReceipt)'
+    - 'Implement: Fail closed for missing attestations in high-risk tiers'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
+  definition_of_done:
+    evidence_ids:
+    - EVID-0016
+    criteria:
+    - Higher risk tiers require stronger attestations without breaking low-tier throughput
+    - Missing/invalid attestation fails closed where required
+  notes:
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.

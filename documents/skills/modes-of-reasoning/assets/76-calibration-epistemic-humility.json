@@ -1,0 +1,243 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/calibration-epistemic-humility@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z",
+    "updated_at": "2026-02-02T00:00:00Z"
+  },
+  "payload": {
+    "id": 76,
+    "name": "calibration-epistemic-humility",
+    "cat": "meta",
+    "core": "Measure how well stated confidence matches actual accuracy across many predictions, then adjust future confidence accordingly. Second-order reasoning: asks 'how good am I at knowing what's true?' not 'what is true?'. Key insight: confidence without track record is just optimism.",
+
+    "out": [
+      {"name": "prediction_log", "desc": "timestamped forecasts with percentage confidence, resolution criteria, and resolution deadline—logged BEFORE outcomes known"},
+      {"name": "calibration_curve", "desc": "plot of stated confidence (x) vs actual hit rate (y); perfect calibration = diagonal; above = underconfidence, below = overconfidence"},
+      {"name": "brier_score", "desc": "(confidence - outcome)^2 averaged across predictions; 0 = perfect, 0.25 = random, <0.2 = good; decomposable into calibration + resolution + uncertainty"},
+      {"name": "calibration_gap_report", "desc": "per-band analysis (50-60%, 60-70%, ..., 90-100%) showing hit rate vs stated confidence; flags bands >10% off diagonal"},
+      {"name": "adjustment_rule", "desc": "mapping from felt confidence to stated confidence based on measured bias (e.g., 'when I feel 90%, say 70%')"},
+      {"name": "domain_accuracy_profile", "desc": "calibration metrics broken down by topic area; identifies systematically better/worse domains"}
+    ],
+
+    "proc": [
+      {
+        "step": 1,
+        "name": "Log prediction before outcome",
+        "action": "Record forecast with: (a) specific falsifiable claim, (b) percentage confidence 50-99%, (c) resolution criteria, (d) resolution deadline.",
+        "gate": "If prediction logged after outcome known, discard—post-hoc is worthless.",
+        "example": "Prediction: 'PR #1234 merges without CI failure' @ 75%, resolves when PR closes, deadline EOD Friday."
+      },
+      {
+        "step": 2,
+        "name": "Score resolution",
+        "action": "When outcome known: mark 1 (correct) or 0 (incorrect). Compute Brier component: (confidence - outcome)^2.",
+        "gate": "No partial credit. If resolution criteria ambiguous, mark as 'unscored' and tighten criteria for future predictions.",
+        "example": "PR merged with CI pass -> outcome=1. Brier component = (0.75 - 1)^2 = 0.0625."
+      },
+      {
+        "step": 3,
+        "name": "Accumulate until N >= 30",
+        "action": "Continue logging and scoring. Do not compute calibration metrics until N >= 30 predictions scored.",
+        "gate": "N < 30 = insufficient data. Report 'calibration pending, N=X' instead of metrics.",
+        "example": "After 6 weeks: 34 predictions scored, ready for analysis."
+      },
+      {
+        "step": 4,
+        "name": "Compute calibration metrics",
+        "action": "Calculate overall Brier score. Bin predictions by stated confidence (50-60%, 60-70%, etc.). For each bin: actual hit rate = sum(outcomes)/N_bin.",
+        "gate": "If any bin has N < 5, merge with adjacent bin or report as 'sparse'.",
+        "example": "90-100% bin: 12 predictions, 8 correct = 67% hit rate (vs 90-100% stated). Overconfident by 23-33%."
+      },
+      {
+        "step": 5,
+        "name": "Identify systematic biases",
+        "action": "Compare actual vs stated per band. Flag bands >10% off. Check domain breakdown for outliers. Common patterns: overconfident at high end, underconfident at low end.",
+        "gate": "If ALL bands within 10%, you are well-calibrated—focus shifts to improving resolution (sharpness).",
+        "example": "Pattern: 80-90% band only 65% accurate; worst in 'new technology' domain."
+      },
+      {
+        "step": 6,
+        "name": "Construct adjustment rule",
+        "action": "For each miscalibrated band, create mapping: felt_confidence -> stated_confidence. Typical: subtract 15-20% from high-confidence bands.",
+        "gate": "Adjustment rule must be testable: apply to next 30 predictions and re-evaluate.",
+        "example": "Rule: 90% felt -> state 70%. 80% felt -> state 65%. New tech: add extra 10% discount."
+      },
+      {
+        "step": 7,
+        "name": "Iterate and track improvement",
+        "action": "After 30+ new predictions with adjustment rule applied, recompute Brier score and calibration curve. Compare to previous period.",
+        "gate": "If Brier not improved, revise rule or investigate domain-specific issues.",
+        "example": "Q1: Brier=0.22. Q2 with adjustments: Brier=0.18. 90% band now 75% accurate (was 60%)."
+      }
+    ],
+
+    "check": [
+      "Prediction logged BEFORE outcome known? (timestamp proves it)",
+      "Confidence stated as percentage, not 'likely' or 'probable'?",
+      "Resolution criteria unambiguous—would two people agree on outcome?",
+      "N >= 30 scored predictions before computing metrics?",
+      "Calibration curve computed and plotted by confidence band?",
+      "Brier score calculated? (benchmark: <0.25 beats random, <0.2 is good)",
+      "Systematic biases identified by band AND by domain?",
+      "Adjustment rule articulated with testable mapping?",
+      "Improvement tracked across time periods?"
+    ],
+
+    "diff": {
+      "meta-reasoning": {
+        "boundary": "Meta-reasoning selects which reasoning mode to use BEFORE reasoning. Calibration scores accuracy AFTER many predictions resolve.",
+        "test": "Are you choosing how to think (meta) or measuring how well you thought (calibration)?"
+      },
+      "debiasing-epistemic-hygiene": {
+        "boundary": "Debiasing applies corrective checks to a SINGLE decision now. Calibration measures accuracy across MANY decisions over time.",
+        "test": "Are you auditing this one judgment (debiasing) or your track record across judgments (calibration)?"
+      },
+      "bayesian-probabilistic": {
+        "boundary": "Bayesian updates beliefs with new evidence using Bayes' rule. Calibration scores whether your posteriors match actual frequencies long-run.",
+        "test": "Are you updating P(H|E) now (Bayesian) or checking if your 70% confidence predictions come true 70% of the time (calibration)?"
+      },
+      "reference-class-outside-view": {
+        "boundary": "Reference-class provides base rates for a SPECIFIC forecast. Calibration evaluates YOUR forecasting accuracy across ALL techniques.",
+        "test": "Are you anchoring this estimate on historical data (reference-class) or measuring your personal hit rate (calibration)?"
+      },
+      "reflective-equilibrium": {
+        "boundary": "Reflective equilibrium seeks coherence between principles and judgments. Calibration compares predictions to outcomes—no coherence, just accuracy.",
+        "test": "Are you reconciling beliefs with principles (equilibrium) or comparing forecasts to reality (calibration)?"
+      },
+      "statistical-frequentist": {
+        "boundary": "Frequentist methods compute p-values and confidence intervals for data analysis. Calibration applies frequentist thinking to YOUR OWN predictions.",
+        "test": "Are you analyzing external data (frequentist) or your internal confidence accuracy (calibration)?"
+      }
+    },
+
+    "confusions": [
+      {
+        "pair": ["calibration", "debiasing"],
+        "confusion": "Both improve judgment quality, but debiasing is per-decision intervention while calibration is cross-decision measurement.",
+        "resolution": "Use debiasing on each decision. Use calibration to measure whether debiasing (and other techniques) actually improved your hit rate."
+      },
+      {
+        "pair": ["calibration", "bayesian"],
+        "confusion": "Both involve probability, but Bayesian computes what to believe; calibration checks whether your beliefs match reality over time.",
+        "resolution": "Bayesian is the reasoning process. Calibration is the feedback loop that tells you if your Bayesian reasoning is well-calibrated."
+      },
+      {
+        "pair": ["calibration", "reference-class"],
+        "confusion": "Both use historical data, but reference-class uses OTHER projects' outcomes; calibration uses YOUR OWN prediction track record.",
+        "resolution": "Reference-class: 'projects like this take 12 weeks on average.' Calibration: 'when I say 80% confident, I'm right 65% of the time.'"
+      },
+      {
+        "pair": ["calibration", "meta-reasoning"],
+        "confusion": "Both are meta-level, but meta-reasoning is prospective (choosing mode) while calibration is retrospective (scoring accuracy).",
+        "resolution": "Meta-reasoning: 'which reasoning approach should I use?' Calibration: 'how accurate have my predictions been?'"
+      }
+    ],
+
+    "fail": {
+      "mode": "confidence_without_track_record",
+      "desc": "Expressing confidence levels without any mechanism to verify whether they match reality. Confidence becomes social signaling rather than probability.",
+      "signals": [
+        "no prediction log exists—confidence is pure assertion",
+        "predictions recorded AFTER outcomes known (hindsight contamination)",
+        "vague unfalsifiable predictions ('this might not work well')",
+        "same confidence for everything (80% on all predictions = no discrimination)",
+        "never scored wrong (only remembering hits)",
+        "confidence levels never revised despite track record",
+        "denominator blindness (only counts correct predictions, not total)"
+      ],
+      "mitigations": [
+        {
+          "mitigation": "Mandatory prediction log with timestamps",
+          "test": "Does log exist with >= 30 entries? Are timestamps BEFORE resolution dates?",
+          "threshold": "100% of high-stakes predictions logged; random audit of 10% shows timestamps precede outcomes"
+        },
+        {
+          "mitigation": "Percentage-only confidence",
+          "test": "Zero predictions use 'likely', 'probably', 'confident'—only X% format allowed",
+          "threshold": "100% compliance; log rejected if vague terms found"
+        },
+        {
+          "mitigation": "Pre-registered resolution criteria",
+          "test": "Each prediction has criteria that two independent raters would score identically",
+          "threshold": "Inter-rater agreement >= 90% on resolution coding"
+        },
+        {
+          "mitigation": "Forced scoring of all predictions",
+          "test": "Unresolved predictions flagged automatically when deadline passes; no 'quiet expiration'",
+          "threshold": "Unscored rate < 5% (only truly unresolvable cases)"
+        },
+        {
+          "mitigation": "External accountability partner",
+          "test": "Another person reviews log monthly and signs off on scoring",
+          "threshold": "12 monthly sign-offs per year"
+        },
+        {
+          "mitigation": "Calibration review cadence",
+          "test": "Quarterly calibration report generated with Brier score and adjustment rule update",
+          "threshold": "4 reports per year with documented rule changes"
+        },
+        {
+          "mitigation": "Skin in the game",
+          "test": "Predictions tied to consequences (bets, reputation scores, decision weight)",
+          "threshold": "At least 20% of predictions have tangible stakes"
+        }
+      ]
+    },
+
+    "use": [
+      "forecasting teams measuring and improving prediction accuracy",
+      "risk management ensuring stated confidence matches actual outcomes",
+      "decision post-mortems systematically scoring past judgment quality",
+      "expert elicitation calibrating SME confidence before using their estimates",
+      "estimation improvement reducing planning fallacy through feedback",
+      "high-stakes domains (medicine, security, finance) where overconfidence has severe consequences",
+      "AI/ML systems outputting confidence scores that need validation",
+      "personal epistemic improvement for knowledge workers"
+    ],
+
+    "rel": [
+      {"id": 11, "name": "bayesian-probabilistic", "role": "normative standard for belief updating; calibration checks if your Bayesian reasoning is accurate"},
+      {"id": 18, "name": "reference-class-outside-view", "role": "provides base rates for specific forecasts; calibration measures your forecasting skill"},
+      {"id": 75, "name": "meta-reasoning", "role": "selects reasoning mode prospectively; calibration scores mode effectiveness retrospectively"},
+      {"id": 80, "name": "debiasing-epistemic-hygiene", "role": "per-decision correction; calibration measures whether corrections work over time"},
+      {"id": 45, "name": "decision-theoretic", "role": "uses probabilities to choose actions; calibration ensures probability inputs are accurate"},
+      {"id": 77, "name": "reflective-equilibrium", "role": "coherence between principles and judgments; calibration is accuracy against outcomes"},
+      {"id": 10, "name": "statistical-frequentist", "role": "frequentist thinking applied to your own prediction track record"},
+      {"id": 52, "name": "value-of-information", "role": "decides whether to gather more data; calibration tells you how much to trust your current judgment"}
+    ],
+
+    "ex": {
+      "situation": "Tech lead assessing personal calibration on project timeline estimates",
+      "steps": [
+        "SETUP: Created spreadsheet with columns: prediction, confidence%, resolution_criteria, deadline, outcome, brier_component",
+        "LOG (6 months): Recorded 40 timeline predictions before sprint planning meetings. Example: 'Feature X ships in sprint 12' @ 80%",
+        "SCORE: After each deadline, marked outcome (1=shipped, 0=missed). Computed Brier component for each.",
+        "ANALYZE: Overall Brier = 0.22. Binned by confidence: 90-100% band (N=15) had only 60% hit rate. 70-80% band (N=12) had 75% hit rate.",
+        "DIAGNOSE: Systematic overconfidence at high end. Domain breakdown: 'new tech' projects 45% hit rate at 80%+ confidence; 'incremental' projects 85% hit rate.",
+        "ADJUST: New rule: 90% felt -> state 70%. For new tech: add extra 15% discount (90% felt -> state 55%).",
+        "ITERATE: Next quarter with adjustment rule: Brier improved to 0.18. 90% band now 75% accurate (was 60%). New tech band improved from 45% to 60%."
+      ],
+      "asset": {
+        "log": "prediction_log.csv (40 entries)",
+        "curve": "calibration_curve.png",
+        "rule": "adjustment_rule.md",
+        "report": "quarterly_comparison.md"
+      }
+    },
+
+    "micro_ex": {
+      "situation": "Developer self-calibrating on code review predictions",
+      "predictions": [
+        "'PR will pass review first try' @ 70% -> failed (0) -> Brier = 0.49",
+        "'No critical bugs in my changes' @ 85% -> passed (1) -> Brier = 0.02",
+        "'Deploy completes < 30min' @ 60% -> passed (1) -> Brier = 0.16"
+      ],
+      "running_brier": "(0.49 + 0.02 + 0.16) / 3 = 0.22",
+      "pattern": "After 30 predictions: 85%+ band only 65% accurate. Adjustment: when feeling 85%, state 70%."
+    }
+  }
+}

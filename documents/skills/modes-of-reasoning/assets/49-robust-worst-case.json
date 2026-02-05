@@ -1,0 +1,150 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/robust-worst-case@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 49,
+    "name": "robust-worst-case",
+    "cat": "decision",
+    "core": "Select actions yielding acceptable outcomes under worst plausible conditions via minimax optimization over threat envelope. Key question: 'What is the worst that can happen, and can I live with it?' Appropriate when (a) outcomes below a floor are catastrophic/unacceptable, (b) probabilities are unknown or adversarially chosen, or (c) regulatory/contractual guarantees require worst-case bounds.",
+    "out": [
+      {"n": "threat_envelope", "d": "bounded set of adverse conditions to defend against, with credibility evidence per threat"},
+      {"n": "worst_case_bound", "d": "minimum guaranteed outcome across all threats in envelope, computed not asserted"},
+      {"n": "safety_margin", "d": "gap between worst-case bound and minimum acceptable threshold"},
+      {"n": "robust_policy", "d": "action or strategy achieving the worst-case bound"},
+      {"n": "robustness_cost", "d": "expected-value sacrifice compared to optimizing without robustness constraint"},
+      {"n": "residual_risk_statement", "d": "threats outside envelope with rationale for exclusion and monitoring triggers"}
+    ],
+    "proc": [
+      {"step": "determine_if_robust_appropriate", "test": "answer yes to: (a) floor outcome exists below which is unacceptable? (b) probabilities genuinely unknown or adversarial? (c) must provide contractual/regulatory guarantee?", "if_no": "consider decision-theoretic (mode 45) or minimax-regret (mode 50)"},
+      {"step": "define_threat_envelope", "actions": ["enumerate threat dimensions (load, failure rate, adversary capability)", "set credible upper bound per dimension with citation (historical max, regulatory spec, adversary budget)", "decide correlation: independent vs simultaneous worst-case"], "asset": "threat_envelope with bounds and evidence"},
+      {"step": "enumerate_candidate_actions", "actions": ["list feasible policies/designs", "include baseline and conservative variants", "exclude options that cannot meet floor under any threat"], "asset": "action_set"},
+      {"step": "evaluate_worst_case_per_action", "actions": ["for each action, compute outcome under simultaneous worst-case of all envelope dimensions", "use analytical bound, simulation, or formal verification", "record method and assumptions"], "asset": "worst_case_matrix[action][threat_combo]"},
+      {"step": "select_minimax_action", "actions": ["rank actions by worst-case outcome (higher is better)", "apply floor constraint: reject actions whose worst-case < threshold", "among survivors, select max(min(outcome))"], "asset": "robust_policy with justification"},
+      {"step": "compute_robustness_cost", "actions": ["estimate expected value under nominal distribution for robust action vs EU-optimal action", "report difference as 'robustness tax'", "if tax exceeds budget, revisit envelope bounds"], "asset": "robustness_cost with comparison"},
+      {"step": "document_residual_risk", "actions": ["list threats outside envelope with exclusion rationale", "define monitoring triggers that would indicate envelope breach", "schedule periodic envelope review"], "asset": "residual_risk_statement with review_triggers"}
+    ],
+    "check": [
+      {"item": "envelope_bounded_with_evidence", "test": "each threat dimension has explicit upper bound with citation (regulation, historical data, or adversary model)"},
+      {"item": "worst_case_computed_not_asserted", "test": "outcome under worst-case derived via analysis/simulation, not stated without derivation"},
+      {"item": "floor_threshold_explicit", "test": "minimum acceptable outcome stated with units and stakeholder sign-off"},
+      {"item": "robustness_cost_quantified", "test": "expected-value comparison between robust and EU-optimal action documented"},
+      {"item": "residual_risk_documented", "test": "out-of-envelope threats listed with exclusion rationale"},
+      {"item": "review_trigger_defined", "test": "conditions that would invalidate envelope (new threat class, bound exceeded) specified"},
+      {"item": "tiered_envelope_considered", "test": "if cost high, evaluated plausible vs extreme tiers with different response levels"}
+    ],
+    "diff": {
+      "decision-theoretic": {
+        "contrast": "robust optimizes worst-case floor; decision-theoretic optimizes probability-weighted expected utility",
+        "when_robust": "probabilities unknown, adversarial, or floor failure is catastrophic",
+        "when_other": "probabilities reliable and no hard floor constraint"
+      },
+      "minimax-regret": {
+        "contrast": "robust minimizes absolute worst outcome; regret minimizes worst hindsight shortfall from best-in-scenario",
+        "when_robust": "absolute outcome matters (safety floor); regret allows poor absolute outcome if 'everyone else did poorly too'",
+        "when_other": "relative performance matters (competitive strategy) and no catastrophic outcomes"
+      },
+      "adversarial-red-team": {
+        "contrast": "robust defends by selecting policy with acceptable worst-case; red-team attacks to find where worst-case exceeds expectation",
+        "when_robust": "selecting defensive policy",
+        "when_other": "stress-testing an existing policy; modes are complements (red-team informs envelope)"
+      },
+      "assurance-case": {
+        "contrast": "robust selects policy achieving bound; assurance-case documents evidence that bound is actually achieved",
+        "when_robust": "deciding what to do",
+        "when_other": "justifying that decision to auditors/regulators"
+      },
+      "imprecise-probability": {
+        "contrast": "IP represents uncertainty as probability interval; robust is decision rule consuming that uncertainty",
+        "when_robust": "need to choose action, not just represent uncertainty",
+        "when_other": "characterizing uncertainty before decision; often used together"
+      }
+    },
+    "fail": {
+      "mode": "overconservatism",
+      "desc": "threat envelope includes implausible scenarios, worst-case bound is unnecessarily pessimistic, leaving value on table or making solution unaffordable",
+      "signals": [
+        "envelope includes scenarios with negligible probability (<0.1% and non-adversarial)",
+        "stakeholders reject solution as too costly relative to actual risk",
+        "cannot articulate credible evidence for worst-case bound",
+        "robustness cost exceeds 50% of expected value and no regulatory mandate",
+        "envelope unchanged despite new data narrowing threat range"
+      ],
+      "mit": [
+        {"m": "require credibility evidence per threat", "test": "each envelope bound has citation: historical max, regulatory spec, or adversary-capability analysis", "fail_if": "bound stated without source or 'to be safe'"},
+        {"m": "compute and budget robustness tax", "test": "robustness_cost asset exists with comparison to EU-optimal; tax reviewed against budget", "fail_if": "no cost comparison or tax exceeds budget without mandate"},
+        {"m": "use tiered envelopes", "test": "separate 'plausible' (design basis) vs 'extreme' (beyond design) envelopes with different response levels", "fail_if": "single envelope with no severity tiers"},
+        {"m": "set value-at-risk budget", "test": "maximum acceptable worst-case loss stated; envelope trimmed to that budget", "fail_if": "envelope defined without loss budget"},
+        {"m": "red-team the envelope", "test": "adversarial review challenged whether bounds are too loose or too tight; at least 3 challenges documented", "fail_if": "envelope accepted without adversarial scrutiny"},
+        {"m": "schedule envelope refresh", "test": "review date set; new data triggers bound update", "fail_if": "envelope treated as permanent"}
+      ]
+    },
+    "use": [
+      "safety-critical systems: aircraft, medical devices, nuclear (regulatory floors)",
+      "security design: assume adversary optimizes against you",
+      "SLA/contract guarantees: must meet bound or pay penalty",
+      "tail-risk control: portfolio must survive worst drawdown",
+      "infrastructure sizing: capacity must handle peak load",
+      "adversarial ML: certified robustness against perturbation budget"
+    ],
+    "rel": [
+      {"id": 45, "n": "decision-theoretic", "r": "alternative when probabilities known"},
+      {"id": 50, "n": "minimax-regret", "r": "alternative when relative performance matters"},
+      {"id": 21, "n": "imprecise-probability", "r": "uncertainty representation often paired with robust decision rule"},
+      {"id": 79, "n": "adversarial-red-team", "r": "stress-tests envelope; complement not substitute"},
+      {"id": 36, "n": "assurance-case", "r": "documents evidence that robust bound achieved"}
+    ],
+    "ex": {
+      "situation": "Design backup power for hospital; must maintain critical systems during grid outage",
+      "envelope": {
+        "threat_dimensions": [
+          {"dim": "outage_duration", "bound": "72 hours", "evidence": "historical max regional outage + 50% margin"},
+          {"dim": "peak_load", "bound": "800 kW", "evidence": "measured peak + 10% growth buffer"},
+          {"dim": "generator_failure", "bound": "1 of 2 fails", "evidence": "N+1 redundancy standard"}
+        ],
+        "correlation": "simultaneous (outage may stress generator)"
+      },
+      "actions": ["diesel_only", "diesel_plus_battery", "diesel_plus_battery_plus_solar"],
+      "worst_case_analysis": {
+        "diesel_only": "72h * 800kW / 1 gen = exceeds fuel capacity; fails floor",
+        "diesel_plus_battery": "battery covers 8h peak; diesel covers remainder with 1 gen; meets floor with 4h margin",
+        "diesel_plus_battery_plus_solar": "solar reduces fuel need; meets floor with 12h margin"
+      },
+      "selection": "diesel_plus_battery (meets floor; solar adds margin but 40% cost increase exceeds robustness budget)",
+      "robustness_cost": "15% premium over diesel_only which would fail under worst-case",
+      "residual_risk": "outage > 72h (excluded: no historical precedent; trigger: regional grid upgrade delays)"
+    },
+    "confusion": {
+      "vs_decision_theoretic": {
+        "symptom": "using robust when probabilities are well-characterized and no hard floor",
+        "diagnostic": "can you assign calibrated probabilities? is there a true catastrophic threshold?",
+        "resolution": "if probabilities known and outcomes are continuous (no cliff), use EU maximization with sensitivity analysis"
+      },
+      "vs_minimax_regret": {
+        "symptom": "confusing 'worst outcome' with 'worst regret'",
+        "diagnostic": "do you care about absolute outcome (lives, dollars) or relative performance (vs best-in-hindsight)?",
+        "resolution": "robust: 'I must not fall below X'; regret: 'I must not look bad compared to what I could have done'"
+      },
+      "vs_adversarial_red_team": {
+        "symptom": "thinking robust and red-team are alternatives",
+        "diagnostic": "are you selecting a policy or stress-testing one?",
+        "resolution": "red-team informs threat envelope; robust uses envelope to select policy; they are complements"
+      },
+      "vs_assurance_case": {
+        "symptom": "conflating policy selection with policy justification",
+        "diagnostic": "are you deciding what to do or explaining why it's safe?",
+        "resolution": "robust selects; assurance documents; robust policy becomes claim in assurance case"
+      },
+      "vs_imprecise_probability": {
+        "symptom": "confusing uncertainty representation with decision rule",
+        "diagnostic": "are you characterizing what you don't know or choosing what to do?",
+        "resolution": "IP gives you [P_low, P_high]; robust tells you to optimize at P that hurts most"
+      }
+    }
+  }
+}

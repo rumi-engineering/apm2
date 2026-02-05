@@ -1,0 +1,15 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0014"
+  title: "FAC efficiency evidence (deltas, caching, specialization)"
+  category: "PERF_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that FAC iteration economics are controlled via context deltas, CAS-backed caching, and
+    specialist role slicing, keeping multi-iteration runs within fixed budgets.
+  requirement_ids:
+    - "REQ-0014"
+  source_refs:
+    - "documents/rfcs/RFC-0019/requirements/REQ-0014.yaml"
+    - "documents/rfcs/RFC-0019/10_fac_efficiency_and_role_specs.md"
+  artifacts: []

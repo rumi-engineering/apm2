@@ -1,0 +1,157 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/constructive-intuitionistic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 3,
+    "name": "constructive-intuitionistic",
+    "cat": "formal",
+    "core": "A proof of existence must provide a construction/witness; excluded middle (P or not-P) and double-negation elimination are rejected. If you prove 'there exists x', you must exhibit x or an algorithm that computes it. The proof IS the program.",
+    "key_principle": "Existence without witness is not existence. Every disjunction must be resolved by constructing one disjunct. The proof term extracts to runnable code.",
+    "quick_decision": [
+      "Will the existence proof be executed as code? -> YES: use constructive",
+      "Do you need 'there exists' to mean 'I can compute it'? -> YES: use constructive",
+      "Is classical proof-by-contradiction acceptable for this claim? -> YES: use mode 02 instead",
+      "Is the witness obvious and you just need to verify properties? -> YES: use mode 01/02 instead"
+    ],
+    "out": [
+      {"type": "witness", "form": "explicit value or algorithm", "verify": "witness computes and satisfies predicate; can be executed", "example": "for 'exists prime > 1000': output 1009 with primality certificate"},
+      {"type": "constructive_proof", "form": "derivation in intuitionistic logic", "verify": "no LEM/DNE steps; every existence resolved by witness; proof assistant accepts", "example": "Coq proof using only intro/elim tactics, no 'classic' import"},
+      {"type": "extracted_program", "form": "runnable code from proof", "verify": "program terminates on all inputs in domain; output matches spec", "example": "Coq Extraction yields OCaml function that runs on concrete inputs"},
+      {"type": "witness_certificate", "form": "proof that witness satisfies predicate", "verify": "certificate independently checkable; witness + certificate = complete constructive proof", "example": "for sorted list witness, certificate is proof of ordering property"}
+    ],
+    "proc": [
+      {"step": 1, "name": "classify_claim", "do": "determine if claim is existence (there-exists), universal (for-all), or disjunction (A or B)", "gate": "existence claims flagged 'witness-required'; disjunctions flagged 'must-resolve'", "output": "classified claim with constructive obligations"},
+      {"step": 2, "name": "check_necessity", "do": "ask: Will this witness be executed? Is computability required by downstream?", "gate": "if no execution needed AND classical proof simpler, exit to mode 02 with rationale", "output": "decision: proceed-constructive or escalate-classical"},
+      {"step": 3, "name": "audit_classical_shortcuts", "do": "scan proof strategy for LEM (P or not-P assumed), DNE (not-not-P -> P), or proof-by-contradiction for existence", "gate": "each violation must be refactored or explicitly marked as classical escape", "output": "list of non-constructive steps with refactor plan or escape justification"},
+      {"step": 4, "name": "construct_witness", "do": "build explicit object/algorithm satisfying the predicate; for disjunctions, commit to left or right branch with construction", "gate": "witness is computable (terminates on relevant inputs), not merely 'known to exist'", "output": "witness term/algorithm with termination argument"},
+      {"step": 5, "name": "derive_properties", "do": "prove properties of witness using only constructive rules (intro/elim, no classical axioms)", "gate": "each derivation step corresponds to computation step; no oracle calls", "output": "property proofs attached to witness"},
+      {"step": 6, "name": "extract_program", "do": "if using proof assistant, run extraction to obtain executable code", "gate": "extracted code compiles; type matches specification; test on 3+ concrete inputs", "output": "extracted source file + test results"},
+      {"step": 7, "name": "validate_end_to_end", "do": "run witness/extracted program against original predicate on boundary cases", "gate": "all boundary cases pass; no runtime errors; output matches claimed property", "output": "validation report with test cases and results"}
+    ],
+    "check": [
+      {"item": "witness explicitly constructed (not just proved to exist)?", "test": "can you print/display the witness value?", "fail_action": "refactor to produce explicit term"},
+      {"item": "no reliance on excluded middle or double-negation elimination?", "test": "grep proof for 'classic', 'NNPP', 'excluded_middle'; all hits justified or removed", "fail_action": "refactor each use or document classical escape"},
+      {"item": "derivation computationally extractable to terminating program?", "test": "extraction command succeeds; extracted code passes type-check", "fail_action": "simplify proof or use different proof strategy"},
+      {"item": "every disjunction (A or B) resolved by constructing A or constructing B?", "test": "no case-split on LEM; every 'or' resolved by left/right intro with witness", "fail_action": "refactor to produce one disjunct explicitly"},
+      {"item": "no case splits on undecidable predicates?", "test": "each case-split predicate has decision procedure or is explicitly decidable", "fail_action": "restructure proof to avoid undecidable branch"}
+    ],
+    "diff": {
+      "01-deductive": {
+        "boundary": "Deductive allows proof-by-contradiction for existence; constructive forbids it. Deductive proves 'exists' without computing; constructive must compute.",
+        "test": "Ask: Do I need to run the result, or just know it exists? If run, constructive. If know, deductive may suffice.",
+        "example": "Deductive: 'there exists irrational^irrational = rational' by cases on sqrt(2)^sqrt(2). Constructive: must exhibit the specific number."
+      },
+      "02-proof-theoretic": {
+        "boundary": "Proof-theoretic accepts any valid proof; constructive restricts to proofs with computational content. Proof-theoretic may use LEM; constructive forbids it.",
+        "test": "Ask: Is the proof itself a program, or just a certificate of truth?",
+        "example": "Proof-theoretic: prove by contradiction that primes are infinite. Constructive: exhibit algorithm generating arbitrarily large primes."
+      },
+      "07-type-theoretic": {
+        "boundary": "Type-theoretic uses types to encode invariants; can import classical axioms. Constructive focuses on witness extraction; forbids classical axioms even in types.",
+        "test": "Ask: Am I proving existence or enforcing invariants at compile time? Does my type system allow 'Classical' import?",
+        "example": "Type-theoretic in Coq with 'Require Import Classical' is NOT constructive despite using types."
+      },
+      "06-constraint-sat": {
+        "boundary": "Constraint-sat finds satisfying assignment via search; constructive builds witness via proof. SAT solver is oracle; constructive proof is algorithm.",
+        "test": "Ask: Is the witness derived from a proof or found by search? Can I explain WHY the witness works, or just that it does?",
+        "example": "SAT solver: returns model for formula. Constructive: returns witness + proof certificate explaining derivation."
+      }
+    },
+    "confused_with": [
+      {
+        "mode": "01-deductive",
+        "error": "assuming any valid proof is constructive because it reaches a conclusion",
+        "distinguish": "Ask: Does the proof exhibit a witness for every existence claim? If proof uses contradiction to show 'not (not exists)' then concludes 'exists', it is classical deductive, not constructive.",
+        "example_mistake": "Proving 'exists x: P(x)' by assuming 'forall x: not P(x)' and deriving contradiction. This is valid deductively but non-constructive."
+      },
+      {
+        "mode": "02-proof-theoretic",
+        "error": "assuming all formal proofs are constructive because they are rigorous",
+        "distinguish": "Ask: Does the proof use LEM or proof-by-contradiction for existence? If yes, it is classical proof-theoretic, not constructive. Rigor != constructivity.",
+        "example_mistake": "A machine-checked Coq proof that imports 'Classical' axiom is proof-theoretic but not constructive."
+      },
+      {
+        "mode": "07-type-theoretic",
+        "error": "equating 'types as proofs' with 'constructive' because Curry-Howard",
+        "distinguish": "Ask: Does the type system allow classical axioms (e.g., Prop in Coq with Classical import)? If yes, it is type-theoretic but not fully constructive.",
+        "example_mistake": "Haskell's type system is not constructive (no termination guarantee, bottom inhabits all types)."
+      },
+      {
+        "mode": "06-constraint-sat",
+        "error": "treating SAT solver output as constructive witness because it satisfies constraints",
+        "distinguish": "Ask: Was the witness derived from a proof or found by search? Constructive requires proof-derived witness with explanation; SAT is search-based oracle.",
+        "example_mistake": "SAT solver returns model, you call it 'constructive' because you have a value. But no proof explains why the model works."
+      },
+      {
+        "mode": "64-modal",
+        "error": "confusing 'possibly exists' with 'constructively exists'",
+        "distinguish": "Modal possibility (diamond-P) says P holds in some accessible world; constructive existence says P holds AND I can compute the witness. Possibility lacks witness.",
+        "example_mistake": "Concluding 'constructively there exists a solution' from 'it is possible that a solution exists'."
+      }
+    ],
+    "fail": {
+      "mode": "over-constraining",
+      "desc": "applying constructive requirements when classical reasoning is acceptable and simpler; forcing witness extraction when existence proof suffices for actual use case",
+      "signals": [
+        {"signal": "proof attempt stalls on case-split requiring LEM", "indicates": "claim may be classically true but constructively hard/impossible"},
+        {"signal": "extracted program is trivial wrapper around axiom", "indicates": "proof relies on non-computational axiom; extraction is vacuous"},
+        {"signal": "team debates 'how to construct witness' when 'that it exists' is actual need", "indicates": "constructive mode is over-engineering for this use case"},
+        {"signal": "proof complexity exceeds classical alternative by >3x", "indicates": "constructive burden may not be justified by downstream execution needs"},
+        {"signal": "repeated refactoring attempts without progress toward witness", "indicates": "problem may be inherently non-constructive or require different approach"}
+      ],
+      "exit_triggers": [
+        "downstream consumer does not execute witness (only checks existence)",
+        "constructive proof requires axiom of choice or other classical principle for any reasonable approach",
+        "domain experts confirm extracted program will never run, only theorem matters"
+      ],
+      "mit": [
+        {"do": "classify requirement as 'must run' vs 'must know exists' before starting", "test": "each existence claim has explicit tag: WITNESS_REQUIRED or EXISTENCE_ONLY", "action_on_fail": "if EXISTENCE_ONLY, switch to mode 02"},
+        {"do": "allow classical escape hatch with explicit marker", "test": "non-constructive lemmas isolated in separate module with 'classical' annotation; main proof depends only on interface", "action_on_fail": "refactor to isolate classical dependencies"},
+        {"do": "set complexity budget before starting", "test": "abort constructive attempt if proof exceeds N lines (e.g., 3x classical estimate) without progress toward witness", "action_on_fail": "document why constructive approach failed; switch to classical with explanation"},
+        {"do": "use proof assistant with extraction to validate constructivity", "test": "Coq/Agda/Lean extraction succeeds for all existence proofs; extracted code type-checks and runs on test inputs", "action_on_fail": "extraction failure indicates non-constructive proof; refactor or document escape"},
+        {"do": "review whether domain requires computability", "test": "stakeholder interview confirms extracted program will be executed, not just certified", "action_on_fail": "if no execution needed, constructive mode is over-engineering"}
+      ]
+    },
+    "use": [
+      "verified software: proof yields runnable, certified code; compiler correctness, algorithm implementations",
+      "protocol design: security proof extracts to reference implementation that can be tested",
+      "certified compilers: correctness proof produces executable translator; proof IS the compiler",
+      "constructive mathematics: existence means findable, not just non-contradictory; computability matters",
+      "program synthesis: specification-to-code via proof search; proof tactics become program transformations",
+      "cryptographic implementations: proof of security extracts to implementation; no gap between proof and code"
+    ],
+    "rel": [
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "constructive is a restriction of proof-theoretic to computationally meaningful proofs; use proof-theoretic when classical is acceptable"},
+      {"id": 7, "name": "type-theoretic", "link": "Curry-Howard: proofs are programs, propositions are types; but type-theoretic allows classical axioms that break constructivity"},
+      {"id": 1, "name": "deductive-reasoning", "link": "constructive is deduction minus classical axioms; deductive allows proof-by-contradiction for existence"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "both find witnesses, but constructive derives via proof (WHY), constraint via search (THAT)"},
+      {"id": 8, "name": "counterexample-guided", "link": "combine: counterexample search can suggest constructive approach or reveal non-constructive essence"}
+    ],
+    "ex": {
+      "scenario": "Prove: there exists a prime greater than 1000.",
+      "classical_approach": "Assume no such prime exists, derive contradiction using Euclid's argument (non-constructive: does not produce the prime).",
+      "constructive_approach": "Exhibit witness: 1009. Verify: 1009 > 1000 (check). 1009 is prime: not divisible by 2,3,5,7,11,13,17,19,23,29,31 (check: sqrt(1009) < 32). Proof provides the specific number.",
+      "key_difference": "Classical proves existence; constructive provides the number you can use."
+    },
+    "micro_example": {
+      "claim": "forall list L, there exists a sorted permutation of L",
+      "witness": "merge-sort algorithm: function mergesort(L) = if |L| <= 1 then L else merge(mergesort(left_half), mergesort(right_half))",
+      "proof_in_coq": "Theorem sort_exists : forall L, {S | Sorted S /\\ Permutation L S}. Proof. intro L. exists (mergesort L). split. apply mergesort_sorted. apply mergesort_permutation. Defined.",
+      "extraction": "Extraction mergesort. (* produces OCaml: let rec mergesort l = ... *)",
+      "test": "run extracted code on [3,1,4,1,5,9,2,6] -> [1,1,2,3,4,5,6,9]",
+      "asset_produced": "runnable OCaml function + proof that it sorts"
+    },
+    "decision_procedure": {
+      "question_1": {"q": "Will the witness be executed as code?", "yes": "proceed constructive", "no": "go to question 2"},
+      "question_2": {"q": "Does specification require computability (e.g., 'find' not just 'exists')?", "yes": "proceed constructive", "no": "go to question 3"},
+      "question_3": {"q": "Is classical proof significantly simpler (< 1/3 complexity)?", "yes": "use mode 02 (proof-theoretic)", "no": "constructive may still be worthwhile for proof clarity"},
+      "default": "if uncertain, start constructive; escape to classical if blocked after 2 iterations"
+    }
+  }
+}

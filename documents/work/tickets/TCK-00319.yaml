@@ -1,55 +1,60 @@
 ticket_meta:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
+  schema_version: '2026-01-24'
+  template_version: '2026-01-24'
   ticket:
-    id: "TCK-00319"
-    title: "Root tool handlers per workspace"
+    id: TCK-00319
+    title: Root tool handlers per workspace
   binds:
-    prd_id: "PRD-0009"
-    rfc_id: "RFC-0019"
+    prd_id: PRD-0010
+    rfc_id: RFC-0019
     requirements:
-      - requirement_id: "REQ-0003"
-        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0003.yaml#requirement"
+    - requirement_id: REQ-0003
+      requirement_ref: documents/rfcs/RFC-0019/requirements/REQ-0003.yaml#requirement
     evidence_artifacts:
-      - evidence_id: "EVID-0003"
-        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0003.yaml#evidence_artifact"
+    - evidence_id: EVID-0003
+      artifact_ref: documents/rfcs/RFC-0019/evidence_artifacts/EVID-0003.yaml#evidence_artifact
   custody:
     agent_roles:
-      - "AGENT_IMPLEMENTER"
+    - AGENT_IMPLEMENTER
     responsibility_domains:
-      - "DOMAIN_DAEMON"
-      - "DOMAIN_SECURITY"
+    - DOMAIN_DAEMON
+    - DOMAIN_SECURITY
   dependencies:
     tickets:
-      - ticket_id: "TCK-00318"
-        reason: "Workspace root must exist before tools can be rooted to it"
-      - ticket_id: "TCK-00315"
-        reason: "ListFiles/Search handlers exist and must be amended to root per workspace"
+    - ticket_id: TCK-00318
+      reason: Prerequisite per RFC-0019 ticket decomposition ordering
   scope:
     in_scope:
-      - "Amend ListFiles/Search handlers to use workspace root (not daemon CWD)"
-      - "Amend GitOperation handlers similarly"
-      - "Path traversal prevention (canonical root containment checks)"
-      - "Symlink escape blocked"
-      - "TOCTOU mitigation for symlink validation (O_NOFOLLOW, open-then-fstat, or openat2 where available)"
+    - Amend ListFiles/Search handlers to use workspace root
+    - Amend GitOperation handlers similarly
+    - Path traversal prevention
+    - 'TOCTOU race mitigation: use O_NOFOLLOW or fstat verification (RSK-0005)'
     out_of_scope:
-      - "Workspace creation and patch apply (TCK-00318)"
+    - Workspace creation (TCK-00318)
   plan:
     steps:
-      - "Plumb workspace root path into tool handler construction sites (episode runtime/tool executor wiring)"
-      - "Update ListFilesHandler/SearchHandler defaults to be explicit-root only (no implicit \".\" in production)"
-      - "Implement mechanical containment checks for all filesystem tool handlers"
-      - "Add symlink escape tests and TOCTOU regression tests (best-effort, fail closed)"
-      - "Verify ListFiles/Search outputs reflect patched workspace state"
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope
+      list.
+    - 'Implement: Amend ListFiles/Search handlers to use workspace root'
+    - 'Implement: Amend GitOperation handlers similarly'
+    - 'Implement: Path traversal prevention'
+    - 'Implement: TOCTOU race mitigation: use O_NOFOLLOW or fstat verification (RSK-0005)'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression risks per
+      RFC-0019/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-*
+      artifact with concrete artifact pointers.
   definition_of_done:
     evidence_ids:
-      - "EVID-0003"
+    - EVID-0003
     criteria:
-      - "Tool handlers are rooted to the workspace and cannot access daemon CWD by default."
-      - "Symlink escapes are blocked and TOCTOU mitigation is present."
-      - "ListFiles/Search reflect patched workspace state after apply."
+    - Tool handlers rooted to workspace, not daemon CWD
+    - Symlink escape blocked
+    - TOCTOU race mitigated via O_NOFOLLOW or fstat verification
+    - ListFiles/Search reflect patched workspace
   notes:
-    security: "Workspace rooting is a primary containment boundary; treat all path inputs as adversarial."
-    verification: "Include negative tests (escape attempts) and positive tests (valid reads within root)."
-    general: "Without this, reviewer tools observe the wrong filesystem, invalidating FAC review outcomes."
-
+    security: Productivity-first; keep fail-closed invariants intact where already mandated by
+      RFC-0019.
+    verification: Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process
+      memory.
+    general: Keep changes minimal, explicit, and reversible; make dependencies and attribution
+      fields queryable.
