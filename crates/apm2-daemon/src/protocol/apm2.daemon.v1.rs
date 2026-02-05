@@ -822,6 +822,198 @@ pub struct HefError {
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
+/// Request to list all configured processes.
+///
+/// No parameters required - lists all processes.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListProcessesRequest {}
+/// Information about a single process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProcessInfo {
+    /// Process name (unique identifier).
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Current process state.
+    #[prost(enumeration = "ProcessStateEnum", tag = "2")]
+    pub state: i32,
+    /// Total number of configured instances.
+    #[prost(uint32, tag = "3")]
+    pub instances: u32,
+    /// Number of currently running instances.
+    #[prost(uint32, tag = "4")]
+    pub running_instances: u32,
+    /// OS process ID (if running, first instance).
+    #[prost(uint32, optional, tag = "5")]
+    pub pid: ::core::option::Option<u32>,
+    /// Uptime in seconds (if running).
+    #[prost(uint64, optional, tag = "6")]
+    pub uptime_secs: ::core::option::Option<u64>,
+    /// Exit code (if stopped/crashed).
+    #[prost(int32, optional, tag = "7")]
+    pub exit_code: ::core::option::Option<i32>,
+}
+/// Response containing list of all processes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListProcessesResponse {
+    /// List of all configured processes.
+    #[prost(message, repeated, tag = "1")]
+    pub processes: ::prost::alloc::vec::Vec<ProcessInfo>,
+}
+/// Request detailed status for a specific process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProcessStatusRequest {
+    /// Process name to query.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Detailed status response for a process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProcessStatusResponse {
+    /// Basic process information.
+    #[prost(message, optional, tag = "1")]
+    pub info: ::core::option::Option<ProcessInfo>,
+    /// Total restart count across all instances.
+    #[prost(uint32, tag = "2")]
+    pub restart_count: u32,
+    /// CPU usage percentage (0-100, if available).
+    #[prost(float, optional, tag = "3")]
+    pub cpu_percent: ::core::option::Option<f32>,
+    /// Memory usage in bytes (if available).
+    #[prost(uint64, optional, tag = "4")]
+    pub memory_bytes: ::core::option::Option<u64>,
+    /// Command being executed.
+    #[prost(string, tag = "5")]
+    pub command: ::prost::alloc::string::String,
+    /// Working directory.
+    #[prost(string, optional, tag = "6")]
+    pub cwd: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Request to start a configured process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StartProcessRequest {
+    /// Process name to start.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Response after starting a process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StartProcessResponse {
+    /// Process name that was started.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Number of instances that were started.
+    #[prost(uint32, tag = "2")]
+    pub instances_started: u32,
+    /// Message describing the result.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
+/// Request to stop a running process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StopProcessRequest {
+    /// Process name to stop.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Response after stopping a process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StopProcessResponse {
+    /// Process name that was stopped.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Number of instances that were stopped.
+    #[prost(uint32, tag = "2")]
+    pub instances_stopped: u32,
+    /// Message describing the result.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
+/// Request to restart a process (stop then start).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RestartProcessRequest {
+    /// Process name to restart.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Response after restarting a process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RestartProcessResponse {
+    /// Process name that was restarted.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Number of instances that were restarted.
+    #[prost(uint32, tag = "2")]
+    pub instances_restarted: u32,
+    /// Message describing the result.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
+/// Request to perform a rolling restart (graceful reload).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReloadProcessRequest {
+    /// Process name to reload.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Response after reload operation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReloadProcessResponse {
+    /// Process name that was reloaded.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Whether the reload was successful.
+    #[prost(bool, tag = "2")]
+    pub success: bool,
+    /// Message describing the result.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
+/// Request to stream process logs.
+/// This endpoint uses session.sock and requires a valid session_token.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamLogsRequest {
+    /// Session token for authentication.
+    #[prost(string, tag = "1")]
+    pub session_token: ::prost::alloc::string::String,
+    /// Process name to stream logs for.
+    #[prost(string, tag = "2")]
+    pub process_name: ::prost::alloc::string::String,
+    /// Number of historical lines to return (max 1000).
+    #[prost(uint32, tag = "3")]
+    pub lines: u32,
+    /// Whether to follow (stream new lines). Reserved for future use.
+    #[prost(bool, tag = "4")]
+    pub follow: bool,
+}
+/// A single log entry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LogEntry {
+    /// Timestamp in nanoseconds since epoch.
+    #[prost(uint64, tag = "1")]
+    pub timestamp_ns: u64,
+    /// Log line content.
+    #[prost(string, tag = "2")]
+    pub line: ::prost::alloc::string::String,
+    /// Stream kind (stdout/stderr).
+    #[prost(enumeration = "StreamKind", tag = "3")]
+    pub stream: i32,
+    /// Instance index (for multi-instance processes).
+    #[prost(uint32, tag = "4")]
+    pub instance: u32,
+}
+/// Response containing log entries.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamLogsResponse {
+    /// Log entries (most recent last).
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<LogEntry>,
+    /// Whether there are more entries available.
+    #[prost(bool, tag = "2")]
+    pub has_more: bool,
+    /// Process name the logs are from.
+    #[prost(string, tag = "3")]
+    pub process_name: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -1331,6 +1523,99 @@ impl HefErrorCode {
             }
             "HEF_ERROR_ENVELOPE_TOO_LARGE" => Some(Self::HefErrorEnvelopeTooLarge),
             "HEF_ERROR_UNKNOWN_FIELDS" => Some(Self::HefErrorUnknownFields),
+            _ => None,
+        }
+    }
+}
+/// Process lifecycle state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProcessStateEnum {
+    ProcessStateUnspecified = 0,
+    ProcessStateStarting = 1,
+    ProcessStateRunning = 2,
+    ProcessStateUnhealthy = 3,
+    ProcessStateStopping = 4,
+    ProcessStateStopped = 5,
+    ProcessStateCrashed = 6,
+    ProcessStateTerminated = 7,
+}
+impl ProcessStateEnum {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::ProcessStateUnspecified => "PROCESS_STATE_UNSPECIFIED",
+            Self::ProcessStateStarting => "PROCESS_STATE_STARTING",
+            Self::ProcessStateRunning => "PROCESS_STATE_RUNNING",
+            Self::ProcessStateUnhealthy => "PROCESS_STATE_UNHEALTHY",
+            Self::ProcessStateStopping => "PROCESS_STATE_STOPPING",
+            Self::ProcessStateStopped => "PROCESS_STATE_STOPPED",
+            Self::ProcessStateCrashed => "PROCESS_STATE_CRASHED",
+            Self::ProcessStateTerminated => "PROCESS_STATE_TERMINATED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROCESS_STATE_UNSPECIFIED" => Some(Self::ProcessStateUnspecified),
+            "PROCESS_STATE_STARTING" => Some(Self::ProcessStateStarting),
+            "PROCESS_STATE_RUNNING" => Some(Self::ProcessStateRunning),
+            "PROCESS_STATE_UNHEALTHY" => Some(Self::ProcessStateUnhealthy),
+            "PROCESS_STATE_STOPPING" => Some(Self::ProcessStateStopping),
+            "PROCESS_STATE_STOPPED" => Some(Self::ProcessStateStopped),
+            "PROCESS_STATE_CRASHED" => Some(Self::ProcessStateCrashed),
+            "PROCESS_STATE_TERMINATED" => Some(Self::ProcessStateTerminated),
+            _ => None,
+        }
+    }
+}
+/// Error codes for process management operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProcessErrorCode {
+    ProcessErrorUnspecified = 0,
+    /// Process not found by name.
+    ProcessErrorNotFound = 1,
+    /// Process is already running (for start).
+    ProcessErrorAlreadyRunning = 2,
+    /// Process is not running (for stop).
+    ProcessErrorNotRunning = 3,
+    /// Failed to start process.
+    ProcessErrorStartFailed = 4,
+    /// Failed to stop process.
+    ProcessErrorStopFailed = 5,
+    /// Invalid process name.
+    ProcessErrorInvalidName = 6,
+}
+impl ProcessErrorCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::ProcessErrorUnspecified => "PROCESS_ERROR_UNSPECIFIED",
+            Self::ProcessErrorNotFound => "PROCESS_ERROR_NOT_FOUND",
+            Self::ProcessErrorAlreadyRunning => "PROCESS_ERROR_ALREADY_RUNNING",
+            Self::ProcessErrorNotRunning => "PROCESS_ERROR_NOT_RUNNING",
+            Self::ProcessErrorStartFailed => "PROCESS_ERROR_START_FAILED",
+            Self::ProcessErrorStopFailed => "PROCESS_ERROR_STOP_FAILED",
+            Self::ProcessErrorInvalidName => "PROCESS_ERROR_INVALID_NAME",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROCESS_ERROR_UNSPECIFIED" => Some(Self::ProcessErrorUnspecified),
+            "PROCESS_ERROR_NOT_FOUND" => Some(Self::ProcessErrorNotFound),
+            "PROCESS_ERROR_ALREADY_RUNNING" => Some(Self::ProcessErrorAlreadyRunning),
+            "PROCESS_ERROR_NOT_RUNNING" => Some(Self::ProcessErrorNotRunning),
+            "PROCESS_ERROR_START_FAILED" => Some(Self::ProcessErrorStartFailed),
+            "PROCESS_ERROR_STOP_FAILED" => Some(Self::ProcessErrorStopFailed),
+            "PROCESS_ERROR_INVALID_NAME" => Some(Self::ProcessErrorInvalidName),
             _ => None,
         }
     }

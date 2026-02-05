@@ -1235,21 +1235,36 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     let json_array_byte: u8 = b'[';
     assert_eq!(json_array_byte, 91);
 
-    // Valid privileged message types are 1-4
+    // Valid privileged message types are 1-10
+    // Tags 1-4: Original privileged endpoints
     assert!(PrivilegedMessageType::from_tag(1).is_some()); // ClaimWork
     assert!(PrivilegedMessageType::from_tag(2).is_some()); // SpawnEpisode
     assert!(PrivilegedMessageType::from_tag(3).is_some()); // IssueCapability
     assert!(PrivilegedMessageType::from_tag(4).is_some()); // Shutdown
-    assert!(PrivilegedMessageType::from_tag(5).is_none()); // Invalid
+    // Tags 5-10: TCK-00342 Process Management
+    assert!(PrivilegedMessageType::from_tag(5).is_some()); // ListProcesses
+    assert!(PrivilegedMessageType::from_tag(6).is_some()); // ProcessStatus
+    assert!(PrivilegedMessageType::from_tag(7).is_some()); // StartProcess
+    assert!(PrivilegedMessageType::from_tag(8).is_some()); // StopProcess
+    assert!(PrivilegedMessageType::from_tag(9).is_some()); // RestartProcess
+    assert!(PrivilegedMessageType::from_tag(10).is_some()); // ReloadProcess
+    assert!(PrivilegedMessageType::from_tag(11).is_none()); // Invalid (reserved for future)
     assert!(PrivilegedMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
     assert!(PrivilegedMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
 
-    // Valid session message types are 1-4
+    // Valid session message types are 1-5, plus HEF range 64-68
+    // Tags 1-4: Original session endpoints
     assert!(SessionMessageType::from_tag(1).is_some()); // RequestTool
     assert!(SessionMessageType::from_tag(2).is_some()); // EmitEvent
     assert!(SessionMessageType::from_tag(3).is_some()); // PublishEvidence
     assert!(SessionMessageType::from_tag(4).is_some()); // StreamTelemetry
-    assert!(SessionMessageType::from_tag(5).is_none()); // Invalid
+    // Tag 5: TCK-00342 StreamLogs
+    assert!(SessionMessageType::from_tag(5).is_some()); // StreamLogs
+    assert!(SessionMessageType::from_tag(6).is_none()); // Invalid (gap before HEF)
+    // Tags 64-68: HEF Pulse Plane
+    assert!(SessionMessageType::from_tag(64).is_some()); // SubscribePulse
+    assert!(SessionMessageType::from_tag(66).is_some()); // UnsubscribePulse
+    assert!(SessionMessageType::from_tag(68).is_some()); // PulseEvent
     assert!(SessionMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
     assert!(SessionMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
 

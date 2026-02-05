@@ -350,6 +350,21 @@ impl_bounded_decode_simple!(
     UnsubscribePulseResponse,
     PulseEvent,
     HefError,
+    // CTR-PROTO-011: Process Management Endpoints (TCK-00342)
+    ListProcessesRequest,
+    ProcessInfo,
+    ProcessStatusRequest,
+    ProcessStatusResponse,
+    StartProcessRequest,
+    StartProcessResponse,
+    StopProcessRequest,
+    StopProcessResponse,
+    RestartProcessRequest,
+    RestartProcessResponse,
+    ReloadProcessRequest,
+    ReloadProcessResponse,
+    StreamLogsRequest,
+    LogEntry,
 );
 
 // Implement BoundedDecode for messages with repeated fields
@@ -365,6 +380,9 @@ impl_bounded_decode_with_repeated!(CapabilityRequest, read_patterns, write_patte
 impl_bounded_decode_with_repeated!(PulseEnvelopeV1, entities, cas_refs);
 impl_bounded_decode_with_repeated!(SubscribePulseRequest, topic_patterns);
 impl_bounded_decode_with_repeated!(SubscribePulseResponse, accepted_patterns, rejected_patterns);
+// CTR-PROTO-011: Process Management Endpoints (TCK-00342)
+impl_bounded_decode_with_repeated!(ListProcessesResponse, processes);
+impl_bounded_decode_with_repeated!(StreamLogsResponse, entries);
 
 // ============================================================================
 // HEF Field Bounds (CTR-HEF-0001, REQ-HEF-0002, RFC-0018)

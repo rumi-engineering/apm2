@@ -672,11 +672,17 @@ async fn async_main(args: Args) -> Result<()> {
     //
     // TCK-00289: Use with_persistence to wire real governance/ledger components if
     // available.
-    let dispatcher_state: SharedDispatcherState = Arc::new(DispatcherState::with_persistence(
-        state.session_registry().clone(),
-        metrics_registry.clone(),
-        sqlite_conn.clone(),
-    ));
+    // TCK-00342: Wire daemon state into dispatcher for process management.
+    // This enables ListProcesses, ProcessStatus, StartProcess, StopProcess,
+    // RestartProcess, and ReloadProcess handlers to query the Supervisor.
+    let dispatcher_state: SharedDispatcherState = Arc::new(
+        DispatcherState::with_persistence(
+            state.session_registry().clone(),
+            metrics_registry.clone(),
+            sqlite_conn.clone(),
+        )
+        .with_daemon_state(Arc::clone(&state)),
+    );
 
     // TCK-00322: Start projection worker if ledger and projection are configured.
     // The projection worker:

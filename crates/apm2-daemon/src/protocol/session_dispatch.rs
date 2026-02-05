@@ -75,8 +75,8 @@ use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     BoundedDecode, DecisionType, DecodeConfig, EmitEventRequest, EmitEventResponse,
     PatternRejection, PublishEvidenceRequest, PublishEvidenceResponse, RequestToolRequest,
-    RequestToolResponse, SessionError, SessionErrorCode, StreamTelemetryRequest,
-    StreamTelemetryResponse, SubscribePulseRequest, SubscribePulseResponse,
+    RequestToolResponse, SessionError, SessionErrorCode, StreamLogsRequest, StreamLogsResponse,
+    StreamTelemetryRequest, StreamTelemetryResponse, SubscribePulseRequest, SubscribePulseResponse,
     UnsubscribePulseRequest, UnsubscribePulseResponse,
 };
 use super::pulse_acl::{
@@ -119,6 +119,8 @@ pub enum SessionMessageType {
     PublishEvidence  = 3,
     /// `StreamTelemetry` request (IPC-SESS-004)
     StreamTelemetry  = 4,
+    /// `StreamLogs` request (IPC-SESS-005, TCK-00342)
+    StreamLogs       = 5,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
     SubscribePulse   = 64,
@@ -137,6 +139,7 @@ impl SessionMessageType {
             2 => Some(Self::EmitEvent),
             3 => Some(Self::PublishEvidence),
             4 => Some(Self::StreamTelemetry),
+            5 => Some(Self::StreamLogs),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -169,6 +172,8 @@ pub enum SessionResponse {
     PublishEvidence(PublishEvidenceResponse),
     /// Successful `StreamTelemetry` response.
     StreamTelemetry(StreamTelemetryResponse),
+    /// Successful `StreamLogs` response (TCK-00342).
+    StreamLogs(StreamLogsResponse),
     /// Successful `SubscribePulse` response (TCK-00302).
     SubscribePulse(SubscribePulseResponse),
     /// Successful `UnsubscribePulse` response (TCK-00302).
@@ -231,6 +236,10 @@ impl SessionResponse {
             },
             Self::StreamTelemetry(resp) => {
                 buf.push(SessionMessageType::StreamTelemetry.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::StreamLogs(resp) => {
+                buf.push(SessionMessageType::StreamLogs.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::SubscribePulse(resp) => {
@@ -845,6 +854,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             SessionMessageType::EmitEvent => self.handle_emit_event(payload, ctx),
             SessionMessageType::PublishEvidence => self.handle_publish_evidence(payload, ctx),
             SessionMessageType::StreamTelemetry => self.handle_stream_telemetry(payload, ctx),
+            // TCK-00342: Process log streaming
+            SessionMessageType::StreamLogs => self.handle_stream_logs(payload, ctx),
             // HEF Pulse Plane (TCK-00302): Subscription handlers
             SessionMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             SessionMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
@@ -1583,6 +1594,94 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     // ========================================================================
+    // Process Log Streaming (TCK-00342)
+    // ========================================================================
+
+    /// Handles `StreamLogs` requests (IPC-SESS-005, TCK-00342).
+    ///
+    /// # Overview
+    ///
+    /// Streams process log entries from the supervisor's log buffer. Requires
+    /// a valid session token for authentication.
+    ///
+    /// # Security
+    ///
+    /// - [INV-SESS-001] Requires valid `session_token`
+    /// - [CTR-1303] Process name bounded by `MAX_PROCESS_NAME_LEN` (256)
+    /// - [CTR-1303] Lines bounded by `MAX_LOG_LINES` (10000)
+    ///
+    /// # Parameters
+    ///
+    /// - `session_token`: HMAC-authenticated session token
+    /// - `process_name`: Name of the process to stream logs from
+    /// - `lines`: Number of historical lines to retrieve
+    /// - `follow`: Whether to stream new lines (not implemented in Phase 1)
+    fn handle_stream_logs(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<SessionResponse> {
+        /// Maximum process name length per CTR-1303.
+        const MAX_PROCESS_NAME_LEN: usize = 256;
+        /// Maximum log lines per request per CTR-1303.
+        const MAX_LOG_LINES: u32 = 10000;
+
+        let request =
+            StreamLogsRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid StreamLogsRequest: {e}"),
+                }
+            })?;
+
+        // INV-SESS-001: Validate session token
+        let token = match self.validate_token(&request.session_token) {
+            Ok(t) => t,
+            Err(resp) => return Ok(resp),
+        };
+
+        // CTR-1303: Bounded input validation
+        if request.process_name.len() > MAX_PROCESS_NAME_LEN {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                format!(
+                    "process_name exceeds maximum length ({} > {})",
+                    request.process_name.len(),
+                    MAX_PROCESS_NAME_LEN
+                ),
+            ));
+        }
+
+        // CTR-1303: Bound lines parameter
+        let lines = request.lines.min(MAX_LOG_LINES);
+
+        debug!(
+            session_id = %token.session_id,
+            process_name = %request.process_name,
+            lines = lines,
+            follow = request.follow,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "StreamLogs request received"
+        );
+
+        // TODO(TCK-00342): Wire to supervisor log buffer
+        // For Phase 1, return a stub response indicating the feature is not yet
+        // fully implemented. The handler validates inputs and token, but actual
+        // log retrieval requires supervisor integration.
+        warn!(
+            process_name = %request.process_name,
+            "StreamLogs: supervisor log buffer not yet integrated"
+        );
+
+        // Return empty response for now - real implementation will query
+        // supervisor's log ring buffer
+        Ok(SessionResponse::StreamLogs(StreamLogsResponse {
+            entries: vec![],
+            has_more: false,
+            process_name: request.process_name,
+        }))
+    }
+
+    // ========================================================================
     // HEF Pulse Plane Handlers (TCK-00302)
     // ========================================================================
 
@@ -1983,6 +2082,14 @@ pub fn encode_publish_evidence_request(request: &PublishEvidenceRequest) -> Byte
 #[must_use]
 pub fn encode_stream_telemetry_request(request: &StreamTelemetryRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::StreamTelemetry.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `StreamLogs` request to bytes for sending (TCK-00342).
+#[must_use]
+pub fn encode_stream_logs_request(request: &StreamLogsRequest) -> Bytes {
+    let mut buf = vec![SessionMessageType::StreamLogs.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }

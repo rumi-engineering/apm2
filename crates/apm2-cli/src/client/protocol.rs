@@ -50,17 +50,26 @@ use apm2_daemon::protocol::{
     HandshakeMessage,
     IssueCapabilityRequest,
     IssueCapabilityResponse,
+    // TCK-00342: Process management types
+    ListProcessesRequest,
+    ListProcessesResponse,
     PrivilegedError,
     PrivilegedErrorCode,
     PrivilegedMessageType,
+    ProcessStatusRequest,
+    ProcessStatusResponse,
     // Error types
     ProtocolError,
     // Evidence publishing
     PublishEvidenceRequest,
     PublishEvidenceResponse,
+    ReloadProcessRequest,
+    ReloadProcessResponse,
     // Session endpoint messages
     RequestToolRequest,
     RequestToolResponse,
+    RestartProcessRequest,
+    RestartProcessResponse,
     SessionError,
     SessionErrorCode,
     SessionMessageType,
@@ -68,15 +77,31 @@ use apm2_daemon::protocol::{
     ShutdownResponse,
     SpawnEpisodeRequest,
     SpawnEpisodeResponse,
+    StartProcessRequest,
+    StartProcessResponse,
+    StopProcessRequest,
+    StopProcessResponse,
+    // TCK-00342: Log streaming types
+    StreamLogsRequest,
+    StreamLogsResponse,
     // Work types
     WorkRole,
     encode_claim_work_request,
     encode_emit_event_request,
     encode_issue_capability_request,
+    // TCK-00342: Process management encoding
+    encode_list_processes_request,
+    encode_process_status_request,
     encode_publish_evidence_request,
+    encode_reload_process_request,
     encode_request_tool_request,
+    encode_restart_process_request,
     encode_shutdown_request,
     encode_spawn_episode_request,
+    encode_start_process_request,
+    encode_stop_process_request,
+    // TCK-00342: Log streaming encoding
+    encode_stream_logs_request,
     parse_handshake_message,
     serialize_handshake_message,
 };
@@ -599,6 +624,425 @@ impl OperatorClient {
         IssueCapabilityResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
+
+    // =========================================================================
+    // TCK-00342: Process Management Operations
+    // =========================================================================
+
+    /// Lists all managed processes.
+    ///
+    /// # Returns
+    ///
+    /// A list of all processes with their current state and instance counts.
+    pub async fn list_processes(&mut self) -> Result<ListProcessesResponse, ProtocolClientError> {
+        let request = ListProcessesRequest {};
+        let request_bytes = encode_list_processes_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_list_processes_response(&response_frame)
+    }
+
+    /// Gets the status of a specific process.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Process name
+    ///
+    /// # Returns
+    ///
+    /// Detailed status including restart count, CPU, and memory usage.
+    pub async fn process_status(
+        &mut self,
+        name: &str,
+    ) -> Result<ProcessStatusResponse, ProtocolClientError> {
+        let request = ProcessStatusRequest {
+            name: name.to_string(),
+        };
+        let request_bytes = encode_process_status_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_process_status_response(&response_frame)
+    }
+
+    /// Starts a managed process.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Process name to start
+    ///
+    /// # Returns
+    ///
+    /// Number of instances started.
+    pub async fn start_process(
+        &mut self,
+        name: &str,
+    ) -> Result<StartProcessResponse, ProtocolClientError> {
+        let request = StartProcessRequest {
+            name: name.to_string(),
+        };
+        let request_bytes = encode_start_process_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_start_process_response(&response_frame)
+    }
+
+    /// Stops a managed process.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Process name to stop
+    ///
+    /// # Returns
+    ///
+    /// Number of instances stopped.
+    pub async fn stop_process(
+        &mut self,
+        name: &str,
+    ) -> Result<StopProcessResponse, ProtocolClientError> {
+        let request = StopProcessRequest {
+            name: name.to_string(),
+        };
+        let request_bytes = encode_stop_process_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_stop_process_response(&response_frame)
+    }
+
+    /// Restarts a managed process.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Process name to restart
+    ///
+    /// # Returns
+    ///
+    /// Number of instances restarted.
+    pub async fn restart_process(
+        &mut self,
+        name: &str,
+    ) -> Result<RestartProcessResponse, ProtocolClientError> {
+        let request = RestartProcessRequest {
+            name: name.to_string(),
+        };
+        let request_bytes = encode_restart_process_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_restart_process_response(&response_frame)
+    }
+
+    /// Reloads a managed process (rolling restart).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Process name to reload
+    ///
+    /// # Returns
+    ///
+    /// Success status and message.
+    pub async fn reload_process(
+        &mut self,
+        name: &str,
+    ) -> Result<ReloadProcessResponse, ProtocolClientError> {
+        let request = ReloadProcessRequest {
+            name: name.to_string(),
+        };
+        let request_bytes = encode_reload_process_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_reload_process_response(&response_frame)
+    }
+
+    // =========================================================================
+    // TCK-00342: Process Management Response Decoders
+    // =========================================================================
+
+    /// Decodes a `ListProcesses` response.
+    fn decode_list_processes_response(
+        frame: &Bytes,
+    ) -> Result<ListProcessesResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ListProcesses.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ListProcesses response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ListProcesses.tag()
+            )));
+        }
+
+        ListProcessesResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `ProcessStatus` response.
+    fn decode_process_status_response(
+        frame: &Bytes,
+    ) -> Result<ProcessStatusResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ProcessStatus.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ProcessStatus response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ProcessStatus.tag()
+            )));
+        }
+
+        ProcessStatusResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `StartProcess` response.
+    fn decode_start_process_response(
+        frame: &Bytes,
+    ) -> Result<StartProcessResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::StartProcess.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected StartProcess response (tag {}), got tag {tag}",
+                PrivilegedMessageType::StartProcess.tag()
+            )));
+        }
+
+        StartProcessResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `StopProcess` response.
+    fn decode_stop_process_response(
+        frame: &Bytes,
+    ) -> Result<StopProcessResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::StopProcess.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected StopProcess response (tag {}), got tag {tag}",
+                PrivilegedMessageType::StopProcess.tag()
+            )));
+        }
+
+        StopProcessResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `RestartProcess` response.
+    fn decode_restart_process_response(
+        frame: &Bytes,
+    ) -> Result<RestartProcessResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::RestartProcess.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected RestartProcess response (tag {}), got tag {tag}",
+                PrivilegedMessageType::RestartProcess.tag()
+            )));
+        }
+
+        RestartProcessResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `ReloadProcess` response.
+    fn decode_reload_process_response(
+        frame: &Bytes,
+    ) -> Result<ReloadProcessResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ReloadProcess.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ReloadProcess response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ReloadProcess.tag()
+            )));
+        }
+
+        ReloadProcessResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
 }
 
 // ============================================================================
@@ -892,6 +1336,92 @@ impl SessionClient {
         }
 
         PublishEvidenceResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    // =========================================================================
+    // TCK-00342: Process Log Streaming
+    // =========================================================================
+
+    /// Streams process logs from a managed process.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_token` - Session token for authentication
+    /// * `process_name` - Name of the process to stream logs from
+    /// * `lines` - Number of historical lines to retrieve
+    /// * `follow` - Whether to stream new lines (not implemented in Phase 1)
+    ///
+    /// # Returns
+    ///
+    /// Log entries from the process.
+    #[allow(dead_code)] // Scaffolding for when session token management is available
+    pub async fn stream_logs(
+        &mut self,
+        session_token: &str,
+        process_name: &str,
+        lines: u32,
+        follow: bool,
+    ) -> Result<StreamLogsResponse, ProtocolClientError> {
+        let request = StreamLogsRequest {
+            session_token: session_token.to_string(),
+            process_name: process_name.to_string(),
+            lines,
+            follow,
+        };
+        let request_bytes = encode_stream_logs_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_stream_logs_response(&response_frame)
+    }
+
+    /// Decodes a `StreamLogs` response.
+    #[allow(dead_code)] // Used by stream_logs which is scaffolding
+    fn decode_stream_logs_response(
+        frame: &Bytes,
+    ) -> Result<StreamLogsResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response
+            let err = SessionError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = SessionErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != SessionMessageType::StreamLogs.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected StreamLogs response (tag {}), got tag {tag}",
+                SessionMessageType::StreamLogs.tag()
+            )));
+        }
+
+        StreamLogsResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 }
