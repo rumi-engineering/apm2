@@ -52,13 +52,13 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use apm2_core::crypto::Signer;
+use apm2_core::fac::view_commitment::ViewCommitmentV1;
 use apm2_core::fac::{
     ChangeKind, ChangeSetBundleV1, ReasonCode, ReviewArtifactBundleV1, ReviewBlockedError,
     ReviewBlockedRecorded, ReviewBlockedRecordedBuilder, ReviewMetadata, ReviewReceiptError,
     ReviewReceiptRecorded, ReviewReceiptRecordedBuilder,
 };
 use apm2_core::htf::TimeEnvelopeRef;
-use apm2_core::fac::view_commitment::ViewCommitmentV1;
 use thiserror::Error;
 
 use super::executor::ContentAddressedStore;
@@ -892,6 +892,7 @@ pub fn create_receipt_event(
 /// # Errors
 ///
 /// Returns error if the bundle cannot be created (validation failures).
+#[allow(clippy::too_many_arguments)]
 pub fn create_artifact_bundle(
     review_id: String,
     changeset_digest: [u8; 32],
@@ -913,8 +914,8 @@ pub fn create_artifact_bundle(
         builder = builder.view_commitment_hash(hash);
     }
 
-    if let Some(ref r) = policy_resolved_ref {
-        builder = builder.policy_resolved_ref(r.clone());
+    if let Some(r) = policy_resolved_ref {
+        builder = builder.policy_resolved_ref(r);
     }
 
     if let Some(meta) = metadata {
@@ -1265,7 +1266,8 @@ impl WorkspaceManager {
 
     /// Commits the current workspace view.
     ///
-    /// This captures the post-execution state binding it to the policy resolution.
+    /// This captures the post-execution state binding it to the policy
+    /// resolution.
     ///
     /// # Arguments
     ///
@@ -1491,11 +1493,8 @@ impl WorkspaceManager {
         let mut result = self.apply_with_timestamp(bundle, timestamp_ns)?;
 
         // Capture view commitment
-        let commitment = self.commit_view(
-            work_id,
-            policy_resolved_ref,
-            Some(result.applied_at_ns),
-        )?;
+        let commitment =
+            self.commit_view(work_id, policy_resolved_ref, Some(result.applied_at_ns))?;
 
         // Store in CAS
         let commitment_hash = self.store_view_commitment(&commitment)?;
@@ -1507,14 +1506,18 @@ impl WorkspaceManager {
     }
 
     /// Stores the view commitment in CAS.
-    fn store_view_commitment(&self, commitment: &ViewCommitmentV1) -> Result<[u8; 32], WorkspaceError> {
+    fn store_view_commitment(
+        &self,
+        commitment: &ViewCommitmentV1,
+    ) -> Result<[u8; 32], WorkspaceError> {
         if let Some(cas) = &self.cas {
-            let json = serde_json::to_vec(commitment).map_err(|e| WorkspaceError::ApplyFailed(e.to_string()))?;
+            let json = serde_json::to_vec(commitment)
+                .map_err(|e| WorkspaceError::ApplyFailed(e.to_string()))?;
             let hash = cas.store(&json);
             Ok(hash)
         } else {
-             // If no CAS, just return computed hash (validation mode)
-             Ok(commitment.compute_cas_hash())
+            // If no CAS, just return computed hash (validation mode)
+            Ok(commitment.compute_cas_hash())
         }
     }
 

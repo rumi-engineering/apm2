@@ -1,3 +1,8 @@
+//! View commitment types.
+//!
+//! This module defines the `ViewCommitmentV1` structure used to bind the
+//! materialized workspace state to the policy resolution.
+
 use serde::{Deserialize, Serialize};
 
 /// View Commitment V1 schema identifier.
@@ -11,9 +16,12 @@ pub const VIEW_COMMITMENT_V1_SCHEMA: &str = "apm2.view_commitment.v1";
 ///
 /// # Security Properties
 ///
-/// - **Policy Binding**: Binds the view to a specific policy resolution (`policy_resolved_ref`).
-/// - **State Integrity**: Binds the view to a specific filesystem state (`result_digest`).
-/// - **Temporal Authority**: Binds the view to a specific time (`committed_at_ns`).
+/// - **Policy Binding**: Binds the view to a specific policy resolution
+///   (`policy_resolved_ref`).
+/// - **State Integrity**: Binds the view to a specific filesystem state
+///   (`result_digest`).
+/// - **Temporal Authority**: Binds the view to a specific time
+///   (`committed_at_ns`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewCommitmentV1 {
     /// Schema identifier (always `apm2.view_commitment.v1`).
@@ -52,6 +60,10 @@ impl ViewCommitmentV1 {
     }
 
     /// Computes the CAS hash of this commitment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization fails (should never happen for valid struct).
     #[must_use]
     pub fn compute_cas_hash(&self) -> [u8; 32] {
         let json = serde_json::to_vec(self).expect("ViewCommitmentV1 is always serializable");
@@ -60,8 +72,10 @@ impl ViewCommitmentV1 {
 }
 
 // Note: DomainSeparator is typically implemented for events that are SIGNED.
-// ViewCommitment is currently just a data structure stored in CAS and referenced
-// by signed events (like ReviewReceiptRecorded). It acts as the "Body" of the view.
+// ViewCommitment is currently just a data structure stored in CAS and
+// referenced by signed events (like ReviewReceiptRecorded). It acts as the
+// "Body" of the view.
 //
-// If we need to sign the ViewCommitment directly, we would implement DomainSeparator.
-// For now, it is bound via the ReviewArtifactBundle -> ReviewReceiptRecorded chain.
+// If we need to sign the ViewCommitment directly, we would implement
+// DomainSeparator. For now, it is bound via the ReviewArtifactBundle ->
+// ReviewReceiptRecorded chain.

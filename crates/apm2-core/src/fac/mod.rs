@@ -256,3 +256,5 @@ pub use transcript_binding::{
     MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
 };
 pub mod view_commitment;
+// Re-export view commitment types
+pub use view_commitment::{VIEW_COMMITMENT_V1_SCHEMA, ViewCommitmentV1};
