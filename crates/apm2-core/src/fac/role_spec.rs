@@ -202,6 +202,12 @@ pub enum RoleType {
     CodeQualityReviewer,
     /// Security reviewer role: detects unsafe patterns, policy violations.
     SecurityReviewer,
+    /// Test flake fixer: fixes test failures.
+    TestFlakeFixer,
+    /// Rust compile error fixer: fixes compilation errors.
+    RustCompileErrorFixer,
+    /// Dependency updater: updates dependencies.
+    DependencyUpdater,
     /// Custom role: user-defined role with explicit specification.
     Custom,
 }
@@ -213,6 +219,9 @@ impl std::fmt::Display for RoleType {
             Self::Implementer => write!(f, "implementer"),
             Self::CodeQualityReviewer => write!(f, "code_quality_reviewer"),
             Self::SecurityReviewer => write!(f, "security_reviewer"),
+            Self::TestFlakeFixer => write!(f, "test_flake_fixer"),
+            Self::RustCompileErrorFixer => write!(f, "rust_compile_error_fixer"),
+            Self::DependencyUpdater => write!(f, "dependency_updater"),
             Self::Custom => write!(f, "custom"),
         }
     }
@@ -227,6 +236,9 @@ impl FromStr for RoleType {
             "implementer" => Ok(Self::Implementer),
             "code_quality_reviewer" => Ok(Self::CodeQualityReviewer),
             "security_reviewer" => Ok(Self::SecurityReviewer),
+            "test_flake_fixer" => Ok(Self::TestFlakeFixer),
+            "rust_compile_error_fixer" => Ok(Self::RustCompileErrorFixer),
+            "dependency_updater" => Ok(Self::DependencyUpdater),
             "custom" => Ok(Self::Custom),
             _ => Err(RoleSpecError::InvalidRoleType(s.to_string())),
         }
@@ -506,6 +518,22 @@ impl RoleBudgets {
             max_wall_clock_ms: 3_600_000, // 1 hour
             max_evidence_bytes: 100 * 1024 * 1024,
             default_tool_budget: ToolBudget::read_only(),
+        }
+    }
+
+    /// Creates budgets suitable for specialist roles.
+    ///
+    /// Specialists have narrower budgets than generalist implementers because
+    /// they are focused on specific, well-scoped tasks (e.g., fixing a single
+    /// compile error or test flake).
+    #[must_use]
+    pub fn specialist() -> Self {
+        Self {
+            max_total_tool_calls: 50,
+            max_tokens: 500_000,
+            max_wall_clock_ms: 1_800_000, // 30 minutes
+            max_evidence_bytes: 50 * 1024 * 1024,
+            default_tool_budget: ToolBudget::default(),
         }
     }
 }
@@ -1130,6 +1158,10 @@ mod tests {
 
         let reviewer = RoleBudgets::reviewer();
         assert_eq!(reviewer.max_total_tool_calls, 100);
+
+        let specialist = RoleBudgets::specialist();
+        assert_eq!(specialist.max_total_tool_calls, 50);
+        assert_eq!(specialist.max_tokens, 500_000);
     }
 
     #[test]

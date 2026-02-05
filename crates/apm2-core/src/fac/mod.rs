@@ -331,3 +331,43 @@ pub use view_commitment::{
     MAX_WORK_ID_LENGTH as MAX_VIEW_COMMITMENT_WORK_ID_LENGTH, VIEW_COMMITMENT_V1_SCHEMA,
     ViewCommitmentError, ViewCommitmentV1, ViewCommitmentV1Builder,
 };
+/// Role routing and classification logic for work allocation.
+///
+/// This module provides heuristics for routing work to specialist roles
+/// based on diff analysis and issue labels. It is designed to be called
+/// by the Orchestrator or daemon when allocating work to determine whether
+/// a specialist (e.g., `TestFlakeFixer`, `RustCompileErrorFixer`) or a
+/// generalist (`Implementer`) role should handle the task.
+///
+/// # Integration Point
+///
+/// The primary entry point is [`classify_changeset`], which analyzes:
+/// - Issue labels (strongest signal)
+/// - Issue title keywords (medium signal)
+/// - Changed file patterns (heuristic signal)
+///
+/// And returns a [`RoutingDecision`] indicating which role to use.
+///
+/// # Example
+///
+/// ```rust
+/// use apm2_core::fac::role_routing::{RoutingDecision, classify_changeset};
+///
+/// let decision = classify_changeset(
+///     &["Cargo.toml".to_string()],
+///     &["dependencies".to_string()],
+///     "Bump serde to 1.0.200",
+/// );
+///
+/// match decision {
+///     RoutingDecision::Specialist(role) => {
+///         println!("Route to specialist: {}", role.role_id);
+///     },
+///     RoutingDecision::Generalist(role) => {
+///         println!("Route to generalist: {}", role.role_id);
+///     },
+/// }
+/// ```
+pub mod role_routing;
+// Re-export role routing types for convenient access
+pub use role_routing::{RoutingDecision, classify_changeset};

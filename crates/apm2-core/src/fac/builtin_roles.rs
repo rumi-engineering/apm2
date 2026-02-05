@@ -67,6 +67,15 @@ pub const CODE_QUALITY_REVIEWER_ROLE_ID: &str = "code_quality_reviewer-v1";
 /// Role ID for security reviewer.
 pub const SECURITY_REVIEWER_ROLE_ID: &str = "security_reviewer-v1";
 
+/// Role ID for test flake fixer.
+pub const TEST_FLAKE_FIXER_ROLE_ID: &str = "test_flake_fixer-v1";
+
+/// Role ID for rust compile error fixer.
+pub const RUST_COMPILE_ERROR_FIXER_ROLE_ID: &str = "rust_compile_error_fixer-v1";
+
+/// Role ID for dependency updater.
+pub const DEPENDENCY_UPDATER_ROLE_ID: &str = "dependency_updater-v1";
+
 // =============================================================================
 // Orchestrator Role
 // =============================================================================
@@ -407,6 +416,194 @@ pub fn security_reviewer_role() -> RoleSpecV1 {
 }
 
 // =============================================================================
+// Specialist Roles
+// =============================================================================
+
+/// Creates a `RoleSpecV1` for the test flake fixer role.
+///
+/// # Role Responsibilities
+///
+/// - Diagnoses and fixes test flakes (non-deterministic failures)
+/// - Runs tests in isolation or loop to reproduce
+/// - Applies fixes to test code or logic
+///
+/// # Typical Kernel Operations
+///
+/// - `kernel.fs.read`: Read test files
+/// - `kernel.fs.edit`: Modify test logic
+/// - `kernel.shell.exec`: Run `cargo test`
+/// - `kernel.evidence.publish`: Publish fix
+///
+/// # Panics
+///
+/// Panics if the role spec fails to build due to invalid configuration.
+/// This should never happen with the hardcoded values.
+#[must_use]
+pub fn test_flake_fixer_role() -> RoleSpecV1 {
+    let tool_allowlist = ToolAllowlist::empty()
+        .with_tool_and_budget("kernel.artifact.fetch", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.list", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.search", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.read", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.edit", ToolBudget::write())
+        .with_tool_and_budget("kernel.fs.write", ToolBudget::write())
+        .with_tool_and_budget("kernel.shell.exec", ToolBudget::shell_exec())
+        .with_tool_and_budget("kernel.evidence.publish", ToolBudget::write())
+        .with_tool_and_budget("kernel.event.emit", ToolBudget::write());
+
+    RoleSpecV1::builder()
+        .role_id(TEST_FLAKE_FIXER_ROLE_ID)
+        .role_name("Test Flake Fixer")
+        .role_type(RoleType::TestFlakeFixer)
+        .description(
+            "Specialist role for diagnosing and fixing non-deterministic test \
+             failures (flakes).",
+        )
+        .tool_allowlist(tool_allowlist)
+        .budgets(RoleBudgets::specialist())
+        .required_output_schema(RequiredOutputSchema::new(
+            "apm2.changeset_published.v1",
+            true,
+        ))
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.tool_execution_receipt.v1", false)
+                .with_description("Tool execution receipts for audit"),
+        )
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.summary_receipt.v1", false)
+                .with_description("Summary of implementation work"),
+        )
+        .system_prompt_template(
+            "You are a test flake fixer specialist. Your goal is to fix flaky tests.\n\n\
+             1. Analyze the test failure log\n\
+             2. Reproduce the flake (if possible)\n\
+             3. Modify the test or code to fix the race/indeterminism\n\
+             4. Verify the fix\n\n\
+             Work ID: {work_id}\n\
+             Context: {context}",
+        )
+        .required_capability("fs.write", 1)
+        .required_capability("shell.exec", 1)
+        .build()
+        .expect("test_flake_fixer_role should be valid")
+}
+
+/// Creates a `RoleSpecV1` for the Rust compile error fixer role.
+///
+/// # Role Responsibilities
+///
+/// - Fixes Rust compilation errors
+/// - Interprets `cargo check` output
+/// - Applies syntax/type fixes
+///
+/// # Panics
+///
+/// Panics if the role spec fails to build due to invalid configuration.
+/// This should never happen with the hardcoded values.
+#[must_use]
+pub fn rust_compile_error_fixer_role() -> RoleSpecV1 {
+    let tool_allowlist = ToolAllowlist::empty()
+        .with_tool_and_budget("kernel.artifact.fetch", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.list", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.search", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.read", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.edit", ToolBudget::write())
+        .with_tool_and_budget("kernel.fs.write", ToolBudget::write())
+        .with_tool_and_budget("kernel.shell.exec", ToolBudget::shell_exec())
+        .with_tool_and_budget("kernel.evidence.publish", ToolBudget::write())
+        .with_tool_and_budget("kernel.event.emit", ToolBudget::write());
+
+    RoleSpecV1::builder()
+        .role_id(RUST_COMPILE_ERROR_FIXER_ROLE_ID)
+        .role_name("Rust Compile Error Fixer")
+        .role_type(RoleType::RustCompileErrorFixer)
+        .description("Specialist role for fixing Rust compilation errors.")
+        .tool_allowlist(tool_allowlist)
+        .budgets(RoleBudgets::specialist())
+        .required_output_schema(RequiredOutputSchema::new(
+            "apm2.changeset_published.v1",
+            true,
+        ))
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.tool_execution_receipt.v1", false)
+                .with_description("Tool execution receipts for audit"),
+        )
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.summary_receipt.v1", false)
+                .with_description("Summary of implementation work"),
+        )
+        .system_prompt_template(
+            "You are a Rust compile error fixer specialist. Your goal is to make the code compile.\n\n\
+             1. Analyze the cargo check output\n\
+             2. Apply fixes to the code\n\
+             3. Verify compilation\n\n\
+             Work ID: {work_id}\n\
+             Context: {context}",
+        )
+        .required_capability("fs.write", 1)
+        .required_capability("shell.exec", 1)
+        .build()
+        .expect("rust_compile_error_fixer_role should be valid")
+}
+
+/// Creates a `RoleSpecV1` for the dependency updater role.
+///
+/// # Role Responsibilities
+///
+/// - Updates dependencies in `Cargo.toml`
+/// - Resolves version conflicts
+///
+/// # Panics
+///
+/// Panics if the role spec fails to build due to invalid configuration.
+/// This should never happen with the hardcoded values.
+#[must_use]
+pub fn dependency_updater_role() -> RoleSpecV1 {
+    let tool_allowlist = ToolAllowlist::empty()
+        .with_tool_and_budget("kernel.artifact.fetch", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.list", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.search", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.read", ToolBudget::read_only())
+        .with_tool_and_budget("kernel.fs.write", ToolBudget::write())
+        .with_tool_and_budget("kernel.fs.edit", ToolBudget::write())
+        .with_tool_and_budget("kernel.shell.exec", ToolBudget::shell_exec())
+        .with_tool_and_budget("kernel.evidence.publish", ToolBudget::write())
+        .with_tool_and_budget("kernel.event.emit", ToolBudget::write());
+
+    RoleSpecV1::builder()
+        .role_id(DEPENDENCY_UPDATER_ROLE_ID)
+        .role_name("Dependency Updater")
+        .role_type(RoleType::DependencyUpdater)
+        .description("Specialist role for updating project dependencies.")
+        .tool_allowlist(tool_allowlist)
+        .budgets(RoleBudgets::specialist())
+        .required_output_schema(RequiredOutputSchema::new(
+            "apm2.changeset_published.v1",
+            true,
+        ))
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.tool_execution_receipt.v1", false)
+                .with_description("Tool execution receipts for audit"),
+        )
+        .required_output_schema(
+            RequiredOutputSchema::new("apm2.summary_receipt.v1", false)
+                .with_description("Summary of implementation work"),
+        )
+        .system_prompt_template(
+            "You are a dependency updater specialist. Your goal is to update dependencies safely.\n\n\
+             1. Check for outdated dependencies\n\
+             2. Update Cargo.toml/Cargo.lock\n\
+             3. Verify build passes\n\n\
+             Work ID: {work_id}\n\
+             Context: {context}",
+        )
+        .required_capability("fs.write", 1)
+        .required_capability("shell.exec", 1)
+        .build()
+        .expect("dependency_updater_role should be valid")
+}
+
+// =============================================================================
 // Registry Functions
 // =============================================================================
 
@@ -422,6 +619,9 @@ pub fn all_builtin_roles() -> Vec<RoleSpecV1> {
         implementer_role(),
         code_quality_reviewer_role(),
         security_reviewer_role(),
+        test_flake_fixer_role(),
+        rust_compile_error_fixer_role(),
+        dependency_updater_role(),
     ]
 }
 
@@ -441,6 +641,9 @@ pub fn get_builtin_role(role_id: &str) -> Option<RoleSpecV1> {
         IMPLEMENTER_ROLE_ID => Some(implementer_role()),
         CODE_QUALITY_REVIEWER_ROLE_ID => Some(code_quality_reviewer_role()),
         SECURITY_REVIEWER_ROLE_ID => Some(security_reviewer_role()),
+        TEST_FLAKE_FIXER_ROLE_ID => Some(test_flake_fixer_role()),
+        RUST_COMPILE_ERROR_FIXER_ROLE_ID => Some(rust_compile_error_fixer_role()),
+        DEPENDENCY_UPDATER_ROLE_ID => Some(dependency_updater_role()),
         _ => None,
     }
 }
@@ -521,6 +724,29 @@ mod tests {
             implementer.budgets.max_tokens > reviewer.budgets.max_tokens,
             "Implementer should have higher token budget"
         );
+    }
+
+    #[test]
+    fn test_specialist_roles_have_narrower_budgets_than_implementer() {
+        let implementer = implementer_role();
+        let specialists = [
+            test_flake_fixer_role(),
+            rust_compile_error_fixer_role(),
+            dependency_updater_role(),
+        ];
+
+        for specialist in specialists {
+            assert!(
+                specialist.budgets.max_total_tool_calls < implementer.budgets.max_total_tool_calls,
+                "{} should have fewer tool calls than implementer",
+                specialist.role_id
+            );
+            assert!(
+                specialist.budgets.max_tokens < implementer.budgets.max_tokens,
+                "{} should have lower token budget than implementer",
+                specialist.role_id
+            );
+        }
     }
 
     #[test]
@@ -611,7 +837,7 @@ mod tests {
     #[test]
     fn test_all_builtin_roles() {
         let roles = all_builtin_roles();
-        assert_eq!(roles.len(), 4);
+        assert_eq!(roles.len(), 7);
 
         for role in &roles {
             assert!(
