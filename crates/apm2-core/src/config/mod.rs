@@ -113,6 +113,79 @@ pub struct DaemonConfig {
     /// Audit configuration.
     #[serde(default)]
     pub audit: AuditConfig,
+
+    /// Projection worker configuration (TCK-00322).
+    ///
+    /// Controls the projection worker that posts review results to GitHub.
+    #[serde(default)]
+    pub projection: ProjectionConfig,
+}
+
+/// Projection worker configuration (TCK-00322).
+///
+/// Controls the projection worker that posts review results to GitHub.
+/// Disabled by default; enable by setting `enabled = true` and providing
+/// GitHub API credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionConfig {
+    /// Whether projection is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// GitHub API base URL (default: `https://api.github.com`).
+    #[serde(default = "default_github_api_url")]
+    pub github_api_url: String,
+
+    /// Repository owner (e.g., "rumi-engineering").
+    #[serde(default)]
+    pub github_owner: String,
+
+    /// Repository name (e.g., "apm2").
+    #[serde(default)]
+    pub github_repo: String,
+
+    /// GitHub API token (stored as environment variable reference).
+    ///
+    /// For security, this should reference an environment variable,
+    /// e.g., `$GITHUB_TOKEN` or use a credential profile.
+    ///
+    /// **Required when `enabled = true`**: Missing token is a fatal error
+    /// to prevent fail-open security issues (TCK-00322 security review).
+    #[serde(default)]
+    pub github_token_env: Option<String>,
+
+    /// Poll interval in seconds for ledger tailer.
+    #[serde(default = "default_projection_poll_interval")]
+    pub poll_interval_secs: u64,
+
+    /// Batch size for processing ledger events.
+    #[serde(default = "default_projection_batch_size")]
+    pub batch_size: usize,
+
+    /// Path to persistent signer key file for projection receipts.
+    ///
+    /// TCK-00322 BLOCKER FIX: The projection worker requires a persistent
+    /// signing key to ensure receipt signatures remain valid across daemon
+    /// restarts. If not specified, defaults to
+    /// `{state_file_dir}/projection_signer.key`.
+    ///
+    /// The key file contains the 32-byte Ed25519 secret key. It is created
+    /// automatically with mode 0600 if it does not exist.
+    #[serde(default)]
+    pub signer_key_file: Option<PathBuf>,
+}
+
+fn default_github_api_url() -> String {
+    "https://api.github.com".to_string()
+}
+
+const fn default_projection_poll_interval() -> u64 {
+    1
+}
+
+const fn default_projection_batch_size() -> usize {
+    100
 }
 
 impl Default for DaemonConfig {
@@ -124,6 +197,7 @@ impl Default for DaemonConfig {
             log_dir: default_log_dir(),
             state_file: default_state_file(),
             audit: AuditConfig::default(),
+            projection: ProjectionConfig::default(),
         }
     }
 }

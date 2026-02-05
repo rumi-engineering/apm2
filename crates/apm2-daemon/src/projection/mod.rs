@@ -1,9 +1,19 @@
-// AGENT-AUTHORED (TCK-00212)
+// AGENT-AUTHORED (TCK-00212, TCK-00322)
 //! Projection adapters for the FAC (Forge Admission Cycle).
 //!
 //! This module implements write-only projection adapters that synchronize
 //! ledger state to external systems. The key design principle is that the
 //! ledger is always the source of truth - projections are one-way writes.
+//!
+//! # RFC-0019: Projection Worker (TCK-00322)
+//!
+//! Per RFC-0019 Workstream F, this module now includes a long-running
+//! projection worker that:
+//!
+//! 1. Tails the ledger for `ReviewReceiptRecorded` events
+//! 2. Maintains a work index: `changeset_digest` -> `work_id` -> PR metadata
+//! 3. Projects review results to GitHub (status + comment)
+//! 4. Stores projection receipts in CAS for idempotency
 //!
 //! # RFC-0015: FAC Projections
 //!
@@ -25,6 +35,9 @@
 //!
 //! # Components
 //!
+//! - [`ProjectionWorker`]: Long-running worker that tails ledger and projects
+//! - [`WorkIndex`]: Work index for changeset -> `work_id` -> PR mappings
+//! - [`LedgerTailer`]: Ledger event tailer for driving projection decisions
 //! - [`ProjectionAdapter`]: Async trait for write-only projection adapters
 //! - [`GitHubProjectionAdapter`]: GitHub commit status projection
 //! - [`ProjectionReceipt`]: Signed proof of projection
@@ -53,7 +66,28 @@
 //! 1. Emits `DefectRecord(PROJECTION_TAMPER)`
 //! 2. Overwrites GitHub status to match ledger truth
 //!
-//! # Example
+//! # Example: Projection Worker
+//!
+//! ```rust,ignore
+//! use std::sync::{Arc, Mutex};
+//! use apm2_daemon::projection::{ProjectionWorker, ProjectionWorkerConfig};
+//! use rusqlite::Connection;
+//!
+//! // Create worker with ledger connection
+//! let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+//! let config = ProjectionWorkerConfig::new()
+//!     .with_poll_interval(std::time::Duration::from_secs(1));
+//!
+//! let mut worker = ProjectionWorker::new(conn, config).unwrap();
+//!
+//! // Register PR association
+//! worker.work_index().register_pr("work-001", 123, "owner", "repo", "abc123").unwrap();
+//!
+//! // Run worker (blocks until shutdown)
+//! // worker.run().await.unwrap();
+//! ```
+//!
+//! # Example: Direct Projection
 //!
 //! ```rust,ignore
 //! use apm2_core::crypto::Signer;
@@ -81,6 +115,7 @@
 pub mod divergence_watchdog;
 pub mod github_sync;
 pub mod projection_receipt;
+pub mod worker;
 
 // Re-export main types
 pub use divergence_watchdog::{
@@ -96,4 +131,8 @@ pub use github_sync::{
 pub use projection_receipt::{
     IdempotencyKey, MAX_STRING_LENGTH, ProjectedStatus, ProjectionReceipt,
     ProjectionReceiptBuilder, ProjectionReceiptError,
+};
+pub use worker::{
+    LedgerTailer, PrMetadata, ProjectionWorker, ProjectionWorkerConfig, ProjectionWorkerError,
+    WorkIndex,
 };

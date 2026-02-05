@@ -527,14 +527,58 @@ struct IdempotencyCache {
 
 impl IdempotencyCache {
     /// Opens or creates an idempotency cache at the specified path.
+    ///
+    /// # Security (TCK-00322 MAJOR FIX)
+    ///
+    /// The cache file is created with mode 0600 (owner read/write only) to
+    /// prevent unauthorized access to projection receipts and idempotency data.
     fn open(path: impl AsRef<Path>) -> Result<Self, ProjectionError> {
+        let path = path.as_ref();
+
+        // TCK-00322 MAJOR FIX: Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProjectionError::DatabaseError(format!("failed to create cache directory: {e}"))
+            })?;
+        }
+
+        // TCK-00322 MAJOR FIX: Set secure permissions (0600) on cache file.
+        // We need to handle two cases:
+        // 1. File doesn't exist: Create it with umask then fix permissions
+        // 2. File exists: Fix permissions if needed
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // If file already exists, fix permissions
+            if path.exists() {
+                let permissions = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(path, permissions).map_err(|e| {
+                    ProjectionError::DatabaseError(format!(
+                        "failed to set cache file permissions: {e}"
+                    ))
+                })?;
+            }
+        }
+
         let conn = Connection::open_with_flags(
-            path.as_ref(),
+            path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
+
+        // TCK-00322 MAJOR FIX: Set permissions after file creation (for new files)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, permissions).map_err(|e| {
+                ProjectionError::DatabaseError(format!("failed to set cache file permissions: {e}"))
+            })?;
+        }
 
         conn.execute_batch(CACHE_SCHEMA_SQL)
             .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
@@ -683,6 +727,45 @@ impl IdempotencyCache {
         Ok(())
     }
 
+    /// Async version of `register_digest_sha_mapping` that uses
+    /// `spawn_blocking`.
+    ///
+    /// Major fix: Thread blocking in async context - wraps the sync `SQLite`
+    /// operation in `spawn_blocking` to avoid blocking the Tokio executor
+    /// threads.
+    #[allow(clippy::cast_possible_wrap)] // Timestamp won't overflow until year 2554
+    async fn register_digest_sha_mapping_async(
+        &self,
+        digest: [u8; 32],
+        sha: String,
+    ) -> Result<(), ProjectionError> {
+        let conn = Arc::clone(&self.conn);
+
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn
+                .lock()
+                .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            conn_guard
+                .execute(
+                    "INSERT OR REPLACE INTO digest_sha_mappings
+                     (changeset_digest, commit_sha, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![digest.as_slice(), &sha, now as i64],
+                )
+                .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ProjectionError::DatabaseError(format!("spawn_blocking failed: {e}")))?
+    }
+
     /// Looks up the commit SHA for a changeset digest.
     fn get_commit_sha(&self, digest: &[u8; 32]) -> Result<Option<String>, ProjectionError> {
         let conn = self
@@ -803,6 +886,22 @@ impl IdempotencyCache {
 // GitHub HTTP Client
 // =============================================================================
 
+use std::sync::OnceLock;
+
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
+
+/// Type alias for the persistent HTTPS client.
+///
+/// MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+/// Previously, each request created a new `HttpsConnector` and `Client`,
+/// exhausting network resources under load. Now we reuse a single client.
+type PersistentHttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
 /// HTTP client for GitHub API calls.
 ///
 /// Security controls:
@@ -810,14 +909,55 @@ impl IdempotencyCache {
 /// - AD-NET-001: Request timeouts via `tokio::time::timeout`
 /// - AD-SEC-001: API token uses `SecretString` (via config)
 /// - AD-CMP-001: Cognitive complexity reduced via helper methods
+///
+/// MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+/// The client now uses a persistent `HttpsConnector` and `Client` that are
+/// lazily initialized once and reused for all requests. This prevents
+/// resource exhaustion from creating new TLS connections per request.
 struct GitHubClient {
     config: GitHubAdapterConfig,
+    /// Lazily-initialized persistent HTTPS client for connection reuse.
+    /// Using `std::sync::OnceLock` for thread-safe lazy initialization.
+    http_client: OnceLock<PersistentHttpsClient>,
 }
 
 impl GitHubClient {
-    /// Creates a new GitHub client.
-    const fn new(config: GitHubAdapterConfig) -> Self {
-        Self { config }
+    /// Creates a new GitHub client with lazy-initialized persistent connection.
+    #[allow(clippy::missing_const_for_fn)] // OnceLock::new() is not const in stable Rust
+    fn new(config: GitHubAdapterConfig) -> Self {
+        Self {
+            config,
+            http_client: OnceLock::new(),
+        }
+    }
+
+    /// Gets or initializes the persistent HTTPS client.
+    ///
+    /// MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+    /// This method lazily creates a single HTTPS client that is reused for
+    /// all subsequent requests, preventing the creation of new connections
+    /// and TLS handshakes per request.
+    ///
+    /// # Security
+    ///
+    /// - HTTPS-only mode prevents secret exfiltration via HTTP fallback
+    /// - HTTP/2 support enables connection multiplexing
+    fn get_or_init_client(&self) -> &PersistentHttpsClient {
+        self.http_client.get_or_init(|| {
+            use hyper_rustls::HttpsConnectorBuilder;
+
+            // Build persistent HTTPS connector
+            // SECURITY: Use https_only() to prevent secret exfiltration via HTTP fallback.
+            // API tokens must never be sent over unencrypted connections.
+            let https = HttpsConnectorBuilder::new()
+                .with_webpki_roots()
+                .https_only()
+                .enable_http1()
+                .enable_http2()
+                .build();
+
+            Client::builder(TokioExecutor::new()).build(https)
+        })
     }
 
     /// Builds the GitHub API URL for posting a commit status.
@@ -929,31 +1069,21 @@ impl GitHubClient {
     /// - AD-NET-001: Request timeout via `tokio::time::timeout`
     /// - AD-SEC-001: API token uses `SecretString` (via config)
     /// - AD-CMP-001: Logic split into helper methods
+    ///
+    /// # MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+    ///
+    /// Now uses a persistent HTTPS client instead of creating a new connector
+    /// and client for every request. This prevents resource exhaustion.
     async fn post_commit_status(
         &self,
         sha: &str,
         status: ProjectedStatus,
     ) -> Result<(), ProjectionError> {
-        use bytes::Bytes;
-        use http_body_util::Full;
-        use hyper_rustls::HttpsConnectorBuilder;
-        use hyper_util::client::legacy::Client;
-        use hyper_util::rt::TokioExecutor;
-
         let url = self.build_status_url(sha);
         let body_bytes = self.build_status_body(status)?;
 
-        // Build the HTTPS connector
-        // SECURITY: Use https_only() to prevent secret exfiltration via HTTP fallback.
-        // API tokens must never be sent over unencrypted connections.
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_only()
-            .enable_http1()
-            .enable_http2()
-            .build();
-
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+        // MAJOR FIX: Use persistent client instead of creating new one per request
+        let client = self.get_or_init_client();
 
         let request = self.build_request(&url, Full::new(Bytes::from(body_bytes)))?;
 
@@ -988,6 +1118,92 @@ impl GitHubClient {
         }
 
         debug!("GitHub commit status posted successfully");
+        Ok(())
+    }
+
+    /// Builds the GitHub API URL for posting a PR comment.
+    fn build_comment_url(&self, pr_number: u64) -> String {
+        format!(
+            "{}/repos/{}/{}/issues/{}/comments",
+            self.config.api_base_url.trim_end_matches('/'),
+            self.config.owner,
+            self.config.repo,
+            pr_number
+        )
+    }
+
+    /// Builds the JSON request body for a PR comment.
+    #[allow(clippy::unused_self)] // Kept for API consistency with build_status_body
+    fn build_comment_body(&self, body: &str) -> Result<Vec<u8>, ProjectionError> {
+        let json = serde_json::json!({
+            "body": body
+        });
+
+        serde_json::to_vec(&json).map_err(|e| ProjectionError::NetworkError(e.to_string()))
+    }
+
+    /// Posts a comment to a GitHub PR.
+    ///
+    /// `POST /repos/{owner}/{repo}/issues/{issue_number}/comments`
+    ///
+    /// # Security Controls
+    ///
+    /// - AD-MEM-001: Response body size limited to 64KB via `Limited`
+    /// - AD-NET-001: Request timeout via `tokio::time::timeout`
+    /// - AD-SEC-001: API token uses `SecretString` (via config)
+    ///
+    /// # TCK-00322: PR Comment Projection
+    ///
+    /// Per RFC-0019, the projection worker posts review comments to PRs.
+    /// This enables automated code review feedback from the FAC.
+    ///
+    /// # MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+    ///
+    /// Now uses a persistent HTTPS client instead of creating a new connector
+    /// and client for every request. This prevents resource exhaustion.
+    async fn post_pr_comment(&self, pr_number: u64, body: &str) -> Result<(), ProjectionError> {
+        let url = self.build_comment_url(pr_number);
+        let body_bytes = self.build_comment_body(body)?;
+
+        // MAJOR FIX: Use persistent client instead of creating new one per request
+        let client = self.get_or_init_client();
+
+        let request = self.build_request(&url, Full::new(Bytes::from(body_bytes)))?;
+
+        debug!(url = %url, pr_number = pr_number, "posting comment to GitHub PR");
+
+        // Send the request with timeout (AD-NET-001)
+        let response = tokio::time::timeout(self.config.request_timeout, client.request(request))
+            .await
+            .map_err(|_| {
+                ProjectionError::NetworkError(format!(
+                    "request timed out after {:?}",
+                    self.config.request_timeout
+                ))
+            })?
+            .map_err(|e: hyper_util::client::legacy::Error| {
+                ProjectionError::NetworkError(e.to_string())
+            })?;
+
+        let (parts, body) = response.into_parts();
+        let status_code = parts.status;
+
+        // Check for specific error conditions
+        Self::check_response_status(status_code, &parts.headers)?;
+
+        // Check for success (201 Created for new comments)
+        if !status_code.is_success() {
+            let message = Self::read_error_body(body).await;
+            return Err(ProjectionError::GitHubApiError {
+                message,
+                status_code: Some(status_code.as_u16()),
+            });
+        }
+
+        debug!(
+            pr_number = pr_number,
+            "GitHub PR comment posted successfully"
+        );
         Ok(())
     }
 }
@@ -1252,6 +1468,21 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
     ) -> Result<(), ProjectionError> {
         self.cache
             .register_digest_sha_mapping(changeset_digest, commit_sha)
+    }
+
+    /// Async version of `register_commit_sha` that uses `spawn_blocking`.
+    ///
+    /// Major fix: Thread blocking in async context - wraps the sync `SQLite`
+    /// operation in `spawn_blocking` to avoid blocking the Tokio executor
+    /// threads.
+    pub async fn register_commit_sha_async(
+        &self,
+        changeset_digest: [u8; 32],
+        commit_sha: String,
+    ) -> Result<(), ProjectionError> {
+        self.cache
+            .register_digest_sha_mapping_async(changeset_digest, commit_sha)
+            .await
     }
 
     /// Looks up the commit SHA for a changeset digest.
@@ -1663,6 +1894,95 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
             receipt,
             freeze_triggered: false,
         })
+    }
+
+    // =========================================================================
+    // PR Comment Projection (TCK-00322)
+    // =========================================================================
+
+    /// Posts a comment to a GitHub PR.
+    ///
+    /// Per RFC-0019 (Workstream F), the projection worker posts review results
+    /// as comments to PRs. This provides visibility into FAC review outcomes.
+    ///
+    /// # Security
+    ///
+    /// - **Write-only**: Comments are posted based on ledger state, not GitHub
+    ///   reads
+    /// - **Idempotency**: Callers should track comment posting via ledger
+    ///   events to avoid duplicates
+    ///
+    /// # Arguments
+    ///
+    /// * `pr_number` - The PR number to post the comment to
+    /// * `body` - The comment body (Markdown supported)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::GitHubApiError`] if the API call fails.
+    /// Returns [`ProjectionError::RateLimitExceeded`] if rate limited.
+    /// Returns [`ProjectionError::AuthenticationError`] if auth fails.
+    pub async fn post_comment(&self, pr_number: u64, body: &str) -> Result<(), ProjectionError> {
+        if self.mock_mode {
+            debug!(pr_number = pr_number, "mock mode: skipping comment post");
+            return Ok(());
+        }
+
+        self.client.post_pr_comment(pr_number, body).await
+    }
+
+    /// Formats a review result as a PR comment body.
+    ///
+    /// This method creates a standardized comment format for review results
+    /// that includes:
+    /// - Review status (pass/fail)
+    /// - Receipt ID for auditability
+    /// - Summary of findings (if any)
+    ///
+    /// # Arguments
+    ///
+    /// * `receipt_id` - The review receipt ID
+    /// * `status` - The projected status (Success/Failure/etc.)
+    /// * `summary` - Optional summary of review findings
+    ///
+    /// # Returns
+    ///
+    /// A Markdown-formatted comment body.
+    #[must_use]
+    pub fn format_review_comment(
+        receipt_id: &str,
+        status: ProjectedStatus,
+        summary: Option<&str>,
+    ) -> String {
+        use std::fmt::Write;
+
+        let status_icon = match status {
+            ProjectedStatus::Success => ":white_check_mark:",
+            ProjectedStatus::Failure => ":x:",
+            ProjectedStatus::Pending => ":hourglass:",
+            ProjectedStatus::Error => ":warning:",
+            ProjectedStatus::Cancelled => ":no_entry_sign:",
+        };
+
+        let mut comment = format!(
+            "## {} APM2 FAC Review: {}\n\n",
+            status_icon,
+            status.as_str().to_uppercase()
+        );
+
+        // Using write! instead of push_str(&format!()) to avoid extra allocation
+        let _ = write!(comment, "**Receipt ID:** `{receipt_id}`\n\n");
+
+        if let Some(summary_text) = summary {
+            comment.push_str("### Summary\n\n");
+            comment.push_str(summary_text);
+            comment.push_str("\n\n");
+        }
+
+        comment.push_str("---\n");
+        comment.push_str("*This comment was generated by the APM2 Forge Admission Cycle.*");
+
+        comment
     }
 
     /// Convenience method to detect tamper and handle it in one call.
