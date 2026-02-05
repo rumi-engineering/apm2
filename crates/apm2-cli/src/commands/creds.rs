@@ -265,9 +265,7 @@ pub fn switch(socket_path: &Path, process_name: &str, profile_id: &str) -> Resul
             .context("failed to switch credential")?;
 
         if response.success {
-            println!(
-                "Switched credential for '{process_name}' to profile '{profile_id}'."
-            );
+            println!("Switched credential for '{process_name}' to profile '{profile_id}'.");
             if !response.previous_profile_id.is_empty() {
                 println!("  Previous profile: {}", response.previous_profile_id);
             }
