@@ -741,16 +741,31 @@ fn validate_no_symlinks(path: &Path) -> Result<(), DurableCasError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
-        // Only check components that actually exist on the filesystem
-        if current.exists()
-            && current
-                .symlink_metadata()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-        {
-            return Err(DurableCasError::InitializationFailed {
-                message: format!("CAS path contains symlink component: {}", current.display()),
-            });
+        // Use symlink_metadata() instead of exists() to detect dangling symlinks.
+        // exists() returns false for dangling symlinks, which would bypass detection.
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(DurableCasError::InitializationFailed {
+                        message: format!(
+                            "CAS path contains symlink component: {}",
+                            current.display()
+                        ),
+                    });
+                }
+            },
+            // Component does not exist yet — that is fine, it will be created later.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            // Any other I/O error: fail closed to avoid silent bypass.
+            Err(e) => {
+                return Err(DurableCasError::InitializationFailed {
+                    message: format!(
+                        "Cannot verify path component {} is not a symlink: {}",
+                        current.display(),
+                        e
+                    ),
+                });
+            },
         }
     }
     Ok(())
@@ -1104,6 +1119,35 @@ mod tests {
         assert!(
             matches!(result, Err(DurableCasError::InitializationFailed { .. })),
             "Expected InitializationFailed for symlink path, got: {result:?}"
+        );
+        if let Err(DurableCasError::InitializationFailed { message }) = result {
+            assert!(
+                message.contains("symlink"),
+                "Error should mention 'symlink': {message}"
+            );
+        }
+    }
+
+    /// SEC-CAS-002b: Reject paths containing dangling symlink components.
+    ///
+    /// A dangling symlink (target does not exist) must still be detected.
+    /// Previously, `current.exists()` returned `false` for dangling symlinks,
+    /// causing them to bypass detection.
+    #[test]
+    fn test_reject_dangling_symlink_path() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a symlink whose target does NOT exist (dangling).
+        let dangling_symlink = temp_dir.path().join("dangling_link");
+        std::os::unix::fs::symlink("/nonexistent/target", &dangling_symlink).unwrap();
+
+        // Use the dangling symlink as a path component for the CAS base.
+        let cas_path = dangling_symlink.join("cas_store");
+        let config = DurableCasConfig::new(&cas_path);
+        let result = DurableCas::new(config);
+        assert!(
+            matches!(result, Err(DurableCasError::InitializationFailed { .. })),
+            "Expected InitializationFailed for dangling symlink path, got: {result:?}"
         );
         if let Err(DurableCasError::InitializationFailed { message }) = result {
             assert!(
