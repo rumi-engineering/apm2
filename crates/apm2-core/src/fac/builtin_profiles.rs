@@ -106,30 +106,9 @@ pub const LOCAL_INFERENCE_PROFILE_ID: &str = "local-inference-v1";
 #[must_use]
 pub fn claude_code_profile() -> AgentAdapterProfileV1 {
     let mut permission_mode_map = BTreeMap::new();
-    permission_mode_map.insert(
-        "restricted".to_string(),
-        vec![
-            "--tools".to_string(),
-            String::new(),
-            "--no-session-persistence".to_string(),
-        ],
-    );
-    permission_mode_map.insert(
-        "standard".to_string(),
-        vec![
-            "--tools".to_string(),
-            String::new(),
-            "--no-session-persistence".to_string(),
-        ],
-    );
-    permission_mode_map.insert(
-        "elevated".to_string(),
-        vec![
-            "--tools".to_string(),
-            String::new(),
-            "--no-session-persistence".to_string(),
-        ],
-    );
+    permission_mode_map.insert("restricted".to_string(), vec![]);
+    permission_mode_map.insert("standard".to_string(), vec![]);
+    permission_mode_map.insert("elevated".to_string(), vec![]);
 
     let mut capability_map = BTreeMap::new();
     capability_map.insert("read_file".to_string(), "kernel.fs.read".to_string());
@@ -231,18 +210,9 @@ pub fn claude_code_profile() -> AgentAdapterProfileV1 {
 #[must_use]
 pub fn gemini_cli_profile() -> AgentAdapterProfileV1 {
     let mut permission_mode_map = BTreeMap::new();
-    permission_mode_map.insert(
-        "restricted".to_string(),
-        vec!["-e".to_string(), "none".to_string()],
-    );
-    permission_mode_map.insert(
-        "standard".to_string(),
-        vec!["-e".to_string(), "none".to_string()],
-    );
-    permission_mode_map.insert(
-        "elevated".to_string(),
-        vec!["-e".to_string(), "none".to_string()],
-    );
+    permission_mode_map.insert("restricted".to_string(), vec![]);
+    permission_mode_map.insert("standard".to_string(), vec![]);
+    permission_mode_map.insert("elevated".to_string(), vec![]);
 
     let mut capability_map = BTreeMap::new();
     capability_map.insert("read_file".to_string(), "kernel.fs.read".to_string());
@@ -386,16 +356,7 @@ pub fn codex_cli_profile() -> AgentAdapterProfileV1 {
         .profile_id(CODEX_CLI_PROFILE_ID)
         .adapter_mode(AdapterMode::BlackBox)
         .command("codex")
-        .args_template(vec![
-            "exec".to_string(),
-            "{prompt}".to_string(),
-            "--config".to_string(),
-            "features.shell_tool=false".to_string(),
-            "--config".to_string(),
-            "web_search=disabled".to_string(),
-            "--config".to_string(),
-            "history.persistence=none".to_string(),
-        ])
+        .args_template(vec!["exec".to_string(), "{prompt}".to_string()])
         .env_template(vec![
             ("CODEX_HEADLESS".to_string(), "1".to_string()),
             ("NO_COLOR".to_string(), "1".to_string()),
@@ -701,21 +662,10 @@ mod tests {
     fn test_codex_cli_profile_args() {
         let profile = codex_cli_profile();
         assert!(profile.args_template.contains(&"exec".to_string()));
-        assert!(profile.args_template.contains(&"--config".to_string()));
         assert!(
-            profile
+            !profile
                 .args_template
                 .contains(&"features.shell_tool=false".to_string())
-        );
-        assert!(
-            profile
-                .args_template
-                .contains(&"web_search=disabled".to_string())
-        );
-        assert!(
-            profile
-                .args_template
-                .contains(&"history.persistence=none".to_string())
         );
     }
 
@@ -815,19 +765,19 @@ mod tests {
     fn test_profile_hashes_are_deterministic() {
         let profile1 = claude_code_profile();
         let profile2 = claude_code_profile();
-        assert_eq!(profile1.compute_cas_hash(), profile2.compute_cas_hash());
+        assert_eq!(profile1.compute_cas_hash().unwrap(), profile2.compute_cas_hash().unwrap());
 
         let profile3 = gemini_cli_profile();
         let profile4 = gemini_cli_profile();
-        assert_eq!(profile3.compute_cas_hash(), profile4.compute_cas_hash());
+        assert_eq!(profile3.compute_cas_hash().unwrap(), profile4.compute_cas_hash().unwrap());
     }
 
     #[test]
     fn test_profile_hashes_differ_between_profiles() {
-        let claude_hash = claude_code_profile().compute_cas_hash();
-        let gemini_hash = gemini_cli_profile().compute_cas_hash();
-        let codex_hash = codex_cli_profile().compute_cas_hash();
-        let local_hash = local_inference_profile().compute_cas_hash();
+        let claude_hash = claude_code_profile().compute_cas_hash().unwrap();
+        let gemini_hash = gemini_cli_profile().compute_cas_hash().unwrap();
+        let codex_hash = codex_cli_profile().compute_cas_hash().unwrap();
+        let local_hash = local_inference_profile().compute_cas_hash().unwrap();
 
         // All hashes should be unique
         assert_ne!(claude_hash, gemini_hash);

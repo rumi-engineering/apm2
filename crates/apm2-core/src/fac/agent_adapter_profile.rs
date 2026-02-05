@@ -54,11 +54,13 @@
 //!     .expect("valid profile");
 //!
 //! assert!(profile.validate().is_ok());
-//! let cas_hash = profile.compute_cas_hash();
+//! let cas_hash = profile.compute_cas_hash().expect("hash computation");
 //! ```
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -158,6 +160,14 @@ pub enum AgentAdapterProfileError {
     #[error("invalid adapter mode: {0}")]
     InvalidAdapterMode(String),
 
+    /// Invalid input mode.
+    #[error("invalid input mode: {0}")]
+    InvalidInputMode(String),
+
+    /// Invalid output mode.
+    #[error("invalid output mode: {0}")]
+    InvalidOutputMode(String),
+
     /// Collection field exceeds maximum count.
     #[error("collection field '{field}' exceeds maximum count ({count} > {max})")]
     CollectionTooLarge {
@@ -168,6 +178,23 @@ pub enum AgentAdapterProfileError {
         /// Maximum allowed count.
         max: usize,
     },
+
+    /// Invalid regex in version probe.
+    #[error("invalid regex in version probe: {0}")]
+    InvalidRegex(String),
+
+    /// Invalid path.
+    #[error("invalid path in field '{field}': {reason}")]
+    InvalidPath {
+        /// The field name containing the invalid path.
+        field: &'static str,
+        /// The reason why the path is invalid.
+        reason: String,
+    },
+
+    /// Invalid tool bridge config.
+    #[error("invalid tool bridge config: {0}")]
+    InvalidToolBridge(String),
 
     /// CAS error.
     #[error("CAS error: {0}")]
@@ -237,7 +264,7 @@ impl std::fmt::Display for AdapterMode {
     }
 }
 
-impl std::str::FromStr for AdapterMode {
+impl FromStr for AdapterMode {
     type Err = AgentAdapterProfileError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -276,6 +303,20 @@ impl std::fmt::Display for InputMode {
     }
 }
 
+impl FromStr for InputMode {
+    type Err = AgentAdapterProfileError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "arg" => Ok(Self::Arg),
+            "stdin" => Ok(Self::Stdin),
+            "file" => Ok(Self::File),
+            "stream_json" => Ok(Self::StreamJson),
+            _ => Err(AgentAdapterProfileError::InvalidInputMode(s.to_string())),
+        }
+    }
+}
+
 /// Output mode defining how the agent's responses are captured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -301,12 +342,27 @@ impl std::fmt::Display for OutputMode {
     }
 }
 
+impl FromStr for OutputMode {
+    type Err = AgentAdapterProfileError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "raw" => Ok(Self::Raw),
+            "json" => Ok(Self::Json),
+            "jsonl" => Ok(Self::Jsonl),
+            "stream_json" => Ok(Self::StreamJson),
+            _ => Err(AgentAdapterProfileError::InvalidOutputMode(s.to_string())),
+        }
+    }
+}
+
 // =============================================================================
 // Sub-structs
 // =============================================================================
 
 /// Configuration for tool bridging between agent and kernel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolBridgeConfig {
     /// Whether tool bridging is enabled.
     pub enabled: bool,
@@ -327,6 +383,37 @@ pub struct ToolBridgeConfig {
     pub tool_timeout_ms: u64,
 }
 
+impl ToolBridgeConfig {
+    /// Validates the tool bridge configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if validation fails (e.g. zero timeout).
+    pub fn validate(&self) -> Result<(), AgentAdapterProfileError> {
+        if self.tool_timeout_ms == 0 {
+            return Err(AgentAdapterProfileError::InvalidToolBridge(
+                "tool_timeout_ms must be non-zero".to_string(),
+            ));
+        }
+        if self.max_args_size == 0 {
+            return Err(AgentAdapterProfileError::InvalidToolBridge(
+                "max_args_size must be non-zero".to_string(),
+            ));
+        }
+        if self.max_result_size == 0 {
+            return Err(AgentAdapterProfileError::InvalidToolBridge(
+                "max_result_size must be non-zero".to_string(),
+            ));
+        }
+        if self.max_args_size > 100 * 1024 * 1024 { // 100MB limit
+             return Err(AgentAdapterProfileError::InvalidToolBridge(
+                "max_args_size exceeds safety limit (100MB)".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for ToolBridgeConfig {
     fn default() -> Self {
         Self {
@@ -342,6 +429,7 @@ impl Default for ToolBridgeConfig {
 
 /// Version probe configuration for detecting agent CLI version.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VersionProbe {
     /// Command to run to get version (e.g., "claude --version").
     pub command: String,
@@ -364,7 +452,7 @@ impl VersionProbe {
     ///
     /// # Errors
     ///
-    /// Returns error if command or regex exceeds maximum length.
+    /// Returns error if command or regex exceeds maximum length, or regex is invalid.
     pub fn validate(&self) -> Result<(), AgentAdapterProfileError> {
         if self.command.is_empty() {
             return Err(AgentAdapterProfileError::MissingField(
@@ -390,12 +478,17 @@ impl VersionProbe {
                 max: MAX_VERSION_PROBE_REGEX_LENGTH,
             });
         }
+        
+        // Compile regex to validate syntax
+        Regex::new(&self.regex).map_err(|e| AgentAdapterProfileError::InvalidRegex(e.to_string()))?;
+
         Ok(())
     }
 }
 
 /// Health check configuration for agent process monitoring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthChecks {
     /// Startup timeout in milliseconds.
     pub startup_timeout_ms: u64,
@@ -427,6 +520,7 @@ impl Default for HealthChecks {
 
 /// Budget defaults for agent execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetDefaults {
     /// Maximum number of tool calls per episode.
     pub max_tool_calls: u32,
@@ -455,6 +549,7 @@ impl Default for BudgetDefaults {
 /// Evidence policy controlling what is recorded vs discarded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
+#[serde(deny_unknown_fields)]
 pub struct EvidencePolicy {
     /// Whether to record full agent output.
     pub record_full_output: bool,
@@ -505,6 +600,7 @@ impl Default for EvidencePolicy {
 /// - **CAS Binding**: Profile is content-addressed for integrity
 /// - **No Ambient Defaults**: Must be explicitly selected by hash
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentAdapterProfileV1 {
     /// Schema identifier (always `apm2.agent_adapter_profile.v1`).
     pub schema: String,
@@ -578,6 +674,7 @@ impl AgentAdapterProfileV1 {
     /// - Required fields are empty
     /// - String fields exceed maximum length
     /// - Collection fields exceed maximum count
+    /// - Path traversal in paths
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), AgentAdapterProfileError> {
         // Validate schema
@@ -609,6 +706,13 @@ impl AgentAdapterProfileV1 {
                 field: "command",
                 len: self.command.len(),
                 max: MAX_COMMAND_LENGTH,
+            });
+        }
+        // Path Traversal Check for command
+        if self.command.contains("..") {
+            return Err(AgentAdapterProfileError::InvalidPath {
+                field: "command",
+                reason: "path traversal sequences not allowed".to_string(),
             });
         }
 
@@ -655,6 +759,13 @@ impl AgentAdapterProfileV1 {
                     max: MAX_ENV_VALUE_LENGTH,
                 });
             }
+            // Syntax check: alphanumeric + underscore
+            if !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                 return Err(AgentAdapterProfileError::InvalidPath {
+                    field: "env_template.key",
+                    reason: format!("invalid env key syntax: {key}"),
+                });
+            }
         }
 
         // Validate cwd
@@ -666,6 +777,13 @@ impl AgentAdapterProfileV1 {
                 field: "cwd",
                 len: self.cwd.len(),
                 max: MAX_CWD_LENGTH,
+            });
+        }
+        // Path Traversal Check for cwd
+        if self.cwd.contains("..") {
+            return Err(AgentAdapterProfileError::InvalidPath {
+                field: "cwd",
+                reason: "path traversal sequences not allowed".to_string(),
             });
         }
 
@@ -731,6 +849,11 @@ impl AgentAdapterProfileV1 {
         // Validate version_probe
         self.version_probe.validate()?;
 
+        // Validate tool_bridge if present
+        if let Some(tb) = &self.tool_bridge {
+            tb.validate()?;
+        }
+
         Ok(())
     }
 
@@ -739,14 +862,14 @@ impl AgentAdapterProfileV1 {
     /// Uses RFC 8785 canonical JSON serialization via the `Canonicalizable`
     /// trait to ensure deterministic hashing.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if canonicalization fails (should never happen for valid struct).
+    /// Returns error if canonicalization fails.
     #[must_use]
-    pub fn compute_cas_hash(&self) -> [u8; 32] {
+    pub fn compute_cas_hash(&self) -> Result<[u8; 32], AgentAdapterProfileError> {
         self.canonical_bytes()
             .map(|bytes| *blake3::hash(&bytes).as_bytes())
-            .expect("AgentAdapterProfileV1 canonicalization should not fail")
+            .map_err(|e| AgentAdapterProfileError::SerializationError(format!("canonicalization failed: {e}")))
     }
 
     /// Stores this profile in CAS and returns its hash.
@@ -796,7 +919,7 @@ impl AgentAdapterProfileV1 {
         profile.validate()?;
 
         // Verify hash matches
-        let computed_hash = profile.compute_cas_hash();
+        let computed_hash = profile.compute_cas_hash()?;
         if computed_hash != *hash {
             return Err(AgentAdapterProfileError::CasError(format!(
                 "hash mismatch: expected {}, got {}",
@@ -1114,7 +1237,10 @@ mod tests {
         let profile1 = create_valid_profile();
         let profile2 = create_valid_profile();
 
-        assert_eq!(profile1.compute_cas_hash(), profile2.compute_cas_hash());
+        assert_eq!(
+            profile1.compute_cas_hash().unwrap(),
+            profile2.compute_cas_hash().unwrap()
+        );
     }
 
     #[test]
@@ -1142,7 +1268,10 @@ mod tests {
             .build()
             .expect("valid profile");
 
-        assert_ne!(profile1.compute_cas_hash(), profile2.compute_cas_hash());
+        assert_ne!(
+            profile1.compute_cas_hash().unwrap(),
+            profile2.compute_cas_hash().unwrap()
+        );
     }
 
     #[test]
@@ -1250,6 +1379,13 @@ mod tests {
                 field: "version_probe.command",
                 ..
             })
+        ));
+
+        // Invalid regex
+        let probe = VersionProbe::new("claude --version", r"v(\d+");
+        assert!(matches!(
+            probe.validate(),
+            Err(AgentAdapterProfileError::InvalidRegex(_))
         ));
     }
 
@@ -1367,5 +1503,57 @@ mod tests {
             profile.capability_map.get("read_file"),
             Some(&"kernel.fs.read".to_string())
         );
+    }
+
+    #[test]
+    fn test_path_traversal() {
+        let result = AgentAdapterProfileV1::builder()
+            .profile_id("test")
+            .adapter_mode(AdapterMode::BlackBox)
+            .command("../claude")
+            .cwd("/workspace")
+            .input_mode(InputMode::Stdin)
+            .output_mode(OutputMode::Raw)
+            .version_probe(VersionProbe::new("claude", "v1"))
+            .build();
+        assert!(matches!(
+            result,
+            Err(AgentAdapterProfileError::InvalidPath { field: "command", .. })
+        ));
+    }
+
+    #[test]
+    fn test_from_str_impls() {
+        assert_eq!(InputMode::from_str("arg").unwrap(), InputMode::Arg);
+        assert_eq!(OutputMode::from_str("raw").unwrap(), OutputMode::Raw);
+        assert!(InputMode::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_deny_unknown_fields() {
+        let json = r#"{
+            "schema": "apm2.agent_adapter_profile.v1",
+            "profile_id": "test",
+            "adapter_mode": "black_box",
+            "command": "cmd",
+            "args_template": [],
+            "env_template": [],
+            "cwd": "/tmp",
+            "requires_pty": false,
+            "input_mode": "stdin",
+            "output_mode": "raw",
+            "permission_mode_map": {},
+            "capability_map": {},
+            "version_probe": { "command": "cmd", "regex": "v1" },
+            "health_checks": { "startup_timeout_ms": 1, "heartbeat_interval_ms": 1, "heartbeat_timeout_ms": 1, "stall_threshold_ms": 1, "max_stalls": 1 },
+            "budget_defaults": { "max_tool_calls": 1, "max_tokens": 1, "max_wall_clock_ms": 1, "max_evidence_bytes": 1 },
+            "evidence_policy": { "record_full_output": true, "record_tool_traces": true, "record_timing": true, "record_token_usage": true, "max_recorded_output_bytes": 1, "redact_sensitive": true },
+            "extra_field": "fail"
+        }"#;
+
+        let result: Result<AgentAdapterProfileV1, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown field `extra_field`"));
     }
 }
