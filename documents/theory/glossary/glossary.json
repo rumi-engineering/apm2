@@ -173,16 +173,49 @@
       "id": "term:receipt",
       "term": "Receipt",
       "definition": "A machine-verifiable proof of an outcome (e.g., Gate Pass, Tool Execution). It binds authority/validity to specific evidence.",
-      "operationalization": "Implemented as `GateReceipt` (`crates/apm2-core/src/evidence/receipt.rs`), `ToolReceipt`, and `SummaryReceipt`. Must be signed via `ReceiptSigner` and hash-linked.",
+      "operationalization": "Gate receipts are implemented in `crates/apm2-core/src/evidence/receipt.rs` and signed via `ReceiptSigner`. Tool receipts are represented in daemon protocol bindings. SummaryReceipt is a digest-first receipt form defined by schema (`schemas/apm2/summary_receipt.schema.json`) and is aspirational until fully wired through the ledger + CAS + verification stack.",
       "theory_refs": [
-        "LAW-01",
         "LAW-07",
-        "LAW-15"
+        "LAW-15",
+        "LAW-04",
+        "LAW-16"
       ],
       "implementation_refs": [
         "crates/apm2-core/src/evidence/receipt.rs",
-        "crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs",
-        "crates/apm2-daemon/src/evidence/signer.rs"
+        "schemas/apm2/summary_receipt.schema.json"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:summary_receipt",
+      "term": "SummaryReceipt",
+      "definition": "A receipt that compresses a larger body of work/evidence into a verifiable, digest-first summary with declared loss profile and zoom-in selectors.",
+      "operationalization": "Schema-defined at `schemas/apm2/summary_receipt.schema.json`. A SummaryReceipt MUST bind to a ledger commitment and provide selectors/hashes to retrieve omitted evidence under delegated capability.",
+      "theory_refs": [
+        "LAW-07",
+        "LAW-10",
+        "LAW-15",
+        "LAW-16"
+      ],
+      "implementation_refs": [
+        "schemas/apm2/summary_receipt.schema.json"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:work_graph",
+      "term": "Work Graph",
+      "definition": "A directed acyclic graph (DAG) of WorkIDs representing decomposition: nodes are work items and edges encode dependency/parentage (e.g., parent_work_ids). It is the structured coordination fabric that allows parallelism without shared-context flooding.",
+      "operationalization": "Realized by `parent_work_ids` on Work objects/events and by deterministic projections in the core work reducer (`crates/apm2-core/src/work`).",
+      "theory_refs": [
+        "LAW-06",
+        "LAW-12",
+        "LAW-16"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/work",
+        "crates/apm2-core/src/work/state.rs",
+        "crates/apm2-core/src/work/reducer.rs"
       ],
       "node_class": "NORMATIVE"
     },
@@ -739,12 +772,13 @@
     {
       "id": "term:holonic_mesh_protocol",
       "term": "Holonic Mesh Protocol (HMP)",
-      "definition": "The digest-first communication standard for inter-holon messages. It enforces `Discovery -> Handshake -> Work -> Evidence` channel progression.",
+      "definition": "The digest-first communication standard for inter-holon messages. It enforces `Discovery -> Handshake -> Work -> Evidence` progression, with a low-bandwidth signed Governance channel for stop orders and policy/contract updates.",
       "operationalization": "Conceptual standard defined in `unified_theory.json` (MECH-HOLON-MESH-PROTOCOL). Partially implemented by the `apm2-daemon` protocol.",
       "theory_refs": [
+        "LAW-10",
         "LAW-05",
-        "LAW-07",
-        "LAW-10"
+        "LAW-15",
+        "LAW-16"
       ],
       "implementation_refs": [
         "crates/apm2-daemon/src/protocol"
@@ -970,6 +1004,21 @@
       "source": "term:oracle_request",
       "target": "term:work_object",
       "relation": "implements"
+    },
+    {
+      "source": "term:summary_receipt",
+      "target": "term:receipt",
+      "relation": "refines"
+    },
+    {
+      "source": "term:work_graph",
+      "target": "term:work_object",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:work_graph",
+      "target": "term:work_substrate",
+      "relation": "depends_on"
     },
     {
       "source": "term:holonic_mesh_protocol",

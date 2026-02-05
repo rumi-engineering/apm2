@@ -90,7 +90,8 @@
         "CAPABILITY_OVERGRANT",
         "CAPABILITY_UNDERGRANT",
         "UNBOUNDED_SEARCH",
-        "SCHEMA_DRIFT"
+        "SCHEMA_DRIFT",
+        "INTERFACE_PROLIFERATION"
       ],
       "violation_code": [
         "SILENT_MEMORY_MUTATION",
@@ -101,7 +102,9 @@
         "REASONING_DEGENERATION",
         "POLICY_VIOLATION",
         "MEASUREMENT_INTEGRITY",
-        "SCHEMA_VIOLATION"
+        "SCHEMA_VIOLATION",
+        "INTERFACE_PROLIFERATION",
+        "ABSTRACTION_BREAK"
       ],
       "action_type": [
         "UPDATE_DOCS",

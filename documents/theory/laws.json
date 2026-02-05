@@ -9,11 +9,11 @@
   },
   "payload": {
     "version": "1.0.0",
-    "law_count": 15,
+    "law_count": 16,
     "laws": [
       {
         "id": "LAW-01",
-        "name": "Loop Closure & Recursive Improvement",
+        "name": "Loop Closure & Gated Promotion",
         "effective_date": "2026-02-04",
         "citation": "apm2://theory",
         "status": "active",
@@ -443,6 +443,41 @@
           }
         ],
         "rationale": "If the evidence can be forged or selectively ignored, the entire holonic SDLC becomes gameable. Measurement integrity is the ultimate substrate of trust."
+      },
+      {
+        "id": "LAW-16",
+        "name": "Closure Under Composition & Boundary Contracts",
+        "effective_date": "2026-02-05",
+        "citation": "apm2://theory",
+        "status": "active",
+        "statement": "Holons MUST be closed under composition: a holon-of-holons interacts with peers and supervisors using the same primitive boundary channels and message shapes as a leaf holon. Cross-boundary communication MUST be coarse-grained (commitments, receipts, summaries, selectors), and any zoom-in to raw evidence MUST occur by content hash under explicitly delegated capability. New ad-hoc cross-boundary primitives are forbidden without a versioned interface contract and an explicit governance decision.",
+        "operationalization": [
+          {
+            "rule": "Interface Closure",
+            "desc": "Boundary interfaces MUST remain minimal and stable. Extend only by versioned schemas/contracts, never by informal prose conventions or hidden side channels.",
+            "subrules": [
+              "A holon boundary MUST NOT invent new message classes beyond the canonical channel classes.",
+              "Breaking changes require explicit negotiation and migration receipts."
+            ]
+          },
+          {
+            "rule": "Coarse-Grained Boundary Artifacts",
+            "desc": "Upward traffic SHOULD be summary receipts, manifests, and commitments; downward traffic SHOULD be scoped work offers and capability-limited requests.",
+            "subrules": [
+              "Inter-holon chat logs and private state MUST NOT cross boundaries as authoritative artifacts.",
+              "Progressive disclosure is mandatory: details are fetched only by hash/selector under delegated capability."
+            ]
+          },
+          {
+            "rule": "Budgeted Zoom-In",
+            "desc": "If a holon requires more detail than the coarse-grained boundary artifact provides, it MUST request zoom-in via selectors that deterministically address omitted facts/evidence, subject to budgets and risk tier.",
+            "subrules": [
+              "Zoom-in requests MUST be auditable as tool calls or protocol messages with receipts where appropriate.",
+              "High-risk promotions MUST prefer evidence-channel zoom-in over narrative claims."
+            ]
+          }
+        ],
+        "rationale": "Without compositional closure, holarchies do not scale: every new aggregation layer invents new conventions, increasing interface variety, cognitive load, and attack surface. Closure under composition allows the same primitives to govern a single agent or millions of agents, enabling recursive nesting, digest-first communication, and verifiable summaries at civilizational scale."
       }
     ]
   }

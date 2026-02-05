@@ -5,7 +5,7 @@
     "version": "1.0.0",
     "created_at": "2026-02-04T22:27:53.975717Z",
     "description": "The unified architectural definition for agent-native systems, combining theoretical foundations (axioms, models) with operational doctrine (protocols, prescriptions).",
-    "concepts_count": 62
+    "concepts_count": 63
   },
   "payload": {
     "axioms": [
@@ -104,9 +104,10 @@
         "components": ["Interface", "Internal State", "Invariants", "Resource Budgets"],
         "implications": [
           "Complexity must be hidden behind verifiable behavior.",
-          "Boundaries define the locus of understanding."
+          "Boundaries define the locus of understanding.",
+          "Interfaces must be closed under composition; aggregation must not invent new boundary primitives."
         ],
-        "law_refs": ["LAW-01", "LAW-05"]
+        "law_refs": ["LAW-01", "LAW-05", "LAW-16"]
       },
       {
         "id": "AX-10",
@@ -208,9 +209,10 @@
         "statement": "Holarchies provide multi-scale representations; higher levels summarize, lower levels execute.",
         "implications": [
           "Mirror context management needs across the system.",
-          "Summaries upward, drill-down on demand."
+          "Summaries upward, drill-down on demand.",
+          "Composition must not widen interfaces: higher levels summarize via verifiable receipts + selectors."
         ],
-        "law_refs": ["LAW-07"]
+        "law_refs": ["LAW-07", "LAW-16"]
       },
       {
         "id": "AX-20",
@@ -221,6 +223,17 @@
           "Preserve authority only where decisions are irreducible."
         ],
         "law_refs": ["LAW-01", "LAW-14"]
+      },
+      {
+        "id": "AX-21",
+        "name": "Scale-Invariant Interface Composition",
+        "statement": "A holarchic system scales only if it is closed under composition: a holon-of-holons must be addressable and governable through the same boundary primitives as a single holon.",
+        "implications": [
+          "Avoid per-level protocol forks; change budgets/scopes/policy, not primitives.",
+          "Treat summaries as verifiable coarse-graining operators with declared loss profiles and deterministic zoom-in.",
+          "Make recursion explicit in the work DAG: any node may expand into a subgraph without changing external contracts."
+        ],
+        "law_refs": ["LAW-16", "LAW-07", "LAW-05"]
       }
     ],
     "models": [
