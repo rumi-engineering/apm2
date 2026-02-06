@@ -1075,14 +1075,19 @@ impl InMemorySessionRegistry {
         }
     }
 
-    /// Clears all sessions.
+    /// Clears all active and terminated sessions.
     ///
     /// Used during crash recovery after sending all `LEASE_REVOKED` signals.
+    /// Also clears terminated entries so that `clear_and_persist` (which
+    /// writes an empty `terminated: []` to disk) is consistent with the
+    /// in-memory state. Without this, a full clear would write empty
+    /// terminated entries to disk but leave stale entries in memory.
     pub fn clear(&self) {
         let mut state = self.state.write().expect("lock poisoned");
         state.by_id.clear();
         state.by_handle.clear();
         state.queue.clear();
+        state.terminated.clear();
     }
 
     /// Returns the number of active sessions.
@@ -1589,6 +1594,25 @@ pub enum PersistentRegistryError {
         /// The duplicated session ID.
         session_id: String,
     },
+
+    /// State file contains more active sessions than the `MAX_SESSIONS` cap.
+    ///
+    /// Per Security Review BLOCKER 1 (PR #434): the recovery load path must
+    /// fail-closed rather than silently evicting excess sessions. Eviction
+    /// during load would drop sessions without running recovery side-effects
+    /// (lease revocation, work claim cleanup), causing those sessions to
+    /// permanently disappear from the recovery pipeline. Startup must abort
+    /// so the operator can investigate the over-cap state file.
+    #[error(
+        "State file session count {count} exceeds MAX_SESSIONS ({max}); \
+         startup aborted (fail-closed, no silent eviction)"
+    )]
+    TooManySessions {
+        /// Number of sessions in the state file.
+        count: usize,
+        /// The maximum allowed session count.
+        max: usize,
+    },
 }
 
 /// Persistent session registry for crash recovery.
@@ -1675,6 +1699,19 @@ impl PersistentSessionRegistry {
                 return Err(PersistentRegistryError::VersionMismatch {
                     found: state_file.version,
                     expected: 1,
+                });
+            }
+
+            // Security Review BLOCKER 1 (PR #434): Fail-closed if the state
+            // file contains more sessions than MAX_SESSIONS. The recovery load
+            // path must NOT silently evict excess sessions, because eviction
+            // would drop sessions without running recovery side-effects (lease
+            // revocation, work claim cleanup). Those evicted sessions would
+            // permanently disappear from the recovery pipeline.
+            if state_file.sessions.len() > MAX_SESSIONS {
+                return Err(PersistentRegistryError::TooManySessions {
+                    count: state_file.sessions.len(),
+                    max: MAX_SESSIONS,
                 });
             }
 
@@ -2785,6 +2822,210 @@ mod session_registry_tests {
             },
             other => panic!("Expected CorruptedDuplicateSessionId, got: {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // SECURITY BLOCKER 1: Over-cap active sessions rejected at load (PR #434)
+    // =========================================================================
+
+    /// Regression test: `load_from_file` MUST reject state files with more
+    /// active sessions than `MAX_SESSIONS` rather than silently evicting the
+    /// excess. Silent eviction during load would drop sessions without running
+    /// recovery side-effects (lease revocation, work claim cleanup).
+    #[test]
+    fn test_load_rejects_over_cap_sessions() {
+        use std::io::Write;
+
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        // Build a state file with MAX_SESSIONS + 1 sessions
+        let sessions: Vec<serde_json::Value> = (0..=MAX_SESSIONS)
+            .map(|i| {
+                serde_json::json!({
+                    "session_id": format!("sess-{i}"),
+                    "work_id": format!("work-{i}"),
+                    "role": 1,
+                    "ephemeral_handle": format!("handle-{i}"),
+                    "policy_resolved_ref": "policy-ref",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                })
+            })
+            .collect();
+
+        let state_json = serde_json::json!({
+            "version": 1,
+            "sessions": sessions
+        });
+        temp_file
+            .write_all(state_json.to_string().as_bytes())
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let result = PersistentSessionRegistry::load_from_file(temp_file.path());
+        assert!(
+            result.is_err(),
+            "load_from_file must reject state files with > MAX_SESSIONS entries"
+        );
+
+        match result.unwrap_err() {
+            PersistentRegistryError::TooManySessions { count, max } => {
+                assert_eq!(count, MAX_SESSIONS + 1);
+                assert_eq!(max, MAX_SESSIONS);
+            },
+            other => panic!("Expected TooManySessions error, got: {other:?}"),
+        }
+    }
+
+    /// Regression test: `load_from_file` allows exactly `MAX_SESSIONS` (not
+    /// off-by-one) since the check is strictly greater-than.
+    #[test]
+    fn test_load_allows_exactly_max_sessions() {
+        use std::io::Write;
+
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        // Build a state file with exactly MAX_SESSIONS sessions
+        let sessions: Vec<serde_json::Value> = (0..MAX_SESSIONS)
+            .map(|i| {
+                serde_json::json!({
+                    "session_id": format!("sess-{i}"),
+                    "work_id": format!("work-{i}"),
+                    "role": 1,
+                    "ephemeral_handle": format!("handle-{i}"),
+                    "policy_resolved_ref": "policy-ref",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                })
+            })
+            .collect();
+
+        let state_json = serde_json::json!({
+            "version": 1,
+            "sessions": sessions
+        });
+        temp_file
+            .write_all(state_json.to_string().as_bytes())
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let result = PersistentSessionRegistry::load_from_file(temp_file.path());
+        assert!(
+            result.is_ok(),
+            "load_from_file must allow exactly MAX_SESSIONS entries"
+        );
+        assert_eq!(result.unwrap().session_count(), MAX_SESSIONS);
+    }
+
+    // =========================================================================
+    // QUALITY MAJOR 1: clear_and_persist clears terminated entries (PR #434)
+    // =========================================================================
+
+    /// Regression test: `clear_and_persist` must clear terminated entries from
+    /// in-memory state to be consistent with the empty state file it writes.
+    /// Before this fix, `InMemorySessionRegistry::clear` only cleared active
+    /// session maps, leaving terminated entries in memory while writing an
+    /// empty `terminated: []` to disk.
+    #[test]
+    fn test_clear_and_persist_clears_terminated_entries() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        let registry = PersistentSessionRegistry::new(&state_path);
+
+        // Register a session
+        registry
+            .register_session(make_session("sess-1", "handle-1"))
+            .unwrap();
+
+        // Terminate it (move from active to terminated)
+        let info = SessionTerminationInfo {
+            session_id: "sess-1".to_string(),
+            rationale_code: "normal".to_string(),
+            exit_classification: "SUCCESS".to_string(),
+            exit_code: Some(0),
+            terminated_at_ns: 1_000_000_000,
+            actual_tokens_consumed: None,
+        };
+        let found = registry.mark_terminated("sess-1", info).unwrap();
+        assert!(found, "session should be found and terminated");
+
+        // Verify terminated entry exists in memory
+        assert!(
+            registry.get_termination_info("sess-1").is_some(),
+            "terminated entry should exist before clear"
+        );
+
+        // Clear and persist
+        registry.clear_and_persist().unwrap();
+
+        // Verify terminated entry is also cleared from memory
+        assert!(
+            registry.get_termination_info("sess-1").is_none(),
+            "terminated entry must be cleared by clear_and_persist"
+        );
+        assert_eq!(registry.session_count(), 0);
+
+        // Verify state file reflects empty state
+        let reloaded = PersistentSessionRegistry::load_from_file(&state_path).unwrap();
+        assert_eq!(reloaded.session_count(), 0);
+        assert!(
+            reloaded.get_termination_info("sess-1").is_none(),
+            "terminated entry must not survive reload after clear_and_persist"
+        );
+    }
+
+    /// Regression test: after `clear_all_sessions` + restart, both active and
+    /// terminated entries are gone. Exercises the full lifecycle through the
+    /// `SessionRegistry` trait.
+    #[test]
+    fn test_clear_all_sessions_then_restart_is_empty() {
+        use crate::session::SessionRegistry as SR;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        // Phase 1: Create active + terminated state
+        {
+            let registry = PersistentSessionRegistry::new(&state_path);
+
+            registry
+                .register_session(make_session("active-1", "h-active-1"))
+                .unwrap();
+            registry
+                .register_session(make_session("term-1", "h-term-1"))
+                .unwrap();
+
+            let info = SessionTerminationInfo {
+                session_id: "term-1".to_string(),
+                rationale_code: "crash".to_string(),
+                exit_classification: "FAILURE".to_string(),
+                exit_code: Some(1),
+                terminated_at_ns: 1_000_000_000,
+                actual_tokens_consumed: None,
+            };
+            SR::mark_terminated(&registry, "term-1", info).unwrap();
+
+            // Verify both exist
+            assert!(registry.get_session("active-1").is_some());
+            assert!(SR::get_termination_info(&registry, "term-1").is_some());
+
+            // Clear all sessions via the trait method
+            SR::clear_all_sessions(&registry).unwrap();
+
+            // Verify everything is gone in memory
+            assert!(registry.get_session("active-1").is_none());
+            assert!(SR::get_termination_info(&registry, "term-1").is_none());
+        }
+
+        // Phase 2: Simulate restart
+        let reloaded = PersistentSessionRegistry::load_from_file(&state_path).unwrap();
+        assert_eq!(reloaded.session_count(), 0);
+        assert!(reloaded.get_termination_info("term-1").is_none());
     }
 }
 

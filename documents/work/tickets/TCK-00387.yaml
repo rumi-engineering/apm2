@@ -45,7 +45,8 @@ ticket_meta:
       - "Work items bound to stale sessions become re-claimable."
       - "Recovery completes within 5-second timeout."
       - "Recovery is idempotent (second startup with same state doesn't double-emit)."
-      - "Recovery failure does not prevent daemon from starting (warn and continue)."
+      - "Recovery failure is startup-fatal (fail-closed). The daemon MUST NOT accept connections when recovery fails, because incomplete recovery means stale leases and work claims may persist. Sessions are preserved in the state file for retry on the next startup."
+      - "State file with active session count exceeding MAX_SESSIONS is rejected at load time (no silent eviction)."
   notes:
     context: |
       Crash recovery at main.rs line 1013 calls `perform_crash_recovery(&state)` which
@@ -75,6 +76,9 @@ ticket_meta:
       - crates/apm2-daemon/src/ledger.rs (SqliteLedgerEventEmitter for lease revocation events)
       - crates/apm2-core/src/work/state.rs (work state transitions for recovery)
     security: |
-      Crash recovery must be fail-safe: if recovery fails, the daemon should still
-      start and log warnings. Orphaned leases should time out via HTF time envelopes
-      even without explicit revocation.
+      Crash recovery is fail-closed: if recovery fails, the daemon MUST NOT start.
+      Incomplete recovery could leave stale leases and work claims that would not
+      be re-emitted on the next startup if sessions were silently dropped. The
+      fail-closed policy ensures that the operator is alerted to recovery failures
+      and can investigate before the daemon accepts new connections. Orphaned leases
+      also time out via HTF time envelopes as a defense-in-depth measure.

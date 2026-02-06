@@ -1473,12 +1473,14 @@ async fn perform_crash_recovery(
             })?;
         },
         Err(e) => {
-            // Registry is NOT cleared on error -- unrecovered sessions are
-            // preserved so they can be retried on the next startup.
-            warn!(
-                error = %e,
-                "Crash recovery failed; session registry preserved for retry on next startup"
-            );
+            // Security Review BLOCKER 1 (PR #434): All recovery failures are
+            // startup-fatal. The registry is NOT cleared, preserving sessions
+            // for retry on the next startup. But the daemon must NOT proceed
+            // to accept connections, because incomplete recovery means stale
+            // leases and work claims may still exist.
+            return Err(anyhow::anyhow!(
+                "Crash recovery failed (fail-closed, startup aborted): {e}"
+            ));
         },
     }
 
