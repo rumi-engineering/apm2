@@ -657,6 +657,11 @@ impl DispatcherState {
     /// ledger events for the caller to persist.
     #[must_use]
     pub fn with_gate_orchestrator(mut self, orchestrator: Arc<GateOrchestrator>) -> Self {
+        // Wire orchestrator into session dispatcher so termination triggers
+        // gate lifecycle directly from the session dispatch path (Security
+        // BLOCKER 1 fix).
+        self.session_dispatcher
+            .set_gate_orchestrator(Arc::clone(&orchestrator));
         self.gate_orchestrator = Some(orchestrator);
         self
     }

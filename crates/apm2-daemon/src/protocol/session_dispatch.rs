@@ -91,6 +91,7 @@ use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::registry::TerminationReason;
 use crate::episode::{CapabilityManifest, EpisodeId, EpisodeRuntime, SharedToolBroker, ToolClass};
+use crate::gate::{GateOrchestrator, SessionTerminatedInfo};
 use crate::htf::{ClockError, HolonicClock};
 
 // ============================================================================
@@ -475,6 +476,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Per TCK-00344, the session registry is used to look up session state
     /// for `SessionStatus` queries.
     session_registry: Option<Arc<dyn crate::session::SessionRegistry>>,
+    /// Gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    ///
+    /// When set, session termination triggers gate orchestration via
+    /// [`GateOrchestrator::on_session_terminated`]. The returned events
+    /// are persisted to the ledger through the session dispatcher's
+    /// `ledger` emitter.
+    gate_orchestrator: Option<Arc<GateOrchestrator>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -501,6 +509,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -519,6 +528,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            gate_orchestrator: None,
         }
     }
 }
@@ -542,6 +552,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -565,6 +576,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -604,6 +616,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -672,6 +685,26 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ) -> Self {
         self.session_registry = Some(registry);
         self
+    }
+
+    /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    ///
+    /// When set, session termination via `ToolDecision::Terminate` triggers
+    /// gate orchestration. Events from the orchestrator are persisted to
+    /// the ledger through the dispatcher's `ledger` emitter.
+    /// Sets the gate orchestrator (builder pattern).
+    #[must_use]
+    pub fn with_gate_orchestrator(mut self, orchestrator: Arc<GateOrchestrator>) -> Self {
+        self.gate_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Sets the gate orchestrator on an already-constructed dispatcher.
+    ///
+    /// This is used by `DispatcherState::with_gate_orchestrator` to wire
+    /// the orchestrator after the session dispatcher has been built.
+    pub fn set_gate_orchestrator(&mut self, orchestrator: Arc<GateOrchestrator>) {
+        self.gate_orchestrator = Some(orchestrator);
     }
 
     fn emit_htf_regression_defect(&self, current: u64, previous: u64) {
@@ -1328,6 +1361,116 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             SessionErrorCode::SessionErrorInternal,
                             format!("session termination persistence failed: {e} ({request_id})"),
                         ));
+                    }
+                }
+
+                // Security BLOCKER 1 fix (TCK-00388): Trigger gate
+                // orchestration after session termination.  This ensures the
+                // gate lifecycle (PolicyResolved -> GateLeaseIssued -> receipt
+                // path) fires on every real session termination, not just in
+                // tests.
+                if let (Some(orch), Some(registry)) =
+                    (&self.gate_orchestrator, &self.session_registry)
+                {
+                    // Retrieve authoritative work_id from the session registry.
+                    let work_id = registry
+                        .get_session(session_id)
+                        .map_or_else(|| session_id.to_string(), |s| s.work_id);
+
+                    // Derive changeset_digest deterministically from session
+                    // and work identifiers. The actual changeset hash would
+                    // come from the workspace layer in the full pipeline; here
+                    // we use a BLAKE3 binding so the digest is non-zero and
+                    // unique per session+work pair.
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(session_id.as_bytes());
+                    hasher.update(work_id.as_bytes());
+                    let changeset_digest: [u8; 32] = *hasher.finalize().as_bytes();
+
+                    #[allow(clippy::cast_possible_truncation)]
+                    let terminated_at_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+
+                    let gate_info = SessionTerminatedInfo {
+                        session_id: session_id.to_string(),
+                        work_id: work_id.clone(),
+                        changeset_digest,
+                        terminated_at_ms,
+                    };
+
+                    // The orchestrator's on_session_terminated is async; use
+                    // block_in_place to call it from the sync dispatch path.
+                    // This is safe because the session dispatcher runs on a
+                    // Tokio worker thread.
+                    let orch_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(orch.on_session_terminated(gate_info))
+                    });
+
+                    match orch_result {
+                        Ok((_gate_types, _signers, events)) => {
+                            // Persist gate orchestration events to ledger
+                            // (fail-closed on persistence error).
+                            if let Some(ref ledger) = self.ledger {
+                                for event in &events {
+                                    let event_type = match event {
+                                        crate::gate::GateOrchestratorEvent::PolicyResolved {
+                                            ..
+                                        } => "gate.policy_resolved",
+                                        crate::gate::GateOrchestratorEvent::GateLeaseIssued {
+                                            ..
+                                        } => "gate.lease_issued",
+                                        _ => "gate.event",
+                                    };
+                                    let payload = serde_json::to_vec(event).unwrap_or_default();
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_nanos() as u64)
+                                        .unwrap_or(0);
+                                    if let Err(e) = ledger.emit_session_event(
+                                        session_id,
+                                        event_type,
+                                        &payload,
+                                        "orchestrator:gate-lifecycle",
+                                        ts,
+                                    ) {
+                                        error!(
+                                            session_id = %session_id,
+                                            event_type = %event_type,
+                                            error = %e,
+                                            "Failed to persist gate orchestration event (fail-closed)"
+                                        );
+                                        return Ok(SessionResponse::error(
+                                            SessionErrorCode::SessionErrorInternal,
+                                            format!(
+                                                "gate event persistence failed: {e} ({request_id})"
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                            info!(
+                                session_id = %session_id,
+                                work_id = %work_id,
+                                event_count = events.len(),
+                                "Gate orchestration triggered on session termination"
+                            );
+                        },
+                        Err(e) => {
+                            // Fail-closed: gate orchestration failure is fatal.
+                            error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "Gate orchestration failed on session termination (fail-closed)"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInternal,
+                                format!("gate orchestration failed: {e} ({request_id})"),
+                            ));
+                        },
                     }
                 }
 

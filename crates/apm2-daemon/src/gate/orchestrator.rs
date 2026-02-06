@@ -32,6 +32,7 @@ use apm2_core::fac::{
     AatLeaseExtension, GateLease, GateLeaseBuilder, GateReceipt, GateReceiptBuilder,
     PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
 };
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -71,6 +72,14 @@ pub const MAX_WORK_ID_LENGTH: usize = 4096;
 /// orchestrations that have been removed but whose keys should still be
 /// rejected.
 pub const MAX_IDEMPOTENCY_KEYS: usize = 10 * MAX_CONCURRENT_ORCHESTRATIONS;
+
+/// Dedicated timeout authority actor ID for timeout receipts.
+///
+/// Timeout receipts are signed by the orchestrator key (the executor never ran
+/// or did not finish), so using the executor's actor ID would be misleading.
+/// This constant makes the timeout authority identity explicit and
+/// distinguishable from real executor-signed receipts.
+pub const TIMEOUT_AUTHORITY_ACTOR_ID: &str = "orchestrator:timeout";
 
 /// Maximum length of any string field in orchestrator events.
 const MAX_STRING_LENGTH: usize = 4096;
@@ -119,7 +128,7 @@ impl Clock for SystemClock {
 ///
 /// Each terminated session with associated work triggers execution of
 /// all required gate types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum GateType {
     /// Agent Acceptance Testing gate.
     Aat,
@@ -222,7 +231,7 @@ impl GateStatus {
 // =============================================================================
 
 /// The outcome of a gate execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GateOutcome {
     /// The gate type.
     pub gate_type: GateType,
@@ -451,7 +460,7 @@ pub enum GateOrchestratorError {
 ///
 /// These events represent the gate lifecycle and are intended to be
 /// persisted to the ledger.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub enum GateOrchestratorEvent {
     /// Policy was resolved for a changeset.
@@ -1813,6 +1822,21 @@ impl GateOrchestrator {
             "All gates completed"
         );
 
+        // Security MAJOR 1 fix: Reclaim completed orchestrations to prevent
+        // unbounded growth of the active-map. Without this, completed
+        // orchestrations accumulate until max_concurrent_orchestrations is
+        // reached, rejecting all new orchestrations.
+        //
+        // The events have been collected by value above, so removing the
+        // entry from the active map does not lose any data the caller needs
+        // for ledger persistence.
+        let removed = self.remove_orchestration(work_id).await;
+        debug!(
+            work_id = %work_id,
+            removed = %removed,
+            "Completed orchestration reclaimed from active map"
+        );
+
         Ok(Some(outcomes))
     }
 }
@@ -1842,11 +1866,18 @@ const fn state_name(status: &GateStatus) -> &'static str {
 /// no actual gate execution occurred. The `passed` field is explicitly
 /// set to `false` (Quality BLOCKER 2).
 ///
-/// # Signer Identity (Quality MAJOR 1)
+/// # Signer Identity (Security MAJOR 2)
 ///
 /// The receipt is signed by the `signer` parameter, which is the
 /// **orchestrator key** acting as a dedicated timeout authority. The
 /// executor never ran (or didn't finish), so it cannot produce a receipt.
+///
+/// The `executor_actor_id` is set to [`TIMEOUT_AUTHORITY_ACTOR_ID`]
+/// (`"orchestrator:timeout"`) rather than borrowing the lease's
+/// `executor_actor_id`. This makes timeout receipt identity explicit
+/// and distinguishable from real executor-signed receipts. The receipt
+/// verification path must accept the orchestrator key for receipts
+/// bearing this actor ID.
 #[must_use]
 pub fn create_timeout_receipt(
     gate_type: GateType,
@@ -1857,7 +1888,7 @@ pub fn create_timeout_receipt(
 
     GateReceiptBuilder::new(&receipt_id, gate_type.as_gate_id(), &lease.lease_id)
         .changeset_digest(lease.changeset_digest)
-        .executor_actor_id(&lease.executor_actor_id)
+        .executor_actor_id(TIMEOUT_AUTHORITY_ACTOR_ID)
         .receipt_version(1)
         .payload_kind(gate_type.payload_kind())
         .payload_schema_version(1)
@@ -3117,13 +3148,13 @@ mod tests {
             }
         }
 
-        let status = orch
-            .gate_status("work-fail", GateType::Quality)
-            .await
-            .unwrap();
+        // Security MAJOR 1: After all gates complete, the orchestration is
+        // reclaimed from the active map to prevent unbounded growth.
         assert!(
-            matches!(status, GateStatus::Completed { passed: false, .. }),
-            "quality gate should be completed with passed=false"
+            orch.gate_status("work-fail", GateType::Quality)
+                .await
+                .is_none(),
+            "orchestration should be reclaimed after all gates complete"
         );
     }
 
@@ -3820,17 +3851,24 @@ mod tests {
             events.len()
         );
 
-        // Verify all gates timed out.
-        for gate_type in GateType::all() {
-            let status = orch
-                .gate_status("work-drive-timeout", gate_type)
-                .await
-                .unwrap();
-            assert!(
-                matches!(status, GateStatus::TimedOut { .. }),
-                "Gate {gate_type} should be TimedOut with zero timeout"
-            );
-        }
+        // Security MAJOR 1: With zero timeout all 3 gates time out, triggering
+        // AllGatesCompleted and orchestration reclamation.  The active map
+        // should be empty.
+        assert_eq!(
+            orch.active_count().await,
+            0,
+            "Orchestration should be reclaimed after all gates time out"
+        );
+
+        // Verify events contain GateTimedOut for all gate types.
+        let timeout_count = events
+            .iter()
+            .filter(|e| matches!(e, GateOrchestratorEvent::GateTimedOut { .. }))
+            .count();
+        assert_eq!(
+            timeout_count, 3,
+            "Should have 3 GateTimedOut events for all gates"
+        );
     }
 
     #[tokio::test]
@@ -3866,5 +3904,96 @@ mod tests {
                 "Adapter profile mismatch for {gate_type}"
             );
         }
+    }
+
+    // =========================================================================
+    // Security MAJOR 2: Timeout receipt identity semantics
+    // =========================================================================
+
+    /// Verifies that timeout receipts use the dedicated timeout authority
+    /// actor ID (`TIMEOUT_AUTHORITY_ACTOR_ID`) instead of borrowing the
+    /// executor's actor ID from the lease.
+    #[tokio::test]
+    async fn test_timeout_receipt_uses_dedicated_authority_actor_id() {
+        let signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-auth", "work-auth", "gate-quality")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-original")
+            .issued_at(1000)
+            .expires_at(2000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-auth")
+            .time_envelope_ref("htf:tick:99999")
+            .build_and_sign(&signer);
+
+        let receipt = create_timeout_receipt(GateType::Quality, &lease, &signer);
+
+        // The timeout receipt MUST use the dedicated timeout authority actor
+        // ID, not the executor's original actor ID from the lease.
+        assert_eq!(
+            receipt.executor_actor_id, TIMEOUT_AUTHORITY_ACTOR_ID,
+            "Timeout receipt must use dedicated timeout authority actor ID, \
+             not the lease executor_actor_id"
+        );
+
+        // Verify the receipt is NOT using the lease's executor actor ID.
+        assert_ne!(
+            receipt.executor_actor_id, lease.executor_actor_id,
+            "Timeout receipt must NOT borrow executor_actor_id from the lease"
+        );
+
+        // Verify the receipt is still a FAIL verdict.
+        assert!(!receipt.passed, "Timeout receipt must be a FAIL verdict");
+
+        // Verify the receipt signature is valid (signed by orchestrator key).
+        assert!(
+            receipt.validate_signature(&signer.verifying_key()).is_ok(),
+            "Timeout receipt signature must be valid against orchestrator key"
+        );
+    }
+
+    // =========================================================================
+    // Security MAJOR 1: Completed orchestration reclamation
+    // =========================================================================
+
+    /// Verifies that completed orchestrations are removed from the active
+    /// map after all gates reach terminal state, preventing unbounded growth.
+    #[tokio::test]
+    async fn test_completed_orchestration_reclaimed_from_active_map() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-reclaim").await;
+
+        // Complete all gates.
+        for gate_type in GateType::all() {
+            let lease = orch.gate_lease("work-reclaim", gate_type).await.unwrap();
+            let exec_signer = &exec_signers[&gate_type];
+            let receipt = build_receipt(
+                &format!("receipt-reclaim-{gate_type}"),
+                gate_type,
+                &lease,
+                exec_signer,
+                [0xAA; 32],
+                [0xBB; 32],
+            );
+            orch.record_gate_receipt("work-reclaim", gate_type, receipt)
+                .await
+                .unwrap();
+        }
+
+        // After all gates complete, the orchestration should be removed from
+        // the active map.
+        assert_eq!(
+            orch.active_count().await,
+            0,
+            "Completed orchestration should be reclaimed from active map"
+        );
+
+        // The gate status should no longer be found (orchestration removed).
+        assert!(
+            orch.gate_status("work-reclaim", GateType::Aat)
+                .await
+                .is_none(),
+            "Gate status should be None after orchestration reclamation"
+        );
     }
 }
