@@ -121,6 +121,15 @@ impl std::fmt::Debug for SessionState {
 ///
 /// Per TCK-00256, sessions must be persisted to enable subsequent
 /// session-scoped IPC calls.
+///
+/// # TCK-00385: Termination Tracking
+///
+/// The registry now supports marking sessions as terminated via
+/// [`mark_terminated`](Self::mark_terminated) and querying termination info
+/// via [`get_termination_info`](Self::get_termination_info). Terminated
+/// sessions are preserved in the registry (with TTL) so that
+/// `SessionStatus` queries after termination return useful information
+/// instead of "session not found".
 pub trait SessionRegistry: Send + Sync {
     /// Registers a new session.
     fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError>;
@@ -137,6 +146,43 @@ pub trait SessionRegistry: Send + Sync {
     /// if no session matches. This is an O(n) scan; a production implementation
     /// could add a secondary index for efficiency.
     fn get_session_by_work_id(&self, work_id: &str) -> Option<SessionState>;
+
+    /// Marks a session as terminated with the given termination info
+    /// (TCK-00385).
+    ///
+    /// The session entry is preserved in the registry so that subsequent
+    /// `SessionStatus` queries return TERMINATED state with exit details.
+    /// The entry will be cleaned up after the configured TTL.
+    ///
+    /// Returns `Ok(true)` if the session was found and marked terminated,
+    /// `Ok(false)` if the session was not found. Returns `Err` if the
+    /// termination could not be persisted (fail-closed: callers MUST treat
+    /// persistence failures as fatal for the session lifecycle).
+    fn mark_terminated(
+        &self,
+        session_id: &str,
+        info: SessionTerminationInfo,
+    ) -> Result<bool, SessionRegistryError>;
+
+    /// Queries termination info for a session (TCK-00385).
+    ///
+    /// Returns `Some(info)` if the session has been terminated and the
+    /// termination entry has not yet expired (TTL). Returns `None` if the
+    /// session is still active or not found.
+    fn get_termination_info(&self, session_id: &str) -> Option<SessionTerminationInfo>;
+
+    /// Queries a terminated session's preserved state and termination info
+    /// (TCK-00385).
+    ///
+    /// Returns `Some((session, info))` if the session has been terminated
+    /// and the entry has not yet expired. Returns `None` otherwise.
+    ///
+    /// This is used by the `SessionStatus` handler to return `work_id`, role,
+    /// and `episode_id` alongside termination details.
+    fn get_terminated_session(
+        &self,
+        session_id: &str,
+    ) -> Option<(SessionState, SessionTerminationInfo)>;
 }
 
 /// Error type for session registry operations.

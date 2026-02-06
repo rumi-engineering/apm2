@@ -204,6 +204,24 @@ pub enum EpisodeError {
         /// Error message.
         message: String,
     },
+
+    /// Session termination persistence failed (TCK-00385 MAJOR 1).
+    ///
+    /// Per the fail-closed contract (session/mod.rs), persistence failures
+    /// during `mark_terminated` are fatal for the session lifecycle. The
+    /// episode stop/quarantine operation succeeded, but the session registry
+    /// could not persist the termination state.
+    #[error(
+        "session termination persistence failed for episode {episode_id}, session {session_id}: {message}"
+    )]
+    SessionTerminationFailed {
+        /// Episode identifier.
+        episode_id: String,
+        /// Session identifier.
+        session_id: String,
+        /// Error message from the registry.
+        message: String,
+    },
 }
 
 impl EpisodeError {
@@ -229,6 +247,7 @@ impl EpisodeError {
             Self::CustodyDomainViolation { .. } => "custody_domain_violation",
             Self::ExecutionFailed { .. } => "execution_failed",
             Self::LedgerFailure { .. } => "ledger_failure",
+            Self::SessionTerminationFailed { .. } => "session_termination_failed",
         }
     }
 }

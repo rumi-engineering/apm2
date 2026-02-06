@@ -2269,6 +2269,36 @@ impl SessionClient {
         Self::decode_session_status_response(&response_frame)
     }
 
+    /// Queries the status of a session with termination details (TCK-00385).
+    ///
+    /// This is equivalent to [`session_status`](Self::session_status) but
+    /// clarifies that the response may include termination information when
+    /// the session has ended. The caller can distinguish ACTIVE from
+    /// TERMINATED by checking `response.state`:
+    ///
+    /// - `"ACTIVE"`: Session is running. Termination fields are `None`.
+    /// - `"TERMINATED"`: Session has ended. `termination_reason`, `exit_code`,
+    ///   `terminated_at_ns`, and `actual_tokens_consumed` may be populated.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_token` - Session token for authentication
+    ///
+    /// # Returns
+    ///
+    /// Session status including state, work association, telemetry summary,
+    /// and termination details (if applicable).
+    #[allow(dead_code)] // Scaffolding for TCK-00386 coordinate command
+    pub async fn session_status_with_termination(
+        &mut self,
+        session_token: &str,
+    ) -> Result<SessionStatusResponse, ProtocolClientError> {
+        // Delegates to session_status -- the wire response is the same,
+        // the new optional fields are populated server-side for TERMINATED
+        // sessions.
+        self.session_status(session_token).await
+    }
+
     /// Decodes a `StreamLogs` response.
     #[allow(dead_code)] // Used by stream_logs which is scaffolding
     fn decode_stream_logs_response(

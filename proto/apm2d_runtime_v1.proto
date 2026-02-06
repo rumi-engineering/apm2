@@ -700,6 +700,18 @@ message SessionStatusResponse {
   uint64 started_at_ns = 8;
   // Session duration in milliseconds.
   uint64 duration_ms = 9;
+
+  // TCK-00385: Session termination fields.
+  // Present only when state == "TERMINATED".
+
+  // Termination reason (normal, crash, timeout, quarantined, budget_exhausted).
+  optional string termination_reason = 10;
+  // Process exit code (0 = success).
+  optional int32 exit_code = 11;
+  // Timestamp when session terminated (nanoseconds since epoch).
+  optional uint64 terminated_at_ns = 12;
+  // Actual tokens consumed by the session (if available from agent adapter).
+  optional uint64 actual_tokens_consumed = 13;
 }
 
 // =============================================================================

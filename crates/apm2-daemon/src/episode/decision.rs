@@ -835,31 +835,82 @@ impl AsRef<str> for DedupeKey {
 /// Information about a session termination.
 ///
 /// Moved from `consume.rs` to support `ToolDecision::Terminate`.
+///
+/// # TCK-00385: Extended Termination Details
+///
+/// Extended with `exit_code`, `terminated_at_ns`, and `actual_tokens_consumed`
+/// fields to support the session termination signal protocol. These fields
+/// enable the `SessionStatus` endpoint to return terminal state details
+/// (reason, exit code, timing, token usage) after a session has ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTerminationInfo {
     /// Session ID that was terminated.
     pub session_id: String,
 
     /// Rationale code for the termination.
+    ///
+    /// Maps to `termination_reason` in the `SessionStatusResponse` wire format.
+    /// Values: `"normal"`, `"crash"`, `"timeout"`, `"quarantined"`,
+    /// `"budget_exhausted"`, `"CONTEXT_MISS"`.
     pub rationale_code: String,
 
     /// Exit classification (SUCCESS, FAILURE, etc.).
     pub exit_classification: String,
+
+    /// Process exit code (TCK-00385).
+    ///
+    /// `Some(0)` indicates clean exit; non-zero indicates abnormal termination.
+    /// `None` when exit code is not available (e.g., killed by signal).
+    pub exit_code: Option<i32>,
+
+    /// Timestamp when the session terminated, in nanoseconds since epoch
+    /// (TCK-00385).
+    ///
+    /// Set automatically by [`Self::new`] using the system clock.
+    pub terminated_at_ns: u64,
+
+    /// Actual tokens consumed by the agent adapter (TCK-00385).
+    ///
+    /// `None` when token tracking is not available from the adapter.
+    pub actual_tokens_consumed: Option<u64>,
 }
 
 impl SessionTerminationInfo {
-    /// Creates a new termination info.
+    /// Creates a new termination info with current timestamp.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(
         session_id: impl Into<String>,
         rationale: impl Into<String>,
         classification: impl Into<String>,
     ) -> Self {
+        let terminated_at_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
         Self {
             session_id: session_id.into(),
             rationale_code: rationale.into(),
             exit_classification: classification.into(),
+            exit_code: None,
+            terminated_at_ns,
+            actual_tokens_consumed: None,
         }
+    }
+
+    /// Sets the process exit code.
+    #[must_use]
+    pub const fn with_exit_code(mut self, code: i32) -> Self {
+        self.exit_code = Some(code);
+        self
+    }
+
+    /// Sets the actual tokens consumed.
+    #[must_use]
+    pub const fn with_tokens_consumed(mut self, tokens: u64) -> Self {
+        self.actual_tokens_consumed = Some(tokens);
+        self
     }
 }
 
