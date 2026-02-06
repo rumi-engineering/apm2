@@ -346,7 +346,7 @@ impl AttestationRequirements {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyInheritanceError::AttestationNotMet`] if any array
+    /// Returns [`PolicyInheritanceError::NonMonotonicTable`] if any array
     /// violates the monotonically non-decreasing invariant.
     pub fn try_new(
         tool_execution: [AttestationLevel; 5],
@@ -412,7 +412,8 @@ impl AttestationRequirements {
     ///
     /// # Errors
     ///
-    /// Returns error if any tier requires less attestation than a lower tier.
+    /// Returns [`PolicyInheritanceError::NonMonotonicTable`] if any tier
+    /// requires less attestation than a lower tier.
     pub fn validate_monotonic(&self) -> Result<(), PolicyInheritanceError> {
         for (name, levels) in [
             ("tool_execution", &self.tool_execution),
@@ -421,10 +422,7 @@ impl AttestationRequirements {
         ] {
             for i in 1..levels.len() {
                 if (levels[i] as u8) < (levels[i - 1] as u8) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    // i is bounded by levels.len() (5), so truncation cannot occur.
-                    return Err(PolicyInheritanceError::AttestationNotMet {
-                        tier: RiskTier::try_from(i as u8).unwrap_or(RiskTier::Tier4),
+                    return Err(PolicyInheritanceError::NonMonotonicTable {
                         reason: format!(
                             "monotonic ratchet violated for {name}: tier {i} requires \
                              {} but tier {} requires {}",
@@ -1831,7 +1829,14 @@ mod tests {
                 AttestationLevel::CounterSigned,
             ],
         );
-        assert!(result.is_err(), "non-monotonic table must be rejected");
+        assert!(
+            matches!(
+                result,
+                Err(PolicyInheritanceError::NonMonotonicTable { ref reason })
+                if reason.contains("monotonic ratchet violated")
+            ),
+            "non-monotonic table must be rejected with NonMonotonicTable variant, got: {result:?}"
+        );
     }
 
     #[test]
