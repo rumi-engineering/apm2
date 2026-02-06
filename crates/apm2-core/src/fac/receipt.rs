@@ -53,6 +53,7 @@
 //!         .payload_schema_version(1)
 //!         .payload_hash([0xAB; 32])
 //!         .evidence_bundle_hash([0xCD; 32])
+//!         .passed(true)
 //!         .build_and_sign(&signer);
 //!
 //! // Validate version in enforce mode
@@ -175,6 +176,7 @@ pub enum ReceiptError {
 /// - `payload_schema_version`: Version of the payload schema
 /// - `payload_hash`: Hash of the payload content
 /// - `evidence_bundle_hash`: Hash of the evidence bundle
+/// - `passed`: Explicit pass/fail verdict declared by the executor
 /// - `receipt_signature`: Ed25519 signature with domain separation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -216,6 +218,14 @@ pub struct GateReceipt {
     #[serde(with = "serde_bytes")]
     pub evidence_bundle_hash: [u8; 32],
 
+    /// Explicit pass/fail verdict declared by the gate executor.
+    ///
+    /// This is the authoritative verdict field. The orchestrator uses this
+    /// field directly rather than deriving the verdict from hash inspection.
+    /// Receipts without an explicit verdict are rejected at the admission
+    /// boundary (TCK-00388 Quality BLOCKER 2).
+    pub passed: bool,
+
     /// Ed25519 signature over canonical bytes with domain separation.
     #[serde(with = "serde_bytes")]
     pub receipt_signature: [u8; 64],
@@ -244,7 +254,8 @@ impl GateReceipt {
             + 4 + self.payload_kind.len()
             + 4   // payload_schema_version
             + 32  // payload_hash
-            + 32; // evidence_bundle_hash
+            + 32  // evidence_bundle_hash
+            + 1; // passed (bool)
 
         let mut bytes = Vec::with_capacity(capacity);
 
@@ -282,6 +293,9 @@ impl GateReceipt {
 
         // 10. evidence_bundle_hash
         bytes.extend_from_slice(&self.evidence_bundle_hash);
+
+        // 11. passed (1 byte: 0 = false, 1 = true)
+        bytes.push(u8::from(self.passed));
 
         bytes
     }
@@ -355,6 +369,7 @@ impl GateReceipt {
     ///         .payload_schema_version(1)
     ///         .payload_hash([0xAB; 32])
     ///         .evidence_bundle_hash([0xCD; 32])
+    ///         .passed(true)
     ///         .build_and_sign(&signer);
     ///
     /// // Enforce mode: errors on unknown versions
@@ -421,6 +436,7 @@ pub struct GateReceiptBuilder {
     payload_schema_version: Option<u32>,
     payload_hash: Option<[u8; 32]>,
     evidence_bundle_hash: Option<[u8; 32]>,
+    passed: Option<bool>,
 }
 
 impl GateReceiptBuilder {
@@ -488,6 +504,17 @@ impl GateReceiptBuilder {
         self
     }
 
+    /// Sets the explicit pass/fail verdict.
+    ///
+    /// This is the authoritative verdict field that the orchestrator reads
+    /// directly. Receipts MUST declare their verdict explicitly rather than
+    /// relying on hash-based inference (TCK-00388 Quality BLOCKER 2).
+    #[must_use]
+    pub const fn passed(mut self, passed: bool) -> Self {
+        self.passed = Some(passed);
+        self
+    }
+
     /// Builds the receipt and signs it with the provided signer.
     ///
     /// # Panics
@@ -532,6 +559,7 @@ impl GateReceiptBuilder {
         let evidence_bundle_hash = self
             .evidence_bundle_hash
             .ok_or(ReceiptError::MissingField("evidence_bundle_hash"))?;
+        let passed = self.passed.ok_or(ReceiptError::MissingField("passed"))?;
 
         // Validate string lengths to prevent DoS
         if self.receipt_id.len() > MAX_STRING_LENGTH {
@@ -582,6 +610,7 @@ impl GateReceiptBuilder {
             payload_schema_version,
             payload_hash,
             evidence_bundle_hash,
+            passed,
             receipt_signature: [0u8; 64],
         };
 
@@ -668,6 +697,7 @@ impl TryFrom<GateReceiptProto> for GateReceipt {
             payload_schema_version: proto.payload_schema_version,
             payload_hash,
             evidence_bundle_hash,
+            passed: proto.passed,
             receipt_signature,
         })
     }
@@ -690,6 +720,7 @@ impl From<GateReceipt> for GateReceiptProto {
             // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
+            passed: receipt.passed,
         }
     }
 }
@@ -714,6 +745,7 @@ pub mod tests {
             .payload_schema_version(1)
             .payload_hash([0xAB; 32])
             .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
             .build_and_sign(signer)
     }
 
@@ -785,6 +817,7 @@ pub mod tests {
             .payload_schema_version(1)
             .payload_hash([0xAB; 32])
             .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
             .try_build_and_sign(&signer);
 
         assert!(matches!(
@@ -830,6 +863,7 @@ pub mod tests {
             .payload_schema_version(1)
             .payload_hash([0xAB; 32])
             .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
             .build_and_sign(&signer);
 
         // "ab" + "cd" should NOT equal "a" + "bcd" with length-prefixing
@@ -841,6 +875,7 @@ pub mod tests {
             .payload_schema_version(1)
             .payload_hash([0xAB; 32])
             .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
             .build_and_sign(&signer);
 
         // Canonical bytes should be different
@@ -945,6 +980,7 @@ pub mod tests {
                 .payload_schema_version(1)
                 .payload_hash([0xAB; 32])
                 .evidence_bundle_hash([0xCD; 32])
+                .passed(true)
                 .build_and_sign(&signer);
 
             assert!(
@@ -1036,6 +1072,7 @@ pub mod tests {
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
+            passed: false,
         };
 
         let result = GateReceipt::try_from(proto);
@@ -1058,6 +1095,7 @@ pub mod tests {
             receipt_signature: vec![0u8; 32], // Wrong length - should be 64
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
+            passed: false,
         };
 
         let result = GateReceipt::try_from(proto);
@@ -1077,6 +1115,7 @@ pub mod tests {
             .payload_schema_version(1)
             .payload_hash([0xAB; 32])
             .evidence_bundle_hash([0xCD; 32])
+            .passed(true)
             .try_build_and_sign(&signer);
 
         assert!(matches!(
@@ -1105,6 +1144,7 @@ pub mod tests {
             receipt_signature: vec![0u8; 64],
             // HTF time envelope reference (RFC-0016): not yet populated.
             time_envelope_ref: None,
+            passed: false,
         };
 
         let result = GateReceipt::try_from(proto);

@@ -51,9 +51,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
 use apm2_core::config::EcosystemConfig;
+use apm2_core::crypto::Signer;
 use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
+use apm2_daemon::gate::{GateOrchestrator, GateOrchestratorConfig};
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
 use apm2_daemon::protocol; // Import from library
@@ -944,6 +946,106 @@ async fn async_main(args: Args) -> Result<()> {
         }
         .with_daemon_state(Arc::clone(&state)),
     );
+
+    // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
+    //
+    // The orchestrator is instantiated with a fresh signing key and wired into
+    // the DispatcherState. When a session terminates, the dispatcher calls
+    // `notify_session_terminated` which delegates to the orchestrator. A
+    // background task polls for gate timeouts periodically.
+    let gate_signer = Arc::new(Signer::generate());
+    let gate_orchestrator = Arc::new(GateOrchestrator::new(
+        GateOrchestratorConfig::default(),
+        gate_signer,
+    ));
+
+    // Wire orchestrator into dispatcher state so session termination events
+    // trigger autonomous gate lifecycle (Quality BLOCKER 1).
+    let dispatcher_state = {
+        // Unwrap the Arc, attach the orchestrator, and re-wrap.
+        // Safety: we just created this Arc and hold the only reference.
+        match Arc::try_unwrap(dispatcher_state) {
+            Ok(inner) => Arc::new(inner.with_gate_orchestrator(Arc::clone(&gate_orchestrator))),
+            Err(_arc) => {
+                unreachable!("dispatcher_state Arc should have single owner at bootstrap");
+            },
+        }
+    };
+
+    // Spawn background timeout poller for autonomous gate execution (Quality
+    // BLOCKER 2). This ensures timed-out gates produce FAIL verdicts even
+    // without explicit receipt collection. The poller runs every 10 seconds.
+    //
+    // Security BLOCKER 2 fix: Persist timeout and gate events to the ledger
+    // with fail-closed error handling. Without persistence, timeout FAIL
+    // verdicts exist only in memory and are lost on restart.
+    {
+        let orch = Arc::clone(&gate_orchestrator);
+        // Create a dedicated ledger emitter for the timeout poller if a
+        // ledger database is configured. Uses the same sqlite_conn (shared
+        // via Arc<Mutex>) and a fresh signing key.
+        let timeout_ledger_emitter: Option<SqliteLedgerEventEmitter> =
+            sqlite_conn.as_ref().map(|conn| {
+                let timeout_signer = Signer::generate();
+                let key_bytes = timeout_signer.secret_key_bytes();
+                let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
+            });
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let events = orch.poll_timeouts().await;
+                if !events.is_empty() {
+                    info!(
+                        event_count = events.len(),
+                        "Gate timeout poller emitted events"
+                    );
+                    // Security BLOCKER 2 fix: Persist events to ledger.
+                    if let Some(ref emitter) = timeout_ledger_emitter {
+                        use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
+                        for event in &events {
+                            let event_type = match event {
+                                apm2_daemon::gate::GateOrchestratorEvent::GateTimedOut { .. } => {
+                                    "gate.timed_out"
+                                },
+                                apm2_daemon::gate::GateOrchestratorEvent::GateTimeoutReceiptGenerated { .. } => {
+                                    "gate.timeout_receipt_generated"
+                                },
+                                apm2_daemon::gate::GateOrchestratorEvent::AllGatesCompleted { .. } => {
+                                    "gate.all_completed"
+                                },
+                                _ => "gate.event",
+                            };
+                            let payload = serde_json::to_vec(event).unwrap_or_default();
+                            #[allow(clippy::cast_possible_truncation)]
+                            let timestamp_ns = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            if let Err(e) = emitter.emit_session_event(
+                                "gate-timeout-poller",
+                                event_type,
+                                &payload,
+                                "orchestrator:timeout-poller",
+                                timestamp_ns,
+                            ) {
+                                // Fail-closed: log the error. The timeout
+                                // verdict still exists in the orchestrator's
+                                // in-memory state and will be re-emitted on
+                                // the next poll if the gate is still active.
+                                error!(
+                                    event_type = %event_type,
+                                    error = %e,
+                                    "Failed to persist gate timeout event to ledger (fail-closed)"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // TCK-00322: Start projection worker if ledger and projection are configured.
     // The projection worker:

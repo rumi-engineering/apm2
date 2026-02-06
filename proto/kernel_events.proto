@@ -895,6 +895,11 @@ message GateReceipt {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds the gate receipt to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 12;
+  // Explicit pass/fail verdict declared by the gate executor.
+  // This is the authoritative verdict field - not derived from hash inspection.
+  // MUST be set by the executor; ambiguous payloads without an explicit verdict
+  // are rejected at the admission boundary (TCK-00388 Quality BLOCKER 2).
+  bool passed = 13;
 }
 
 // ============================================================
