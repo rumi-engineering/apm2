@@ -18,7 +18,7 @@
 //! 4. Run anti-gaming analysis on the diff
 //! 5. Invoke AAT skill for hypothesis generation and execution
 //! 6. Generate evidence bundle
-//! 7. Set GitHub status check (unless --dry-run)
+//! 7. Log status check (GitHub status writes removed per TCK-00297)
 //!
 //! # Exit Codes
 //!
@@ -51,7 +51,6 @@ use crate::aat::validation::validate_pr_description;
 use crate::aat::variation::InputVariationGenerator;
 use crate::reviewer_state::select_review_model;
 use crate::shell_escape::build_script_command;
-use crate::util::print_non_authoritative_banner;
 
 // =============================================================================
 // PR URL Parsing
@@ -170,25 +169,25 @@ pub fn fetch_pr_sha(sh: &Shell, pr_info: &PrInfo) -> Result<String> {
     Ok(sha)
 }
 
-/// Set GitHub status check.
+/// Log that a GitHub status check would have been set (writes are removed).
 ///
-/// # NON-AUTHORITATIVE OUTPUT
+/// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
-/// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
-/// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
-/// the HEF evidence pipeline. A NON-AUTHORITATIVE banner is printed to stderr
-/// before each status write to make this explicit.
+/// Per RFC-0018, direct GitHub status writes from xtask have been removed.
+/// This function logs what the status would have been for diagnostic purposes
+/// and returns `Ok(())`. The `sh` parameter is retained for API compatibility.
 ///
 /// # Arguments
 ///
-/// * `sh` - Shell instance
+/// * `_sh` - Shell instance (unused; retained for call-site compatibility)
 /// * `pr_info` - PR information
-/// * `sha` - Commit SHA to set status on
-/// * `state` - Status state (success, failure, pending)
+/// * `sha` - Commit SHA the status would have targeted
+/// * `state` - Status state that would have been set (success, failure,
+///   pending)
 /// * `description` - Human-readable description
 /// * `target_url` - Optional URL to evidence bundle
 pub fn set_status_check(
-    sh: &Shell,
+    _sh: &Shell,
     pr_info: &PrInfo,
     sha: &str,
     state: &str,
@@ -199,12 +198,27 @@ pub fn set_status_check(
         StatusWriteDecision, check_status_write_allowed, emit_projection_request_receipt,
     };
 
-    // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
+    // TCK-00297 (Stage X3): Status writes are permanently removed.
     match check_status_write_allowed() {
+        StatusWriteDecision::Removed => {
+            let owner_repo = pr_info.owner_repo();
+            println!(
+                "  [TCK-00297] GitHub status write removed. Would have set on {owner_repo}@{sha}:"
+            );
+            println!("    context: aat/acceptance");
+            println!("    state:   {state}");
+            println!("    desc:    {description}");
+            if let Some(url) = target_url {
+                println!("    url:     {url}");
+            }
+            crate::util::print_status_writes_removed_notice();
+            Ok(())
+        },
+        // Legacy variants preserved for backwards compatibility but never returned.
         StatusWriteDecision::SkipHefProjection => {
             println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
             println!("  [HEF] Status would be: {state} - {description}");
-            return Ok(());
+            Ok(())
         },
         StatusWriteDecision::EmitReceiptOnly => {
             // TCK-00324: Emit receipt only, no direct GitHub write
@@ -224,45 +238,22 @@ pub fn set_status_check(
                 &correlation_id,
             )?;
             println!("  [CUTOVER] AAT status receipt emitted: {state} - {description}");
-            return Ok(());
+            Ok(())
         },
         StatusWriteDecision::BlockStrictMode => {
             bail!(
                 "Status writes blocked in strict mode.\n\
-                 Set XTASK_ALLOW_STATUS_WRITES=true to allow.\n\
                  Status would be: {state} - {description}"
             );
         },
         StatusWriteDecision::Proceed => {
-            // TCK-00296: Print non-strict mode warning
-            crate::util::print_non_strict_mode_warning();
+            // TCK-00297: Even if somehow reached, do not write.
+            println!(
+                "  [TCK-00297] GitHub status writes removed. Status would be: {state} - {description}"
+            );
+            Ok(())
         },
     }
-
-    // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
-    print_non_authoritative_banner();
-
-    let owner_repo = pr_info.owner_repo();
-    let endpoint = format!("/repos/{owner_repo}/statuses/{sha}");
-    let context = "aat/acceptance";
-
-    if let Some(url) = target_url {
-        cmd!(
-            sh,
-            "gh api --method POST {endpoint} -f state={state} -f context={context} -f description={description} -f target_url={url}"
-        )
-        .run()
-        .context("Failed to set status check")?;
-    } else {
-        cmd!(
-            sh,
-            "gh api --method POST {endpoint} -f state={state} -f context={context} -f description={description}"
-        )
-        .run()
-        .context("Failed to set status check")?;
-    }
-
-    Ok(())
 }
 
 // =============================================================================

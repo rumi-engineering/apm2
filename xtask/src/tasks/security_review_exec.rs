@@ -15,7 +15,7 @@
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
-use crate::util::{current_branch, print_non_authoritative_banner, validate_ticket_branch};
+use crate::util::{current_branch, validate_ticket_branch};
 
 /// Required reading paths for security reviewers.
 pub const REQUIRED_READING: &[&str] = &[
@@ -470,15 +470,17 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
     Ok(sha)
 }
 
-/// Update the status check for security review.
+/// Log that the security review status check would have been updated (writes
+/// are removed).
 ///
-/// # NON-AUTHORITATIVE OUTPUT
+/// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
-/// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
-/// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
-/// the HEF evidence pipeline.
+/// Per RFC-0018, direct GitHub status writes from xtask have been removed.
+/// This function logs what the status would have been for diagnostic purposes
+/// and returns `Ok(())`. The `_sh` parameter is retained for call-site
+/// compatibility.
 fn update_status(
-    sh: &Shell,
+    _sh: &Shell,
     owner_repo: &str,
     head_sha: &str,
     success: bool,
@@ -488,12 +490,25 @@ fn update_status(
         StatusWriteDecision, check_status_write_allowed, emit_projection_request_receipt,
     };
 
-    // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
+    let state = if success { "success" } else { "failure" };
+
+    // TCK-00297 (Stage X3): Status writes are permanently removed.
     match check_status_write_allowed() {
+        StatusWriteDecision::Removed => {
+            println!(
+                "  [TCK-00297] GitHub status write removed. Would have set on {owner_repo}@{head_sha}:"
+            );
+            println!("    context: {STATUS_CONTEXT}");
+            println!("    state:   {state}");
+            println!("    desc:    {description}");
+            crate::util::print_status_writes_removed_notice();
+            Ok(())
+        },
+        // Legacy variants preserved for backwards compatibility but never returned.
         StatusWriteDecision::SkipHefProjection => {
             println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
             println!("  [HEF] Status would be: {STATUS_CONTEXT} = {success} - {description}");
-            return Ok(());
+            Ok(())
         },
         StatusWriteDecision::EmitReceiptOnly => {
             // TCK-00324: Emit receipt only, no direct GitHub write
@@ -514,37 +529,22 @@ fn update_status(
             println!(
                 "  [CUTOVER] Security review status receipt emitted: {STATUS_CONTEXT} = {state}"
             );
-            return Ok(());
+            Ok(())
         },
         StatusWriteDecision::BlockStrictMode => {
             bail!(
                 "Status writes blocked in strict mode.\n\
-                 Set XTASK_ALLOW_STATUS_WRITES=true to allow.\n\
                  Status would be: {STATUS_CONTEXT} = {success} - {description}"
             );
         },
         StatusWriteDecision::Proceed => {
-            // TCK-00296: Print non-strict mode warning
-            crate::util::print_non_strict_mode_warning();
+            // TCK-00297: Even if somehow reached, do not write.
+            println!(
+                "  [TCK-00297] GitHub status writes removed. Status would be: {STATUS_CONTEXT} = {state} - {description}"
+            );
+            Ok(())
         },
     }
-
-    // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
-    print_non_authoritative_banner();
-
-    let state = if success { "success" } else { "failure" };
-    let endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
-
-    cmd!(
-        sh,
-        "gh api --method POST {endpoint} -f state={state} -f context={STATUS_CONTEXT} -f description={description}"
-    )
-    .run()
-    .context("Failed to update status check")?;
-
-    println!("  Updated status: {STATUS_CONTEXT} = {state}");
-
-    Ok(())
 }
 
 #[cfg(test)]
