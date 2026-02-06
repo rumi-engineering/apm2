@@ -1245,6 +1245,12 @@ pub struct GateReceipt {
     /// Binds the gate receipt to verifiable HTF time.
     #[prost(message, optional, tag = "12")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Explicit pass/fail verdict declared by the gate executor.
+    /// This is the authoritative verdict field - not derived from hash inspection.
+    /// MUST be set by the executor; ambiguous payloads without an explicit verdict
+    /// are rejected at the admission boundary (TCK-00388 Quality BLOCKER 2).
+    #[prost(bool, tag = "13")]
+    pub passed: bool,
 }
 /// Output from a terminal verifier.
 /// Terminal verifiers provide ground truth (exit codes, snapshot diffs, etc.).
