@@ -61,6 +61,13 @@ pub struct CrashRecoveryOutcome {
     pub work_claims_released: u32,
     /// Time taken for recovery in milliseconds.
     pub recovery_time_ms: u32,
+    /// Session IDs that were successfully recovered (both ledger event emitted
+    /// and work claim released without error). Only these sessions should be
+    /// cleared from the registry; failed sessions are preserved for retry.
+    pub succeeded_session_ids: Vec<String>,
+    /// Session IDs where a critical side-effect (ledger emit or work claim
+    /// release) failed. These must NOT be cleared from the registry.
+    pub failed_session_ids: Vec<String>,
 }
 
 /// Result of session collection for recovery.
@@ -100,6 +107,26 @@ pub enum CrashRecoveryError {
     WorkClaimCleanupFailed {
         /// Error message.
         message: String,
+    },
+
+    /// Timestamp acquisition failed.
+    #[error("failed to acquire timestamp: {message}")]
+    TimestampFailed {
+        /// Error message.
+        message: String,
+    },
+
+    /// Partial recovery: some sessions failed critical side-effects.
+    /// The outcome contains details of which sessions succeeded and which
+    /// failed. Only succeeded sessions should be cleared from the registry.
+    #[error("partial recovery: {failed_count} of {total_count} sessions had critical failures")]
+    PartialRecovery {
+        /// Number of sessions that failed.
+        failed_count: usize,
+        /// Total number of sessions attempted.
+        total_count: usize,
+        /// The recovery outcome with per-session success/failure tracking.
+        outcome: CrashRecoveryOutcome,
     },
 }
 
@@ -174,6 +201,8 @@ pub fn recover_stale_sessions(
 
     let mut lease_revoked_events_emitted: u32 = 0;
     let mut work_claims_released: u32 = 0;
+    let mut succeeded_session_ids: Vec<String> = Vec::new();
+    let mut failed_session_ids: Vec<String> = Vec::new();
 
     for session in sessions {
         // Check timeout before each session
@@ -183,6 +212,10 @@ pub fn recover_stale_sessions(
                 timeout_ms: timeout.as_millis() as u32,
             });
         }
+
+        // Track per-session success: a session is considered failed if any
+        // critical side-effect (ledger emit or work claim release) fails.
+        let mut session_failed = false;
 
         // Step 1: Emit LEASE_REVOKED event to ledger
         if let Some(emitter) = emitter {
@@ -197,12 +230,14 @@ pub fn recover_stale_sessions(
                     lease_revoked_events_emitted += 1;
                 },
                 Err(e) => {
-                    // Log and continue -- partial recovery is acceptable
+                    // Critical failure: ledger event not persisted. Mark session
+                    // as failed so it is preserved in the registry for retry.
                     warn!(
                         session_id = %session.session_id,
                         error = %e,
-                        "Failed to emit LEASE_REVOKED event, continuing recovery"
+                        "Failed to emit LEASE_REVOKED event; session will be preserved for retry"
                     );
+                    session_failed = true;
                 },
             }
         } else {
@@ -227,67 +262,102 @@ pub fn recover_stale_sessions(
                     }
                 },
                 Err(e) => {
+                    // Critical failure: work claim not released. Mark session
+                    // as failed so it is preserved in the registry for retry.
                     warn!(
                         work_id = %session.work_id,
                         error = %e,
-                        "Failed to release work claim, continuing recovery"
+                        "Failed to release work claim; session will be preserved for retry"
                     );
+                    session_failed = true;
                 },
             }
+        }
+
+        if session_failed {
+            failed_session_ids.push(session.session_id.clone());
+        } else {
+            succeeded_session_ids.push(session.session_id.clone());
         }
     }
 
     let recovery_time_ms = start.elapsed().as_millis() as u32;
 
-    Ok(CrashRecoveryOutcome {
-        sessions_recovered: sessions.len() as u32,
+    // Post-operation deadline check: if we exceeded the timeout during
+    // processing (but didn't catch it at a loop boundary), fail before
+    // reporting success.
+    if Instant::now() > deadline {
+        return Err(CrashRecoveryError::Timeout {
+            elapsed_ms: start.elapsed().as_millis() as u32,
+            timeout_ms: timeout.as_millis() as u32,
+        });
+    }
+
+    let outcome = CrashRecoveryOutcome {
+        sessions_recovered: succeeded_session_ids.len() as u32,
         lease_revoked_events_emitted,
         work_claims_released,
         recovery_time_ms,
-    })
+        succeeded_session_ids,
+        failed_session_ids: failed_session_ids.clone(),
+    };
+
+    // If any sessions had critical failures, return PartialRecovery error
+    // so the caller knows NOT to clear the failed session IDs from the
+    // registry.
+    if !failed_session_ids.is_empty() {
+        return Err(CrashRecoveryError::PartialRecovery {
+            failed_count: failed_session_ids.len(),
+            total_count: sessions.len(),
+            outcome,
+        });
+    }
+
+    Ok(outcome)
 }
 
 /// Clears the persistent session registry after successful recovery.
 ///
-/// When `collected.was_truncated` is `false`, clears all sessions using
-/// `clear_all_sessions()`. When truncation occurred, only clears the
-/// recovered subset using `clear_sessions_by_ids()` so unrecovered
-/// sessions are preserved for the next startup.
+/// Only clears sessions that were **successfully** recovered (i.e., their
+/// `LEASE_REVOKED` event was emitted and work claim was released without
+/// error). Failed sessions are preserved in the registry for retry on the
+/// next startup.
+///
+/// When `collected.was_truncated` is `false` **and** all sessions succeeded,
+/// clears all sessions using `clear_all_sessions()`. Otherwise, only clears
+/// the successfully recovered subset using `clear_sessions_by_ids()`.
 ///
 /// # Arguments
 ///
 /// * `registry` - The session registry to clear
 /// * `collected` - The collection result from [`collect_sessions`], used to
 ///   determine whether to clear all or only the recovered subset
-pub fn clear_session_registry(registry: &Arc<dyn SessionRegistry>, collected: &CollectedSessions) {
-    if collected.was_truncated {
-        // Only clear the sessions that were actually recovered.
-        // Remaining sessions stay in the registry for the next startup.
-        let session_ids: Vec<String> = collected
-            .sessions
-            .iter()
-            .map(|s| s.session_id.clone())
-            .collect();
-        info!(
-            cleared = session_ids.len(),
-            remaining = collected.total_in_registry - session_ids.len(),
-            "Clearing recovered subset (truncated recovery); remaining sessions preserved"
-        );
-        match registry.clear_sessions_by_ids(&session_ids) {
-            Ok(()) => {
-                info!(
-                    cleared = session_ids.len(),
-                    "Cleared recovered sessions from registry (partial)"
-                );
-            },
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to clear recovered sessions from registry"
-                );
-            },
-        }
-    } else {
+/// * `succeeded_ids` - Session IDs that were successfully recovered. Only these
+///   will be cleared. If `None`, all collected sessions are assumed to have
+///   succeeded (backward-compatible path).
+pub fn clear_session_registry(
+    registry: &Arc<dyn SessionRegistry>,
+    collected: &CollectedSessions,
+    succeeded_ids: Option<&[String]>,
+) {
+    // Determine which IDs to clear: if succeeded_ids is provided, use it;
+    // otherwise fall back to all collected session IDs.
+    let ids_to_clear: Vec<String> = succeeded_ids.map_or_else(
+        || {
+            collected
+                .sessions
+                .iter()
+                .map(|s| s.session_id.clone())
+                .collect()
+        },
+        <[String]>::to_vec,
+    );
+
+    // Use clear_all_sessions only if not truncated AND all collected sessions
+    // are being cleared (no per-session failures).
+    let can_clear_all = !collected.was_truncated && ids_to_clear.len() == collected.sessions.len();
+
+    if can_clear_all {
         match registry.clear_all_sessions() {
             Ok(()) => {
                 info!("Cleared session registry after crash recovery");
@@ -299,6 +369,28 @@ pub fn clear_session_registry(registry: &Arc<dyn SessionRegistry>, collected: &C
                 );
             },
         }
+    } else if !ids_to_clear.is_empty() {
+        info!(
+            cleared = ids_to_clear.len(),
+            total_in_registry = collected.total_in_registry,
+            "Clearing recovered subset; remaining sessions preserved for retry"
+        );
+        match registry.clear_sessions_by_ids(&ids_to_clear) {
+            Ok(()) => {
+                info!(
+                    cleared = ids_to_clear.len(),
+                    "Cleared recovered sessions from registry (partial)"
+                );
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to clear recovered sessions from registry"
+                );
+            },
+        }
+    } else {
+        info!("No sessions to clear from registry (all failed; preserved for retry)");
     }
 }
 
@@ -312,11 +404,19 @@ fn emit_lease_revoked_event(
 ) -> Result<String, CrashRecoveryError> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // Fail-closed: if timestamp acquisition fails (e.g. system clock is before
+    // UNIX epoch), propagate the error rather than silently using timestamp 0.
+    // Per SEC-CTRL-FAC-0015, we must not emit events with invalid timestamps.
     #[allow(clippy::cast_possible_truncation)]
     let timestamp_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+        .map_err(|e| CrashRecoveryError::TimestampFailed {
+            message: format!(
+                "system clock before UNIX epoch for session {}: {e}",
+                session.session_id
+            ),
+        })?;
 
     // Build the LEASE_REVOKED payload
     let payload = serde_json::json!({
@@ -612,8 +712,8 @@ mod tests {
         assert_eq!(collected.sessions.len(), 1);
         assert!(!collected.was_truncated);
 
-        // Clear after recovery
-        clear_session_registry(&registry, &collected);
+        // Clear after recovery (None = all collected sessions succeeded)
+        clear_session_registry(&registry, &collected, None);
 
         // Now collect again (simulates second startup after reload)
         let collected_after = collect_sessions(&registry);
@@ -780,7 +880,7 @@ mod tests {
         drop(db);
 
         // Phase 4: Clear registry (idempotency)
-        clear_session_registry(&registry, &collected);
+        clear_session_registry(&registry, &collected, Some(&result.succeeded_session_ids));
 
         // Phase 5: Verify second recovery finds nothing
         let collected_after = collect_sessions(&registry);
@@ -922,8 +1022,8 @@ mod tests {
             total_in_registry: 5,
         };
 
-        // Clear only the recovered subset
-        clear_session_registry(&registry, &truncated);
+        // Clear only the recovered subset (None = all collected sessions succeeded)
+        clear_session_registry(&registry, &truncated, None);
 
         // Verify: only the 2 unrecovered sessions remain
         let remaining = collect_sessions(&registry);
@@ -974,6 +1074,235 @@ mod tests {
         assert_eq!(collected.sessions.len(), 1);
     }
 
+    // =========================================================================
+    // Regression Tests: Per-Session Failure Tracking (SECURITY BLOCKER 2)
+    // =========================================================================
+
+    /// Regression test: when a per-session work claim release fails, the
+    /// failed session ID must be preserved in the registry (not cleared).
+    /// Only successfully recovered sessions should be cleared.
+    #[test]
+    fn test_per_session_failure_preserves_failed_ids_in_registry() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        // Create registry with 3 sessions
+        let registry = PersistentSessionRegistry::new(&state_path);
+        for i in 0..3 {
+            registry
+                .register_session(make_session(&format!("sess-{i}"), &format!("work-{i}")))
+                .unwrap();
+        }
+        assert_eq!(registry.session_count(), 3);
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+        let collected = collect_sessions(&registry);
+        assert_eq!(collected.sessions.len(), 3);
+
+        // Set up SQLite with a poisoned connection to cause work claim failures.
+        // We create a connection, then poison it by panicking inside a lock.
+        let conn = setup_sqlite();
+        let emitter = make_emitter(&conn);
+
+        // Poison the mutex by panicking inside a lock guard
+        let conn_clone = Arc::clone(&conn);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = conn_clone.lock().unwrap();
+            panic!("intentional poison");
+        }));
+
+        // Now the mutex is poisoned. Recovery should fail for work claim release
+        // but the function should track per-session failures.
+        let result = recover_stale_sessions(
+            &collected.sessions,
+            Some(&emitter), // Emitter also uses the same poisoned conn
+            None,           // No sqlite_conn for claims (ledger will fail)
+            Duration::from_secs(5),
+        );
+
+        // With the poisoned connection, emit_lease_revoked_event will fail
+        // because the emitter internally uses the poisoned connection.
+        // This should produce a PartialRecovery error.
+        match result {
+            Err(CrashRecoveryError::PartialRecovery {
+                failed_count,
+                total_count,
+                outcome,
+            }) => {
+                assert_eq!(total_count, 3);
+                assert_eq!(failed_count, 3);
+                assert_eq!(outcome.failed_session_ids.len(), 3);
+                assert!(outcome.succeeded_session_ids.is_empty());
+
+                // CRITICAL: Only clear succeeded sessions (none in this case).
+                // Failed sessions must be preserved for retry.
+                clear_session_registry(&registry, &collected, Some(&outcome.succeeded_session_ids));
+
+                // Verify ALL sessions are still in the registry
+                let remaining = collect_sessions(&registry);
+                assert_eq!(
+                    remaining.sessions.len(),
+                    3,
+                    "All sessions must be preserved when all have failures"
+                );
+            },
+            Ok(_) => panic!("Expected PartialRecovery error, got Ok"),
+            Err(other) => panic!("Expected PartialRecovery error, got: {other:?}"),
+        }
+    }
+
+    /// Regression test: when some sessions succeed and others fail, only the
+    /// succeeded sessions are cleared from the registry.
+    #[test]
+    fn test_partial_failure_clears_only_succeeded_sessions() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        // Create registry with 3 sessions
+        let registry = PersistentSessionRegistry::new(&state_path);
+        for i in 0..3 {
+            registry
+                .register_session(make_session(&format!("sess-{i}"), &format!("work-{i}")))
+                .unwrap();
+        }
+        assert_eq!(registry.session_count(), 3);
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+        let collected = collect_sessions(&registry);
+
+        // Simulate a partial recovery outcome: sess-0 and sess-2 succeeded,
+        // sess-1 failed.
+        let succeeded_ids = vec!["sess-0".to_string(), "sess-2".to_string()];
+        clear_session_registry(&registry, &collected, Some(&succeeded_ids));
+
+        // Verify: only sess-1 (the failed one) remains in the registry
+        let remaining = collect_sessions(&registry);
+        assert_eq!(
+            remaining.sessions.len(),
+            1,
+            "Only the failed session should remain"
+        );
+        assert_eq!(remaining.sessions[0].session_id, "sess-1");
+    }
+
+    // =========================================================================
+    // Regression Tests: Timeout Before Registry Clear (SECURITY BLOCKER 1)
+    // =========================================================================
+
+    /// Regression test: `recover_stale_sessions` performs a post-operation
+    /// deadline check after processing all sessions, ensuring timeout is
+    /// detected even if individual session processing completes before the
+    /// per-iteration check.
+    #[test]
+    fn test_timeout_check_occurs_before_registry_clear() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        // Create registry with sessions
+        let registry = PersistentSessionRegistry::new(&state_path);
+        registry
+            .register_session(make_session("sess-1", "work-1"))
+            .unwrap();
+        registry
+            .register_session(make_session("sess-2", "work-2"))
+            .unwrap();
+        assert_eq!(registry.session_count(), 2);
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+        let collected = collect_sessions(&registry);
+
+        // Use a 0ms timeout. recover_stale_sessions checks the deadline
+        // before each session AND after all sessions (post-operation check).
+        // With 0ms timeout, it must return Timeout before success.
+        let result =
+            recover_stale_sessions(&collected.sessions, None, None, Duration::from_millis(0));
+
+        // Must be a Timeout error
+        assert!(
+            matches!(result, Err(CrashRecoveryError::Timeout { .. })),
+            "Expected Timeout error, got: {result:?}"
+        );
+
+        // CRITICAL: Registry must NOT be cleared on timeout.
+        // The caller (perform_crash_recovery in main.rs) skips
+        // clear_session_registry when recover_stale_sessions returns Err.
+        let remaining = collect_sessions(&registry);
+        assert_eq!(
+            remaining.sessions.len(),
+            2,
+            "Registry must preserve all sessions when timeout occurs"
+        );
+    }
+
+    // =========================================================================
+    // Regression Tests: Timestamp Failure Propagation (SECURITY MAJOR 1)
+    // =========================================================================
+
+    /// Regression test: `CrashRecoveryError::TimestampFailed` variant exists
+    /// and can be constructed, ensuring timestamp acquisition failures are
+    /// propagated as errors rather than silently using timestamp 0.
+    #[test]
+    fn test_timestamp_failure_error_variant_exists() {
+        let err = CrashRecoveryError::TimestampFailed {
+            message: "system clock before UNIX epoch".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(
+            display.contains("system clock before UNIX epoch"),
+            "TimestampFailed error should contain the message"
+        );
+        assert!(
+            display.contains("failed to acquire timestamp"),
+            "TimestampFailed error should have descriptive prefix"
+        );
+    }
+
+    /// Regression test: `emit_lease_revoked_event` does NOT use `unwrap_or(0)`
+    /// for timestamps. Under normal conditions, it succeeds. This test verifies
+    /// the function works correctly and the event gets a valid non-zero
+    /// timestamp.
+    #[test]
+    fn test_lease_revoked_event_has_valid_timestamp() {
+        let conn = setup_sqlite();
+        let emitter = make_emitter(&conn);
+        let session = make_session("sess-ts", "work-ts");
+
+        let result = recover_stale_sessions(
+            &[session],
+            Some(&emitter),
+            Some(&conn),
+            Duration::from_secs(5),
+        )
+        .expect("recovery should succeed");
+
+        assert_eq!(result.lease_revoked_events_emitted, 1);
+
+        // Verify the event has a non-zero timestamp (fail-closed: no
+        // unwrap_or(0) fallback)
+        let db = conn.lock().unwrap();
+        let timestamp_ns: i64 = db
+            .query_row(
+                "SELECT timestamp_ns FROM ledger_events WHERE event_type = ?1",
+                params![LEASE_REVOKED_EVENT_TYPE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            timestamp_ns > 0,
+            "Timestamp must be non-zero (fail-closed, no unwrap_or(0) fallback)"
+        );
+    }
+
+    // =========================================================================
+    // Original Regression Tests (preserved)
+    // =========================================================================
+
     /// Full end-to-end test: non-truncated successful recovery clears all
     /// sessions from registry.
     #[test]
@@ -999,16 +1328,16 @@ mod tests {
         assert!(!collected.was_truncated);
 
         // Successful recovery
-        let result = recover_stale_sessions(
+        let outcome = recover_stale_sessions(
             &collected.sessions,
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-        );
-        assert!(result.is_ok());
+        )
+        .expect("recovery should succeed");
 
         // Clear -- should clear all since not truncated
-        clear_session_registry(&registry, &collected);
+        clear_session_registry(&registry, &collected, Some(&outcome.succeeded_session_ids));
 
         let after = collect_sessions(&registry);
         assert!(

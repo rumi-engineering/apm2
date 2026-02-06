@@ -1294,9 +1294,10 @@ async fn async_main(args: Args) -> Result<()> {
 /// 2. For each recovered session, emits a `LEASE_REVOKED` event to the ledger
 /// 3. For each recovered session with active work claims, deletes the claim so
 ///    the work becomes re-claimable
-/// 4. Cleans up stale socket/PID state from previous daemon instance
-/// 5. Clears the persistent session registry after successful recovery
-/// 6. Logs recovery actions for operational visibility
+/// 4. Clears the persistent session registry after successful recovery (only
+///    successfully recovered sessions are cleared; failed sessions are
+///    preserved for retry on the next startup)
+/// 5. Logs recovery actions for operational visibility
 ///
 /// # Arguments
 ///
@@ -1370,6 +1371,20 @@ async fn perform_crash_recovery(
 
     match result {
         Ok(outcome) => {
+            // TCK-00387 SECURITY BLOCKER 1 FIX: Check timeout BEFORE clearing
+            // the registry. If recovery exceeded the timeout, we must NOT clear
+            // the registry -- sessions should be preserved for retry.
+            let elapsed_ms = start.elapsed().as_millis() as u32;
+            let timeout_ms = timeout.as_millis() as u32;
+            if elapsed_ms > timeout_ms {
+                warn!(
+                    elapsed_ms = elapsed_ms,
+                    timeout_ms = timeout_ms,
+                    "Crash recovery exceeded timeout; registry NOT cleared"
+                );
+                anyhow::bail!("crash recovery timeout exceeded");
+            }
+
             info!(
                 sessions_recovered = outcome.sessions_recovered,
                 lease_revoked_events_emitted = outcome.lease_revoked_events_emitted,
@@ -1378,12 +1393,33 @@ async fn perform_crash_recovery(
                 "Crash recovery completed"
             );
 
-            // TCK-00387: Only clear registry on successful recovery.
-            // When truncated, clear only the recovered subset so unrecovered
-            // sessions are preserved for the next startup cycle.
+            // TCK-00387 SECURITY BLOCKER 2 FIX: Only clear successfully
+            // recovered sessions. Pass the succeeded IDs to clear_session_registry
+            // so failed sessions are preserved for retry.
             apm2_daemon::episode::crash_recovery::clear_session_registry(
                 session_registry,
                 &collected,
+                Some(&outcome.succeeded_session_ids),
+            );
+        },
+        Err(apm2_daemon::episode::crash_recovery::CrashRecoveryError::PartialRecovery {
+            failed_count,
+            total_count,
+            outcome,
+        }) => {
+            // TCK-00387 SECURITY BLOCKER 2 FIX: Partial recovery -- some
+            // sessions had critical side-effect failures. Only clear the
+            // succeeded sessions; failed ones are preserved for retry.
+            warn!(
+                failed_count = failed_count,
+                total_count = total_count,
+                succeeded = outcome.succeeded_session_ids.len(),
+                "Partial crash recovery; clearing only succeeded sessions"
+            );
+            apm2_daemon::episode::crash_recovery::clear_session_registry(
+                session_registry,
+                &collected,
+                Some(&outcome.succeeded_session_ids),
             );
         },
         Err(e) => {
@@ -1394,17 +1430,6 @@ async fn perform_crash_recovery(
                 "Crash recovery failed; session registry preserved for retry on next startup"
             );
         },
-    }
-
-    let elapsed_ms = start.elapsed().as_millis() as u32;
-    let timeout_ms = timeout.as_millis() as u32;
-    if elapsed_ms > timeout_ms {
-        warn!(
-            elapsed_ms = elapsed_ms,
-            timeout_ms = timeout_ms,
-            "Crash recovery exceeded timeout"
-        );
-        anyhow::bail!("crash recovery timeout exceeded");
     }
 
     Ok(())
