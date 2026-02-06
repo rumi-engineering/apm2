@@ -297,6 +297,12 @@ pub trait LedgerEventEmitter: Send + Sync {
 
     /// Emits a signed `SessionStarted` event to the ledger (TCK-00289).
     ///
+    /// Per TCK-00348, the `SessionStarted` event is the **authoritative**
+    /// record for contract binding metadata. When `contract_binding` is
+    /// `Some`, the binding fields (client/server hashes, mismatch waived,
+    /// risk tier) are included in the signed payload. Persistence failure
+    /// MUST be propagated as an error (fail-closed).
+    ///
     /// # Arguments
     ///
     /// * `session_id` - The session ID being started
@@ -304,6 +310,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `lease_id` - The lease ID authorizing this session
     /// * `actor_id` - The actor starting the session
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    /// * `contract_binding` - Contract binding from handshake (if available)
     ///
     /// # Returns
     ///
@@ -319,6 +326,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         lease_id: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a generic session event to the ledger (TCK-00290).
@@ -627,10 +635,17 @@ pub trait LedgerEventEmitter: Send + Sync {
         lease_id: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Default implementation: emit sequentially.
-        let session_event =
-            self.emit_session_started(session_id, work_id, lease_id, actor_id, timestamp_ns)?;
+        let session_event = self.emit_session_started(
+            session_id,
+            work_id,
+            lease_id,
+            actor_id,
+            timestamp_ns,
+            contract_binding,
+        )?;
         let transition_count = self.get_work_transition_count(work_id);
         if let Err(e) = self.emit_work_transitioned(&WorkTransition {
             work_id,
@@ -979,6 +994,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         lease_id: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -988,14 +1004,39 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build canonical payload (deterministic JSON)
-        let payload = serde_json::json!({
+        // Build canonical payload (deterministic JSON).
+        // TCK-00348: Include contract binding fields when available.
+        let mut payload = serde_json::json!({
             "event_type": "session_started",
             "session_id": session_id,
             "work_id": work_id,
             "lease_id": lease_id,
             "actor_id": actor_id,
         });
+        if let Some(binding) = contract_binding {
+            let obj = payload.as_object_mut().expect("payload is object");
+            obj.insert(
+                "cli_contract_hash".to_string(),
+                serde_json::Value::String(binding.cli_contract_hash.clone()),
+            );
+            obj.insert(
+                "server_contract_hash".to_string(),
+                serde_json::Value::String(binding.server_contract_hash.clone()),
+            );
+            obj.insert(
+                "mismatch_waived".to_string(),
+                serde_json::Value::Bool(binding.mismatch_waived),
+            );
+            obj.insert(
+                "risk_tier".to_string(),
+                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
+            );
+            obj.insert(
+                "client_canonicalizers".to_string(),
+                serde_json::to_value(&binding.client_canonicalizers)
+                    .expect("CanonicalizerInfo serializes"),
+            );
+        }
 
         let payload_bytes =
             serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
@@ -2478,6 +2519,13 @@ pub struct ConnectionContext {
     /// across all subscribe/unsubscribe operations. Must be passed to
     /// `unregister_connection` when the connection closes to prevent leaks.
     connection_id: String,
+
+    /// Contract binding metadata from the handshake (TCK-00348).
+    ///
+    /// Stored at connection time and threaded into `SessionStarted` events
+    /// during `SpawnEpisode` so the authoritative record uses the real
+    /// session ID (not a surrogate connection ID).
+    contract_binding: Option<crate::hsi_contract::SessionContractBinding>,
 }
 
 impl ConnectionContext {
@@ -2498,6 +2546,7 @@ impl ConnectionContext {
             peer_credentials,
             session_id: None,
             connection_id,
+            contract_binding: None,
         }
     }
 
@@ -2526,6 +2575,7 @@ impl ConnectionContext {
             peer_credentials,
             session_id,
             connection_id,
+            contract_binding: None,
         }
     }
 
@@ -2557,6 +2607,20 @@ impl ConnectionContext {
     #[must_use]
     pub fn connection_id(&self) -> &str {
         &self.connection_id
+    }
+
+    /// Sets the contract binding metadata from the handshake (TCK-00348).
+    ///
+    /// Called after `perform_handshake` succeeds. The binding is later
+    /// threaded into `SessionStarted` events during `emit_spawn_lifecycle`.
+    pub fn set_contract_binding(&mut self, binding: crate::hsi_contract::SessionContractBinding) {
+        self.contract_binding = Some(binding);
+    }
+
+    /// Returns the contract binding if set.
+    #[must_use]
+    pub const fn contract_binding(&self) -> Option<&crate::hsi_contract::SessionContractBinding> {
+        self.contract_binding.as_ref()
     }
 }
 
@@ -5624,12 +5688,14 @@ impl PrivilegedDispatcher {
         // TCK-00395: Emit SessionStarted + WorkTransitioned(Claimed->InProgress)
         // atomically via emit_spawn_lifecycle. Both events are persisted as a
         // single atomic operation to prevent partial state commits.
+        // TCK-00348: Thread contract binding into SessionStarted.
         if let Err(e) = self.event_emitter.emit_spawn_lifecycle(
             &session_id,
             &request.work_id,
             &claim.lease_id,
             &actor_id,
             timestamp_ns,
+            ctx.contract_binding(),
         ) {
             // TCK-00384 review fix: unified post-start rollback stops the
             // episode and cleans up session/telemetry/manifest.
@@ -14152,7 +14218,7 @@ mod tests {
                 .unwrap();
 
             emitter
-                .emit_session_started("SESS-001", "W-ORDER-001", "L-001", "uid:1000", ts)
+                .emit_session_started("SESS-001", "W-ORDER-001", "L-001", "uid:1000", ts, None)
                 .unwrap();
 
             // Query events - must maintain insertion order
@@ -14259,6 +14325,7 @@ mod tests {
                 "L-001",
                 "uid:1000",
                 2_000_000_000,
+                None,
             );
             assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
 

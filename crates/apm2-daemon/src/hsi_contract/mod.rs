@@ -39,6 +39,7 @@
 //! - `CTR-0001`: `HSIContractManifestV1` contract
 //! - `REQ-0001`: `HSIContractManifest` deterministic generation
 
+pub mod handshake_binding;
 pub mod manifest;
 pub mod registry;
 pub mod semantics;
@@ -46,6 +47,10 @@ pub mod semantics;
 #[cfg(test)]
 pub mod golden_vectors;
 
+pub use handshake_binding::{
+    CanonicalizerInfo, ContractBinding, ContractBindingError, MismatchOutcome, RiskTier,
+    SessionContractBinding, evaluate_mismatch_policy, validate_contract_binding,
+};
 pub use manifest::{
     CliVersion, HsiContractManifestV1, HsiRouteEntry, HsiRouteSemantics, IdempotencyRequirement,
     ManifestValidationError, StabilityClass,

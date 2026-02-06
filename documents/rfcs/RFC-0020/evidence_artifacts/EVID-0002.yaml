@@ -1,0 +1,93 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0002"
+  title: "Handshake contract-hash binding and tiered mismatch gates evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that the Hello/HelloAck handshake exchanges cli_contract_hash
+    and canonicalizer metadata, and that the tiered mismatch policy is
+    enforced per RFC-0020 sections 3.1.2 and 3.1.3.
+
+    Production wiring:
+    - ServerHandshake is constructed with real contract hash (from
+      build_manifest().content_hash()), daemon canonicalizers, and risk
+      tier via HandshakeConfig::from_manifest() (connection_handler.rs).
+    - Client Hello includes cli_contract_hash and canonicalizer metadata
+      computed from the same HSI contract manifest (protocol.rs client).
+    - validate_contract_binding() is called in process_hello() BEFORE
+      mismatch evaluation, rejecting over-limit payloads fail-closed.
+    - Missing/empty client canonicalizers at Tier2+ are treated as
+      mismatch (fail-closed).
+    - contract_mismatch_total counter is emitted from the production
+      handshake path with risk_tier and outcome labels. DaemonMetrics is
+      wired into HandshakeConfig in main.rs via the DaemonStateHandle's
+      metrics registry.
+    - SessionContractBinding is returned from perform_handshake() and
+      persisted in SessionStarted events for session-level audit trail.
+      The binding includes cli_contract_hash, server_contract_hash,
+      client_canonicalizers, mismatch_waived flag, and risk_tier.
+    - Fail-closed manifest unavailability: when build_manifest() fails or
+      returns an empty hash, HandshakeConfig::from_manifest() escalates
+      to Tier3 (fail-closed), ensuring Tier2+ sessions are denied. The
+      daemon cannot verify contract compatibility without a valid manifest.
+
+    Tier0/Tier1 mismatches are waived (warned), Tier2+ mismatches are
+    denied (fail-closed).
+  requirement_ids:
+    - "REQ-0002"
+  source_refs:
+    - "crates/apm2-daemon/src/hsi_contract/handshake_binding.rs"
+    - "crates/apm2-daemon/src/hsi_contract/mod.rs"
+    - "crates/apm2-daemon/src/protocol/handshake.rs"
+    - "crates/apm2-daemon/src/protocol/connection_handler.rs"
+    - "crates/apm2-daemon/src/metrics.rs"
+    - "crates/apm2-daemon/src/protocol/dispatch.rs"
+    - "crates/apm2-daemon/src/ledger.rs"
+    - "crates/apm2-daemon/src/main.rs"
+    - "crates/apm2-cli/src/client/protocol.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Production wiring integration tests in connection_handler.rs:
+        - test_perform_handshake_success: basic handshake with config
+        - test_perform_handshake_version_mismatch: version check first
+        - test_perform_handshake_tier2_contract_mismatch_denied: Tier2 denial
+        - test_perform_handshake_returns_contract_binding: binding returned
+        - test_perform_handshake_emits_mismatch_metrics: counter emitted
+        - test_perform_handshake_rejects_oversized_contract_hash: bounds check
+
+        Handshake binding tests in handshake.rs:
+        - test_hello_with_contract_hash: cli_contract_hash serialization roundtrip
+        - test_hello_without_contract_hash_omits_field: backward-compatible omission
+        - test_hello_with_canonicalizers: canonicalizer metadata serialization
+        - test_hello_ack_with_contract_binding_fields: server contract binding in HelloAck
+        - test_hello_nack_contract_mismatch: ContractMismatch error code
+        - test_server_handshake_contract_match_tier2: exact match at Tier2 succeeds
+        - test_server_handshake_contract_mismatch_tier0_waived: Tier0 mismatch waived
+        - test_server_handshake_contract_mismatch_tier2_denied: Tier2 mismatch denied
+        - test_server_handshake_missing_client_hash_tier2_denied: fail-closed
+        - test_server_handshake_version_mismatch_takes_precedence_over_contract: ordering
+        - test_server_handshake_hello_ack_includes_server_canonicalizers: canonicalizer echo
+
+        Handshake binding module tests in handshake_binding.rs:
+        - exact_match_returns_match: no mismatch when hashes match
+        - contract_hash_mismatch_tier0_waived: Tier0 warn/waive
+        - contract_hash_mismatch_tier2_denied: Tier2 deny
+        - missing_client_hash_tier2_denied: empty hash at Tier2 denied
+        - missing_client_canonicalizers_tier2_denied: empty canonicalizers at Tier2
+        - canonicalizer_version_mismatch_tier2_denied: version mismatch denied
+        - unknown_canonicalizer_tier2_denied: unsupported canonicalizer denied
+        - empty_server_hash_tier2_denied: empty server hash at Tier2 denied (fail-closed)
+        - empty_server_hash_tier0_allowed: empty server hash at Tier0 allowed
+        - both_hashes_empty_tier2_denied: both empty at Tier2 denied (fail-closed)
+        - both_hashes_empty_tier0_allowed: both empty at Tier0 allowed (backward compat)
+
+        Ledger persistence tests in ledger.rs:
+        - emit_session_started_includes_canonicalizer_metadata: SessionStarted binding persisted with canonicalizer metadata
+        - emit_spawn_lifecycle_includes_canonicalizer_metadata: spawn lifecycle binding includes canonicalizer metadata
+
+        Metrics tests in metrics.rs:
+        - test_contract_mismatch_counter: counter increments with labels
+        - test_metrics_text_encoding: contract_mismatch_total in Prometheus output
+      ref: "cargo test -p apm2-daemon --lib protocol::connection_handler && cargo test -p apm2-daemon --lib protocol::handshake && cargo test -p apm2-daemon --lib hsi_contract::handshake_binding && cargo test -p apm2-daemon --lib metrics && cargo test -p apm2-daemon --lib ledger"

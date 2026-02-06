@@ -65,9 +65,16 @@ async fn test_pulse_only_admission_fail_closed() {
         loop {
             if let Ok((mut conn, _permit, _type)) = manager_clone.accept().await {
                 // Perform handshake
-                if apm2_daemon::protocol::connection_handler::perform_handshake(&mut conn)
-                    .await
-                    .is_err()
+                // Use Tier1 for test backward compat; production default
+                // is Tier2 (deny) per TCK-00348.
+                let hs_config =
+                    apm2_daemon::protocol::connection_handler::HandshakeConfig::default()
+                        .with_risk_tier(apm2_daemon::hsi_contract::RiskTier::Tier1);
+                if apm2_daemon::protocol::connection_handler::perform_handshake(
+                    &mut conn, &hs_config,
+                )
+                .await
+                .is_err()
                 {
                     continue;
                 }

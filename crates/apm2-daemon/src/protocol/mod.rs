@@ -131,7 +131,7 @@ pub mod topic_derivation;
 // These re-exports form the public API of this module and may not be used
 // within the crate itself.
 #[allow(unused_imports)]
-pub use connection_handler::{HandshakeResult, perform_handshake};
+pub use connection_handler::{HandshakeConfig, HandshakeResult, perform_handshake};
 #[allow(unused_imports)]
 pub use credentials::PeerCredentials;
 #[allow(unused_imports)]

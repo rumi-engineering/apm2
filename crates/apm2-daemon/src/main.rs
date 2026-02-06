@@ -2042,12 +2042,12 @@ async fn run_socket_manager_server(
 async fn handle_dual_socket_connection(
     mut connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
-    _state: SharedState,
+    state: SharedState,
     dispatcher_state: SharedDispatcherState,
 ) -> Result<()> {
     use bytes::Bytes;
     use futures::{SinkExt, StreamExt};
-    use protocol::connection_handler::{HandshakeResult, perform_handshake};
+    use protocol::connection_handler::{HandshakeConfig, HandshakeResult, perform_handshake};
     use protocol::dispatch::ConnectionContext;
 
     info!(
@@ -2056,10 +2056,30 @@ async fn handle_dual_socket_connection(
         "New ProtocolServer connection"
     );
 
+    // TCK-00348: Build handshake config from real HSI contract manifest.
+    // The server contract hash is computed from the dispatch registry so
+    // that real connections enforce the tiered mismatch policy.
+    //
+    // TCK-00348 MAJOR: Wire DaemonMetrics into HandshakeConfig so the
+    // contract_mismatch_total counter is emitted from the production path.
+    let handshake_config = {
+        let mut config = HandshakeConfig::from_manifest();
+        if let Some(metrics_reg) = state.metrics_registry() {
+            config = config.with_metrics(metrics_reg.daemon_metrics().clone());
+        }
+        config
+    };
+
     // Perform mandatory handshake
-    match perform_handshake(&mut connection).await? {
-        HandshakeResult::Success => {
-            info!(socket_type = %socket_type, "Handshake completed successfully");
+    let contract_binding = match perform_handshake(&mut connection, &handshake_config).await? {
+        HandshakeResult::Success { contract_binding } => {
+            info!(
+                socket_type = %socket_type,
+                mismatch_waived = contract_binding.mismatch_waived,
+                risk_tier = %contract_binding.risk_tier,
+                "Handshake completed successfully"
+            );
+            contract_binding
         },
         HandshakeResult::Failed => {
             warn!(socket_type = %socket_type, "Handshake failed, closing connection");
@@ -2069,11 +2089,14 @@ async fn handle_dual_socket_connection(
             info!(socket_type = %socket_type, "Connection closed during handshake");
             return Ok(());
         },
-    }
+    };
 
     // TCK-00287: Wire up tag-based ProtocolServer dispatchers
-    // Create connection context based on socket type
-    let ctx = match socket_type {
+    // Create connection context based on socket type.
+    // TCK-00348: Attach contract binding to connection context so it is
+    // threaded into SessionStarted events during SpawnEpisode (authoritative
+    // record with real session_id, not a surrogate connection_id).
+    let mut ctx = match socket_type {
         protocol::socket_manager::SocketType::Operator => {
             ConnectionContext::privileged(connection.peer_credentials().cloned())
         },
@@ -2081,6 +2104,7 @@ async fn handle_dual_socket_connection(
             ConnectionContext::session(connection.peer_credentials().cloned(), None)
         },
     };
+    ctx.set_contract_binding(contract_binding.clone());
 
     // TCK-00287 Item 1 & 2: Use shared dispatchers from DispatcherState.
     // These dispatchers persist across connections and use stable secrets.

@@ -231,6 +231,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         lease_id: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Domain prefix for session events (must be at function start per clippy)
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
@@ -238,14 +239,39 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build payload as JSON
-        let payload = serde_json::json!({
+        // Build payload as JSON.
+        // TCK-00348: Include contract binding fields when available.
+        let mut payload = serde_json::json!({
             "event_type": "session_started",
             "session_id": session_id,
             "work_id": work_id,
             "lease_id": lease_id,
             "actor_id": actor_id,
         });
+        if let Some(binding) = contract_binding {
+            let obj = payload.as_object_mut().expect("payload is object");
+            obj.insert(
+                "cli_contract_hash".to_string(),
+                serde_json::Value::String(binding.cli_contract_hash.clone()),
+            );
+            obj.insert(
+                "server_contract_hash".to_string(),
+                serde_json::Value::String(binding.server_contract_hash.clone()),
+            );
+            obj.insert(
+                "mismatch_waived".to_string(),
+                serde_json::Value::Bool(binding.mismatch_waived),
+            );
+            obj.insert(
+                "risk_tier".to_string(),
+                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
+            );
+            obj.insert(
+                "client_canonicalizers".to_string(),
+                serde_json::to_value(&binding.client_canonicalizers)
+                    .expect("CanonicalizerInfo serializes"),
+            );
+        }
 
         // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
         // This ensures deterministic JSON representation per RFC-0016.
@@ -1209,8 +1235,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
     /// TCK-00395 MAJOR 2: Transactional override for `emit_spawn_lifecycle`.
     ///
-    /// Wraps `SessionStarted` + `WorkTransitioned(Claimed->InProgress)` in a
-    /// single `SQLite` transaction to guarantee atomicity.
+    /// Wraps `SessionStarted` (with optional contract binding) +
+    /// `WorkTransitioned(Claimed->InProgress)` in a single `SQLite`
+    /// transaction to guarantee atomicity.
     fn emit_spawn_lifecycle(
         &self,
         session_id: &str,
@@ -1218,6 +1245,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         lease_id: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
 
@@ -1236,13 +1264,38 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         // --- Event 1: SessionStarted ---
         let session_event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-        let session_payload = serde_json::json!({
+        // TCK-00348: Include contract binding in SessionStarted payload
+        let mut session_payload = serde_json::json!({
             "event_type": "session_started",
             "session_id": session_id,
             "work_id": work_id,
             "lease_id": lease_id,
             "actor_id": actor_id,
         });
+        if let Some(binding) = contract_binding {
+            let obj = session_payload.as_object_mut().expect("payload is object");
+            obj.insert(
+                "cli_contract_hash".to_string(),
+                serde_json::Value::String(binding.cli_contract_hash.clone()),
+            );
+            obj.insert(
+                "server_contract_hash".to_string(),
+                serde_json::Value::String(binding.server_contract_hash.clone()),
+            );
+            obj.insert(
+                "mismatch_waived".to_string(),
+                serde_json::Value::Bool(binding.mismatch_waived),
+            );
+            obj.insert(
+                "risk_tier".to_string(),
+                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
+            );
+            obj.insert(
+                "client_canonicalizers".to_string(),
+                serde_json::to_value(&binding.client_canonicalizers)
+                    .expect("CanonicalizerInfo serializes"),
+            );
+        }
         let session_payload_json = session_payload.to_string();
         let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
             let _ = conn.execute("ROLLBACK", []);
@@ -1891,7 +1944,14 @@ mod tests {
             .unwrap();
 
         emitter
-            .emit_session_started("SESS-SQL-001", "W-ORDER-SQL-001", "L-001", "uid:1000", ts)
+            .emit_session_started(
+                "SESS-SQL-001",
+                "W-ORDER-SQL-001",
+                "L-001",
+                "uid:1000",
+                ts,
+                None,
+            )
             .unwrap();
 
         // Query events - must be in insertion order
@@ -2069,6 +2129,7 @@ mod tests {
             "L-001",
             "uid:1000",
             2_000_000_000,
+            None,
         );
         assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
 
@@ -2164,6 +2225,7 @@ mod tests {
             "L-001",
             "uid:1000",
             1_000,
+            None,
         );
         assert!(result.is_ok());
         let events = emitter.get_events_by_work_id("W-ROLLBACK-003");
@@ -2184,6 +2246,7 @@ mod tests {
             "L-002",
             "uid:1000",
             2_000,
+            None,
         );
         assert!(result2.is_err(), "Should fail when table is dropped");
     }
@@ -2250,5 +2313,125 @@ mod tests {
             Some("W-WID-001"),
             "get_lease_work_id must return the stored work_id"
         );
+    }
+
+    // ====================================================================
+    // TCK-00348: Contract binding canonicalizer metadata tests
+    // ====================================================================
+
+    /// TCK-00348: `emit_session_started` includes canonicalizer metadata
+    /// in the persisted payload when a contract binding is provided.
+    #[test]
+    fn emit_session_started_includes_canonicalizer_metadata() {
+        use crate::hsi_contract::RiskTier;
+        use crate::hsi_contract::handshake_binding::{CanonicalizerInfo, SessionContractBinding};
+
+        let emitter = test_emitter();
+
+        let binding = SessionContractBinding {
+            cli_contract_hash: "blake3:client_abc".to_string(),
+            server_contract_hash: "blake3:server_xyz".to_string(),
+            client_canonicalizers: vec![CanonicalizerInfo {
+                id: "apm2.canonical.v1".to_string(),
+                version: 1,
+            }],
+            mismatch_waived: true,
+            risk_tier: RiskTier::Tier1,
+        };
+
+        let result = emitter.emit_session_started(
+            "SESS-CANON-001",
+            "W-CANON-001",
+            "L-001",
+            "uid:1000",
+            1_000_000_000,
+            Some(&binding),
+        );
+        assert!(result.is_ok(), "emit_session_started should succeed");
+
+        let signed_event = result.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&signed_event.payload).unwrap();
+
+        // Verify contract binding fields present
+        assert_eq!(payload["cli_contract_hash"], "blake3:client_abc");
+        assert_eq!(payload["server_contract_hash"], "blake3:server_xyz");
+        assert_eq!(payload["mismatch_waived"], true);
+
+        // Verify canonicalizer metadata is present
+        let canonicalizers = payload["client_canonicalizers"]
+            .as_array()
+            .expect("client_canonicalizers should be an array");
+        assert_eq!(canonicalizers.len(), 1, "Expected 1 canonicalizer entry");
+        assert_eq!(canonicalizers[0]["id"], "apm2.canonical.v1");
+        assert_eq!(canonicalizers[0]["version"], 1);
+    }
+
+    /// TCK-00348: `emit_spawn_lifecycle` includes canonicalizer metadata
+    /// in the persisted `SessionStarted` payload.
+    #[test]
+    fn emit_spawn_lifecycle_includes_canonicalizer_metadata() {
+        use crate::hsi_contract::RiskTier;
+        use crate::hsi_contract::handshake_binding::{CanonicalizerInfo, SessionContractBinding};
+
+        let emitter = test_emitter();
+
+        // Set up a claimed work item via emit_claim_lifecycle
+        let claim = WorkClaim {
+            work_id: "W-CANON-002".to_string(),
+            lease_id: "L-002".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+        };
+        emitter
+            .emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000)
+            .unwrap();
+
+        let binding = SessionContractBinding {
+            cli_contract_hash: "blake3:client_def".to_string(),
+            server_contract_hash: "blake3:server_ghi".to_string(),
+            client_canonicalizers: vec![
+                CanonicalizerInfo {
+                    id: "apm2.canonical.v1".to_string(),
+                    version: 1,
+                },
+                CanonicalizerInfo {
+                    id: "apm2.canonical.jcs".to_string(),
+                    version: 2,
+                },
+            ],
+            mismatch_waived: false,
+            risk_tier: RiskTier::Tier2,
+        };
+
+        let result = emitter.emit_spawn_lifecycle(
+            "SESS-CANON-002",
+            "W-CANON-002",
+            "L-002",
+            "uid:1000",
+            2_000_000_000,
+            Some(&binding),
+        );
+        assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
+
+        let signed_event = result.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&signed_event.payload).unwrap();
+
+        // Verify contract binding fields present
+        assert_eq!(payload["cli_contract_hash"], "blake3:client_def");
+        assert_eq!(payload["server_contract_hash"], "blake3:server_ghi");
+        assert_eq!(payload["mismatch_waived"], false);
+
+        // Verify canonicalizer metadata is present with both entries
+        let canonicalizers = payload["client_canonicalizers"]
+            .as_array()
+            .expect("client_canonicalizers should be an array");
+        assert_eq!(canonicalizers.len(), 2, "Expected 2 canonicalizer entries");
+        assert_eq!(canonicalizers[0]["id"], "apm2.canonical.v1");
+        assert_eq!(canonicalizers[0]["version"], 1);
+        assert_eq!(canonicalizers[1]["id"], "apm2.canonical.jcs");
+        assert_eq!(canonicalizers[1]["version"], 2);
     }
 }
