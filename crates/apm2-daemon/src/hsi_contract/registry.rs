@@ -599,4 +599,144 @@ mod tests {
             );
         }
     }
+
+    // ====================================================================
+    // Independent tag-scan completeness tests (non-self-referential)
+    //
+    // These tests derive the set of client-request variants by scanning
+    // all decodable tags (0..=255) via `from_tag()` and filtering with
+    // `is_client_request()`. This is an independently-derived source of
+    // truth. If a new variant is added to `from_tag()` but omitted from
+    // `all_request_variants()`, the set-equality assertion fails.
+    //
+    // `is_client_request()` uses exhaustive match arms (no `_ =>` wildcard),
+    // so adding a new enum variant causes a compile error until it is
+    // classified — making this a non-self-referential completeness guard.
+    // ====================================================================
+
+    /// Derives `PrivilegedMessageType` client-request variants by scanning
+    /// all u8 tags through `from_tag()` + `is_client_request()`, and
+    /// asserts set equality with `all_request_variants()`.
+    #[test]
+    fn privileged_tag_scan_matches_all_request_variants() {
+        let tag_scanned: std::collections::HashSet<PrivilegedMessageType> = (0..=255u8)
+            .filter_map(PrivilegedMessageType::from_tag)
+            .filter(|v| v.is_client_request())
+            .collect();
+
+        let declared: std::collections::HashSet<PrivilegedMessageType> =
+            PrivilegedMessageType::all_request_variants()
+                .iter()
+                .copied()
+                .collect();
+
+        // Variants found by tag scan but missing from all_request_variants()
+        let missing_from_declared: Vec<_> = tag_scanned.difference(&declared).collect();
+        assert!(
+            missing_from_declared.is_empty(),
+            "Tag-scan found client-request variants missing from \
+             PrivilegedMessageType::all_request_variants(): {missing_from_declared:?}. \
+             Add them to all_request_variants()."
+        );
+
+        // Variants declared in all_request_variants() but not found by tag scan
+        let extra_in_declared: Vec<_> = declared.difference(&tag_scanned).collect();
+        assert!(
+            extra_in_declared.is_empty(),
+            "PrivilegedMessageType::all_request_variants() contains variants \
+             not found by tag scan or not classified as client requests: \
+             {extra_in_declared:?}. Update is_client_request() or from_tag()."
+        );
+
+        // Binding evidence: at least one variant was scanned.
+        assert!(
+            !tag_scanned.is_empty(),
+            "tag scan must find at least one client-request variant"
+        );
+    }
+
+    /// Derives `SessionMessageType` client-request variants by scanning
+    /// all u8 tags through `from_tag()` + `is_client_request()`, and
+    /// asserts set equality with `all_request_variants()`.
+    #[test]
+    fn session_tag_scan_matches_all_request_variants() {
+        let tag_scanned: std::collections::HashSet<SessionMessageType> = (0..=255u8)
+            .filter_map(SessionMessageType::from_tag)
+            .filter(|v| v.is_client_request())
+            .collect();
+
+        let declared: std::collections::HashSet<SessionMessageType> =
+            SessionMessageType::all_request_variants()
+                .iter()
+                .copied()
+                .collect();
+
+        // Variants found by tag scan but missing from all_request_variants()
+        let missing_from_declared: Vec<_> = tag_scanned.difference(&declared).collect();
+        assert!(
+            missing_from_declared.is_empty(),
+            "Tag-scan found client-request variants missing from \
+             SessionMessageType::all_request_variants(): {missing_from_declared:?}. \
+             Add them to all_request_variants()."
+        );
+
+        // Variants declared in all_request_variants() but not found by tag scan
+        let extra_in_declared: Vec<_> = declared.difference(&tag_scanned).collect();
+        assert!(
+            extra_in_declared.is_empty(),
+            "SessionMessageType::all_request_variants() contains variants \
+             not found by tag scan or not classified as client requests: \
+             {extra_in_declared:?}. Update is_client_request() or from_tag()."
+        );
+
+        // Binding evidence: at least one variant was scanned.
+        assert!(
+            !tag_scanned.is_empty(),
+            "tag scan must find at least one client-request variant"
+        );
+    }
+
+    /// Verifies that `PrivilegedMessageType::is_client_request()` returns
+    /// `false` for all non-request variants (server-to-client notifications).
+    #[test]
+    fn privileged_non_request_variants_excluded_by_tag_scan() {
+        let non_request: Vec<PrivilegedMessageType> = (0..=255u8)
+            .filter_map(PrivilegedMessageType::from_tag)
+            .filter(|v| !v.is_client_request())
+            .collect();
+
+        // PulseEvent is the only non-request variant today.
+        assert!(
+            !non_request.is_empty(),
+            "there must be at least one non-request variant (e.g., PulseEvent)"
+        );
+        for v in &non_request {
+            assert!(
+                !PrivilegedMessageType::all_request_variants().contains(v),
+                "non-request variant {v:?} must NOT appear in all_request_variants()"
+            );
+        }
+    }
+
+    /// Verifies that `SessionMessageType::is_client_request()` returns
+    /// `false` for all non-request variants (server-to-client notifications).
+    #[test]
+    fn session_non_request_variants_excluded_by_tag_scan() {
+        let non_request: Vec<SessionMessageType> = (0..=255u8)
+            .filter_map(SessionMessageType::from_tag)
+            .filter(|v| !v.is_client_request())
+            .collect();
+
+        // PulseEvent is the only non-request variant today.
+        assert!(
+            !non_request.is_empty(),
+            "there must be at least one non-request variant (e.g., PulseEvent)"
+        );
+        for v in &non_request {
+            assert!(
+                !SessionMessageType::all_request_variants().contains(v),
+                "non-request variant {v:?} must NOT appear in all_request_variants()"
+            );
+        }
+    }
 }

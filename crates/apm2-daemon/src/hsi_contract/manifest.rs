@@ -58,17 +58,19 @@ pub enum ManifestValidationError {
         /// The route that should have appeared before `before`.
         after: String,
     },
-    /// Route count exceeds u32 capacity.
+    /// Route count exceeds the maximum allowed.
     RouteCountOverflow {
         /// The actual route count.
         count: usize,
     },
-    /// A string field exceeds u32 length capacity.
+    /// A string field exceeds its maximum allowed length.
     StringLengthOverflow {
         /// Description of which field overflowed.
         field: String,
         /// The actual length.
         length: usize,
+        /// The bound that was exceeded.
+        max: usize,
     },
 }
 
@@ -82,12 +84,15 @@ impl std::fmt::Display for ManifestValidationError {
                 )
             },
             Self::RouteCountOverflow { count } => {
-                write!(f, "route count {count} exceeds u32 capacity")
-            },
-            Self::StringLengthOverflow { field, length } => {
                 write!(
                     f,
-                    "string field '{field}' length {length} exceeds u32 capacity"
+                    "route count {count} exceeds maximum allowed ({MAX_ROUTES})"
+                )
+            },
+            Self::StringLengthOverflow { field, length, max } => {
+                write!(
+                    f,
+                    "string field '{field}' length {length} exceeds maximum allowed ({max})"
                 )
             },
         }
@@ -361,18 +366,21 @@ impl HsiContractManifestV1 {
                 return Err(ManifestValidationError::StringLengthOverflow {
                     field: format!("routes[{i}].route"),
                     length: entry.route.len(),
+                    max: MAX_ROUTE_LEN,
                 });
             }
             if entry.request_schema.len() > MAX_SCHEMA_ID_LEN {
                 return Err(ManifestValidationError::StringLengthOverflow {
                     field: format!("routes[{i}].request_schema"),
                     length: entry.request_schema.len(),
+                    max: MAX_SCHEMA_ID_LEN,
                 });
             }
             if entry.response_schema.len() > MAX_SCHEMA_ID_LEN {
                 return Err(ManifestValidationError::StringLengthOverflow {
                     field: format!("routes[{i}].response_schema"),
                     length: entry.response_schema.len(),
+                    max: MAX_SCHEMA_ID_LEN,
                 });
             }
         }
@@ -449,8 +457,8 @@ impl HsiContractManifestV1 {
     /// Checks:
     /// - Route count within bounds
     /// - Routes are sorted
-    /// - Route strings are within length bounds
-    /// - All routes have non-empty semantics fields
+    /// - Route and schema strings are within length bounds
+    /// - Route and ID strings are non-empty
     ///
     /// Returns a list of validation errors (empty = valid).
     #[must_use]
@@ -523,6 +531,7 @@ fn encode_string(
             .map_err(|_| ManifestValidationError::StringLengthOverflow {
                 field: field_name.to_string(),
                 length: s.len(),
+                max: u32::MAX as usize,
             })?;
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
@@ -715,12 +724,13 @@ mod tests {
             "canonical_bytes must fail when route string exceeds MAX_ROUTE_LEN"
         );
         match result.unwrap_err() {
-            ManifestValidationError::StringLengthOverflow { field, length } => {
+            ManifestValidationError::StringLengthOverflow { field, length, max } => {
                 assert!(
                     field.contains("route"),
                     "error field should reference 'route', got: {field}"
                 );
                 assert!(length > MAX_ROUTE_LEN);
+                assert_eq!(max, MAX_ROUTE_LEN);
             },
             other => panic!("expected StringLengthOverflow, got: {other:?}"),
         }
@@ -748,12 +758,13 @@ mod tests {
             "canonical_bytes must fail when schema string exceeds MAX_SCHEMA_ID_LEN"
         );
         match result.unwrap_err() {
-            ManifestValidationError::StringLengthOverflow { field, length } => {
+            ManifestValidationError::StringLengthOverflow { field, length, max } => {
                 assert!(
                     field.contains("request_schema"),
                     "error field should reference 'request_schema', got: {field}"
                 );
                 assert!(length > MAX_SCHEMA_ID_LEN);
+                assert_eq!(max, MAX_SCHEMA_ID_LEN);
             },
             other => panic!("expected StringLengthOverflow, got: {other:?}"),
         }

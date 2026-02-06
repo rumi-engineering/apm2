@@ -2558,7 +2558,7 @@ impl ConnectionContext {
 /// - 66 = `UnsubscribePulse`
 /// - 67 = `UnsubscribePulseResponse` (response only)
 /// - 68 = `PulseEvent` (server->client only)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PrivilegedMessageType {
     /// `ClaimWork` request (IPC-PRIV-001)
@@ -2708,6 +2708,51 @@ impl PrivilegedMessageType {
             Self::UnsubscribePulse,
             Self::PublishChangeSet,
         ]
+    }
+
+    /// Returns `true` if this variant represents a client-initiated request,
+    /// `false` if it is a server-to-client notification or response-only
+    /// variant.
+    ///
+    /// This method uses an **exhaustive** match (no wildcard `_ =>` arm), so
+    /// adding a new variant to the enum forces a compile error until it is
+    /// classified here. This provides the non-self-referential completeness
+    /// guarantee required by RFC-0020 section 3.1.1.
+    #[must_use]
+    pub const fn is_client_request(self) -> bool {
+        // IMPORTANT: This match MUST remain exhaustive (no `_ =>` wildcard).
+        // Adding a new enum variant forces a compile error here, ensuring the
+        // developer must classify it as client-request (true) or not (false).
+        match self {
+            Self::ClaimWork
+            | Self::SpawnEpisode
+            | Self::IssueCapability
+            | Self::Shutdown
+            | Self::ListProcesses
+            | Self::ProcessStatus
+            | Self::StartProcess
+            | Self::StopProcess
+            | Self::RestartProcess
+            | Self::ReloadProcess
+            | Self::ConsensusStatus
+            | Self::ConsensusValidators
+            | Self::ConsensusByzantineEvidence
+            | Self::ConsensusMetrics
+            | Self::WorkStatus
+            | Self::EndSession
+            | Self::IngestReviewReceipt
+            | Self::ListCredentials
+            | Self::AddCredential
+            | Self::RemoveCredential
+            | Self::RefreshCredential
+            | Self::SwitchCredential
+            | Self::LoginCredential
+            | Self::SubscribePulse
+            | Self::UnsubscribePulse
+            | Self::PublishChangeSet => true,
+            // Server-to-client notification only — not a client request.
+            Self::PulseEvent => false,
+        }
     }
 
     /// Returns the HSI route path for this variant.
