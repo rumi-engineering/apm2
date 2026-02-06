@@ -195,13 +195,35 @@ pub fn set_status_check(
     description: &str,
     target_url: Option<&str>,
 ) -> Result<()> {
-    use crate::util::{StatusWriteDecision, check_status_write_allowed};
+    use crate::util::{
+        StatusWriteDecision, check_status_write_allowed, emit_projection_request_receipt,
+    };
 
     // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
     match check_status_write_allowed() {
         StatusWriteDecision::SkipHefProjection => {
             println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
             println!("  [HEF] Status would be: {state} - {description}");
+            return Ok(());
+        },
+        StatusWriteDecision::EmitReceiptOnly => {
+            // TCK-00324: Emit receipt only, no direct GitHub write
+            let owner_repo = pr_info.owner_repo();
+            let payload = serde_json::json!({
+                "context": "aat/acceptance",
+                "state": state,
+                "description": description,
+                "target_url": target_url
+            });
+            let correlation_id = format!("aat-status-{sha}");
+            emit_projection_request_receipt(
+                "status_write",
+                &owner_repo,
+                sha,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+            println!("  [CUTOVER] AAT status receipt emitted: {state} - {description}");
             return Ok(());
         },
         StatusWriteDecision::BlockStrictMode => {
