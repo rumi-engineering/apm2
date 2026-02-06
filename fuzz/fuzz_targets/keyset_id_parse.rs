@@ -1,0 +1,25 @@
+//! Fuzz harness for `KeySetIdV1::parse_text`.
+//!
+//! This target exercises the parser with arbitrary byte sequences converted
+//! to UTF-8 strings, ensuring no panics occur on malformed Unicode,
+//! overlong payloads, non-canonical encodings, or percent-encoded forms.
+//!
+//! # Contract References
+//!
+//! - REQ-0007: Canonical key identifier formats
+//! - EVID-0007: Canonical key identifier conformance evidence
+
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &[u8]| {
+    // Only test valid UTF-8 strings (parse_text takes &str)
+    if let Ok(s) = std::str::from_utf8(data) {
+        // The parser must never panic, regardless of input.
+        // It should always return Ok or Err.
+        let _ = apm2_daemon::identity::KeySetIdV1::parse_text(s);
+    }
+
+    // Also test with raw bytes via from_binary
+    let _ = apm2_daemon::identity::KeySetIdV1::from_binary(data);
+});

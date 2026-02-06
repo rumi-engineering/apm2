@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 apm2-core = { path = "../crates/apm2-core" }
+apm2-daemon = { path = "../crates/apm2-daemon" }
 prost = "0.13"
 
 [[bin]]
@@ -19,3 +20,11 @@ path = "fuzz_targets/cli_args.rs"
 [[bin]]
 name = "fuzz_tool_request"
 path = "fuzz_targets/tool_request.rs"
+
+[[bin]]
+name = "fuzz_public_key_id_parse"
+path = "fuzz_targets/public_key_id_parse.rs"
+
+[[bin]]
+name = "fuzz_keyset_id_parse"
+path = "fuzz_targets/keyset_id_parse.rs"

@@ -40,6 +40,8 @@
 //! - [`protocol`]: UDS protocol and message framing
 //! - [`session`]: Session handling with context firewall integration
 //! - [`hsi_contract`]: HSI Contract Manifest V1 for RFC-0020 (TCK-00347)
+//! - [`identity`]: Canonical key identifiers (`PublicKeyIdV1`, `KeySetIdV1`)
+//!   for RFC-0020 (TCK-00353)
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
 
 pub mod cas;
@@ -49,6 +51,7 @@ pub mod gate;
 pub mod governance;
 pub mod hsi_contract;
 pub mod htf;
+pub mod identity;
 pub mod ledger;
 pub mod metrics;
 pub mod projection;
