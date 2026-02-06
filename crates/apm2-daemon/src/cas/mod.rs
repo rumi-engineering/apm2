@@ -1365,7 +1365,7 @@ mod tests {
         let config = DurableCasConfig::new(temp_dir.path().join("cas")).with_max_total_size(100);
         let cas = Arc::new(DurableCas::new(config).unwrap());
 
-        let num_threads = 8;
+        let num_threads: usize = 8;
         // Each payload is 60 bytes — only one should succeed for a 100-byte
         // quota (60 + 60 = 120 > 100).
         let payload_size = 60;
@@ -1377,8 +1377,11 @@ mod tests {
                     // Each thread writes distinct content so hashes differ
                     // (no deduplication).
                     let mut data = vec![0u8; payload_size];
-                    data[0] = i as u8;
-                    data[1] = (i >> 8) as u8;
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        data[0] = i as u8;
+                        data[1] = (i >> 8) as u8;
+                    }
                     cas.store(&data)
                 })
             })
