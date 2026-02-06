@@ -78,6 +78,9 @@ use apm2_daemon::protocol::{
     ProcessStatusResponse,
     // Error types
     ProtocolError,
+    // TCK-00394: ChangeSet publishing
+    PublishChangeSetRequest,
+    PublishChangeSetResponse,
     // Evidence publishing
     PublishEvidenceRequest,
     PublishEvidenceResponse,
@@ -131,6 +134,7 @@ use apm2_daemon::protocol::{
     encode_list_processes_request,
     encode_login_credential_request,
     encode_process_status_request,
+    encode_publish_changeset_request,
     encode_publish_evidence_request,
     encode_refresh_credential_request,
     encode_reload_process_request,
@@ -1491,6 +1495,91 @@ impl OperatorClient {
         }
 
         WorkStatusResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    // =========================================================================
+    // TCK-00394: ChangeSet Publishing
+    // =========================================================================
+
+    /// Publishes a `ChangeSetBundleV1` to the daemon.
+    ///
+    /// Stores the bundle in CAS, emits a `ChangeSetPublished` ledger event,
+    /// and returns the changeset digest and CAS hash for subsequent gate
+    /// lease binding.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Work identifier this changeset belongs to
+    /// * `bundle_bytes` - Serialized `ChangeSetBundleV1` (canonical JSON)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The daemon rejects the request (invalid `work_id`, bad bundle, etc.)
+    /// - Communication fails
+    #[allow(dead_code)] // Wired by future CLI subcommand
+    pub async fn publish_changeset(
+        &mut self,
+        work_id: &str,
+        bundle_bytes: Vec<u8>,
+    ) -> Result<PublishChangeSetResponse, ProtocolClientError> {
+        let request = PublishChangeSetRequest {
+            work_id: work_id.to_string(),
+            bundle_bytes,
+        };
+        let request_bytes = encode_publish_changeset_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_publish_changeset_response(&response_frame)
+    }
+
+    /// Decodes a `PublishChangeSet` response.
+    #[allow(dead_code)] // Used by publish_changeset
+    fn decode_publish_changeset_response(
+        frame: &Bytes,
+    ) -> Result<PublishChangeSetResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::PublishChangeSet.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected PublishChangeSet response (tag {}), got tag {tag}",
+                PrivilegedMessageType::PublishChangeSet.tag()
+            )));
+        }
+
+        PublishChangeSetResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 

@@ -136,6 +136,8 @@ pub use connection_handler::{HandshakeResult, perform_handshake};
 pub use credentials::PeerCredentials;
 #[allow(unused_imports)]
 pub use dispatch::{
+    // TCK-00394: ChangeSet publishing
+    CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX,
     // Core dispatcher types
     ConnectionContext,
     // TCK-00253: Ledger event emitter types
@@ -175,6 +177,7 @@ pub use dispatch::{
     encode_list_processes_request,
     encode_login_credential_request,
     encode_process_status_request,
+    encode_publish_changeset_request,
     encode_refresh_credential_request,
     encode_reload_process_request,
     encode_remove_credential_request,
@@ -261,6 +264,9 @@ pub use messages::{
     ProcessStateEnum,
     ProcessStatusRequest,
     ProcessStatusResponse,
+    // TCK-00394: ChangeSet publishing messages
+    PublishChangeSetRequest,
+    PublishChangeSetResponse,
     PublishEvidenceRequest,
     PublishEvidenceResponse,
     PulseEnvelopeV1,
