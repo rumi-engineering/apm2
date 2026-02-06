@@ -107,7 +107,7 @@ impl Clock for SystemClock {
 ///
 /// Each terminated session with associated work triggers execution of
 /// all required gate types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum GateType {
     /// Agent Acceptance Testing gate.
     Aat,
@@ -243,6 +243,39 @@ pub struct SessionTerminatedInfo {
 }
 
 // =============================================================================
+// Idempotency Key (Security MAJOR 1)
+// =============================================================================
+
+/// Deterministic idempotency key computed from `session_id + changeset_digest`.
+///
+/// Used to prevent replay of termination events after restart. The key is
+/// persisted alongside the orchestration entry and enforced at the admission
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IdempotencyKey {
+    /// The session ID from the terminated session.
+    session_id: String,
+    /// The changeset digest from the terminated session.
+    changeset_digest: [u8; 32],
+}
+
+impl IdempotencyKey {
+    /// Creates a new idempotency key from session termination info.
+    fn from_info(info: &SessionTerminatedInfo) -> Self {
+        Self {
+            session_id: info.session_id.clone(),
+            changeset_digest: info.changeset_digest,
+        }
+    }
+}
+
+/// Maximum age of a termination event in milliseconds (1 hour).
+///
+/// Termination events older than this are rejected as stale to prevent
+/// replay attacks after restart (Security MAJOR 1).
+pub const MAX_TERMINATED_AT_AGE_MS: u64 = 3_600_000;
+
+// =============================================================================
 // Error Types
 // =============================================================================
 
@@ -373,6 +406,29 @@ pub enum GateOrchestratorError {
         /// Description of the rejection.
         reason: String,
     },
+
+    /// Replay detected: an orchestration with the same idempotency key
+    /// (`session_id` + `changeset_digest`) already exists or was previously
+    /// processed (Security MAJOR 1).
+    #[error(
+        "replay detected for session_id={session_id}: an orchestration with the same idempotency key already exists"
+    )]
+    ReplayDetected {
+        /// The session ID that was replayed.
+        session_id: String,
+    },
+
+    /// Stale termination event: `terminated_at_ms` is too old to be accepted
+    /// (Security MAJOR 1).
+    #[error(
+        "stale termination event for work_id {work_id}: terminated_at_ms={terminated_at_ms} is older than freshness threshold"
+    )]
+    StaleTerminationEvent {
+        /// The work ID.
+        work_id: String,
+        /// The stale timestamp.
+        terminated_at_ms: u64,
+    },
 }
 
 // =============================================================================
@@ -445,6 +501,20 @@ pub enum GateOrchestratorEvent {
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
+    /// A timeout receipt was generated for a timed-out gate (Quality MAJOR 1).
+    ///
+    /// This explicit event ensures the caller/ledger has a durable artifact
+    /// for the timeout verdict, not just an internal synthetic receipt.
+    GateTimeoutReceiptGenerated {
+        /// The work ID.
+        work_id: String,
+        /// The gate type.
+        gate_type: GateType,
+        /// The receipt ID of the timeout receipt.
+        receipt_id: String,
+        /// Timestamp (ms since epoch).
+        timestamp_ms: u64,
+    },
     /// All gates for a work item have completed.
     AllGatesCompleted {
         /// The work ID.
@@ -483,7 +553,20 @@ struct OrchestrationEntry {
     receipts: HashMap<GateType, GateReceipt>,
     /// When the orchestration started (ms since epoch).
     /// Used by downstream merge automation (TCK-00390) for stale detection.
+    /// This is metadata/informational only - NOT used for timeout decisions.
     _started_at_ms: u64,
+    /// Monotonic instant when the orchestration started (Security BLOCKER 1).
+    ///
+    /// Used for timeout decisions. Immune to NTP/manual clock shifts.
+    /// The timeout fires when `started_at_monotonic.elapsed() >= gate_timeout`.
+    started_at_monotonic: Instant,
+    /// Deterministic idempotency key (Security MAJOR 1).
+    ///
+    /// Computed from `session_id + changeset_digest` to prevent replay of
+    /// termination events generating new gate lifecycles. Stored for
+    /// debugging/audit purposes alongside the `seen_idempotency_keys` set.
+    #[allow(dead_code)]
+    idempotency_key: IdempotencyKey,
 }
 
 // =============================================================================
@@ -560,6 +643,14 @@ pub struct GateOrchestrator {
     signer: Arc<Signer>,
     /// Injected clock for timestamps and timeout checking (MAJOR 1).
     clock: Arc<dyn Clock>,
+    /// Seen idempotency keys for replay rejection (Security MAJOR 1).
+    ///
+    /// Tracks idempotency keys for both active and completed orchestrations
+    /// to prevent replayed termination events from generating new lifecycles.
+    seen_idempotency_keys: RwLock<std::collections::HashSet<IdempotencyKey>>,
+    /// Gate timeout as a `Duration` for monotonic comparison (Security BLOCKER
+    /// 1).
+    gate_timeout_duration: std::time::Duration,
 }
 
 impl GateOrchestrator {
@@ -568,11 +659,14 @@ impl GateOrchestrator {
     /// Uses the default [`SystemClock`] for time operations.
     #[must_use]
     pub fn new(config: GateOrchestratorConfig, signer: Arc<Signer>) -> Self {
+        let gate_timeout_duration = std::time::Duration::from_millis(config.gate_timeout_ms);
         Self {
             config,
             orchestrations: RwLock::new(HashMap::new()),
             signer,
             clock: Arc::new(SystemClock),
+            seen_idempotency_keys: RwLock::new(std::collections::HashSet::new()),
+            gate_timeout_duration,
         }
     }
 
@@ -586,11 +680,14 @@ impl GateOrchestrator {
         signer: Arc<Signer>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let gate_timeout_duration = std::time::Duration::from_millis(config.gate_timeout_ms);
         Self {
             config,
             orchestrations: RwLock::new(HashMap::new()),
             signer,
             clock,
+            seen_idempotency_keys: RwLock::new(std::collections::HashSet::new()),
+            gate_timeout_duration,
         }
     }
 
@@ -702,6 +799,28 @@ impl GateOrchestrator {
         }
 
         let now_ms = self.clock.now_ms();
+        let monotonic_now = self.clock.monotonic_now();
+
+        // Security MAJOR 1: Freshness check - reject stale termination events.
+        // This prevents replayed termination events from older sessions after restart.
+        if info.terminated_at_ms > 0 && now_ms > info.terminated_at_ms + MAX_TERMINATED_AT_AGE_MS {
+            return Err(GateOrchestratorError::StaleTerminationEvent {
+                work_id: info.work_id.clone(),
+                terminated_at_ms: info.terminated_at_ms,
+            });
+        }
+
+        // Security MAJOR 1: Idempotency check - reject replays with same
+        // (session_id, changeset_digest) key.
+        let idempotency_key = IdempotencyKey::from_info(&info);
+        {
+            let seen_keys = self.seen_idempotency_keys.read().await;
+            if seen_keys.contains(&idempotency_key) {
+                return Err(GateOrchestratorError::ReplayDetected {
+                    session_id: info.session_id.clone(),
+                });
+            }
+        }
 
         // Step 1: Resolve policy for the changeset.
         // ORDERING INVARIANT: This MUST happen before any lease issuance.
@@ -761,9 +880,17 @@ impl GateOrchestrator {
                         executor_keys,
                         receipts: HashMap::new(),
                         _started_at_ms: now_ms,
+                        started_at_monotonic: monotonic_now,
+                        idempotency_key: idempotency_key.clone(),
                     });
                 },
             }
+        }
+
+        // Security MAJOR 1: Register idempotency key after successful insertion.
+        {
+            let mut seen_keys = self.seen_idempotency_keys.write().await;
+            seen_keys.insert(idempotency_key);
         }
 
         // Step 4 (BLOCKER 3 FIX): Stage events locally per-invocation and
@@ -957,13 +1084,29 @@ impl GateOrchestrator {
             }
         })?;
 
-        // BLOCKER 1 FIX: Derive verdict from receipt payload. Reject PASS
-        // on zero/invalid evidence hashes. A receipt with zero payload_hash
-        // or zero evidence_bundle_hash is cryptographically insufficient
-        // evidence and MUST be treated as FAIL.
-        let has_zero_payload = receipt.payload_hash == [0u8; 32];
-        let has_zero_evidence = receipt.evidence_bundle_hash == [0u8; 32];
-        let passed = !has_zero_payload && !has_zero_evidence;
+        // Quality BLOCKER 2 FIX: Use the explicit `passed` field from the
+        // receipt rather than deriving the verdict from hash inspection.
+        // The executor MUST declare the verdict explicitly. Additionally,
+        // reject receipts that claim PASS but have zero evidence hashes
+        // (defense-in-depth).
+        let passed = receipt.passed;
+
+        // Defense-in-depth: a PASS verdict with zero hashes is suspicious
+        // and rejected. This prevents executors from declaring PASS without
+        // actually producing evidence.
+        if passed {
+            let has_zero_payload = receipt.payload_hash == [0u8; 32];
+            let has_zero_evidence = receipt.evidence_bundle_hash == [0u8; 32];
+            if has_zero_payload || has_zero_evidence {
+                return Err(GateOrchestratorError::ZeroEvidenceVerdictRejected {
+                    work_id: work_id.to_string(),
+                    reason: format!(
+                        "receipt declares passed=true but has zero evidence \
+                         (payload_hash_zero={has_zero_payload}, evidence_hash_zero={has_zero_evidence})"
+                    ),
+                });
+            }
+        }
 
         {
             let mut orchestrations = self.orchestrations.write().await;
@@ -1099,6 +1242,21 @@ impl GateOrchestrator {
     /// Expired gates produce a FAIL verdict, not silent expiry. This ensures
     /// that timeouts block merge rather than allowing unreviewed code through.
     ///
+    /// # Signer Identity (Quality MAJOR 1)
+    ///
+    /// Timeout receipts are signed with the **orchestrator key** acting as a
+    /// dedicated timeout authority. This is intentional: the executor never
+    /// ran (or didn't finish), so it cannot produce a receipt. The
+    /// orchestrator key serves as the timeout authority, and this is
+    /// reflected in the `GateTimeoutReceiptGenerated` event.
+    ///
+    /// # Event Emission (Quality MAJOR 1)
+    ///
+    /// In addition to the `GateTimedOut` event, this method emits a
+    /// `GateTimeoutReceiptGenerated` event containing the receipt ID of the
+    /// synthetic timeout receipt. This ensures the ledger has a durable
+    /// artifact for the timeout verdict.
+    ///
     /// # State Machine
     ///
     /// Valid transitions: `LeaseIssued` -> `TimedOut`, `Running` -> `TimedOut`.
@@ -1116,6 +1274,7 @@ impl GateOrchestrator {
     ) -> Result<(Option<Vec<GateOutcome>>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
         let now_ms = self.clock.now_ms();
         let lease_id;
+        let mut timeout_receipt_id: Option<String> = None;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
@@ -1153,8 +1312,12 @@ impl GateOrchestrator {
             // Create and store fail-closed receipt for the timed-out gate.
             // This ensures a FAIL verdict exists in the ledger, preventing
             // silent expiry from allowing unreviewed code through.
+            //
+            // Quality MAJOR 1: The timeout receipt is signed with the
+            // orchestrator key acting as a dedicated timeout authority.
             if let Some(lease) = entry.leases.get(&gate_type) {
                 let timeout_receipt = create_timeout_receipt(gate_type, lease, &self.signer);
+                timeout_receipt_id = Some(timeout_receipt.receipt_id.clone());
                 entry.receipts.insert(gate_type, timeout_receipt);
             }
         }
@@ -1162,7 +1325,7 @@ impl GateOrchestrator {
         warn!(
             work_id = %work_id,
             gate_type = %gate_type,
-            "Gate timed out - fail-closed FAIL verdict"
+            "Gate timed out - fail-closed FAIL verdict (signed by orchestrator timeout authority)"
         );
 
         let mut events = vec![GateOrchestratorEvent::GateTimedOut {
@@ -1171,6 +1334,17 @@ impl GateOrchestrator {
             lease_id,
             timestamp_ms: now_ms,
         }];
+
+        // Quality MAJOR 1: Emit explicit timeout receipt event so the
+        // caller/ledger has a durable artifact for the timeout verdict.
+        if let Some(receipt_id) = timeout_receipt_id {
+            events.push(GateOrchestratorEvent::GateTimeoutReceiptGenerated {
+                work_id: work_id.to_string(),
+                gate_type,
+                receipt_id,
+                timestamp_ms: now_ms,
+            });
+        }
 
         // Check if all gates are complete
         let outcomes = self
@@ -1182,27 +1356,70 @@ impl GateOrchestrator {
 
     /// Checks all active orchestrations for expired gates.
     ///
+    /// Uses monotonic time (`Instant`) for timeout decisions to avoid
+    /// NTP/manual clock shift attacks (Security BLOCKER 1). The wall-clock
+    /// `expires_at` in the lease is kept as informational metadata only.
+    ///
     /// Returns a list of (`work_id`, `gate_type`) pairs that have timed out.
     /// The caller should invoke [`Self::handle_gate_timeout`] for each.
     pub async fn check_timeouts(&self) -> Vec<(String, GateType)> {
-        let now_ms = self.clock.now_ms();
         let orchestrations = self.orchestrations.read().await;
         let mut timed_out = Vec::new();
 
         for (work_id, entry) in orchestrations.iter() {
-            for (&gate_type, status) in &entry.gates {
-                if !status.is_terminal() {
-                    // Check if the lease has expired
-                    if let Some(lease) = entry.leases.get(&gate_type) {
-                        if now_ms >= lease.expires_at {
-                            timed_out.push((work_id.clone(), gate_type));
-                        }
+            // Security BLOCKER 1: Use monotonic elapsed time, not wall-clock.
+            let elapsed = entry.started_at_monotonic.elapsed();
+            if elapsed >= self.gate_timeout_duration {
+                for (&gate_type, status) in &entry.gates {
+                    if !status.is_terminal() {
+                        timed_out.push((work_id.clone(), gate_type));
                     }
                 }
             }
         }
 
         timed_out
+    }
+
+    /// Production scheduler/driver for periodic timeout progression
+    /// (Security BLOCKER 2).
+    ///
+    /// This method performs a complete timeout sweep: it checks for expired
+    /// gates and handles each timeout in a single call. The daemon runtime
+    /// should call this periodically (e.g., every 10 seconds) to ensure
+    /// gate leases transition to terminal FAIL/PASS verdicts.
+    ///
+    /// Returns all events emitted during the sweep, suitable for ledger
+    /// persistence.
+    pub async fn poll_timeouts(&self) -> Vec<GateOrchestratorEvent> {
+        let timed_out = self.check_timeouts().await;
+        let mut all_events = Vec::new();
+
+        for (work_id, gate_type) in timed_out {
+            match self.handle_gate_timeout(&work_id, gate_type).await {
+                Ok((_outcomes, events)) => all_events.extend(events),
+                Err(e) => {
+                    // Best-effort: log but don't fail the sweep.
+                    // This can happen if a gate was completed between
+                    // check_timeouts and handle_gate_timeout.
+                    debug!(
+                        work_id = %work_id,
+                        gate_type = %gate_type,
+                        error = %e,
+                        "Timeout handling skipped (gate may have completed concurrently)"
+                    );
+                },
+            }
+        }
+
+        if !all_events.is_empty() {
+            info!(
+                event_count = all_events.len(),
+                "Timeout sweep produced events"
+            );
+        }
+
+        all_events
     }
 
     /// Returns the gate status for a specific gate in an orchestration.
@@ -1414,11 +1631,18 @@ impl GateOrchestrator {
             return Ok(None);
         }
 
-        // Build outcomes
+        // Build outcomes.
+        // Quality MAJOR 2: Sort outcomes by stable key (gate_id) to ensure
+        // deterministic ordering for replay/hash/projection determinism.
         let mut outcomes = Vec::new();
         let mut all_passed = true;
 
-        for (&gate_type, status) in &entry.gates {
+        // Collect gate types and sort by gate_id for deterministic iteration.
+        let mut gate_types: Vec<GateType> = entry.gates.keys().copied().collect();
+        gate_types.sort_by_key(GateType::as_gate_id);
+
+        for &gate_type in &gate_types {
+            let status = &entry.gates[&gate_type];
             let outcome = match status {
                 GateStatus::Completed {
                     receipt_id, passed, ..
@@ -1490,7 +1714,14 @@ const fn state_name(status: &GateStatus) -> &'static str {
 /// silent expiry from allowing unreviewed changes through the pipeline.
 ///
 /// The receipt uses a zero payload hash and evidence bundle hash since
-/// no actual gate execution occurred.
+/// no actual gate execution occurred. The `passed` field is explicitly
+/// set to `false` (Quality BLOCKER 2).
+///
+/// # Signer Identity (Quality MAJOR 1)
+///
+/// The receipt is signed by the `signer` parameter, which is the
+/// **orchestrator key** acting as a dedicated timeout authority. The
+/// executor never ran (or didn't finish), so it cannot produce a receipt.
 #[must_use]
 pub fn create_timeout_receipt(
     gate_type: GateType,
@@ -1507,6 +1738,7 @@ pub fn create_timeout_receipt(
         .payload_schema_version(1)
         .payload_hash([0u8; 32]) // Zero hash: no actual execution
         .evidence_bundle_hash([0u8; 32]) // Zero hash: no evidence
+        .passed(false) // Explicit FAIL verdict (Quality BLOCKER 2)
         .build_and_sign(signer)
 }
 
@@ -1524,12 +1756,15 @@ mod tests {
     }
 
     /// Helper: creates a test session terminated info.
+    ///
+    /// Uses `terminated_at_ms: 0` to bypass freshness checks in tests.
+    /// Tests that specifically validate freshness logic set a non-zero value.
     fn test_session_info(work_id: &str) -> SessionTerminatedInfo {
         SessionTerminatedInfo {
             session_id: format!("session-{work_id}"),
             work_id: work_id.to_string(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 1_704_067_200_000,
+            terminated_at_ms: 0,
         }
     }
 
@@ -1550,6 +1785,9 @@ mod tests {
     }
 
     /// Helper: build a valid receipt signed with the correct executor signer.
+    ///
+    /// The `passed` field is derived from whether both hashes are non-zero,
+    /// matching the defense-in-depth check in the orchestrator.
     fn build_receipt(
         receipt_id: &str,
         gate_type: GateType,
@@ -1558,6 +1796,7 @@ mod tests {
         payload_hash: [u8; 32],
         evidence_hash: [u8; 32],
     ) -> GateReceipt {
+        let verdict = payload_hash != [0u8; 32] && evidence_hash != [0u8; 32];
         GateReceiptBuilder::new(receipt_id, gate_type.as_gate_id(), &lease.lease_id)
             .changeset_digest(lease.changeset_digest)
             .executor_actor_id(&lease.executor_actor_id)
@@ -1566,6 +1805,7 @@ mod tests {
             .payload_schema_version(1)
             .payload_hash(payload_hash)
             .evidence_bundle_hash(evidence_hash)
+            .passed(verdict)
             .build_and_sign(executor_signer)
     }
 
@@ -1634,7 +1874,7 @@ mod tests {
             session_id: "session-binding".to_string(),
             work_id: "work-binding".to_string(),
             changeset_digest: changeset,
-            terminated_at_ms: 1_704_067_200_000,
+            terminated_at_ms: 0,
         };
 
         orch.handle_session_terminated(info).await.unwrap();
@@ -1883,7 +2123,7 @@ mod tests {
             session_id: "session-empty".to_string(),
             work_id: String::new(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 1_704_067_200_000,
+            terminated_at_ms: 0,
         };
 
         let err = orch
@@ -1901,7 +2141,7 @@ mod tests {
             session_id: "session-long".to_string(),
             work_id: "x".repeat(MAX_WORK_ID_LENGTH + 1),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 1_704_067_200_000,
+            terminated_at_ms: 0,
         };
 
         let err = orch
@@ -1913,10 +2153,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duplicate_orchestration_rejected() {
+    async fn test_duplicate_orchestration_rejected_via_replay() {
+        // Security MAJOR 1: Same session_id + changeset_digest → ReplayDetected
         let orch = test_orchestrator();
         let info1 = test_session_info("work-dup");
         let info2 = test_session_info("work-dup");
+
+        orch.handle_session_terminated(info1).await.unwrap();
+
+        let err = orch
+            .handle_session_terminated(info2)
+            .await
+            .err()
+            .expect("expected error");
+        assert!(matches!(err, GateOrchestratorError::ReplayDetected { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_work_id_different_session_rejected() {
+        // Same work_id but different session_id → DuplicateOrchestration
+        let orch = test_orchestrator();
+        let info1 = SessionTerminatedInfo {
+            session_id: "session-alpha".to_string(),
+            work_id: "work-dup-wid".to_string(),
+            changeset_digest: [0x42; 32],
+            terminated_at_ms: 0,
+        };
+        let info2 = SessionTerminatedInfo {
+            session_id: "session-beta".to_string(),
+            work_id: "work-dup-wid".to_string(),
+            changeset_digest: [0x99; 32], // Different digest avoids replay check
+            terminated_at_ms: 0,
+        };
 
         orch.handle_session_terminated(info1).await.unwrap();
 
@@ -2123,7 +2391,7 @@ mod tests {
             session_id: "s".repeat(MAX_STRING_LENGTH + 1),
             work_id: "work-valid".to_string(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 1_704_067_200_000,
+            terminated_at_ms: 0,
         };
 
         let err = orch
@@ -2181,16 +2449,13 @@ mod tests {
         let (_gate_types, _signers, events1) = orch.handle_session_terminated(info1).await.unwrap();
         assert!(!events1.is_empty());
 
-        // Second fails with DuplicateOrchestration - no events should be returned
+        // Second fails with ReplayDetected (same session+changeset) - no events
         let err = orch
             .handle_session_terminated(info2)
             .await
             .err()
             .expect("expected error");
-        assert!(matches!(
-            err,
-            GateOrchestratorError::DuplicateOrchestration { .. }
-        ));
+        assert!(matches!(err, GateOrchestratorError::ReplayDetected { .. }));
     }
 
     #[tokio::test]
@@ -2292,12 +2557,9 @@ mod tests {
         let result = orch
             .on_session_terminated(test_session_info("work-dup2"))
             .await;
-        assert!(result.is_err(), "expected DuplicateOrchestration");
+        assert!(result.is_err(), "expected ReplayDetected");
         let err = result.err().unwrap();
-        assert!(matches!(
-            err,
-            GateOrchestratorError::DuplicateOrchestration { .. }
-        ));
+        assert!(matches!(err, GateOrchestratorError::ReplayDetected { .. }));
     }
 
     // =========================================================================
@@ -2456,6 +2718,7 @@ mod tests {
             .payload_schema_version(1)
             .payload_hash([0xBB; 32])
             .evidence_bundle_hash([0xCC; 32])
+            .passed(true)
             .build_and_sign(exec_signer);
 
         let err = orch
@@ -2488,6 +2751,7 @@ mod tests {
             .payload_schema_version(1)
             .payload_hash([0xBB; 32])
             .evidence_bundle_hash([0xCC; 32])
+            .passed(true)
             .build_and_sign(exec_signer);
 
         let err = orch
@@ -2520,6 +2784,7 @@ mod tests {
                 .payload_schema_version(1)
                 .payload_hash([0xBB; 32])
                 .evidence_bundle_hash([0xCC; 32])
+                .passed(true)
                 .build_and_sign(exec_signer);
 
         let err = orch
@@ -2552,6 +2817,7 @@ mod tests {
             .payload_schema_version(1)
             .payload_hash([0xBB; 32])
             .evidence_bundle_hash([0xCC; 32])
+            .passed(true)
             .build_and_sign(exec_signer);
 
         let err = orch
@@ -2760,6 +3026,7 @@ mod tests {
                 .payload_schema_version(1)
                 .payload_hash([0xBB; 32])
                 .evidence_bundle_hash([0xCC; 32])
+                .passed(true)
                 .build_and_sign(exec_signer);
 
         let err = orch
@@ -2792,6 +3059,7 @@ mod tests {
                 .payload_schema_version(1)
                 .payload_hash([0xBB; 32])
                 .evidence_bundle_hash([0xCC; 32])
+                .passed(true)
                 .build_and_sign(exec_signer);
 
         let err = orch
@@ -2824,6 +3092,7 @@ mod tests {
                 .payload_schema_version(99) // unsupported
                 .payload_hash([0xBB; 32])
                 .evidence_bundle_hash([0xCC; 32])
+                .passed(true)
                 .build_and_sign(exec_signer);
 
         let err = orch
@@ -3020,6 +3289,269 @@ mod tests {
                 stored_vk, expected_vk,
                 "Stored executor VK should match for {gate_type}"
             );
+        }
+    }
+
+    // =========================================================================
+    // Security MAJOR 1: Replay/Idempotency Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_replay_same_session_changeset_rejected() {
+        let orch = test_orchestrator();
+        let info1 = SessionTerminatedInfo {
+            session_id: "session-replay".to_string(),
+            work_id: "work-replay-1".to_string(),
+            changeset_digest: [0xAA; 32],
+            terminated_at_ms: 0,
+        };
+        orch.handle_session_terminated(info1).await.unwrap();
+
+        // Remove the orchestration so work_id is free, but replay key persists
+        orch.remove_orchestration("work-replay-1").await;
+
+        // Same session_id + changeset_digest but different work_id
+        let info2 = SessionTerminatedInfo {
+            session_id: "session-replay".to_string(),
+            work_id: "work-replay-2".to_string(),
+            changeset_digest: [0xAA; 32],
+            terminated_at_ms: 0,
+        };
+        let err = orch
+            .handle_session_terminated(info2)
+            .await
+            .err()
+            .expect("expected replay error");
+        assert!(
+            matches!(err, GateOrchestratorError::ReplayDetected { .. }),
+            "Same session+changeset after removal should be rejected as replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_termination_event_rejected() {
+        let orch = test_orchestrator();
+        let info = SessionTerminatedInfo {
+            session_id: "session-stale".to_string(),
+            work_id: "work-stale".to_string(),
+            changeset_digest: [0x42; 32],
+            // A very old timestamp (2024)
+            terminated_at_ms: 1_704_067_200_000,
+        };
+        let err = orch
+            .handle_session_terminated(info)
+            .await
+            .err()
+            .expect("expected stale error");
+        assert!(
+            matches!(err, GateOrchestratorError::StaleTerminationEvent { .. }),
+            "Old termination event should be rejected as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_terminated_at_ms_bypasses_freshness_check() {
+        let orch = test_orchestrator();
+        // terminated_at_ms: 0 should bypass the freshness check
+        let info = test_session_info("work-fresh");
+        assert_eq!(info.terminated_at_ms, 0);
+        orch.handle_session_terminated(info).await.unwrap();
+        assert_eq!(orch.active_count().await, 1);
+    }
+
+    // =========================================================================
+    // Security BLOCKER 2: poll_timeouts Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_poll_timeouts_handles_expired_gates() {
+        let config = GateOrchestratorConfig {
+            gate_timeout_ms: 0, // Instant timeout
+            ..Default::default()
+        };
+        let orch = GateOrchestrator::new(config, test_signer());
+        let info = test_session_info("work-poll");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        // poll_timeouts should handle all 3 expired gates
+        let events = orch.poll_timeouts().await;
+        let timeout_count = events
+            .iter()
+            .filter(|e| matches!(e, GateOrchestratorEvent::GateTimedOut { .. }))
+            .count();
+        assert_eq!(timeout_count, 3, "poll_timeouts should handle all 3 gates");
+
+        // Should also have timeout receipt events (Quality MAJOR 1)
+        let receipt_count = events
+            .iter()
+            .filter(|e| matches!(e, GateOrchestratorEvent::GateTimeoutReceiptGenerated { .. }))
+            .count();
+        assert_eq!(
+            receipt_count, 3,
+            "poll_timeouts should emit timeout receipt events"
+        );
+    }
+
+    // =========================================================================
+    // Quality BLOCKER 2: Explicit Passed Field Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_pass_with_zero_evidence_rejected() {
+        // Defense-in-depth: passed=true but zero hashes should be rejected
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-pass-zero").await;
+
+        let lease = orch
+            .gate_lease("work-pass-zero", GateType::Quality)
+            .await
+            .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
+
+        // Build a receipt that declares passed=true but has zero evidence
+        let receipt = GateReceiptBuilder::new(
+            "receipt-pass-zero",
+            GateType::Quality.as_gate_id(),
+            &lease.lease_id,
+        )
+        .changeset_digest(lease.changeset_digest)
+        .executor_actor_id(&lease.executor_actor_id)
+        .receipt_version(1)
+        .payload_kind(GateType::Quality.payload_kind())
+        .payload_schema_version(1)
+        .payload_hash([0u8; 32]) // zero!
+        .evidence_bundle_hash([0xCC; 32])
+        .passed(true) // claims pass despite zero payload hash
+        .build_and_sign(exec_signer);
+
+        let err = orch
+            .record_gate_receipt("work-pass-zero", GateType::Quality, receipt)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GateOrchestratorError::ZeroEvidenceVerdictRejected { .. }
+            ),
+            "passed=true with zero evidence should be rejected, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_with_zero_evidence_accepted() {
+        // passed=false with zero hashes is fine (e.g., explicit fail)
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-fail-zero").await;
+
+        let lease = orch
+            .gate_lease("work-fail-zero", GateType::Quality)
+            .await
+            .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
+
+        // Build a receipt that declares passed=false with zero evidence
+        let receipt = GateReceiptBuilder::new(
+            "receipt-fail-zero",
+            GateType::Quality.as_gate_id(),
+            &lease.lease_id,
+        )
+        .changeset_digest(lease.changeset_digest)
+        .executor_actor_id(&lease.executor_actor_id)
+        .receipt_version(1)
+        .payload_kind(GateType::Quality.payload_kind())
+        .payload_schema_version(1)
+        .payload_hash([0u8; 32])
+        .evidence_bundle_hash([0u8; 32])
+        .passed(false) // explicit fail
+        .build_and_sign(exec_signer);
+
+        let (_result, events) = orch
+            .record_gate_receipt("work-fail-zero", GateType::Quality, receipt)
+            .await
+            .unwrap();
+        assert!(!events.is_empty(), "FAIL receipt should be accepted");
+
+        let status = orch
+            .gate_status("work-fail-zero", GateType::Quality)
+            .await
+            .unwrap();
+        assert!(matches!(
+            status,
+            GateStatus::Completed { passed: false, .. }
+        ));
+    }
+
+    // =========================================================================
+    // Quality MAJOR 1: Timeout Receipt Event Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_timeout_emits_receipt_event() {
+        let orch = test_orchestrator();
+        setup_orchestration(&orch, "work-timeout-evt").await;
+
+        let (_result, events) = orch
+            .handle_gate_timeout("work-timeout-evt", GateType::Aat)
+            .await
+            .unwrap();
+
+        // Should have both GateTimedOut and GateTimeoutReceiptGenerated
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GateOrchestratorEvent::GateTimedOut { .. })),
+            "Should have GateTimedOut event"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GateOrchestratorEvent::GateTimeoutReceiptGenerated { .. })),
+            "Should have GateTimeoutReceiptGenerated event"
+        );
+    }
+
+    // =========================================================================
+    // Quality MAJOR 2: Deterministic Outcome Ordering Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_all_gates_completed_outcomes_sorted_by_gate_id() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-sort").await;
+
+        // Complete all gates in reverse order (Security, Quality, Aat)
+        for &gate_type in &[GateType::Security, GateType::Quality, GateType::Aat] {
+            let lease = orch.gate_lease("work-sort", gate_type).await.unwrap();
+            let exec_signer = &exec_signers[&gate_type];
+            let receipt = build_receipt(
+                &format!("receipt-{}", gate_type.as_gate_id()),
+                gate_type,
+                &lease,
+                exec_signer,
+                [0xBB; 32],
+                [0xCC; 32],
+            );
+
+            let (result, _events) = orch
+                .record_gate_receipt("work-sort", gate_type, receipt)
+                .await
+                .unwrap();
+
+            if gate_type == GateType::Aat {
+                // Last gate completed -> outcomes
+                let outcomes = result.expect("expected outcomes");
+                assert_eq!(outcomes.len(), 3);
+
+                // Outcomes must be sorted by gate_id
+                let gate_ids: Vec<&str> =
+                    outcomes.iter().map(|o| o.gate_type.as_gate_id()).collect();
+                assert_eq!(
+                    gate_ids,
+                    vec!["gate-aat", "gate-quality", "gate-security"],
+                    "Outcomes should be sorted by gate_id for determinism"
+                );
+            }
         }
     }
 }

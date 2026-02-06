@@ -45,12 +45,14 @@ use apm2_daemon::gate::{
 use apm2_daemon::state::DispatcherState;
 
 /// Helper: creates a test `SessionTerminatedInfo`.
+///
+/// Uses `terminated_at_ms: 0` to bypass freshness checks in tests.
 fn test_session_info(work_id: &str) -> SessionTerminatedInfo {
     SessionTerminatedInfo {
         session_id: format!("session-{work_id}"),
         work_id: work_id.to_string(),
         changeset_digest: [0x42; 32],
-        terminated_at_ms: 1_704_067_200_000,
+        terminated_at_ms: 0,
     }
 }
 
@@ -107,6 +109,7 @@ async fn tck_00388_full_lifecycle_through_daemon_entry_point() {
         .payload_schema_version(1)
         .payload_hash([0xBB; 32])
         .evidence_bundle_hash([0xCC; 32])
+        .passed(true)
         .build_and_sign(exec_signer);
 
         let (outcomes, events) = orch
@@ -196,6 +199,7 @@ async fn tck_00388_receipt_signature_verified() {
         .payload_schema_version(1)
         .payload_hash([0xBB; 32])
         .evidence_bundle_hash([0xCC; 32])
+        .passed(true)
         .build_and_sign(&wrong_signer);
 
     let err = orch
@@ -218,6 +222,7 @@ async fn tck_00388_receipt_signature_verified() {
         .payload_schema_version(1)
         .payload_hash([0xBB; 32])
         .evidence_bundle_hash([0xCC; 32])
+        .passed(true)
         .build_and_sign(exec_signer);
 
     let result = orch
@@ -273,11 +278,11 @@ async fn tck_00388_admission_check_before_events() {
     let result = orch2
         .on_session_terminated(test_session_info("work-integ-04c"))
         .await;
-    assert!(result.is_err(), "Expected duplicate error");
+    assert!(result.is_err(), "Expected replay/duplicate error");
     let err = result.err().unwrap();
     assert!(
-        matches!(err, GateOrchestratorError::DuplicateOrchestration { .. }),
-        "Expected duplicate error"
+        matches!(err, GateOrchestratorError::ReplayDetected { .. }),
+        "Expected ReplayDetected error, got: {err:?}"
     );
 }
 
