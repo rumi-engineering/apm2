@@ -25,4 +25,4 @@ evidence_artifact:
         - retrieve by content hash returns byte-identical canonical bytes
         - second store of identical bytes is deduplicated (is_new = false)
         - HolonGenesisV1 validates the same hash-addressed store/retrieve/dedup flow
-      ref: "cargo test -p apm2-daemon identity::cell_id identity::holon_id"
+      ref: "cargo test -p apm2-daemon identity::"
