@@ -4251,47 +4251,68 @@ mod tests {
                 .expect("failed to build tokio runtime");
 
             rt.block_on(async {
+                use rand::rngs::OsRng;
+
+                use crate::episode::decision::Credential;
+                use crate::episode::tool_handler::ToolArgs;
                 use crate::episode::{
-                    EpisodeRuntime, EpisodeRuntimeConfig, ToolBroker, ToolBrokerConfig, ToolClass,
+                    BudgetDelta, EpisodeRuntime, EpisodeRuntimeConfig, StubContentAddressedStore,
+                    ToolBroker, ToolBrokerConfig, ToolClass, ToolHandler, ToolHandlerError,
+                    ToolResultData,
                 };
                 use crate::htf::{ClockConfig, HolonicClock};
                 use crate::ledger::SqliteLedgerEventEmitter;
-                use rand::rngs::OsRng;
+
+                // --- Mock handler that returns success without real I/O ---
+                #[derive(Debug)]
+                struct MockReadHandler;
+
+                #[async_trait::async_trait]
+                impl ToolHandler for MockReadHandler {
+                    fn tool_class(&self) -> ToolClass {
+                        ToolClass::Read
+                    }
+
+                    async fn execute(
+                        &self,
+                        _args: &ToolArgs,
+                        _credential: Option<&Credential>,
+                    ) -> Result<ToolResultData, ToolHandlerError> {
+                        Ok(ToolResultData::success(
+                            b"mock-read-output".to_vec(),
+                            BudgetDelta::single_call(),
+                            std::time::Duration::from_millis(1),
+                        ))
+                    }
+
+                    fn validate(&self, _args: &ToolArgs) -> Result<(), ToolHandlerError> {
+                        Ok(())
+                    }
+
+                    fn name(&self) -> &'static str {
+                        "MockReadHandler"
+                    }
+                }
 
                 let minter = test_minter();
-                let ctx = make_session_ctx();
 
                 // --- Infrastructure setup ---
 
-                // In-memory SQLite for ledger
-                let conn = rusqlite::Connection::open_in_memory()
-                    .expect("in-memory sqlite");
-                SqliteLedgerEventEmitter::init_schema(&conn)
-                    .expect("init ledger schema");
-                let conn = Arc::new(std::sync::Mutex::new(conn));
-                let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
-                let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
-                    Arc::new(SqliteLedgerEventEmitter::new(
-                        Arc::clone(&conn),
-                        signing_key,
-                    ));
-
-                // HolonicClock
-                let clock = Arc::new(
-                    HolonicClock::new(ClockConfig::default(), None)
-                        .expect("clock"),
+                // EpisodeRuntime with CAS and a mock Read handler factory
+                // so that execute_tool() succeeds end-to-end.
+                let cas: Arc<dyn crate::episode::ContentAddressedStore> =
+                    Arc::new(StubContentAddressedStore::new());
+                let runtime_config = EpisodeRuntimeConfig::default();
+                #[allow(deprecated)]
+                let episode_runtime = Arc::new(
+                    EpisodeRuntime::new(runtime_config)
+                        .with_cas(cas)
+                        .with_handler_factory(|| Box::new(MockReadHandler) as Box<dyn ToolHandler>),
                 );
 
-                // ToolBroker (default config allows all tool classes)
-                let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
-
-                // EpisodeRuntime - minimal, no handler factories needed because
-                // the broker Allow path requires episode_runtime.execute_tool(),
-                // and we need the episode to exist and be running.
-                let runtime_config = EpisodeRuntimeConfig::default();
-                let episode_runtime = Arc::new(EpisodeRuntime::new(runtime_config));
-
-                // Create and start an episode for session-001
+                // Create and start an episode. The generated episode_id becomes
+                // the session_id so that handle_request_tool's
+                // `EpisodeId::new(&token.session_id)` resolves to this episode.
                 let episode_id = episode_runtime
                     .create(*blake3::hash(b"test-envelope").as_bytes(), 1_000_000)
                     .await
@@ -4303,25 +4324,62 @@ mod tests {
                     .await
                     .expect("start episode");
 
+                // Use the episode_id as session_id everywhere so the
+                // dispatcher can find the episode at execute_tool() time.
+                let session_id = episode_id.as_str().to_string();
+
+                // Build a ConnectionContext tied to this session_id
+                let ctx = ConnectionContext::session(
+                    Some(crate::protocol::credentials::PeerCredentials {
+                        uid: 1000,
+                        gid: 1000,
+                        pid: Some(12346),
+                    }),
+                    Some(session_id.clone()),
+                );
+
+                // In-memory SQLite for ledger
+                let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+                SqliteLedgerEventEmitter::init_schema(&conn).expect("init ledger schema");
+                let conn = Arc::new(std::sync::Mutex::new(conn));
+                let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+                let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> = Arc::new(
+                    SqliteLedgerEventEmitter::new(Arc::clone(&conn), signing_key),
+                );
+
+                // HolonicClock
+                let clock =
+                    Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+
+                // ToolBroker - disable policy check (no policy engine in test)
+                // and initialize with manifest so request() succeeds.
+                let broker_config = ToolBrokerConfig::default().without_policy_check();
+                let broker = Arc::new(ToolBroker::new(broker_config));
+                let broker_manifest =
+                    super::tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+                broker
+                    .initialize_with_manifest(broker_manifest)
+                    .await
+                    .expect("broker initialization should succeed");
+
                 // Manifest store with Read allowed
                 let manifest_store = Arc::new(InMemoryManifestStore::new());
-                let manifest = super::tck_00260_manifest_validation::make_test_manifest(
-                    vec![ToolClass::Read],
-                );
-                manifest_store.register("session-001", manifest);
+                let manifest =
+                    super::tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+                manifest_store.register(&session_id, manifest);
 
                 // Session registry
                 let registry: Arc<dyn crate::session::SessionRegistry> =
                     Arc::new(crate::episode::InMemorySessionRegistry::new());
                 let session = crate::session::SessionState {
-                    session_id: "session-001".to_string(),
+                    session_id: session_id.clone(),
                     work_id: "W-E2E-001".to_string(),
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
                     lease_id: "L-E2E-001".to_string(),
                     ephemeral_handle: "handle-e2e".to_string(),
                     policy_resolved_ref: String::new(),
                     capability_manifest_hash: vec![],
-                    episode_id: Some(episode_id.as_str().to_string()),
+                    episode_id: Some(session_id.clone()),
                 };
                 registry
                     .register_session(session)
@@ -4337,44 +4395,46 @@ mod tests {
                         ns
                     })
                     .unwrap_or(0);
-                telemetry_store.register("session-001", started_at_ns).expect("telemetry registration should succeed");
+                telemetry_store
+                    .register(&session_id, started_at_ns)
+                    .expect("telemetry registration should succeed");
 
                 // --- Build dispatcher with all production dependencies ---
-                let dispatcher = SessionDispatcher::with_manifest_store(
-                    minter.clone(),
-                    manifest_store,
-                )
-                .with_broker(broker)
-                .with_clock(clock)
-                .with_ledger(ledger)
-                .with_episode_runtime(episode_runtime)
-                .with_session_registry(Arc::clone(&registry))
-                .with_telemetry_store(Arc::clone(&telemetry_store));
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_clock(clock)
+                        .with_ledger(ledger)
+                        .with_episode_runtime(episode_runtime)
+                        .with_session_registry(Arc::clone(&registry))
+                        .with_telemetry_store(Arc::clone(&telemetry_store));
 
-                let token = test_token(&minter);
+                // Mint token with the episode-derived session_id
+                let spawn_time = std::time::SystemTime::now();
+                let ttl = Duration::from_secs(3600);
+                let token = minter
+                    .mint(&session_id, "lease-001", spawn_time, ttl)
+                    .unwrap();
 
                 // --- (b) Dispatch RequestTool through real broker path ---
-                // The broker will Allow this (Read is in manifest), and the
-                // episode_runtime.execute_tool() will run. Even if execution
-                // returns an error (no handler for Read), the counter is
-                // incremented on Allow decision before execution.
+                // The broker is initialized with a manifest that allows Read,
+                // the episode runtime has a CAS and a MockReadHandler, so the
+                // full Allow -> execute -> success path is exercised.
+                let read_args = serde_json::json!({
+                    "type": "read",
+                    "path": "/tmp/e2e-telemetry-test-dummy"
+                });
                 let tool_request = RequestToolRequest {
                     session_token: serde_json::to_string(&token).unwrap(),
                     tool_id: "read".to_string(),
-                    arguments: b"{}".to_vec(),
+                    arguments: serde_json::to_vec(&read_args).unwrap(),
                     dedupe_key: "e2e-dedupe-1".to_string(),
                 };
                 let frame = encode_request_tool_request(&tool_request);
                 let tool_result = dispatcher.dispatch(&frame, &ctx);
-                // The tool request may succeed (Allow) or fail at execution
-                // (no handler registered for Read in this minimal runtime).
-                // Either way, if we get an Allow decision, the counter was
-                // incremented. If execution fails, we get an error response
-                // but the counter still increments because the check is on
-                // the broker decision, not execution success.
-                //
-                // Check: if the result is a RequestTool Allow or an
-                // Internal error (execution failed), the counter was hit.
+
+                // The broker returns Allow and MockReadHandler succeeds,
+                // so we must get a RequestTool response with Allow decision.
                 match &tool_result {
                     Ok(SessionResponse::RequestTool(resp)) => {
                         assert_eq!(
@@ -4384,17 +4444,9 @@ mod tests {
                         );
                     },
                     Ok(SessionResponse::Error(err)) => {
-                        // Execution may fail (no handler), but counter should
-                        // still have been incremented if broker returned Allow.
-                        // In this case, the error happens inside
-                        // handle_broker_decision AFTER the broker returns Allow
-                        // but the counter increment happens AFTER
-                        // handle_broker_decision returns, so the counter is NOT
-                        // incremented for execution failures.
-                        // This is acceptable - we just need to track what
-                        // actually happened.
-                        eprintln!(
-                            "Tool execution returned error (expected if no handler): code={}, msg={}",
+                        panic!(
+                            "RequestTool should succeed with initialized broker \
+                             and mock handler, but got error: code={}, msg={}",
                             err.code, err.message
                         );
                     },
@@ -4448,38 +4500,26 @@ mod tests {
                 let status_result = dispatcher.dispatch(&frame, &ctx).unwrap();
 
                 // --- (e) Assert observed counters ---
+                // tool_calls MUST be 1: the broker returned Allow, the mock
+                // handler succeeded, and the counter was incremented.
                 match status_result {
                     SessionResponse::SessionStatus(resp) => {
-                        // Determine expected tool_calls based on whether the
-                        // RequestTool succeeded (Allow) or failed at execution.
-                        let expected_tool_calls = match &tool_result {
-                            Ok(SessionResponse::RequestTool(r))
-                                if r.decision == i32::from(DecisionType::Allow) =>
-                            {
-                                1u32
-                            },
-                            _ => 0u32,
-                        };
-
                         assert_eq!(
-                            resp.tool_calls, expected_tool_calls,
-                            "tool_calls should reflect dispatcher-driven increments"
+                            resp.tool_calls, 1,
+                            "tool_calls must be 1 after successful RequestTool dispatch"
                         );
                         assert_eq!(
                             resp.events_emitted, 2,
                             "events_emitted should be 2 (two EmitEvent dispatches)"
                         );
-                        assert!(
-                            resp.started_at_ns > 0,
-                            "started_at_ns should be non-zero"
-                        );
+                        assert!(resp.started_at_ns > 0, "started_at_ns should be non-zero");
                         // duration_ms should be a small session-relative value
                         assert!(
                             resp.duration_ms < 60_000,
                             "duration_ms should be session duration (< 1 min), got {}",
                             resp.duration_ms
                         );
-                        assert_eq!(resp.session_id, "session-001");
+                        assert_eq!(resp.session_id, session_id);
                         assert_eq!(resp.state, "ACTIVE");
                         assert_eq!(resp.work_id, "W-E2E-001");
                     },
