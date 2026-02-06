@@ -190,8 +190,9 @@ pub use dedupe::{
     MAX_TTL_SECS, SharedDedupeCache, new_shared_cache,
 };
 pub use envelope::{
-    ContextRefs, DeterminismClass, EnvelopeError, EpisodeEnvelope, EpisodeEnvelopeBuilder,
-    RiskTier, StopConditions,
+    ContextRefs, DeterminismClass, EnvelopeBindings, EnvelopeError, EnvelopeV1Error,
+    EpisodeEnvelope, EpisodeEnvelopeBuilder, EpisodeEnvelopeV1, EpisodeEnvelopeV1Builder, RiskTier,
+    StopConditions, validate_spawn_gate,
 };
 // Re-export runtime types (TCK-00160)
 pub use error::{EpisodeError, EpisodeId, MAX_EPISODE_ID_LEN};

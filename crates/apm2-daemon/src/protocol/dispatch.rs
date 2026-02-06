@@ -725,6 +725,62 @@ pub trait LedgerEventEmitter: Send + Sync {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a signed receipt with envelope bindings (TCK-00350).
+    ///
+    /// Per REQ-0004, all authoritative effect receipts MUST carry
+    /// `envelope_hash`, `capability_manifest_hash`, and
+    /// `view_commitment_hash`. This method validates bindings before
+    /// emission (fail-closed) and includes them in the signed payload.
+    ///
+    /// # Fail-closed
+    ///
+    /// Returns [`LedgerEventError::ValidationFailed`] if any binding
+    /// hash is zero. Receipts MUST NOT be emitted without valid bindings.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode that produced this receipt
+    /// * `receipt_id` - Unique receipt identifier
+    /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
+    /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
+    /// * `reviewer_actor_id` - Actor ID of the reviewer
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds
+    /// * `bindings` - Envelope bindings to include in the receipt
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if validation, signing, or persistence
+    /// fails.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_receipt_with_bindings(
+        &self,
+        episode_id: &str,
+        receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+        bindings: &crate::episode::EnvelopeBindings,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Fail-closed: validate bindings before emission
+        bindings
+            .validate()
+            .map_err(|e| LedgerEventError::ValidationFailed {
+                message: format!("envelope binding validation failed: {e}"),
+            })?;
+
+        // Default implementation delegates to emit_review_receipt.
+        // Implementations that persist bindings should override this.
+        self.emit_review_receipt(
+            episode_id,
+            receipt_id,
+            changeset_digest,
+            artifact_bundle_hash,
+            reviewer_actor_id,
+            timestamp_ns,
+        )
+    }
 }
 
 /// Domain separation prefix for `WorkClaimed` events.
@@ -1991,6 +2047,101 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             cas_hash = %hex::encode(cas_hash),
             "ChangeSetPublished event signed and persisted"
         );
+
+        Ok(signed_event)
+    }
+
+    /// TCK-00350: Emits a receipt with envelope bindings in the stub
+    /// implementation.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_receipt_with_bindings(
+        &self,
+        episode_id: &str,
+        receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+        bindings: &crate::episode::EnvelopeBindings,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Fail-closed: validate bindings before emission
+        bindings
+            .validate()
+            .map_err(|e| LedgerEventError::ValidationFailed {
+                message: format!("envelope binding validation failed: {e}"),
+            })?;
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Include bindings in the signed payload
+        let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
+        let payload_json = serde_json::json!({
+            "event_type": "review_receipt_recorded",
+            "episode_id": episode_id,
+            "receipt_id": receipt_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
+            "envelope_hash": env_hex,
+            "capability_manifest_hash": cap_hex,
+            "view_commitment_hash": view_hex,
+        });
+
+        let payload_bytes =
+            serde_json::to_vec(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("payload serialization failed: {e}"),
+            })?;
+
+        let mut canonical_bytes =
+            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "review_receipt_recorded".to_string(),
+            work_id: episode_id.to_string(),
+            actor_id: reviewer_actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(episode_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
 
         Ok(signed_event)
     }
