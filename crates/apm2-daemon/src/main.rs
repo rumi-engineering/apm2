@@ -862,6 +862,16 @@ async fn async_main(args: Args) -> Result<()> {
         None
     };
 
+    // Security Review v5 MAJOR 2: Create ONE ledger signing key per daemon
+    // lifecycle. This key is shared between crash recovery (LEASE_REVOKED
+    // events) and the dispatcher (session events). Previously, recovery and
+    // the dispatcher each generated their own ephemeral key, resulting in
+    // multi-key signing within a single daemon lifecycle.
+    let ledger_signing_key = {
+        use rand::rngs::OsRng;
+        ed25519_dalek::SigningKey::generate(&mut OsRng)
+    };
+
     // TCK-00387: Crash recovery on startup
     // Before accepting new connections, recover any sessions from persistent state,
     // emit LEASE_REVOKED events to the ledger, clean up stale work claims, and
@@ -873,7 +883,7 @@ async fn async_main(args: Args) -> Result<()> {
     // the daemon must NOT proceed to accept connections. Succeeded sessions
     // are checkpointed before the error is returned so partial progress is
     // preserved for the next startup attempt.
-    perform_crash_recovery(&state, sqlite_conn.as_ref()).await?;
+    perform_crash_recovery(&state, sqlite_conn.as_ref(), &ledger_signing_key).await?;
 
     info!(
         metrics_enabled = metrics_registry.is_some(),
@@ -920,17 +930,20 @@ async fn async_main(args: Args) -> Result<()> {
     // with_persistence_and_cas() to wire the session dispatcher with ToolBroker,
     // DurableCas, ledger event emitter, and holonic clock. This enables session-
     // scoped operations: tool execution, event emission, and evidence publishing.
+    // Security Review v5 MAJOR 2: Pass the same signing key used for recovery
+    // into the dispatcher, ensuring ONE key per daemon lifecycle.
     let dispatcher_state: SharedDispatcherState = Arc::new(
         if let (Some(conn), Some(cas_path)) = (&sqlite_conn, &daemon_config.cas_path) {
             info!(
                 cas_path = %cas_path.display(),
                 "Using with_persistence_and_cas: session dispatcher fully wired"
             );
-            DispatcherState::with_persistence_and_cas(
+            DispatcherState::with_persistence_and_cas_and_key(
                 state.session_registry().clone(),
                 metrics_registry.clone(),
                 Arc::clone(conn),
                 cas_path,
+                Some(ledger_signing_key),
             )
             .map_err(|e| {
                 anyhow::anyhow!("CAS initialization failed for {}: {e}", cas_path.display())
@@ -946,6 +959,7 @@ async fn async_main(args: Args) -> Result<()> {
                 state.session_registry().clone(),
                 metrics_registry.clone(),
                 sqlite_conn.clone(),
+                Some(ledger_signing_key),
             )
         }
         .with_daemon_state(Arc::clone(&state)),
@@ -1307,6 +1321,9 @@ async fn async_main(args: Args) -> Result<()> {
 /// * `state` - The daemon shared state containing the session registry
 /// * `sqlite_conn` - Optional `SQLite` connection for emitting ledger events.
 ///   If `None`, lease revocation events will be logged but not persisted.
+/// * `ledger_signing_key` - The daemon-lifecycle signing key for ledger event
+///   emission. Per Security Review v5 MAJOR 2, there must be ONE signing key
+///   per daemon lifecycle shared between crash recovery and the dispatcher.
 ///
 /// # Returns
 ///
@@ -1321,6 +1338,7 @@ async fn async_main(args: Args) -> Result<()> {
 async fn perform_crash_recovery(
     state: &SharedState,
     sqlite_conn: Option<&Arc<Mutex<Connection>>>,
+    ledger_signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<()> {
     use std::time::Instant;
 
@@ -1359,11 +1377,13 @@ async fn perform_crash_recovery(
 
     // TCK-00387: Create a ledger event emitter for emitting LEASE_REVOKED events.
     // If no SQLite connection is available, we log but do not persist events.
-    let emitter = sqlite_conn.map(|conn| {
-        use rand::rngs::OsRng;
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
-        SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
-    });
+    //
+    // Security Review v5 MAJOR 2: Use the daemon-lifecycle signing key (passed
+    // in from async_main) instead of generating a separate ephemeral key. This
+    // ensures ONE signing key per daemon lifecycle, shared between recovery and
+    // the dispatcher.
+    let emitter = sqlite_conn
+        .map(|conn| SqliteLedgerEventEmitter::new(Arc::clone(conn), ledger_signing_key.clone()));
 
     // Security Review v4 BLOCKER 2: Create the daemon's shared HTF clock for
     // recovery timestamps. Per RFC-0016, all ledger event timestamps must come
@@ -1855,6 +1875,12 @@ mod crash_recovery_integration_tests {
 
     use super::*;
 
+    /// Creates a test signing key for ledger event emission.
+    fn make_signing_key() -> ed25519_dalek::SigningKey {
+        use rand::rngs::OsRng;
+        ed25519_dalek::SigningKey::generate(&mut OsRng)
+    }
+
     /// Creates a test session simulating a stale session from a prior daemon.
     fn make_session(id: &str, work_id: &str) -> SessionState {
         SessionState {
@@ -1957,7 +1983,8 @@ mod crash_recovery_integration_tests {
         register_claim(&sqlite_conn, "real-work-2");
 
         // Phase 4: Call the REAL perform_crash_recovery function
-        perform_crash_recovery(&state, Some(&sqlite_conn))
+        let signing_key = make_signing_key();
+        perform_crash_recovery(&state, Some(&sqlite_conn), &signing_key)
             .await
             .expect("real perform_crash_recovery should succeed");
 
@@ -2034,7 +2061,8 @@ mod crash_recovery_integration_tests {
         );
 
         // Call real perform_crash_recovery with no sessions
-        perform_crash_recovery(&state, None)
+        let signing_key = make_signing_key();
+        perform_crash_recovery(&state, None, &signing_key)
             .await
             .expect("recovery with no sessions should succeed");
     }
@@ -2075,7 +2103,8 @@ mod crash_recovery_integration_tests {
         // With no SQLite connection, emitter is None, so ledger events are
         // only logged (not persisted). Recovery succeeds (no critical failures)
         // and clears the registry. This tests the happy path with ledger=None.
-        let result = perform_crash_recovery(&state, None).await;
+        let signing_key = make_signing_key();
+        let result = perform_crash_recovery(&state, None, &signing_key).await;
         assert!(
             result.is_ok(),
             "Recovery without ledger should succeed (events logged, not persisted)"
