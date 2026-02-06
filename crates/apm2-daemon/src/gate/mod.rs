@@ -1,15 +1,23 @@
-// AGENT-AUTHORED (TCK-00388)
-//! Gate execution orchestrator for autonomous gate lifecycle.
+// AGENT-AUTHORED (TCK-00388, TCK-00390)
+//! Gate execution orchestrator and merge executor for autonomous gate
+//! lifecycle.
 //!
 //! This module implements the [`GateOrchestrator`] which watches for
 //! `session_terminated` ledger events and autonomously orchestrates the
 //! gate lifecycle: policy resolution, lease issuance, gate executor
 //! spawning, and receipt collection.
 //!
+//! It also implements the [`MergeExecutor`] (TCK-00390) which watches for
+//! all required gate receipts reaching PASS verdict and autonomously
+//! executes the merge via GitHub API, creates a signed `MergeReceipt`,
+//! and transitions work state to Completed.
+//!
 //! # FAC State Machine
 //!
 //! ```text
 //! session_terminated -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
+//!                                                 -> ALL_PASS -> MERGE -> Completed
+//!                                                 -> CONFLICT -> ReviewBlocked
 //! ```
 //!
 //! The `GateOrchestrator` bridges the gap between session termination and
@@ -20,6 +28,7 @@
 //! 3. Issuing `GateLease` for each required gate (aat, quality, security)
 //! 4. Spawning gate executor episodes via `EpisodeRuntime`
 //! 5. Collecting `GateReceipt` results (or timeout -> FAIL verdict)
+//! 6. When all gates pass, the [`MergeExecutor`] autonomously merges
 //!
 //! # Security Invariants
 //!
@@ -38,8 +47,13 @@
 //! - Maximum gate types per orchestration: [`MAX_GATE_TYPES`]
 //! - Gate lease timeout: [`DEFAULT_GATE_TIMEOUT_MS`]
 
+pub mod merge_executor;
 mod orchestrator;
 
+pub use merge_executor::{
+    ExecuteOrBlockResult, GitHubMergeAdapter, MAX_PENDING_MERGES, MergeExecutor,
+    MergeExecutorError, MergeExecutorEvent, MergeInput, MergeResult,
+};
 pub use orchestrator::{
     Clock, DEFAULT_GATE_TIMEOUT_MS, GateOrchestrator, GateOrchestratorConfig,
     GateOrchestratorError, GateOrchestratorEvent, GateOutcome, GateStatus, GateType,
