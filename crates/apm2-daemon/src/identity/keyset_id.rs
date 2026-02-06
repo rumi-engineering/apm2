@@ -111,8 +111,18 @@ impl fmt::Display for SetTag {
 
 /// A canonical identifier for a set of public keys (RFC-0020 section 1.7.2a).
 ///
-/// Instances are guaranteed to contain a valid set tag and exactly 32 bytes
-/// of BLAKE3 merkle root. The type is cheaply cloneable (33 bytes inline).
+/// Instances contain exactly 32 bytes of BLAKE3 merkle root and an
+/// **optional** set tag. The type is cheaply cloneable (33 bytes inline).
+///
+/// # Tag Semantics
+///
+/// - When constructed via [`KeySetIdV1::from_descriptor`] or
+///   [`KeySetIdV1::from_binary`], the set tag is known and
+///   [`KeySetIdV1::set_tag`] returns `Some(tag)`.
+/// - When parsed from text via [`KeySetIdV1::parse_text`], the set tag is **not
+///   available** because the text form `kset:v1:blake3:<hex>` does not encode
+///   the mode. In this case [`KeySetIdV1::set_tag`] returns `None`. To resolve
+///   the mode, callers must look up the descriptor via CAS.
 ///
 /// # Construction
 ///
@@ -138,17 +148,25 @@ impl fmt::Display for SetTag {
 ///     2, // threshold_k = n for multisig
 ///     &[key1, key2],
 ///     None, // no weights
-/// );
+/// )
+/// .unwrap();
 ///
-/// // Round-trip through text form
+/// // Round-trip through text form (text form is hash-only, no tag)
 /// let text = set_id.to_text();
 /// assert!(text.starts_with("kset:v1:blake3:"));
 /// let parsed = KeySetIdV1::parse_text(&text).unwrap();
-/// assert_eq!(set_id, parsed);
+/// assert_eq!(set_id.merkle_root(), parsed.merkle_root());
+/// // Tag is only available from binary/descriptor, not text
+/// assert_eq!(set_id.set_tag(), Some(SetTag::Multisig));
+/// assert_eq!(parsed.set_tag(), None);
 /// ```
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeySetIdV1 {
-    /// Raw binary form: `set_tag` (1 byte) + `merkle_root` (32 bytes).
+    /// Storage: `tag_or_sentinel` (1 byte) + `merkle_root` (32 bytes).
+    ///
+    /// When constructed from binary or descriptor, byte 0 is a valid
+    /// [`SetTag`] value (0x01 or 0x02). When parsed from text, byte 0 is
+    /// 0x00 (sentinel for "tag unknown").
     binary: [u8; BINARY_LEN],
 }
 
@@ -160,18 +178,29 @@ impl KeySetIdV1 {
     ///
     /// - `key_algorithm`: algorithm name (e.g. "ed25519")
     /// - `set_tag`: mode (Multisig or Threshold)
-    /// - `threshold_k`: quorum threshold (for Multisig, should equal n)
-    /// - `members`: the member `PublicKeyIdV1` keys
-    /// - `weights`: optional per-member weights
+    /// - `threshold_k`: quorum threshold (for Multisig, must equal `n`)
+    /// - `members`: the member `PublicKeyIdV1` keys (must be non-empty)
+    /// - `weights`: optional per-member weights (length must match members)
     ///
-    /// Members are sorted lexicographically by their raw binary form before
-    /// hashing, ensuring deterministic derivation regardless of input order.
+    /// # Validation
+    ///
+    /// Returns `Err(KeyIdError::InvalidDescriptor)` if:
+    /// - `members` is empty
+    /// - For `Multisig`: `threshold_k != members.len()`
+    /// - For `Threshold`: `threshold_k < 1` or `threshold_k > members.len()`
+    /// - `weights` is `Some` but its length differs from `members.len()`
+    ///
+    /// # Deterministic Canonicalization
+    ///
+    /// Members (and their corresponding weights, if present) are sorted
+    /// lexicographically by member binary representation before hashing,
+    /// ensuring deterministic derivation regardless of input order.
     ///
     /// The hash is computed as:
     /// ```text
     /// blake3("apm2:keyset_id:v1\0" + key_algorithm + "\n" + mode_name
     ///        + "\n" + threshold_k(4-byte LE) + "\n" + sorted_member_binaries
-    ///        + ["\n" + weights(each 8-byte LE)])
+    ///        + ["\n" + sorted_weights(each 8-byte LE)])
     /// ```
     pub fn from_descriptor(
         key_algorithm: &str,
@@ -179,11 +208,69 @@ impl KeySetIdV1 {
         threshold_k: u32,
         members: &[PublicKeyIdV1],
         weights: Option<&[u64]>,
-    ) -> Self {
-        // Sort members by their binary representation for determinism
-        let mut sorted_binaries: Vec<[u8; BINARY_LEN]> =
+    ) -> Result<Self, KeyIdError> {
+        // Validate: members must be non-empty
+        if members.is_empty() {
+            return Err(KeyIdError::InvalidDescriptor {
+                reason: "members must be non-empty".to_string(),
+            });
+        }
+
+        let n = members.len();
+        let n_u32 = u32::try_from(n).map_err(|_| KeyIdError::InvalidDescriptor {
+            reason: format!("members.len() ({n}) exceeds u32::MAX"),
+        })?;
+
+        // Validate threshold_k against mode
+        match set_tag {
+            SetTag::Multisig => {
+                if threshold_k != n_u32 {
+                    return Err(KeyIdError::InvalidDescriptor {
+                        reason: format!(
+                            "Multisig requires threshold_k == members.len(), \
+                             got threshold_k={threshold_k}, members.len()={n}"
+                        ),
+                    });
+                }
+            },
+            SetTag::Threshold => {
+                if threshold_k < 1 || threshold_k > n_u32 {
+                    return Err(KeyIdError::InvalidDescriptor {
+                        reason: format!(
+                            "Threshold requires 1 <= threshold_k <= members.len(), \
+                             got threshold_k={threshold_k}, members.len()={n}"
+                        ),
+                    });
+                }
+            },
+        }
+
+        // Validate weights alignment
+        if let Some(w) = weights {
+            if w.len() != n {
+                return Err(KeyIdError::InvalidDescriptor {
+                    reason: format!(
+                        "weights.len() must equal members.len(), \
+                         got weights.len()={}, members.len()={n}",
+                        w.len()
+                    ),
+                });
+            }
+        }
+
+        // Sort (member, weight) pairs together by member binary for determinism.
+        // This ensures that different input orderings of the same logical
+        // descriptor always produce the same canonical hash.
+        let member_binaries: Vec<[u8; BINARY_LEN]> =
             members.iter().map(PublicKeyIdV1::to_binary).collect();
-        sorted_binaries.sort_unstable();
+
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.sort_unstable_by(|&a, &b| member_binaries[a].cmp(&member_binaries[b]));
+
+        let sorted_binaries: Vec<[u8; BINARY_LEN]> =
+            indices.iter().map(|&i| member_binaries[i]).collect();
+        let sorted_weights: Option<Vec<u64>> =
+            weights.map(|w| indices.iter().map(|&i| w[i]).collect());
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN_SEPARATION);
@@ -200,8 +287,8 @@ impl KeySetIdV1 {
         for member_binary in &sorted_binaries {
             hasher.update(member_binary);
         }
-        // Include optional weights
-        if let Some(w) = weights {
+        // Include optional weights (sorted to match member order)
+        if let Some(ref w) = sorted_weights {
             hasher.update(b"\n");
             for weight in w {
                 hasher.update(&weight.to_le_bytes());
@@ -212,7 +299,7 @@ impl KeySetIdV1 {
         let mut binary = [0u8; BINARY_LEN];
         binary[0] = set_tag.to_byte();
         binary[1..].copy_from_slice(root.as_bytes());
-        Self { binary }
+        Ok(Self { binary })
     }
 
     /// Parse a `KeySetIdV1` from its canonical text form.
@@ -226,22 +313,14 @@ impl KeySetIdV1 {
     /// - No whitespace, no mixed case, no percent-encoding
     /// - Exactly 64 hex characters (32 bytes)
     ///
-    /// Note: The set tag is NOT encoded in the text form. The binary form
-    /// can only be reconstructed from the binary representation, not from
-    /// the text form alone. For `parse_text`, the set tag byte is set to
-    /// 0x00 as a placeholder since the text form only contains the hash.
-    /// Use `from_binary` when you need the full tagged binary form.
+    /// # Tag Semantics
     ///
-    /// Actually, the binary form IS recoverable from text: we store the
-    /// merkle root hash as the hex payload. The `set_tag` is NOT part of the
-    /// text form (RFC-0020 `kset:v1:blake3:` does not encode the mode).
-    /// For text-only round-trips, we need to know the set tag from context.
-    /// However, for conformance testing, we store the full binary (tag + hash)
-    /// and verify both parse paths agree.
-    ///
-    /// Since the text form doesn't encode the set tag, `parse_text` returns
-    /// a `KeySetIdV1` with the Multisig tag (0x01) by default. To get a
-    /// specific tag, use `from_binary` or `from_descriptor`.
+    /// The text form does **not** encode the set tag (mode). The returned
+    /// `KeySetIdV1` will have [`set_tag()`](KeySetIdV1::set_tag) returning
+    /// `None`. To resolve the mode, callers must look up the full descriptor
+    /// via CAS, or use [`from_binary`](KeySetIdV1::from_binary) /
+    /// [`from_descriptor`](KeySetIdV1::from_descriptor) which do carry the
+    /// tag.
     pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
         validate_text_common(input)?;
 
@@ -259,11 +338,10 @@ impl KeySetIdV1 {
         // Decode hex payload (validates length = 64, lowercase only)
         let hash = decode_hex_payload(hex_payload)?;
 
-        // The text form does not encode the set tag. We store the hash only
-        // and default to Multisig tag. Callers who need a specific tag should
-        // use from_binary.
+        // The text form does not encode the set tag. Store tag byte 0x00
+        // (not a valid SetTag) so that set_tag() returns None.
         let mut binary = [0u8; BINARY_LEN];
-        binary[0] = SetTag::Multisig.to_byte();
+        // binary[0] is already 0x00 — sentinel for "tag unknown"
         binary[1..].copy_from_slice(&hash);
         Ok(Self { binary })
     }
@@ -286,9 +364,11 @@ impl KeySetIdV1 {
 
     /// Return the canonical text form: `kset:v1:blake3:<64-hex>`.
     ///
-    /// Note: The text form encodes only the merkle root hash, not the set
-    /// tag. Two `KeySetIdV1` values with different set tags but the same
-    /// merkle root will produce the same text form.
+    /// The text form encodes only the merkle root hash, not the set tag.
+    /// Two `KeySetIdV1` values with different set tags but the same merkle
+    /// root will produce the same text form. This is by design: the text
+    /// form is a content-addressed hash reference; mode resolution requires
+    /// a CAS lookup of the full descriptor.
     pub fn to_text(&self) -> String {
         let hash: &[u8; HASH_LEN] = self.merkle_root();
         let mut result = String::with_capacity(PREFIX.len() + 64);
@@ -302,10 +382,16 @@ impl KeySetIdV1 {
         self.binary
     }
 
-    /// Return the set tag.
-    pub fn set_tag(&self) -> SetTag {
-        // Safe: we validated the tag at construction time.
-        SetTag::from_byte(self.binary[0]).expect("set tag was validated at construction")
+    /// Return the set tag, if known.
+    ///
+    /// Returns `Some(tag)` when constructed via
+    /// [`from_descriptor`](Self::from_descriptor)
+    /// or [`from_binary`](Self::from_binary), which both carry the tag byte.
+    /// Returns `None` when parsed from text via
+    /// [`parse_text`](Self::parse_text), because the text form
+    /// `kset:v1:blake3:<hex>` does not encode the mode.
+    pub fn set_tag(&self) -> Option<SetTag> {
+        SetTag::from_byte(self.binary[0]).ok()
     }
 
     /// Return the 32-byte BLAKE3 merkle root.
@@ -352,7 +438,7 @@ mod tests {
     fn make_test_keyset() -> KeySetIdV1 {
         let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
         let key2 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
-        KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 2, &[key1, key2], None)
+        KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 2, &[key1, key2], None).unwrap()
     }
 
     #[test]
@@ -410,9 +496,11 @@ mod tests {
             2,
             &[key1.clone(), key2.clone()],
             None,
-        );
+        )
+        .unwrap();
         let id_ba =
-            KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 2, &[key2, key1], None);
+            KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 2, &[key2, key1], None)
+                .unwrap();
 
         assert_eq!(id_ab, id_ba);
     }
@@ -429,8 +517,10 @@ mod tests {
             2,
             &[key1.clone(), key2],
             None,
-        );
-        let id2 = KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 2, &[key1, key3], None);
+        )
+        .unwrap();
+        let id2 = KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 2, &[key1, key3], None)
+            .unwrap();
 
         assert_ne!(id1, id2);
     }
@@ -446,9 +536,11 @@ mod tests {
             2,
             &[key1.clone(), key2.clone()],
             None,
-        );
+        )
+        .unwrap();
         let id_thresh =
-            KeySetIdV1::from_descriptor("ed25519", SetTag::Threshold, 1, &[key1, key2], None);
+            KeySetIdV1::from_descriptor("ed25519", SetTag::Threshold, 1, &[key1, key2], None)
+                .unwrap();
 
         assert_ne!(id_multi, id_thresh);
         assert_ne!(id_multi.merkle_root(), id_thresh.merkle_root());
@@ -466,9 +558,11 @@ mod tests {
             1,
             &[key1.clone(), key2.clone(), key3.clone()],
             None,
-        );
+        )
+        .unwrap();
         let id_2of3 =
-            KeySetIdV1::from_descriptor("ed25519", SetTag::Threshold, 2, &[key1, key2, key3], None);
+            KeySetIdV1::from_descriptor("ed25519", SetTag::Threshold, 2, &[key1, key2, key3], None)
+                .unwrap();
 
         assert_ne!(id_1of3, id_2of3);
         assert_ne!(id_1of3.merkle_root(), id_2of3.merkle_root());
@@ -485,24 +579,63 @@ mod tests {
             1,
             &[key1.clone(), key2.clone()],
             None,
-        );
+        )
+        .unwrap();
         let id_with_weights = KeySetIdV1::from_descriptor(
             "ed25519",
             SetTag::Threshold,
             1,
             &[key1.clone(), key2.clone()],
             Some(&[1, 2]),
-        );
+        )
+        .unwrap();
         let id_diff_weights = KeySetIdV1::from_descriptor(
             "ed25519",
             SetTag::Threshold,
             1,
             &[key1, key2],
             Some(&[3, 4]),
-        );
+        )
+        .unwrap();
 
         assert_ne!(id_no_weights, id_with_weights);
         assert_ne!(id_with_weights, id_diff_weights);
+    }
+
+    /// Regression test: weighted keyset canonicalization must sort (member,
+    /// weight) pairs together, so different input orderings of the same
+    /// logical descriptor produce identical IDs.
+    #[test]
+    fn weighted_keyset_order_independent() {
+        let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+        let key2 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+
+        // Order 1: [key1=BB, key2=AA] with weights [10, 20]
+        let id_ab = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[key1.clone(), key2.clone()],
+            Some(&[10, 20]),
+        )
+        .unwrap();
+
+        // Order 2: [key2=AA, key1=BB] with weights [20, 10]
+        // Same logical descriptor, different input order.
+        let id_ba = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[key2, key1],
+            Some(&[20, 10]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            id_ab, id_ba,
+            "different input orderings of the same (member, weight) pairs \
+             must produce identical KeySetIdV1"
+        );
     }
 
     #[test]
@@ -636,9 +769,88 @@ mod tests {
     #[test]
     fn accessors_work() {
         let id = make_test_keyset();
-        assert_eq!(id.set_tag(), SetTag::Multisig);
+        assert_eq!(id.set_tag(), Some(SetTag::Multisig));
         assert_eq!(id.merkle_root().len(), 32);
         assert_eq!(id.as_bytes().len(), 33);
+    }
+
+    #[test]
+    fn text_parsed_has_no_tag() {
+        let id = make_test_keyset();
+        let text = id.to_text();
+        let parsed = KeySetIdV1::parse_text(&text).unwrap();
+        assert_eq!(parsed.set_tag(), None, "text-parsed IDs must have no tag");
+        assert_eq!(id.set_tag(), Some(SetTag::Multisig));
+    }
+
+    // --- Descriptor validation tests ---
+
+    #[test]
+    fn rejects_empty_members() {
+        let err =
+            KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 0, &[], None).unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "expected InvalidDescriptor, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_multisig_threshold_mismatch() {
+        let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let key2 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+
+        // Multisig with threshold_k != n
+        let err = KeySetIdV1::from_descriptor("ed25519", SetTag::Multisig, 1, &[key1, key2], None)
+            .unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "expected InvalidDescriptor, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_threshold_k_zero() {
+        let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+
+        let err = KeySetIdV1::from_descriptor("ed25519", SetTag::Threshold, 0, &[key1], None)
+            .unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "expected InvalidDescriptor for threshold_k=0, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_threshold_k_exceeds_n() {
+        let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let key2 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+
+        let err = KeySetIdV1::from_descriptor("ed25519", SetTag::Threshold, 3, &[key1, key2], None)
+            .unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "expected InvalidDescriptor for threshold_k > n, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_weights_length_mismatch() {
+        let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let key2 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+
+        let err = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[key1, key2],
+            Some(&[1, 2, 3]), // 3 weights for 2 members
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "expected InvalidDescriptor for weights/members mismatch, got {err:?}"
+        );
     }
 
     #[test]

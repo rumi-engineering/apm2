@@ -22,8 +22,11 @@ evidence_artifact:
         Canonical key identifier conformance tests covering:
         - 5 valid PublicKeyIdV1 vectors (ed25519 algorithm)
         - 4 valid KeySetIdV1 vectors (multisig and threshold modes)
-        - 25 invalid input vectors (mixed case, whitespace, padding, wrong prefix,
-          truncated, invalid base32, too long)
+        - 32 invalid input vectors (mixed case, whitespace, padding, wrong prefix,
+          truncated, invalid hex, too long, percent-encoding, Unicode normalization)
         - Parser differential tests (text vs binary parsers agree)
-        - Binary-text-binary lossless round-trip verification
+        - Binary-text-binary lossless round-trip verification (merkle-root level
+          for KeySetIdV1 since text form does not encode the set tag)
+        - Descriptor validation tests (empty members, threshold bounds, weights alignment)
+        - Deterministic canonicalization (weighted keyset order independence)
       ref: "cargo test -p apm2-daemon identity"

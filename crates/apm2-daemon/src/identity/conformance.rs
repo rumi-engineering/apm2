@@ -599,7 +599,7 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
         ));
 
         // Verify set tag from binary parse
-        let tag_pass = from_binary.set_tag() == vector.set_tag;
+        let tag_pass = from_binary.set_tag() == Some(vector.set_tag);
         results.push((
             vector.name,
             tag_pass,
@@ -855,7 +855,8 @@ mod tests {
 
         for (i, (name, tag, threshold_k, members, weights)) in derivations.iter().enumerate() {
             let derived =
-                KeySetIdV1::from_descriptor("ed25519", *tag, *threshold_k, members, *weights);
+                KeySetIdV1::from_descriptor("ed25519", *tag, *threshold_k, members, *weights)
+                    .expect("valid descriptor must succeed");
             let fixture = &fixtures[i];
             assert_eq!(
                 fixture.name, *name,
@@ -977,14 +978,16 @@ mod tests {
             1,
             &[key_a.clone(), key_b.clone(), key_c.clone()],
             None,
-        );
+        )
+        .unwrap();
         let id_2of3 = KeySetIdV1::from_descriptor(
             "ed25519",
             SetTag::Threshold,
             2,
             &[key_a, key_b, key_c],
             None,
-        );
+        )
+        .unwrap();
 
         assert_ne!(
             id_1of3.merkle_root(),
@@ -1006,21 +1009,24 @@ mod tests {
             1,
             &[key_a.clone(), key_b.clone()],
             None,
-        );
+        )
+        .unwrap();
         let id_w12 = KeySetIdV1::from_descriptor(
             "ed25519",
             SetTag::Threshold,
             1,
             &[key_a.clone(), key_b.clone()],
             Some(&[1, 2]),
-        );
+        )
+        .unwrap();
         let id_w34 = KeySetIdV1::from_descriptor(
             "ed25519",
             SetTag::Threshold,
             1,
             &[key_a, key_b],
             Some(&[3, 4]),
-        );
+        )
+        .unwrap();
 
         assert_ne!(
             id_no_w.merkle_root(),

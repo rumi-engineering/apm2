@@ -62,7 +62,6 @@ prost.workspace = true
 
 # Cryptography
 blake3.workspace = true
-data-encoding.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 hmac.workspace = true

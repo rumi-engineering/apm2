@@ -194,6 +194,13 @@ pub enum KeyIdError {
         /// Actual hex payload length.
         got: usize,
     },
+
+    /// Descriptor invariants violated (e.g. empty members, bad threshold).
+    #[error("invalid descriptor: {reason}")]
+    InvalidDescriptor {
+        /// Description of the invariant violation.
+        reason: String,
+    },
 }
 
 /// Validate common text-form invariants before type-specific parsing.
