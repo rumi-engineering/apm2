@@ -399,6 +399,9 @@ impl_bounded_decode_simple!(
     // TCK-00389: Review receipt ingestion
     IngestReviewReceiptRequest,
     IngestReviewReceiptResponse,
+    // TCK-00394: ChangeSet publishing
+    PublishChangeSetRequest,
+    PublishChangeSetResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

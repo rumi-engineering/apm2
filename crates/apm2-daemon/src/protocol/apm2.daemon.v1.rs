@@ -438,6 +438,32 @@ pub struct WorkStatusResponse {
     #[prost(uint64, optional, tag = "8")]
     pub claimed_at_ns: ::core::option::Option<u64>,
 }
+/// Request to publish a changeset bundle.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishChangeSetRequest {
+    /// Work identifier this changeset belongs to.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Serialized ChangeSetBundleV1 (canonical JSON bytes).
+    #[prost(bytes = "vec", tag = "2")]
+    pub bundle_bytes: ::prost::alloc::vec::Vec<u8>,
+}
+/// Response confirming changeset publication.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishChangeSetResponse {
+    /// BLAKE3 digest of the canonical bundle (hex-encoded, 64 chars).
+    #[prost(string, tag = "1")]
+    pub changeset_digest: ::prost::alloc::string::String,
+    /// CAS hash of the stored bundle artifact (hex-encoded, 64 chars).
+    #[prost(string, tag = "2")]
+    pub cas_hash: ::prost::alloc::string::String,
+    /// Work identifier this changeset belongs to.
+    #[prost(string, tag = "3")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Ledger event ID for the ChangeSetPublished event.
+    #[prost(string, tag = "4")]
+    pub event_id: ::prost::alloc::string::String,
+}
 /// Request to end an active session.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EndSessionRequest {
