@@ -1,0 +1,42 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0301"
+  title: "HSI contract manifest fail-closed build enforcement evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that missing route semantics annotations fail the manifest
+    build. The registry builder derives routes mechanically from the
+    dispatch enums (PrivilegedMessageType and SessionMessageType). Any
+    route without a semantics annotation causes build_manifest() to return
+    ManifestBuildError::MissingSemantics.
+  requirement_ids:
+    - "REQ-0001"
+  source_refs:
+    - "crates/apm2-daemon/src/hsi_contract/registry.rs"
+    - "crates/apm2-daemon/src/hsi_contract/semantics.rs"
+    - "crates/apm2-daemon/src/protocol/dispatch.rs"
+    - "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Registry tests verify fail-closed enforcement:
+        - build_manifest_succeeds: all routes have semantics annotations
+        - privileged_routes_cover_dispatch_types: enum variants match manifest routes
+        - session_routes_cover_dispatch_types: enum variants match manifest routes
+        - all_authoritative_routes_require_receipts: no authoritative route lacks receipts
+        - all_routes_have_unique_ids: no duplicate route IDs
+        - all_routes_have_unique_routes: no duplicate route paths
+        - missing_semantics_error_path_triggers_via_build: concrete negative test that calls
+          build_manifest_from_descriptors() with a fake route lacking semantics annotation and
+          asserts MissingSemantics error is returned from the production build pipeline
+        - conflicting_shared_route_causes_build_error: negative test that injects two descriptors
+          for the same route with differing schemas and asserts ConflictingSharedRoute error
+        - identical_shared_route_deduplicates_cleanly: positive test verifying identical shared
+          routes are silently deduplicated without error
+        - every_dispatchable_variant_appears_in_manifest: verifies all enum variants in manifest
+        Semantics tests verify annotation coverage:
+        - authoritative_routes_always_require_receipts: invariant holds for all routes
+        - side_effectful_local_routes_are_authoritative_with_receipts: shutdown/credentials are authoritative
+        - side_effectful_handlers_cannot_be_advisory: invariant that side-effectful routes cannot be advisory
+      ref: "cargo test -p apm2-daemon hsi_contract::registry && cargo test -p apm2-daemon hsi_contract::semantics"
