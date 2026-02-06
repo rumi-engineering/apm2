@@ -2960,18 +2960,50 @@ mod session_registry_tests {
 
     /// BLOCKER 1 fix: verify that evicted sessions are restored when
     /// `persist()` fails during a registration that triggered eviction.
+    ///
+    /// This test pre-populates the registry via `load_from_file` to avoid the
+    /// O(n^2) cost of 10,000 individual `register_session` calls (each of
+    /// which serializes the full state to disk). The test validates rollback
+    /// correctness, not persistence throughput.
     #[test]
     fn test_register_session_rollback_restores_evicted_on_persist_failure() {
+        use std::io::Write;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
 
-        let registry = PersistentSessionRegistry::new(&path);
+        // Build a JSON state file with exactly MAX_SESSIONS entries to
+        // pre-populate the registry in O(n) time (single file write + load)
+        // instead of O(n^2) (10,000 register_session calls each persisting
+        // the entire state).
+        let sessions: Vec<serde_json::Value> = (0..MAX_SESSIONS)
+            .map(|i| {
+                serde_json::json!({
+                    "session_id": format!("sess-{i}"),
+                    "work_id": format!("work-sess-{i}"),
+                    "role": 1,
+                    "ephemeral_handle": format!("handle-{i}"),
+                    "policy_resolved_ref": "policy-ref",
+                    "capability_manifest_hash": [],
+                    "episode_id": null
+                })
+            })
+            .collect();
 
-        // Fill the registry to MAX_SESSIONS
-        for i in 0..MAX_SESSIONS {
-            let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
-            registry.register_session(session).unwrap();
+        let state_json = serde_json::json!({
+            "version": 1,
+            "sessions": sessions
+        });
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(state_json.to_string().as_bytes()).unwrap();
+            file.sync_all().unwrap();
         }
+
+        let registry = PersistentSessionRegistry::load_from_file(&path)
+            .expect("pre-populated state file must load successfully");
+
+        assert_eq!(registry.session_count(), MAX_SESSIONS);
 
         // Confirm the oldest session is present (it will be evicted)
         assert!(
