@@ -3749,7 +3749,10 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00384: Register session telemetry with started_at_ns
+        // TCK-00384: Register session telemetry with started_at_ns.
+        // The wall-clock timestamp is stored as audit metadata only;
+        // elapsed duration is computed from a monotonic Instant inside the
+        // store (security review: no wall-clock dependency for duration_ms).
         if let Some(ref store) = self.telemetry_store {
             let started_at_ns = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -3759,7 +3762,13 @@ impl PrivilegedDispatcher {
                     ns
                 })
                 .unwrap_or(0);
-            store.register(&session_id, started_at_ns);
+            if let Err(e) = store.register(&session_id, started_at_ns) {
+                warn!(error = %e, "Telemetry registration rejected (store at capacity)");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("telemetry store at capacity: {e}"),
+                ));
+            }
         }
 
         debug!(

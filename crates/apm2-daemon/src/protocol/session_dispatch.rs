@@ -1368,6 +1368,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
+                // TCK-00384: Clean up telemetry on session termination to
+                // free capacity in the bounded store.
+                if let Some(ref store) = self.telemetry_store {
+                    store.remove(session_id);
+                }
+
                 // TCK-00307: Emit DefectRecorded for ContextMiss
                 if termination_info.rationale_code == "CONTEXT_MISS" {
                     if let Some(event_bytes) = refinement_event {
@@ -1750,24 +1756,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         if let Some(session_registry) = &self.session_registry {
             // First check for active session
             if let Some(session) = session_registry.get_session(&token.session_id) {
-                // TCK-00384: Compute duration_ms as (now - started_at_ns) / 1_000_000
-                // instead of raw epoch milliseconds.
+                // TCK-00384: Read duration_ms from the snapshot's monotonic
+                // Instant-based field. Wall-clock SystemTime is no longer
+                // used for elapsed time computation (security review fix:
+                // immune to clock jumps/skew).
                 let (tool_calls, events_emitted, started_at_ns, duration_ms) =
                     telemetry.as_ref().map_or((0u32, 0u32, 0u64, 0u64), |snap| {
-                        let now_ns = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|d| {
-                                #[allow(clippy::cast_possible_truncation)]
-                                let ns = d.as_nanos() as u64;
-                                ns
-                            })
-                            .unwrap_or(0);
-                        let duration_ms = now_ns.saturating_sub(snap.started_at_ns) / 1_000_000;
                         // Proto fields for tool_calls/events_emitted are u32;
                         // saturate at u32::MAX to avoid truncation panics.
                         let tc = u32::try_from(snap.tool_calls).unwrap_or(u32::MAX);
                         let ee = u32::try_from(snap.events_emitted).unwrap_or(u32::MAX);
-                        (tc, ee, snap.started_at_ns, duration_ms)
+                        (tc, ee, snap.started_at_ns, snap.duration_ms)
                     });
 
                 let response = SessionStatusResponse {
@@ -3975,7 +3974,9 @@ mod tests {
                     ns
                 })
                 .unwrap_or(0);
-            telemetry_store.register("session-001", started_at_ns);
+            telemetry_store
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
 
             // Create dispatcher with session registry and telemetry store wired
             let dispatcher = SessionDispatcher::new(minter.clone())
@@ -4144,7 +4145,9 @@ mod tests {
                     ns
                 })
                 .unwrap_or(0);
-            telemetry_store.register("session-001", started_at_ns);
+            telemetry_store
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
 
             // Simulate tool calls and event emissions
             {
@@ -4334,7 +4337,7 @@ mod tests {
                         ns
                     })
                     .unwrap_or(0);
-                telemetry_store.register("session-001", started_at_ns);
+                telemetry_store.register("session-001", started_at_ns).expect("telemetry registration should succeed");
 
                 // --- Build dispatcher with all production dependencies ---
                 let dispatcher = SessionDispatcher::with_manifest_store(
@@ -4485,10 +4488,11 @@ mod tests {
             });
         }
 
-        /// IT-00384-03: `duration_ms` reflects actual session duration,
-        /// not raw epoch time.
+        /// IT-00384-03: `duration_ms` is computed from the monotonic
+        /// `Instant` clock, not from wall-clock `SystemTime`. This makes it
+        /// immune to clock jumps and skew.
         #[test]
-        fn test_session_status_duration_is_session_relative() {
+        fn test_session_status_duration_uses_monotonic_clock() {
             let minter = test_minter();
             let ctx = make_session_ctx();
 
@@ -4509,19 +4513,14 @@ mod tests {
                 .register_session(session)
                 .expect("session registration should succeed");
 
-            // Register telemetry with a start time 100ms in the past
+            // Register telemetry. The monotonic Instant is captured at
+            // register() time, so duration_ms will reflect elapsed time
+            // since registration (not wall-clock manipulation).
             let telemetry_store = Arc::new(SessionTelemetryStore::new());
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let ns = d.as_nanos() as u64;
-                    ns
-                })
-                .unwrap_or(0);
-            // Set started_at_ns to 100ms ago
-            let started_100ms_ago = now_ns.saturating_sub(100_000_000);
-            telemetry_store.register("session-001", started_100ms_ago);
+            let started_at_ns = 42_u64; // Wall-clock ns is display metadata only
+            telemetry_store
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
 
             let dispatcher = SessionDispatcher::new(minter.clone())
                 .with_session_registry(registry)
@@ -4536,11 +4535,12 @@ mod tests {
 
             match response {
                 SessionResponse::SessionStatus(resp) => {
-                    // Duration should be approximately 100ms (allow generous
-                    // margin for test timing)
+                    // duration_ms comes from Instant::now().elapsed(), so it
+                    // should be very small (< 5 seconds for a just-registered
+                    // session in a test).
                     assert!(
-                        resp.duration_ms >= 50 && resp.duration_ms < 5_000,
-                        "duration_ms should be ~100ms (session-relative), got {}",
+                        resp.duration_ms < 5_000,
+                        "duration_ms should be small for a just-registered session, got {}",
                         resp.duration_ms
                     );
                     // Critically, it must NOT be raw epoch time (~1.77 trillion)
@@ -4549,6 +4549,8 @@ mod tests {
                         "duration_ms must not be raw epoch time; got {}",
                         resp.duration_ms
                     );
+                    // Wall-clock metadata is preserved
+                    assert_eq!(resp.started_at_ns, 42);
                 },
                 other => panic!("Expected SessionStatus response, got: {other:?}"),
             }
