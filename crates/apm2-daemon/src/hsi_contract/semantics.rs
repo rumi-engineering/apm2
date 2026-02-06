@@ -112,6 +112,7 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         | "hsi.process.start"
         | "hsi.review.ingest_receipt"
         | "hsi.changeset.publish"
+        | "hsi.sublease.delegate"
         | "hsi.tool.request"
         | "hsi.event.emit"
         | "hsi.evidence.publish" => Some(AUTH_IDEMPOTENT_RECEIPT),

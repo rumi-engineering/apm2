@@ -8,8 +8,45 @@
 //!
 //! Implements real policy resolution wiring. Currently uses local deterministic
 //! resolution until the Governance Holon is fully integrated.
+//!
+//! # Phase 1 Transitional Tier Mapping (TCK-00340, v7 Finding 3)
+//!
+//! SECURITY NOTE: Risk tiers are assigned based on work role as a
+//! transitional measure until full Governance Holon integration (RFC-0019).
+//! Non-executor roles all resolve to Tier1 (`SelfSigned` attestation).
+//! Higher-risk work in non-executor roles is NOT receiving stricter
+//! attestation until RFC-0019 governance resolution is implemented.
+//!
+//! | Role            | Risk Tier | Attestation Required |
+//! |-----------------|-----------|----------------------|
+//! | `GateExecutor`  | Tier2     | `CounterSigned`      |
+//! | `Reviewer`      | Tier1     | `SelfSigned`         |
+//! | `Implementer`   | Tier1     | `SelfSigned`         |
+//! | `Coordinator`   | Tier1     | `SelfSigned`         |
+//! | `Unspecified`   | Tier1     | `SelfSigned`         |
+//!
+//! **Justification**: `GateExecutor` handles gate execution (highest risk
+//! in Phase 1), so it receives Tier2 which requires `CounterSigned`
+//! attestation. All other roles use Tier1 (`SelfSigned`), which the
+//! daemon's IPC endpoints can produce without breaking throughput.
+//!
+//! **Scope**: Single-daemon, single-node operation only. All agents operate
+//! within the daemon's trust boundary in Phase 1. The deployment guardrail
+//! is architectural: no cross-node federation or multi-tenant IPC transport
+//! exists in Phase 1 -- the daemon only listens on local Unix sockets,
+//! which confines the trust boundary to the local machine.
+//!
+//! **Expiry**: This mapping expires when RFC-0019 governance resolution is
+//! implemented, which will derive risk tiers from changeset metadata (file
+//! paths, module criticality, dependency fanout).
+//!
+//! **Waiver**: TCK-00340 v9 MAJOR — Role-based tier mapping is a tracked
+//! transitional measure. The waiver scope is bounded to Phase 1 single-node
+//! operation and MUST NOT be carried forward into multi-tenant or cross-node
+//! federation without full RFC-0019 governance resolution.
 
 use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+use tracing::warn;
 
 use crate::protocol::dispatch::{PolicyResolution, PolicyResolutionError, PolicyResolver};
 use crate::protocol::messages::WorkRole;
@@ -30,7 +67,7 @@ impl PolicyResolver for GovernancePolicyResolver {
     fn resolve_for_claim(
         &self,
         work_id: &str,
-        _role: WorkRole,
+        role: WorkRole,
         actor_id: &str,
     ) -> Result<PolicyResolution, PolicyResolutionError> {
         // TCK-00289: In Phase 1, we use deterministic local resolution.
@@ -64,11 +101,277 @@ impl PolicyResolver for GovernancePolicyResolver {
                     message: format!("context pack sealing failed: {e}"),
                 })?;
 
+        // TODO(RFC-0019): Resolve from real governance policy evaluation.
+        //
+        // SECURITY NOTE (v8 Finding 1 — Role-Differentiated Risk Tiers):
+        //
+        // The previous hardcoded Tier4 value was fail-closed by design, but
+        // it broke low-tier throughput because ALL governance-resolved claims
+        // required ThresholdSigned attestation (which the IngestReviewReceipt
+        // endpoint cannot provide — it only offers SelfSigned).
+        //
+        // This transitional mapping differentiates risk by work role:
+        //
+        // - GateExecutor: Tier2 (CounterSigned required — highest risk role)
+        // - All other roles: Tier1 (SelfSigned required — safe default)
+        //
+        // SECURITY: Fail-closed semantics are preserved at higher tiers
+        // via the attestation ratchet table in AttestationRequirements:
+        //   - Tier0: None required
+        //   - Tier1: SelfSigned required
+        //   - Tier2: CounterSigned required (for Review receipts)
+        //   - Tier3+: CounterSigned/ThresholdSigned
+        //
+        // See `transitional_risk_tier()` doc comment for full security analysis.
+        //
+        // When real governance resolution is wired (RFC-0019), the actual
+        // risk tier from the changeset metadata will be used instead of
+        // this role-based heuristic.
+        let resolved_risk_tier = transitional_risk_tier(role);
+
         Ok(PolicyResolution {
             policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: *manifest_hash.as_bytes(),
             context_pack_hash,
+            resolved_risk_tier,
         })
+    }
+}
+
+/// Transitional risk tier mapping based on work role (Phase 1).
+///
+/// # SECURITY NOTE (v8 Finding 1 — Role-Differentiated Risk Tiers)
+///
+/// This function implements a deterministic transitional tier mapping that
+/// differentiates risk levels by work role:
+///
+/// - **`GateExecutor`** (highest risk — handles gate execution): **Tier2**
+///   (requires `CounterSigned` attestation per the ratchet table). Gate
+///   executors perform security-critical operations (running gates, producing
+///   receipts) and MUST have stronger attestation than self-attestation.
+///
+/// - **`Reviewer`**: **Tier1** (requires `SelfSigned` attestation). Reviewers
+///   attest their own review work. `SelfSigned` is appropriate because the
+///   reviewer IS the authority on whether their review is complete.
+///
+/// - **`Implementer`**, **`Coordinator`**, **`Unspecified`**: **Tier1**
+///   (requires `SelfSigned` attestation). Phase 1 default for roles where the
+///   daemon's IPC endpoints produce `SelfSigned` attestation.
+///
+/// # Attestation Ratchet Table (default, Review receipts)
+///
+/// | Tier | Attestation Required    |
+/// |------|-------------------------|
+/// | 0    | None                    |
+/// | 1    | `SelfSigned`            |
+/// | 2    | `CounterSigned`         |
+/// | 3    | `CounterSigned`         |
+/// | 4    | `ThresholdSigned`       |
+///
+/// # Risk Analysis
+///
+/// **Impact**: Roles other than `GateExecutor` still only require
+/// `SelfSigned` attestation. A compromised agent performing high-risk work
+/// in a non-executor role would bypass the stronger `CounterSigned`
+/// requirement. This is acceptable for Phase 1 where all agents operate
+/// within the daemon's trust boundary, but MUST be addressed before
+/// multi-tenant or cross-node federation.
+///
+/// # Deployment Guardrail (v9 MAJOR Mitigation)
+///
+/// The architectural guardrail is the transport layer: the daemon listens
+/// only on local Unix sockets (`UnixListener`) with no TCP/network
+/// federation transport. This confines all IPC to the local trust
+/// boundary. The introduction of any cross-node transport MUST trigger
+/// replacement of this function with RFC-0019 governance resolution.
+///
+/// # TODO(RFC-0019) — v7 Finding 3
+///
+/// Replace with Governance Holon policy resolution (RFC-0019) that derives
+/// the actual risk tier from changeset metadata (file paths, module
+/// criticality, dependency fanout, etc.) rather than work role alone.
+fn transitional_risk_tier(role: WorkRole) -> u8 {
+    // Phase 1 transitional mapping: differentiate by role to apply
+    // stronger attestation to higher-risk operations.
+    //
+    // TODO(RFC-0019): Replace with Governance Holon policy resolution
+    // that evaluates changeset metadata for risk classification (v7 Finding 3).
+    let tier = match role {
+        // GateExecutor handles gate execution — highest risk in Phase 1.
+        // Tier2 requires CounterSigned attestation per the ratchet table.
+        WorkRole::GateExecutor => 2,
+        // All other roles: Tier1 requires SelfSigned attestation, which
+        // the daemon's IPC endpoints can produce.
+        WorkRole::Reviewer
+        | WorkRole::Implementer
+        | WorkRole::Coordinator
+        | WorkRole::Unspecified => 1,
+    };
+    warn!(
+        role = ?role,
+        resolved_tier = tier,
+        "Governance stub: transitional role-based tier mapping. \
+         TODO(RFC-0019): implement real governance policy resolution."
+    );
+    tier
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies the governance resolver returns Tier1 for Phase 1 transitional
+    /// operation. This ensures production claims can flow through
+    /// `IngestReviewReceipt` which only provides `SelfSigned` attestation.
+    /// Tier1 requires `SelfSigned` attestation, which the endpoint can provide.
+    #[test]
+    fn test_governance_resolver_returns_tier1_for_reviewer() {
+        let resolver = GovernancePolicyResolver::new();
+        let result = resolver
+            .resolve_for_claim("work-001", WorkRole::Reviewer, "actor-001")
+            .expect("resolve_for_claim should succeed");
+
+        assert_eq!(
+            result.resolved_risk_tier, 1,
+            "Governance resolver must return Tier1 for Reviewer role \
+             — Tier4 blocks all production SelfSigned attestation"
+        );
+    }
+
+    /// Verifies that different roles get their expected risk tiers in the
+    /// transitional mapping: `GateExecutor` gets Tier2, all others get Tier1.
+    #[test]
+    fn test_governance_resolver_role_differentiated_tiers() {
+        let resolver = GovernancePolicyResolver::new();
+
+        // Tier1 roles: Reviewer, Implementer, Coordinator
+        for (role, name, expected_tier) in [
+            (WorkRole::Reviewer, "Reviewer", 1),
+            (WorkRole::Implementer, "Implementer", 1),
+            (WorkRole::Coordinator, "Coordinator", 1),
+        ] {
+            let result = resolver
+                .resolve_for_claim("work-001", role, "actor-001")
+                .expect("resolve_for_claim should succeed");
+            assert_eq!(
+                result.resolved_risk_tier, expected_tier,
+                "Role {name} must get Tier{expected_tier} in transitional mapping, got {}",
+                result.resolved_risk_tier
+            );
+        }
+
+        // GateExecutor: Tier2 (CounterSigned required — highest risk role)
+        let executor_result = resolver
+            .resolve_for_claim("work-001", WorkRole::GateExecutor, "actor-001")
+            .expect("resolve_for_claim should succeed for GateExecutor");
+        assert_eq!(
+            executor_result.resolved_risk_tier, 2,
+            "GateExecutor must get Tier2 in transitional mapping, got {}",
+            executor_result.resolved_risk_tier
+        );
+    }
+
+    /// Verifies that policy resolution is deterministic: same inputs produce
+    /// the same outputs (policy hash, manifest hash, context pack hash).
+    #[test]
+    fn test_governance_resolver_deterministic() {
+        let resolver = GovernancePolicyResolver::new();
+        let r1 = resolver
+            .resolve_for_claim("work-001", WorkRole::Reviewer, "actor-001")
+            .unwrap();
+        let r2 = resolver
+            .resolve_for_claim("work-001", WorkRole::Reviewer, "actor-001")
+            .unwrap();
+
+        assert_eq!(r1.resolved_policy_hash, r2.resolved_policy_hash);
+        assert_eq!(r1.capability_manifest_hash, r2.capability_manifest_hash);
+        assert_eq!(r1.context_pack_hash, r2.context_pack_hash);
+        assert_eq!(r1.resolved_risk_tier, r2.resolved_risk_tier);
+    }
+
+    /// Verifies that different work IDs produce different policy hashes,
+    /// ensuring proper domain separation.
+    #[test]
+    fn test_governance_resolver_different_work_ids_differ() {
+        let resolver = GovernancePolicyResolver::new();
+        let r1 = resolver
+            .resolve_for_claim("work-001", WorkRole::Reviewer, "actor-001")
+            .unwrap();
+        let r2 = resolver
+            .resolve_for_claim("work-002", WorkRole::Reviewer, "actor-001")
+            .unwrap();
+
+        assert_ne!(
+            r1.resolved_policy_hash, r2.resolved_policy_hash,
+            "Different work_ids must produce different policy hashes"
+        );
+    }
+
+    /// Integration test: verifies that a Reviewer claim (Tier1) allows
+    /// `SelfSigned` attestation through the attestation ratchet. This
+    /// exercises the production `ClaimWork -> IngestReviewReceipt` path.
+    #[test]
+    fn test_governance_resolver_reviewer_tier_allows_self_signed() {
+        use apm2_core::fac::{AttestationLevel, AttestationRequirements, ReceiptKind, RiskTier};
+
+        let resolver = GovernancePolicyResolver::new();
+        let resolution = resolver
+            .resolve_for_claim("work-001", WorkRole::Reviewer, "actor-001")
+            .unwrap();
+
+        let tier = RiskTier::try_from(resolution.resolved_risk_tier)
+            .expect("resolved_risk_tier must be a valid RiskTier value (0-4)");
+
+        assert_eq!(
+            tier,
+            RiskTier::Tier1,
+            "Reviewer must return Tier1 for transitional operation"
+        );
+
+        // Verify SelfSigned satisfies the attestation requirement for Tier1.
+        let requirements = AttestationRequirements::new();
+        let required_level = requirements.required_level(ReceiptKind::Review, tier);
+        assert!(
+            AttestationLevel::SelfSigned.satisfies(required_level),
+            "SelfSigned must satisfy {required_level} for Review at {tier:?}"
+        );
+    }
+
+    /// Integration test: verifies that a `GateExecutor` claim (Tier2) requires
+    /// `CounterSigned` attestation. `SelfSigned` MUST NOT satisfy Tier2
+    /// for Review receipts -- this enforces the risk differentiation.
+    #[test]
+    fn test_governance_resolver_gate_executor_tier_requires_counter_signed() {
+        use apm2_core::fac::{AttestationLevel, AttestationRequirements, ReceiptKind, RiskTier};
+
+        let resolver = GovernancePolicyResolver::new();
+        let resolution = resolver
+            .resolve_for_claim("work-001", WorkRole::GateExecutor, "actor-001")
+            .unwrap();
+
+        let tier = RiskTier::try_from(resolution.resolved_risk_tier)
+            .expect("resolved_risk_tier must be a valid RiskTier value (0-4)");
+
+        assert_eq!(
+            tier,
+            RiskTier::Tier2,
+            "GateExecutor must return Tier2 for transitional operation"
+        );
+
+        // Verify CounterSigned satisfies the attestation requirement for Tier2.
+        let requirements = AttestationRequirements::new();
+        let required_level = requirements.required_level(ReceiptKind::Review, tier);
+        assert!(
+            AttestationLevel::CounterSigned.satisfies(required_level),
+            "CounterSigned must satisfy {required_level} for Review at {tier:?}"
+        );
+
+        // Verify SelfSigned does NOT satisfy Tier2 -- this is the fail-closed check.
+        assert!(
+            !AttestationLevel::SelfSigned.satisfies(required_level),
+            "SelfSigned must NOT satisfy {required_level} for Review at {tier:?} \
+             -- GateExecutor requires CounterSigned"
+        );
     }
 }

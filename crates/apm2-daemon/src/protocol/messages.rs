@@ -402,6 +402,9 @@ impl_bounded_decode_simple!(
     // TCK-00394: ChangeSet publishing
     PublishChangeSetRequest,
     PublishChangeSetResponse,
+    // TCK-00340: Sublease delegation
+    DelegateSubleaseRequest,
+    DelegateSubleaseResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

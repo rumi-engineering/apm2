@@ -20,7 +20,7 @@ evidence_artifact:
       description: |
         Golden vector tests verify deterministic hash generation:
         - full_manifest_determinism: two builds produce identical hash
-        - full_manifest_golden_hash: pinned hash b315f429e8287dd4e20f840ab7b1a14163ef7c37a3d67c1e3de1872ccc53539c
+        - full_manifest_golden_hash: pinned hash 0612e89e62a4d1d37d5d7d7ce1cbe77bf4a8353f9de3f78046bf7ea23837578c
         - minimal_manifest_golden_hash: pinned hash 4c6a6f64a3fd26e1e4b6447d0f64784be8e7135dfdc6c588758f4412478ac5d6
         - content_hash_bytes_matches_text: text and bytes forms match
       ref: "cargo test -p apm2-daemon hsi_contract::golden_vectors"

@@ -1612,3 +1612,34 @@ message IngestReviewReceiptResponse {
   // The ledger event ID for the emitted event.
   string event_id = 3;
 }
+
+// Request to delegate a sublease from a parent gate lease (TCK-00340).
+//
+// The daemon validates the parent lease, checks strict-subset constraints,
+// and issues a signed sublease for the delegatee actor.
+message DelegateSubleaseRequest {
+  // Parent lease ID to delegate from.
+  string parent_lease_id = 1;
+  // Actor ID of the delegatee (child holon).
+  string delegatee_actor_id = 2;
+  // Requested expiry timestamp in nanoseconds since epoch.
+  uint64 requested_expiry_ns = 3;
+  // Sublease ID to assign (must be unique).
+  string sublease_id = 4;
+}
+
+// Response confirming sublease delegation.
+message DelegateSubleaseResponse {
+  // The sublease ID that was issued.
+  string sublease_id = 1;
+  // The parent lease ID that was delegated from.
+  string parent_lease_id = 2;
+  // The delegatee actor ID.
+  string delegatee_actor_id = 3;
+  // The gate ID from the parent lease.
+  string gate_id = 4;
+  // Expiry timestamp of the sublease in nanoseconds.
+  uint64 expires_at_ns = 5;
+  // Ledger event ID for the SubleaseIssued event.
+  string event_id = 6;
+}

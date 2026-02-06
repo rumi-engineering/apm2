@@ -68,6 +68,45 @@ impl SqliteLedgerEventEmitter {
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_type_payload ON ledger_events(event_type)",
             [],
         )?;
+        // SECURITY (v9 Finding 1 — Delegation Uniqueness Constraint):
+        //
+        // Enforce at-most-once semantics for authority-bearing delegation
+        // events at the database level. For `SubleaseIssued` events, the
+        // `work_id` column stores the `sublease_id` (set by
+        // `emit_session_event(&sublease.lease_id, "SubleaseIssued", ...)`).
+        // A partial unique index ensures that even under concurrent dispatch
+        // (the handler takes `&self`, not `&mut self`), duplicate emission
+        // of a `SubleaseIssued` event for the same sublease_id is rejected
+        // by SQLite's UNIQUE constraint before any data is committed.
+        //
+        // This converts the check-then-act pattern in `DelegateSublease`
+        // into a defense-in-depth strategy: the application-level check
+        // (`get_gate_lease`) provides the idempotent fast-path, while the
+        // database constraint provides the authoritative uniqueness
+        // guarantee that cannot be bypassed by race conditions.
+        //
+        // NOTE: For `gate_lease_issued` events, the `work_id` column stores
+        // the logical work ID (not `lease_id`), and multiple leases can share
+        // the same `work_id`. We use a unique index on the `json_extract`ed
+        // `$.lease_id` from the payload to enforce at-most-once semantics per
+        // `lease_id` for full-lease persistence. This prevents concurrent
+        // `register_full_lease` calls from creating duplicate lease anchors.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_full_lease_id \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.lease_id')) \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL",
+            [],
+        )?;
+        // For `SubleaseIssued` events, `work_id` = `sublease_id`, so a partial
+        // unique index on `(event_type, work_id)` provides the authoritative
+        // uniqueness guarantee for event emission.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_sublease_issued \
+             ON ledger_events(event_type, work_id) \
+             WHERE event_type = 'SubleaseIssued'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -533,6 +572,40 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         });
 
         rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
+    }
+
+    fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        // Query review receipt events by receipt_id embedded in the JSON payload.
+        // Both `review_receipt_recorded` and `review_blocked_recorded` events
+        // store `receipt_id` in the payload. We use `json_extract` with
+        // `CAST(payload AS TEXT)` because payloads are stored as BLOBs.
+        //
+        // ORDER BY rowid DESC LIMIT 1 ensures deterministic latest-row selection
+        // (defense-in-depth; receipt_id should be unique across receipt events).
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND json_extract(CAST(payload AS TEXT), '$.receipt_id') = ?1 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![receipt_id],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
@@ -1791,35 +1864,29 @@ impl LeaseValidator for SqliteLeaseValidator {
     fn get_lease_executor_actor_id(&self, lease_id: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
 
-        // Query gate_lease_issued events and find the executor_actor_id.
-        // The payload is a JSON blob that may contain executor_actor_id.
+        // TCK-00340 Security MAJOR: Use targeted WHERE clause with
+        // json_extract instead of O(N) full table scan with per-row JSON
+        // parse. Filters by event_type and lease_id in SQL, with ORDER BY
+        // rowid DESC LIMIT 1 for deterministic latest-row selection.
+        //
+        // NOTE: payload is stored as BLOB, so we CAST to TEXT for
+        // json_extract to work on the binary JSON data.
         let mut stmt = conn
             .prepare(
-                "SELECT payload FROM ledger_events WHERE event_type = 'gate_lease_issued' ORDER BY rowid",
+                "SELECT payload FROM ledger_events \
+                 WHERE event_type = 'gate_lease_issued' \
+                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+                 ORDER BY rowid DESC LIMIT 1",
             )
             .ok()?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                let payload: Vec<u8> = row.get(0)?;
-                Ok(payload)
-            })
-            .ok()?;
+        let payload_bytes: Vec<u8> = stmt.query_row(params![lease_id], |row| row.get(0)).ok()?;
 
-        for payload_bytes in rows.flatten() {
-            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
-                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
-                    if l == lease_id {
-                        return payload
-                            .get("executor_actor_id")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-                }
-            }
-        }
-
-        None
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+        payload
+            .get("executor_actor_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
     }
 
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
@@ -1862,6 +1929,180 @@ impl LeaseValidator for SqliteLeaseValidator {
             );
         }
     }
+
+    fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+
+        // TCK-00340 Quality BLOCKER 1: Use targeted WHERE clause with
+        // json_extract instead of O(N) full table scan with per-row JSON
+        // parse. Filters by event_type first (reduces scan scope), then
+        // uses json_extract for indexed field filtering, with ORDER BY
+        // rowid DESC LIMIT 1 for deterministic latest-row selection.
+        //
+        // NOTE: payload is stored as BLOB, so we CAST to TEXT for
+        // json_extract to work on the binary JSON data.
+        let mut stmt = conn
+            .prepare(
+                "SELECT work_id FROM ledger_events \
+                 WHERE event_type = 'gate_lease_issued' \
+                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+                 ORDER BY rowid DESC LIMIT 1",
+            )
+            .ok()?;
+
+        stmt.query_row(params![lease_id], |row| row.get(0)).ok()
+    }
+
+    // Trust Model (single-writer): The daemon is the sole writer to the
+    // ledger. Leases stored via `register_full_lease` are written by the
+    // same process through authenticated IPC handlers that enforce admission
+    // checks before persistence. Cryptographic signature verification is
+    // not needed for same-process data reads — the process trust boundary
+    // guarantees integrity. The embedded `issuer_signature` in each
+    // `GateLease` is preserved for downstream / cross-node verification.
+    fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
+        let conn = self.conn.lock().ok()?;
+
+        // TCK-00340 Quality BLOCKER 2 / Security MAJOR: Use targeted WHERE
+        // clause with json_extract instead of O(N) full table scan with
+        // per-row JSON parse. Filters by event_type, lease_id, AND
+        // full_lease presence in SQL via json_extract on CAST(payload AS
+        // TEXT), with ORDER BY rowid DESC LIMIT 1 for deterministic
+        // latest-row selection.
+        //
+        // NOTE: payload is stored as BLOB (Vec<u8> from serde_json::to_vec),
+        // so we CAST to TEXT for json_extract compatibility.
+        //
+        // The full_lease IS NOT NULL guard ensures we only match events
+        // that actually embed the full GateLease struct, skipping any
+        // events that share the same lease_id but lack the full_lease
+        // field (e.g. executor-only registration events).
+        let result: Result<Vec<u8>, _> = conn.query_row(
+            "SELECT payload FROM ledger_events \
+             WHERE event_type = 'gate_lease_issued' \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.full_lease') IS NOT NULL \
+             ORDER BY rowid DESC LIMIT 1",
+            params![lease_id],
+            |row| row.get(0),
+        );
+
+        let Ok(payload_bytes) = result else {
+            return None;
+        };
+
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+
+        // Try to deserialize from the stored full_lease JSON if available.
+        let full_lease = payload.get("full_lease")?;
+        serde_json::from_value::<apm2_core::fac::GateLease>(full_lease.clone()).ok()
+    }
+
+    /// Registers a full gate lease as a synthetic `gate_lease_issued` event.
+    ///
+    /// # Trust Model (v6 Finding 2)
+    ///
+    /// This method inserts **synthetic events** into the ledger with a
+    /// zero-filled signature (`[0u8; 64]`) and `actor_id = "system"`. These
+    /// events are trusted because:
+    ///
+    /// 1. **Same-process trust boundary**: The daemon writes these events
+    ///    within its own process. The `SQLite` event store is not externally
+    ///    writable — all mutations go through the daemon's authenticated IPC
+    ///    handlers which enforce admission checks before reaching this method.
+    ///
+    /// 2. **Read-path validation**: The `resolve_full_lease_from_events` reader
+    ///    deserializes the `full_lease` JSON and validates it via `GateLease`'s
+    ///    deserialization invariants. The lease's own `issuer_signature`
+    ///    (Ed25519 over canonical bytes) is preserved in the serialized
+    ///    `full_lease` field and can be verified by any downstream consumer
+    ///    that needs cryptographic proof of issuance.
+    ///
+    /// 3. **Synthetic event markers**: The zero-filled signature and `"system"`
+    ///    `actor_id` distinguish these events from cryptographically-signed
+    ///    operator events. Consumers MUST NOT treat the event-level signature
+    ///    as proof of issuance — the `full_lease.issuer_signature` field
+    ///    provides that guarantee.
+    ///
+    /// # TODO
+    ///
+    /// TODO(RFC-0019): Replace synthetic events with fully authenticated-fact
+    /// persistence where each ledger row carries a valid daemon-issued
+    /// signature over the canonical event bytes. This would allow external
+    /// auditors to verify event integrity without trusting the daemon process.
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
+        // Store the full lease as a gate_lease_issued event with the complete
+        // lease object embedded in the payload for later retrieval.
+
+        // SECURITY (v11 BLOCKER 1 -- Atomic INSERT ... WHERE NOT EXISTS):
+        //
+        // The previous implementation used a check-then-insert (TOCTOU)
+        // pattern: `get_gate_lease()` followed by a separate INSERT.
+        // Under concurrent requests, two callers could both pass the
+        // check and both insert, creating duplicate lease entries.
+        //
+        // The fix uses a SINGLE atomic SQL statement that checks for an
+        // existing `gate_lease_issued` event with the same `lease_id`
+        // (via `json_extract` on the payload BLOB) and only inserts if
+        // no such row exists. SQLite serializes writes within a single
+        // statement, eliminating the TOCTOU race.
+        //
+        // After the INSERT, we check `rows_affected()`: if 0, a lease
+        // with this ID already exists -- return a duplicate error.
+        // No schema migration or new columns are needed.
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+        let payload = serde_json::json!({
+            "event_type": "gate_lease_issued",
+            "lease_id": lease.lease_id,
+            "work_id": lease.work_id,
+            "gate_id": lease.gate_id,
+            "executor_actor_id": lease.executor_actor_id,
+            "full_lease": lease
+        });
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("failed to serialize lease payload: {e}"))?;
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
+
+        // NOTE: The zero-filled signature is intentional -- see trust model
+        // documentation above. The real cryptographic proof lives inside
+        // `full_lease.issuer_signature`.
+        //
+        // The WHERE NOT EXISTS subquery atomically checks that no
+        // `gate_lease_issued` event with this `lease_id` already exists
+        // in the payload JSON. Because this is a single SQL statement,
+        // SQLite's write serialization prevents interleaving.
+        let rows_affected = conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM ledger_events
+                 WHERE event_type = 'gate_lease_issued'
+                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?8
+             )",
+            params![
+                event_id,
+                "gate_lease_issued",
+                lease.work_id,
+                "system",
+                payload_bytes,
+                vec![0u8; 64],
+                i64::try_from(lease.issued_at).unwrap_or(0),
+                lease.lease_id
+            ],
+        )
+        .map_err(|e| format!("failed to insert lease event: {e}"))?;
+
+        if rows_affected == 0 {
+            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -1888,6 +2129,7 @@ mod tests {
             resolved_policy_hash: [0u8; 32],
             capability_manifest_hash: [0u8; 32],
             context_pack_hash: [0u8; 32],
+            resolved_risk_tier: 0,
         }
     }
 
@@ -2231,6 +2473,116 @@ mod tests {
         assert!(result2.is_err(), "Should fail when table is dropped");
     }
 
+    /// TCK-00340: Verify `SqliteLeaseValidator::get_gate_lease` retrieves
+    /// a full `GateLease` stored via `register_full_lease`.
+    #[test]
+    fn sqlite_lease_validator_get_gate_lease_roundtrip() {
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        // Use Arc<dyn LeaseValidator> to match how the dispatcher uses it
+        let validator: Arc<dyn LeaseValidator> =
+            Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let lease = apm2_core::fac::GateLeaseBuilder::new("test-lease-001", "W-RT-001", "gate-rt")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("exec-rt")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-rt")
+            .time_envelope_ref("htf:tick:100")
+            .build_and_sign(&signer);
+
+        validator
+            .register_full_lease(&lease)
+            .expect("register_full_lease should succeed in test");
+
+        let retrieved = validator.get_gate_lease("test-lease-001");
+        assert!(
+            retrieved.is_some(),
+            "get_gate_lease must return the stored lease"
+        );
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.lease_id, "test-lease-001");
+        assert_eq!(retrieved.work_id, "W-RT-001");
+        assert_eq!(retrieved.gate_id, "gate-rt");
+        assert_eq!(retrieved.executor_actor_id, "exec-rt");
+    }
+
+    /// TCK-00340: Verify `SqliteLeaseValidator::get_lease_work_id` returns
+    /// the correct `work_id` for a stored lease.
+    #[test]
+    fn sqlite_lease_validator_get_lease_work_id() {
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&conn));
+
+        validator.register_lease_with_executor(
+            "work-lease-001",
+            "W-WID-001",
+            "gate-wid",
+            "exec-wid",
+        );
+
+        let work_id = validator.get_lease_work_id("work-lease-001");
+        assert_eq!(
+            work_id.as_deref(),
+            Some("W-WID-001"),
+            "get_lease_work_id must return the stored work_id"
+        );
+    }
+
+    // ====================================================================
+    // v10 BLOCKER 2: register_full_lease duplicate rejection tests
+    // ====================================================================
+
+    /// v10 BLOCKER 2: `SqliteLeaseValidator::register_full_lease` rejects
+    /// duplicate `lease_id` to enforce DB-level uniqueness.
+    #[test]
+    fn sqlite_lease_validator_register_full_lease_duplicate_rejected() {
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator: Arc<dyn LeaseValidator> =
+            Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let lease = apm2_core::fac::GateLeaseBuilder::new("dup-lease-001", "W-DUP-001", "gate-dup")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("exec-dup")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-dup")
+            .time_envelope_ref("htf:tick:100")
+            .build_and_sign(&signer);
+
+        // First registration succeeds
+        let result1 = validator.register_full_lease(&lease);
+        assert!(result1.is_ok(), "First registration should succeed");
+
+        // Second registration with same lease_id must fail
+        let result2 = validator.register_full_lease(&lease);
+        assert!(
+            result2.is_err(),
+            "Duplicate lease_id must be rejected by register_full_lease"
+        );
+        let err_msg = result2.unwrap_err();
+        assert!(
+            err_msg.contains("duplicate lease_id"),
+            "Error message should mention duplicate: {err_msg}"
+        );
+    }
+
     // ====================================================================
     // TCK-00348: Contract binding canonicalizer metadata tests
     // ====================================================================
@@ -2349,5 +2701,79 @@ mod tests {
         assert_eq!(canonicalizers[0]["version"], 1);
         assert_eq!(canonicalizers[1]["id"], "apm2.canonical.jcs");
         assert_eq!(canonicalizers[1]["version"], 2);
+    }
+
+    /// Verifies that `get_event_by_receipt_id` finds review receipt events
+    /// by their payload-embedded `receipt_id` field, and that submitting the
+    /// same `receipt_id` twice returns the original event (idempotent).
+    #[test]
+    fn test_get_event_by_receipt_id_returns_existing_event() {
+        let emitter = test_emitter();
+
+        let changeset = [0xABu8; 32];
+        let artifact = [0xCDu8; 32];
+
+        // Emit a review receipt with a specific receipt_id
+        let event1 = emitter
+            .emit_review_receipt(
+                "episode-001",
+                "RR-IDEMP-001",
+                &changeset,
+                &artifact,
+                "reviewer-actor-x",
+                1_000_000_000,
+            )
+            .expect("first emit should succeed");
+
+        // Lookup by receipt_id should find the event
+        let found = emitter.get_event_by_receipt_id("RR-IDEMP-001");
+        assert!(
+            found.is_some(),
+            "get_event_by_receipt_id must find the event"
+        );
+        let found = found.unwrap();
+        assert_eq!(
+            found.event_id, event1.event_id,
+            "Must return the same event_id as the original emission"
+        );
+        assert_eq!(found.event_type, "review_receipt_recorded");
+
+        // Lookup by a different receipt_id should return None
+        let not_found = emitter.get_event_by_receipt_id("RR-IDEMP-999");
+        assert!(
+            not_found.is_none(),
+            "get_event_by_receipt_id must return None for unknown receipt_id"
+        );
+    }
+
+    /// Verifies that `get_event_by_receipt_id` also finds blocked receipt
+    /// events.
+    #[test]
+    fn test_get_event_by_receipt_id_finds_blocked_receipts() {
+        let emitter = test_emitter();
+
+        let blocked_log_hash = [0xEEu8; 32];
+
+        let blocked_event = emitter
+            .emit_review_blocked_receipt(
+                "RR-BLOCKED-001",
+                42,
+                &blocked_log_hash,
+                "reviewer-actor-y",
+                2_000_000_000,
+            )
+            .expect("blocked receipt emit should succeed");
+
+        let found = emitter.get_event_by_receipt_id("RR-BLOCKED-001");
+        assert!(
+            found.is_some(),
+            "get_event_by_receipt_id must find blocked receipt events"
+        );
+        let found = found.unwrap();
+        assert_eq!(
+            found.event_id, blocked_event.event_id,
+            "Must return the same event_id as the original blocked emission"
+        );
+        assert_eq!(found.event_type, "review_blocked_recorded");
     }
 }
