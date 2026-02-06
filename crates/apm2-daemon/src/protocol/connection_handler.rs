@@ -80,13 +80,6 @@ pub struct HandshakeConfig {
 
     /// Optional metrics handle for emitting `contract_mismatch_total`.
     pub metrics: Option<DaemonMetrics>,
-
-    /// Whether the manifest build failed or produced an empty hash.
-    ///
-    /// When `true`, Tier2+ sessions MUST be denied (fail-closed per
-    /// RFC-0020 section 4). The daemon cannot verify contract
-    /// compatibility without a valid manifest.
-    pub manifest_unavailable: bool,
 }
 
 impl Default for HandshakeConfig {
@@ -111,7 +104,6 @@ impl Default for HandshakeConfig {
             }],
             risk_tier: RiskTier::Tier2,
             metrics: None,
-            manifest_unavailable: false,
         }
     }
 }
@@ -133,7 +125,7 @@ impl HandshakeConfig {
             build_hash: String::new(),
         };
 
-        let (server_contract_hash, manifest_unavailable, risk_tier) =
+        let (server_contract_hash, risk_tier) =
             match crate::hsi_contract::build_manifest(cli_version) {
                 Ok(manifest) => {
                     let hash = manifest.content_hash().unwrap_or_default();
@@ -149,21 +141,20 @@ impl HandshakeConfig {
                     } else {
                         RiskTier::Tier2
                     };
-                    (hash, unavailable, tier)
+                    (hash, tier)
                 },
                 Err(e) => {
                     tracing::warn!(
                         "Failed to build HSI contract manifest for handshake: {e} \
                          (escalating to Tier3 fail-closed)"
                     );
-                    (String::new(), true, RiskTier::Tier3)
+                    (String::new(), RiskTier::Tier3)
                 },
             };
 
         Self {
             server_contract_hash,
             risk_tier,
-            manifest_unavailable,
             ..Self::default()
         }
     }
@@ -513,7 +504,6 @@ mod tests {
             }],
             risk_tier: RiskTier::Tier2,
             metrics: None,
-            manifest_unavailable: false,
         };
 
         let hs_config_clone = hs_config.clone();
@@ -670,7 +660,6 @@ mod tests {
             }],
             risk_tier: RiskTier::Tier1,
             metrics: None,
-            manifest_unavailable: false,
         };
 
         let hs_config_clone = hs_config.clone();
@@ -743,7 +732,6 @@ mod tests {
             server_canonicalizers: vec![],
             risk_tier: RiskTier::Tier0,
             metrics: Some(metrics.clone()),
-            manifest_unavailable: false,
         };
 
         let hs_config_clone = hs_config.clone();

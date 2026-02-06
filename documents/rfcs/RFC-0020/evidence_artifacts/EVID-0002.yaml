@@ -23,15 +23,14 @@ evidence_artifact:
       handshake path with risk_tier and outcome labels. DaemonMetrics is
       wired into HandshakeConfig in main.rs via the DaemonStateHandle's
       metrics registry.
-    - ContractBindingRecorded event is persisted to SQLite via
-      SqliteLedgerEventEmitter::emit_contract_binding_recorded() in the
-      production connection handler (main.rs handle_dual_socket_connection).
-    - SessionContractBinding is returned from perform_handshake() for
-      session-level audit trail.
+    - SessionContractBinding is returned from perform_handshake() and
+      persisted in SessionStarted events for session-level audit trail.
+      The binding includes cli_contract_hash, server_contract_hash,
+      client_canonicalizers, mismatch_waived flag, and risk_tier.
     - Fail-closed manifest unavailability: when build_manifest() fails or
-      returns an empty hash, evaluate_mismatch_policy() denies Tier2+
-      sessions. The daemon cannot verify contract compatibility without
-      a valid manifest.
+      returns an empty hash, HandshakeConfig::from_manifest() escalates
+      to Tier3 (fail-closed), ensuring Tier2+ sessions are denied. The
+      daemon cannot verify contract compatibility without a valid manifest.
 
     Tier0/Tier1 mismatches are waived (warned), Tier2+ mismatches are
     denied (fail-closed).
@@ -85,7 +84,8 @@ evidence_artifact:
         - both_hashes_empty_tier0_allowed: both empty at Tier0 allowed (backward compat)
 
         Ledger persistence tests in ledger.rs:
-        - emit_contract_binding_recorded_sqlite: contract binding persisted to SQLite
+        - emit_session_started_includes_canonicalizer_metadata: SessionStarted binding persisted with canonicalizer metadata
+        - emit_spawn_lifecycle_includes_canonicalizer_metadata: spawn lifecycle binding includes canonicalizer metadata
 
         Metrics tests in metrics.rs:
         - test_contract_mismatch_counter: counter increments with labels
