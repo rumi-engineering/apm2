@@ -1895,14 +1895,33 @@ impl SessionRegistry for PersistentSessionRegistry {
         &self,
         session: SessionState,
     ) -> Result<Vec<SessionState>, SessionRegistryError> {
+        // Capture the session_id before the move so we can roll back if
+        // persistence fails.
+        let session_id = session.session_id.clone();
+
         // Register in memory first
         let evicted = self.inner.register_session(session)?;
 
-        // Persist to disk (convert error to RegistrationFailed)
-        self.persist()
-            .map_err(|e| SessionRegistryError::RegistrationFailed {
-                message: format!("Failed to persist state: {e}"),
-            })?;
+        // Persist to disk; if this fails, roll back the in-memory mutation
+        // (remove the just-added session and restore any evicted sessions)
+        // so that on-disk and in-memory state remain consistent.
+        if let Err(persist_err) = self.persist() {
+            // Roll back: remove the newly-registered session.
+            // We bypass the PersistentSessionRegistry wrapper and call the
+            // inner (in-memory) registry directly to avoid a second persist
+            // attempt.
+            let _ = self.inner.remove_session(&session_id);
+
+            // Roll back: re-register any evicted sessions to restore
+            // capacity.
+            for evicted_session in &evicted {
+                let _ = self.inner.register_session(evicted_session.clone());
+            }
+
+            return Err(SessionRegistryError::RegistrationFailed {
+                message: format!("Failed to persist state: {persist_err}"),
+            });
+        }
 
         Ok(evicted)
     }
@@ -2555,6 +2574,114 @@ mod session_registry_tests {
             assert!(result.is_ok());
         }
     }
+
+    /// BLOCKER 1 fix: verify that `register_session` rolls back in-memory
+    /// state when `persist()` fails so that callers never see a
+    /// half-committed registration.
+    #[test]
+    fn test_register_session_rollback_on_persist_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let registry = PersistentSessionRegistry::new(&path);
+
+        // Seed with one session so we know it survives rollback
+        let pre = make_session("pre-existing", "handle-pre");
+        registry.register_session(pre).unwrap();
+        assert!(registry.get_session("pre-existing").is_some());
+
+        // Now break persistence by making the parent directory read-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+
+            // Attempt to register a new session — persist() should fail.
+            let result = registry.register_session(make_session("new-sess", "handle-new"));
+            assert!(
+                result.is_err(),
+                "register_session must fail when persistence fails"
+            );
+            match result.unwrap_err() {
+                SessionRegistryError::RegistrationFailed { message } => {
+                    assert!(
+                        message.contains("persist") || message.contains("Persist"),
+                        "Error message should mention persistence: {message}"
+                    );
+                },
+                other => {
+                    panic!("Expected RegistrationFailed, got: {other:?}");
+                },
+            }
+
+            // The new session must NOT be present in the in-memory registry.
+            assert!(
+                registry.get_session("new-sess").is_none(),
+                "new session must be rolled back on persist failure"
+            );
+
+            // The pre-existing session must still be present.
+            assert!(
+                registry.get_session("pre-existing").is_some(),
+                "pre-existing session must survive rollback"
+            );
+
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// BLOCKER 1 fix: verify that evicted sessions are restored when
+    /// `persist()` fails during a registration that triggered eviction.
+    #[test]
+    fn test_register_session_rollback_restores_evicted_on_persist_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let registry = PersistentSessionRegistry::new(&path);
+
+        // Fill the registry to MAX_SESSIONS
+        for i in 0..MAX_SESSIONS {
+            let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
+            registry.register_session(session).unwrap();
+        }
+
+        // Confirm the oldest session is present (it will be evicted)
+        assert!(
+            registry.get_session("sess-0").is_some(),
+            "oldest session should exist before eviction attempt"
+        );
+
+        // Break persistence
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+
+            // Attempt to register one more — this should evict sess-0,
+            // fail on persist, and then restore sess-0.
+            let result =
+                registry.register_session(make_session("overflow-sess", "handle-overflow"));
+            assert!(result.is_err(), "must fail when persistence fails");
+
+            // The overflow session must NOT be present
+            assert!(
+                registry.get_session("overflow-sess").is_none(),
+                "overflow session must be rolled back"
+            );
+
+            // The evicted session must be restored
+            assert!(
+                registry.get_session("sess-0").is_some(),
+                "evicted session must be restored on rollback"
+            );
+
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
 }
 
 // =============================================================================
@@ -3203,7 +3330,7 @@ mod tck_00385_security_fixes {
                     "Error message should mention persistence: {message}"
                 );
             },
-            other @ SessionRegistryError::DuplicateSessionId { .. } => {
+            other => {
                 panic!("Expected RegistrationFailed, got: {other:?}")
             },
         }

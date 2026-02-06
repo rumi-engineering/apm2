@@ -3434,8 +3434,16 @@ mod tests {
         fn register_session(
             &self,
             _session: crate::session::SessionState,
-        ) -> Result<(), crate::session::SessionRegistryError> {
-            Ok(())
+        ) -> Result<Vec<crate::session::SessionState>, crate::session::SessionRegistryError>
+        {
+            Ok(Vec::new())
+        }
+        fn remove_session(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<crate::session::SessionState>, crate::session::SessionRegistryError>
+        {
+            Ok(None)
         }
         fn get_session(&self, _session_id: &str) -> Option<crate::session::SessionState> {
             None

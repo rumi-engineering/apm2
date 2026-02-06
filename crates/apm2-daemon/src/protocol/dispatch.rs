@@ -3350,6 +3350,78 @@ impl PrivilegedDispatcher {
         }))
     }
 
+    /// Rolls back a partially-completed spawn registration.
+    ///
+    /// Removes the newly-registered session, cleans up its telemetry, and
+    /// restores any sessions/telemetry that were evicted during the
+    /// registration.  Optionally removes the manifest if it was registered.
+    ///
+    /// Returns `Some(warning)` if any rollback step failed (indicating
+    /// partial failure), or `None` if rollback was clean.
+    ///
+    /// # TCK-00384 BLOCKER 2
+    ///
+    /// All rollback operations are explicitly error-checked; none are
+    /// silently discarded via `let _ = ...`.
+    fn rollback_spawn(
+        &self,
+        session_id: &str,
+        evicted_sessions: &[SessionState],
+        evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
+        remove_manifest: bool,
+    ) -> Option<String> {
+        let mut warnings: Vec<String> = Vec::new();
+
+        // 1. Remove the newly-registered session from the registry.
+        if let Err(e) = self.session_registry.remove_session(session_id) {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "Rollback: failed to remove session from registry"
+            );
+            warnings.push(format!("remove_session({session_id}): {e}"));
+        }
+
+        // 2. Clean up telemetry for the new session and restore evicted telemetry
+        //    entries.
+        if let Some(ref store) = self.telemetry_store {
+            store.remove(session_id);
+            for (sid, telem) in evicted_telemetry {
+                if let Err(e) = store.restore(sid, std::sync::Arc::clone(telem)) {
+                    warn!(
+                        session_id = %sid,
+                        error = %e,
+                        "Rollback: failed to restore evicted telemetry"
+                    );
+                    warnings.push(format!("restore_telemetry({sid}): {e}"));
+                }
+            }
+        }
+
+        // 3. Remove the manifest if it was registered.
+        if remove_manifest {
+            self.manifest_store.remove(session_id);
+        }
+
+        // 4. Re-register evicted sessions to restore capacity.
+        for evicted in evicted_sessions {
+            if let Err(e) = self.session_registry.register_session(evicted.clone()) {
+                warn!(
+                    session_id = %evicted.session_id,
+                    error = %e,
+                    "Rollback: failed to re-register evicted session"
+                );
+                warnings.push(format!("re-register({}): {e}", evicted.session_id));
+            }
+        }
+
+        if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.join("; "))
+        }
+    }
+
     /// Handles `SpawnEpisode` requests (IPC-PRIV-002).
     ///
     /// # Security Contract (TCK-00257)
@@ -3780,16 +3852,18 @@ impl PrivilegedDispatcher {
         // restore them alongside the session registry entries so that
         // rollback is complete (telemetry + session + manifest).
         let evicted_telemetry: Vec<(String, std::sync::Arc<crate::session::SessionTelemetry>)> =
-            self.telemetry_store.as_ref().map_or_else(Vec::new, |store| {
-                evicted_sessions
-                    .iter()
-                    .filter_map(|s| {
-                        store
-                            .remove_and_return(&s.session_id)
-                            .map(|t| (s.session_id.clone(), t))
-                    })
-                    .collect()
-            });
+            self.telemetry_store
+                .as_ref()
+                .map_or_else(Vec::new, |store| {
+                    evicted_sessions
+                        .iter()
+                        .filter_map(|s| {
+                            store
+                                .remove_and_return(&s.session_id)
+                                .map(|t| (s.session_id.clone(), t))
+                        })
+                        .collect()
+                });
 
         // Step 3: Register telemetry with started_at_ns.
         // The wall-clock timestamp is stored as audit metadata only;
@@ -3807,17 +3881,21 @@ impl PrivilegedDispatcher {
             if let Err(e) = store.register(&session_id, started_at_ns) {
                 // Rollback session on telemetry failure and restore evicted
                 // sessions + telemetry so capacity is not permanently lost.
-                let _ = self.session_registry.remove_session(&session_id);
-                for evicted in &evicted_sessions {
-                    let _ = self.session_registry.register_session(evicted.clone());
-                }
-                for (sid, telem) in &evicted_telemetry {
-                    let _ = store.restore(sid, std::sync::Arc::clone(telem));
+                let rollback_warn =
+                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, false);
+                if let Some(ref rw) = rollback_warn {
+                    warn!(rollback_errors = %rw, "Partial rollback failure during telemetry error recovery");
                 }
                 warn!(error = %e, "Telemetry registration rejected (store at capacity)");
+                let msg = rollback_warn.map_or_else(
+                    || format!("telemetry store at capacity: {e}"),
+                    |rw| {
+                        format!("telemetry store at capacity: {e} (rollback partial failure: {rw})")
+                    },
+                );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("telemetry store at capacity: {e}"),
+                    msg,
                 ));
             }
         }
@@ -3837,32 +3915,36 @@ impl PrivilegedDispatcher {
         // The HTF clock is used for ledger events that require causal ordering.
         let spawn_time = SystemTime::now();
         let ttl = Duration::from_secs(DEFAULT_SESSION_TOKEN_TTL_SECS);
-        let session_token =
-            match self
-                .token_minter
-                .mint(&session_id, &claim.lease_id, spawn_time, ttl)
-            {
-                Ok(token) => token,
-                Err(e) => {
-                    // Rollback session, telemetry, and restore evicted
-                    // sessions + telemetry so capacity is not lost.
-                    let _ = self.session_registry.remove_session(&session_id);
-                    if let Some(ref store) = self.telemetry_store {
-                        store.remove(&session_id);
-                        for (sid, telem) in &evicted_telemetry {
-                            let _ = store.restore(sid, std::sync::Arc::clone(telem));
-                        }
-                    }
-                    for evicted in &evicted_sessions {
-                        let _ = self.session_registry.register_session(evicted.clone());
-                    }
-                    warn!(error = %e, "Session token minting failed");
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!("session token generation failed: {e}"),
-                    ));
-                },
-            };
+        let session_token = match self.token_minter.mint(
+            &session_id,
+            &claim.lease_id,
+            spawn_time,
+            ttl,
+        ) {
+            Ok(token) => token,
+            Err(e) => {
+                // Rollback session, telemetry, and restore evicted
+                // sessions + telemetry so capacity is not lost.
+                let rollback_warn =
+                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, false);
+                if let Some(ref rw) = rollback_warn {
+                    warn!(rollback_errors = %rw, "Partial rollback failure during token minting error recovery");
+                }
+                warn!(error = %e, "Session token minting failed");
+                let msg = rollback_warn.map_or_else(
+                    || format!("session token generation failed: {e}"),
+                    |rw| {
+                        format!(
+                            "session token generation failed: {e} (rollback partial failure: {rw})"
+                        )
+                    },
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            },
+        };
 
         // Step 5: Serialize the token to JSON for inclusion in the response.
         let session_token_json = match serde_json::to_string(&session_token) {
@@ -3870,20 +3952,19 @@ impl PrivilegedDispatcher {
             Err(e) => {
                 // Rollback session, telemetry, and restore evicted
                 // sessions + telemetry so capacity is not lost.
-                let _ = self.session_registry.remove_session(&session_id);
-                if let Some(ref store) = self.telemetry_store {
-                    store.remove(&session_id);
-                    for (sid, telem) in &evicted_telemetry {
-                        let _ = store.restore(sid, std::sync::Arc::clone(telem));
-                    }
-                }
-                for evicted in &evicted_sessions {
-                    let _ = self.session_registry.register_session(evicted.clone());
+                let rollback_warn =
+                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, false);
+                if let Some(ref rw) = rollback_warn {
+                    warn!(rollback_errors = %rw, "Partial rollback failure during token serialization error recovery");
                 }
                 warn!(error = %e, "Session token serialization failed");
+                let msg = rollback_warn.map_or_else(
+                    || format!("session token serialization failed: {e}"),
+                    |rw| format!("session token serialization failed: {e} (rollback partial failure: {rw})"),
+                );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("session token serialization failed: {e}"),
+                    msg,
                 ));
             },
         };
@@ -3915,15 +3996,14 @@ impl PrivilegedDispatcher {
                     // manifest-load failure so bounded capacity is not leaked.
                     // Restore evicted sessions + telemetry so capacity is not
                     // lost.
-                    let _ = self.session_registry.remove_session(&session_id);
-                    if let Some(ref store) = self.telemetry_store {
-                        store.remove(&session_id);
-                        for (sid, telem) in &evicted_telemetry {
-                            let _ = store.restore(sid, std::sync::Arc::clone(telem));
-                        }
-                    }
-                    for evicted in &evicted_sessions {
-                        let _ = self.session_registry.register_session(evicted.clone());
+                    let rollback_warn = self.rollback_spawn(
+                        &session_id,
+                        &evicted_sessions,
+                        &evicted_telemetry,
+                        false,
+                    );
+                    if let Some(ref rw) = rollback_warn {
+                        warn!(rollback_errors = %rw, "Partial rollback failure during manifest load error recovery");
                     }
                     warn!(
                         work_id = %request.work_id,
@@ -3931,9 +4011,13 @@ impl PrivilegedDispatcher {
                         error = %e,
                         "SpawnEpisode rejected: reviewer manifest not found in CAS"
                     );
+                    let msg = rollback_warn.map_or_else(
+                        || format!("reviewer capability manifest not found in CAS: {e}"),
+                        |rw| format!("reviewer capability manifest not found in CAS: {e} (rollback partial failure: {rw})"),
+                    );
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!("reviewer capability manifest not found in CAS: {e}"),
+                        msg,
                     ));
                 }
 
@@ -3980,22 +4064,20 @@ impl PrivilegedDispatcher {
                 // TCK-00384 security fix: rollback session, telemetry, and
                 // manifest on timestamp failure.  Also restore evicted
                 // sessions + telemetry so capacity is not permanently lost.
-                let _ = self.session_registry.remove_session(&session_id);
-                if let Some(ref store) = self.telemetry_store {
-                    store.remove(&session_id);
-                    for (sid, telem) in &evicted_telemetry {
-                        let _ = store.restore(sid, std::sync::Arc::clone(telem));
-                    }
-                }
-                self.manifest_store.remove(&session_id);
-                for evicted in &evicted_sessions {
-                    let _ = self.session_registry.register_session(evicted.clone());
+                let rollback_warn =
+                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, true);
+                if let Some(ref rw) = rollback_warn {
+                    warn!(rollback_errors = %rw, "Partial rollback failure during timestamp error recovery");
                 }
                 // TCK-00289: Fail-closed - do not proceed without valid timestamp
                 warn!(error = %e, "HTF timestamp generation failed for SessionStarted - failing closed");
+                let msg = rollback_warn.map_or_else(
+                    || format!("HTF timestamp error: {e}"),
+                    |rw| format!("HTF timestamp error: {e} (rollback partial failure: {rw})"),
+                );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("HTF timestamp error: {e}"),
+                    msg,
                 ));
             },
         };
@@ -4040,25 +4122,29 @@ impl PrivilegedDispatcher {
                     // TCK-00384 security fix: rollback session, telemetry,
                     // and manifest on episode creation failure.  Restore
                     // evicted sessions + telemetry so capacity is not lost.
-                    let _ = self.session_registry.remove_session(&session_id);
-                    if let Some(ref store) = self.telemetry_store {
-                        store.remove(&session_id);
-                        for (sid, telem) in &evicted_telemetry {
-                            let _ = store.restore(sid, std::sync::Arc::clone(telem));
-                        }
-                    }
-                    self.manifest_store.remove(&session_id);
-                    for evicted in &evicted_sessions {
-                        let _ = self.session_registry.register_session(evicted.clone());
+                    let rollback_warn = self.rollback_spawn(
+                        &session_id,
+                        &evicted_sessions,
+                        &evicted_telemetry,
+                        true,
+                    );
+                    if let Some(ref rw) = rollback_warn {
+                        warn!(rollback_errors = %rw, "Partial rollback failure during episode creation error recovery");
                     }
                     warn!(
                         work_id = %request.work_id,
                         error = %e,
                         "SpawnEpisode failed: episode creation/start failed"
                     );
+                    let msg = rollback_warn.map_or_else(
+                        || format!("episode creation failed: {e}"),
+                        |rw| {
+                            format!("episode creation failed: {e} (rollback partial failure: {rw})")
+                        },
+                    );
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!("episode creation failed: {e}"),
+                        msg,
                     ));
                 },
             }
@@ -4080,21 +4166,19 @@ impl PrivilegedDispatcher {
                 // TCK-00384 security fix: rollback session, telemetry,
                 // and manifest when no runtime is available.  Restore
                 // evicted sessions + telemetry so capacity is not lost.
-                let _ = self.session_registry.remove_session(&session_id);
-                if let Some(ref store) = self.telemetry_store {
-                    store.remove(&session_id);
-                    for (sid, telem) in &evicted_telemetry {
-                        let _ = store.restore(sid, std::sync::Arc::clone(telem));
-                    }
-                }
-                self.manifest_store.remove(&session_id);
-                for evicted in &evicted_sessions {
-                    let _ = self.session_registry.register_session(evicted.clone());
+                let rollback_warn =
+                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, true);
+                if let Some(ref rw) = rollback_warn {
+                    warn!(rollback_errors = %rw, "Partial rollback failure during no-runtime error recovery");
                 }
                 warn!("No Tokio runtime available for episode creation");
+                let msg = rollback_warn.map_or_else(
+                    || "episode creation failed: no async runtime available".to_string(),
+                    |rw| format!("episode creation failed: no async runtime available (rollback partial failure: {rw})"),
+                );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
-                    "episode creation failed: no async runtime available",
+                    msg,
                 ));
             }
         };
@@ -4123,21 +4207,19 @@ impl PrivilegedDispatcher {
             // TCK-00384 security fix: rollback session, telemetry, and
             // manifest on event emission failure.  Restore evicted
             // sessions + telemetry so capacity is not permanently lost.
-            let _ = self.session_registry.remove_session(&session_id);
-            if let Some(ref store) = self.telemetry_store {
-                store.remove(&session_id);
-                for (sid, telem) in &evicted_telemetry {
-                    let _ = store.restore(sid, std::sync::Arc::clone(telem));
-                }
-            }
-            self.manifest_store.remove(&session_id);
-            for evicted in &evicted_sessions {
-                let _ = self.session_registry.register_session(evicted.clone());
+            let rollback_warn =
+                self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, true);
+            if let Some(ref rw) = rollback_warn {
+                warn!(rollback_errors = %rw, "Partial rollback failure during event emission error recovery");
             }
             warn!(error = %e, "SessionStarted event emission failed");
+            let msg = rollback_warn.map_or_else(
+                || format!("event emission failed: {e}"),
+                |rw| format!("event emission failed: {e} (rollback partial failure: {rw})"),
+            );
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("event emission failed: {e}"),
+                msg,
             ));
         }
 
@@ -9654,8 +9736,8 @@ mod tests {
         /// entry.
         #[test]
         fn test_failed_spawn_removes_stale_manifest() {
-            use crate::episode::registry::InMemorySessionRegistry;
             use crate::episode::CapabilityManifest;
+            use crate::episode::registry::InMemorySessionRegistry;
             use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore};
             use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
 
