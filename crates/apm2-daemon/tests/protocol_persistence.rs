@@ -22,7 +22,7 @@ use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
 fn make_privileged_ctx() -> ConnectionContext {
-    ConnectionContext::privileged(Some(PeerCredentials {
+    ConnectionContext::privileged_session_open(Some(PeerCredentials {
         uid: 1000,
         gid: 1000,
         pid: Some(12345),

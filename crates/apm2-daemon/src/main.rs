@@ -2106,6 +2106,16 @@ async fn handle_dual_socket_connection(
     };
     ctx.set_contract_binding(contract_binding.clone());
 
+    // TCK-00349: Advance connection phase through the session-typed state
+    // machine. The handshake has succeeded at this point, so we advance
+    // from Connected -> HandshakeComplete -> SessionOpen before entering
+    // the dispatch loop. This ensures no IPC dispatch is possible until
+    // the full state progression is complete.
+    ctx.advance_to_handshake_complete()
+        .context("connection phase transition to HandshakeComplete failed")?;
+    ctx.advance_to_session_open()
+        .context("connection phase transition to SessionOpen failed")?;
+
     // TCK-00287 Item 1 & 2: Use shared dispatchers from DispatcherState.
     // These dispatchers persist across connections and use stable secrets.
     let privileged_dispatcher = dispatcher_state.privileged_dispatcher();

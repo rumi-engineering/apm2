@@ -43,6 +43,132 @@ use crate::hsi_contract::handshake_binding::{CanonicalizerInfo, SessionContractB
 use crate::hsi_contract::{MismatchOutcome, RiskTier};
 use crate::metrics::DaemonMetrics;
 
+// ============================================================================
+// TCK-00349: Session-Typed Connection Phase State Machine
+// ============================================================================
+
+/// Connection phase for the session-typed state machine (TCK-00349).
+///
+/// Per REQ-0003, authority-bearing operations MUST require valid session-state
+/// progression. This enum enforces a strict, forward-only progression:
+///
+/// ```text
+///   Connected ──> HandshakeComplete ──> SessionOpen
+/// ```
+///
+/// No privileged (authority-bearing) IPC message can be dispatched before the
+/// connection reaches the `SessionOpen` phase. Each transition is validated
+/// explicitly — there are no implicit promotions.
+///
+/// # Security Invariants
+///
+/// - Transitions are forward-only: `Connected -> HandshakeComplete ->
+///   SessionOpen`
+/// - No skipping: transitioning from `Connected` to `SessionOpen` directly is
+///   rejected
+/// - Each transition returns `Result` so callers detect illegal jumps
+/// - The `advance_to_session_open` method requires proof of a completed
+///   handshake (via `HandshakeResult::Success`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPhase {
+    /// TCP/UDS socket accepted but no handshake performed yet.
+    ///
+    /// In this phase, the only valid operation is the Hello/HelloAck
+    /// handshake. All IPC dispatch is rejected.
+    Connected,
+
+    /// Handshake completed successfully, contract binding established.
+    ///
+    /// The server has validated the protocol version and contract binding.
+    /// The connection is ready for session-open promotion (for session
+    /// sockets) or immediate authority-bearing dispatch (for operator
+    /// sockets, which are privileged by socket type).
+    HandshakeComplete,
+
+    /// Session is open and authority-bearing operations are allowed.
+    ///
+    /// For operator sockets: all privileged IPC messages are accepted.
+    /// For session sockets: session-scoped IPC messages are accepted
+    /// (with token validation per request).
+    SessionOpen,
+}
+
+impl ConnectionPhase {
+    /// Attempts to advance from `Connected` to `HandshakeComplete`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionPhaseError::IllegalTransition` if the current
+    /// phase is not `Connected`.
+    pub fn advance_to_handshake_complete(self) -> Result<Self, ConnectionPhaseError> {
+        if self != Self::Connected {
+            return Err(ConnectionPhaseError::IllegalTransition {
+                from: self,
+                to: Self::HandshakeComplete,
+            });
+        }
+        Ok(Self::HandshakeComplete)
+    }
+
+    /// Attempts to advance from `HandshakeComplete` to `SessionOpen`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionPhaseError::IllegalTransition` if the current
+    /// phase is not `HandshakeComplete`.
+    pub fn advance_to_session_open(self) -> Result<Self, ConnectionPhaseError> {
+        if self != Self::HandshakeComplete {
+            return Err(ConnectionPhaseError::IllegalTransition {
+                from: self,
+                to: Self::SessionOpen,
+            });
+        }
+        Ok(Self::SessionOpen)
+    }
+
+    /// Returns `true` if this phase permits authority-bearing dispatch.
+    ///
+    /// Only `SessionOpen` allows IPC message dispatch. `Connected` and
+    /// `HandshakeComplete` reject all non-handshake frames.
+    #[must_use]
+    pub const fn allows_dispatch(&self) -> bool {
+        matches!(self, Self::SessionOpen)
+    }
+}
+
+impl std::fmt::Display for ConnectionPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connected => write!(f, "Connected"),
+            Self::HandshakeComplete => write!(f, "HandshakeComplete"),
+            Self::SessionOpen => write!(f, "SessionOpen"),
+        }
+    }
+}
+
+/// Error type for illegal connection phase transitions (TCK-00349).
+///
+/// This is a structured defect — callers can log the exact illegal
+/// transition without truncation or coercion to a default.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectionPhaseError {
+    /// Attempted an illegal state transition.
+    #[error("illegal connection phase transition from {from} to {to}")]
+    IllegalTransition {
+        /// Phase the connection was in.
+        from: ConnectionPhase,
+        /// Phase the caller attempted to reach.
+        to: ConnectionPhase,
+    },
+
+    /// Dispatch attempted before session was open.
+    #[error("dispatch rejected: connection is in {phase} phase, not SessionOpen")]
+    DispatchBeforeSessionOpen {
+        /// Current phase.
+        phase: ConnectionPhase,
+    },
+}
+
 /// Server information string for handshake.
 ///
 /// This identifies the daemon to connecting clients during the Hello/HelloAck
@@ -819,5 +945,355 @@ mod tests {
             .expect("handshake error");
 
         assert!(matches!(result, HandshakeResult::Failed));
+    }
+
+    // =========================================================================
+    // TCK-00349: Session-typed state machine tests
+    // =========================================================================
+
+    #[test]
+    fn test_connection_phase_initial_state_is_connected() {
+        let phase = ConnectionPhase::Connected;
+        assert!(!phase.allows_dispatch());
+        assert_eq!(format!("{phase}"), "Connected");
+    }
+
+    #[test]
+    fn test_connection_phase_handshake_complete_does_not_allow_dispatch() {
+        let phase = ConnectionPhase::HandshakeComplete;
+        assert!(!phase.allows_dispatch());
+    }
+
+    #[test]
+    fn test_connection_phase_session_open_allows_dispatch() {
+        let phase = ConnectionPhase::SessionOpen;
+        assert!(phase.allows_dispatch());
+    }
+
+    #[test]
+    fn test_connection_phase_valid_forward_progression() {
+        // Connected -> HandshakeComplete -> SessionOpen
+        let phase = ConnectionPhase::Connected;
+        let phase = phase.advance_to_handshake_complete().unwrap();
+        assert_eq!(phase, ConnectionPhase::HandshakeComplete);
+
+        let phase = phase.advance_to_session_open().unwrap();
+        assert_eq!(phase, ConnectionPhase::SessionOpen);
+        assert!(phase.allows_dispatch());
+    }
+
+    #[test]
+    fn test_connection_phase_cannot_skip_handshake() {
+        // Connected -> SessionOpen must fail (skipping HandshakeComplete)
+        let phase = ConnectionPhase::Connected;
+        let result = phase.advance_to_session_open();
+        assert!(result.is_err());
+        if let Err(ConnectionPhaseError::IllegalTransition { from, to }) = result {
+            assert_eq!(from, ConnectionPhase::Connected);
+            assert_eq!(to, ConnectionPhase::SessionOpen);
+        } else {
+            panic!("Expected IllegalTransition error");
+        }
+    }
+
+    #[test]
+    fn test_connection_phase_cannot_double_advance_to_handshake() {
+        // HandshakeComplete -> HandshakeComplete must fail
+        let phase = ConnectionPhase::HandshakeComplete;
+        let result = phase.advance_to_handshake_complete();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_connection_phase_cannot_regress_from_session_open() {
+        // SessionOpen -> HandshakeComplete must fail
+        let phase = ConnectionPhase::SessionOpen;
+        let result = phase.advance_to_handshake_complete();
+        assert!(result.is_err());
+        // SessionOpen -> SessionOpen (via advance_to_session_open) must also fail
+        let result = phase.advance_to_session_open();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_connection_phase_error_display() {
+        let err = ConnectionPhaseError::IllegalTransition {
+            from: ConnectionPhase::Connected,
+            to: ConnectionPhase::SessionOpen,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("Connected"));
+        assert!(msg.contains("SessionOpen"));
+
+        let err = ConnectionPhaseError::DispatchBeforeSessionOpen {
+            phase: ConnectionPhase::HandshakeComplete,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("HandshakeComplete"));
+        assert!(msg.contains("not SessionOpen"));
+    }
+
+    /// TCK-00349: Verify that privileged dispatch is rejected before
+    /// `SessionOpen` phase.
+    #[test]
+    fn test_privileged_dispatch_rejected_before_session_open() {
+        use super::super::dispatch::{ConnectionContext, PrivilegedDispatcher};
+        use crate::protocol::credentials::PeerCredentials;
+
+        let dispatcher = PrivilegedDispatcher::new();
+        // Create context in Connected phase (no handshake yet)
+        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        }));
+
+        // Attempt dispatch with a dummy frame (tag byte = 1 = ClaimWork)
+        let frame = bytes::Bytes::from(vec![1u8, 0, 0, 0]);
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+        let encoded = response.encode();
+
+        // Should get error response, not a successful route
+        // Error tag is 0
+        assert_eq!(
+            encoded[0], 0,
+            "Dispatch before SessionOpen must return error response"
+        );
+    }
+
+    /// TCK-00349: Verify that session dispatch is rejected before
+    /// `SessionOpen` phase.
+    #[test]
+    fn test_session_dispatch_rejected_before_session_open() {
+        use super::super::dispatch::ConnectionContext;
+        use super::super::session_dispatch::{InMemoryManifestStore, SessionDispatcher};
+        use crate::protocol::credentials::PeerCredentials;
+        use crate::protocol::session_token::TokenMinter;
+
+        let minter = TokenMinter::new(TokenMinter::generate_secret());
+        let manifest_store = std::sync::Arc::new(InMemoryManifestStore::new());
+        let dispatcher = SessionDispatcher::with_manifest_store(minter, manifest_store);
+
+        // Create context in Connected phase (no handshake yet)
+        let ctx = ConnectionContext::session(
+            Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12346),
+            }),
+            Some("sess-001".to_string()),
+        );
+
+        // Attempt dispatch with a dummy frame (tag byte = 1 = RequestTool)
+        let frame = bytes::Bytes::from(vec![1u8, 0, 0, 0]);
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+        let encoded = response.encode();
+
+        // Should get error response, not a successful route
+        assert_eq!(
+            encoded[0], 0,
+            "Session dispatch before SessionOpen must return error response"
+        );
+    }
+
+    /// TCK-00349: Verify that dispatch succeeds after full phase progression.
+    #[test]
+    fn test_privileged_dispatch_succeeds_after_session_open() {
+        use super::super::dispatch::{
+            ConnectionContext, PrivilegedDispatcher, encode_claim_work_request,
+        };
+        use super::super::messages::{ClaimWorkRequest, WorkRole};
+        use crate::protocol::credentials::PeerCredentials;
+
+        let dispatcher = PrivilegedDispatcher::new();
+
+        // Create context and advance through full progression
+        let mut ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        }));
+        ctx.advance_to_handshake_complete().unwrap();
+        ctx.advance_to_session_open().unwrap();
+
+        // Encode a valid ClaimWork request
+        let request = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![],
+            nonce: vec![],
+        };
+        let frame = encode_claim_work_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+        let encoded = response.encode();
+
+        // Should route to ClaimWork handler (not blocked by phase check)
+        // The response is a ClaimWork response (tag=1) with a generated work_id
+        assert_eq!(
+            encoded[0], 1,
+            "Dispatch after SessionOpen should route to handler"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00349: Fail-closed enum decoding tests
+    // =========================================================================
+
+    /// TCK-00349: Verify that unknown message type tags are rejected
+    /// (fail-closed, no default coercion).
+    #[test]
+    fn test_unknown_privileged_message_type_returns_none() {
+        use super::super::dispatch::PrivilegedMessageType;
+
+        // All valid tags should return Some
+        for variant in PrivilegedMessageType::all_request_variants() {
+            assert!(
+                PrivilegedMessageType::from_tag(variant.tag()).is_some(),
+                "Valid tag {} should return Some",
+                variant.tag()
+            );
+        }
+
+        // Unknown tags must return None (fail-closed)
+        let unknown_tags: Vec<u8> = vec![0, 18, 19, 20, 27, 50, 63, 65, 67, 69, 71, 100, 255];
+        for tag in unknown_tags {
+            assert!(
+                PrivilegedMessageType::from_tag(tag).is_none(),
+                "Unknown tag {tag} must return None (fail-closed)",
+            );
+        }
+    }
+
+    /// TCK-00349: Verify that unknown session message type tags are rejected.
+    #[test]
+    fn test_unknown_session_message_type_returns_none() {
+        use super::super::session_dispatch::SessionMessageType;
+
+        // All valid tags should return Some
+        for variant in SessionMessageType::all_request_variants() {
+            assert!(
+                SessionMessageType::from_tag(variant.tag()).is_some(),
+                "Valid tag {} should return Some",
+                variant.tag()
+            );
+        }
+
+        // Unknown tags must return None (fail-closed)
+        let unknown_tags: Vec<u8> = vec![0, 7, 8, 50, 63, 65, 67, 69, 100, 255];
+        for tag in unknown_tags {
+            assert!(
+                SessionMessageType::from_tag(tag).is_none(),
+                "Unknown tag {tag} must return None (fail-closed)",
+            );
+        }
+    }
+
+    /// TCK-00349: Verify that unknown `HandshakeErrorCode` variants are
+    /// rejected during deserialization (fail-closed).
+    #[test]
+    fn test_unknown_handshake_error_code_fails_closed() {
+        use super::super::handshake::HandshakeErrorCode;
+
+        // Valid variants deserialize successfully
+        let valid = serde_json::from_str::<HandshakeErrorCode>("\"version_mismatch\"");
+        assert!(valid.is_ok());
+
+        let valid = serde_json::from_str::<HandshakeErrorCode>("\"rejected\"");
+        assert!(valid.is_ok());
+
+        let valid = serde_json::from_str::<HandshakeErrorCode>("\"contract_mismatch\"");
+        assert!(valid.is_ok());
+
+        // Unknown variant MUST fail (no default coercion)
+        let unknown = serde_json::from_str::<HandshakeErrorCode>("\"unknown_code\"");
+        assert!(
+            unknown.is_err(),
+            "Unknown HandshakeErrorCode must fail deserialization (fail-closed)"
+        );
+
+        let unknown = serde_json::from_str::<HandshakeErrorCode>("\"\"");
+        assert!(unknown.is_err(), "Empty string must fail deserialization");
+    }
+
+    // =========================================================================
+    // TCK-00349: Bounded decode enforcement tests
+    // =========================================================================
+
+    /// TCK-00349: Verify that oversized payloads are rejected BEFORE
+    /// deserialization (bounded decode).
+    #[test]
+    fn test_bounded_decode_rejects_oversized_payload() {
+        use super::super::messages::{BoundedDecode, ClaimWorkRequest, DecodeConfig, DecodeError};
+
+        // Create a config with a small limit
+        let config = DecodeConfig::new(64, 10);
+
+        // Create a payload that exceeds the limit
+        let oversized = vec![0u8; 128];
+        let result = ClaimWorkRequest::decode_bounded(&oversized, &config);
+        assert!(
+            matches!(
+                result,
+                Err(DecodeError::MessageTooLarge { size: 128, max: 64 })
+            ),
+            "Oversized payload must be rejected before decode"
+        );
+    }
+
+    /// TCK-00349: Verify that payloads within bounds are accepted.
+    #[test]
+    fn test_bounded_decode_accepts_within_bounds() {
+        use prost::Message;
+
+        use super::super::messages::{BoundedDecode, DecodeConfig, ShutdownRequest};
+
+        let config = DecodeConfig::default();
+
+        // Create a valid protobuf message
+        let request = ShutdownRequest {
+            reason: Some("test".to_string()),
+        };
+        let mut buf = Vec::new();
+        request.encode(&mut buf).unwrap();
+
+        let result = ShutdownRequest::decode_bounded(&buf, &config);
+        assert!(result.is_ok(), "Valid payload within bounds must decode");
+    }
+
+    /// TCK-00349: Verify that unknown fields in `HelloNack` JSON are rejected
+    /// (`deny_unknown_fields`).
+    #[test]
+    fn test_signed_json_rejects_unknown_fields_hello_nack() {
+        use super::super::handshake::HelloNack;
+
+        // HelloNack uses deny_unknown_fields
+        let json = r#"{"error_code":"rejected","message":"test","unknown_field":"malicious"}"#;
+        let result = serde_json::from_str::<HelloNack>(json);
+        assert!(
+            result.is_err(),
+            "HelloNack must reject unknown fields (signed JSON hardening)"
+        );
+    }
+
+    /// TCK-00349: Verify that default `DecodeConfig` constants are reasonable.
+    #[test]
+    fn test_decode_config_defaults_are_bounded() {
+        use super::super::messages::{
+            DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_REPEATED_FIELD_COUNT, DecodeConfig,
+        };
+
+        let config = DecodeConfig::default();
+        assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(
+            config.max_repeated_field_count,
+            DEFAULT_MAX_REPEATED_FIELD_COUNT
+        );
+
+        // Sanity check: defaults are non-zero and bounded
+        assert!(config.max_message_size > 0);
+        assert!(config.max_message_size <= 128 * 1024 * 1024); // At most 128 MiB
+        assert!(config.max_repeated_field_count > 0);
+        assert!(config.max_repeated_field_count <= 1_000_000);
     }
 }

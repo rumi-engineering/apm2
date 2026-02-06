@@ -628,11 +628,11 @@ async fn tck_00392_e2e_daemon_shutdown_cleans_processes() {
                         return;
                     }
                     let ctx = match st {
-                        SocketType::Operator => {
-                            ConnectionContext::privileged(conn.peer_credentials().cloned())
-                        },
+                        SocketType::Operator => ConnectionContext::privileged_session_open(
+                            conn.peer_credentials().cloned(),
+                        ),
                         SocketType::Session => {
-                            ConnectionContext::session(conn.peer_credentials().cloned(), None)
+                            ConnectionContext::session_open(conn.peer_credentials().cloned(), None)
                         },
                     };
                     let pd = ds.privileged_dispatcher();

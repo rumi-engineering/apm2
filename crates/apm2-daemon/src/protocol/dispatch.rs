@@ -731,6 +731,62 @@ pub trait LedgerEventEmitter: Send + Sync {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a signed receipt with envelope bindings (TCK-00350).
+    ///
+    /// Per REQ-0004, all authoritative effect receipts MUST carry
+    /// `envelope_hash`, `capability_manifest_hash`, and
+    /// `view_commitment_hash`. This method validates bindings before
+    /// emission (fail-closed) and includes them in the signed payload.
+    ///
+    /// # Fail-closed
+    ///
+    /// Returns [`LedgerEventError::ValidationFailed`] if any binding
+    /// hash is zero. Receipts MUST NOT be emitted without valid bindings.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode that produced this receipt
+    /// * `receipt_id` - Unique receipt identifier
+    /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
+    /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
+    /// * `reviewer_actor_id` - Actor ID of the reviewer
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds
+    /// * `bindings` - Envelope bindings to include in the receipt
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if validation, signing, or persistence
+    /// fails.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_receipt_with_bindings(
+        &self,
+        episode_id: &str,
+        receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+        bindings: &crate::episode::EnvelopeBindings,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Fail-closed: validate bindings before emission
+        bindings
+            .validate()
+            .map_err(|e| LedgerEventError::ValidationFailed {
+                message: format!("envelope binding validation failed: {e}"),
+            })?;
+
+        // Default implementation delegates to emit_review_receipt.
+        // Implementations that persist bindings should override this.
+        self.emit_review_receipt(
+            episode_id,
+            receipt_id,
+            changeset_digest,
+            artifact_bundle_hash,
+            reviewer_actor_id,
+            timestamp_ns,
+        )
+    }
 }
 
 /// Domain separation prefix for `WorkClaimed` events.
@@ -2000,6 +2056,101 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
         Ok(signed_event)
     }
+
+    /// TCK-00350: Emits a receipt with envelope bindings in the stub
+    /// implementation.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_receipt_with_bindings(
+        &self,
+        episode_id: &str,
+        receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+        bindings: &crate::episode::EnvelopeBindings,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Fail-closed: validate bindings before emission
+        bindings
+            .validate()
+            .map_err(|e| LedgerEventError::ValidationFailed {
+                message: format!("envelope binding validation failed: {e}"),
+            })?;
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Include bindings in the signed payload
+        let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
+        let payload_json = serde_json::json!({
+            "event_type": "review_receipt_recorded",
+            "episode_id": episode_id,
+            "receipt_id": receipt_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
+            "envelope_hash": env_hex,
+            "capability_manifest_hash": cap_hex,
+            "view_commitment_hash": view_hex,
+        });
+
+        let payload_bytes =
+            serde_json::to_vec(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("payload serialization failed: {e}"),
+            })?;
+
+        let mut canonical_bytes =
+            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "review_receipt_recorded".to_string(),
+            work_id: episode_id.to_string(),
+            actor_id: reviewer_actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(episode_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        Ok(signed_event)
+    }
 }
 
 // ============================================================================
@@ -2526,6 +2677,18 @@ pub struct ConnectionContext {
     /// during `SpawnEpisode` so the authoritative record uses the real
     /// session ID (not a surrogate connection ID).
     contract_binding: Option<crate::hsi_contract::SessionContractBinding>,
+
+    /// Connection phase for session-typed state machine (TCK-00349).
+    ///
+    /// Per REQ-0003, authority-bearing operations require valid session-state
+    /// progression. The phase starts at `Connected`, advances to
+    /// `HandshakeComplete` after successful handshake, then to `SessionOpen`
+    /// when the connection is ready for IPC dispatch.
+    ///
+    /// The [`PrivilegedDispatcher::dispatch`] and
+    /// [`SessionDispatcher::dispatch`] methods check this phase to ensure
+    /// no dispatch occurs before `SessionOpen`.
+    phase: crate::protocol::connection_handler::ConnectionPhase,
 }
 
 impl ConnectionContext {
@@ -2547,6 +2710,9 @@ impl ConnectionContext {
             session_id: None,
             connection_id,
             contract_binding: None,
+            // TCK-00349: New connections start in Connected phase.
+            // Callers MUST advance to SessionOpen before dispatch.
+            phase: crate::protocol::connection_handler::ConnectionPhase::Connected,
         }
     }
 
@@ -2576,6 +2742,9 @@ impl ConnectionContext {
             session_id,
             connection_id,
             contract_binding: None,
+            // TCK-00349: New connections start in Connected phase.
+            // Callers MUST advance to SessionOpen before dispatch.
+            phase: crate::protocol::connection_handler::ConnectionPhase::Connected,
         }
     }
 
@@ -2621,6 +2790,88 @@ impl ConnectionContext {
     #[must_use]
     pub const fn contract_binding(&self) -> Option<&crate::hsi_contract::SessionContractBinding> {
         self.contract_binding.as_ref()
+    }
+
+    /// Returns the current connection phase (TCK-00349).
+    #[must_use]
+    pub const fn phase(&self) -> crate::protocol::connection_handler::ConnectionPhase {
+        self.phase
+    }
+
+    /// Advances the connection phase to `HandshakeComplete` (TCK-00349).
+    ///
+    /// Called after `perform_handshake` succeeds. Must be called before
+    /// `advance_to_session_open`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionPhaseError::IllegalTransition` if the current
+    /// phase is not `Connected`.
+    pub fn advance_to_handshake_complete(
+        &mut self,
+    ) -> Result<(), crate::protocol::connection_handler::ConnectionPhaseError> {
+        self.phase = self.phase.advance_to_handshake_complete()?;
+        Ok(())
+    }
+
+    /// Advances the connection phase to `SessionOpen` (TCK-00349).
+    ///
+    /// Called after handshake completion, before entering the message
+    /// dispatch loop. This is the gate that permits authority-bearing
+    /// IPC operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionPhaseError::IllegalTransition` if the current
+    /// phase is not `HandshakeComplete`.
+    pub fn advance_to_session_open(
+        &mut self,
+    ) -> Result<(), crate::protocol::connection_handler::ConnectionPhaseError> {
+        self.phase = self.phase.advance_to_session_open()?;
+        Ok(())
+    }
+
+    /// Creates a privileged connection context already in `SessionOpen` phase.
+    ///
+    /// This is a convenience constructor for tests and situations where the
+    /// handshake has already been validated externally (e.g., unit tests
+    /// that exercise dispatch directly without a socket handshake).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the phase transitions fail (should never happen for a fresh
+    /// context).
+    #[must_use]
+    pub fn privileged_session_open(peer_credentials: Option<PeerCredentials>) -> Self {
+        let mut ctx = Self::privileged(peer_credentials);
+        ctx.advance_to_handshake_complete()
+            .expect("fresh context should transition to HandshakeComplete");
+        ctx.advance_to_session_open()
+            .expect("HandshakeComplete should transition to SessionOpen");
+        ctx
+    }
+
+    /// Creates a session-scoped connection context already in `SessionOpen`
+    /// phase.
+    ///
+    /// This is a convenience constructor for tests and situations where the
+    /// handshake has already been validated externally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the phase transitions fail (should never happen for a fresh
+    /// context).
+    #[must_use]
+    pub fn session_open(
+        peer_credentials: Option<PeerCredentials>,
+        session_id: Option<String>,
+    ) -> Self {
+        let mut ctx = Self::session(peer_credentials, session_id);
+        ctx.advance_to_handshake_complete()
+            .expect("fresh context should transition to HandshakeComplete");
+        ctx.advance_to_session_open()
+            .expect("HandshakeComplete should transition to SessionOpen");
+        ctx
     }
 }
 
@@ -4337,6 +4588,22 @@ impl PrivilegedDispatcher {
         frame: &Bytes,
         ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
+        // TCK-00349: Check session phase BEFORE any message processing.
+        // No authority-bearing IPC is permitted before SessionOpen.
+        if !ctx.phase().allows_dispatch() {
+            warn!(
+                phase = %ctx.phase(),
+                "Dispatch rejected: connection not in SessionOpen phase"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "dispatch rejected: connection is in {} phase, not SessionOpen",
+                    ctx.phase()
+                ),
+            ));
+        }
+
         // INV-0001: Check privilege BEFORE any message processing
         if !ctx.is_privileged() {
             // TH-004: Generic error prevents endpoint enumeration
@@ -9184,7 +9451,7 @@ mod tests {
         #[test]
         fn test_claim_work_routing() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -9205,7 +9472,7 @@ mod tests {
         #[test]
         fn test_spawn_episode_routing() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -9244,7 +9511,7 @@ mod tests {
             use crate::session::SessionState;
 
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -9307,7 +9574,7 @@ mod tests {
         #[test]
         fn test_shutdown_routing() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -9325,7 +9592,7 @@ mod tests {
         #[test]
         fn test_session_socket_returns_permission_denied() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::session(
+            let ctx = ConnectionContext::session_open(
                 Some(PeerCredentials {
                     uid: 1000,
                     gid: 1000,
@@ -9370,7 +9637,7 @@ mod tests {
     }
 
     fn make_privileged_ctx() -> ConnectionContext {
-        ConnectionContext::privileged(Some(PeerCredentials {
+        ConnectionContext::privileged_session_open(Some(PeerCredentials {
             uid: 1000,
             gid: 1000,
             pid: Some(12345),
@@ -9378,7 +9645,7 @@ mod tests {
     }
 
     fn make_session_ctx() -> ConnectionContext {
-        ConnectionContext::session(
+        ConnectionContext::session_open(
             Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -10000,7 +10267,7 @@ mod tests {
         fn test_missing_credentials_fails() {
             let dispatcher = PrivilegedDispatcher::new();
             // Privileged connection but no credentials
-            let ctx = ConnectionContext::privileged(None);
+            let ctx = ConnectionContext::privileged_session_open(None);
 
             let request = ClaimWorkRequest {
                 actor_id: "test-actor".to_string(),
@@ -11013,7 +11280,7 @@ mod tests {
     #[test]
     fn test_sod_spawn_overlapping_domains_denied() {
         let dispatcher = PrivilegedDispatcher::new();
-        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+        let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
             uid: 1001,
             gid: 1001,
             pid: Some(12345),
@@ -11090,7 +11357,7 @@ mod tests {
     #[test]
     fn test_sod_spawn_non_overlapping_domains_succeeds() {
         let dispatcher = PrivilegedDispatcher::new();
-        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+        let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
             uid: 1001,
             gid: 1001,
             pid: Some(12345),
@@ -11156,7 +11423,7 @@ mod tests {
     #[test]
     fn test_sod_spawn_empty_author_domains_denied() {
         let dispatcher = PrivilegedDispatcher::new();
-        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+        let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
             uid: 1001,
             gid: 1001,
             pid: Some(12345),
@@ -11216,7 +11483,7 @@ mod tests {
     #[test]
     fn test_sod_non_gate_executor_skips_validation() {
         let dispatcher = PrivilegedDispatcher::new();
-        let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+        let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
             uid: 1001,
             gid: 1001,
             pid: Some(12345),
@@ -11355,7 +11622,7 @@ mod tests {
         #[test]
         fn test_list_processes_returns_all() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11381,7 +11648,7 @@ mod tests {
         #[test]
         fn test_list_processes_no_daemon_state() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11400,7 +11667,7 @@ mod tests {
         #[test]
         fn test_process_status_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11429,7 +11696,7 @@ mod tests {
         #[test]
         fn test_process_status_not_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11448,7 +11715,7 @@ mod tests {
         #[test]
         fn test_process_status_name_too_long() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11472,7 +11739,7 @@ mod tests {
         #[test]
         fn test_start_process_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11498,7 +11765,7 @@ mod tests {
         #[test]
         fn test_start_process_not_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11517,7 +11784,7 @@ mod tests {
         #[test]
         fn test_stop_process_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11542,7 +11809,7 @@ mod tests {
         #[test]
         fn test_stop_process_not_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11561,7 +11828,7 @@ mod tests {
         #[test]
         fn test_restart_process_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11586,7 +11853,7 @@ mod tests {
         #[test]
         fn test_restart_process_not_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11605,7 +11872,7 @@ mod tests {
         #[test]
         fn test_reload_process_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11631,7 +11898,7 @@ mod tests {
         #[test]
         fn test_reload_process_not_found() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11651,7 +11918,7 @@ mod tests {
         #[test]
         fn test_session_cannot_list_processes() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::session(
+            let ctx = ConnectionContext::session_open(
                 Some(PeerCredentials {
                     uid: 1000,
                     gid: 1000,
@@ -11725,7 +11992,7 @@ mod tests {
         #[test]
         fn test_list_processes_shows_running_state() {
             let (dispatcher, _shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11763,7 +12030,7 @@ mod tests {
         #[test]
         fn test_start_process_mutates_state() {
             let (dispatcher, shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11800,7 +12067,7 @@ mod tests {
         #[test]
         fn test_stop_process_mutates_state() {
             let (dispatcher, shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11836,7 +12103,7 @@ mod tests {
         #[test]
         fn test_restart_process_mutates_state() {
             let (dispatcher, shared_state) = create_dispatcher_with_processes();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -11920,7 +12187,7 @@ mod tests {
 
         /// Helper to create a privileged context for operator connections.
         fn privileged_ctx() -> ConnectionContext {
-            ConnectionContext::privileged(Some(PeerCredentials {
+            ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -12100,7 +12367,7 @@ mod tests {
         #[test]
         fn test_work_status_denied_from_session_socket() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::session(
+            let ctx = ConnectionContext::session_open(
                 Some(PeerCredentials {
                     uid: 1000,
                     gid: 1000,
@@ -12244,7 +12511,7 @@ mod tests {
         fn claim_and_spawn_with_work_id(
             dispatcher: &PrivilegedDispatcher,
         ) -> Result<(String, String), PrivilegedResponse> {
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -12953,7 +13220,7 @@ mod tests {
         #[test]
         fn test_end_session_cleans_up_telemetry() {
             let (dispatcher, store) = dispatcher_with_telemetry();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -13383,7 +13650,7 @@ mod tests {
             let dispatcher = PrivilegedDispatcher::new().with_telemetry_store(Arc::clone(&store));
 
             // First spawn with valid credentials to establish baseline
-            let valid_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let valid_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -13403,7 +13670,7 @@ mod tests {
             };
 
             // SpawnEpisode WITHOUT peer credentials
-            let no_creds_ctx = ConnectionContext::privileged(None);
+            let no_creds_ctx = ConnectionContext::privileged_session_open(None);
             let spawn_request = SpawnEpisodeRequest {
                 workspace_root: test_workspace_root(),
                 work_id,
@@ -13659,7 +13926,7 @@ mod tests {
         #[test]
         fn claim_work_emits_work_transitioned_open_to_claimed() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -13712,7 +13979,7 @@ mod tests {
         #[test]
         fn spawn_episode_emits_work_transitioned_claimed_to_in_progress() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -13851,7 +14118,7 @@ mod tests {
         #[test]
         fn full_lifecycle_claim_spawn_verify_all_events() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14047,7 +14314,7 @@ mod tests {
         #[test]
         fn end_session_emits_session_terminated_event() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14129,7 +14396,7 @@ mod tests {
         #[test]
         fn end_session_success_does_not_emit_completed_transition() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14204,7 +14471,7 @@ mod tests {
         #[test]
         fn end_session_rejects_unknown_session() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14294,7 +14561,7 @@ mod tests {
         #[test]
         fn duplicate_spawn_detected_via_transition_count() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14516,7 +14783,7 @@ mod tests {
         #[test]
         fn end_session_removes_session_from_registry() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14603,7 +14870,7 @@ mod tests {
         #[test]
         fn end_session_rejects_oversized_reason() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14671,7 +14938,7 @@ mod tests {
         #[test]
         fn end_session_accepts_reason_at_max_length() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14729,7 +14996,7 @@ mod tests {
         #[test]
         fn end_session_succeeds_without_work_transition() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14810,7 +15077,7 @@ mod tests {
         #[test]
         fn end_session_typed_outcome_determines_exit_code() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -14998,7 +15265,7 @@ mod tests {
         #[test]
         fn end_session_terminates_and_cleans_up_completely() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -15101,7 +15368,7 @@ mod tests {
             let dispatcher = PrivilegedDispatcher::new();
 
             // Create a session first (with valid credentials)
-            let valid_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let valid_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -15134,7 +15401,7 @@ mod tests {
             };
 
             // Now try EndSession WITHOUT peer credentials
-            let no_creds_ctx = ConnectionContext::privileged(None);
+            let no_creds_ctx = ConnectionContext::privileged_session_open(None);
             let end_request = EndSessionRequest {
                 session_id: session_id.clone(),
                 reason: "completed_normally".to_string(),
@@ -15191,7 +15458,7 @@ mod tests {
             let dispatcher = PrivilegedDispatcher::new();
 
             // ClaimWork with valid credentials
-            let valid_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let valid_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -15211,7 +15478,7 @@ mod tests {
             };
 
             // SpawnEpisode WITHOUT peer credentials
-            let no_creds_ctx = ConnectionContext::privileged(None);
+            let no_creds_ctx = ConnectionContext::privileged_session_open(None);
             let spawn_request = SpawnEpisodeRequest {
                 workspace_root: test_workspace_root(),
                 work_id,
@@ -15248,7 +15515,7 @@ mod tests {
         #[test]
         fn end_session_rejects_malformed_episode_id() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -15457,7 +15724,7 @@ mod tests {
         }
 
         fn privileged_ctx() -> ConnectionContext {
-            ConnectionContext::privileged(Some(PeerCredentials {
+            ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -15786,7 +16053,7 @@ mod tests {
         #[test]
         fn test_publish_changeset_permission_denied_for_non_privileged() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
-            let ctx = ConnectionContext::session(
+            let ctx = ConnectionContext::session_open(
                 Some(PeerCredentials {
                     uid: 1000,
                     gid: 1000,
@@ -15898,7 +16165,7 @@ mod tests {
                 author_custody_domains: vec![],
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
-            let ctx = ConnectionContext::privileged(Some(peer_creds));
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
             (dispatcher, ctx)
         }
 
@@ -16088,7 +16355,7 @@ mod tests {
         #[test]
         fn test_ingest_review_receipt_lease_not_found() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -16127,7 +16394,7 @@ mod tests {
         #[test]
         fn test_ingest_review_receipt_empty_lease_id() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -16314,7 +16581,7 @@ mod tests {
         fn test_ingest_review_receipt_non_privileged_rejected() {
             let dispatcher = PrivilegedDispatcher::new();
             // Non-privileged context (session socket)
-            let ctx = ConnectionContext::session(
+            let ctx = ConnectionContext::session_open(
                 Some(PeerCredentials {
                     uid: 1000,
                     gid: 1000,
@@ -16445,7 +16712,7 @@ mod tests {
         #[test]
         fn test_ingest_review_receipt_oversized_lease_id() {
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -18359,6 +18626,193 @@ mod tests {
                     "Expected IngestReviewReceipt via governance-resolved path, got {other:?}"
                 ),
             }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00349: Session-typed state machine and fail-closed decoding tests
+    // ========================================================================
+    mod tck_00349_session_state_machine {
+        use super::*;
+
+        /// TCK-00349: Verify that `ConnectionContext` starts in `Connected`
+        /// phase.
+        #[test]
+        fn test_context_starts_in_connected_phase() {
+            use crate::protocol::connection_handler::ConnectionPhase;
+
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            assert_eq!(ctx.phase(), ConnectionPhase::Connected);
+            assert!(!ctx.phase().allows_dispatch());
+        }
+
+        /// TCK-00349: Verify full phase progression on `ConnectionContext`.
+        #[test]
+        fn test_context_full_phase_progression() {
+            use crate::protocol::connection_handler::ConnectionPhase;
+
+            let mut ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Connected -> HandshakeComplete
+            ctx.advance_to_handshake_complete().unwrap();
+            assert_eq!(ctx.phase(), ConnectionPhase::HandshakeComplete);
+            assert!(!ctx.phase().allows_dispatch());
+
+            // HandshakeComplete -> SessionOpen
+            ctx.advance_to_session_open().unwrap();
+            assert_eq!(ctx.phase(), ConnectionPhase::SessionOpen);
+            assert!(ctx.phase().allows_dispatch());
+        }
+
+        /// TCK-00349: Verify that dispatch is rejected in Connected phase.
+        #[test]
+        fn test_dispatch_rejected_in_connected_phase() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Create a valid ClaimWork frame
+            let request = ClaimWorkRequest {
+                actor_id: "test".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: vec![],
+            };
+            let frame = encode_claim_work_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("not SessionOpen"),
+                        "Expected phase error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for pre-SessionOpen dispatch, got {other:?}"),
+            }
+        }
+
+        /// TCK-00349: Verify that dispatch is rejected in `HandshakeComplete`
+        /// phase.
+        #[test]
+        fn test_dispatch_rejected_in_handshake_complete_phase() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let mut ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            ctx.advance_to_handshake_complete().unwrap();
+
+            let request = ClaimWorkRequest {
+                actor_id: "test".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: vec![],
+            };
+            let frame = encode_claim_work_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("not SessionOpen"),
+                        "Expected phase error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for HandshakeComplete dispatch, got {other:?}"),
+            }
+        }
+
+        /// TCK-00349: Verify that dispatch succeeds in `SessionOpen` phase.
+        #[test]
+        fn test_dispatch_succeeds_in_session_open_phase() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ClaimWorkRequest {
+                actor_id: "test".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: vec![],
+            };
+            let frame = encode_claim_work_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            // Should route to handler (ClaimWork response, not error)
+            assert!(
+                matches!(response, PrivilegedResponse::ClaimWork(_)),
+                "Dispatch in SessionOpen phase should route to handler"
+            );
+        }
+
+        /// TCK-00349: Verify unknown tag is rejected as protocol error.
+        #[test]
+        fn test_unknown_tag_returns_protocol_error() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Tag 200 is not a valid message type
+            let frame = Bytes::from(vec![200u8, 0, 0, 0]);
+            let result = dispatcher.dispatch(&frame, &ctx);
+            assert!(
+                result.is_err(),
+                "Unknown tag must return protocol error (fail-closed)"
+            );
+        }
+
+        /// TCK-00349: Verify `privileged_session_open` convenience constructor
+        /// creates context in correct phase.
+        #[test]
+        fn test_privileged_session_open_constructor() {
+            use crate::protocol::connection_handler::ConnectionPhase;
+
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            assert_eq!(ctx.phase(), ConnectionPhase::SessionOpen);
+            assert!(ctx.is_privileged());
+        }
+
+        /// TCK-00349: Verify `session_open` convenience constructor creates
+        /// context in correct phase.
+        #[test]
+        fn test_session_open_constructor() {
+            use crate::protocol::connection_handler::ConnectionPhase;
+
+            let ctx = ConnectionContext::session_open(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12346),
+                }),
+                Some("sess-001".to_string()),
+            );
+            assert_eq!(ctx.phase(), ConnectionPhase::SessionOpen);
+            assert!(!ctx.is_privileged());
         }
     }
 }

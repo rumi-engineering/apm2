@@ -74,7 +74,7 @@ fn make_sqlite_conn(temp_dir: &TempDir) -> Arc<Mutex<Connection>> {
 }
 
 fn make_session_ctx() -> ConnectionContext {
-    ConnectionContext::session(
+    ConnectionContext::session_open(
         Some(PeerCredentials {
             uid: 1000,
             gid: 1000,
@@ -428,7 +428,7 @@ fn tck_00383_cas_directory_creation() {
 /// returns the `session_token` JSON string from the `SpawnEpisodeResponse`.
 fn spawn_session_and_get_token(dispatcher_state: &DispatcherState) -> String {
     let priv_dispatcher = dispatcher_state.privileged_dispatcher();
-    let priv_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+    let priv_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
         uid: 1000,
         gid: 1000,
         pid: Some(99999),
