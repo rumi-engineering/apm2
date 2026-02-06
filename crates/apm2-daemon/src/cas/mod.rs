@@ -412,20 +412,11 @@ impl DurableCas {
         let hash = EventHasher::hash_content(content);
         let size = content.len();
 
-        // Check total size limit
-        let current_size = self.current_total_size.load(Ordering::Relaxed);
-        if current_size.saturating_add(size) > self.max_total_size {
-            return Err(DurableCasError::StorageFull {
-                current_size,
-                new_size: size,
-                max_size: self.max_total_size,
-            });
-        }
-
         // Get storage path
         let (dir_path, file_path) = self.hash_to_paths(&hash);
 
-        // Check if already exists (deduplication)
+        // Check if already exists (deduplication) — BEFORE reserving quota
+        // so that duplicates never consume quota.
         if file_path.exists() {
             // Verify existing content matches (collision detection)
             let existing = self.read_file(&file_path)?;
@@ -441,25 +432,58 @@ impl DurableCas {
             });
         }
 
+        // Atomically reserve quota using compare_exchange loop.
+        // This prevents the TOCTOU race where two concurrent stores could
+        // both pass a non-atomic size check and exceed max_total_size.
+        let mut current = self.current_total_size.load(Ordering::Relaxed);
+        loop {
+            let new_total = current.saturating_add(size);
+            if new_total > self.max_total_size {
+                return Err(DurableCasError::StorageFull {
+                    current_size: current,
+                    new_size: size,
+                    max_size: self.max_total_size,
+                });
+            }
+            match self.current_total_size.compare_exchange_weak(
+                current,
+                new_total,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+
+        // From this point on, quota is reserved. Any failure must roll back
+        // via fetch_sub before returning an error.
+
         // Create shard directory if needed (with 0700 permissions)
-        create_dir_secure(&dir_path)?;
+        if let Err(e) = create_dir_secure(&dir_path) {
+            self.current_total_size.fetch_sub(size, Ordering::AcqRel);
+            return Err(e);
+        }
 
         // Write atomically via temp file + rename
         let temp_path = file_path.with_extension("tmp");
-        self.write_file(&temp_path, content)?;
+        if let Err(e) = self.write_file(&temp_path, content) {
+            self.current_total_size.fetch_sub(size, Ordering::AcqRel);
+            return Err(e);
+        }
 
         // Atomic rename
-        fs::rename(&temp_path, &file_path).map_err(|e| {
+        if let Err(e) = fs::rename(&temp_path, &file_path) {
             // Clean up temp file on failure
             let _ = fs::remove_file(&temp_path);
-            DurableCasError::io(
+            self.current_total_size.fetch_sub(size, Ordering::AcqRel);
+            return Err(DurableCasError::io(
                 format!("rename {} to {}", temp_path.display(), file_path.display()),
                 e,
-            )
-        })?;
+            ));
+        }
 
-        // Update total size (atomic)
-        self.current_total_size.fetch_add(size, Ordering::Relaxed);
+        // Quota was already reserved atomically; persist the new total.
         self.persist_total_size()?;
 
         Ok(StoreResult {
@@ -1324,5 +1348,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// SEC-CAS-005: Concurrent stores must not exceed `max_total_size`.
+    ///
+    /// Regression test for the non-atomic quota enforcement TOCTOU race.
+    /// Before the fix, two concurrent 60-byte stores against
+    /// `max_total_size=100` could both pass the check and produce
+    /// `total=120`.
+    #[test]
+    fn test_concurrent_stores_respect_quota() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = DurableCasConfig::new(temp_dir.path().join("cas")).with_max_total_size(100);
+        let cas = Arc::new(DurableCas::new(config).unwrap());
+
+        let num_threads = 8;
+        // Each payload is 60 bytes — only one should succeed for a 100-byte
+        // quota (60 + 60 = 120 > 100).
+        let payload_size = 60;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let cas = Arc::clone(&cas);
+                thread::spawn(move || {
+                    // Each thread writes distinct content so hashes differ
+                    // (no deduplication).
+                    let mut data = vec![0u8; payload_size];
+                    data[0] = i as u8;
+                    data[1] = (i >> 8) as u8;
+                    cas.store(&data)
+                })
+            })
+            .collect();
+
+        let mut successes = 0usize;
+        let mut storage_full_count = 0usize;
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(result) => {
+                    assert!(result.is_new);
+                    successes += 1;
+                }
+                Err(DurableCasError::StorageFull { .. }) => {
+                    storage_full_count += 1;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        // With a 100-byte quota and 60-byte payloads, at most 1 store can
+        // succeed (60 <= 100, but 60+60 = 120 > 100).
+        assert_eq!(
+            successes, 1,
+            "Expected exactly 1 successful store, got {successes} \
+             (storage_full={storage_full_count})"
+        );
+        assert!(
+            cas.total_size() <= 100,
+            "Total size {} exceeds max_total_size 100 — quota race!",
+            cas.total_size()
+        );
     }
 }
