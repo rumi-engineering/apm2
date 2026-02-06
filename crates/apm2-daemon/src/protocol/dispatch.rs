@@ -2585,7 +2585,7 @@ impl ConnectionContext {
 /// - 66 = `UnsubscribePulse`
 /// - 67 = `UnsubscribePulseResponse` (response only)
 /// - 68 = `PulseEvent` (server->client only)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PrivilegedMessageType {
     /// `ClaimWork` request (IPC-PRIV-001)
@@ -2702,6 +2702,229 @@ impl PrivilegedMessageType {
     #[must_use]
     pub const fn tag(self) -> u8 {
         self as u8
+    }
+
+    /// Returns all request-bearing variants of `PrivilegedMessageType`.
+    ///
+    /// This excludes response-only and notification-only variants such as
+    /// `PulseEvent`. Adding a new request-bearing variant to the enum
+    /// without adding it here will cause the HSI manifest completeness
+    /// tests to fail.
+    #[must_use]
+    pub const fn all_request_variants() -> &'static [Self] {
+        &[
+            Self::ClaimWork,
+            Self::SpawnEpisode,
+            Self::IssueCapability,
+            Self::Shutdown,
+            Self::ListProcesses,
+            Self::ProcessStatus,
+            Self::StartProcess,
+            Self::StopProcess,
+            Self::RestartProcess,
+            Self::ReloadProcess,
+            Self::ConsensusStatus,
+            Self::ConsensusValidators,
+            Self::ConsensusByzantineEvidence,
+            Self::ConsensusMetrics,
+            Self::WorkStatus,
+            Self::EndSession,
+            Self::IngestReviewReceipt,
+            Self::ListCredentials,
+            Self::AddCredential,
+            Self::RemoveCredential,
+            Self::RefreshCredential,
+            Self::SwitchCredential,
+            Self::LoginCredential,
+            Self::SubscribePulse,
+            Self::UnsubscribePulse,
+            Self::PublishChangeSet,
+        ]
+    }
+
+    /// Returns `true` if this variant represents a client-initiated request,
+    /// `false` if it is a server-to-client notification or response-only
+    /// variant.
+    ///
+    /// This method uses an **exhaustive** match (no wildcard `_ =>` arm), so
+    /// adding a new variant to the enum forces a compile error until it is
+    /// classified here. This provides the non-self-referential completeness
+    /// guarantee required by RFC-0020 section 3.1.1.
+    #[must_use]
+    pub const fn is_client_request(self) -> bool {
+        // IMPORTANT: This match MUST remain exhaustive (no `_ =>` wildcard).
+        // Adding a new enum variant forces a compile error here, ensuring the
+        // developer must classify it as client-request (true) or not (false).
+        match self {
+            Self::ClaimWork
+            | Self::SpawnEpisode
+            | Self::IssueCapability
+            | Self::Shutdown
+            | Self::ListProcesses
+            | Self::ProcessStatus
+            | Self::StartProcess
+            | Self::StopProcess
+            | Self::RestartProcess
+            | Self::ReloadProcess
+            | Self::ConsensusStatus
+            | Self::ConsensusValidators
+            | Self::ConsensusByzantineEvidence
+            | Self::ConsensusMetrics
+            | Self::WorkStatus
+            | Self::EndSession
+            | Self::IngestReviewReceipt
+            | Self::ListCredentials
+            | Self::AddCredential
+            | Self::RemoveCredential
+            | Self::RefreshCredential
+            | Self::SwitchCredential
+            | Self::LoginCredential
+            | Self::SubscribePulse
+            | Self::UnsubscribePulse
+            | Self::PublishChangeSet => true,
+            // Server-to-client notification only — not a client request.
+            Self::PulseEvent => false,
+        }
+    }
+
+    /// Returns the HSI route path for this variant.
+    ///
+    /// Used by the HSI contract manifest to derive routes directly from the
+    /// dispatch enum, ensuring the manifest stays in sync with the actual
+    /// dispatch registry.
+    #[must_use]
+    pub const fn hsi_route(self) -> &'static str {
+        match self {
+            Self::ClaimWork => "hsi.work.claim",
+            Self::SpawnEpisode => "hsi.episode.spawn",
+            Self::IssueCapability => "hsi.capability.issue",
+            Self::Shutdown => "hsi.daemon.shutdown",
+            Self::ListProcesses => "hsi.process.list",
+            Self::ProcessStatus => "hsi.process.status",
+            Self::StartProcess => "hsi.process.start",
+            Self::StopProcess => "hsi.process.stop",
+            Self::RestartProcess => "hsi.process.restart",
+            Self::ReloadProcess => "hsi.process.reload",
+            Self::ConsensusStatus => "hsi.consensus.status",
+            Self::ConsensusValidators => "hsi.consensus.validators",
+            Self::ConsensusByzantineEvidence => "hsi.consensus.byzantine_evidence",
+            Self::ConsensusMetrics => "hsi.consensus.metrics",
+            Self::WorkStatus => "hsi.work.status",
+            Self::EndSession => "hsi.session.end",
+            Self::IngestReviewReceipt => "hsi.review.ingest_receipt",
+            Self::ListCredentials => "hsi.credential.list",
+            Self::AddCredential => "hsi.credential.add",
+            Self::RemoveCredential => "hsi.credential.remove",
+            Self::RefreshCredential => "hsi.credential.refresh",
+            Self::SwitchCredential => "hsi.credential.switch",
+            Self::LoginCredential => "hsi.credential.login",
+            Self::SubscribePulse => "hsi.pulse.subscribe",
+            Self::UnsubscribePulse => "hsi.pulse.unsubscribe",
+            Self::PublishChangeSet => "hsi.changeset.publish",
+            Self::PulseEvent => "hsi.pulse.event",
+        }
+    }
+
+    /// Returns the HSI manifest route ID for this variant.
+    #[must_use]
+    pub const fn hsi_route_id(self) -> &'static str {
+        match self {
+            Self::ClaimWork => "CLAIM_WORK",
+            Self::SpawnEpisode => "SPAWN_EPISODE",
+            Self::IssueCapability => "ISSUE_CAPABILITY",
+            Self::Shutdown => "SHUTDOWN",
+            Self::ListProcesses => "LIST_PROCESSES",
+            Self::ProcessStatus => "PROCESS_STATUS",
+            Self::StartProcess => "START_PROCESS",
+            Self::StopProcess => "STOP_PROCESS",
+            Self::RestartProcess => "RESTART_PROCESS",
+            Self::ReloadProcess => "RELOAD_PROCESS",
+            Self::ConsensusStatus => "CONSENSUS_STATUS",
+            Self::ConsensusValidators => "CONSENSUS_VALIDATORS",
+            Self::ConsensusByzantineEvidence => "CONSENSUS_BYZANTINE_EVIDENCE",
+            Self::ConsensusMetrics => "CONSENSUS_METRICS",
+            Self::WorkStatus => "WORK_STATUS",
+            Self::EndSession => "END_SESSION",
+            Self::IngestReviewReceipt => "INGEST_REVIEW_RECEIPT",
+            Self::ListCredentials => "LIST_CREDENTIALS",
+            Self::AddCredential => "ADD_CREDENTIAL",
+            Self::RemoveCredential => "REMOVE_CREDENTIAL",
+            Self::RefreshCredential => "REFRESH_CREDENTIAL",
+            Self::SwitchCredential => "SWITCH_CREDENTIAL",
+            Self::LoginCredential => "LOGIN_CREDENTIAL",
+            Self::SubscribePulse => "SUBSCRIBE_PULSE",
+            Self::UnsubscribePulse => "UNSUBSCRIBE_PULSE",
+            Self::PublishChangeSet => "PUBLISH_CHANGESET",
+            Self::PulseEvent => "PULSE_EVENT",
+        }
+    }
+
+    /// Returns the HSI request schema ID for this variant.
+    #[must_use]
+    pub const fn hsi_request_schema(self) -> &'static str {
+        match self {
+            Self::ClaimWork => "apm2.claim_work_request.v1",
+            Self::SpawnEpisode => "apm2.spawn_episode_request.v1",
+            Self::IssueCapability => "apm2.issue_capability_request.v1",
+            Self::Shutdown => "apm2.shutdown_request.v1",
+            Self::ListProcesses => "apm2.list_processes_request.v1",
+            Self::ProcessStatus => "apm2.process_status_request.v1",
+            Self::StartProcess => "apm2.start_process_request.v1",
+            Self::StopProcess => "apm2.stop_process_request.v1",
+            Self::RestartProcess => "apm2.restart_process_request.v1",
+            Self::ReloadProcess => "apm2.reload_process_request.v1",
+            Self::ConsensusStatus => "apm2.consensus_status_request.v1",
+            Self::ConsensusValidators => "apm2.consensus_validators_request.v1",
+            Self::ConsensusByzantineEvidence => "apm2.consensus_byzantine_evidence_request.v1",
+            Self::ConsensusMetrics => "apm2.consensus_metrics_request.v1",
+            Self::WorkStatus => "apm2.work_status_request.v1",
+            Self::EndSession => "apm2.end_session_request.v1",
+            Self::IngestReviewReceipt => "apm2.ingest_review_receipt_request.v1",
+            Self::ListCredentials => "apm2.list_credentials_request.v1",
+            Self::AddCredential => "apm2.add_credential_request.v1",
+            Self::RemoveCredential => "apm2.remove_credential_request.v1",
+            Self::RefreshCredential => "apm2.refresh_credential_request.v1",
+            Self::SwitchCredential => "apm2.switch_credential_request.v1",
+            Self::LoginCredential => "apm2.login_credential_request.v1",
+            Self::SubscribePulse => "apm2.subscribe_pulse_request.v1",
+            Self::UnsubscribePulse => "apm2.unsubscribe_pulse_request.v1",
+            Self::PublishChangeSet => "apm2.publish_changeset_request.v1",
+            Self::PulseEvent => "apm2.pulse_event_request.v1",
+        }
+    }
+
+    /// Returns the HSI response schema ID for this variant.
+    #[must_use]
+    pub const fn hsi_response_schema(self) -> &'static str {
+        match self {
+            Self::ClaimWork => "apm2.claim_work_response.v1",
+            Self::SpawnEpisode => "apm2.spawn_episode_response.v1",
+            Self::IssueCapability => "apm2.issue_capability_response.v1",
+            Self::Shutdown => "apm2.shutdown_response.v1",
+            Self::ListProcesses => "apm2.list_processes_response.v1",
+            Self::ProcessStatus => "apm2.process_status_response.v1",
+            Self::StartProcess => "apm2.start_process_response.v1",
+            Self::StopProcess => "apm2.stop_process_response.v1",
+            Self::RestartProcess => "apm2.restart_process_response.v1",
+            Self::ReloadProcess => "apm2.reload_process_response.v1",
+            Self::ConsensusStatus => "apm2.consensus_status_response.v1",
+            Self::ConsensusValidators => "apm2.consensus_validators_response.v1",
+            Self::ConsensusByzantineEvidence => "apm2.consensus_byzantine_evidence_response.v1",
+            Self::ConsensusMetrics => "apm2.consensus_metrics_response.v1",
+            Self::WorkStatus => "apm2.work_status_response.v1",
+            Self::EndSession => "apm2.end_session_response.v1",
+            Self::IngestReviewReceipt => "apm2.ingest_review_receipt_response.v1",
+            Self::ListCredentials => "apm2.list_credentials_response.v1",
+            Self::AddCredential => "apm2.add_credential_response.v1",
+            Self::RemoveCredential => "apm2.remove_credential_response.v1",
+            Self::RefreshCredential => "apm2.refresh_credential_response.v1",
+            Self::SwitchCredential => "apm2.switch_credential_response.v1",
+            Self::LoginCredential => "apm2.login_credential_response.v1",
+            Self::SubscribePulse => "apm2.subscribe_pulse_response.v1",
+            Self::UnsubscribePulse => "apm2.unsubscribe_pulse_response.v1",
+            Self::PublishChangeSet => "apm2.publish_changeset_response.v1",
+            Self::PulseEvent => "apm2.pulse_event_response.v1",
+        }
     }
 }
 

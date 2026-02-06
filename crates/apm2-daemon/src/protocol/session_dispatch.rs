@@ -111,7 +111,7 @@ use crate::htf::{ClockError, HolonicClock};
 /// - 66 = `UnsubscribePulse`
 /// - 67 = `UnsubscribePulseResponse` (response only)
 /// - 68 = `PulseEvent` (server->client only)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum SessionMessageType {
     /// `RequestTool` request (IPC-SESS-001)
@@ -158,6 +158,121 @@ impl SessionMessageType {
     #[must_use]
     pub const fn tag(self) -> u8 {
         self as u8
+    }
+
+    /// Returns all request-bearing variants of `SessionMessageType`.
+    ///
+    /// This excludes response-only and notification-only variants such as
+    /// `PulseEvent`. Adding a new request-bearing variant to the enum
+    /// without adding it here will cause the HSI manifest completeness
+    /// tests to fail.
+    #[must_use]
+    pub const fn all_request_variants() -> &'static [Self] {
+        &[
+            Self::RequestTool,
+            Self::EmitEvent,
+            Self::PublishEvidence,
+            Self::StreamTelemetry,
+            Self::StreamLogs,
+            Self::SessionStatus,
+            Self::SubscribePulse,
+            Self::UnsubscribePulse,
+        ]
+    }
+
+    /// Returns `true` if this variant represents a client-initiated request,
+    /// `false` if it is a server-to-client notification or response-only
+    /// variant.
+    ///
+    /// This method uses an **exhaustive** match (no wildcard `_ =>` arm), so
+    /// adding a new variant to the enum forces a compile error until it is
+    /// classified here. This provides the non-self-referential completeness
+    /// guarantee required by RFC-0020 section 3.1.1.
+    #[must_use]
+    pub const fn is_client_request(self) -> bool {
+        // IMPORTANT: This match MUST remain exhaustive (no `_ =>` wildcard).
+        // Adding a new enum variant forces a compile error here, ensuring the
+        // developer must classify it as client-request (true) or not (false).
+        match self {
+            Self::RequestTool
+            | Self::EmitEvent
+            | Self::PublishEvidence
+            | Self::StreamTelemetry
+            | Self::StreamLogs
+            | Self::SessionStatus
+            | Self::SubscribePulse
+            | Self::UnsubscribePulse => true,
+            // Server-to-client notification only — not a client request.
+            Self::PulseEvent => false,
+        }
+    }
+
+    /// Returns the HSI route path for this variant.
+    ///
+    /// Used by the HSI contract manifest to derive routes directly from the
+    /// dispatch enum, ensuring the manifest stays in sync with the actual
+    /// dispatch registry.
+    #[must_use]
+    pub const fn hsi_route(self) -> &'static str {
+        match self {
+            Self::RequestTool => "hsi.tool.request",
+            Self::EmitEvent => "hsi.event.emit",
+            Self::PublishEvidence => "hsi.evidence.publish",
+            Self::StreamTelemetry => "hsi.telemetry.stream",
+            Self::StreamLogs => "hsi.logs.stream",
+            Self::SessionStatus => "hsi.session.status",
+            Self::SubscribePulse => "hsi.pulse.subscribe",
+            Self::UnsubscribePulse => "hsi.pulse.unsubscribe",
+            Self::PulseEvent => "hsi.pulse.event",
+        }
+    }
+
+    /// Returns the HSI manifest route ID for this variant.
+    #[must_use]
+    pub const fn hsi_route_id(self) -> &'static str {
+        match self {
+            Self::RequestTool => "REQUEST_TOOL",
+            Self::EmitEvent => "EMIT_EVENT",
+            Self::PublishEvidence => "PUBLISH_EVIDENCE",
+            Self::StreamTelemetry => "STREAM_TELEMETRY",
+            Self::StreamLogs => "STREAM_LOGS",
+            Self::SessionStatus => "SESSION_STATUS",
+            Self::SubscribePulse => "SUBSCRIBE_PULSE",
+            Self::UnsubscribePulse => "UNSUBSCRIBE_PULSE",
+            Self::PulseEvent => "PULSE_EVENT",
+        }
+    }
+
+    /// Returns the HSI request schema ID for this variant.
+    #[must_use]
+    pub const fn hsi_request_schema(self) -> &'static str {
+        match self {
+            Self::RequestTool => "apm2.request_tool_request.v1",
+            Self::EmitEvent => "apm2.emit_event_request.v1",
+            Self::PublishEvidence => "apm2.publish_evidence_request.v1",
+            Self::StreamTelemetry => "apm2.stream_telemetry_request.v1",
+            Self::StreamLogs => "apm2.stream_logs_request.v1",
+            Self::SessionStatus => "apm2.session_status_request.v1",
+            Self::SubscribePulse => "apm2.subscribe_pulse_request.v1",
+            Self::UnsubscribePulse => "apm2.unsubscribe_pulse_request.v1",
+            Self::PulseEvent => "apm2.pulse_event_request.v1",
+        }
+    }
+
+    /// Returns the HSI response schema ID for this variant.
+    #[must_use]
+    pub const fn hsi_response_schema(self) -> &'static str {
+        match self {
+            Self::RequestTool => "apm2.request_tool_response.v1",
+            Self::EmitEvent => "apm2.emit_event_response.v1",
+            Self::PublishEvidence => "apm2.publish_evidence_response.v1",
+            Self::StreamTelemetry => "apm2.stream_telemetry_response.v1",
+            Self::StreamLogs => "apm2.stream_logs_response.v1",
+            Self::SessionStatus => "apm2.session_status_response.v1",
+            Self::SubscribePulse => "apm2.subscribe_pulse_response.v1",
+            Self::UnsubscribePulse => "apm2.unsubscribe_pulse_response.v1",
+            Self::PulseEvent => "apm2.pulse_event_response.v1",
+        }
     }
 }
 

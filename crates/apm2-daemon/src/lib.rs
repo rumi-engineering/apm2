@@ -39,6 +39,7 @@
 //! - [`projection`]: FAC projection adapters for external system sync
 //! - [`protocol`]: UDS protocol and message framing
 //! - [`session`]: Session handling with context firewall integration
+//! - [`hsi_contract`]: HSI Contract Manifest V1 for RFC-0020 (TCK-00347)
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
 
 pub mod cas;
@@ -46,6 +47,7 @@ pub mod episode;
 pub mod evidence;
 pub mod gate;
 pub mod governance;
+pub mod hsi_contract;
 pub mod htf;
 pub mod ledger;
 pub mod metrics;
