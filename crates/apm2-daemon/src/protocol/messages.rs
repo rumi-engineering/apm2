@@ -396,6 +396,9 @@ impl_bounded_decode_simple!(
     // TCK-00395: EndSession for session termination with ledger events
     EndSessionRequest,
     EndSessionResponse,
+    // TCK-00389: Review receipt ingestion
+    IngestReviewReceiptRequest,
+    IngestReviewReceiptResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

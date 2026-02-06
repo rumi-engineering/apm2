@@ -1459,6 +1459,48 @@ pub struct ConsensusError {
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
+/// Request to ingest a review receipt from an external reviewer.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IngestReviewReceiptRequest {
+    /// Gate lease ID that authorized this review.
+    #[prost(string, tag = "1")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Unique receipt identifier for idempotency.
+    #[prost(string, tag = "2")]
+    pub receipt_id: ::prost::alloc::string::String,
+    /// Reviewer identity (must match gate lease executor_actor_id).
+    #[prost(string, tag = "3")]
+    pub reviewer_actor_id: ::prost::alloc::string::String,
+    /// BLAKE3 digest of the changeset being reviewed.
+    #[prost(bytes = "vec", tag = "4")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the ReviewArtifactBundleV1 stored in CAS.
+    #[prost(bytes = "vec", tag = "5")]
+    pub artifact_bundle_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Review verdict.
+    #[prost(enumeration = "ReviewReceiptVerdict", tag = "6")]
+    pub verdict: i32,
+    /// Reason code for blocked reviews (only used when verdict is BLOCKED).
+    /// Maps to ReasonCode numeric codes (1=APPLY_FAILED, 2=TOOL_FAILED, etc.).
+    #[prost(uint32, tag = "7")]
+    pub blocked_reason_code: u32,
+    /// BLAKE3 hash of blocked logs stored in CAS (only for BLOCKED verdict).
+    #[prost(bytes = "vec", tag = "8")]
+    pub blocked_log_hash: ::prost::alloc::vec::Vec<u8>,
+}
+/// Response confirming review receipt ingestion.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IngestReviewReceiptResponse {
+    /// The receipt ID that was ingested.
+    #[prost(string, tag = "1")]
+    pub receipt_id: ::prost::alloc::string::String,
+    /// The event type that was emitted (ReviewReceiptRecorded or ReviewBlockedRecorded).
+    #[prost(string, tag = "2")]
+    pub event_type: ::prost::alloc::string::String,
+    /// The ledger event ID for the emitted event.
+    #[prost(string, tag = "3")]
+    pub event_id: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -2241,6 +2283,38 @@ impl ConsensusErrorCode {
             "CONSENSUS_ERROR_UNSPECIFIED" => Some(Self::ConsensusErrorUnspecified),
             "CONSENSUS_NOT_CONFIGURED" => Some(Self::ConsensusNotConfigured),
             "CONSENSUS_INVALID_PARAMETER" => Some(Self::ConsensusInvalidParameter),
+            _ => None,
+        }
+    }
+}
+/// Review verdict enum for receipt ingestion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReviewReceiptVerdict {
+    Unspecified = 0,
+    /// Review approved the changeset.
+    Approve = 1,
+    /// Review was blocked (tool failure, apply failure, etc.).
+    Blocked = 2,
+}
+impl ReviewReceiptVerdict {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REVIEW_RECEIPT_VERDICT_UNSPECIFIED",
+            Self::Approve => "REVIEW_RECEIPT_VERDICT_APPROVE",
+            Self::Blocked => "REVIEW_RECEIPT_VERDICT_BLOCKED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REVIEW_RECEIPT_VERDICT_UNSPECIFIED" => Some(Self::Unspecified),
+            "REVIEW_RECEIPT_VERDICT_APPROVE" => Some(Self::Approve),
+            "REVIEW_RECEIPT_VERDICT_BLOCKED" => Some(Self::Blocked),
             _ => None,
         }
     }

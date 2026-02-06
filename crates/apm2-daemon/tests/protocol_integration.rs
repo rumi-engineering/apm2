@@ -1258,7 +1258,9 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(PrivilegedMessageType::from_tag(15).is_some()); // WorkStatus
     // Tag 16: TCK-00395 EndSession
     assert!(PrivilegedMessageType::from_tag(16).is_some()); // EndSession
-    assert!(PrivilegedMessageType::from_tag(17).is_none()); // Invalid (gap)
+    // Tag 17: TCK-00389 IngestReviewReceipt
+    assert!(PrivilegedMessageType::from_tag(17).is_some()); // IngestReviewReceipt
+    assert!(PrivilegedMessageType::from_tag(18).is_none()); // Invalid (gap)
     assert!(PrivilegedMessageType::from_tag(20).is_none()); // Invalid (gap)
     // Tags 21-26: Credential management (CTR-PROTO-012, TCK-00343)
     assert!(PrivilegedMessageType::from_tag(21).is_some()); // ListCredentials

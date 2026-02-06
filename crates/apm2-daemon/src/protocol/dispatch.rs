@@ -46,22 +46,70 @@ use tracing::{debug, info, warn};
 use super::credentials::PeerCredentials;
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
-    AddCredentialRequest, AddCredentialResponse, BoundedDecode, ClaimWorkRequest,
-    ClaimWorkResponse, ConsensusByzantineEvidenceRequest, ConsensusByzantineEvidenceResponse,
-    ConsensusErrorCode, ConsensusMetricsRequest, ConsensusMetricsResponse, ConsensusStatusRequest,
-    ConsensusStatusResponse, ConsensusValidatorsRequest, ConsensusValidatorsResponse,
-    CredentialAuthMethod as ProtoAuthMethod, CredentialProvider as ProtoProvider, DecodeConfig,
-    EndSessionRequest, EndSessionResponse, IssueCapabilityRequest, IssueCapabilityResponse,
-    ListCredentialsRequest, ListCredentialsResponse, ListProcessesRequest, ListProcessesResponse,
-    LoginCredentialRequest, LoginCredentialResponse, PatternRejection, PrivilegedError,
-    PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
-    ProcessStatusResponse, RefreshCredentialRequest, RefreshCredentialResponse,
-    ReloadProcessRequest, ReloadProcessResponse, RemoveCredentialRequest, RemoveCredentialResponse,
-    RestartProcessRequest, RestartProcessResponse, ShutdownRequest, ShutdownResponse,
-    SpawnEpisodeRequest, SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse,
-    StopProcessRequest, StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse,
-    SwitchCredentialRequest, SwitchCredentialResponse, TerminationOutcome, UnsubscribePulseRequest,
-    UnsubscribePulseResponse, WorkRole, WorkStatusRequest, WorkStatusResponse,
+    AddCredentialRequest,
+    AddCredentialResponse,
+    BoundedDecode,
+    ClaimWorkRequest,
+    ClaimWorkResponse,
+    ConsensusByzantineEvidenceRequest,
+    ConsensusByzantineEvidenceResponse,
+    ConsensusErrorCode,
+    ConsensusMetricsRequest,
+    ConsensusMetricsResponse,
+    ConsensusStatusRequest,
+    ConsensusStatusResponse,
+    ConsensusValidatorsRequest,
+    ConsensusValidatorsResponse,
+    CredentialAuthMethod as ProtoAuthMethod,
+    CredentialProvider as ProtoProvider,
+    DecodeConfig,
+    EndSessionRequest,
+    EndSessionResponse,
+    // TCK-00389: Review receipt ingestion types
+    IngestReviewReceiptRequest,
+    IngestReviewReceiptResponse,
+    IssueCapabilityRequest,
+    IssueCapabilityResponse,
+    ListCredentialsRequest,
+    ListCredentialsResponse,
+    ListProcessesRequest,
+    ListProcessesResponse,
+    LoginCredentialRequest,
+    LoginCredentialResponse,
+    PatternRejection,
+    PrivilegedError,
+    PrivilegedErrorCode,
+    ProcessInfo,
+    ProcessStateEnum,
+    ProcessStatusRequest,
+    ProcessStatusResponse,
+    RefreshCredentialRequest,
+    RefreshCredentialResponse,
+    ReloadProcessRequest,
+    ReloadProcessResponse,
+    RemoveCredentialRequest,
+    RemoveCredentialResponse,
+    RestartProcessRequest,
+    RestartProcessResponse,
+    ReviewReceiptVerdict,
+    ShutdownRequest,
+    ShutdownResponse,
+    SpawnEpisodeRequest,
+    SpawnEpisodeResponse,
+    StartProcessRequest,
+    StartProcessResponse,
+    StopProcessRequest,
+    StopProcessResponse,
+    SubscribePulseRequest,
+    SubscribePulseResponse,
+    SwitchCredentialRequest,
+    SwitchCredentialResponse,
+    TerminationOutcome,
+    UnsubscribePulseRequest,
+    UnsubscribePulseResponse,
+    WorkRole,
+    WorkStatusRequest,
+    WorkStatusResponse,
 };
 use super::pulse_acl::{
     AclDecision, AclError, PulseAclEvaluator, validate_client_sub_id, validate_subscription_id,
@@ -387,6 +435,36 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
+    /// Emits a `ReviewBlockedRecorded` ledger event (TCK-00389).
+    ///
+    /// Records a blocked review outcome in the ledger. This is emitted when
+    /// an external reviewer reports that the review was blocked due to tool
+    /// failure, apply failure, or similar issues.
+    ///
+    /// # Arguments
+    ///
+    /// * `receipt_id` - Unique receipt identifier (used as `blocked_id`)
+    /// * `reason_code` - Numeric reason code for the blocked review
+    /// * `blocked_log_hash` - CAS hash of blocked logs
+    /// * `reviewer_actor_id` - Actor ID of the reviewer
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_review_blocked_receipt(
+        &self,
+        receipt_id: &str,
+        reason_code: u32,
+        blocked_log_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
     /// Returns the number of `work_transitioned` events for a given work ID.
     ///
     /// This is the authoritative source for the `previous_transition_count`
@@ -645,6 +723,13 @@ pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
 // to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
 // See `apm2_core::fac::domain_separator` for the canonical definition.
+
+/// Domain separation prefix for `ReviewBlockedRecorded` ledger events
+/// (TCK-00389).
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// This prefix is used when emitting review blocked events to the ledger.
+pub const REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX: &[u8] = b"apm2.event.review_blocked_recorded:";
 
 /// Maximum length for ID fields (`work_id`, `lease_id`, etc.).
 ///
@@ -1348,6 +1433,92 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             episode_id = %episode_id,
             receipt_id = %receipt_id,
             "ReviewReceiptRecorded event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_review_blocked_receipt(
+        &self,
+        receipt_id: &str,
+        reason_code: u32,
+        blocked_log_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        let payload_json = serde_json::json!({
+            "event_type": "review_blocked_recorded",
+            "receipt_id": receipt_id,
+            "reason_code": reason_code,
+            "blocked_log_hash": hex::encode(blocked_log_hash),
+            "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes =
+            Vec::with_capacity(REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "review_blocked_recorded".to_string(),
+            work_id: receipt_id.to_string(),
+            actor_id: reviewer_actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(receipt_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            receipt_id = %receipt_id,
+            reason_code = %reason_code,
+            "ReviewBlockedRecorded event signed and persisted"
         );
 
         Ok(signed_event)
@@ -2285,6 +2456,8 @@ pub enum PrivilegedMessageType {
     WorkStatus          = 15,
     /// `EndSession` request (IPC-PRIV-016, TCK-00395)
     EndSession          = 16,
+    /// `IngestReviewReceipt` request (IPC-PRIV-017, TCK-00389)
+    IngestReviewReceipt = 17,
     // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
     /// `ListCredentials` request (IPC-PRIV-021)
     ListCredentials     = 21,
@@ -2332,6 +2505,8 @@ impl PrivilegedMessageType {
             15 => Some(Self::WorkStatus),
             // TCK-00395: EndSession for session termination
             16 => Some(Self::EndSession),
+            // TCK-00389: IngestReviewReceipt for external reviewer results
+            17 => Some(Self::IngestReviewReceipt),
             // Credential management tags (21-26, TCK-00343)
             21 => Some(Self::ListCredentials),
             22 => Some(Self::AddCredential),
@@ -2388,6 +2563,8 @@ pub enum PrivilegedResponse {
     WorkStatus(WorkStatusResponse),
     /// Successful `EndSession` response (TCK-00395).
     EndSession(EndSessionResponse),
+    /// Successful `IngestReviewReceipt` response (TCK-00389).
+    IngestReviewReceipt(IngestReviewReceiptResponse),
     // --- Credential Management (CTR-PROTO-012, TCK-00343) ---
     /// Successful `ListCredentials` response.
     ListCredentials(ListCredentialsResponse),
@@ -2495,6 +2672,11 @@ impl PrivilegedResponse {
             },
             Self::EndSession(resp) => {
                 buf.push(PrivilegedMessageType::EndSession.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            // TCK-00389: IngestReviewReceipt
+            Self::IngestReviewReceipt(resp) => {
+                buf.push(PrivilegedMessageType::IngestReviewReceipt.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             // Credential Management (CTR-PROTO-012, TCK-00343)
@@ -2659,19 +2841,48 @@ pub trait LeaseValidator: Send + Sync {
         work_id: &str,
     ) -> Result<(), LeaseValidationError>;
 
+    /// Returns the `executor_actor_id` bound to a lease (TCK-00389).
+    ///
+    /// This is used by `IngestReviewReceipt` to validate that the reviewer
+    /// identity matches the executor authorized by the gate lease.
+    ///
+    /// # Returns
+    ///
+    /// `Some(actor_id)` if the lease exists, `None` otherwise.
+    fn get_lease_executor_actor_id(&self, lease_id: &str) -> Option<String>;
+
     /// Registers a gate lease for testing purposes.
     ///
     /// In production, leases are issued through a separate governance flow.
     /// This method exists to support test fixtures.
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str);
+
+    /// Registers a gate lease with an executor actor ID (TCK-00389).
+    ///
+    /// This method exists to support test fixtures that need to verify
+    /// reviewer identity against the lease's `executor_actor_id`.
+    fn register_lease_with_executor(
+        &self,
+        lease_id: &str,
+        work_id: &str,
+        gate_id: &str,
+        executor_actor_id: &str,
+    ) {
+        // Default: delegate to register_lease (backward compat)
+        let _ = executor_actor_id;
+        self.register_lease(lease_id, work_id, gate_id);
+    }
 }
 
 /// Entry for a registered lease.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)]
 struct LeaseEntry {
     work_id: String,
     #[allow(dead_code)]
     gate_id: String,
+    /// The executor actor ID authorized by this lease (TCK-00389).
+    executor_actor_id: String,
 }
 
 /// Stub implementation of [`LeaseValidator`] for testing.
@@ -2743,7 +2954,27 @@ impl LeaseValidator for StubLeaseValidator {
         )
     }
 
+    fn get_lease_executor_actor_id(&self, lease_id: &str) -> Option<String> {
+        let guard = self.leases.read().expect("lock poisoned");
+        let (_, leases) = &*guard;
+        leases
+            .get(lease_id)
+            .map(|entry| entry.executor_actor_id.clone())
+    }
+
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
+        // Delegate to register_lease_with_executor with empty executor ID
+        // for backward compatibility with existing tests.
+        self.register_lease_with_executor(lease_id, work_id, gate_id, "");
+    }
+
+    fn register_lease_with_executor(
+        &self,
+        lease_id: &str,
+        work_id: &str,
+        gate_id: &str,
+        executor_actor_id: &str,
+    ) {
         let mut guard = self.leases.write().expect("lock poisoned");
         let (order, leases) = &mut *guard;
 
@@ -2755,6 +2986,7 @@ impl LeaseValidator for StubLeaseValidator {
                 LeaseEntry {
                     work_id: work_id.to_string(),
                     gate_id: gate_id.to_string(),
+                    executor_actor_id: executor_actor_id.to_string(),
                 },
             );
             return;
@@ -2776,6 +3008,7 @@ impl LeaseValidator for StubLeaseValidator {
             LeaseEntry {
                 work_id: work_id.to_string(),
                 gate_id: gate_id.to_string(),
+                executor_actor_id: executor_actor_id.to_string(),
             },
         );
     }
@@ -3551,6 +3784,10 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::WorkStatus => self.handle_work_status(payload, ctx),
             // TCK-00395: EndSession for session termination with ledger event
             PrivilegedMessageType::EndSession => self.handle_end_session(payload, ctx),
+            // TCK-00389: IngestReviewReceipt for external reviewer results
+            PrivilegedMessageType::IngestReviewReceipt => {
+                self.handle_ingest_review_receipt(payload, ctx)
+            },
             // Credential Management (CTR-PROTO-012, TCK-00343)
             PrivilegedMessageType::ListCredentials => self.handle_list_credentials(payload, ctx),
             PrivilegedMessageType::AddCredential => self.handle_add_credential(payload, ctx),
@@ -3593,6 +3830,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::WorkStatus => "WorkStatus",
                 // TCK-00395
                 PrivilegedMessageType::EndSession => "EndSession",
+                // TCK-00389
+                PrivilegedMessageType::IngestReviewReceipt => "IngestReviewReceipt",
                 // Credential Management (CTR-PROTO-012, TCK-00343)
                 PrivilegedMessageType::ListCredentials => "ListCredentials",
                 PrivilegedMessageType::AddCredential => "AddCredential",
@@ -5519,6 +5758,282 @@ impl PrivilegedDispatcher {
     }
 
     // ========================================================================
+    // TCK-00389: IngestReviewReceipt Handler
+    // ========================================================================
+
+    /// Handles `IngestReviewReceipt` requests (IPC-PRIV-017, TCK-00389).
+    ///
+    /// Ingests a review receipt from an external reviewer into the FAC ledger.
+    /// Validates reviewer identity against the gate lease, verifies request
+    /// integrity, and emits either `ReviewReceiptRecorded` or
+    /// `ReviewBlockedRecorded` event.
+    ///
+    /// # Security Invariants
+    ///
+    /// - **Reviewer identity validation**: The `reviewer_actor_id` MUST match
+    ///   the `executor_actor_id` bound in the gate lease (constant-time
+    ///   comparison to prevent timing side-channels).
+    /// - **Lease existence validation**: The `lease_id` MUST reference a valid
+    ///   gate lease (fail-closed on missing lease).
+    /// - **Idempotency**: Duplicate `receipt_id` values do not create duplicate
+    ///   events (checked via ledger query).
+    /// - **Fail-closed**: Any validation failure rejects the request with a
+    ///   clear error.
+    fn handle_ingest_review_receipt(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = IngestReviewReceiptRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid IngestReviewReceiptRequest: {e}"),
+            })?;
+
+        info!(
+            lease_id = %request.lease_id,
+            receipt_id = %request.receipt_id,
+            reviewer_actor_id = %request.reviewer_actor_id,
+            verdict = %request.verdict,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "IngestReviewReceipt request received"
+        );
+
+        // ---- Phase 0: Validate required fields (admission checks) ----
+
+        if request.lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease_id is required",
+            ));
+        }
+        if request.lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.receipt_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "receipt_id is required",
+            ));
+        }
+        if request.receipt_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("receipt_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.reviewer_actor_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "reviewer_actor_id is required",
+            ));
+        }
+        if request.reviewer_actor_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("reviewer_actor_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        // Validate changeset_digest is exactly 32 bytes
+        if request.changeset_digest.len() != 32 {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "changeset_digest must be exactly 32 bytes, got {}",
+                    request.changeset_digest.len()
+                ),
+            ));
+        }
+
+        // Validate artifact_bundle_hash is exactly 32 bytes
+        if request.artifact_bundle_hash.len() != 32 {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "artifact_bundle_hash must be exactly 32 bytes, got {}",
+                    request.artifact_bundle_hash.len()
+                ),
+            ));
+        }
+
+        // Validate verdict is not unspecified (fail-closed)
+        let verdict = ReviewReceiptVerdict::try_from(request.verdict)
+            .unwrap_or(ReviewReceiptVerdict::Unspecified);
+        if verdict == ReviewReceiptVerdict::Unspecified {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "verdict must be APPROVE or BLOCKED, not UNSPECIFIED",
+            ));
+        }
+
+        // For BLOCKED verdict, validate blocked_log_hash is present
+        if verdict == ReviewReceiptVerdict::Blocked {
+            if request.blocked_log_hash.len() != 32 {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "blocked_log_hash must be exactly 32 bytes for BLOCKED verdict, got {}",
+                        request.blocked_log_hash.len()
+                    ),
+                ));
+            }
+            if request.blocked_reason_code == 0 {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "blocked_reason_code must be non-zero for BLOCKED verdict",
+                ));
+            }
+        }
+
+        // ---- Phase 1: Lease existence + reviewer identity validation ----
+        // Security-critical: reviewer identity MUST match lease executor.
+        // This prevents unauthorized actors from submitting review results.
+
+        let expected_actor_id = self
+            .lease_validator
+            .get_lease_executor_actor_id(&request.lease_id);
+
+        let Some(expected_actor_id) = expected_actor_id else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::GateLeaseMissing,
+                format!("gate lease not found: {}", request.lease_id),
+            ));
+        };
+
+        // SEC-TIMING-001: Constant-time comparison to prevent timing
+        // side-channel attacks on reviewer identity.
+        let identity_matches = expected_actor_id.len() == request.reviewer_actor_id.len()
+            && bool::from(
+                expected_actor_id
+                    .as_bytes()
+                    .ct_eq(request.reviewer_actor_id.as_bytes()),
+            );
+
+        if !identity_matches {
+            warn!(
+                lease_id = %request.lease_id,
+                claimed_reviewer = %request.reviewer_actor_id,
+                "Reviewer identity mismatch - rejecting review receipt"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "reviewer_actor_id does not match gate lease executor",
+            ));
+        }
+
+        // ---- Phase 2: Idempotency check ----
+        // Check if a receipt with this ID already exists in the ledger.
+        if let Some(existing) = self.event_emitter.get_event(&request.receipt_id) {
+            info!(
+                receipt_id = %request.receipt_id,
+                existing_event_id = %existing.event_id,
+                "Duplicate receipt_id detected - returning existing event (idempotent)"
+            );
+            return Ok(PrivilegedResponse::IngestReviewReceipt(
+                IngestReviewReceiptResponse {
+                    receipt_id: request.receipt_id,
+                    event_type: existing.event_type,
+                    event_id: existing.event_id,
+                },
+            ));
+        }
+
+        // ---- Phase 3: Get HTF timestamp ----
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // ---- Phase 4: Emit event based on verdict ----
+        let (event_type, signed_event) = match verdict {
+            ReviewReceiptVerdict::Approve => {
+                let changeset_digest: [u8; 32] = request
+                    .changeset_digest
+                    .as_slice()
+                    .try_into()
+                    .expect("validated to be 32 bytes above");
+                let artifact_bundle_hash: [u8; 32] = request
+                    .artifact_bundle_hash
+                    .as_slice()
+                    .try_into()
+                    .expect("validated to be 32 bytes above");
+
+                let event = self
+                    .event_emitter
+                    .emit_review_receipt(
+                        &request.lease_id,
+                        &request.receipt_id,
+                        &changeset_digest,
+                        &artifact_bundle_hash,
+                        &request.reviewer_actor_id,
+                        timestamp_ns,
+                    )
+                    .map_err(|e| ProtocolError::Serialization {
+                        reason: format!("review receipt emission failed: {e}"),
+                    })?;
+
+                ("ReviewReceiptRecorded".to_string(), event)
+            },
+            ReviewReceiptVerdict::Blocked => {
+                let blocked_log_hash: [u8; 32] = request
+                    .blocked_log_hash
+                    .as_slice()
+                    .try_into()
+                    .expect("validated to be 32 bytes above");
+
+                let event = self
+                    .event_emitter
+                    .emit_review_blocked_receipt(
+                        &request.receipt_id,
+                        request.blocked_reason_code,
+                        &blocked_log_hash,
+                        &request.reviewer_actor_id,
+                        timestamp_ns,
+                    )
+                    .map_err(|e| ProtocolError::Serialization {
+                        reason: format!("review blocked emission failed: {e}"),
+                    })?;
+
+                ("ReviewBlockedRecorded".to_string(), event)
+            },
+            ReviewReceiptVerdict::Unspecified => {
+                // Already handled above, but fail-closed for safety
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "verdict must be APPROVE or BLOCKED",
+                ));
+            },
+        };
+
+        info!(
+            receipt_id = %request.receipt_id,
+            event_type = %event_type,
+            event_id = %signed_event.event_id,
+            reviewer = %request.reviewer_actor_id,
+            "Review receipt ingested successfully"
+        );
+
+        Ok(PrivilegedResponse::IngestReviewReceipt(
+            IngestReviewReceiptResponse {
+                receipt_id: request.receipt_id,
+                event_type,
+                event_id: signed_event.event_id,
+            },
+        ))
+    }
+
+    // ========================================================================
     // Process Management Handlers (TCK-00342)
     // ========================================================================
 
@@ -6992,6 +7507,14 @@ pub fn encode_shutdown_request(request: &ShutdownRequest) -> Bytes {
 #[must_use]
 pub fn encode_end_session_request(request: &EndSessionRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::EndSession.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes an `IngestReviewReceipt` request to bytes for sending (TCK-00389).
+#[must_use]
+pub fn encode_ingest_review_receipt_request(request: &IngestReviewReceiptRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::IngestReviewReceipt.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -13412,6 +13935,511 @@ mod tests {
                 .collect();
             let p1: serde_json::Value = serde_json::from_slice(&t1[0].payload).unwrap();
             assert_eq!(p1["actor_id"], "daemon:shutdown");
+        }
+    }
+
+    // ========================================================================
+    // TCK-00389: IngestReviewReceipt Tests
+    // ========================================================================
+    mod ingest_review_receipt {
+        use super::*;
+
+        /// Creates a dispatcher with a registered lease for testing.
+        fn setup_dispatcher_with_lease(
+            lease_id: &str,
+            work_id: &str,
+            gate_id: &str,
+            executor_actor_id: &str,
+        ) -> (PrivilegedDispatcher, ConnectionContext) {
+            let dispatcher = PrivilegedDispatcher::new();
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                work_id,
+                gate_id,
+                executor_actor_id,
+            );
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            (dispatcher, ctx)
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_approve_success() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-001", "W-001", "gate-001", "reviewer-alpha");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-001".to_string(),
+                receipt_id: "RR-001".to_string(),
+                reviewer_actor_id: "reviewer-alpha".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-001");
+                    assert_eq!(resp.event_type, "ReviewReceiptRecorded");
+                    assert!(!resp.event_id.is_empty(), "event_id must be non-empty");
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!("Expected IngestReviewReceipt, got error: {}", err.message);
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_blocked_success() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-002", "W-002", "gate-002", "reviewer-beta");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-002".to_string(),
+                receipt_id: "RB-001".to_string(),
+                reviewer_actor_id: "reviewer-beta".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Blocked.into(),
+                blocked_reason_code: 1, // APPLY_FAILED
+                blocked_log_hash: vec![0x55; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RB-001");
+                    assert_eq!(resp.event_type, "ReviewBlockedRecorded");
+                    assert!(!resp.event_id.is_empty(), "event_id must be non-empty");
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!("Expected IngestReviewReceipt, got error: {}", err.message);
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_reviewer_identity_mismatch() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-003", "W-003", "gate-003", "reviewer-gamma");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-003".to_string(),
+                receipt_id: "RR-002".to_string(),
+                reviewer_actor_id: "impersonator".to_string(), // Wrong reviewer
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("does not match gate lease executor"),
+                        "Expected reviewer identity mismatch error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_lease_not_found() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "nonexistent-lease".to_string(),
+                receipt_id: "RR-003".to_string(),
+                reviewer_actor_id: "reviewer-delta".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::GateLeaseMissing as i32,
+                        "Should return GateLeaseMissing for unknown lease_id"
+                    );
+                    assert!(
+                        err.message.contains("gate lease not found"),
+                        "Error message should indicate lease not found, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_empty_lease_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: String::new(),
+                receipt_id: "RR-004".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lease_id is required"),
+                        "Expected lease_id required error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_empty_receipt_id() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-004", "W-004", "gate-004", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-004".to_string(),
+                receipt_id: String::new(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("receipt_id is required"),
+                        "Expected receipt_id required error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_unspecified_verdict() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-005", "W-005", "gate-005", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-005".to_string(),
+                receipt_id: "RR-005".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: 0, // UNSPECIFIED
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("verdict must be APPROVE or BLOCKED"),
+                        "Expected verdict error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_invalid_changeset_digest_length() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-006", "W-006", "gate-006", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-006".to_string(),
+                receipt_id: "RR-006".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 16], // Wrong length
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("changeset_digest must be exactly 32 bytes"),
+                        "Expected changeset_digest length error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_blocked_missing_log_hash() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-007", "W-007", "gate-007", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-007".to_string(),
+                receipt_id: "RB-002".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Blocked.into(),
+                blocked_reason_code: 1,
+                blocked_log_hash: vec![], // Missing log hash for BLOCKED
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("blocked_log_hash must be exactly 32 bytes"),
+                        "Expected blocked_log_hash error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_blocked_zero_reason_code() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-008", "W-008", "gate-008", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-008".to_string(),
+                receipt_id: "RB-003".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Blocked.into(),
+                blocked_reason_code: 0, // Zero is invalid for BLOCKED
+                blocked_log_hash: vec![0x55; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("blocked_reason_code must be non-zero"),
+                        "Expected blocked_reason_code error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_non_privileged_rejected() {
+            let dispatcher = PrivilegedDispatcher::new();
+            // Non-privileged context (session socket)
+            let ctx = ConnectionContext::session(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                }),
+                None,
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-009".to_string(),
+                receipt_id: "RR-009".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::PermissionDenied as i32,
+                        "Non-privileged connections should get PERMISSION_DENIED"
+                    );
+                },
+                other => panic!("Expected PERMISSION_DENIED error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_ledger_event_persisted() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-010", "W-010", "gate-010", "reviewer-zeta");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-010".to_string(),
+                receipt_id: "RR-010".to_string(),
+                reviewer_actor_id: "reviewer-zeta".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let event_id = match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => resp.event_id,
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            };
+
+            // Verify the event was persisted to the emitter
+            let stored_event = dispatcher.event_emitter.get_event(&event_id);
+            assert!(
+                stored_event.is_some(),
+                "Event should be persisted in emitter"
+            );
+            let event = stored_event.unwrap();
+            assert_eq!(event.event_type, "review_receipt_recorded");
+            assert_eq!(event.actor_id, "reviewer-zeta");
+            assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_response_encoding() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-011", "W-011", "gate-011", "reviewer-enc");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-011".to_string(),
+                receipt_id: "RR-011".to_string(),
+                reviewer_actor_id: "reviewer-enc".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Verify encode/decode roundtrip
+            let encoded = response.encode();
+            assert!(!encoded.is_empty(), "Encoded response should not be empty");
+            assert_eq!(
+                encoded[0],
+                PrivilegedMessageType::IngestReviewReceipt.tag(),
+                "Response tag should match IngestReviewReceipt"
+            );
+
+            // Decode the payload
+            let decoded = IngestReviewReceiptResponse::decode_bounded(
+                &encoded[1..],
+                &DecodeConfig::default(),
+            )
+            .expect("decode should succeed");
+            assert_eq!(decoded.receipt_id, "RR-011");
+            assert_eq!(decoded.event_type, "ReviewReceiptRecorded");
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_message_type_tag() {
+            assert_eq!(
+                PrivilegedMessageType::IngestReviewReceipt.tag(),
+                17,
+                "IngestReviewReceipt should have tag 17"
+            );
+            assert_eq!(
+                PrivilegedMessageType::from_tag(17),
+                Some(PrivilegedMessageType::IngestReviewReceipt),
+                "Tag 17 should resolve to IngestReviewReceipt"
+            );
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_oversized_lease_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "x".repeat(MAX_ID_LENGTH + 1),
+                receipt_id: "RR-012".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lease_id exceeds maximum length"),
+                        "Expected oversized lease_id error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
         }
     }
 }

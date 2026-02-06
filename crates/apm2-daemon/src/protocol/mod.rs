@@ -169,6 +169,8 @@ pub use dispatch::{
     // TCK-00345: Consensus query encoding helpers
     encode_consensus_status_request,
     encode_consensus_validators_request,
+    // TCK-00389: Review receipt ingestion encoding
+    encode_ingest_review_receipt_request,
     encode_issue_capability_request,
     encode_list_credentials_request,
     // TCK-00342: Process management encoding helpers
@@ -240,6 +242,9 @@ pub use messages::{
     HefError,
     HefErrorCode,
     HlcStamp,
+    // TCK-00389: Review receipt ingestion messages
+    IngestReviewReceiptRequest,
+    IngestReviewReceiptResponse,
     IssueCapabilityRequest,
     IssueCapabilityResponse,
     // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
@@ -277,6 +282,7 @@ pub use messages::{
     RequestToolResponse,
     RestartProcessRequest,
     RestartProcessResponse,
+    ReviewReceiptVerdict,
     SessionError,
     SessionErrorCode,
     SessionStatusRequest,

@@ -62,6 +62,9 @@ use apm2_daemon::protocol::{
     // Framing
     FrameCodec,
     HandshakeMessage,
+    // TCK-00389: Review receipt ingestion
+    IngestReviewReceiptRequest,
+    IngestReviewReceiptResponse,
     IssueCapabilityRequest,
     IssueCapabilityResponse,
     ListCredentialsRequest,
@@ -125,6 +128,8 @@ use apm2_daemon::protocol::{
     encode_consensus_status_request,
     encode_consensus_validators_request,
     encode_emit_event_request,
+    // TCK-00389: Review receipt ingestion encoding
+    encode_ingest_review_receipt_request,
     encode_issue_capability_request,
     encode_list_credentials_request,
     // TCK-00342: Process management encoding
@@ -1080,6 +1085,94 @@ impl OperatorClient {
 
         // Decode response
         Self::decode_work_status_response(&response_frame)
+    }
+
+    // =========================================================================
+    // TCK-00389: IngestReviewReceipt
+    // =========================================================================
+
+    /// Ingests a review receipt from an external reviewer (TCK-00389).
+    ///
+    /// Sends the review receipt to the daemon for ledger ingestion. The daemon
+    /// validates the reviewer identity against the gate lease and emits either
+    /// a `ReviewReceiptRecorded` or `ReviewBlockedRecorded` event.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The `IngestReviewReceiptRequest` containing all review
+    ///   receipt fields
+    ///
+    /// # Returns
+    ///
+    /// The `IngestReviewReceiptResponse` with the receipt ID, event type, and
+    /// ledger event ID on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProtocolClientError` if:
+    /// - Communication with daemon fails
+    /// - Reviewer identity validation fails
+    /// - Lease is not found
+    /// - Event emission fails
+    #[allow(dead_code)] // Scaffolding for TCK-00389 review receipt ingestion
+    pub async fn ingest_review_receipt(
+        &mut self,
+        request: &IngestReviewReceiptRequest,
+    ) -> Result<IngestReviewReceiptResponse, ProtocolClientError> {
+        let request_bytes = encode_ingest_review_receipt_request(request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_ingest_review_receipt_response(&response_frame)
+    }
+
+    /// Decodes an `IngestReviewReceipt` response.
+    #[allow(dead_code)] // Scaffolding for TCK-00389 review receipt ingestion
+    fn decode_ingest_review_receipt_response(
+        frame: &Bytes,
+    ) -> Result<IngestReviewReceiptResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::IngestReviewReceipt.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected IngestReviewReceipt response (tag {}), got tag {tag}",
+                PrivilegedMessageType::IngestReviewReceipt.tag()
+            )));
+        }
+
+        IngestReviewReceiptResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
     // =========================================================================

@@ -652,6 +652,84 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(signed_event)
     }
 
+    fn emit_review_blocked_receipt(
+        &self,
+        receipt_id: &str,
+        reason_code: u32,
+        blocked_log_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use crate::protocol::dispatch::REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX;
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        let payload_json = serde_json::json!({
+            "event_type": "review_blocked_recorded",
+            "receipt_id": receipt_id,
+            "reason_code": reason_code,
+            "blocked_log_hash": hex::encode(blocked_log_hash),
+            "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes =
+            Vec::with_capacity(REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "review_blocked_recorded".to_string(),
+            work_id: receipt_id.to_string(),
+            actor_id: reviewer_actor_id.to_string(),
+            payload: payload_bytes.clone(),
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns
+            ],
+        ).map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+
+        info!(
+            event_id = %event_id,
+            receipt_id = %receipt_id,
+            reason_code = %reason_code,
+            "Persisted ReviewBlockedRecorded event"
+        );
+
+        Ok(signed_event)
+    }
+
     fn emit_episode_run_attributed(
         &self,
         work_id: &str,
@@ -1417,7 +1495,51 @@ impl LeaseValidator for SqliteLeaseValidator {
         })
     }
 
+    fn get_lease_executor_actor_id(&self, lease_id: &str) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+
+        // Query gate_lease_issued events and find the executor_actor_id.
+        // The payload is a JSON blob that may contain executor_actor_id.
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM ledger_events WHERE event_type = 'gate_lease_issued' ORDER BY rowid",
+            )
+            .ok()?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let payload: Vec<u8> = row.get(0)?;
+                Ok(payload)
+            })
+            .ok()?;
+
+        for payload_bytes in rows.flatten() {
+            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
+                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
+                    if l == lease_id {
+                        return payload
+                            .get("executor_actor_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
+        self.register_lease_with_executor(lease_id, work_id, gate_id, "");
+    }
+
+    fn register_lease_with_executor(
+        &self,
+        lease_id: &str,
+        work_id: &str,
+        gate_id: &str,
+        executor_actor_id: &str,
+    ) {
         // We emit a fake event to populate the ledger for validation to work.
         // This makes `register_lease` functionally verify the ledger logic.
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
@@ -1425,7 +1547,8 @@ impl LeaseValidator for SqliteLeaseValidator {
             "event_type": "gate_lease_issued",
             "lease_id": lease_id,
             "work_id": work_id,
-            "gate_id": gate_id
+            "gate_id": gate_id,
+            "executor_actor_id": executor_actor_id
         });
         let payload_bytes = serde_json::to_vec(&payload).unwrap();
 

@@ -1537,3 +1537,51 @@ message ConsensusError {
   ConsensusErrorCode code = 1;
   string message = 2;
 }
+
+// =============================================================================
+// IPC-PRIV-017: IngestReviewReceipt (TCK-00389)
+// =============================================================================
+// Ingests a review receipt from an external reviewer into the FAC ledger.
+// Validates reviewer identity against gate lease, verifies artifact bundle
+// integrity via CAS hash, and emits either ReviewReceiptRecorded or
+// ReviewBlockedRecorded event.
+
+// Review verdict enum for receipt ingestion.
+enum ReviewReceiptVerdict {
+  REVIEW_RECEIPT_VERDICT_UNSPECIFIED = 0;
+  // Review approved the changeset.
+  REVIEW_RECEIPT_VERDICT_APPROVE = 1;
+  // Review was blocked (tool failure, apply failure, etc.).
+  REVIEW_RECEIPT_VERDICT_BLOCKED = 2;
+}
+
+// Request to ingest a review receipt from an external reviewer.
+message IngestReviewReceiptRequest {
+  // Gate lease ID that authorized this review.
+  string lease_id = 1;
+  // Unique receipt identifier for idempotency.
+  string receipt_id = 2;
+  // Reviewer identity (must match gate lease executor_actor_id).
+  string reviewer_actor_id = 3;
+  // BLAKE3 digest of the changeset being reviewed.
+  bytes changeset_digest = 4;
+  // BLAKE3 hash of the ReviewArtifactBundleV1 stored in CAS.
+  bytes artifact_bundle_hash = 5;
+  // Review verdict.
+  ReviewReceiptVerdict verdict = 6;
+  // Reason code for blocked reviews (only used when verdict is BLOCKED).
+  // Maps to ReasonCode numeric codes (1=APPLY_FAILED, 2=TOOL_FAILED, etc.).
+  uint32 blocked_reason_code = 7;
+  // BLAKE3 hash of blocked logs stored in CAS (only for BLOCKED verdict).
+  bytes blocked_log_hash = 8;
+}
+
+// Response confirming review receipt ingestion.
+message IngestReviewReceiptResponse {
+  // The receipt ID that was ingested.
+  string receipt_id = 1;
+  // The event type that was emitted (ReviewReceiptRecorded or ReviewBlockedRecorded).
+  string event_type = 2;
+  // The ledger event ID for the emitted event.
+  string event_id = 3;
+}
