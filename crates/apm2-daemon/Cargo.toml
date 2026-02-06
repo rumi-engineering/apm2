@@ -70,6 +70,9 @@ sha2.workspace = true
 # D-Bus (systemd integration)
 zbus.workspace = true
 
+# URL parsing (BLOCKER 1: secure host extraction vs authority confusion)
+url.workspace = true
+
 # Error types
 thiserror.workspace = true
 

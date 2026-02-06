@@ -128,6 +128,9 @@ webpki-roots = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-cert = { version = "0.2", features = ["builder", "pem"] }
 
+# URL parsing (secure host extraction for network policy enforcement)
+url = "2.5"
+
 # Unicode normalization
 unicode-normalization = "0.1"
 

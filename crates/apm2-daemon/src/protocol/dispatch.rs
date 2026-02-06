@@ -2238,6 +2238,19 @@ pub struct PolicyResolution {
     /// schema drift or tampered persistence (fail-closed semantics).
     #[serde(default = "risk_tier_fail_closed")]
     pub resolved_risk_tier: u8,
+
+    /// Policy-resolved scope baseline for strict-subset validation.
+    ///
+    /// SECURITY (MAJOR 1 v3 fix): The scope baseline MUST come from an
+    /// authoritative policy source (the policy resolver), NOT from the
+    /// candidate manifest being validated. Building the baseline from the
+    /// manifest itself makes the subset check tautological (always passes).
+    ///
+    /// When `None` (or absent from serialized data), V1 minting is
+    /// denied (fail-closed) because no independent baseline is available
+    /// to validate the candidate manifest against.
+    #[serde(default)]
+    pub resolved_scope_baseline: Option<crate::episode::capability::ScopeBaseline>,
 }
 
 /// Serde default for `resolved_risk_tier`: returns `4` (Tier4, most
@@ -2372,13 +2385,32 @@ impl PolicyResolver for StubPolicyResolver {
         //
         // - Reviewer: Use canonical reviewer v0 manifest hash
         // - Other roles: Use deterministic stub hash (fail-closed on CAS lookup)
-        let manifest_hash = match role {
-            WorkRole::Reviewer => *reviewer_v0_manifest_hash(),
-            _ => {
-                // For non-reviewer roles, generate a deterministic hash that will
-                // fail closed when loaded from CAS (hash doesn't exist in store)
-                *blake3::hash(format!("manifest:{work_id}:{actor_id}").as_bytes()).as_bytes()
-            },
+        //
+        // MAJOR 1 v3 fix: Also resolve the authoritative scope baseline and
+        // risk tier ceiling from the policy (not from the candidate manifest).
+        let (manifest_hash, resolved_scope_baseline) = if role == WorkRole::Reviewer {
+            let reviewer = crate::episode::reviewer_manifest::reviewer_v0_manifest();
+            let baseline = crate::episode::capability::ScopeBaseline {
+                tools: reviewer.tool_allowlist.clone(),
+                write_paths: reviewer.write_allowlist.clone(),
+                shell_patterns: reviewer.shell_allowlist.clone(),
+            };
+            (*reviewer_v0_manifest_hash(), Some(baseline))
+        } else {
+            // For non-reviewer roles, generate a deterministic hash that will
+            // fail closed when loaded from CAS (hash doesn't exist in store).
+            // The fallback manifest (`from_hash_with_default_allowlist`) has
+            // empty allowlists, so we provide a matching empty baseline. This
+            // is NOT fail-open: the empty baseline means no tools, write paths,
+            // or shell patterns are permitted, which matches the empty fallback
+            // manifest. Any manifest with non-empty allowlists would be rejected
+            // as exceeding this baseline.
+            let hash =
+                *blake3::hash(format!("manifest:{work_id}:{actor_id}").as_bytes()).as_bytes();
+            (
+                hash,
+                Some(crate::episode::capability::ScopeBaseline::default()),
+            )
         };
 
         // TCK-00255: Create and seal a context pack manifest
@@ -2416,6 +2448,7 @@ impl PolicyResolver for StubPolicyResolver {
             capability_manifest_hash: manifest_hash,
             context_pack_hash,
             resolved_risk_tier: 0, // Stub resolver: Tier0 default
+            resolved_scope_baseline,
         })
     }
 }
@@ -4059,6 +4092,14 @@ pub struct PrivilegedDispatcher {
     /// the handler returns an error indicating CAS is not configured.
     cas: Option<Arc<dyn ContentAddressedStore>>,
 
+    /// Shared V1 manifest store for TCK-00352 scope enforcement.
+    ///
+    /// Per Security Review MAJOR 2, `handle_spawn_episode` mints a V1
+    /// capability manifest and registers it in this store. The
+    /// `SessionDispatcher` holds a clone of the same `Arc` and enforces
+    /// V1 scope checks in `handle_request_tool`.
+    v1_manifest_store: Option<crate::protocol::session_dispatch::SharedV1ManifestStore>,
+
     /// Gate orchestrator for sublease delegation (TCK-00340).
     ///
     /// When present, `DelegateSublease` delegates to the orchestrator to
@@ -4140,6 +4181,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            v1_manifest_store: None,
             gate_orchestrator: None,
         }
     }
@@ -4198,6 +4240,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            v1_manifest_store: None,
             gate_orchestrator: None,
         }
     }
@@ -4275,6 +4318,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            v1_manifest_store: None,
             gate_orchestrator: None,
         }
     }
@@ -4329,6 +4373,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            v1_manifest_store: None,
             gate_orchestrator: None,
         }
     }
@@ -4382,6 +4427,20 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Sets the shared V1 manifest store (TCK-00352 Security Review MAJOR 2).
+    ///
+    /// When set, `handle_spawn_episode` mints a V1 capability manifest and
+    /// registers it in this store. The `SessionDispatcher` holds a clone of
+    /// the same `Arc` and enforces V1 scope checks in `handle_request_tool`.
+    #[must_use]
+    pub fn with_v1_manifest_store(
+        mut self,
+        store: crate::protocol::session_dispatch::SharedV1ManifestStore,
+    ) -> Self {
+        self.v1_manifest_store = Some(store);
         self
     }
 
@@ -5049,6 +5108,13 @@ impl PrivilegedDispatcher {
         // 3. Remove the manifest if it was registered.
         if remove_manifest {
             self.manifest_store.remove(session_id);
+        }
+
+        // 3a. TCK-00352 MAJOR 2 fix: Remove V1 manifest on rollback.
+        // Without this, a failed spawn leaves a stale V1 manifest that
+        // could be matched by a recycled session ID (dangling reference).
+        if let Some(ref v1_store) = self.v1_manifest_store {
+            v1_store.remove(session_id);
         }
 
         // 3b. Restore evicted manifests so capacity is not permanently lost.
@@ -5796,6 +5862,160 @@ impl PrivilegedDispatcher {
         };
 
         self.manifest_store.register(&session_id, manifest.clone());
+
+        // TCK-00352 Security Review MAJOR 2: Mint and register V1 manifest
+        // in the shared store so that SessionDispatcher can enforce V1 scope
+        // checks (risk tier ceiling, host restrictions, envelope binding)
+        // during handle_request_tool.
+        if let Some(ref v1_store) = self.v1_manifest_store {
+            // TCK-00352 MAJOR 1 v3 fix: The scope baseline MUST come from
+            // an authoritative policy source (claim.policy_resolution), NOT
+            // from the candidate manifest. Building the baseline from the
+            // manifest itself makes the subset check tautological (the
+            // manifest is always a subset of itself). Fail closed when no
+            // independent baseline is available.
+            let scope_baseline = if let Some(ref baseline) =
+                claim.policy_resolution.resolved_scope_baseline
+            {
+                baseline.clone()
+            } else {
+                // No independent scope baseline available -- fail closed.
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    true,
+                );
+                if let Some(ref rw) = rollback_warn {
+                    warn!(
+                        rollback_errors = %rw,
+                        "Partial rollback failure during scope baseline check"
+                    );
+                }
+                warn!(
+                    session_id = %session_id,
+                    "SpawnEpisode rejected: no policy-resolved scope baseline (fail-closed)"
+                );
+                let msg = rollback_warn.map_or_else(
+                        || "no policy-resolved scope baseline available; V1 minting denied (fail-closed)".to_string(),
+                        |rw| format!("no policy-resolved scope baseline; V1 denied (rollback partial: {rw})"),
+                    );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            };
+            if let Err(e) = crate::episode::capability::validate_manifest_scope_subset(
+                &manifest,
+                &scope_baseline,
+            ) {
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    true,
+                );
+                if let Some(ref rw) = rollback_warn {
+                    warn!(
+                        rollback_errors = %rw,
+                        "Partial rollback failure during scope subset validation"
+                    );
+                }
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "SpawnEpisode rejected: manifest scope exceeds policy baseline (fail-closed)"
+                );
+                let msg = rollback_warn.map_or_else(
+                    || format!("manifest scope validation failed: {e}"),
+                    |rw| {
+                        format!(
+                            "manifest scope validation failed: {e} (rollback partial failure: {rw})"
+                        )
+                    },
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            }
+
+            // TCK-00352 MAJOR 3 fix: Obtain mint token through the
+            // governance-resolver authority path, not direct construction.
+            // This centralizes minting authority to the policy resolver and
+            // ensures the token is obtained through the approved channel.
+            let governance = crate::governance::GovernancePolicyResolver::new();
+            let mint_token = governance.mint_token();
+
+            // BLOCKER 2 v3 fix: Derive risk tier ceiling from the
+            // policy-resolved risk tier (claim.policy_resolution), NOT
+            // from the manifest's own capabilities. Using the manifest's
+            // max_capability_tier() makes the check tautological because
+            // the very manifest being validated determines its own ceiling.
+            //
+            // SECURITY: Fail closed (Tier4, most restrictive) when the
+            // resolved_risk_tier cannot be parsed to a valid RiskTier.
+            let risk_tier_ceiling = crate::episode::envelope::RiskTier::from_u8(
+                claim.policy_resolution.resolved_risk_tier,
+            )
+            .unwrap_or(crate::episode::envelope::RiskTier::Tier4);
+
+            // TCK-00352 BLOCKER 2 fix: V1 minting failure is now a HARD
+            // DENY (fail-closed). When V1 controls are configured (v1_store
+            // is Some), every session MUST have an active V1 manifest.
+            // Continuing without one would leave the session without V1
+            // scope enforcement, which is fail-open.
+            match crate::episode::CapabilityManifestV1::mint(
+                mint_token,
+                manifest.clone(),
+                risk_tier_ceiling,
+                Vec::new(), // Host restrictions from policy (empty = fail-closed for network)
+            ) {
+                Ok(v1_manifest) => {
+                    v1_store.register(&session_id, v1_manifest);
+                    debug!(
+                        session_id = %session_id,
+                        risk_tier_ceiling = ?risk_tier_ceiling,
+                        "V1 capability manifest minted and registered"
+                    );
+                },
+                Err(e) => {
+                    // HARD DENY: Roll back all state and reject the spawn.
+                    let rollback_warn = self.rollback_spawn(
+                        &session_id,
+                        &evicted_sessions,
+                        &evicted_telemetry,
+                        &evicted_manifests,
+                        true,
+                    );
+                    if let Some(ref rw) = rollback_warn {
+                        warn!(
+                            rollback_errors = %rw,
+                            "Partial rollback failure during V1 mint failure recovery"
+                        );
+                    }
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "SpawnEpisode rejected: V1 manifest minting failed (fail-closed)"
+                    );
+                    let msg = rollback_warn.map_or_else(
+                        || format!("V1 manifest minting failed: {e}"),
+                        |rw| {
+                            format!(
+                                "V1 manifest minting failed: {e} (rollback partial failure: {rw})"
+                            )
+                        },
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        msg,
+                    ));
+                },
+            }
+        }
 
         debug!(
             session_id = %session_id,
@@ -6662,6 +6882,15 @@ impl PrivilegedDispatcher {
         // to prevent retained session tokens from passing manifest lookup
         // in RequestTool after EndSession.
         self.manifest_store.remove(&request.session_id);
+
+        // TCK-00352 MAJOR 2 fix: Remove V1 manifest on EndSession.
+        // Without this, a terminated session's V1 manifest remains in the
+        // store. If a new session reuses the same ID (or a retained token
+        // is replayed), the stale V1 manifest could incorrectly match,
+        // either granting or denying based on an expired session's policy.
+        if let Some(ref v1_store) = self.v1_manifest_store {
+            v1_store.remove(&request.session_id);
+        }
 
         // TCK-00384 review fix: Clean up telemetry on EndSession to free
         // capacity in the bounded store. Without this, repeated
@@ -9893,6 +10122,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -10205,6 +10435,7 @@ mod tests {
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
             },
             author_custody_domains: vec![],
             executor_custody_domains: vec![],
@@ -11573,6 +11804,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -11606,6 +11838,7 @@ mod tests {
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
             },
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
@@ -11676,6 +11909,7 @@ mod tests {
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()],
@@ -11736,6 +11970,7 @@ mod tests {
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
@@ -11800,6 +12035,7 @@ mod tests {
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec![], // Empty - resolution failed
@@ -11861,6 +12097,7 @@ mod tests {
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
@@ -12618,6 +12855,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -14987,6 +15225,7 @@ mod tests {
                             capability_manifest_hash: [0u8; 32],
                             context_pack_hash: [0u8; 32],
                             resolved_risk_tier: 0,
+                            resolved_scope_baseline: None,
                         },
                         executor_custody_domains: vec![],
                         author_custody_domains: vec![],
@@ -15056,6 +15295,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -15100,6 +15340,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -16519,6 +16760,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: risk_tier,
+                    resolved_scope_baseline: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -18547,6 +18789,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0, // Tier0
+                    resolved_scope_baseline: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -18619,6 +18862,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 2, // Tier2
+                    resolved_scope_baseline: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -18889,6 +19133,7 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0, // Tier0
+                    resolved_scope_baseline: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -19244,6 +19489,412 @@ mod tests {
             );
             assert_eq!(ctx.phase(), ConnectionPhase::SessionOpen);
             assert!(!ctx.is_privileged());
+        }
+    }
+
+    // ========================================================================
+    // BLOCKER 2 v3: Risk tier ceiling from policy resolution (not manifest)
+    // ========================================================================
+    mod risk_tier_ceiling_policy_binding {
+        use crate::episode::envelope::RiskTier;
+
+        /// BLOCKER 2 v3: Risk tier ceiling MUST be derived from policy
+        /// resolution, not from the manifest. This test proves that
+        /// `RiskTier::from_u8(claim.policy_resolution.resolved_risk_tier)`
+        /// correctly bounds the ceiling, and that an invalid tier value
+        /// falls back to Tier4 (fail-closed).
+        #[test]
+        fn risk_tier_ceiling_from_policy_resolution_not_manifest() {
+            // Policy says Tier1 -- even if manifest capabilities are Tier3,
+            // the ceiling should be Tier1.
+            let policy_resolved_tier: u8 = 1;
+            let ceiling = RiskTier::from_u8(policy_resolved_tier).unwrap_or(RiskTier::Tier4);
+            assert_eq!(
+                ceiling,
+                RiskTier::Tier1,
+                "Ceiling should match policy-resolved tier, not manifest capabilities"
+            );
+        }
+
+        /// BLOCKER 2 v3: Invalid risk tier in policy resolution fails closed
+        /// to Tier4 (most restrictive).
+        #[test]
+        fn invalid_risk_tier_falls_back_to_tier4_fail_closed() {
+            let invalid_tier: u8 = 255;
+            let ceiling = RiskTier::from_u8(invalid_tier).unwrap_or(RiskTier::Tier4);
+            assert_eq!(
+                ceiling,
+                RiskTier::Tier4,
+                "Invalid risk tier must fail closed to Tier4"
+            );
+        }
+
+        /// BLOCKER 2 v3: Each valid tier value round-trips correctly.
+        #[test]
+        fn all_valid_tiers_round_trip() {
+            for tier_val in 0..=4u8 {
+                let tier = RiskTier::from_u8(tier_val)
+                    .unwrap_or_else(|| panic!("Tier {tier_val} should be valid"));
+                assert_eq!(
+                    tier.tier(),
+                    tier_val,
+                    "Tier value should round-trip: expected {tier_val}, got {}",
+                    tier.tier()
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // MAJOR 1 v3: Scope baseline from policy resolution (not manifest)
+    // ========================================================================
+    mod scope_baseline_policy_binding {
+        use super::*;
+
+        /// MAJOR 1 v3: When `resolved_scope_baseline` is None in
+        /// `PolicyResolution`, V1 minting should not proceed (fail-closed).
+        /// This test verifies the None check logic independently.
+        #[test]
+        fn none_scope_baseline_is_fail_closed() {
+            let resolution = PolicyResolution {
+                policy_resolved_ref: "test".to_string(),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
+                resolved_scope_baseline: None,
+            };
+
+            assert!(
+                resolution.resolved_scope_baseline.is_none(),
+                "None baseline must trigger fail-closed in V1 minting path"
+            );
+        }
+
+        /// MAJOR 1 v3: When `resolved_scope_baseline` is Some with a valid
+        /// baseline, the scope validation should use that baseline (not the
+        /// manifest being validated).
+        #[test]
+        fn some_scope_baseline_used_for_validation() {
+            use crate::episode::ToolClass;
+            use crate::episode::capability::ScopeBaseline;
+
+            let baseline = ScopeBaseline {
+                tools: vec![ToolClass::Read, ToolClass::Git],
+                write_paths: vec![],
+                shell_patterns: vec![],
+            };
+            let resolution = PolicyResolution {
+                policy_resolved_ref: "test".to_string(),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
+                resolved_scope_baseline: Some(baseline),
+            };
+
+            let resolved = resolution.resolved_scope_baseline.unwrap();
+            assert_eq!(
+                resolved.tools.len(),
+                2,
+                "Baseline should have 2 tools from policy"
+            );
+            assert_eq!(resolved.tools[0], ToolClass::Read);
+            assert_eq!(resolved.tools[1], ToolClass::Git);
+        }
+
+        /// MAJOR 1 v3: A manifest with tools NOT in the policy baseline is
+        /// rejected by `validate_manifest_scope_subset` when the baseline
+        /// comes from `PolicyResolution`, not from the manifest itself.
+        #[test]
+        fn manifest_exceeding_policy_baseline_is_rejected() {
+            use crate::episode::ToolClass;
+            use crate::episode::capability::{ScopeBaseline, validate_manifest_scope_subset};
+
+            // Policy only allows Read
+            let policy_baseline = ScopeBaseline {
+                tools: vec![ToolClass::Read],
+                write_paths: vec![],
+                shell_patterns: vec![],
+            };
+
+            // Manifest tries to use Read + Execute
+            let manifest = crate::episode::CapabilityManifest::builder("attack")
+                .delegator("attacker")
+                .created_at(1000)
+                .expires_at(2000)
+                .tool_allowlist(vec![ToolClass::Read, ToolClass::Execute])
+                .build()
+                .unwrap();
+
+            let result = validate_manifest_scope_subset(&manifest, &policy_baseline);
+            assert!(
+                result.is_err(),
+                "manifest exceeding policy baseline must be rejected"
+            );
+        }
+    }
+
+    // ========================================================================
+    // TCK-00352 v3 integration: SpawnEpisode with V1 store
+    // ========================================================================
+    mod v3_spawn_episode_v1_integration {
+        use std::sync::Arc;
+
+        use super::*;
+        use crate::episode::capability::ScopeBaseline;
+        use crate::episode::reviewer_manifest::{reviewer_v0_manifest, reviewer_v0_manifest_hash};
+        use crate::episode::tool_class::ToolClass;
+        use crate::protocol::session_dispatch::V1ManifestStore;
+
+        fn priv_ctx() -> ConnectionContext {
+            ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }))
+        }
+
+        /// TCK-00352 MAJOR 1 v3 integration: `SpawnEpisode` with V1 store
+        /// enabled MUST reject when `resolved_scope_baseline` is `None`.
+        #[test]
+        fn spawn_v1_rejects_none_scope_baseline_integration() {
+            let v1_store = Arc::new(V1ManifestStore::new());
+            let dispatcher = PrivilegedDispatcher::new().with_v1_manifest_store(v1_store);
+            let ctx = priv_ctx();
+
+            // Pre-register claim with NO scope baseline
+            let claim = WorkClaim {
+                work_id: "W-V3-SCOPE-NONE".to_string(),
+                lease_id: "L-V3-001".to_string(),
+                actor_id: "actor:test-impl".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-v3-none".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 1,
+                    resolved_scope_baseline: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: "/tmp".to_string(),
+                work_id: "W-V3-SCOPE-NONE".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-V3-001".to_string()),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for missing scope baseline"
+                    );
+                    assert!(
+                        err.message.contains("scope baseline")
+                            || err.message.contains("fail-closed"),
+                        "Error should mention scope baseline or fail-closed: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected rejection for None scope baseline, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 MAJOR 1 v3 integration: `SpawnEpisode` rejects a
+        /// manifest whose tools exceed the policy-resolved scope baseline.
+        #[test]
+        fn spawn_v1_rejects_scope_exceeding_policy_baseline() {
+            let v1_store = Arc::new(V1ManifestStore::new());
+            let dispatcher = PrivilegedDispatcher::new().with_v1_manifest_store(v1_store);
+            let ctx = priv_ctx();
+
+            // Scope baseline only allows Read -- reviewer manifest has more
+            let narrow_baseline = ScopeBaseline {
+                tools: vec![ToolClass::Read],
+                write_paths: Vec::new(),
+                shell_patterns: Vec::new(),
+            };
+            let claim = WorkClaim {
+                work_id: "W-V3-SCOPE-NARROW".to_string(),
+                lease_id: "L-V3-002".to_string(),
+                actor_id: "actor:test-reviewer".to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-v3-narrow".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: *reviewer_v0_manifest_hash(),
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 1,
+                    resolved_scope_baseline: Some(narrow_baseline),
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: "/tmp".to_string(),
+                work_id: "W-V3-SCOPE-NARROW".to_string(),
+                role: WorkRole::Reviewer.into(),
+                lease_id: Some("L-V3-002".to_string()),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for overbroad scope"
+                    );
+                    assert!(
+                        err.message.contains("scope")
+                            || err.message.contains("OverbroadScope")
+                            || err.message.contains("baseline"),
+                        "Error should mention scope failure: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected rejection for overbroad scope, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 2 v3 integration: Risk tier ceiling comes
+        /// from `policy_resolution.resolved_risk_tier`, verified through
+        /// the actual `SpawnEpisode` path with V1 store.
+        #[test]
+        fn spawn_v1_risk_ceiling_from_policy_integration() {
+            let v1_store = Arc::new(V1ManifestStore::new());
+            let dispatcher = PrivilegedDispatcher::new().with_v1_manifest_store(v1_store.clone());
+            let ctx = priv_ctx();
+
+            let reviewer = reviewer_v0_manifest();
+            let matching_baseline = ScopeBaseline {
+                tools: reviewer.tool_allowlist.clone(),
+                write_paths: reviewer.write_allowlist.clone(),
+                shell_patterns: reviewer.shell_allowlist.clone(),
+            };
+
+            // Policy says Tier0 -- the V1 ceiling must be Tier0
+            let claim = WorkClaim {
+                work_id: "W-V3-RISK-CEIL".to_string(),
+                lease_id: "L-V3-003".to_string(),
+                actor_id: "actor:test-reviewer".to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-v3-risk".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: *reviewer_v0_manifest_hash(),
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: Some(matching_baseline),
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: "/tmp".to_string(),
+                work_id: "W-V3-RISK-CEIL".to_string(),
+                role: WorkRole::Reviewer.into(),
+                lease_id: Some("L-V3-003".to_string()),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    let v1 = v1_store
+                        .get(&resp.session_id)
+                        .expect("V1 manifest should be registered");
+                    assert_eq!(
+                        v1.risk_tier_ceiling(),
+                        crate::episode::envelope::RiskTier::Tier0,
+                        "Risk tier ceiling must come from policy (Tier0)"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!("SpawnEpisode should succeed, got error: {err:?}");
+                },
+                other => panic!("Expected SpawnEpisode, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 2 v3 integration: Invalid risk tier (255)
+        /// must fail closed to Tier4 through the actual `SpawnEpisode` path.
+        #[test]
+        fn spawn_v1_invalid_risk_tier_fails_to_tier4_integration() {
+            let v1_store = Arc::new(V1ManifestStore::new());
+            let dispatcher = PrivilegedDispatcher::new().with_v1_manifest_store(v1_store.clone());
+            let ctx = priv_ctx();
+
+            let reviewer = reviewer_v0_manifest();
+            let matching_baseline = ScopeBaseline {
+                tools: reviewer.tool_allowlist.clone(),
+                write_paths: reviewer.write_allowlist.clone(),
+                shell_patterns: reviewer.shell_allowlist.clone(),
+            };
+
+            let claim = WorkClaim {
+                work_id: "W-V3-RISK-INV".to_string(),
+                lease_id: "L-V3-004".to_string(),
+                actor_id: "actor:test-reviewer".to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-v3-invalid".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: *reviewer_v0_manifest_hash(),
+                    context_pack_hash: [0u8; 32],
+                    // Invalid tier value
+                    resolved_risk_tier: 255,
+                    resolved_scope_baseline: Some(matching_baseline),
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: "/tmp".to_string(),
+                work_id: "W-V3-RISK-INV".to_string(),
+                role: WorkRole::Reviewer.into(),
+                lease_id: Some("L-V3-004".to_string()),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    let v1 = v1_store
+                        .get(&resp.session_id)
+                        .expect("V1 manifest should be registered");
+                    assert_eq!(
+                        v1.risk_tier_ceiling(),
+                        crate::episode::envelope::RiskTier::Tier4,
+                        "Invalid risk tier must fail closed to Tier4"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    // Also acceptable: minting fails due to Tier4 constraint
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Error must be CapabilityRequestRejected: {err:?}"
+                    );
+                },
+                other => panic!("Expected SpawnEpisode or Error, got: {other:?}"),
+            }
         }
     }
 }

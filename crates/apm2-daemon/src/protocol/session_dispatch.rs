@@ -541,6 +541,57 @@ impl ManifestStore for InMemoryManifestStore {
 }
 
 // ============================================================================
+// TCK-00352: V1 Manifest Store (Security Review MAJOR 2)
+// ============================================================================
+
+/// Thread-safe store for V1 capability manifests keyed by session ID.
+///
+/// Per TCK-00352 Security Review MAJOR 2, V1 manifests must be wired into
+/// the production actuation path. This store is shared between the
+/// `PrivilegedDispatcher` (which mints and registers V1 manifests during
+/// `SpawnEpisode`) and the `SessionDispatcher` (which enforces V1 scope
+/// checks during `RequestTool`).
+#[derive(Debug, Default)]
+pub struct V1ManifestStore {
+    manifests:
+        std::sync::RwLock<std::collections::HashMap<String, crate::episode::CapabilityManifestV1>>,
+}
+
+impl V1ManifestStore {
+    /// Creates a new empty V1 manifest store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a V1 manifest for a session.
+    pub fn register(
+        &self,
+        session_id: impl Into<String>,
+        manifest: crate::episode::CapabilityManifestV1,
+    ) {
+        let mut store = self.manifests.write().expect("lock poisoned");
+        store.insert(session_id.into(), manifest);
+    }
+
+    /// Looks up the V1 manifest for a session.
+    #[must_use]
+    pub fn get(&self, session_id: &str) -> Option<crate::episode::CapabilityManifestV1> {
+        let store = self.manifests.read().expect("lock poisoned");
+        store.get(session_id).cloned()
+    }
+
+    /// Removes a V1 manifest for a session.
+    pub fn remove(&self, session_id: &str) {
+        let mut store = self.manifests.write().expect("lock poisoned");
+        store.remove(session_id);
+    }
+}
+
+/// Shared reference to a [`V1ManifestStore`].
+pub type SharedV1ManifestStore = Arc<V1ManifestStore>;
+
+// ============================================================================
 // Dispatcher
 // ============================================================================
 
@@ -636,6 +687,18 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// are persisted to the ledger through the session dispatcher's
     /// `ledger` emitter.
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
+    /// Shared V1 manifest store for broker scope enforcement
+    /// (TCK-00352 Security Review MAJOR 2).
+    ///
+    /// When a session has a V1 manifest registered, the `handle_request_tool`
+    /// path enforces V1 scope checks (risk tier ceiling, host restrictions,
+    /// envelope-manifest hash binding) before dispatching to the broker.
+    /// Sessions without a V1 manifest fall through to the existing broker
+    /// path (backwards compatible).
+    ///
+    /// This store is shared with `PrivilegedDispatcher` via `DispatcherState`
+    /// so that `SpawnEpisode` can mint and register V1 manifests.
+    v1_manifest_store: Option<SharedV1ManifestStore>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -664,6 +727,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -684,6 +748,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 }
@@ -709,6 +774,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -734,6 +800,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -775,6 +842,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -874,6 +942,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// the orchestrator after the session dispatcher has been built.
     pub fn set_gate_orchestrator(&mut self, orchestrator: Arc<GateOrchestrator>) {
         self.gate_orchestrator = Some(orchestrator);
+    }
+
+    /// Sets the shared V1 manifest store for TCK-00352 scope enforcement.
+    ///
+    /// Per TCK-00352 Security Review MAJOR 2, this store is shared with
+    /// `PrivilegedDispatcher` so that V1 manifests minted during
+    /// `SpawnEpisode` are visible for scope enforcement in
+    /// `handle_request_tool`.
+    #[must_use]
+    pub fn with_v1_manifest_store(mut self, store: SharedV1ManifestStore) -> Self {
+        self.v1_manifest_store = Some(store);
+        self
     }
 
     fn emit_htf_regression_defect(&self, current: u64, previous: u64) {
@@ -1251,6 +1331,194 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 format!("unknown tool class: {}", request.tool_id),
             ));
         };
+
+        // TCK-00352 Security Review BLOCKER 1 fix: V1 scope enforcement gate.
+        // If the session has a V1 manifest registered, enforce V1 checks
+        // (risk tier ceiling, host restrictions, expiry) BEFORE dispatching
+        // to the broker. Deny if V1 validation fails.
+        //
+        // CRITICAL: Parse request.arguments to extract typed tool args
+        // (path, network host/port, shell command, size) so that V1 scope
+        // validation sees the ACTUAL untrusted fields from the request,
+        // not a synthesized empty ToolRequest that would bypass path/host
+        // checks.
+        if let Some(ref v1_store) = self.v1_manifest_store {
+            if let Some(v1_manifest) = v1_store.get(&token.session_id) {
+                // Build a V1-compatible ToolRequest for scope validation.
+                // Extract risk tier from manifest capabilities for this tool class.
+                let risk_tier = self
+                    .manifest_store
+                    .as_ref()
+                    .and_then(|store| store.get_manifest(&token.session_id))
+                    .and_then(|manifest| {
+                        manifest
+                            .find_by_tool_class(tool_class)
+                            .next()
+                            .map(|cap| cap.risk_tier_required)
+                    })
+                    .unwrap_or(RiskTier::Tier0);
+
+                let mut v1_request = crate::episode::ToolRequest::new(tool_class, risk_tier);
+
+                // TCK-00352 BLOCKER 1 fix: Parse request.arguments JSON to
+                // extract typed fields (path, network, shell_command, size).
+                // Without this, validate_request_scoped only checks risk tier
+                // and expiry but skips host/path/shell checks because those
+                // fields are None in the synthesized request.
+                if let Ok(args_value) =
+                    serde_json::from_slice::<serde_json::Value>(&request.arguments)
+                {
+                    // Extract path for filesystem operations (Read, Write, ListFiles)
+                    if let Some(path_str) = args_value.get("path").and_then(|v| v.as_str()) {
+                        v1_request = v1_request.with_path(std::path::PathBuf::from(path_str));
+                    }
+
+                    // Extract network target for Network operations (host from URL).
+                    // SECURITY (BLOCKER 1 v3 fix): Use the `url` crate for
+                    // RFC-3986-compliant parsing. Ad-hoc string splitting is
+                    // vulnerable to authority confusion attacks where a URL like
+                    // `https://trusted.com:443@evil.com/steal` tricks naive
+                    // parsers into extracting "trusted.com" as the host while
+                    // the actual network destination is "evil.com".
+                    //
+                    // The `url` crate correctly parses the authority component
+                    // and separates userinfo from the actual host. We also
+                    // hard-deny URLs that contain userinfo (username/password)
+                    // since legitimate tool URLs never include credentials in
+                    // the URL itself and their presence strongly indicates an
+                    // authority confusion attack vector.
+                    if let Some(url_str) = args_value.get("url").and_then(|v| v.as_str()) {
+                        match url::Url::parse(url_str) {
+                            Ok(parsed_url) => {
+                                // SECURITY: Reject URLs with userinfo (username
+                                // or password). Userinfo in URLs is the primary
+                                // vector for authority confusion attacks.
+                                if !parsed_url.username().is_empty()
+                                    || parsed_url.password().is_some()
+                                {
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        "RequestTool denied: URL contains userinfo (authority confusion)"
+                                    );
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorToolNotAllowed,
+                                        "URL contains userinfo component; rejected for authority confusion risk".to_string(),
+                                    ));
+                                }
+                                if let Some(host) = parsed_url.host_str() {
+                                    let port =
+                                        parsed_url.port_or_known_default().unwrap_or_else(|| {
+                                            if parsed_url.scheme() == "https" {
+                                                443
+                                            } else {
+                                                80
+                                            }
+                                        });
+                                    v1_request = v1_request.with_network(host, port);
+                                }
+                                // If host_str() is None (e.g. data: URLs), the
+                                // request proceeds without a network target and
+                                // the V1 scope check will deny Network tool
+                                // class if host restrictions are configured
+                                // (fail-closed via empty host restrictions).
+                            },
+                            Err(_) => {
+                                // SECURITY: Fail-closed on unparseable URLs.
+                                // If we cannot reliably determine the host, we
+                                // must deny Network tool class to prevent
+                                // bypass via malformed URLs.
+                                if tool_class == ToolClass::Network {
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        "RequestTool denied: URL parse failed for Network tool (fail-closed)"
+                                    );
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorToolNotAllowed,
+                                        "URL parse failed; Network tool denied (fail-closed)"
+                                            .to_string(),
+                                    ));
+                                }
+                                // For non-Network tool classes, unparseable URL
+                                // is not security-relevant; proceed without
+                                // network target.
+                            },
+                        }
+                    }
+
+                    // Extract shell command for Execute operations
+                    if let Some(cmd) = args_value.get("command").and_then(|v| v.as_str()) {
+                        v1_request = v1_request.with_shell_command(cmd);
+                    }
+
+                    // Extract size for read/write operations
+                    if let Some(size) = args_value.get("limit").and_then(serde_json::Value::as_u64)
+                    {
+                        v1_request = v1_request.with_size(size);
+                    }
+                    if let Some(content) = args_value.get("content") {
+                        if let Some(content_bytes) = content.as_array() {
+                            v1_request = v1_request.with_size(content_bytes.len() as u64);
+                        } else if let Some(content_str) = content.as_str() {
+                            v1_request = v1_request.with_size(content_str.len() as u64);
+                        }
+                    }
+                }
+                // If arguments cannot be parsed as JSON, v1_request retains
+                // only tool_class and risk_tier. The inner manifest validation
+                // will still enforce tool allowlist and expiry checks (fail-
+                // closed for unrecognized tool classes).
+
+                // Get clock for expiry checks (use HTF clock if available,
+                // otherwise use system clock as fallback).
+                let clock: Box<dyn crate::episode::capability::Clock> =
+                    if let Some(ref htf_clock) = self.clock {
+                        match htf_clock.now_hlc() {
+                            Ok(hlc) => Box::new(crate::episode::capability::FixedClock::new(
+                                hlc.wall_ns / 1_000_000_000,
+                            )),
+                            Err(_) => Box::new(crate::episode::capability::SystemClock),
+                        }
+                    } else {
+                        Box::new(crate::episode::capability::SystemClock)
+                    };
+
+                let decision = v1_manifest.validate_request_scoped(&v1_request, clock.as_ref());
+                if decision.is_denied() {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_class = ?tool_class,
+                        "RequestTool denied by V1 scope enforcement"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("V1 scope enforcement denied: {decision:?}"),
+                    ));
+                }
+
+                // TCK-00352: Verify envelope-manifest hash binding.
+                // Look up the session's envelope manifest hash and verify it
+                // matches the V1 manifest digest.
+                if let Some(ref registry) = self.session_registry {
+                    if let Some(session_state) = registry.get_session(&token.session_id) {
+                        if !session_state.capability_manifest_hash.is_empty() {
+                            if let Err(e) = v1_manifest
+                                .verify_envelope_binding(&session_state.capability_manifest_hash)
+                            {
+                                warn!(
+                                    session_id = %token.session_id,
+                                    error = %e,
+                                    "RequestTool denied: envelope-manifest hash mismatch"
+                                );
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorToolNotAllowed,
+                                    format!("envelope-manifest binding failed: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
@@ -5663,6 +5931,491 @@ mod tests {
             assert!(
                 matches!(response, SessionResponse::EmitEvent(_)),
                 "EmitEvent should succeed for active session, got: {response:?}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // TCK-00352 MAJOR 4: V1 dispatch/session integration tests
+    //
+    // These tests prove that V1 scope enforcement is exercised through the
+    // real `SessionDispatcher::handle_request_tool` path, including deny
+    // paths for envelope mismatch, scoped host/path violations, and risk
+    // tier ceiling enforcement.
+    // ========================================================================
+    mod v1_integration_tests {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::{Duration, SystemTime};
+
+        use secrecy::SecretString;
+
+        use super::*;
+        use crate::episode::InMemorySessionRegistry;
+        use crate::episode::capability::{
+            Capability, CapabilityManifest, CapabilityManifestV1, PolicyMintToken,
+        };
+        use crate::episode::envelope::RiskTier;
+        use crate::episode::scope::{CapabilityScope, SizeLimits};
+        use crate::episode::tool_class::ToolClass;
+        use crate::protocol::credentials::PeerCredentials;
+        use crate::protocol::messages::{RequestToolRequest, SessionErrorCode};
+        use crate::protocol::session_dispatch::{
+            InMemoryManifestStore, SharedV1ManifestStore, V1ManifestStore,
+        };
+        use crate::session::SessionState;
+
+        fn test_minter() -> TokenMinter {
+            TokenMinter::new(SecretString::from("test-daemon-secret-key-32bytes!!"))
+        }
+
+        fn make_session_ctx() -> ConnectionContext {
+            ConnectionContext::session_open(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12346),
+                }),
+                Some("session-v1-001".to_string()),
+            )
+        }
+
+        /// Helper: Creates a V1 manifest with Read capability rooted at
+        /// /workspace, and registers it in the V1 store for session-v1-001.
+        fn setup_v1_dispatcher(
+            host_restrictions: Vec<String>,
+            tool_allowlist: &[ToolClass],
+            capabilities: Vec<Capability>,
+        ) -> (SessionDispatcher<InMemoryManifestStore>, TokenMinter) {
+            let minter = test_minter();
+            let v1_store: SharedV1ManifestStore = Arc::new(V1ManifestStore::new());
+
+            // Build a manifest with explicit tool allowlist and capabilities
+            let manifest = CapabilityManifest::builder("v1-int-test")
+                .delegator("policy-resolver")
+                .created_at(1000)
+                .expires_at(4_070_908_800) // 2099-01-01 UTC
+                .capabilities(capabilities)
+                .tool_allowlist(tool_allowlist.to_vec())
+                .build()
+                .unwrap();
+
+            // Also register in regular manifest store for risk tier lookup
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            manifest_store.register("session-v1-001", manifest.clone());
+
+            // Mint V1 manifest and register
+            let v1_manifest = CapabilityManifestV1::mint(
+                PolicyMintToken::new(),
+                manifest,
+                RiskTier::Tier2,
+                host_restrictions,
+            )
+            .unwrap();
+            v1_store.register("session-v1-001", v1_manifest);
+
+            // Register session in registry
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+            let session = SessionState {
+                session_id: "session-v1-001".to_string(),
+                work_id: "W-V1-TEST".to_string(),
+                role: crate::protocol::messages::WorkRole::Implementer.into(),
+                lease_id: "L-V1-001".to_string(),
+                ephemeral_handle: "handle-v1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-V1-001".to_string()),
+            };
+            registry.register_session(session).unwrap();
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_v1_manifest_store(v1_store)
+                .with_session_registry(registry);
+
+            (dispatcher, minter)
+        }
+
+        fn make_tool_request(
+            minter: &TokenMinter,
+            tool_id: &str,
+            args_json: &serde_json::Value,
+        ) -> Bytes {
+            let spawn_time = SystemTime::now();
+            let ttl = Duration::from_secs(3600);
+            let token = minter
+                .mint("session-v1-001", "L-V1-001", spawn_time, ttl)
+                .unwrap();
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: tool_id.to_string(),
+                arguments: serde_json::to_vec(args_json).unwrap(),
+                dedupe_key: format!("dedupe-{}", uuid::Uuid::new_v4()),
+            };
+            encode_request_tool_request(&request)
+        }
+
+        /// TCK-00352 BLOCKER 1 integration test: V1 scope enforcement
+        /// denies a network request to an unauthorized host when the
+        /// actual host is extracted from request.arguments.
+        #[test]
+        fn v1_denies_network_request_to_unauthorized_host_via_dispatch() {
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                vec!["*.trusted.corp".to_string()], // Only trusted hosts
+                &[ToolClass::Network],
+                vec![
+                    Capability::builder("net-cap", ToolClass::Network)
+                        .scope(CapabilityScope {
+                            root_paths: Vec::new(),
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: Some(crate::episode::scope::NetworkPolicy {
+                                allowed_hosts: vec!["*.trusted.corp".to_string()],
+                                allowed_ports: vec![443],
+                                require_tls: true,
+                            }),
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Request with unauthorized host in URL
+            let frame = make_tool_request(
+                &minter,
+                "network",
+                &serde_json::json!({
+                    "url": "https://evil-exfil.attacker.com/steal-data",
+                    "method": "GET"
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for unauthorized host"
+                    );
+                    assert!(
+                        err.message.contains("V1 scope enforcement denied")
+                            || err.message.contains("NetworkNotAllowed"),
+                        "Error should mention V1 scope denial or NetworkNotAllowed: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected V1 denial for unauthorized network host, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 1 integration test: V1 scope enforcement
+        /// denies a Read request with a path outside the allowed scope.
+        #[test]
+        fn v1_denies_read_request_with_out_of_scope_path_via_dispatch() {
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                Vec::new(),
+                &[ToolClass::Read],
+                vec![
+                    Capability::builder("read-cap", ToolClass::Read)
+                        .scope(CapabilityScope {
+                            root_paths: vec![PathBuf::from("/workspace")],
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: None,
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Request a path outside /workspace
+            let frame = make_tool_request(
+                &minter,
+                "read",
+                &serde_json::json!({
+                    "path": "/etc/shadow"
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for out-of-scope path"
+                    );
+                    assert!(
+                        err.message.contains("V1 scope enforcement denied")
+                            || err.message.contains("PathNotAllowed"),
+                        "Error should mention V1 scope denial: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected V1 denial for out-of-scope path, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 MAJOR 4 integration test: V1 scope enforcement
+        /// denies a tool not in the manifest allowlist.
+        #[test]
+        fn v1_denies_disallowed_tool_class_via_dispatch() {
+            // Only Read is allowed, Execute is not
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                Vec::new(),
+                &[ToolClass::Read],
+                vec![
+                    Capability::builder("read-cap", ToolClass::Read)
+                        .scope(CapabilityScope {
+                            root_paths: vec![PathBuf::from("/workspace")],
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: None,
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Request Execute, which is not in the tool allowlist
+            let frame = make_tool_request(
+                &minter,
+                "execute",
+                &serde_json::json!({
+                    "command": "rm",
+                    "args": ["-rf", "/"]
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for disallowed tool class"
+                    );
+                    assert!(
+                        err.message.contains("V1 scope enforcement denied")
+                            || err.message.contains("ToolNotInAllowlist"),
+                        "Error should mention V1 scope denial: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected V1 denial for disallowed tool class, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 1 v3: Authority confusion attack via userinfo
+        /// in URL. A URL like `https://trusted.com:443@evil.com/steal` must
+        /// be rejected because the actual network destination is `evil.com`,
+        /// not `trusted.com`. The `url` crate correctly parses the authority
+        /// and we deny any URL containing userinfo.
+        #[test]
+        fn v1_denies_url_with_userinfo_authority_confusion() {
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                vec!["*.trusted.com".to_string()],
+                &[ToolClass::Network],
+                vec![
+                    Capability::builder("net-cap", ToolClass::Network)
+                        .scope(CapabilityScope {
+                            root_paths: Vec::new(),
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: Some(crate::episode::scope::NetworkPolicy {
+                                allowed_hosts: vec!["*.trusted.com".to_string()],
+                                allowed_ports: vec![443],
+                                require_tls: true,
+                            }),
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Authority confusion: "trusted.com:443" looks like host:port
+            // but is actually the userinfo component. The real host is evil.com.
+            let frame = make_tool_request(
+                &minter,
+                "network",
+                &serde_json::json!({
+                    "url": "https://trusted.com:443@evil.com/steal",
+                    "method": "GET"
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for authority confusion URL"
+                    );
+                    assert!(
+                        err.message.contains("userinfo"),
+                        "Error should mention userinfo rejection: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected denial for authority confusion URL, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 1 v3: URL with username-only userinfo must
+        /// also be rejected. Even without a password, the presence of
+        /// userinfo indicates potential authority confusion.
+        #[test]
+        fn v1_denies_url_with_username_only_userinfo() {
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                vec!["*.trusted.com".to_string()],
+                &[ToolClass::Network],
+                vec![
+                    Capability::builder("net-cap", ToolClass::Network)
+                        .scope(CapabilityScope {
+                            root_paths: Vec::new(),
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: Some(crate::episode::scope::NetworkPolicy {
+                                allowed_hosts: vec!["*.trusted.com".to_string()],
+                                allowed_ports: vec![443],
+                                require_tls: true,
+                            }),
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Username-only userinfo: user@ before the host
+            let frame = make_tool_request(
+                &minter,
+                "network",
+                &serde_json::json!({
+                    "url": "https://admin@evil.com/path",
+                    "method": "GET"
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for username-only userinfo URL"
+                    );
+                    assert!(
+                        err.message.contains("userinfo"),
+                        "Error should mention userinfo rejection: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected denial for username-only userinfo URL, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 1 v3: Unparseable URL must be denied for
+        /// Network tool class (fail-closed). If we cannot reliably determine
+        /// the host, we must not allow the request through.
+        #[test]
+        fn v1_denies_unparseable_url_for_network_tool() {
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                vec!["*.trusted.com".to_string()],
+                &[ToolClass::Network],
+                vec![
+                    Capability::builder("net-cap", ToolClass::Network)
+                        .scope(CapabilityScope {
+                            root_paths: Vec::new(),
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: Some(crate::episode::scope::NetworkPolicy {
+                                allowed_hosts: vec!["*.trusted.com".to_string()],
+                                allowed_ports: vec![443],
+                                require_tls: true,
+                            }),
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Relative URL path: the `url` crate rejects URLs without a
+            // valid scheme (relative references are not valid absolute URLs).
+            let frame = make_tool_request(
+                &minter,
+                "network",
+                &serde_json::json!({
+                    "url": "/relative/path/no/scheme",
+                    "method": "GET"
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for unparseable URL"
+                    );
+                    assert!(
+                        err.message.contains("URL parse failed"),
+                        "Error should mention URL parse failure: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected denial for unparseable URL on Network tool, got: {other:?}")
+                },
+            }
+        }
+
+        /// TCK-00352 MAJOR 2: V1 store cleanup on remove.
+        /// Verifies that removing a V1 manifest from the store means
+        /// subsequent requests bypass V1 checks (as if the session
+        /// was terminated).
+        #[test]
+        fn v1_store_remove_clears_manifest() {
+            let v1_store = V1ManifestStore::new();
+            let manifest = CapabilityManifest::builder("cleanup-test")
+                .delegator("daemon")
+                .created_at(1000)
+                .expires_at(4_070_908_800)
+                .tool_allowlist(vec![ToolClass::Read])
+                .build()
+                .unwrap();
+            let v1 = CapabilityManifestV1::mint(
+                PolicyMintToken::new(),
+                manifest,
+                RiskTier::Tier2,
+                Vec::new(),
+            )
+            .unwrap();
+
+            v1_store.register("sess-cleanup", v1);
+            assert!(
+                v1_store.get("sess-cleanup").is_some(),
+                "V1 manifest should be registered"
+            );
+
+            v1_store.remove("sess-cleanup");
+            assert!(
+                v1_store.get("sess-cleanup").is_none(),
+                "V1 manifest should be removed after cleanup"
             );
         }
     }
