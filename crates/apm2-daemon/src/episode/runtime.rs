@@ -1416,6 +1416,184 @@ impl EpisodeRuntime {
         Ok(())
     }
 
+    /// Stops an episode and emits a `SessionTerminated` ledger event
+    /// (TCK-00395).
+    ///
+    /// This is a convenience wrapper around [`Self::stop`] that additionally
+    /// emits a `SessionTerminated` event to the ledger when a
+    /// `ledger_emitter` is configured. This enables the `GateOrchestrator`
+    /// (TCK-00388) to observe session termination and trigger gate lifecycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode to stop
+    /// * `termination_class` - How the episode terminated
+    /// * `timestamp_ns` - Current timestamp in nanoseconds since epoch
+    /// * `session_id` - The session being terminated
+    /// * `work_id` - The work ID this session is associated with
+    /// * `actor_id` - The actor associated with this session
+    ///
+    /// # Errors
+    ///
+    /// Returns `EpisodeError` if the episode stop fails or ledger emission
+    /// fails.
+    pub async fn stop_with_session_context(
+        &self,
+        episode_id: &EpisodeId,
+        termination_class: TerminationClass,
+        timestamp_ns: u64,
+        session_id: &str,
+        work_id: &str,
+        actor_id: &str,
+    ) -> Result<(), EpisodeError> {
+        // Perform the normal stop
+        self.stop(episode_id, termination_class, timestamp_ns)
+            .await?;
+
+        // TCK-00395: Emit SessionTerminated event to ledger if emitter is configured
+        if let Some(ref emitter) = self.ledger_emitter {
+            let exit_code = match termination_class {
+                TerminationClass::Success => 0,
+                _ => 1,
+            };
+            let termination_reason = format!("{termination_class}");
+
+            if let Err(e) = emitter.emit_session_terminated(
+                session_id,
+                work_id,
+                exit_code,
+                &termination_reason,
+                actor_id,
+                timestamp_ns,
+            ) {
+                warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    work_id = %work_id,
+                    "SessionTerminated ledger event emission failed"
+                );
+                return Err(EpisodeError::LedgerFailure {
+                    id: episode_id.as_str().to_string(),
+                    message: format!("session terminated event emission failed: {e}"),
+                });
+            }
+
+            info!(
+                session_id = %session_id,
+                work_id = %work_id,
+                episode_id = %episode_id,
+                "SessionTerminated ledger event emitted"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Stops all running episodes with session context (TCK-00395 BLOCKER 1).
+    ///
+    /// This method iterates all running episodes and stops each one, emitting
+    /// `SessionTerminated` ledger events for all sessions. It is intended for
+    /// daemon shutdown, where all managed episodes must be terminated and
+    /// the termination facts must be recorded in the ledger.
+    ///
+    /// The `actor_id` for these terminations is `"daemon:shutdown"` since
+    /// the daemon itself is initiating the termination (not any user).
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp_ns` - Current timestamp in nanoseconds since epoch
+    /// * `termination_class` - How episodes are being terminated
+    ///
+    /// # Returns
+    ///
+    /// The number of episodes successfully stopped. Episodes that fail to
+    /// stop are logged at warn level but do not prevent other episodes from
+    /// being stopped.
+    pub async fn stop_all_running(
+        &self,
+        timestamp_ns: u64,
+        termination_class: TerminationClass,
+    ) -> usize {
+        // Collect running episode IDs and their session_ids under read lock
+        let running: Vec<(String, String)> = {
+            let episodes = self.episodes.read().await;
+            episodes
+                .iter()
+                .filter_map(|(id, entry)| {
+                    if let EpisodeState::Running { session_id, .. } = &entry.state {
+                        Some((id.clone(), session_id.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if running.is_empty() {
+            debug!("No running episodes to stop");
+            return 0;
+        }
+
+        info!(
+            count = running.len(),
+            "Stopping all running episodes for daemon shutdown"
+        );
+
+        let mut stopped_count = 0usize;
+        for (episode_id_str, session_id) in &running {
+            let episode_id = match EpisodeId::new(episode_id_str.clone()) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        episode_id = %episode_id_str,
+                        "Failed to parse episode ID during shutdown - skipping"
+                    );
+                    continue;
+                },
+            };
+
+            // Resolve work_id from session registry if available
+            let work_id = self
+                .session_registry
+                .as_ref()
+                .and_then(|reg| reg.get_session(session_id))
+                .map(|s| s.work_id)
+                .unwrap_or_default();
+
+            match self
+                .stop_with_session_context(
+                    &episode_id,
+                    termination_class,
+                    timestamp_ns,
+                    session_id,
+                    &work_id,
+                    "daemon:shutdown",
+                )
+                .await
+            {
+                Ok(()) => {
+                    stopped_count += 1;
+                },
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        episode_id = %episode_id_str,
+                        session_id = %session_id,
+                        "Failed to stop episode during shutdown - continuing with remaining"
+                    );
+                },
+            }
+        }
+
+        info!(
+            stopped = stopped_count,
+            total = running.len(),
+            "Daemon shutdown episode stop complete"
+        );
+        stopped_count
+    }
+
     /// Quarantines an episode, transitioning it from RUNNING to QUARANTINED.
     ///
     /// # Arguments
@@ -3446,6 +3624,13 @@ mod tests {
         fn get_session_by_work_id(&self, _work_id: &str) -> Option<crate::session::SessionState> {
             None
         }
+        fn remove_session(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<crate::session::SessionState>, crate::session::SessionRegistryError>
+        {
+            Ok(None)
+        }
         fn mark_terminated(
             &self,
             _session_id: &str,
@@ -3463,6 +3648,13 @@ mod tests {
             _session_id: &str,
         ) -> Option<(crate::session::SessionState, SessionTerminationInfo)> {
             None
+        }
+        fn update_episode_id(
+            &self,
+            _session_id: &str,
+            _episode_id: String,
+        ) -> Result<(), crate::session::SessionRegistryError> {
+            Ok(())
         }
     }
 

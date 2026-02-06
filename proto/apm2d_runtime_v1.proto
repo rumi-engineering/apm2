@@ -387,6 +387,46 @@ message WorkStatusResponse {
 }
 
 // =============================================================================
+// IPC-PRIV-016: EndSession (TCK-00395)
+// =============================================================================
+// Terminates an active session and emits SessionTerminated + WorkTransitioned
+// ledger events. Wires the SessionTerminated code-path into production use.
+
+// Typed termination outcome for EndSession (TCK-00395 Quality v3 MAJOR).
+// Replaces free-form string matching for success/failure inference.
+enum TerminationOutcome {
+  // Unspecified outcome (treated as failure for safety).
+  TERMINATION_OUTCOME_UNSPECIFIED = 0;
+  // Session completed successfully (exit_code = 0).
+  TERMINATION_OUTCOME_SUCCESS = 1;
+  // Session failed (exit_code = 1).
+  TERMINATION_OUTCOME_FAILURE = 2;
+  // Session was cancelled by the operator.
+  TERMINATION_OUTCOME_CANCELLED = 3;
+  // Session timed out.
+  TERMINATION_OUTCOME_TIMEOUT = 4;
+}
+
+// Request to end an active session.
+message EndSessionRequest {
+  // Identifier of the session to terminate.
+  string session_id = 1;
+  // Human-readable reason for termination.
+  string reason = 2;
+  // Typed termination outcome (TCK-00395 Quality v3 MAJOR).
+  // When set, this takes precedence over string-based reason matching.
+  TerminationOutcome outcome = 3;
+}
+
+// Response confirming session termination.
+message EndSessionResponse {
+  // Identifier of the terminated session.
+  string session_id = 1;
+  // Human-readable confirmation message.
+  string message = 2;
+}
+
+// =============================================================================
 // CTR-PROTO-012: Credential Management Endpoints (RFC-0018, TCK-00343)
 // =============================================================================
 // These endpoints manage credential profiles for agent authentication.

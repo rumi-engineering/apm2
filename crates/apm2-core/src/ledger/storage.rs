@@ -1136,6 +1136,8 @@ impl SqliteLedgerBackend {
             "artifact_manifest" => Ok(crate::events::ARTIFACT_MANIFEST_DOMAIN_PREFIX),
             // FAC events
             "changeset_published" => Ok(crate::events::CHANGESET_PUBLISHED_DOMAIN_PREFIX),
+            // TCK-00395: Work lifecycle transition events
+            "work_transitioned" => Ok(crate::events::WORK_TRANSITIONED_DOMAIN_PREFIX),
             // RFC-0018 HEF review events (TCK-00313)
             "review_receipt_recorded" => Ok(crate::events::REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX),
             "review_blocked_recorded" => Ok(crate::events::REVIEW_BLOCKED_RECORDED_DOMAIN_PREFIX),

@@ -184,6 +184,45 @@ pub trait SessionRegistry: Send + Sync {
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)>;
 
+    /// Removes a session by ID (TCK-00395).
+    ///
+    /// Returns the removed session state if found, or `None` if no session
+    /// with the given ID exists. After removal, the session is no longer
+    /// observable via `get_session` or `get_session_by_handle`.
+    ///
+    /// This is called by `EndSession` to ensure terminated sessions are
+    /// removed from the registry, preventing repeated termination and
+    /// stale session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SessionRegistryError` if persistence fails (fail-closed).
+    /// The in-memory removal may have already occurred; callers must treat
+    /// this as a hard failure.
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError>;
+
+    /// Updates the `episode_id` for an existing session (TCK-00395 Security
+    /// BLOCKER 1).
+    ///
+    /// After `SpawnEpisode` creates and starts an episode via
+    /// `episode_runtime.create()` + `start_with_workspace()`, the returned
+    /// episode ID must be written back to the session in the registry.
+    /// Without this write-back, `EndSession` cannot resolve the episode
+    /// binding and will skip runtime stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SessionRegistryError` if the session is not found or
+    /// persistence fails (fail-closed).
+    fn update_episode_id(
+        &self,
+        session_id: &str,
+        episode_id: String,
+    ) -> Result<(), SessionRegistryError>;
+
     /// Returns all active sessions for crash recovery (TCK-00387).
     ///
     /// Default implementation returns an empty vec (suitable for in-memory

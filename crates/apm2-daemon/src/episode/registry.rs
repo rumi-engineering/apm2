@@ -1047,6 +1047,37 @@ impl SessionRegistry for InMemorySessionRegistry {
 
         Some((entry.session.clone(), entry.info.clone()))
     }
+
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError> {
+        let mut state = self.state.write().expect("lock poisoned");
+
+        if let Some(session) = state.by_id.remove(session_id) {
+            state.by_handle.remove(&session.ephemeral_handle);
+            state.queue.retain(|id| id != session_id);
+            Ok(Some(session))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn update_episode_id(
+        &self,
+        session_id: &str,
+        episode_id: String,
+    ) -> Result<(), SessionRegistryError> {
+        let mut state = self.state.write().expect("lock poisoned");
+        if let Some(session) = state.by_id.get_mut(session_id) {
+            session.episode_id = Some(episode_id);
+            Ok(())
+        } else {
+            Err(SessionRegistryError::RegistrationFailed {
+                message: format!("session not found for episode_id update: {session_id}"),
+            })
+        }
+    }
 }
 
 impl InMemorySessionRegistry {
@@ -2202,6 +2233,42 @@ impl SessionRegistry for PersistentSessionRegistry {
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)> {
         SessionRegistry::get_terminated_session(&self.inner, session_id)
+    }
+
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError> {
+        let removed =
+            <InMemorySessionRegistry as SessionRegistry>::remove_session(&self.inner, session_id)?;
+        if removed.is_some() {
+            // Fail-closed: persistence failure is a hard error.
+            // The in-memory removal has already occurred, but callers
+            // must treat this as a failure to maintain consistency.
+            self.persist().map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    session_id = %session_id,
+                    "Failed to persist state after session removal - failing closed"
+                );
+                SessionRegistryError::RegistrationFailed {
+                    message: format!("persistence failed after session removal: {e}"),
+                }
+            })?;
+        }
+        Ok(removed)
+    }
+
+    fn update_episode_id(
+        &self,
+        session_id: &str,
+        episode_id: String,
+    ) -> Result<(), SessionRegistryError> {
+        self.inner.update_episode_id(session_id, episode_id)?;
+        self.persist()
+            .map_err(|e| SessionRegistryError::RegistrationFailed {
+                message: format!("persistence failed after episode_id update: {e}"),
+            })
     }
 
     /// Returns all sessions for crash recovery (TCK-00387).

@@ -1029,7 +1029,7 @@ impl LedgerTailer {
         // In a full implementation, this would be the chain hash
         let result: Option<String> = conn
             .query_row(
-                "SELECT event_id FROM ledger_events ORDER BY timestamp_ns DESC LIMIT 1",
+                "SELECT event_id FROM ledger_events ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -1779,7 +1779,7 @@ impl ProjectionWorker {
                 #[allow(clippy::cast_sign_loss)]
                 let result: Option<String> = conn_guard
                     .query_row(
-                        "SELECT event_id FROM ledger_events ORDER BY timestamp_ns DESC LIMIT 1",
+                        "SELECT event_id FROM ledger_events ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1",
                         [],
                         |row| row.get(0),
                     )

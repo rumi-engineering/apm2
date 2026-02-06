@@ -393,6 +393,9 @@ impl_bounded_decode_simple!(
     SwitchCredentialResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
+    // TCK-00395: EndSession for session termination with ledger events
+    EndSessionRequest,
+    EndSessionResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

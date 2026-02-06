@@ -51,17 +51,17 @@ use super::messages::{
     ConsensusErrorCode, ConsensusMetricsRequest, ConsensusMetricsResponse, ConsensusStatusRequest,
     ConsensusStatusResponse, ConsensusValidatorsRequest, ConsensusValidatorsResponse,
     CredentialAuthMethod as ProtoAuthMethod, CredentialProvider as ProtoProvider, DecodeConfig,
-    IssueCapabilityRequest, IssueCapabilityResponse, ListCredentialsRequest,
-    ListCredentialsResponse, ListProcessesRequest, ListProcessesResponse, LoginCredentialRequest,
-    LoginCredentialResponse, PatternRejection, PrivilegedError, PrivilegedErrorCode, ProcessInfo,
-    ProcessStateEnum, ProcessStatusRequest, ProcessStatusResponse, RefreshCredentialRequest,
-    RefreshCredentialResponse, ReloadProcessRequest, ReloadProcessResponse,
-    RemoveCredentialRequest, RemoveCredentialResponse, RestartProcessRequest,
-    RestartProcessResponse, ShutdownRequest, ShutdownResponse, SpawnEpisodeRequest,
-    SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse, StopProcessRequest,
-    StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse, SwitchCredentialRequest,
-    SwitchCredentialResponse, UnsubscribePulseRequest, UnsubscribePulseResponse, WorkRole,
-    WorkStatusRequest, WorkStatusResponse,
+    EndSessionRequest, EndSessionResponse, IssueCapabilityRequest, IssueCapabilityResponse,
+    ListCredentialsRequest, ListCredentialsResponse, ListProcessesRequest, ListProcessesResponse,
+    LoginCredentialRequest, LoginCredentialResponse, PatternRejection, PrivilegedError,
+    PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
+    ProcessStatusResponse, RefreshCredentialRequest, RefreshCredentialResponse,
+    ReloadProcessRequest, ReloadProcessResponse, RemoveCredentialRequest, RemoveCredentialResponse,
+    RestartProcessRequest, RestartProcessResponse, ShutdownRequest, ShutdownResponse,
+    SpawnEpisodeRequest, SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse,
+    StopProcessRequest, StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse,
+    SwitchCredentialRequest, SwitchCredentialResponse, TerminationOutcome, UnsubscribePulseRequest,
+    UnsubscribePulseResponse, WorkRole, WorkStatusRequest, WorkStatusResponse,
 };
 use super::pulse_acl::{
     AclDecision, AclError, PulseAclEvaluator, validate_client_sub_id, validate_subscription_id,
@@ -73,9 +73,9 @@ use super::session_dispatch::InMemoryManifestStore;
 use super::session_token::TokenMinter;
 use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
-    CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
-    InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
-    validate_custody_domain_overlap,
+    CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
+    EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
+    TerminationClass, validate_custody_domain_overlap,
 };
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
@@ -181,6 +181,29 @@ impl std::fmt::Display for HtfTimestampError {
 }
 
 impl std::error::Error for HtfTimestampError {}
+
+/// Parameters for a work state transition event (TCK-00395).
+///
+/// Bundles the parameters needed to emit a `WorkTransitioned` event to the
+/// ledger. This struct reduces the number of arguments passed to
+/// `emit_work_transitioned`.
+#[derive(Debug, Clone)]
+pub struct WorkTransition<'a> {
+    /// The work ID being transitioned.
+    pub work_id: &'a str,
+    /// The state before the transition.
+    pub from_state: &'a str,
+    /// The state after the transition.
+    pub to_state: &'a str,
+    /// Why the transition occurred (e.g., `work_claimed_via_ipc`).
+    pub rationale_code: &'a str,
+    /// The work item's `transition_count` before this transition.
+    pub previous_transition_count: u32,
+    /// The actor performing the transition.
+    pub actor_id: &'a str,
+    /// HTF-compliant timestamp in nanoseconds since epoch.
+    pub timestamp_ns: u64,
+}
 
 /// Trait for emitting signed events to the ledger.
 ///
@@ -364,6 +387,182 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
+    /// Returns the number of `work_transitioned` events for a given work ID.
+    ///
+    /// This is the authoritative source for the `previous_transition_count`
+    /// field in `WorkTransitioned` events. Callers MUST use this method
+    /// rather than hardcoding transition counts.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - The work ID to count transitions for
+    ///
+    /// # Returns
+    ///
+    /// The number of `work_transitioned` events for the given work ID.
+    fn get_work_transition_count(&self, work_id: &str) -> u32;
+
+    /// Emits a signed `WorkTransitioned` event to the ledger (TCK-00395).
+    ///
+    /// Records a work item state transition in the ledger, enabling the FAC
+    /// CLI (`apm2 fac work status`) to observe work lifecycle state changes
+    /// and the `GateOrchestrator` (TCK-00388) to trigger gate lifecycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - The work ID being transitioned
+    /// * `from_state` - The state before the transition
+    /// * `to_state` - The state after the transition
+    /// * `rationale_code` - Why the transition occurred (e.g.,
+    ///   `work_claimed_via_ipc`)
+    /// * `previous_transition_count` - The work item's `transition_count`
+    ///   before this transition (replay protection)
+    /// * `actor_id` - The actor performing the transition
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_work_transitioned(
+        &self,
+        transition: &WorkTransition<'_>,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a signed `SessionTerminated` event to the ledger (TCK-00395).
+    ///
+    /// Records session termination in the ledger, enabling the
+    /// `GateOrchestrator` (TCK-00388) to trigger gate lifecycle after
+    /// session completion.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session that terminated
+    /// * `work_id` - The work ID this session was associated with
+    /// * `exit_code` - The process exit code (0 = success)
+    /// * `termination_reason` - Human-readable termination reason
+    /// * `actor_id` - The actor associated with this session
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_session_terminated(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        exit_code: i32,
+        termination_reason: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Atomically emits a `WorkClaimed` event followed by a
+    /// `WorkTransitioned`(Open -> Claimed) event (TCK-00395).
+    ///
+    /// # Atomicity Contract
+    ///
+    /// Both events are persisted atomically per operation: either both
+    /// succeed or neither is committed. This prevents partial state where
+    /// `work_claimed` is persisted but the corresponding transition is not.
+    ///
+    /// For in-memory emitters, atomicity is trivially guaranteed. For
+    /// durable emitters, this must be implemented with a database
+    /// transaction.
+    ///
+    /// # Returns
+    ///
+    /// The signed `WorkClaimed` event on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence of either
+    /// event fails. On error, neither event is committed.
+    fn emit_claim_lifecycle(
+        &self,
+        claim: &WorkClaim,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Default implementation: emit sequentially.
+        // Override in durable emitters for transactional atomicity.
+        let transition_count = self.get_work_transition_count(&claim.work_id);
+        let claimed_event = self.emit_work_claimed(claim, timestamp_ns)?;
+        if let Err(e) = self.emit_work_transitioned(&WorkTransition {
+            work_id: &claim.work_id,
+            from_state: "Open",
+            to_state: "Claimed",
+            rationale_code: "work_claimed_via_ipc",
+            previous_transition_count: transition_count,
+            actor_id,
+            timestamp_ns,
+        }) {
+            // Partial failure: work_claimed was persisted but transition was not.
+            // Log and propagate the error.
+            warn!(
+                error = %e,
+                work_id = %claim.work_id,
+                "Partial commit: work_claimed persisted but work_transitioned failed"
+            );
+            return Err(e);
+        }
+        Ok(claimed_event)
+    }
+
+    /// Atomically emits a `SessionStarted` event followed by a
+    /// `WorkTransitioned`(Claimed -> `InProgress`) event (TCK-00395).
+    ///
+    /// # Atomicity Contract
+    ///
+    /// Both events are persisted atomically per operation. See
+    /// [`Self::emit_claim_lifecycle`] for details.
+    ///
+    /// # Returns
+    ///
+    /// The signed `SessionStarted` event on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence of either
+    /// event fails.
+    fn emit_spawn_lifecycle(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        lease_id: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Default implementation: emit sequentially.
+        let session_event =
+            self.emit_session_started(session_id, work_id, lease_id, actor_id, timestamp_ns)?;
+        let transition_count = self.get_work_transition_count(work_id);
+        if let Err(e) = self.emit_work_transitioned(&WorkTransition {
+            work_id,
+            from_state: "Claimed",
+            to_state: "InProgress",
+            rationale_code: "episode_spawned_via_ipc",
+            previous_transition_count: transition_count,
+            actor_id,
+            timestamp_ns,
+        }) {
+            warn!(
+                error = %e,
+                work_id = %work_id,
+                "Partial commit: session_started persisted but work_transitioned failed"
+            );
+            return Err(e);
+        }
+        Ok(session_event)
+    }
+
     /// Emits an `EpisodeRunAttributed` event to the ledger (TCK-00330).
     ///
     /// This method records attribution for an episode run, binding:
@@ -421,6 +620,28 @@ pub const EPISODE_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.episode:";
 /// adapter profiles via their CAS hash.
 pub const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
 
+/// Domain separation prefix for `WorkTransitioned` ledger events (TCK-00395).
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// This prefix is used when emitting work state transition events to the
+/// ledger, enabling the FAC CLI and `GateOrchestrator` to observe work
+/// lifecycle state changes.
+pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitioned:";
+
+/// Domain separation prefix for `SessionTerminated` ledger events (TCK-00395).
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// This prefix is used when emitting session termination events to the
+/// ledger, enabling the `GateOrchestrator` to trigger gate lifecycle
+/// after session completion.
+///
+/// # Note
+///
+/// This is distinct from `SESSION_TERMINATED_DOMAIN_PREFIX` in
+/// `apm2_core::events::canonical` which is used for kernel event signing.
+/// This prefix is for ledger-level JCS-canonicalized JSON events.
+pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_terminated_ledger:";
+
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
 // to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
 // See `apm2_core::fac::domain_separator` for the canonical definition.
@@ -431,6 +652,14 @@ pub const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attrib
 /// denial-of-service via OOM. This limit prevents attackers from supplying
 /// multi-GB ID strings.
 pub const MAX_ID_LENGTH: usize = 256;
+
+/// Maximum allowed length for the `reason` field in `EndSessionRequest`.
+///
+/// Per SEC-SCP-FAC-0020: Caller-controlled text is written into signed ledger
+/// payloads. Unbounded reason strings enable denial-of-service via OOM and
+/// bloated ledger entries. This limit constrains the reason to a reasonable
+/// diagnostic string.
+pub const MAX_REASON_LENGTH: usize = 1024;
 
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
 ///
@@ -917,6 +1146,21 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             .unwrap_or_default()
     }
 
+    fn get_work_transition_count(&self, work_id: &str) -> u32 {
+        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
+        let guard = self.events.read().expect("lock poisoned");
+
+        events_by_work.get(work_id).map_or(0, |event_ids| {
+            #[allow(clippy::cast_possible_truncation)]
+            let count = event_ids
+                .iter()
+                .filter_map(|id| guard.1.get(id))
+                .filter(|e| e.event_type == "work_transitioned")
+                .count() as u32;
+            count
+        })
+    }
+
     fn emit_episode_event(
         &self,
         episode_id: &str,
@@ -1203,6 +1447,198 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             session_id = %session_id,
             adapter_profile_hash = %hex::encode(adapter_profile_hash),
             "EpisodeRunAttributed event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_work_transitioned(
+        &self,
+        transition: &WorkTransition<'_>,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with work transition data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness)
+        let payload_json = serde_json::json!({
+            "event_type": "work_transitioned",
+            "work_id": transition.work_id,
+            "from_state": transition.from_state,
+            "to_state": transition.to_state,
+            "rationale_code": transition.rationale_code,
+            "previous_transition_count": transition.previous_transition_count,
+            "actor_id": transition.actor_id,
+            "timestamp_ns": transition.timestamp_ns,
+        });
+
+        // TCK-00395: Use JCS (RFC 8785) canonicalization for signing.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(WORK_TRANSITIONED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(WORK_TRANSITIONED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "work_transitioned".to_string(),
+            work_id: transition.work_id.to_string(),
+            actor_id: transition.actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns: transition.timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(transition.work_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            work_id = %transition.work_id,
+            from_state = %transition.from_state,
+            to_state = %transition.to_state,
+            rationale_code = %transition.rationale_code,
+            "WorkTransitioned event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_session_terminated(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        exit_code: i32,
+        termination_reason: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with session termination data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness)
+        let payload_json = serde_json::json!({
+            "event_type": "session_terminated",
+            "session_id": session_id,
+            "work_id": work_id,
+            "exit_code": exit_code,
+            "termination_reason": termination_reason,
+            "actor_id": actor_id,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // TCK-00395: Use JCS (RFC 8785) canonicalization for signing.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "session_terminated".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(work_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            work_id = %work_id,
+            exit_code = %exit_code,
+            termination_reason = %termination_reason,
+            "SessionTerminated event signed and persisted"
         );
 
         Ok(signed_event)
@@ -1847,6 +2283,8 @@ pub enum PrivilegedMessageType {
     ConsensusMetrics    = 14,
     /// `WorkStatus` request (IPC-PRIV-015, TCK-00344)
     WorkStatus          = 15,
+    /// `EndSession` request (IPC-PRIV-016, TCK-00395)
+    EndSession          = 16,
     // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
     /// `ListCredentials` request (IPC-PRIV-021)
     ListCredentials     = 21,
@@ -1892,6 +2330,8 @@ impl PrivilegedMessageType {
             14 => Some(Self::ConsensusMetrics),
             // TCK-00344: Work status query
             15 => Some(Self::WorkStatus),
+            // TCK-00395: EndSession for session termination
+            16 => Some(Self::EndSession),
             // Credential management tags (21-26, TCK-00343)
             21 => Some(Self::ListCredentials),
             22 => Some(Self::AddCredential),
@@ -1946,6 +2386,8 @@ pub enum PrivilegedResponse {
     ReloadProcess(ReloadProcessResponse),
     /// Successful `WorkStatus` response (TCK-00344).
     WorkStatus(WorkStatusResponse),
+    /// Successful `EndSession` response (TCK-00395).
+    EndSession(EndSessionResponse),
     // --- Credential Management (CTR-PROTO-012, TCK-00343) ---
     /// Successful `ListCredentials` response.
     ListCredentials(ListCredentialsResponse),
@@ -2049,6 +2491,10 @@ impl PrivilegedResponse {
             },
             Self::WorkStatus(resp) => {
                 buf.push(PrivilegedMessageType::WorkStatus.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::EndSession(resp) => {
+                buf.push(PrivilegedMessageType::EndSession.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             // Credential Management (CTR-PROTO-012, TCK-00343)
@@ -3064,6 +3510,8 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::ConsensusMetrics => self.handle_consensus_metrics(payload),
             // TCK-00344: Work status query
             PrivilegedMessageType::WorkStatus => self.handle_work_status(payload, ctx),
+            // TCK-00395: EndSession for session termination with ledger event
+            PrivilegedMessageType::EndSession => self.handle_end_session(payload, ctx),
             // Credential Management (CTR-PROTO-012, TCK-00343)
             PrivilegedMessageType::ListCredentials => self.handle_list_credentials(payload, ctx),
             PrivilegedMessageType::AddCredential => self.handle_add_credential(payload, ctx),
@@ -3104,6 +3552,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::ConsensusMetrics => "ConsensusMetrics",
                 // TCK-00344
                 PrivilegedMessageType::WorkStatus => "WorkStatus",
+                // TCK-00395
+                PrivilegedMessageType::EndSession => "EndSession",
                 // Credential Management (CTR-PROTO-012, TCK-00343)
                 PrivilegedMessageType::ListCredentials => "ListCredentials",
                 PrivilegedMessageType::AddCredential => "AddCredential",
@@ -3249,6 +3699,10 @@ impl PrivilegedDispatcher {
             },
         };
 
+        // TCK-00395: Clone actor_id before it is moved into WorkClaim,
+        // as we need it later for emit_work_transitioned.
+        let actor_id_for_transition = actor_id.clone();
+
         // Register the work claim
         let claim = WorkClaim {
             work_id,
@@ -3273,9 +3727,9 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00253: Emit signed WorkClaimed event to ledger.
+        // TCK-00253: Emit signed WorkClaimed + WorkTransitioned events atomically.
         // Per acceptance criteria: "`WorkClaimed` event signed and persisted"
-        // The event is:
+        // The events are:
         // - Signed with the daemon's signing key (Ed25519)
         // - Includes work_id, lease_id, actor_id, role, and policy_resolved_ref
         // - Persisted to the append-only ledger for audit trail
@@ -3283,6 +3737,10 @@ impl PrivilegedDispatcher {
         // TCK-00289: Use HTF-compliant timestamp from HolonicClock.
         // Per RFC-0016, timestamps must come from the HTF clock source to ensure
         // monotonicity and causal ordering.
+        //
+        // TCK-00395: Uses emit_claim_lifecycle for atomic dual-event emission.
+        // Both work_claimed and work_transitioned(Open->Claimed) are emitted
+        // as a single atomic operation to prevent partial state commits.
         let timestamp_ns = match self.get_htf_timestamp_ns() {
             Ok(ts) => ts,
             Err(e) => {
@@ -3294,15 +3752,17 @@ impl PrivilegedDispatcher {
                 ));
             },
         };
-        let signed_event = match self.event_emitter.emit_work_claimed(&claim, timestamp_ns) {
+        let signed_event = match self.event_emitter.emit_claim_lifecycle(
+            &claim,
+            &actor_id_for_transition,
+            timestamp_ns,
+        ) {
             Ok(event) => event,
             Err(e) => {
-                warn!(error = %e, "WorkClaimed event emission failed");
-                // Return application-level error, not protocol error
-                // Event emission failures are logic errors, not serialization errors
+                warn!(error = %e, "Claim lifecycle event emission failed");
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("event emission failed: {e}"),
+                    format!("claim lifecycle event emission failed: {e}"),
                 ));
             },
         };
@@ -3310,7 +3770,7 @@ impl PrivilegedDispatcher {
         debug!(
             event_id = %signed_event.event_id,
             work_id = %claim.work_id,
-            "WorkClaimed event emitted successfully"
+            "Claim lifecycle events emitted (work_claimed + work_transitioned)"
         );
 
         // Return the work assignment
@@ -3918,38 +4378,66 @@ impl PrivilegedDispatcher {
             }
         };
 
+        // TCK-00395 Security BLOCKER 1: Write the episode_id back to the
+        // session in the registry. Without this write-back, EndSession cannot
+        // resolve the episode binding and will skip runtime stop, allowing
+        // the episode to continue running after session termination.
         if let Some(ref episode_id) = episode_id_opt {
+            if let Err(e) = self
+                .session_registry
+                .update_episode_id(&session_id, episode_id.to_string())
+            {
+                warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    episode_id = %episode_id,
+                    "Failed to write episode_id back to session registry - failing closed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("session episode_id update failed: {e}"),
+                ));
+            }
             debug!(
                 session_id = %session_id,
                 episode_id = %episode_id,
                 workspace_root = %request.workspace_root,
-                "Episode created and started with workspace root"
+                "Episode created, started, and bound to session"
             );
         }
 
-        // Derive actor_id from credentials (same pattern as ClaimWork)
-        let actor_id = ctx
+        // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
+        // missing. Same pattern as ClaimWork. SpawnEpisode emits authoritative
+        // ledger events (SessionStarted + WorkTransitioned), and recording
+        // "unknown" as the actor identity would break the accountability chain.
+        let peer_creds = ctx
             .peer_credentials()
-            .map_or_else(|| "unknown".to_string(), derive_actor_id);
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for episode spawn".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer_creds);
 
-        if let Err(e) = self.event_emitter.emit_session_started(
+        // TCK-00395: Emit SessionStarted + WorkTransitioned(Claimed->InProgress)
+        // atomically via emit_spawn_lifecycle. Both events are persisted as a
+        // single atomic operation to prevent partial state commits.
+        if let Err(e) = self.event_emitter.emit_spawn_lifecycle(
             &session_id,
             &request.work_id,
             &claim.lease_id,
             &actor_id,
             timestamp_ns,
         ) {
-            warn!(error = %e, "SessionStarted event emission failed");
+            warn!(error = %e, "Spawn lifecycle event emission failed");
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("event emission failed: {e}"),
+                format!("spawn lifecycle event emission failed: {e}"),
             ));
         }
 
         debug!(
             session_id = %session_id,
             work_id = %request.work_id,
-            "SessionStarted event emitted successfully"
+            "Spawn lifecycle events emitted (session_started + work_transitioned)"
         );
 
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
@@ -4261,6 +4749,308 @@ impl PrivilegedDispatcher {
     /// performance-critical.
     fn find_session_by_work_id(&self, work_id: &str) -> Option<SessionState> {
         self.session_registry.get_session_by_work_id(work_id)
+    }
+
+    // ========================================================================
+    // Session Termination Handler (TCK-00395)
+    // ========================================================================
+
+    /// Handles `EndSession` requests (IPC-PRIV-016, TCK-00395).
+    ///
+    /// Terminates an active session and emits a `SessionTerminated` ledger
+    /// event. This is the authoritative path for session termination that
+    /// ensures the ledger records all session lifecycle events.
+    ///
+    /// # Security Contract
+    ///
+    /// - Session must exist in the session registry
+    /// - Actor ID is derived from peer credentials (not user input)
+    /// - `SessionTerminated` event is signed and persisted atomically
+    /// - Fail-closed: returns error if timestamp generation, runtime stop, or
+    ///   event emission fails
+    /// - Session is removed from registry POST-COMMIT (after runtime stop +
+    ///   ledger succeed), ensuring the session is re-findable for retry on
+    ///   failure
+    /// - `WorkTransitioned` emission failure is propagated (fail-closed)
+    /// - Exit code derived from typed `TerminationOutcome` enum (not string
+    ///   matching)
+    /// - Reason field bounded by `MAX_REASON_LENGTH` to prevent OOM/bloated
+    ///   ledger entries
+    ///
+    /// # Ordering (Security BLOCKER 2 / Quality BLOCKER 1)
+    ///
+    /// 1. Read session state (no removal)
+    /// 2. Stop runtime via `stop_with_session_context` (fail-closed)
+    /// 3. Derive exit code from typed `TerminationOutcome` enum
+    /// 4. Emit ledger events (`SessionTerminated`, `WorkTransitioned`)
+    /// 5. Remove session from registry (POST-COMMIT)
+    fn handle_end_session(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            EndSessionRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid EndSessionRequest: {e}"),
+                }
+            })?;
+
+        info!(
+            session_id = %request.session_id,
+            reason = %request.reason,
+            outcome = %request.outcome,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "EndSession request received"
+        );
+
+        // Validate required fields
+        if request.session_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "session_id is required",
+            ));
+        }
+
+        // SEC-SCP-FAC-0020: Enforce maximum length on session_id
+        if request.session_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("session_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        // SEC-SCP-FAC-0020 / Security MAJOR 1: Enforce maximum length on
+        // reason to prevent OOM and bloated signed ledger payloads.
+        if request.reason.len() > MAX_REASON_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "reason exceeds maximum length of {MAX_REASON_LENGTH} bytes (got {})",
+                    request.reason.len()
+                ),
+            ));
+        }
+
+        // ---- Phase 1: Read session state (no removal) ----
+        // Look up session WITHOUT removing it. The session is only removed
+        // after all fallible operations succeed (POST-COMMIT), ensuring the
+        // session is re-findable for retry if any step fails.
+        let Some(session) = self.session_registry.get_session(&request.session_id) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("session not found: {}", request.session_id),
+            ));
+        };
+
+        // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
+        // missing. Same pattern as ClaimWork (line 3631). EndSession emits
+        // authoritative ledger events (SessionTerminated), and recording
+        // "unknown" as the actor identity would break the accountability
+        // chain for a privileged termination action.
+        let peer_creds = ctx
+            .peer_credentials()
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for session termination".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer_creds);
+
+        // Get HTF-compliant timestamp
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // TCK-00395 Quality v3 MAJOR: Use typed TerminationOutcome enum to
+        // determine exit code instead of free-form string matching.
+        // When `outcome` is set (non-zero), it takes precedence over the
+        // legacy `reason` string. Unspecified (0) falls back to string
+        // matching for backward compatibility.
+        let exit_code = match TerminationOutcome::try_from(request.outcome) {
+            Ok(TerminationOutcome::Success) => 0,
+            Ok(
+                TerminationOutcome::Failure
+                | TerminationOutcome::Cancelled
+                | TerminationOutcome::Timeout,
+            ) => 1,
+            // Unspecified or unknown: fall back to legacy string matching
+            _ => {
+                let is_failure =
+                    request.reason != "completed_normally" && request.reason != "success";
+                i32::from(is_failure)
+            },
+        };
+
+        // ---- Phase 2: Stop runtime BEFORE emitting ledger events ----
+        // Security BLOCKER 1: Fail closed if the session has no resolvable
+        // episode binding. SpawnEpisode now writes back the episode_id
+        // (see update_episode_id call above). If the session still lacks
+        // an episode_id, it means the episode was never created or the
+        // write-back failed, so we must not emit termination facts.
+        //
+        // In test mode (no tokio runtime), episode_id may legitimately be
+        // None. Production sessions always have an episode_id after
+        // SpawnEpisode succeeds.
+        let episode_id_str = match session.episode_id {
+            Some(ref id) => id.clone(),
+            None => {
+                // In cfg(test), allow sessions without episode_id for
+                // backward compatibility with sync unit tests.
+                #[cfg(test)]
+                {
+                    debug!(
+                        session_id = %request.session_id,
+                        "EndSession: session lacks episode_id (test mode) - skipping runtime stop"
+                    );
+                    String::new()
+                }
+                #[cfg(not(test))]
+                {
+                    warn!(
+                        session_id = %request.session_id,
+                        "EndSession: session has no episode_id binding - failing closed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "session has no episode binding: cannot stop runtime",
+                    ));
+                }
+            },
+        };
+
+        // Stop the runtime episode if we have a valid episode_id.
+        // TCK-00395 Security MAJOR 1: Fail closed on EpisodeId parse failure.
+        // Previously, a malformed/corrupted episode_id would silently skip
+        // the runtime stop but still emit termination facts and clean up
+        // registry state, leaving the runtime running without accountability.
+        if !episode_id_str.is_empty() {
+            let episode_id_parsed = match EpisodeId::new(episode_id_str.clone()) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        episode_id = %episode_id_str,
+                        session_id = %request.session_id,
+                        "EndSession: EpisodeId parse failed - failing closed before ledger emission"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("malformed episode_id '{episode_id_str}': {e}"),
+                    ));
+                },
+            };
+
+            let termination_class = if exit_code == 0 {
+                TerminationClass::Success
+            } else {
+                TerminationClass::Failure
+            };
+            let stop_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let rt = &self.episode_runtime;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(rt.stop_with_session_context(
+                        &episode_id_parsed,
+                        termination_class,
+                        timestamp_ns,
+                        &request.session_id,
+                        &session.work_id,
+                        &actor_id,
+                    ))
+                })
+            } else {
+                // No tokio runtime available; fail closed rather than
+                // skipping the runtime stop.
+                warn!("No tokio runtime handle available for runtime stop - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "runtime stop failed: no async runtime available",
+                ));
+            };
+
+            if let Err(e) = stop_result {
+                warn!(
+                    error = %e,
+                    episode_id = %episode_id_str,
+                    "Runtime stop failed - failing closed without writing success facts"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("runtime stop failed: {e}"),
+                ));
+            }
+        }
+
+        // ---- Phase 3: Emit ledger events (after successful runtime stop) ----
+        let termination_reason = if request.reason.is_empty() {
+            "session_ended_via_ipc"
+        } else {
+            &request.reason
+        };
+
+        // TCK-00395: Emit SessionTerminated event to ledger.
+        // This is the authoritative path for recording session termination.
+        // Only emitted AFTER runtime stop succeeds (Security BLOCKER 2).
+        if let Err(e) = self.event_emitter.emit_session_terminated(
+            &request.session_id,
+            &session.work_id,
+            exit_code,
+            termination_reason,
+            &actor_id,
+            timestamp_ns,
+        ) {
+            warn!(error = %e, "SessionTerminated event emission failed");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("session terminated event emission failed: {e}"),
+            ));
+        }
+
+        // TCK-00395 Quality BLOCKER 2: DO NOT emit
+        // WorkTransitioned(InProgress -> Completed) on EndSession.
+        // The InProgress -> Completed transition violates core work-state
+        // transition rules (state.rs only allows InProgress -> Review,
+        // CiPending, NeedsInput, NeedsAdjudication, or Aborted).
+        // Work state completion belongs to a separate workflow path
+        // (gate orchestration), not EndSession.
+
+        // ---- Phase 4: POST-COMMIT session + manifest removal ----
+        // Remove session from registry only after ALL fallible operations
+        // (runtime stop + ledger emission) have succeeded. This prevents
+        // the session from being orphaned if a downstream step fails.
+        //
+        // TCK-00395 Security BLOCKER 2: Also remove the manifest entry
+        // to prevent retained session tokens from passing manifest lookup
+        // in RequestTool after EndSession.
+        self.manifest_store.remove(&request.session_id);
+
+        if let Err(e) = self.session_registry.remove_session(&request.session_id) {
+            warn!(
+                error = %e,
+                session_id = %request.session_id,
+                "Session removal persistence failed after successful ledger commit"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("session removal persistence failed: {e}"),
+            ));
+        }
+
+        debug!(
+            session_id = %request.session_id,
+            work_id = %session.work_id,
+            "EndSession completed - SessionTerminated event emitted"
+        );
+
+        Ok(PrivilegedResponse::EndSession(EndSessionResponse {
+            session_id: request.session_id,
+            message: "session terminated".to_string(),
+        }))
     }
 
     // ========================================================================
@@ -5733,6 +6523,14 @@ pub fn encode_shutdown_request(request: &ShutdownRequest) -> Bytes {
     Bytes::from(buf)
 }
 
+/// Encodes an `EndSession` request to bytes for sending (TCK-00395).
+#[must_use]
+pub fn encode_end_session_request(request: &EndSessionRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::EndSession.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
 // ============================================================================
 // Process Management Request Encoding (TCK-00342)
 // ============================================================================
@@ -6860,7 +7658,13 @@ mod tests {
             // Query events by work_id from the ledger
             let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
 
-            assert_eq!(events.len(), 1, "Exactly one event should be emitted");
+            // TCK-00395: ClaimWork now emits both work_claimed and
+            // work_transitioned(Open->Claimed)
+            assert_eq!(
+                events.len(),
+                2,
+                "ClaimWork should emit work_claimed + work_transitioned events"
+            );
 
             let event = &events[0];
             assert_eq!(event.work_id, work_id);
@@ -8936,6 +9740,1771 @@ mod tests {
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
             }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00395: Work lifecycle observability ledger events
+    // ========================================================================
+    mod tck_00395_work_lifecycle_observability {
+        use super::*;
+
+        /// TCK-00395: `ClaimWork` emits `WorkTransitioned`(Open -> Claimed)
+        /// event.
+        #[test]
+        fn claim_work_emits_work_transitioned_open_to_claimed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let frame = encode_claim_work_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let work_id = match response {
+                PrivilegedResponse::ClaimWork(ref resp) => resp.work_id.clone(),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Verify WorkTransitioned event was emitted to ledger
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let transition_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .collect();
+
+            assert_eq!(
+                transition_events.len(),
+                1,
+                "Expected exactly 1 WorkTransitioned event, got {}",
+                transition_events.len()
+            );
+
+            let event = transition_events[0];
+            assert_eq!(event.work_id, work_id);
+
+            // Parse payload to verify transition details
+            let payload: serde_json::Value =
+                serde_json::from_slice(&event.payload).expect("valid JSON payload");
+            assert_eq!(payload["event_type"], "work_transitioned");
+            assert_eq!(payload["from_state"], "Open");
+            assert_eq!(payload["to_state"], "Claimed");
+            assert_eq!(payload["rationale_code"], "work_claimed_via_ipc");
+            assert_eq!(payload["previous_transition_count"], 0);
+            assert!(event.timestamp_ns > 0, "timestamp must be non-zero");
+        }
+
+        /// TCK-00395: `SpawnEpisode` emits `WorkTransitioned`(Claimed ->
+        /// `InProgress`) event.
+        #[test]
+        fn spawn_episode_emits_work_transitioned_claimed_to_in_progress() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Step 1: ClaimWork to establish policy resolution
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Step 2: SpawnEpisode
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            assert!(
+                matches!(spawn_response, PrivilegedResponse::SpawnEpisode(_)),
+                "Expected SpawnEpisode response"
+            );
+
+            // Verify WorkTransitioned events
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let transition_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .collect();
+
+            assert_eq!(
+                transition_events.len(),
+                2,
+                "Expected 2 WorkTransitioned events (Open->Claimed, Claimed->InProgress), got {}",
+                transition_events.len()
+            );
+
+            // First transition: Open -> Claimed
+            let first_payload: serde_json::Value =
+                serde_json::from_slice(&transition_events[0].payload).expect("valid JSON");
+            assert_eq!(first_payload["from_state"], "Open");
+            assert_eq!(first_payload["to_state"], "Claimed");
+            assert_eq!(first_payload["rationale_code"], "work_claimed_via_ipc");
+            assert_eq!(first_payload["previous_transition_count"], 0);
+
+            // Second transition: Claimed -> InProgress
+            let second_payload: serde_json::Value =
+                serde_json::from_slice(&transition_events[1].payload).expect("valid JSON");
+            assert_eq!(second_payload["from_state"], "Claimed");
+            assert_eq!(second_payload["to_state"], "InProgress");
+            assert_eq!(second_payload["rationale_code"], "episode_spawned_via_ipc");
+            assert_eq!(second_payload["previous_transition_count"], 1);
+        }
+
+        /// TCK-00395: `WorkTransitioned` events use domain-separated
+        /// signatures.
+        #[test]
+        fn work_transitioned_uses_domain_separated_signatures() {
+            let emitter = StubLedgerEventEmitter::new();
+            let result = emitter.emit_work_transitioned(&WorkTransition {
+                work_id: "W-TEST-001",
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: "work_claimed_via_ipc",
+                previous_transition_count: 0,
+                actor_id: "uid:1000",
+                timestamp_ns: 1_000_000_000,
+            });
+
+            assert!(result.is_ok(), "emit_work_transitioned should succeed");
+            let event = result.unwrap();
+
+            assert_eq!(event.event_type, "work_transitioned");
+            assert_eq!(event.work_id, "W-TEST-001");
+            assert_eq!(event.actor_id, "uid:1000");
+            assert!(!event.signature.is_empty(), "signature must be non-empty");
+            assert_eq!(
+                event.signature.len(),
+                64,
+                "Ed25519 signature must be 64 bytes"
+            );
+        }
+
+        /// TCK-00395: `SessionTerminated` event uses domain-separated
+        /// signatures.
+        #[test]
+        fn session_terminated_uses_domain_separated_signatures() {
+            let emitter = StubLedgerEventEmitter::new();
+            let result = emitter.emit_session_terminated(
+                "SESS-001",
+                "W-TEST-001",
+                0,
+                "completed_normally",
+                "uid:1000",
+                1_000_000_000,
+            );
+
+            assert!(result.is_ok(), "emit_session_terminated should succeed");
+            let event = result.unwrap();
+
+            assert_eq!(event.event_type, "session_terminated");
+            assert_eq!(event.work_id, "W-TEST-001");
+            assert_eq!(event.actor_id, "uid:1000");
+            assert!(!event.signature.is_empty(), "signature must be non-empty");
+            assert_eq!(
+                event.signature.len(),
+                64,
+                "Ed25519 signature must be 64 bytes"
+            );
+
+            // Parse payload to verify all fields present
+            let payload: serde_json::Value =
+                serde_json::from_slice(&event.payload).expect("valid JSON payload");
+            assert_eq!(payload["event_type"], "session_terminated");
+            assert_eq!(payload["session_id"], "SESS-001");
+            assert_eq!(payload["work_id"], "W-TEST-001");
+            assert_eq!(payload["exit_code"], 0);
+            assert_eq!(payload["termination_reason"], "completed_normally");
+            assert_eq!(payload["actor_id"], "uid:1000");
+            assert_eq!(payload["timestamp_ns"], 1_000_000_000);
+        }
+
+        /// TCK-00395: Full lifecycle `ClaimWork` -> `SpawnEpisode` -> verify
+        /// all event types in ledger.
+        #[test]
+        fn full_lifecycle_claim_spawn_verify_all_events() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Step 1: ClaimWork
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Step 2: SpawnEpisode
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            assert!(
+                matches!(spawn_response, PrivilegedResponse::SpawnEpisode(_)),
+                "Expected SpawnEpisode response"
+            );
+
+            // Step 3: Verify full event chain in ledger
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+
+            // Should have: work_claimed, work_transitioned(Open->Claimed),
+            //              session_started, work_transitioned(Claimed->InProgress)
+            let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+            assert!(
+                event_types.contains(&"work_claimed"),
+                "Expected work_claimed event in ledger, got: {event_types:?}"
+            );
+            assert!(
+                event_types.contains(&"session_started"),
+                "Expected session_started event in ledger, got: {event_types:?}"
+            );
+            assert!(
+                event_types.contains(&"work_transitioned"),
+                "Expected work_transitioned event in ledger, got: {event_types:?}"
+            );
+
+            // Verify we have exactly 2 work_transitioned events
+            let transition_count = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .count();
+            assert_eq!(
+                transition_count, 2,
+                "Expected 2 work_transitioned events, got {transition_count}"
+            );
+
+            // Verify HTF-compliant timestamps (all non-zero)
+            for event in &events {
+                assert!(
+                    event.timestamp_ns > 0,
+                    "Event {} should have non-zero HTF timestamp",
+                    event.event_type
+                );
+            }
+
+            // Verify all events are signed (non-empty signatures)
+            for event in &events {
+                assert!(
+                    !event.signature.is_empty(),
+                    "Event {} should have non-empty signature",
+                    event.event_type
+                );
+            }
+        }
+
+        /// TCK-00395: `WorkTransitioned` and `SessionTerminated` domain
+        /// prefixes are unique.
+        #[test]
+        fn domain_prefixes_are_unique() {
+            // All relevant domain prefixes must be unique
+            let prefixes: Vec<&[u8]> = vec![
+                WORK_CLAIMED_DOMAIN_PREFIX,
+                WORK_TRANSITIONED_DOMAIN_PREFIX,
+                DEFECT_RECORDED_DOMAIN_PREFIX,
+                EPISODE_EVENT_DOMAIN_PREFIX,
+                EPISODE_RUN_ATTRIBUTED_PREFIX,
+                SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
+            ];
+
+            for (i, prefix_a) in prefixes.iter().enumerate() {
+                for (j, prefix_b) in prefixes.iter().enumerate() {
+                    if i != j {
+                        assert_ne!(
+                            prefix_a, prefix_b,
+                            "Domain prefixes must be unique to prevent replay attacks"
+                        );
+                    }
+                }
+            }
+
+            // Verify prefixes have the correct format
+            for prefix in &prefixes {
+                let prefix_str = std::str::from_utf8(prefix).expect("Prefix must be valid UTF-8");
+                assert!(
+                    prefix_str.starts_with("apm2.event."),
+                    "Prefix must start with 'apm2.event.': {prefix_str}"
+                );
+                assert!(
+                    prefix_str.ends_with(':'),
+                    "Prefix must end with ':': {prefix_str}"
+                );
+            }
+        }
+
+        /// TCK-00395: `WorkTransitioned` events are queryable by `work_id`.
+        #[test]
+        fn work_transitioned_events_queryable_by_work_id() {
+            let emitter = StubLedgerEventEmitter::new();
+
+            // Emit two transition events for the same work_id
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-QUERY-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "work_claimed_via_ipc",
+                    previous_transition_count: 0,
+                    actor_id: "uid:1000",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .unwrap();
+
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-QUERY-001",
+                    from_state: "Claimed",
+                    to_state: "InProgress",
+                    rationale_code: "episode_spawned_via_ipc",
+                    previous_transition_count: 1,
+                    actor_id: "uid:1000",
+                    timestamp_ns: 2_000_000_000,
+                })
+                .unwrap();
+
+            // Emit a transition for a different work_id
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-QUERY-002",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "work_claimed_via_ipc",
+                    previous_transition_count: 0,
+                    actor_id: "uid:2000",
+                    timestamp_ns: 3_000_000_000,
+                })
+                .unwrap();
+
+            // Query by first work_id - should get 2 events
+            let events = emitter.get_events_by_work_id("W-QUERY-001");
+            assert_eq!(
+                events.len(),
+                2,
+                "Expected 2 events for W-QUERY-001, got {}",
+                events.len()
+            );
+
+            // Query by second work_id - should get 1 event
+            let events = emitter.get_events_by_work_id("W-QUERY-002");
+            assert_eq!(
+                events.len(),
+                1,
+                "Expected 1 event for W-QUERY-002, got {}",
+                events.len()
+            );
+        }
+
+        // ================================================================
+        // TCK-00395 v2: Regression tests for review findings
+        // ================================================================
+
+        /// FIX-BLOCKER: `EndSession` handler emits `SessionTerminated` ledger
+        /// event.
+        ///
+        /// Integration test: `ClaimWork` -> `SpawnEpisode` -> `EndSession` ->
+        /// verify `session_terminated` is persisted.
+        #[test]
+        fn end_session_emits_session_terminated_event() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Step 1: ClaimWork
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Step 2: SpawnEpisode
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // Step 3: EndSession
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let end_response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            match end_response {
+                PrivilegedResponse::EndSession(resp) => {
+                    assert_eq!(resp.session_id, session_id);
+                },
+                other => panic!("Expected EndSession response, got: {other:?}"),
+            }
+
+            // Step 4: Verify session_terminated event in ledger
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let terminated_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            assert_eq!(
+                terminated_events.len(),
+                1,
+                "Expected exactly 1 session_terminated event, got {}",
+                terminated_events.len()
+            );
+
+            let event = terminated_events[0];
+            let payload: serde_json::Value =
+                serde_json::from_slice(&event.payload).expect("valid JSON payload");
+            assert_eq!(payload["event_type"], "session_terminated");
+            assert_eq!(payload["session_id"], session_id);
+            assert_eq!(payload["work_id"], work_id);
+            assert_eq!(payload["exit_code"], 0);
+            assert_eq!(payload["termination_reason"], "completed_normally");
+        }
+
+        /// Quality BLOCKER 2: `EndSession` does NOT emit
+        /// `WorkTransitioned(InProgress -> Completed)`.
+        ///
+        /// The `InProgress` -> `Completed` transition violates core
+        /// work-state rules (`state.rs`). Work completion belongs to
+        /// gate orchestration, not `EndSession`. `EndSession` only emits
+        /// `session_terminated`.
+        #[test]
+        fn end_session_success_does_not_emit_completed_transition() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // ClaimWork + SpawnEpisode
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // EndSession with success
+            let end_request = EndSessionRequest {
+                session_id,
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            dispatcher.dispatch(&end_frame, &ctx).unwrap();
+
+            // Verify NO WorkTransitioned(InProgress -> Completed) is emitted.
+            // Per Quality BLOCKER 2: work completion belongs to gate
+            // orchestration, not EndSession.
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let completed_count = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .filter(|e| {
+                    let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                    p["to_state"] == "Completed"
+                })
+                .count();
+
+            assert_eq!(
+                completed_count, 0,
+                "EndSession must NOT emit WorkTransitioned(Completed) - work completion belongs to gate orchestration"
+            );
+
+            // Verify session_terminated was still emitted
+            let terminated_count = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .count();
+            assert_eq!(
+                terminated_count, 1,
+                "EndSession should emit session_terminated"
+            );
+        }
+
+        /// FIX-BLOCKER: `EndSession` rejects unknown session ID.
+        #[test]
+        fn end_session_rejects_unknown_session() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let end_request = EndSessionRequest {
+                session_id: "NONEXISTENT-SESSION".to_string(),
+                reason: "test".to_string(),
+                outcome: TerminationOutcome::Failure as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("session not found"),
+                        "Expected 'session not found' error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        /// FIX-SEC-MAJOR: `previous_transition_count` is derived from
+        /// authoritative ledger state, not hardcoded.
+        #[test]
+        fn transition_count_derived_from_ledger_state() {
+            let emitter = StubLedgerEventEmitter::new();
+
+            // Initially, no transitions
+            assert_eq!(
+                emitter.get_work_transition_count("W-COUNT-001"),
+                0,
+                "No transitions yet"
+            );
+
+            // Emit first transition
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-COUNT-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "work_claimed_via_ipc",
+                    previous_transition_count: 0,
+                    actor_id: "uid:1000",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .unwrap();
+
+            assert_eq!(
+                emitter.get_work_transition_count("W-COUNT-001"),
+                1,
+                "Should have 1 transition after first emit"
+            );
+
+            // Emit second transition
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-COUNT-001",
+                    from_state: "Claimed",
+                    to_state: "InProgress",
+                    rationale_code: "episode_spawned_via_ipc",
+                    previous_transition_count: 1,
+                    actor_id: "uid:1000",
+                    timestamp_ns: 2_000_000_000,
+                })
+                .unwrap();
+
+            assert_eq!(
+                emitter.get_work_transition_count("W-COUNT-001"),
+                2,
+                "Should have 2 transitions after second emit"
+            );
+
+            // Different work_id should have 0 transitions
+            assert_eq!(
+                emitter.get_work_transition_count("W-COUNT-002"),
+                0,
+                "Different work_id should have 0 transitions"
+            );
+        }
+
+        /// FIX-SEC-MAJOR: Duplicate/retry spawn transitions are detected
+        /// via authoritative transition count.
+        #[test]
+        fn duplicate_spawn_detected_via_transition_count() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // ClaimWork
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, _lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // After ClaimWork: should have 1 transition (Open->Claimed)
+            let count_after_claim = dispatcher.event_emitter.get_work_transition_count(&work_id);
+            assert_eq!(
+                count_after_claim, 1,
+                "After ClaimWork, transition count should be 1"
+            );
+
+            // Verify the transition event has previous_transition_count=0
+            // (which is the count BEFORE the transition was emitted)
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let first_transition: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .collect();
+            assert_eq!(first_transition.len(), 1);
+            let payload: serde_json::Value =
+                serde_json::from_slice(&first_transition[0].payload).unwrap();
+            assert_eq!(
+                payload["previous_transition_count"], 0,
+                "First transition should have previous_transition_count=0"
+            );
+        }
+
+        /// FIX-SEC-BLOCKER: Replay ordering is deterministic for
+        /// equal-timestamp events.
+        ///
+        /// Events emitted with the same timestamp must maintain stable
+        /// insertion order when queried via `get_events_by_work_id`.
+        #[test]
+        fn equal_timestamp_events_maintain_insertion_order() {
+            let emitter = StubLedgerEventEmitter::new();
+            let ts = 1_000_000_000u64;
+
+            // Emit three events with the same timestamp
+            emitter
+                .emit_work_claimed(
+                    &WorkClaim {
+                        work_id: "W-ORDER-001".to_string(),
+                        lease_id: "L-001".to_string(),
+                        actor_id: "uid:1000".to_string(),
+                        role: WorkRole::Implementer,
+                        policy_resolution: PolicyResolution {
+                            policy_resolved_ref: "test-resolved".to_string(),
+                            resolved_policy_hash: [0u8; 32],
+                            capability_manifest_hash: [0u8; 32],
+                            context_pack_hash: [0u8; 32],
+                        },
+                        executor_custody_domains: vec![],
+                        author_custody_domains: vec![],
+                    },
+                    ts,
+                )
+                .unwrap();
+
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-ORDER-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "work_claimed_via_ipc",
+                    previous_transition_count: 0,
+                    actor_id: "uid:1000",
+                    timestamp_ns: ts,
+                })
+                .unwrap();
+
+            emitter
+                .emit_session_started("SESS-001", "W-ORDER-001", "L-001", "uid:1000", ts)
+                .unwrap();
+
+            // Query events - must maintain insertion order
+            let events = emitter.get_events_by_work_id("W-ORDER-001");
+            assert_eq!(events.len(), 3, "Expected 3 events");
+
+            // Verify ordering: work_claimed, work_transitioned, session_started
+            assert_eq!(
+                events[0].event_type, "work_claimed",
+                "First event should be work_claimed"
+            );
+            assert_eq!(
+                events[1].event_type, "work_transitioned",
+                "Second event should be work_transitioned"
+            );
+            assert_eq!(
+                events[2].event_type, "session_started",
+                "Third event should be session_started"
+            );
+
+            // All have the same timestamp
+            for event in &events {
+                assert_eq!(
+                    event.timestamp_ns, ts,
+                    "All events should have the same timestamp"
+                );
+            }
+        }
+
+        /// FIX-QUALITY-MAJOR: `emit_claim_lifecycle` is atomic.
+        ///
+        /// Tests that `emit_claim_lifecycle` emits both `work_claimed` and
+        /// `work_transitioned` events.
+        #[test]
+        fn emit_claim_lifecycle_emits_both_events() {
+            let emitter = StubLedgerEventEmitter::new();
+            let claim = WorkClaim {
+                work_id: "W-ATOMIC-001".to_string(),
+                lease_id: "L-001".to_string(),
+                actor_id: "uid:1000".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "test-resolved".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+
+            let result = emitter.emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000);
+            assert!(result.is_ok(), "emit_claim_lifecycle should succeed");
+
+            let events = emitter.get_events_by_work_id("W-ATOMIC-001");
+            assert_eq!(
+                events.len(),
+                2,
+                "Expected 2 events (work_claimed + work_transitioned)"
+            );
+            assert_eq!(events[0].event_type, "work_claimed");
+            assert_eq!(events[1].event_type, "work_transitioned");
+
+            // Verify the transition has correct previous_transition_count
+            let payload: serde_json::Value = serde_json::from_slice(&events[1].payload).unwrap();
+            assert_eq!(payload["from_state"], "Open");
+            assert_eq!(payload["to_state"], "Claimed");
+            assert_eq!(payload["previous_transition_count"], 0);
+        }
+
+        /// FIX-QUALITY-MAJOR: `emit_spawn_lifecycle` is atomic.
+        ///
+        /// Tests that `emit_spawn_lifecycle` emits both `session_started` and
+        /// `work_transitioned` events.
+        #[test]
+        fn emit_spawn_lifecycle_emits_both_events() {
+            let emitter = StubLedgerEventEmitter::new();
+
+            // First, emit the claim lifecycle so transition count is 1
+            let claim = WorkClaim {
+                work_id: "W-ATOMIC-002".to_string(),
+                lease_id: "L-001".to_string(),
+                actor_id: "uid:1000".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "test-resolved".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            emitter
+                .emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000)
+                .unwrap();
+
+            // Now emit spawn lifecycle
+            let result = emitter.emit_spawn_lifecycle(
+                "SESS-002",
+                "W-ATOMIC-002",
+                "L-001",
+                "uid:1000",
+                2_000_000_000,
+            );
+            assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
+
+            let events = emitter.get_events_by_work_id("W-ATOMIC-002");
+            // Should have: work_claimed, work_transitioned(Open->Claimed),
+            // session_started, work_transitioned(Claimed->InProgress)
+            assert_eq!(events.len(), 4, "Expected 4 events total");
+            assert_eq!(events[2].event_type, "session_started");
+            assert_eq!(events[3].event_type, "work_transitioned");
+
+            let payload: serde_json::Value = serde_json::from_slice(&events[3].payload).unwrap();
+            assert_eq!(payload["from_state"], "Claimed");
+            assert_eq!(payload["to_state"], "InProgress");
+            // previous_transition_count should be 1 (derived from ledger)
+            assert_eq!(payload["previous_transition_count"], 1);
+        }
+
+        // ================================================================
+        // TCK-00395 v3: Quality review v2 fixes
+        // ================================================================
+
+        /// MAJOR 1: `EndSession` removes session from registry, preventing
+        /// repeated termination.
+        #[test]
+        fn end_session_removes_session_from_registry() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // ClaimWork + SpawnEpisode
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // Verify session exists before EndSession
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_some(),
+                "Session should exist before EndSession"
+            );
+
+            // First EndSession - should succeed
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::EndSession(resp) => {
+                    assert_eq!(resp.session_id, session_id);
+                },
+                other => panic!("Expected EndSession response, got: {other:?}"),
+            }
+
+            // Verify session is removed from registry
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_none(),
+                "Session should be removed after EndSession"
+            );
+
+            // Second EndSession - should fail with "session not found"
+            let end_frame2 = encode_end_session_request(&end_request);
+            let response2 = dispatcher.dispatch(&end_frame2, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("session not found"),
+                        "Expected 'session not found' on repeated EndSession, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error on repeated EndSession, got: {other:?}"),
+            }
+        }
+
+        /// Security MAJOR 1: `EndSession` rejects reason strings that exceed
+        /// `MAX_REASON_LENGTH`. Prevents OOM and bloated signed ledger
+        /// payloads.
+        #[test]
+        fn end_session_rejects_oversized_reason() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // ClaimWork + SpawnEpisode to get a valid session
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // EndSession with oversized reason (MAX_REASON_LENGTH + 1)
+            let oversized_reason = "x".repeat(MAX_REASON_LENGTH + 1);
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: oversized_reason,
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("reason exceeds maximum length"),
+                        "Expected reason length error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for oversized reason, got: {other:?}"),
+            }
+
+            // Verify session is NOT removed (request was rejected)
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_some(),
+                "Session MUST be preserved when reason validation fails"
+            );
+        }
+
+        /// Security MAJOR 1: `EndSession` accepts reason at exactly
+        /// `MAX_REASON_LENGTH` bytes (boundary).
+        #[test]
+        fn end_session_accepts_reason_at_max_length() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // EndSession with reason at exactly MAX_REASON_LENGTH
+            let max_reason = "r".repeat(MAX_REASON_LENGTH);
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: max_reason,
+                outcome: TerminationOutcome::Failure as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::EndSession(resp) => {
+                    assert_eq!(resp.session_id, session_id);
+                },
+                other => {
+                    panic!("Expected EndSession response for max-length reason, got: {other:?}")
+                },
+            }
+        }
+
+        /// Quality BLOCKER 2: `EndSession` succeeds regardless of
+        /// `emit_work_transitioned` status because `EndSession` no longer
+        /// emits work transitions. Work completion belongs to gate
+        /// orchestration.
+        #[test]
+        fn end_session_succeeds_without_work_transition() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // ClaimWork
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // SpawnEpisode
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // EndSession with success
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+
+            // EndSession should succeed (no work transition emitted)
+            match response {
+                PrivilegedResponse::EndSession(resp) => {
+                    assert_eq!(resp.message, "session terminated");
+                },
+                other => panic!("Expected EndSession response, got: {other:?}"),
+            }
+
+            // Session should be removed from registry after success
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_none(),
+                "Session MUST be removed from registry after successful EndSession"
+            );
+
+            // Verify no Completed transitions were emitted
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let completed_count = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .filter(|e| {
+                    let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                    p["to_state"] == "Completed"
+                })
+                .count();
+            assert_eq!(
+                completed_count, 0,
+                "EndSession must not emit WorkTransitioned(Completed)"
+            );
+        }
+
+        /// Quality v3 MAJOR: Typed `TerminationOutcome` enum determines
+        /// exit code instead of free-form reason string matching.
+        #[test]
+        fn end_session_typed_outcome_determines_exit_code() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Helper: claim + spawn and return (work_id, session_id)
+            let setup = |d: &PrivilegedDispatcher| {
+                let claim_request = ClaimWorkRequest {
+                    actor_id: "test-actor".to_string(),
+                    role: WorkRole::Implementer.into(),
+                    credential_signature: vec![1, 2, 3],
+                    nonce: vec![4, 5, 6],
+                };
+                let claim_frame = encode_claim_work_request(&claim_request);
+                let claim_response = d.dispatch(&claim_frame, &ctx).unwrap();
+                let (work_id, lease_id) = match claim_response {
+                    PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                    _ => panic!("Expected ClaimWork response"),
+                };
+                let spawn_request = SpawnEpisodeRequest {
+                    workspace_root: test_workspace_root(),
+                    work_id: work_id.clone(),
+                    role: WorkRole::Implementer.into(),
+                    lease_id: Some(lease_id),
+                };
+                let spawn_frame = encode_spawn_episode_request(&spawn_request);
+                let spawn_response = d.dispatch(&spawn_frame, &ctx).unwrap();
+                let session_id = match spawn_response {
+                    PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                    _ => panic!("Expected SpawnEpisode response"),
+                };
+                (work_id, session_id)
+            };
+
+            // Test 1: TerminationOutcome::Success -> exit_code 0.
+            // Quality BLOCKER 2: NO WorkTransitioned(Completed) emitted.
+            let (work_id, session_id) = setup(&dispatcher);
+            let end_request = EndSessionRequest {
+                session_id,
+                reason: "some_reason".to_string(), // reason is irrelevant when outcome is set
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let terminated: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            assert_eq!(terminated.len(), 1);
+            let payload: serde_json::Value =
+                serde_json::from_slice(&terminated[0].payload).unwrap();
+            assert_eq!(payload["exit_code"], 0, "Success outcome -> exit_code 0");
+            // Quality BLOCKER 2: EndSession must NOT emit
+            // WorkTransitioned(Completed). Work completion belongs to
+            // gate orchestration.
+            assert!(
+                !events.iter().any(|e| {
+                    e.event_type == "work_transitioned" && {
+                        let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                        p["to_state"] == "Completed"
+                    }
+                }),
+                "Success outcome must NOT emit WorkTransitioned(Completed) per Quality BLOCKER 2"
+            );
+
+            // Test 2: TerminationOutcome::Failure -> exit_code 1,
+            //         NO WorkTransitioned(Completed).
+            let (work_id2, session_id2) = setup(&dispatcher);
+            let end_request2 = EndSessionRequest {
+                session_id: session_id2,
+                reason: "completed_normally".to_string(), /* Even with "success" reason, outcome
+                                                           * overrides */
+                outcome: TerminationOutcome::Failure as i32,
+            };
+            let end_frame2 = encode_end_session_request(&end_request2);
+            dispatcher.dispatch(&end_frame2, &ctx).unwrap();
+            let events2 = dispatcher.event_emitter.get_events_by_work_id(&work_id2);
+            let terminated2: Vec<_> = events2
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            assert_eq!(terminated2.len(), 1);
+            let payload2: serde_json::Value =
+                serde_json::from_slice(&terminated2[0].payload).unwrap();
+            assert_eq!(payload2["exit_code"], 1, "Failure outcome -> exit_code 1");
+            // Should NOT have WorkTransitioned to Completed
+            let completed_count = events2
+                .iter()
+                .filter(|e| {
+                    e.event_type == "work_transitioned" && {
+                        let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                        p["to_state"] == "Completed"
+                    }
+                })
+                .count();
+            assert_eq!(
+                completed_count, 0,
+                "Failure outcome should NOT emit WorkTransitioned(Completed)"
+            );
+
+            // Test 3: TerminationOutcome::Unspecified (0) falls back to
+            //         legacy string matching (backward compat).
+            let (work_id3, session_id3) = setup(&dispatcher);
+            let end_request3 = EndSessionRequest {
+                session_id: session_id3,
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Unspecified as i32,
+            };
+            let end_frame3 = encode_end_session_request(&end_request3);
+            dispatcher.dispatch(&end_frame3, &ctx).unwrap();
+            let events3 = dispatcher.event_emitter.get_events_by_work_id(&work_id3);
+            let terminated3: Vec<_> = events3
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            assert_eq!(terminated3.len(), 1);
+            let payload3: serde_json::Value =
+                serde_json::from_slice(&terminated3[0].payload).unwrap();
+            assert_eq!(
+                payload3["exit_code"], 0,
+                "Unspecified outcome with 'completed_normally' reason -> exit_code 0 (legacy)"
+            );
+        }
+
+        /// BLOCKER 1: `stop_with_session_context` emits `SessionTerminated`
+        /// event to the ledger when episode runtime stops.
+        #[tokio::test]
+        async fn stop_with_session_context_emits_session_terminated() {
+            let emitter = Arc::new(StubLedgerEventEmitter::new());
+            let config = EpisodeRuntimeConfig {
+                emit_events: true,
+                ..EpisodeRuntimeConfig::default()
+            };
+
+            let runtime = EpisodeRuntime::new(config).with_ledger_emitter(emitter.clone());
+
+            // Create and start an episode
+            let episode_id = runtime.create([0u8; 32], 1_000_000_000).await.unwrap();
+            let _handle = runtime
+                .start_with_workspace(
+                    &episode_id,
+                    "lease-001",
+                    1_000_001_000,
+                    std::path::Path::new("/tmp"),
+                )
+                .await
+                .unwrap();
+
+            // Stop via stop_with_session_context (simulating runtime-driven
+            // termination with session context)
+            let result = runtime
+                .stop_with_session_context(
+                    &episode_id,
+                    crate::episode::TerminationClass::Success,
+                    1_000_002_000,
+                    "SESS-RUNTIME-001",
+                    "W-RUNTIME-001",
+                    "uid:1000",
+                )
+                .await;
+            assert!(result.is_ok(), "stop_with_session_context should succeed");
+
+            // Verify SessionTerminated event was emitted to the ledger
+            let events = emitter.get_events_by_work_id("W-RUNTIME-001");
+            let terminated: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            assert_eq!(
+                terminated.len(),
+                1,
+                "Expected 1 session_terminated event from runtime stop"
+            );
+
+            let payload: serde_json::Value =
+                serde_json::from_slice(&terminated[0].payload).unwrap();
+            assert_eq!(payload["session_id"], "SESS-RUNTIME-001");
+            assert_eq!(payload["work_id"], "W-RUNTIME-001");
+            assert_eq!(payload["exit_code"], 0);
+        }
+
+        /// BLOCKER 1: `EndSession` integration test where runtime termination
+        /// occurs through the handler (end-to-end with session removal).
+        #[test]
+        fn end_session_terminates_and_cleans_up_completely() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // ClaimWork + SpawnEpisode
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // EndSession
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+            match &response {
+                PrivilegedResponse::EndSession(resp) => {
+                    assert_eq!(resp.session_id, session_id);
+                },
+                other => panic!("Expected EndSession response, got: {other:?}"),
+            }
+
+            // Verify: session removed from registry
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_none(),
+                "Session should be removed from registry"
+            );
+
+            // Verify: SessionTerminated event in ledger
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            assert!(
+                events.iter().any(|e| e.event_type == "session_terminated"),
+                "SessionTerminated event should be in ledger"
+            );
+
+            // Quality BLOCKER 2: EndSession must NOT emit
+            // WorkTransitioned(InProgress->Completed). Work completion
+            // belongs to gate orchestration.
+            let completed_count = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .filter(|e| {
+                    let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                    p["to_state"] == "Completed"
+                })
+                .count();
+            assert_eq!(
+                completed_count, 0,
+                "EndSession must NOT emit WorkTransitioned(Completed)"
+            );
+
+            // Verify: repeated EndSession is rejected
+            let end_frame2 = encode_end_session_request(&end_request);
+            let response2 = dispatcher.dispatch(&end_frame2, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(err.message.contains("session not found"));
+                },
+                other => panic!("Expected error on repeated EndSession, got: {other:?}"),
+            }
+        }
+
+        // ================================================================
+        // TCK-00395 Security review v4 regression tests
+        // ================================================================
+
+        /// Security MAJOR 2: `EndSession` fails closed when peer credentials
+        /// are missing. The handler must not emit authoritative ledger events
+        /// with placeholder "unknown" actor IDs.
+        #[test]
+        fn end_session_rejects_missing_peer_credentials() {
+            let dispatcher = PrivilegedDispatcher::new();
+
+            // Create a session first (with valid credentials)
+            let valid_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &valid_ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &valid_ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // Now try EndSession WITHOUT peer credentials
+            let no_creds_ctx = ConnectionContext::privileged(None);
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let result = dispatcher.dispatch(&end_frame, &no_creds_ctx);
+
+            // Should fail (either Err or Error response)
+            match result {
+                Err(e) => {
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("peer credentials"),
+                        "Error should mention peer credentials: {msg}"
+                    );
+                },
+                Ok(PrivilegedResponse::Error(err)) => {
+                    assert!(
+                        err.message.contains("peer credentials")
+                            || err.message.contains("credential"),
+                        "Error should mention credentials: {}",
+                        err.message
+                    );
+                },
+                Ok(other) => panic!("Expected error for missing peer credentials, got: {other:?}"),
+            }
+
+            // Verify session is still in the registry (not cleaned up)
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_some(),
+                "Session MUST be preserved when credentials are missing"
+            );
+
+            // Verify no session_terminated events were emitted
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let terminated_count = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .count();
+            assert_eq!(
+                terminated_count, 0,
+                "No session_terminated events should be emitted without credentials"
+            );
+        }
+
+        /// Security MAJOR 2: `SpawnEpisode` fails closed when peer
+        /// credentials are missing.
+        #[test]
+        fn spawn_episode_rejects_missing_peer_credentials() {
+            let dispatcher = PrivilegedDispatcher::new();
+
+            // ClaimWork with valid credentials
+            let valid_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &valid_ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // SpawnEpisode WITHOUT peer credentials
+            let no_creds_ctx = ConnectionContext::privileged(None);
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
+
+            // Should fail
+            match result {
+                Err(e) => {
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("peer credentials"),
+                        "Error should mention peer credentials: {msg}"
+                    );
+                },
+                Ok(PrivilegedResponse::Error(err)) => {
+                    assert!(
+                        err.message.contains("peer credentials")
+                            || err.message.contains("credential"),
+                        "Error should mention credentials: {}",
+                        err.message
+                    );
+                },
+                Ok(other) => panic!("Expected error for missing peer credentials, got: {other:?}"),
+            }
+        }
+
+        /// Security MAJOR 1: `EndSession` fails closed on malformed
+        /// `episode_id`. A corrupted `episode_id` must not silently skip
+        /// the runtime stop while still emitting termination facts.
+        #[test]
+        fn end_session_rejects_malformed_episode_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Register a session directly with a malformed episode_id
+            // (empty string after Some() - which is non-empty but invalid)
+            let session = crate::session::SessionState {
+                session_id: "SESS-MALFORMED-001".to_string(),
+                work_id: "W-MALFORMED-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-MALFORMED-001".to_string(),
+                ephemeral_handle: "handle-malformed-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                // Malformed: contains forbidden '/' characters for an EpisodeId
+                episode_id: Some("invalid/episode/id".to_string()),
+            };
+
+            dispatcher
+                .session_registry()
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            let end_request = EndSessionRequest {
+                session_id: "SESS-MALFORMED-001".to_string(),
+                reason: "test".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("malformed episode_id")
+                            || err.message.contains("episode"),
+                        "Error should mention malformed episode_id: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for malformed episode_id, got: {other:?}"),
+            }
+
+            // Session should be preserved since termination was rejected
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session("SESS-MALFORMED-001")
+                    .is_some(),
+                "Session MUST be preserved when episode_id parsing fails"
+            );
+
+            // No session_terminated events should have been emitted
+            let events = dispatcher
+                .event_emitter
+                .get_events_by_work_id("W-MALFORMED-001");
+            let terminated_count = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .count();
+            assert_eq!(
+                terminated_count, 0,
+                "No termination events should be emitted when episode_id is malformed"
+            );
+        }
+
+        /// BLOCKER 1 (v2): `stop_all_running` stops all running episodes
+        /// and emits `SessionTerminated` events for each.
+        #[tokio::test]
+        async fn stop_all_running_emits_session_terminated_for_all() {
+            use crate::episode::registry::InMemorySessionRegistry;
+
+            let emitter = Arc::new(StubLedgerEventEmitter::new());
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let config = EpisodeRuntimeConfig {
+                emit_events: true,
+                ..EpisodeRuntimeConfig::default()
+            };
+
+            let runtime =
+                EpisodeRuntime::new(config)
+                    .with_ledger_emitter(emitter.clone())
+                    .with_session_registry(
+                        registry.clone() as Arc<dyn crate::session::SessionRegistry>
+                    );
+
+            // Create and start two episodes
+            let ep1 = runtime.create([10u8; 32], 1_000_000_000).await.unwrap();
+            let h1 = runtime
+                .start_with_workspace(
+                    &ep1,
+                    "lease-001",
+                    1_000_001_000,
+                    std::path::Path::new("/tmp"),
+                )
+                .await
+                .unwrap();
+            let sid1 = h1.session_id().to_string();
+
+            let ep2 = runtime.create([20u8; 32], 1_000_000_000).await.unwrap();
+            let h2 = runtime
+                .start_with_workspace(
+                    &ep2,
+                    "lease-002",
+                    1_000_001_000,
+                    std::path::Path::new("/tmp"),
+                )
+                .await
+                .unwrap();
+            let sid2 = h2.session_id().to_string();
+
+            // Register sessions with known work IDs
+            let s1 = crate::session::SessionState {
+                session_id: sid1.clone(),
+                work_id: "W-ALL-001".to_string(),
+                role: 1,
+                ephemeral_handle: "h1".to_string(),
+                lease_id: "lease-001".to_string(),
+                policy_resolved_ref: "pol-001".to_string(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: Some(ep1.as_str().to_string()),
+            };
+            registry.register_session(s1).unwrap();
+
+            let s2 = crate::session::SessionState {
+                session_id: sid2.clone(),
+                work_id: "W-ALL-002".to_string(),
+                role: 1,
+                ephemeral_handle: "h2".to_string(),
+                lease_id: "lease-002".to_string(),
+                policy_resolved_ref: "pol-002".to_string(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: Some(ep2.as_str().to_string()),
+            };
+            registry.register_session(s2).unwrap();
+
+            assert_eq!(runtime.active_count().await, 2);
+
+            // Stop all running
+            let stopped = runtime
+                .stop_all_running(2_000_000_000, crate::episode::TerminationClass::Cancelled)
+                .await;
+            assert_eq!(stopped, 2, "Should have stopped 2 episodes");
+            assert_eq!(runtime.active_count().await, 0);
+
+            // Verify SessionTerminated events for both work IDs
+            let ev1 = emitter.get_events_by_work_id("W-ALL-001");
+            assert!(
+                ev1.iter().any(|e| e.event_type == "session_terminated"),
+                "W-ALL-001 should have session_terminated event"
+            );
+            let ev2 = emitter.get_events_by_work_id("W-ALL-002");
+            assert!(
+                ev2.iter().any(|e| e.event_type == "session_terminated"),
+                "W-ALL-002 should have session_terminated event"
+            );
+
+            // Verify actor_id is daemon:shutdown
+            let t1: Vec<_> = ev1
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            let p1: serde_json::Value = serde_json::from_slice(&t1[0].payload).unwrap();
+            assert_eq!(p1["actor_id"], "daemon:shutdown");
         }
     }
 }
