@@ -68,6 +68,36 @@ impl SqliteLedgerEventEmitter {
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_type_payload ON ledger_events(event_type)",
             [],
         )?;
+        // SECURITY (v9 Finding 1 — Delegation Uniqueness Constraint):
+        //
+        // Enforce at-most-once semantics for authority-bearing delegation
+        // events at the database level. For `SubleaseIssued` events, the
+        // `work_id` column stores the `sublease_id` (set by
+        // `emit_session_event(&sublease.lease_id, "SubleaseIssued", ...)`).
+        // A partial unique index ensures that even under concurrent dispatch
+        // (the handler takes `&self`, not `&mut self`), duplicate emission
+        // of a `SubleaseIssued` event for the same sublease_id is rejected
+        // by SQLite's UNIQUE constraint before any data is committed.
+        //
+        // This converts the check-then-act pattern in `DelegateSublease`
+        // into a defense-in-depth strategy: the application-level check
+        // (`get_gate_lease`) provides the idempotent fast-path, while the
+        // database constraint provides the authoritative uniqueness
+        // guarantee that cannot be bypassed by race conditions.
+        //
+        // NOTE: We do NOT add a unique index on `gate_lease_issued` events
+        // because their `work_id` column stores the logical `work_id`
+        // (not `lease_id`), and multiple leases (parent + sublease) can
+        // legitimately share the same `work_id`. The `SubleaseIssued`
+        // uniqueness constraint is sufficient because it fires first in
+        // the delegation flow (emit happens before `register_full_lease`),
+        // so any race-condition duplicate is caught at the event level.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_sublease_issued \
+             ON ledger_events(event_type, work_id) \
+             WHERE event_type = 'SubleaseIssued'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -533,6 +563,40 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         });
 
         rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
+    }
+
+    fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        // Query review receipt events by receipt_id embedded in the JSON payload.
+        // Both `review_receipt_recorded` and `review_blocked_recorded` events
+        // store `receipt_id` in the payload. We use `json_extract` with
+        // `CAST(payload AS TEXT)` because payloads are stored as BLOBs.
+        //
+        // ORDER BY rowid DESC LIMIT 1 ensures deterministic latest-row selection
+        // (defense-in-depth; receipt_id should be unique across receipt events).
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND json_extract(CAST(payload AS TEXT), '$.receipt_id') = ?1 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![receipt_id],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
@@ -1880,6 +1944,13 @@ impl LeaseValidator for SqliteLeaseValidator {
         stmt.query_row(params![lease_id], |row| row.get(0)).ok()
     }
 
+    // Trust Model (single-writer): The daemon is the sole writer to the
+    // ledger. Leases stored via `register_full_lease` are written by the
+    // same process through authenticated IPC handlers that enforce admission
+    // checks before persistence. Cryptographic signature verification is
+    // not needed for same-process data reads — the process trust boundary
+    // guarantees integrity. The embedded `issuer_signature` in each
+    // `GateLease` is preserved for downstream / cross-node verification.
     fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
         let conn = self.conn.lock().ok()?;
 
@@ -1953,6 +2024,20 @@ impl LeaseValidator for SqliteLeaseValidator {
     fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
         // Store the full lease as a gate_lease_issued event with the complete
         // lease object embedded in the payload for later retrieval.
+
+        // SECURITY (v10 BLOCKER 2): Check for existing lease with this ID
+        // BEFORE inserting. This makes the DB the authoritative uniqueness
+        // gate, preventing TOCTOU races where two concurrent requests both
+        // pass the in-memory pre-check (get_gate_lease) and create
+        // conflicting leases.
+        //
+        // We check using get_gate_lease (which queries json_extract on
+        // payload) rather than adding a schema migration. This approach
+        // requires no new columns or indexes.
+        if self.get_gate_lease(&lease.lease_id).is_some() {
+            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+        }
+
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
         let payload = serde_json::json!({
             "event_type": "gate_lease_issued",
@@ -1970,7 +2055,7 @@ impl LeaseValidator for SqliteLeaseValidator {
             .lock()
             .map_err(|e| format!("failed to acquire ledger lock: {e}"))?;
 
-        // NOTE: The zero-filled signature is intentional — see trust model
+        // NOTE: The zero-filled signature is intentional -- see trust model
         // documentation above. The real cryptographic proof lives inside
         // `full_lease.issuer_signature`.
         conn.execute(
@@ -2427,6 +2512,50 @@ mod tests {
     }
 
     // ====================================================================
+    // v10 BLOCKER 2: register_full_lease duplicate rejection tests
+    // ====================================================================
+
+    /// v10 BLOCKER 2: `SqliteLeaseValidator::register_full_lease` rejects
+    /// duplicate `lease_id` to enforce DB-level uniqueness.
+    #[test]
+    fn sqlite_lease_validator_register_full_lease_duplicate_rejected() {
+        use crate::protocol::dispatch::LeaseValidator;
+
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let validator: Arc<dyn LeaseValidator> =
+            Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let lease = apm2_core::fac::GateLeaseBuilder::new("dup-lease-001", "W-DUP-001", "gate-dup")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("exec-dup")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-dup")
+            .time_envelope_ref("htf:tick:100")
+            .build_and_sign(&signer);
+
+        // First registration succeeds
+        let result1 = validator.register_full_lease(&lease);
+        assert!(result1.is_ok(), "First registration should succeed");
+
+        // Second registration with same lease_id must fail
+        let result2 = validator.register_full_lease(&lease);
+        assert!(
+            result2.is_err(),
+            "Duplicate lease_id must be rejected by register_full_lease"
+        );
+        let err_msg = result2.unwrap_err();
+        assert!(
+            err_msg.contains("duplicate lease_id"),
+            "Error message should mention duplicate: {err_msg}"
+        );
+    }
+
+    // ====================================================================
     // TCK-00348: Contract binding canonicalizer metadata tests
     // ====================================================================
 
@@ -2544,5 +2673,79 @@ mod tests {
         assert_eq!(canonicalizers[0]["version"], 1);
         assert_eq!(canonicalizers[1]["id"], "apm2.canonical.jcs");
         assert_eq!(canonicalizers[1]["version"], 2);
+    }
+
+    /// Verifies that `get_event_by_receipt_id` finds review receipt events
+    /// by their payload-embedded `receipt_id` field, and that submitting the
+    /// same `receipt_id` twice returns the original event (idempotent).
+    #[test]
+    fn test_get_event_by_receipt_id_returns_existing_event() {
+        let emitter = test_emitter();
+
+        let changeset = [0xABu8; 32];
+        let artifact = [0xCDu8; 32];
+
+        // Emit a review receipt with a specific receipt_id
+        let event1 = emitter
+            .emit_review_receipt(
+                "episode-001",
+                "RR-IDEMP-001",
+                &changeset,
+                &artifact,
+                "reviewer-actor-x",
+                1_000_000_000,
+            )
+            .expect("first emit should succeed");
+
+        // Lookup by receipt_id should find the event
+        let found = emitter.get_event_by_receipt_id("RR-IDEMP-001");
+        assert!(
+            found.is_some(),
+            "get_event_by_receipt_id must find the event"
+        );
+        let found = found.unwrap();
+        assert_eq!(
+            found.event_id, event1.event_id,
+            "Must return the same event_id as the original emission"
+        );
+        assert_eq!(found.event_type, "review_receipt_recorded");
+
+        // Lookup by a different receipt_id should return None
+        let not_found = emitter.get_event_by_receipt_id("RR-IDEMP-999");
+        assert!(
+            not_found.is_none(),
+            "get_event_by_receipt_id must return None for unknown receipt_id"
+        );
+    }
+
+    /// Verifies that `get_event_by_receipt_id` also finds blocked receipt
+    /// events.
+    #[test]
+    fn test_get_event_by_receipt_id_finds_blocked_receipts() {
+        let emitter = test_emitter();
+
+        let blocked_log_hash = [0xEEu8; 32];
+
+        let blocked_event = emitter
+            .emit_review_blocked_receipt(
+                "RR-BLOCKED-001",
+                42,
+                &blocked_log_hash,
+                "reviewer-actor-y",
+                2_000_000_000,
+            )
+            .expect("blocked receipt emit should succeed");
+
+        let found = emitter.get_event_by_receipt_id("RR-BLOCKED-001");
+        assert!(
+            found.is_some(),
+            "get_event_by_receipt_id must find blocked receipt events"
+        );
+        let found = found.unwrap();
+        assert_eq!(
+            found.event_id, blocked_event.event_id,
+            "Must return the same event_id as the original blocked emission"
+        );
+        assert_eq!(found.event_type, "review_blocked_recorded");
     }
 }

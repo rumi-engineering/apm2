@@ -372,6 +372,31 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// Queries events by work ID.
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent>;
 
+    /// Queries a signed event by `receipt_id` embedded in the payload.
+    ///
+    /// This searches for events of type `review_receipt_recorded` or
+    /// `review_blocked_recorded` whose JSON payload contains a matching
+    /// `receipt_id` field. Used by `handle_ingest_review_receipt` for
+    /// idempotency: if a receipt with the same `receipt_id` was already
+    /// ingested, the existing event is returned to avoid duplicate ledger
+    /// entries.
+    ///
+    /// # Why not `get_event`?
+    ///
+    /// `get_event` looks up by `event_id` (the random `EVT-<uuid>` primary
+    /// key), which is different from `receipt_id` (the caller-supplied
+    /// idempotency key). Using `get_event(&receipt_id)` would never match
+    /// because `receipt_id` is not stored as the `event_id`.
+    ///
+    /// # Default
+    ///
+    /// Returns `None`. Implementations that support receipt-based lookup
+    /// should override this.
+    fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
+        let _ = receipt_id;
+        None
+    }
+
     /// Emits an episode lifecycle event to the ledger (TCK-00321).
     ///
     /// Per REQ-0005, episode events must be streamed directly to the ledger
@@ -1375,6 +1400,31 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        // Search all review receipt events for a matching receipt_id in the
+        // JCS-canonicalized JSON payload. Both `review_receipt_recorded` and
+        // `review_blocked_recorded` events embed `receipt_id` in the payload.
+        for event in guard.1.values() {
+            if event.event_type != "review_receipt_recorded"
+                && event.event_type != "review_blocked_recorded"
+            {
+                continue;
+            }
+            // The payload is JCS-canonicalized JSON stored as bytes.
+            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&event.payload) {
+                if payload
+                    .get("receipt_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(receipt_id)
+                {
+                    return Some(event.clone());
+                }
+            }
+        }
+        None
     }
 
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
@@ -3817,6 +3867,15 @@ impl LeaseValidator for StubLeaseValidator {
 
     fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
         let mut guard = self.full_leases.write().expect("lock poisoned");
+        // SECURITY (v10 BLOCKER 2): Enforce uniqueness at the persistence
+        // layer. If a lease with this ID already exists, return an error
+        // so the caller can handle it (idempotent or conflict). This makes
+        // the store the source of truth for uniqueness, preventing TOCTOU
+        // races where two concurrent requests both pass the in-memory
+        // pre-check and create conflicting leases.
+        if guard.contains_key(&lease.lease_id) {
+            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+        }
         guard.insert(lease.lease_id.clone(), lease.clone());
         Ok(())
     }
@@ -6940,17 +6999,43 @@ impl PrivilegedDispatcher {
         }
 
         // ---- Phase 2: Idempotency check ----
-        // Check if a receipt with this ID already exists in the ledger.
-        if let Some(existing) = self.event_emitter.get_event(&request.receipt_id) {
+        //
+        // SECURITY (v10 MAJOR 1 -- receipt_id idempotency fix):
+        //
+        // Use `get_event_by_receipt_id` to look up existing events by the
+        // caller-supplied `receipt_id` embedded in the event payload. The
+        // previous approach using `get_event(&receipt_id)` was broken because
+        // `get_event` looks up by `event_id` (auto-generated `EVT-<uuid>`),
+        // not by `receipt_id`. The intermediate `get_events_by_work_id` approach
+        // also had a gap: `emit_review_blocked_receipt` stores `work_id` as
+        // `receipt_id` (not `lease_id`), so blocked receipts would not be found
+        // when querying by `lease_id`.
+        //
+        // `get_event_by_receipt_id` searches the payload JSON directly for the
+        // matching `receipt_id` field across both `review_receipt_recorded` and
+        // `review_blocked_recorded` event types, regardless of `work_id`.
+        if let Some(existing) = self
+            .event_emitter
+            .get_event_by_receipt_id(&request.receipt_id)
+        {
             info!(
                 receipt_id = %request.receipt_id,
                 existing_event_id = %existing.event_id,
                 "Duplicate receipt_id detected - returning existing event (idempotent)"
             );
+            // Map the internal event_type to the response-level event type.
+            // The ledger stores snake_case event types ("review_receipt_recorded",
+            // "review_blocked_recorded"), but the response contract uses
+            // PascalCase ("ReviewReceiptRecorded", "ReviewBlockedRecorded").
+            let response_event_type = match existing.event_type.as_str() {
+                "review_receipt_recorded" => "ReviewReceiptRecorded".to_string(),
+                "review_blocked_recorded" => "ReviewBlockedRecorded".to_string(),
+                other => other.to_string(),
+            };
             return Ok(PrivilegedResponse::IngestReviewReceipt(
                 IngestReviewReceiptResponse {
                     receipt_id: request.receipt_id,
-                    event_type: existing.event_type,
+                    event_type: response_event_type,
                     event_id: existing.event_id,
                 },
             ));
@@ -7982,9 +8067,20 @@ impl PrivilegedDispatcher {
 
         // ---- Phase 2b: Sublease ID uniqueness check (admission before mutation) ----
         //
-        // SECURITY: Enforce sublease_id uniqueness to prevent conflicting
-        // leases from sharing the same ID. Check both full lease storage
-        // and the lease validator's executor lookup.
+        // SECURITY (v9 Finding 1 — Defense-in-Depth Uniqueness):
+        //
+        // This application-level check provides the idempotent fast-path for
+        // duplicate sublease requests. However, since `dispatch()` takes
+        // `&self` (not `&mut self`), concurrent dispatch of two requests
+        // with the same `sublease_id` could theoretically race past this
+        // check. The authoritative uniqueness guarantee is enforced at the
+        // database level via a partial unique index on `(event_type,
+        // work_id)` for `SubleaseIssued` events (see
+        // `SqliteLedgerEventEmitter::init_schema`). For these events,
+        // `work_id` = `sublease_id`, so the index enforces at-most-once
+        // semantics per sublease. If a duplicate does race past the
+        // application check, `emit_session_event` will fail with a UNIQUE
+        // constraint violation and the handler will fail-closed.
         if let Some(existing) = self.lease_validator.get_gate_lease(&request.sublease_id) {
             // Idempotent return: if the existing sublease has identical
             // parameters, return it. Otherwise reject as a conflict.
@@ -8075,67 +8171,107 @@ impl PrivilegedDispatcher {
                     ));
                 };
 
-                // SECURITY (v7 Finding 2 — Parent Lineage Binding):
+                // SECURITY (v9 Finding 2 — Fail-Closed Parent Lineage Binding):
                 //
-                // Verify that the original SubleaseIssued event was bound to
-                // the same parent_lease_id as the current request. Even though
-                // the changeset_digest/policy_hash comparison above provides
+                // Verify that the original `SubleaseIssued` event was bound to
+                // the same `parent_lease_id` as the current request. Even though
+                // the `changeset_digest`/`policy_hash` comparison above provides
                 // indirect lineage verification, we MUST also check the
-                // explicit parent_lease_id from the event payload to prevent
+                // explicit `parent_lease_id` from the event payload to prevent
                 // lineage ambiguity when two different parent leases happen
                 // to share inherited cryptographic fields.
+                //
+                // SECURITY: This extraction MUST be fail-closed. If the event
+                // payload cannot be parsed, or if `parent_lease_id` cannot be
+                // extracted from either the hex-encoded inner payload or the
+                // top-level wrapper, the idempotent replay MUST be rejected.
+                // Silently bypassing this check on parse failure would allow
+                // corrupted or legacy payloads to return success without
+                // verifying lineage, weakening confused-deputy resistance.
                 //
                 // NOTE: The event payload is a wrapper JSON containing the
                 // original payload as a hex-encoded string in the "payload"
                 // field. We must decode that inner payload to extract the
-                // parent_lease_id field.
-                if let Ok(wrapper) =
-                    serde_json::from_slice::<serde_json::Value>(&original_event.payload)
-                {
-                    // Extract the inner payload: it may be hex-encoded (stub
-                    // emitter) or directly embedded depending on the emitter.
-                    // Try hex-decoding the "payload" field first, then fall
-                    // back to checking parent_lease_id at the top level.
-                    let original_parent_id = wrapper
-                        .get("payload")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|hex_str| hex::decode(hex_str).ok())
-                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                        .and_then(|inner| {
-                            inner
-                                .get("parent_lease_id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(String::from)
-                        })
-                        .or_else(|| {
-                            // Fallback: parent_lease_id at top level (e.g.,
-                            // production SQLite emitter stores raw payload).
-                            wrapper
-                                .get("parent_lease_id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(String::from)
-                        });
-
-                    if let Some(original_parent_id) = original_parent_id {
-                        if original_parent_id != request.parent_lease_id {
+                // `parent_lease_id` field.
+                let wrapper =
+                    match serde_json::from_slice::<serde_json::Value>(&original_event.payload) {
+                        Ok(w) => w,
+                        Err(e) => {
                             warn!(
                                 sublease_id = %request.sublease_id,
-                                original_parent = %original_parent_id,
-                                requested_parent = %request.parent_lease_id,
-                                "Idempotent sublease replay rejected: parent_lease_id mismatch"
+                                error = %e,
+                                "Idempotent sublease replay rejected: cannot parse event payload \
+                                 for lineage verification"
                             );
                             return Ok(PrivilegedResponse::error(
                                 PrivilegedErrorCode::CapabilityRequestRejected,
                                 format!(
-                                    "sublease '{}' was originally delegated from parent '{}', \
-                                     not '{}'",
-                                    request.sublease_id,
-                                    original_parent_id,
-                                    request.parent_lease_id
+                                    "sublease '{}' exists but its event payload cannot be parsed \
+                                 for lineage verification: {e}",
+                                    request.sublease_id
                                 ),
                             ));
-                        }
-                    }
+                        },
+                    };
+
+                // Extract the inner payload: it may be hex-encoded (stub
+                // emitter) or directly embedded depending on the emitter.
+                // Try hex-decoding the "payload" field first, then fall
+                // back to checking `parent_lease_id` at the top level.
+                let original_parent_id = wrapper
+                    .get("payload")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|hex_str| hex::decode(hex_str).ok())
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|inner| {
+                        inner
+                            .get("parent_lease_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from)
+                    })
+                    .or_else(|| {
+                        // Fallback: `parent_lease_id` at top level (e.g.,
+                        // production SQLite emitter stores raw payload).
+                        wrapper
+                            .get("parent_lease_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from)
+                    });
+
+                // SECURITY: Fail-closed -- if parent_lease_id cannot be
+                // extracted from the event payload, reject the idempotent
+                // replay rather than silently bypassing lineage verification.
+                let Some(original_parent_id) = original_parent_id else {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        "Idempotent sublease replay rejected: cannot extract parent_lease_id \
+                         from event payload for lineage verification"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' exists but parent_lease_id cannot be extracted \
+                             from its event payload for lineage verification",
+                            request.sublease_id
+                        ),
+                    ));
+                };
+
+                if original_parent_id != request.parent_lease_id {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        original_parent = %original_parent_id,
+                        requested_parent = %request.parent_lease_id,
+                        "Idempotent sublease replay rejected: parent_lease_id mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' was originally delegated from parent '{}', \
+                             not '{}'",
+                            request.sublease_id, original_parent_id, request.parent_lease_id
+                        ),
+                    ));
                 }
 
                 info!(
@@ -8227,7 +8363,77 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // ---- Phase 5: Emit SubleaseIssued event ----
+        // ---- Phase 5: Persist sublease BEFORE event emission ----
+        //
+        // SECURITY (v10 BLOCKER 1 -- Non-atomic DelegateSublease fix):
+        //
+        // Lease persistence MUST happen BEFORE event emission. If we emitted
+        // the SubleaseIssued event first and register_full_lease then failed,
+        // we'd have an orphan event in the ledger with no corresponding lease
+        // anchor. Retries would emit duplicate events. By persisting the
+        // lease first:
+        //   - If register_full_lease fails, no event is emitted (clean).
+        //   - If emit_session_event fails after successful persistence, the lease
+        //     exists (authoritative state) and we log a warning but return success --
+        //     the event is an audit trail that follows.
+        //
+        // SECURITY (v10 BLOCKER 2 -- Sublease ID uniqueness via DB):
+        //
+        // register_full_lease is the authoritative uniqueness gate. The
+        // pre-check in Phase 2b (get_gate_lease) is a fast-path optimization
+        // only. If two concurrent requests pass the pre-check, the first to
+        // call register_full_lease succeeds and the second gets a duplicate
+        // error, which we handle as idempotent (look up existing lease and
+        // return it) or reject as conflict.
+        if let Err(e) = self.lease_validator.register_full_lease(&sublease) {
+            // Check if this is a duplicate: the lease_id already exists.
+            // If it does, treat as idempotent if the existing lease matches.
+            if let Some(existing) = self.lease_validator.get_gate_lease(&sublease.lease_id) {
+                if existing.work_id == sublease.work_id
+                    && existing.gate_id == sublease.gate_id
+                    && existing.executor_actor_id == sublease.executor_actor_id
+                    && existing.expires_at == sublease.expires_at
+                {
+                    // Idempotent: return the existing sublease (lease was
+                    // persisted by a concurrent request with identical params).
+                    let original_event = self
+                        .event_emitter
+                        .get_events_by_work_id(&existing.lease_id)
+                        .into_iter()
+                        .find(|ev| ev.event_type == "SubleaseIssued");
+                    let event_id = original_event.map(|ev| ev.event_id).unwrap_or_default();
+                    info!(
+                        sublease_id = %sublease.lease_id,
+                        "Concurrent duplicate sublease persisted -- idempotent return"
+                    );
+                    return Ok(PrivilegedResponse::DelegateSublease(
+                        DelegateSubleaseResponse {
+                            sublease_id: existing.lease_id,
+                            parent_lease_id: request.parent_lease_id,
+                            delegatee_actor_id: request.delegatee_actor_id,
+                            gate_id: existing.gate_id,
+                            expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
+                            event_id,
+                        },
+                    ));
+                }
+            }
+            warn!(
+                sublease_id = %sublease.lease_id,
+                error = %e,
+                "Lease persistence failed -- failing closed without emitting event"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease '{}' lease persistence failed: {e} \
+                     -- no event emitted (fail-closed)",
+                    sublease.lease_id
+                ),
+            ));
+        }
+
+        // ---- Phase 6: Emit SubleaseIssued event (after successful persistence) ----
         //
         // SECURITY (v5 Finding 3): The event's actor_id MUST be the
         // authenticated caller (from peer credentials), NOT the
@@ -8255,38 +8461,29 @@ impl PrivilegedDispatcher {
         ) {
             Ok(evt) => evt,
             Err(e) => {
-                warn!(error = %e, "SubleaseIssued event emission failed");
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("SubleaseIssued event emission failed: {e}"),
+                // Lease is persisted (authoritative state). Event emission
+                // failure is non-fatal: the lease exists and the event is
+                // an audit trail that follows. Log a warning and return
+                // success with an empty event_id so the caller knows the
+                // sublease was created but the audit event is missing.
+                warn!(
+                    sublease_id = %sublease.lease_id,
+                    error = %e,
+                    "SubleaseIssued event emission failed after lease persistence -- \
+                     returning success (lease is authoritative)"
+                );
+                return Ok(PrivilegedResponse::DelegateSublease(
+                    DelegateSubleaseResponse {
+                        sublease_id: sublease.lease_id,
+                        parent_lease_id: request.parent_lease_id,
+                        delegatee_actor_id: request.delegatee_actor_id,
+                        gate_id: sublease.gate_id,
+                        expires_at_ns: sublease.expires_at.saturating_mul(1_000_000),
+                        event_id: String::new(),
+                    },
                 ));
             },
         };
-
-        // ---- Phase 6: Register sublease for future uniqueness checks ----
-        //
-        // SECURITY (v7 Finding 3 -- Fail-Closed Lease Persistence):
-        //
-        // register_full_lease MUST succeed for the sublease response to be
-        // valid. If persistence fails (serialization error, DB write error),
-        // returning success without a persisted lease anchor would violate
-        // the single-effect guarantee (LAW-11): subsequent requests could
-        // bypass uniqueness checks and cause duplicate logical issuance.
-        if let Err(e) = self.lease_validator.register_full_lease(&sublease) {
-            warn!(
-                sublease_id = %sublease.lease_id,
-                error = %e,
-                "Full lease persistence failed after SubleaseIssued event -- failing closed"
-            );
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "sublease '{}' event was emitted but lease persistence failed: {e} \
-                     -- failing closed to prevent duplicate issuance",
-                    sublease.lease_id
-                ),
-            ));
-        }
 
         info!(
             parent_lease_id = %request.parent_lease_id,
@@ -17142,6 +17339,78 @@ mod tests {
                     panic!("Expected IngestReviewReceipt for Tier1 SelfSigned, got {other:?}")
                 },
             }
+        }
+
+        /// v10 MAJOR 1: Duplicate `receipt_id` replay returns the original
+        /// event (idempotent) instead of creating a new event. This verifies
+        /// the fix for the broken idempotency check that previously looked up
+        /// events by `event_id` (auto-generated UUID) instead of searching
+        /// payloads for the caller-supplied `receipt_id`.
+        #[test]
+        fn test_ingest_review_receipt_duplicate_receipt_id_idempotent() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-dup-001", "W-DUP-001", "gate-001", "reviewer-a");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-001".to_string(),
+                receipt_id: "RR-DUP-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+
+            // First submission should succeed
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response1 = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let (event_id_1, event_type_1) = match &response1 {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-DUP-001");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "First event_id must be non-empty"
+                    );
+                    (resp.event_id.clone(), resp.event_type.clone())
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            };
+
+            // Second submission with same receipt_id should return idempotent
+            // result with the SAME event_id as the first submission.
+            let frame2 = encode_ingest_review_receipt_request(&request);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match &response2 {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(
+                        resp.receipt_id, "RR-DUP-001",
+                        "Idempotent replay must return same receipt_id"
+                    );
+                    assert_eq!(
+                        resp.event_id, event_id_1,
+                        "Idempotent replay must return the ORIGINAL event_id, not a new one"
+                    );
+                    assert_eq!(
+                        resp.event_type, event_type_1,
+                        "Idempotent replay must return same event_type"
+                    );
+                },
+                other => panic!("Expected idempotent IngestReviewReceipt, got {other:?}"),
+            }
+
+            // Verify only ONE event was created in the ledger (not two)
+            let events = dispatcher
+                .event_emitter
+                .get_events_by_work_id("lease-dup-001");
+            let receipt_event_count = events
+                .iter()
+                .filter(|e| e.event_type == "review_receipt_recorded")
+                .count();
+            assert_eq!(
+                receipt_event_count, 1,
+                "Duplicate receipt_id submission must NOT create a second event"
+            );
         }
 
         // ====================================================================

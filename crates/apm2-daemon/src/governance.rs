@@ -31,11 +31,19 @@
 //! daemon's IPC endpoints can produce without breaking throughput.
 //!
 //! **Scope**: Single-daemon, single-node operation only. All agents operate
-//! within the daemon's trust boundary in Phase 1.
+//! within the daemon's trust boundary in Phase 1. The deployment guardrail
+//! is architectural: no cross-node federation or multi-tenant IPC transport
+//! exists in Phase 1 -- the daemon only listens on local Unix sockets,
+//! which confines the trust boundary to the local machine.
 //!
 //! **Expiry**: This mapping expires when RFC-0019 governance resolution is
 //! implemented, which will derive risk tiers from changeset metadata (file
 //! paths, module criticality, dependency fanout).
+//!
+//! **Waiver**: TCK-00340 v9 MAJOR — Role-based tier mapping is a tracked
+//! transitional measure. The waiver scope is bounded to Phase 1 single-node
+//! operation and MUST NOT be carried forward into multi-tenant or cross-node
+//! federation without full RFC-0019 governance resolution.
 
 use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
 use tracing::warn;
@@ -169,6 +177,14 @@ impl PolicyResolver for GovernancePolicyResolver {
 /// requirement. This is acceptable for Phase 1 where all agents operate
 /// within the daemon's trust boundary, but MUST be addressed before
 /// multi-tenant or cross-node federation.
+///
+/// # Deployment Guardrail (v9 MAJOR Mitigation)
+///
+/// The architectural guardrail is the transport layer: the daemon listens
+/// only on local Unix sockets (`UnixListener`) with no TCP/network
+/// federation transport. This confines all IPC to the local trust
+/// boundary. The introduction of any cross-node transport MUST trigger
+/// replacement of this function with RFC-0019 governance resolution.
 ///
 /// # TODO(RFC-0019) — v7 Finding 3
 ///
