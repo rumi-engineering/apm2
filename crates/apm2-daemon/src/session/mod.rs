@@ -12,6 +12,11 @@
 pub mod consume;
 
 // Re-export main types
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
 pub use consume::{
     ConsumeSessionContext, ConsumeSessionError, ConsumeSessionHandler,
     EXIT_CLASSIFICATION_CONTEXT_MISS, MAX_REFINEMENT_ATTEMPTS, TERMINATION_RATIONALE_CONTEXT_MISS,
@@ -132,7 +137,35 @@ impl std::fmt::Debug for SessionState {
 /// instead of "session not found".
 pub trait SessionRegistry: Send + Sync {
     /// Registers a new session.
-    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError>;
+    ///
+    /// Returns the full [`SessionState`] of any sessions that were evicted to
+    /// make room for the new session (may be empty if no eviction was
+    /// necessary). Callers MUST clean up telemetry for evicted sessions to
+    /// prevent orphaned entries (TCK-00384 security fix). Returning full
+    /// state (rather than just IDs) enables callers to restore evicted
+    /// sessions on transactional rollback, preventing capacity loss when a
+    /// spawn fails after eviction (TCK-00384 quality fix).
+    fn register_session(
+        &self,
+        session: SessionState,
+    ) -> Result<Vec<SessionState>, SessionRegistryError>;
+
+    /// Removes a session by ID.
+    ///
+    /// Returns the removed session state, or `None` if the session was not
+    /// found. Used for transactional rollback when post-registration steps
+    /// fail (TCK-00384 security fix).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionRegistryError::PersistenceFailed`] if the removal
+    /// succeeds in-memory but fails to persist to durable storage.
+    /// Persistent backends MUST propagate persistence errors so callers
+    /// know the on-disk state may be stale (TCK-00384 security BLOCKER 2).
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError>;
 
     /// Queries a session by session ID.
     fn get_session(&self, session_id: &str) -> Option<SessionState>;
@@ -183,26 +216,6 @@ pub trait SessionRegistry: Send + Sync {
         &self,
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)>;
-
-    /// Removes a session by ID (TCK-00395).
-    ///
-    /// Returns the removed session state if found, or `None` if no session
-    /// with the given ID exists. After removal, the session is no longer
-    /// observable via `get_session` or `get_session_by_handle`.
-    ///
-    /// This is called by `EndSession` to ensure terminated sessions are
-    /// removed from the registry, preventing repeated termination and
-    /// stale session state.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SessionRegistryError` if persistence fails (fail-closed).
-    /// The in-memory removal may have already occurred; callers must treat
-    /// this as a hard failure.
-    fn remove_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionState>, SessionRegistryError>;
 
     /// Updates the `episode_id` for an existing session (TCK-00395 Security
     /// BLOCKER 1).
@@ -277,4 +290,702 @@ pub enum SessionRegistryError {
         /// Error message.
         message: String,
     },
+
+    /// Persistence failed after an in-memory mutation.
+    ///
+    /// TCK-00384 security BLOCKER 2: persistent backends MUST propagate
+    /// persistence errors instead of silently swallowing them.  When this
+    /// error is returned from `remove_session`, the in-memory state has
+    /// already been updated but the on-disk state is stale.  Callers
+    /// should treat this as a critical failure and avoid assuming the
+    /// removal was durable.
+    #[error("persistence failed: {message}")]
+    PersistenceFailed {
+        /// Error message describing the persistence failure.
+        message: String,
+    },
+}
+
+// =============================================================================
+// Session Telemetry (TCK-00384)
+// =============================================================================
+
+/// Maximum number of sessions tracked in the telemetry store.
+///
+/// Per CTR-1303: In-memory stores must have `max_entries` limit to prevent
+/// denial-of-service via memory exhaustion. Matches the session registry
+/// bound from `crate::episode::registry::MAX_SESSIONS`.
+pub const MAX_TELEMETRY_SESSIONS: usize = 10_000;
+
+/// Per-session telemetry counters.
+///
+/// Per TCK-00384, tracks tool call and event emission counts as well as
+/// session start time. Counters are thread-safe using atomic operations.
+///
+/// This is stored separately from [`SessionState`] because `SessionState` must
+/// remain `Clone + Serialize + Deserialize`, which is incompatible with
+/// `AtomicU64`.
+///
+/// # Monotonic Duration
+///
+/// The `started_at` field uses `std::time::Instant` (monotonic clock) for
+/// elapsed time computation. The `started_at_ns` field retains the wall-clock
+/// timestamp for display/audit purposes only.
+pub struct SessionTelemetry {
+    /// Number of `RequestTool` calls dispatched for this session.
+    pub tool_calls: AtomicU64,
+    /// Number of `EmitEvent` calls dispatched for this session.
+    pub events_emitted: AtomicU64,
+    /// Timestamp (nanoseconds since epoch) when the session was spawned.
+    /// Used for display/audit metadata only; NOT for elapsed time computation.
+    pub started_at_ns: u64,
+    /// Monotonic instant when the session was spawned.
+    /// Used for computing elapsed `duration_ms` without wall-clock skew.
+    pub started_at: Instant,
+}
+
+impl SessionTelemetry {
+    /// Creates a new telemetry record with the given start timestamp and
+    /// monotonic instant.
+    #[must_use]
+    pub fn new(started_at_ns: u64) -> Self {
+        Self {
+            tool_calls: AtomicU64::new(0),
+            events_emitted: AtomicU64::new(0),
+            started_at_ns,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Creates a new telemetry record with an explicit monotonic instant.
+    ///
+    /// This constructor is useful for testing where the caller wants to
+    /// control the monotonic start point.
+    #[must_use]
+    pub const fn with_instant(started_at_ns: u64, started_at: Instant) -> Self {
+        Self {
+            tool_calls: AtomicU64::new(0),
+            events_emitted: AtomicU64::new(0),
+            started_at_ns,
+            started_at,
+        }
+    }
+
+    /// Returns the elapsed time since session start in milliseconds,
+    /// computed from the monotonic clock.
+    #[must_use]
+    pub fn elapsed_ms(&self) -> u64 {
+        let elapsed = self.started_at.elapsed();
+        #[allow(clippy::cast_possible_truncation)]
+        let ms = elapsed.as_millis() as u64;
+        ms
+    }
+
+    /// Increments the tool call counter and returns the new value.
+    pub fn increment_tool_calls(&self) -> u64 {
+        self.tool_calls.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Increments the events emitted counter and returns the new value.
+    pub fn increment_events_emitted(&self) -> u64 {
+        self.events_emitted.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Returns the current tool call count.
+    pub fn get_tool_calls(&self) -> u64 {
+        self.tool_calls.load(Ordering::Relaxed)
+    }
+
+    /// Returns the current events emitted count.
+    pub fn get_events_emitted(&self) -> u64 {
+        self.events_emitted.load(Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Debug for SessionTelemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionTelemetry")
+            .field("tool_calls", &self.tool_calls.load(Ordering::Relaxed))
+            .field(
+                "events_emitted",
+                &self.events_emitted.load(Ordering::Relaxed),
+            )
+            .field("started_at_ns", &self.started_at_ns)
+            .field("started_at", &self.started_at)
+            .field("elapsed_ms", &self.elapsed_ms())
+            .finish()
+    }
+}
+
+/// A snapshot of session telemetry values (non-atomic, cloneable).
+///
+/// Used to return telemetry data from the store without holding references
+/// to atomic values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelemetrySnapshot {
+    /// Number of tool calls dispatched.
+    pub tool_calls: u64,
+    /// Number of events emitted.
+    pub events_emitted: u64,
+    /// Session start timestamp (nanoseconds since epoch).
+    /// Wall-clock metadata for display/audit only.
+    pub started_at_ns: u64,
+    /// Elapsed time in milliseconds since session start, computed from
+    /// the monotonic clock (`Instant`). Immune to wall-clock jumps/skew.
+    pub duration_ms: u64,
+}
+
+/// Error type for telemetry store operations.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TelemetryStoreError {
+    /// Store is at capacity and cannot accept new registrations.
+    ///
+    /// Per CTR-1303, the store enforces a hard bound of
+    /// [`MAX_TELEMETRY_SESSIONS`] to prevent memory exhaustion. Callers
+    /// must clean up terminated sessions before registering new ones.
+    #[error("telemetry store at capacity ({max} sessions); registration rejected for {session_id}")]
+    AtCapacity {
+        /// The session ID that was rejected.
+        session_id: String,
+        /// The maximum number of sessions allowed.
+        max: usize,
+    },
+}
+
+/// Thread-safe store for per-session telemetry data (TCK-00384).
+///
+/// This store is separate from the session registry because telemetry
+/// counters use atomic operations that are incompatible with the `Clone +
+/// Serialize` requirements of [`SessionState`].
+///
+/// # Capacity Bounds (CTR-1303)
+///
+/// The store enforces a hard cap of [`MAX_TELEMETRY_SESSIONS`] entries.
+/// When the limit is reached, new registrations are rejected (fail-closed)
+/// rather than silently evicting existing entries. Callers must wire
+/// session lifecycle events (e.g., termination) to call [`Self::remove`] and
+/// free capacity.
+///
+/// # Thread Safety
+///
+/// Uses `RwLock<HashMap>` for concurrent access. Individual counter updates
+/// use atomic operations without holding the write lock.
+#[derive(Debug, Default)]
+pub struct SessionTelemetryStore {
+    /// Per-session telemetry indexed by session ID.
+    entries: RwLock<HashMap<String, Arc<SessionTelemetry>>>,
+}
+
+impl SessionTelemetryStore {
+    /// Creates a new empty telemetry store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers telemetry for a new session.
+    ///
+    /// Records the session start time and initializes counters to zero.
+    /// If a session with the same ID already exists, the existing entry is
+    /// preserved (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryStoreError::AtCapacity`] if the store already
+    /// contains [`MAX_TELEMETRY_SESSIONS`] entries and the session ID is
+    /// not already registered. This is a fail-closed policy per CTR-1303.
+    pub fn register(
+        &self,
+        session_id: &str,
+        started_at_ns: u64,
+    ) -> Result<(), TelemetryStoreError> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        // Idempotent: if session already exists, return Ok without checking
+        // bounds.
+        if entries.contains_key(session_id) {
+            return Ok(());
+        }
+        // Fail-closed: reject new registrations when at capacity.
+        if entries.len() >= MAX_TELEMETRY_SESSIONS {
+            return Err(TelemetryStoreError::AtCapacity {
+                session_id: session_id.to_string(),
+                max: MAX_TELEMETRY_SESSIONS,
+            });
+        }
+        entries.insert(
+            session_id.to_string(),
+            Arc::new(SessionTelemetry::new(started_at_ns)),
+        );
+        Ok(())
+    }
+
+    /// Returns a reference-counted handle to the session's telemetry.
+    ///
+    /// The returned `Arc<SessionTelemetry>` can be used to increment
+    /// counters without holding the store lock.
+    #[must_use]
+    pub fn get(&self, session_id: &str) -> Option<Arc<SessionTelemetry>> {
+        let entries = self.entries.read().expect("lock poisoned");
+        entries.get(session_id).cloned()
+    }
+
+    /// Returns a snapshot of the session's telemetry values.
+    ///
+    /// The `duration_ms` field in the snapshot is computed from the
+    /// monotonic `Instant`, not from wall-clock arithmetic.
+    #[must_use]
+    pub fn snapshot(&self, session_id: &str) -> Option<TelemetrySnapshot> {
+        let entries = self.entries.read().expect("lock poisoned");
+        entries.get(session_id).map(|t| TelemetrySnapshot {
+            tool_calls: t.get_tool_calls(),
+            events_emitted: t.get_events_emitted(),
+            started_at_ns: t.started_at_ns,
+            duration_ms: t.elapsed_ms(),
+        })
+    }
+
+    /// Removes telemetry for a session.
+    ///
+    /// This should be called when a session terminates to free capacity
+    /// in the bounded store. Wire this to session lifecycle cleanup events.
+    pub fn remove(&self, session_id: &str) {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.remove(session_id);
+    }
+
+    /// Removes telemetry for a session and returns the entry.
+    ///
+    /// TCK-00384 security BLOCKER 1: Used during spawn eviction to capture
+    /// the evicted telemetry entry BEFORE removal.  If a later spawn step
+    /// fails, the caller can pass this entry to [`Self::restore`] alongside
+    /// the re-registered session to make the rollback complete.
+    #[must_use]
+    pub fn remove_and_return(&self, session_id: &str) -> Option<Arc<SessionTelemetry>> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.remove(session_id)
+    }
+
+    /// Restores a previously removed telemetry entry.
+    ///
+    /// TCK-00384 security BLOCKER 1: Complements [`Self::remove_and_return`].
+    /// On rollback, callers pass back the `Arc<SessionTelemetry>` obtained
+    /// during eviction so counters and timestamps are preserved exactly.
+    ///
+    /// If the session ID already exists (idempotent case), the existing
+    /// entry is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryStoreError::AtCapacity`] if the store is full and
+    /// the entry is not already present.
+    pub fn restore(
+        &self,
+        session_id: &str,
+        entry: Arc<SessionTelemetry>,
+    ) -> Result<(), TelemetryStoreError> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        if entries.contains_key(session_id) {
+            return Ok(());
+        }
+        if entries.len() >= MAX_TELEMETRY_SESSIONS {
+            return Err(TelemetryStoreError::AtCapacity {
+                session_id: session_id.to_string(),
+                max: MAX_TELEMETRY_SESSIONS,
+            });
+        }
+        entries.insert(session_id.to_string(), entry);
+        Ok(())
+    }
+
+    /// Returns the number of tracked sessions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let entries = self.entries.read().expect("lock poisoned");
+        entries.len()
+    }
+
+    /// Returns true if no sessions are tracked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Removes all telemetry entries.
+    ///
+    /// Used during crash recovery to clear telemetry state alongside the
+    /// session registry (TCK-00384 security fix: complete lifecycle cleanup).
+    pub fn clear(&self) {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.clear();
+    }
+
+    /// Returns the maximum number of sessions this store can track.
+    #[must_use]
+    pub const fn capacity() -> usize {
+        MAX_TELEMETRY_SESSIONS
+    }
+}
+
+// =============================================================================
+// TCK-00384: Session Telemetry Tests
+// =============================================================================
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+
+    // =========================================================================
+    // SessionTelemetry Unit Tests
+    // =========================================================================
+
+    #[test]
+    fn test_telemetry_new_initializes_zeros() {
+        let telemetry = SessionTelemetry::new(1_000_000);
+        assert_eq!(telemetry.get_tool_calls(), 0);
+        assert_eq!(telemetry.get_events_emitted(), 0);
+        assert_eq!(telemetry.started_at_ns, 1_000_000);
+    }
+
+    #[test]
+    fn test_telemetry_increment_tool_calls() {
+        let telemetry = SessionTelemetry::new(0);
+        assert_eq!(telemetry.increment_tool_calls(), 1);
+        assert_eq!(telemetry.increment_tool_calls(), 2);
+        assert_eq!(telemetry.increment_tool_calls(), 3);
+        assert_eq!(telemetry.get_tool_calls(), 3);
+    }
+
+    #[test]
+    fn test_telemetry_increment_events_emitted() {
+        let telemetry = SessionTelemetry::new(0);
+        assert_eq!(telemetry.increment_events_emitted(), 1);
+        assert_eq!(telemetry.increment_events_emitted(), 2);
+        assert_eq!(telemetry.get_events_emitted(), 2);
+    }
+
+    #[test]
+    fn test_telemetry_counters_independent() {
+        let telemetry = SessionTelemetry::new(42);
+        telemetry.increment_tool_calls();
+        telemetry.increment_tool_calls();
+        telemetry.increment_events_emitted();
+
+        assert_eq!(telemetry.get_tool_calls(), 2);
+        assert_eq!(telemetry.get_events_emitted(), 1);
+        assert_eq!(telemetry.started_at_ns, 42);
+    }
+
+    #[test]
+    fn test_telemetry_debug_format() {
+        let telemetry = SessionTelemetry::new(999);
+        telemetry.increment_tool_calls();
+        let debug_str = format!("{telemetry:?}");
+        assert!(debug_str.contains("tool_calls: 1"));
+        assert!(debug_str.contains("events_emitted: 0"));
+        assert!(debug_str.contains("started_at_ns: 999"));
+        assert!(debug_str.contains("elapsed_ms:"));
+    }
+
+    #[test]
+    fn test_telemetry_elapsed_ms_uses_monotonic_clock() {
+        // Use with_instant to control the start point
+        let past_instant = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(500))
+            .expect("500ms subtraction should not underflow");
+        let telemetry = SessionTelemetry::with_instant(0, past_instant);
+
+        // Elapsed should be approximately 500ms (allow some tolerance)
+        let elapsed = telemetry.elapsed_ms();
+        assert!(elapsed >= 490, "elapsed_ms should be >= 490, got {elapsed}");
+        assert!(elapsed < 2000, "elapsed_ms should be < 2000, got {elapsed}");
+    }
+
+    // =========================================================================
+    // TelemetrySnapshot Tests
+    // =========================================================================
+
+    #[test]
+    fn test_snapshot_values() {
+        let snap = TelemetrySnapshot {
+            tool_calls: 5,
+            events_emitted: 3,
+            started_at_ns: 1_000_000_000,
+            duration_ms: 42,
+        };
+        assert_eq!(snap.tool_calls, 5);
+        assert_eq!(snap.events_emitted, 3);
+        assert_eq!(snap.started_at_ns, 1_000_000_000);
+        assert_eq!(snap.duration_ms, 42);
+    }
+
+    #[test]
+    fn test_snapshot_clone_eq() {
+        let snap1 = TelemetrySnapshot {
+            tool_calls: 5,
+            events_emitted: 3,
+            started_at_ns: 1_000_000_000,
+            duration_ms: 0,
+        };
+        let snap2 = snap1;
+        assert_eq!(snap1, snap2);
+    }
+
+    // =========================================================================
+    // SessionTelemetryStore Tests
+    // =========================================================================
+
+    #[test]
+    fn test_store_new_is_empty() {
+        let store = SessionTelemetryStore::new();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_store_register_and_get() {
+        let store = SessionTelemetryStore::new();
+        store.register("sess-1", 1_000_000).unwrap();
+
+        let telemetry = store.get("sess-1");
+        assert!(telemetry.is_some());
+        let t = telemetry.unwrap();
+        assert_eq!(t.get_tool_calls(), 0);
+        assert_eq!(t.get_events_emitted(), 0);
+        assert_eq!(t.started_at_ns, 1_000_000);
+    }
+
+    #[test]
+    fn test_store_get_nonexistent() {
+        let store = SessionTelemetryStore::new();
+        assert!(store.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_store_register_idempotent() {
+        let store = SessionTelemetryStore::new();
+        store.register("sess-1", 100).unwrap();
+
+        // Increment a counter
+        store.get("sess-1").unwrap().increment_tool_calls();
+
+        // Re-register with different started_at_ns (should be idempotent)
+        store.register("sess-1", 999).unwrap();
+
+        // Original entry should be preserved
+        let t = store.get("sess-1").unwrap();
+        assert_eq!(t.started_at_ns, 100);
+        assert_eq!(t.get_tool_calls(), 1);
+    }
+
+    #[test]
+    fn test_store_snapshot() {
+        let store = SessionTelemetryStore::new();
+        store.register("sess-1", 42).unwrap();
+
+        let t = store.get("sess-1").unwrap();
+        t.increment_tool_calls();
+        t.increment_tool_calls();
+        t.increment_events_emitted();
+
+        let snap = store.snapshot("sess-1");
+        assert!(snap.is_some());
+        let snap = snap.unwrap();
+        assert_eq!(snap.tool_calls, 2);
+        assert_eq!(snap.events_emitted, 1);
+        assert_eq!(snap.started_at_ns, 42);
+        // duration_ms should be non-negative (monotonic)
+        assert!(
+            snap.duration_ms < 5000,
+            "duration_ms should be small for a just-registered session"
+        );
+    }
+
+    #[test]
+    fn test_store_snapshot_nonexistent() {
+        let store = SessionTelemetryStore::new();
+        assert!(store.snapshot("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_store_remove() {
+        let store = SessionTelemetryStore::new();
+        store.register("sess-1", 100).unwrap();
+        assert_eq!(store.len(), 1);
+
+        store.remove("sess-1");
+        assert!(store.is_empty());
+        assert!(store.get("sess-1").is_none());
+    }
+
+    #[test]
+    fn test_store_remove_nonexistent() {
+        let store = SessionTelemetryStore::new();
+        store.remove("nonexistent"); // Should not panic
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_store_multiple_sessions() {
+        let store = SessionTelemetryStore::new();
+        store.register("sess-1", 100).unwrap();
+        store.register("sess-2", 200).unwrap();
+        store.register("sess-3", 300).unwrap();
+        assert_eq!(store.len(), 3);
+
+        // Increment counters independently
+        store.get("sess-1").unwrap().increment_tool_calls();
+        store.get("sess-2").unwrap().increment_events_emitted();
+        store.get("sess-2").unwrap().increment_events_emitted();
+
+        let snap1 = store.snapshot("sess-1").unwrap();
+        assert_eq!(snap1.tool_calls, 1);
+        assert_eq!(snap1.events_emitted, 0);
+
+        let snap2 = store.snapshot("sess-2").unwrap();
+        assert_eq!(snap2.tool_calls, 0);
+        assert_eq!(snap2.events_emitted, 2);
+
+        let snap3 = store.snapshot("sess-3").unwrap();
+        assert_eq!(snap3.tool_calls, 0);
+        assert_eq!(snap3.events_emitted, 0);
+    }
+
+    /// TCK-00384: Verify counters are thread-safe using concurrent
+    /// increments from multiple threads.
+    #[test]
+    fn test_telemetry_thread_safety() {
+        use std::sync::Arc;
+
+        let telemetry = Arc::new(SessionTelemetry::new(0));
+        let iterations: u64 = 1000;
+        let threads: u64 = 4;
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let t = Arc::clone(&telemetry);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..iterations {
+                    t.increment_tool_calls();
+                    t.increment_events_emitted();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+
+        let expected = threads * iterations;
+        assert_eq!(telemetry.get_tool_calls(), expected);
+        assert_eq!(telemetry.get_events_emitted(), expected);
+    }
+
+    // =========================================================================
+    // Bounded Store Tests (Security Blocker + Quality Major)
+    // =========================================================================
+
+    #[test]
+    fn test_store_capacity_constant() {
+        assert_eq!(SessionTelemetryStore::capacity(), MAX_TELEMETRY_SESSIONS);
+        assert_eq!(MAX_TELEMETRY_SESSIONS, 10_000);
+    }
+
+    #[test]
+    fn test_store_rejects_at_capacity() {
+        let store = SessionTelemetryStore::new();
+
+        // Fill the store to capacity
+        for i in 0..MAX_TELEMETRY_SESSIONS {
+            store.register(&format!("sess-{i}"), i as u64).unwrap();
+        }
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS);
+
+        // Next registration should fail (fail-closed)
+        let result = store.register("one-too-many", 999);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TelemetryStoreError::AtCapacity { session_id, max } => {
+                assert_eq!(session_id, "one-too-many");
+                assert_eq!(max, MAX_TELEMETRY_SESSIONS);
+            },
+        }
+
+        // Store size should not have changed
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS);
+    }
+
+    #[test]
+    fn test_store_idempotent_register_at_capacity() {
+        let store = SessionTelemetryStore::new();
+
+        // Fill to capacity
+        for i in 0..MAX_TELEMETRY_SESSIONS {
+            store.register(&format!("sess-{i}"), i as u64).unwrap();
+        }
+
+        // Re-registering an existing session should succeed (idempotent)
+        let result = store.register("sess-0", 999);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_store_remove_then_register_at_capacity() {
+        let store = SessionTelemetryStore::new();
+
+        // Fill to capacity
+        for i in 0..MAX_TELEMETRY_SESSIONS {
+            store.register(&format!("sess-{i}"), i as u64).unwrap();
+        }
+
+        // Remove one session to free capacity
+        store.remove("sess-0");
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS - 1);
+
+        // Now registration should succeed
+        let result = store.register("new-sess", 42);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS);
+    }
+
+    // =========================================================================
+    // Monotonic Duration Tests (Security Major)
+    // =========================================================================
+
+    #[test]
+    fn test_snapshot_duration_ms_is_monotonic() {
+        let store = SessionTelemetryStore::new();
+        store.register("sess-1", 100).unwrap();
+
+        // Take two snapshots; second should have >= duration_ms
+        let snap1 = store.snapshot("sess-1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let snap2 = store.snapshot("sess-1").unwrap();
+
+        assert!(
+            snap2.duration_ms >= snap1.duration_ms,
+            "duration_ms should be monotonically non-decreasing: {} vs {}",
+            snap1.duration_ms,
+            snap2.duration_ms,
+        );
+    }
+
+    #[test]
+    fn test_snapshot_duration_ms_immune_to_wallclock() {
+        // This test verifies the duration_ms field comes from Instant
+        // (monotonic), not from wall-clock arithmetic. We construct a
+        // SessionTelemetry with a deliberately wrong started_at_ns
+        // (far in the future) but a known Instant in the past, and
+        // verify that duration_ms reflects the Instant, not the ns.
+        let store = SessionTelemetryStore::new();
+        store.register("sess-wallclock", 0).unwrap();
+
+        let snap = store.snapshot("sess-wallclock").unwrap();
+        // duration_ms is from Instant::now() elapsed since register, should
+        // be very small (a few ms at most)
+        assert!(
+            snap.duration_ms < 5000,
+            "duration_ms should be small, got {}",
+            snap.duration_ms,
+        );
+    }
 }

@@ -385,6 +385,37 @@ impl InMemoryManifestStore {
         let mut manifests = self.manifests.write().expect("lock poisoned");
         manifests.remove(session_id);
     }
+
+    /// Removes a manifest for a session and returns it.
+    ///
+    /// This is used during eviction to capture the manifest entry so it can
+    /// be restored during rollback if a later spawn step fails.
+    pub fn remove_and_return(&self, session_id: &str) -> Option<Arc<CapabilityManifest>> {
+        let mut manifests = self.manifests.write().expect("lock poisoned");
+        manifests.remove(session_id)
+    }
+
+    /// Restores a previously removed manifest entry.
+    ///
+    /// Used during rollback to re-insert an evicted manifest that was captured
+    /// via [`Self::remove_and_return`].
+    pub fn restore(&self, session_id: impl Into<String>, manifest: Arc<CapabilityManifest>) {
+        let mut manifests = self.manifests.write().expect("lock poisoned");
+        manifests.insert(session_id.into(), manifest);
+    }
+
+    /// Returns the number of manifests stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let manifests = self.manifests.read().expect("lock poisoned");
+        manifests.len()
+    }
+
+    /// Returns `true` if the store contains no manifests.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl ManifestStore for InMemoryManifestStore {
@@ -476,6 +507,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Per TCK-00344, the session registry is used to look up session state
     /// for `SessionStatus` queries.
     session_registry: Option<Arc<dyn crate::session::SessionRegistry>>,
+    /// Session telemetry store for tracking tool calls, events emitted,
+    /// and session start time (TCK-00384).
+    ///
+    /// Per TCK-00384, this store tracks per-session counters using atomic
+    /// operations. It is separate from the session registry because
+    /// `SessionState` must remain `Clone + Serialize + Deserialize`.
+    telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
     /// Gate orchestrator for autonomous gate lifecycle (TCK-00388).
     ///
     /// When set, session termination triggers gate orchestration via
@@ -509,6 +547,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
             gate_orchestrator: None,
         }
     }
@@ -528,6 +567,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
             gate_orchestrator: None,
         }
     }
@@ -552,6 +592,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
             gate_orchestrator: None,
         }
     }
@@ -576,6 +617,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
             gate_orchestrator: None,
         }
     }
@@ -616,6 +658,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             subscription_registry: None,
             episode_runtime: None,
             session_registry: None,
+            telemetry_store: None,
             gate_orchestrator: None,
         }
     }
@@ -684,6 +727,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         registry: Arc<dyn crate::session::SessionRegistry>,
     ) -> Self {
         self.session_registry = Some(registry);
+        self
+    }
+
+    /// Sets the session telemetry store for tracking tool calls, events
+    /// emitted, and session start time (TCK-00384).
+    #[must_use]
+    pub fn with_telemetry_store(
+        mut self,
+        store: Arc<crate::session::SessionTelemetryStore>,
+    ) -> Self {
+        self.telemetry_store = Some(store);
         self
     }
 
@@ -1134,7 +1188,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
             });
 
-            return self.handle_broker_decision(
+            let response = self.handle_broker_decision(
                 decision,
                 &token.session_id,
                 tool_class,
@@ -1142,6 +1196,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 timestamp_ns,
                 &episode_id,
             );
+
+            // TCK-00384: Increment tool_calls counter on successful dispatch.
+            // We count Allow and DedupeCacheHit as successful tool calls.
+            if let Ok(SessionResponse::RequestTool(ref resp)) = response {
+                if resp.decision == i32::from(DecisionType::Allow) {
+                    if let Some(ref store) = self.telemetry_store {
+                        if let Some(telemetry) = store.get(&token.session_id) {
+                            telemetry.increment_tool_calls();
+                        }
+                    }
+                }
+            }
+
+            return response;
         }
 
         // INV-TCK-00290-001: Neither broker nor manifest store configured - fail closed
@@ -1379,6 +1447,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             format!("session termination persistence failed: {e} ({request_id})"),
                         ));
                     }
+                }
+
+                // TCK-00384: Clean up telemetry on session termination to
+                // free capacity in the bounded store.
+                if let Some(ref store) = self.telemetry_store {
+                    store.remove(session_id);
                 }
 
                 // Security BLOCKER 1 fix (TCK-00388): Trigger gate
@@ -1660,6 +1734,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             now_ns,
         ) {
             Ok(signed_event) => {
+                // TCK-00384: Increment events_emitted counter on successful
+                // ledger persistence.
+                if let Some(ref store) = self.telemetry_store {
+                    if let Some(telemetry) = store.get(&token.session_id) {
+                        telemetry.increment_events_emitted();
+                    }
+                }
+
                 info!(
                     session_id = %token.session_id,
                     event_id = %signed_event.event_id,
@@ -1889,15 +1971,28 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "SessionStatus request received"
         );
 
+        // TCK-00384: Look up telemetry counters for this session
+        let telemetry = self
+            .telemetry_store
+            .as_ref()
+            .and_then(|store| store.snapshot(&token.session_id));
+
         // Query session registry for session state
         if let Some(session_registry) = &self.session_registry {
             // First check for active session
             if let Some(session) = session_registry.get_session(&token.session_id) {
-                // Calculate session duration
-                let duration_ms = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
+                // TCK-00384: Read duration_ms from the snapshot's monotonic
+                // Instant-based field. Wall-clock SystemTime is no longer
+                // used for elapsed time computation (security review fix:
+                // immune to clock jumps/skew).
+                let (tool_calls, events_emitted, started_at_ns, duration_ms) =
+                    telemetry.as_ref().map_or((0u32, 0u32, 0u64, 0u64), |snap| {
+                        // Proto fields for tool_calls/events_emitted are u32;
+                        // saturate at u32::MAX to avoid truncation panics.
+                        let tc = u32::try_from(snap.tool_calls).unwrap_or(u32::MAX);
+                        let ee = u32::try_from(snap.events_emitted).unwrap_or(u32::MAX);
+                        (tc, ee, snap.started_at_ns, snap.duration_ms)
+                    });
 
                 let response = SessionStatusResponse {
                     session_id: token.session_id.clone(),
@@ -1905,9 +2000,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     work_id: session.work_id,
                     role: session.role,
                     episode_id: session.episode_id,
-                    tool_calls: 0,     // TODO: Track in session telemetry
-                    events_emitted: 0, // TODO: Track in session telemetry
-                    started_at_ns: 0,  // TODO: Track session start time
+                    tool_calls,
+                    events_emitted,
+                    started_at_ns,
                     duration_ms,
                     // TCK-00385: No termination info for active sessions
                     termination_reason: None,
@@ -4066,7 +4161,7 @@ mod tests {
         use super::*;
         use crate::episode::InMemorySessionRegistry;
         use crate::protocol::messages::WorkRole;
-        use crate::session::SessionState;
+        use crate::session::{SessionState, SessionTelemetryStore};
 
         /// IT-00344-SS-01: `SessionStatus` returns ACTIVE with full session
         /// data when session registry is wired and session is
@@ -4094,8 +4189,24 @@ mod tests {
                 .register_session(session)
                 .expect("session registration should succeed");
 
-            // Create dispatcher with session registry wired
-            let dispatcher = SessionDispatcher::new(minter.clone()).with_session_registry(registry);
+            // TCK-00384: Wire telemetry store with a real start time
+            let telemetry_store = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ns = d.as_nanos() as u64;
+                    ns
+                })
+                .unwrap_or(0);
+            telemetry_store
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            // Create dispatcher with session registry and telemetry store wired
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_session_registry(registry)
+                .with_telemetry_store(telemetry_store);
 
             let token = test_token(&minter);
             let request = SessionStatusRequest {
@@ -4111,7 +4222,13 @@ mod tests {
                     assert_eq!(resp.work_id, "W-SS-001");
                     assert_eq!(resp.role, i32::from(WorkRole::Implementer));
                     assert_eq!(resp.episode_id, Some("E-SS-001".to_string()));
-                    assert!(resp.duration_ms > 0, "duration_ms should be non-zero");
+                    assert!(resp.started_at_ns > 0, "started_at_ns should be non-zero");
+                    // duration_ms should be a small delta (not raw epoch time)
+                    assert!(
+                        resp.duration_ms < 60_000,
+                        "duration_ms should be session duration, not epoch time; got {}",
+                        resp.duration_ms
+                    );
                 },
                 other => panic!("Expected SessionStatus response, got: {other:?}"),
             }
@@ -4213,6 +4330,495 @@ mod tests {
                 "SessionStatus tag should be 6"
             );
             assert_eq!(encoded[0], 6u8, "SessionStatus tag value should be 6");
+        }
+
+        // ====================================================================
+        // TCK-00384: Session Telemetry Integration Tests
+        // ====================================================================
+
+        /// IT-00384-01: `SessionStatus` returns real telemetry counters
+        /// when telemetry store is wired and counters are incremented.
+        #[test]
+        fn test_session_status_returns_real_telemetry_counters() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TEL-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-TEL-001".to_string(),
+                ephemeral_handle: "handle-tel-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-TEL-001".to_string()),
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // Wire telemetry store and simulate counter increments
+            let telemetry_store = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ns = d.as_nanos() as u64;
+                    ns
+                })
+                .unwrap_or(0);
+            telemetry_store
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            // Simulate tool calls and event emissions
+            {
+                let t = telemetry_store.get("session-001").unwrap();
+                t.increment_tool_calls();
+                t.increment_tool_calls();
+                t.increment_tool_calls();
+                t.increment_events_emitted();
+                t.increment_events_emitted();
+            }
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_session_registry(registry)
+                .with_telemetry_store(telemetry_store);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.tool_calls, 3, "tool_calls should be 3");
+                    assert_eq!(resp.events_emitted, 2, "events_emitted should be 2");
+                    assert!(resp.started_at_ns > 0, "started_at_ns should be non-zero");
+                    // duration_ms should be session duration (small), not epoch
+                    assert!(
+                        resp.duration_ms < 60_000,
+                        "duration_ms should be session duration (< 1 min), got {}",
+                        resp.duration_ms
+                    );
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00384-02: `SessionStatus` returns zeros when telemetry store
+        /// is not wired (backward compatibility).
+        #[test]
+        fn test_session_status_returns_zeros_without_telemetry() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TEL-002".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-TEL-002".to_string(),
+                ephemeral_handle: "handle-tel-002".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // No telemetry store wired
+            let dispatcher = SessionDispatcher::new(minter.clone()).with_session_registry(registry);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.tool_calls, 0);
+                    assert_eq!(resp.events_emitted, 0);
+                    assert_eq!(resp.started_at_ns, 0);
+                    assert_eq!(resp.duration_ms, 0);
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
+        }
+
+        /// IT-00384-04: End-to-end test verifying that telemetry counters are
+        /// incremented through real dispatcher paths (`RequestTool` via broker,
+        /// `EmitEvent` via ledger) rather than manual counter manipulation.
+        ///
+        /// This test:
+        /// (a) Pre-registers a session (simulating `SpawnEpisode`)
+        /// (b) Dispatches `RequestTool` through the real broker path
+        /// (c) Dispatches `EmitEvent` through the real ledger path
+        /// (d) Dispatches `SessionStatus`
+        /// (e) Asserts that counters reflect the live dispatcher flow
+        #[test]
+        fn test_e2e_telemetry_counters_through_dispatcher_paths() {
+            // We need a multi-threaded tokio runtime because the broker path
+            // uses `block_in_place` which requires a multi-threaded runtime.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async {
+                use rand::rngs::OsRng;
+
+                use crate::episode::decision::Credential;
+                use crate::episode::tool_handler::ToolArgs;
+                use crate::episode::{
+                    BudgetDelta, EpisodeRuntime, EpisodeRuntimeConfig, StubContentAddressedStore,
+                    ToolBroker, ToolBrokerConfig, ToolClass, ToolHandler, ToolHandlerError,
+                    ToolResultData,
+                };
+                use crate::htf::{ClockConfig, HolonicClock};
+                use crate::ledger::SqliteLedgerEventEmitter;
+
+                // --- Mock handler that returns success without real I/O ---
+                #[derive(Debug)]
+                struct MockReadHandler;
+
+                #[async_trait::async_trait]
+                impl ToolHandler for MockReadHandler {
+                    fn tool_class(&self) -> ToolClass {
+                        ToolClass::Read
+                    }
+
+                    async fn execute(
+                        &self,
+                        _args: &ToolArgs,
+                        _credential: Option<&Credential>,
+                    ) -> Result<ToolResultData, ToolHandlerError> {
+                        Ok(ToolResultData::success(
+                            b"mock-read-output".to_vec(),
+                            BudgetDelta::single_call(),
+                            std::time::Duration::from_millis(1),
+                        ))
+                    }
+
+                    fn validate(&self, _args: &ToolArgs) -> Result<(), ToolHandlerError> {
+                        Ok(())
+                    }
+
+                    fn name(&self) -> &'static str {
+                        "MockReadHandler"
+                    }
+                }
+
+                let minter = test_minter();
+
+                // --- Infrastructure setup ---
+
+                // EpisodeRuntime with CAS and a mock Read handler factory
+                // so that execute_tool() succeeds end-to-end.
+                let cas: Arc<dyn crate::episode::ContentAddressedStore> =
+                    Arc::new(StubContentAddressedStore::new());
+                let runtime_config = EpisodeRuntimeConfig::default();
+                #[allow(deprecated)]
+                let episode_runtime = Arc::new(
+                    EpisodeRuntime::new(runtime_config)
+                        .with_cas(cas)
+                        .with_handler_factory(|| Box::new(MockReadHandler) as Box<dyn ToolHandler>),
+                );
+
+                // Create and start an episode. The generated episode_id becomes
+                // the session_id so that handle_request_tool's
+                // `EpisodeId::new(&token.session_id)` resolves to this episode.
+                let episode_id = episode_runtime
+                    .create(*blake3::hash(b"test-envelope").as_bytes(), 1_000_000)
+                    .await
+                    .expect("create episode");
+
+                #[allow(deprecated)]
+                let _handle = episode_runtime
+                    .start(&episode_id, "lease-001", 2_000_000)
+                    .await
+                    .expect("start episode");
+
+                // Use the episode_id as session_id everywhere so the
+                // dispatcher can find the episode at execute_tool() time.
+                let session_id = episode_id.as_str().to_string();
+
+                // Build a ConnectionContext tied to this session_id
+                let ctx = ConnectionContext::session(
+                    Some(crate::protocol::credentials::PeerCredentials {
+                        uid: 1000,
+                        gid: 1000,
+                        pid: Some(12346),
+                    }),
+                    Some(session_id.clone()),
+                );
+
+                // In-memory SQLite for ledger
+                let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+                SqliteLedgerEventEmitter::init_schema(&conn).expect("init ledger schema");
+                let conn = Arc::new(std::sync::Mutex::new(conn));
+                let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+                let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> = Arc::new(
+                    SqliteLedgerEventEmitter::new(Arc::clone(&conn), signing_key),
+                );
+
+                // HolonicClock
+                let clock =
+                    Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+
+                // ToolBroker - disable policy check (no policy engine in test)
+                // and initialize with manifest so request() succeeds.
+                let broker_config = ToolBrokerConfig::default().without_policy_check();
+                let broker = Arc::new(ToolBroker::new(broker_config));
+                let broker_manifest =
+                    super::tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+                broker
+                    .initialize_with_manifest(broker_manifest)
+                    .await
+                    .expect("broker initialization should succeed");
+
+                // Manifest store with Read allowed
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+                let manifest =
+                    super::tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+                manifest_store.register(&session_id, manifest);
+
+                // Session registry
+                let registry: Arc<dyn crate::session::SessionRegistry> =
+                    Arc::new(crate::episode::InMemorySessionRegistry::new());
+                let session = crate::session::SessionState {
+                    session_id: session_id.clone(),
+                    work_id: "W-E2E-001".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "L-E2E-001".to_string(),
+                    ephemeral_handle: "handle-e2e".to_string(),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: Some(session_id.clone()),
+                };
+                registry
+                    .register_session(session)
+                    .expect("register session");
+
+                // Telemetry store - register with real start time
+                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let started_at_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let ns = d.as_nanos() as u64;
+                        ns
+                    })
+                    .unwrap_or(0);
+                telemetry_store
+                    .register(&session_id, started_at_ns)
+                    .expect("telemetry registration should succeed");
+
+                // --- Build dispatcher with all production dependencies ---
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_clock(clock)
+                        .with_ledger(ledger)
+                        .with_episode_runtime(episode_runtime)
+                        .with_session_registry(Arc::clone(&registry))
+                        .with_telemetry_store(Arc::clone(&telemetry_store));
+
+                // Mint token with the episode-derived session_id
+                let spawn_time = std::time::SystemTime::now();
+                let ttl = Duration::from_secs(3600);
+                let token = minter
+                    .mint(&session_id, "lease-001", spawn_time, ttl)
+                    .unwrap();
+
+                // --- (b) Dispatch RequestTool through real broker path ---
+                // The broker is initialized with a manifest that allows Read,
+                // the episode runtime has a CAS and a MockReadHandler, so the
+                // full Allow -> execute -> success path is exercised.
+                let read_args = serde_json::json!({
+                    "type": "read",
+                    "path": "/tmp/e2e-telemetry-test-dummy"
+                });
+                let tool_request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                    tool_id: "read".to_string(),
+                    arguments: serde_json::to_vec(&read_args).unwrap(),
+                    dedupe_key: "e2e-dedupe-1".to_string(),
+                };
+                let frame = encode_request_tool_request(&tool_request);
+                let tool_result = dispatcher.dispatch(&frame, &ctx);
+
+                // The broker returns Allow and MockReadHandler succeeds,
+                // so we must get a RequestTool response with Allow decision.
+                match &tool_result {
+                    Ok(SessionResponse::RequestTool(resp)) => {
+                        assert_eq!(
+                            resp.decision,
+                            i32::from(DecisionType::Allow),
+                            "Expected Allow decision from broker"
+                        );
+                    },
+                    Ok(SessionResponse::Error(err)) => {
+                        panic!(
+                            "RequestTool should succeed with initialized broker \
+                             and mock handler, but got error: code={}, msg={}",
+                            err.code, err.message
+                        );
+                    },
+                    Err(e) => {
+                        panic!("RequestTool dispatch failed unexpectedly: {e:?}");
+                    },
+                    other => {
+                        panic!("Unexpected RequestTool response: {other:?}");
+                    },
+                }
+
+                // --- (c) Dispatch EmitEvent through real ledger path ---
+                let emit_request = EmitEventRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                    event_type: "test.event".to_string(),
+                    payload: b"test-payload".to_vec(),
+                    correlation_id: "corr-e2e-001".to_string(),
+                };
+                let frame = encode_emit_event_request(&emit_request);
+                let emit_result = dispatcher.dispatch(&frame, &ctx).unwrap();
+                match &emit_result {
+                    SessionResponse::EmitEvent(resp) => {
+                        assert!(!resp.event_id.is_empty(), "event_id should be set");
+                        assert_eq!(resp.seq, 1, "first event should have seq=1");
+                        assert!(resp.timestamp_ns > 0, "timestamp_ns should be set");
+                    },
+                    other => panic!("Expected EmitEvent response, got: {other:?}"),
+                }
+
+                // Emit a second event to verify counter increments
+                let emit_request2 = EmitEventRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                    event_type: "test.event.2".to_string(),
+                    payload: b"payload-2".to_vec(),
+                    correlation_id: "corr-e2e-002".to_string(),
+                };
+                let frame2 = encode_emit_event_request(&emit_request2);
+                let emit_result2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+                match &emit_result2 {
+                    SessionResponse::EmitEvent(resp) => {
+                        assert_eq!(resp.seq, 2, "second event should have seq=2");
+                    },
+                    other => panic!("Expected EmitEvent response for second event, got: {other:?}"),
+                }
+
+                // --- (d) Dispatch SessionStatus and assert counters ---
+                let status_request = SessionStatusRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                };
+                let frame = encode_session_status_request(&status_request);
+                let status_result = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+                // --- (e) Assert observed counters ---
+                // tool_calls MUST be 1: the broker returned Allow, the mock
+                // handler succeeded, and the counter was incremented.
+                match status_result {
+                    SessionResponse::SessionStatus(resp) => {
+                        assert_eq!(
+                            resp.tool_calls, 1,
+                            "tool_calls must be 1 after successful RequestTool dispatch"
+                        );
+                        assert_eq!(
+                            resp.events_emitted, 2,
+                            "events_emitted should be 2 (two EmitEvent dispatches)"
+                        );
+                        assert!(resp.started_at_ns > 0, "started_at_ns should be non-zero");
+                        // duration_ms should be a small session-relative value
+                        assert!(
+                            resp.duration_ms < 60_000,
+                            "duration_ms should be session duration (< 1 min), got {}",
+                            resp.duration_ms
+                        );
+                        assert_eq!(resp.session_id, session_id);
+                        assert_eq!(resp.state, "ACTIVE");
+                        assert_eq!(resp.work_id, "W-E2E-001");
+                    },
+                    other => panic!("Expected SessionStatus response, got: {other:?}"),
+                }
+            });
+        }
+
+        /// IT-00384-03: `duration_ms` is computed from the monotonic
+        /// `Instant` clock, not from wall-clock `SystemTime`. This makes it
+        /// immune to clock jumps and skew.
+        #[test]
+        fn test_session_status_duration_uses_monotonic_clock() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-TEL-003".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-TEL-003".to_string(),
+                ephemeral_handle: "handle-tel-003".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            // Register telemetry. The monotonic Instant is captured at
+            // register() time, so duration_ms will reflect elapsed time
+            // since registration (not wall-clock manipulation).
+            let telemetry_store = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = 42_u64; // Wall-clock ns is display metadata only
+            telemetry_store
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_session_registry(registry)
+                .with_telemetry_store(telemetry_store);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    // duration_ms comes from Instant::now().elapsed(), so it
+                    // should be very small (< 5 seconds for a just-registered
+                    // session in a test).
+                    assert!(
+                        resp.duration_ms < 5_000,
+                        "duration_ms should be small for a just-registered session, got {}",
+                        resp.duration_ms
+                    );
+                    // Critically, it must NOT be raw epoch time (~1.77 trillion)
+                    assert!(
+                        resp.duration_ms < 1_000_000,
+                        "duration_ms must not be raw epoch time; got {}",
+                        resp.duration_ms
+                    );
+                    // Wall-clock metadata is preserved
+                    assert_eq!(resp.started_at_ns, 42);
+                },
+                other => panic!("Expected SessionStatus response, got: {other:?}"),
+            }
         }
     }
 

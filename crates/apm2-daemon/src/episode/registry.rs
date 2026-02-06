@@ -928,7 +928,10 @@ impl InMemorySessionRegistry {
 }
 
 impl SessionRegistry for InMemorySessionRegistry {
-    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
+    fn register_session(
+        &self,
+        session: SessionState,
+    ) -> Result<Vec<SessionState>, SessionRegistryError> {
         let mut state = self.state.write().expect("lock poisoned");
 
         // TCK-00385 MINOR 1: Centralize TTL cleanup on all write paths.
@@ -944,11 +947,16 @@ impl SessionRegistry for InMemorySessionRegistry {
             });
         }
 
-        // CTR-1303: Evict oldest entry if at capacity
+        // CTR-1303: Evict oldest entry if at capacity.
+        // TCK-00384 security fix: Return full evicted SessionState so
+        // callers can both clean up telemetry AND restore sessions on
+        // transactional rollback if a later spawn step fails.
+        let mut evicted = Vec::new();
         while state.by_id.len() >= MAX_SESSIONS {
             if let Some(oldest_key) = state.queue.pop_front() {
-                if let Some(evicted) = state.by_id.remove(&oldest_key) {
-                    state.by_handle.remove(&evicted.ephemeral_handle);
+                if let Some(evicted_session) = state.by_id.remove(&oldest_key) {
+                    state.by_handle.remove(&evicted_session.ephemeral_handle);
+                    evicted.push(evicted_session);
                 }
             } else {
                 break;
@@ -960,7 +968,22 @@ impl SessionRegistry for InMemorySessionRegistry {
         state.queue.push_back(session_id.clone());
         state.by_handle.insert(handle, session_id.clone());
         state.by_id.insert(session_id, session);
-        Ok(())
+        Ok(evicted)
+    }
+
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError> {
+        let mut state = self.state.write().expect("lock poisoned");
+
+        if let Some(session) = state.by_id.remove(session_id) {
+            state.by_handle.remove(&session.ephemeral_handle);
+            state.queue.retain(|id| id != session_id);
+            Ok(Some(session))
+        } else {
+            Ok(None)
+        }
     }
 
     fn get_session(&self, session_id: &str) -> Option<SessionState> {
@@ -1048,21 +1071,6 @@ impl SessionRegistry for InMemorySessionRegistry {
         Some((entry.session.clone(), entry.info.clone()))
     }
 
-    fn remove_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionState>, SessionRegistryError> {
-        let mut state = self.state.write().expect("lock poisoned");
-
-        if let Some(session) = state.by_id.remove(session_id) {
-            state.by_handle.remove(&session.ephemeral_handle);
-            state.queue.retain(|id| id != session_id);
-            Ok(Some(session))
-        } else {
-            Ok(None)
-        }
-    }
-
     fn update_episode_id(
         &self,
         session_id: &str,
@@ -1088,22 +1096,6 @@ impl InMemorySessionRegistry {
     pub fn all_sessions(&self) -> Vec<SessionState> {
         let state = self.state.read().expect("lock poisoned");
         state.by_id.values().cloned().collect()
-    }
-
-    /// Removes a session by ID.
-    ///
-    /// Used during crash recovery to clean up sessions after sending
-    /// `LEASE_REVOKED` signals.
-    pub fn remove_session(&self, session_id: &str) -> Option<SessionState> {
-        let mut state = self.state.write().expect("lock poisoned");
-
-        if let Some(session) = state.by_id.remove(session_id) {
-            state.by_handle.remove(&session.ephemeral_handle);
-            state.queue.retain(|id| id != session_id);
-            Some(session)
-        } else {
-            None
-        }
     }
 
     /// Clears all active and terminated sessions.
@@ -1325,7 +1317,13 @@ impl RecoveryManager {
         // Cleanup orphaned processes
         let orphaned_processes_cleaned = self.cleanup_orphaned_processes(&sessions)?;
 
-        // Clear the registry after recovery
+        // Clear the registry after recovery.
+        //
+        // IMPORTANT (TCK-00384): Callers MUST also clear the
+        // `SessionTelemetryStore` after invoking `recover_sessions` to
+        // prevent orphaned telemetry entries. The recovery manager does not
+        // hold a reference to the telemetry store; lifecycle cleanup is the
+        // caller's responsibility.
         registry.clear();
 
         let recovery_time_ms = start.elapsed().as_millis() as u32;
@@ -2160,17 +2158,56 @@ impl PersistentSessionRegistry {
 }
 
 impl SessionRegistry for PersistentSessionRegistry {
-    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
+    fn register_session(
+        &self,
+        session: SessionState,
+    ) -> Result<Vec<SessionState>, SessionRegistryError> {
+        // Capture the session_id before the move so we can roll back if
+        // persistence fails.
+        let session_id = session.session_id.clone();
+
         // Register in memory first
-        self.inner.register_session(session)?;
+        let evicted = self.inner.register_session(session)?;
 
-        // Persist to disk (convert error to RegistrationFailed)
-        self.persist()
-            .map_err(|e| SessionRegistryError::RegistrationFailed {
-                message: format!("Failed to persist state: {e}"),
-            })?;
+        // Persist to disk; if this fails, roll back the in-memory mutation
+        // (remove the just-added session and restore any evicted sessions)
+        // so that on-disk and in-memory state remain consistent.
+        if let Err(persist_err) = self.persist() {
+            // Roll back: remove the newly-registered session.
+            // We bypass the PersistentSessionRegistry wrapper and call the
+            // inner (in-memory) registry directly to avoid a second persist
+            // attempt.
+            let _ = self.inner.remove_session(&session_id);
 
-        Ok(())
+            // Roll back: re-register any evicted sessions to restore
+            // capacity.
+            for evicted_session in &evicted {
+                let _ = self.inner.register_session(evicted_session.clone());
+            }
+
+            return Err(SessionRegistryError::RegistrationFailed {
+                message: format!("Failed to persist state: {persist_err}"),
+            });
+        }
+
+        Ok(evicted)
+    }
+
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError> {
+        let removed = self.inner.remove_session(session_id)?;
+        if removed.is_some() {
+            // TCK-00384 security BLOCKER 2: persist after removal so the
+            // delete is durable across restarts.  Persistence failures are
+            // now propagated (fail-closed) instead of silently swallowed.
+            self.persist()
+                .map_err(|e| SessionRegistryError::PersistenceFailed {
+                    message: format!("Failed to persist state after session removal: {e}"),
+                })?;
+        }
+        Ok(removed)
     }
 
     fn get_session(&self, session_id: &str) -> Option<SessionState> {
@@ -2235,30 +2272,6 @@ impl SessionRegistry for PersistentSessionRegistry {
         SessionRegistry::get_terminated_session(&self.inner, session_id)
     }
 
-    fn remove_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionState>, SessionRegistryError> {
-        let removed =
-            <InMemorySessionRegistry as SessionRegistry>::remove_session(&self.inner, session_id)?;
-        if removed.is_some() {
-            // Fail-closed: persistence failure is a hard error.
-            // The in-memory removal has already occurred, but callers
-            // must treat this as a failure to maintain consistency.
-            self.persist().map_err(|e| {
-                tracing::error!(
-                    error = %e,
-                    session_id = %session_id,
-                    "Failed to persist state after session removal - failing closed"
-                );
-                SessionRegistryError::RegistrationFailed {
-                    message: format!("persistence failed after session removal: {e}"),
-                }
-            })?;
-        }
-        Ok(removed)
-    }
-
     fn update_episode_id(
         &self,
         session_id: &str,
@@ -2313,7 +2326,7 @@ impl SessionRegistry for PersistentSessionRegistry {
 
         // Persist succeeded -- now safe to clear in-memory state.
         for id in session_ids {
-            self.inner.remove_session(id);
+            let _ = self.inner.remove_session(id);
         }
         Ok(())
     }
@@ -2400,7 +2413,7 @@ mod session_registry_tests {
             SessionRegistryError::DuplicateSessionId { session_id } => {
                 assert_eq!(session_id, "sess-1");
             },
-            other @ SessionRegistryError::RegistrationFailed { .. } => {
+            other => {
                 panic!("Expected DuplicateSessionId, got: {other:?}")
             },
         }
@@ -2500,16 +2513,21 @@ mod session_registry_tests {
         // Fill to MAX_SESSIONS
         for i in 0..MAX_SESSIONS {
             let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
-            registry.register_session(session).unwrap();
+            let evicted = registry.register_session(session).unwrap();
+            assert!(evicted.is_empty(), "No evictions while under capacity");
         }
 
         // Verify first session exists
         assert!(registry.get_session("sess-0").is_some());
 
         // Register one more - should evict sess-0 (oldest)
-        registry
+        let evicted = registry
             .register_session(make_session("sess-new", "handle-new"))
             .unwrap();
+
+        // TCK-00384: Verify full evicted SessionState is returned
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].session_id, "sess-0");
 
         // sess-0 should be evicted
         assert!(registry.get_session("sess-0").is_none());
@@ -2733,6 +2751,262 @@ mod session_registry_tests {
         // Should succeed with empty registry when file doesn't exist
         let registry = PersistentSessionRegistry::load_from_file(&path).unwrap();
         assert_eq!(registry.session_count(), 0);
+    }
+
+    /// TCK-00384 Security BLOCKER: Verify that `remove_session` is durable --
+    /// a removed session must NOT reappear after a save/reload cycle.
+    #[test]
+    fn test_durable_remove_session_persists_after_reload() {
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        // Register two sessions and persist
+        {
+            let registry = PersistentSessionRegistry::new(path);
+            registry
+                .register_session(make_session("sess-keep", "handle-keep"))
+                .unwrap();
+            registry
+                .register_session(make_session("sess-remove", "handle-remove"))
+                .unwrap();
+            assert_eq!(registry.session_count(), 2);
+        }
+
+        // Reload from disk, remove one session, then drop
+        {
+            let registry = PersistentSessionRegistry::load_from_file(path).unwrap();
+            assert_eq!(registry.session_count(), 2);
+
+            let removed = registry.remove_session("sess-remove").unwrap();
+            assert!(removed.is_some());
+            assert_eq!(removed.unwrap().session_id, "sess-remove");
+            assert_eq!(registry.session_count(), 1);
+        }
+
+        // Reload again -- removed session must be gone
+        {
+            let registry = PersistentSessionRegistry::load_from_file(path).unwrap();
+            assert_eq!(
+                registry.session_count(),
+                1,
+                "Only the kept session should survive reload"
+            );
+            assert!(
+                registry.get_session("sess-keep").is_some(),
+                "Kept session should still exist"
+            );
+            assert!(
+                registry.get_session("sess-remove").is_none(),
+                "Removed session must NOT reappear after reload"
+            );
+        }
+    }
+
+    /// TCK-00384 Quality BLOCKER: Verify that evicted sessions returned by
+    /// `register_session` contain full `SessionState` (not just IDs), enabling
+    /// transactional rollback to restore them on spawn failure.
+    #[test]
+    fn test_register_session_returns_full_evicted_state() {
+        let registry = InMemorySessionRegistry::new();
+
+        // Fill to capacity
+        for i in 0..MAX_SESSIONS {
+            let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
+            registry.register_session(session).unwrap();
+        }
+
+        // Register one more - should evict oldest
+        let evicted = registry
+            .register_session(make_session("sess-overflow", "handle-overflow"))
+            .unwrap();
+
+        assert_eq!(evicted.len(), 1);
+        let evicted_session = &evicted[0];
+        // Full SessionState fields must be populated
+        assert_eq!(evicted_session.session_id, "sess-0");
+        assert_eq!(evicted_session.ephemeral_handle, "handle-0");
+        assert_eq!(evicted_session.work_id, "work-sess-0");
+
+        // Simulate rollback: remove new session and re-register evicted one
+        registry.remove_session("sess-overflow").unwrap();
+        let restore_result = registry.register_session(evicted_session.clone());
+        assert!(
+            restore_result.is_ok(),
+            "Re-registering evicted session should succeed"
+        );
+        assert!(
+            registry.get_session("sess-0").is_some(),
+            "Restored session should be queryable"
+        );
+        assert!(
+            registry.get_session("sess-overflow").is_none(),
+            "Rolled-back session should be gone"
+        );
+    }
+
+    /// TCK-00384 Security BLOCKER 2: Verify that
+    /// `PersistentSessionRegistry::remove_session` propagates persistence
+    /// failures via `SessionRegistryError::PersistenceFailed` instead of
+    /// silently logging them.
+    #[test]
+    fn test_persistent_remove_session_propagates_persistence_error() {
+        // Point the persistent registry at a read-only directory so that
+        // `persist()` will fail when we try to write the state file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let registry = PersistentSessionRegistry::new(&path);
+
+        // Register a session (this creates the state file)
+        let session = make_session("sess-persist-err", "handle-persist-err");
+        registry.register_session(session).unwrap();
+
+        // Make the state file's parent directory read-only so that the
+        // atomic rename in persist() fails.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+
+            // remove_session should now return Err(PersistenceFailed)
+            let result = registry.remove_session("sess-persist-err");
+            assert!(
+                result.is_err(),
+                "remove_session must propagate persistence failure"
+            );
+            match result.unwrap_err() {
+                SessionRegistryError::PersistenceFailed { message } => {
+                    assert!(
+                        message.contains("persist"),
+                        "Error message should mention persistence: {message}"
+                    );
+                },
+                other => {
+                    panic!("Expected PersistenceFailed, got: {other:?}");
+                },
+            }
+
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // On non-unix platforms, persistence should succeed normally
+        #[cfg(not(unix))]
+        {
+            let result = registry.remove_session("sess-persist-err");
+            assert!(result.is_ok());
+        }
+    }
+
+    /// BLOCKER 1 fix: verify that `register_session` rolls back in-memory
+    /// state when `persist()` fails so that callers never see a
+    /// half-committed registration.
+    #[test]
+    fn test_register_session_rollback_on_persist_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let registry = PersistentSessionRegistry::new(&path);
+
+        // Seed with one session so we know it survives rollback
+        let pre = make_session("pre-existing", "handle-pre");
+        registry.register_session(pre).unwrap();
+        assert!(registry.get_session("pre-existing").is_some());
+
+        // Now break persistence by making the parent directory read-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+
+            // Attempt to register a new session — persist() should fail.
+            let result = registry.register_session(make_session("new-sess", "handle-new"));
+            assert!(
+                result.is_err(),
+                "register_session must fail when persistence fails"
+            );
+            match result.unwrap_err() {
+                SessionRegistryError::RegistrationFailed { message } => {
+                    assert!(
+                        message.contains("persist") || message.contains("Persist"),
+                        "Error message should mention persistence: {message}"
+                    );
+                },
+                other => {
+                    panic!("Expected RegistrationFailed, got: {other:?}");
+                },
+            }
+
+            // The new session must NOT be present in the in-memory registry.
+            assert!(
+                registry.get_session("new-sess").is_none(),
+                "new session must be rolled back on persist failure"
+            );
+
+            // The pre-existing session must still be present.
+            assert!(
+                registry.get_session("pre-existing").is_some(),
+                "pre-existing session must survive rollback"
+            );
+
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// BLOCKER 1 fix: verify that evicted sessions are restored when
+    /// `persist()` fails during a registration that triggered eviction.
+    #[test]
+    fn test_register_session_rollback_restores_evicted_on_persist_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let registry = PersistentSessionRegistry::new(&path);
+
+        // Fill the registry to MAX_SESSIONS
+        for i in 0..MAX_SESSIONS {
+            let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
+            registry.register_session(session).unwrap();
+        }
+
+        // Confirm the oldest session is present (it will be evicted)
+        assert!(
+            registry.get_session("sess-0").is_some(),
+            "oldest session should exist before eviction attempt"
+        );
+
+        // Break persistence
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+
+            // Attempt to register one more — this should evict sess-0,
+            // fail on persist, and then restore sess-0.
+            let result =
+                registry.register_session(make_session("overflow-sess", "handle-overflow"));
+            assert!(result.is_err(), "must fail when persistence fails");
+
+            // The overflow session must NOT be present
+            assert!(
+                registry.get_session("overflow-sess").is_none(),
+                "overflow session must be rolled back"
+            );
+
+            // The evicted session must be restored
+            assert!(
+                registry.get_session("sess-0").is_some(),
+                "evicted session must be restored on rollback"
+            );
+
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     // =========================================================================
@@ -3742,7 +4016,7 @@ mod tck_00385_security_fixes {
                     "Error message should mention persistence: {message}"
                 );
             },
-            other @ SessionRegistryError::DuplicateSessionId { .. } => {
+            other => {
                 panic!("Expected RegistrationFailed, got: {other:?}")
             },
         }

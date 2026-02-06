@@ -48,7 +48,7 @@ use crate::protocol::messages::DecodeConfig;
 use crate::protocol::resource_governance::{SharedSubscriptionRegistry, SubscriptionRegistry};
 use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore, SessionDispatcher};
 use crate::protocol::session_token::TokenMinter;
-use crate::session::SessionRegistry;
+use crate::session::{SessionRegistry, SessionTelemetryStore};
 
 // ============================================================================
 // TCK-00343: Credential Store Service Name
@@ -227,16 +227,26 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
+        // TCK-00384: Create shared telemetry store for session counters
+        let telemetry_store = Arc::new(SessionTelemetryStore::new());
+
+        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
+        // registration
+        let privileged_dispatcher =
+            privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
+
         // TCK-00287: Create session dispatcher with same token minter and manifest
         // store This ensures:
         // - Tokens minted during SpawnEpisode can be validated
         // - Manifests registered during SpawnEpisode are visible for tool validation
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
+        // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
-                .with_session_registry(session_registry);
+                .with_session_registry(session_registry)
+                .with_telemetry_store(telemetry_store);
 
         Self {
             privileged_dispatcher,
@@ -302,14 +312,24 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
+        // TCK-00384: Create shared telemetry store for session counters
+        let telemetry_store = Arc::new(SessionTelemetryStore::new());
+
+        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
+        // registration
+        let privileged_dispatcher =
+            privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
+
         // TCK-00287: Create session dispatcher with same token minter and manifest
         // store
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
+        // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
-                .with_session_registry(session_registry);
+                .with_session_registry(session_registry)
+                .with_telemetry_store(telemetry_store);
 
         Self {
             privileged_dispatcher,
@@ -458,12 +478,22 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
+        // TCK-00384: Create shared telemetry store for session counters
+        let telemetry_store = Arc::new(SessionTelemetryStore::new());
+
+        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
+        // registration
+        let privileged_dispatcher =
+            privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
+
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
+        // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
-                .with_session_registry(session_registry_for_session);
+                .with_session_registry(session_registry_for_session)
+                .with_telemetry_store(telemetry_store);
 
         Self {
             privileged_dispatcher,
@@ -661,8 +691,17 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
+        // TCK-00384: Create shared telemetry store for session counters
+        let telemetry_store = Arc::new(SessionTelemetryStore::new());
+
+        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
+        // registration
+        let privileged_dispatcher =
+            privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
+
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries
+        // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -671,7 +710,8 @@ impl DispatcherState {
                 .with_cas(cas)
                 .with_clock(clock)
                 .with_broker(broker)
-                .with_episode_runtime(episode_runtime);
+                .with_episode_runtime(episode_runtime)
+                .with_telemetry_store(telemetry_store);
 
         Ok(Self {
             privileged_dispatcher,
