@@ -461,18 +461,18 @@ impl DispatcherState {
     /// * `sqlite_conn` - `SQLite` connection for persistent ledger
     /// * `cas_path` - Path for durable CAS storage
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if CAS or clock initialization fails. This is intentional:
-    /// production code MUST have these dependencies configured correctly.
-    #[must_use]
+    /// Returns an error if CAS initialization fails (e.g., relative path,
+    /// symlink components, bad permissions). The caller should handle this
+    /// gracefully (e.g., log the error and exit) rather than panicking.
     #[allow(clippy::needless_pass_by_value)] // Arc is intentionally moved for shared ownership
     pub fn with_persistence_and_cas(
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
         sqlite_conn: Arc<Mutex<Connection>>,
         cas_path: impl AsRef<Path>,
-    ) -> Self {
+    ) -> Result<Self, crate::cas::DurableCasError> {
         use rand::rngs::OsRng;
 
         let token_secret = TokenMinter::generate_secret();
@@ -489,8 +489,7 @@ impl DispatcherState {
 
         // TCK-00316: Create durable CAS
         let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
-        let cas: Arc<dyn ContentAddressedStore> =
-            Arc::new(DurableCas::new(cas_config).expect("CAS initialization failed"));
+        let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config)?);
 
         // TCK-00316: Create ToolBroker with CAS
         let broker: SharedToolBroker<StubManifestLoader> =
@@ -607,10 +606,10 @@ impl DispatcherState {
                 .with_broker(broker)
                 .with_episode_runtime(episode_runtime);
 
-        Self {
+        Ok(Self {
             privileged_dispatcher,
             session_dispatcher,
-        }
+        })
     }
 
     /// Sets the daemon state for process management (TCK-00342).

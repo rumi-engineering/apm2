@@ -4093,7 +4093,7 @@ mod tests {
     async fn test_artifact_fetch_output_too_large() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let cas_dir = temp_dir.path().join("cas");
-        std::fs::create_dir_all(&cas_dir).expect("create cas dir");
+        // Let DurableCas::new create the directory with secure 0700 permissions
         let cas: Arc<dyn ContentAddressedStore> =
             Arc::new(DurableCas::new(DurableCasConfig::new(&cas_dir)).expect("cas"));
         let content = vec![0u8; 64];
@@ -4119,7 +4119,7 @@ mod tests {
     async fn test_artifact_fetch_missing_returns_not_found() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let cas_dir = temp_dir.path().join("cas");
-        std::fs::create_dir_all(&cas_dir).expect("create cas dir");
+        // Let DurableCas::new create the directory with secure 0700 permissions
         let cas: Arc<dyn ContentAddressedStore> =
             Arc::new(DurableCas::new(DurableCasConfig::new(&cas_dir)).expect("cas"));
         let handler = ArtifactFetchHandler::new(cas);

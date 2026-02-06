@@ -119,6 +119,19 @@ pub struct DaemonConfig {
     /// Controls the projection worker that posts review results to GitHub.
     #[serde(default)]
     pub projection: ProjectionConfig,
+
+    /// Path to durable content-addressed storage (CAS) directory (TCK-00383).
+    ///
+    /// When provided alongside a ledger database, the daemon uses
+    /// `with_persistence_and_cas()` to wire the session dispatcher with
+    /// a `ToolBroker`, `DurableCas`, ledger event emitter, and holonic clock.
+    /// Without this, the session dispatcher uses stubs and all session-scoped
+    /// operations (tool execution, event emission, evidence publishing) fail
+    /// closed with "unavailable" errors.
+    ///
+    /// The directory is created with mode 0700 if it does not exist.
+    #[serde(default)]
+    pub cas_path: Option<PathBuf>,
 }
 
 /// Projection worker configuration (TCK-00322).
@@ -198,6 +211,7 @@ impl Default for DaemonConfig {
             state_file: default_state_file(),
             audit: AuditConfig::default(),
             projection: ProjectionConfig::default(),
+            cas_path: None,
         }
     }
 }

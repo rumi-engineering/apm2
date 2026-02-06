@@ -8,6 +8,12 @@ session_socket = "/var/run/apm2/session.sock"
 log_dir = "/var/log/apm2"
 state_file = "/var/lib/apm2/state.json"
 
+# Durable content-addressed storage (CAS) directory (TCK-00383).
+# When provided alongside --ledger-db, enables full session dispatcher wiring:
+# tool execution, event emission, and evidence publishing.
+# The directory is created with mode 0700 if it does not exist.
+cas_path = "/var/lib/apm2/cas"
+
 # Credential profiles (stored securely in OS keyring)
 # Use `apm2 creds add` to create profiles and store credentials
 

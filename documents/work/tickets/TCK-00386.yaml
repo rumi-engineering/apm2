@@ -1,0 +1,77 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00386"
+    title: "Coordinate command: replace heartbeat polling with session termination signal"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_ORCHESTRATION"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00385"
+        reason: "SessionStatus must return TERMINATED state with exit reason before coordinate can use it."
+      - ticket_id: "TCK-00384"
+        reason: "Session telemetry must provide actual token consumption for budget tracking."
+  scope:
+    in_scope:
+      - "Replace `observe_session_termination` heartbeat polling with SessionStatus polling."
+      - "Map daemon-reported termination_reason to SessionOutcome::Success or Failure."
+      - "Use actual_tokens_consumed from SessionStatus instead of wall-clock estimate."
+      - "Remove the `clean_exit = false; break;` fail-closed pattern that forces all sessions to FAILURE."
+      - "Preserve fail-closed semantics for unobservable sessions (socket unavailable)."
+    out_of_scope:
+      - "Daemon-side session termination detection (TCK-00385)."
+      - "Token consumption measurement in agent adapters (future work)."
+      - "CoordinationController business logic changes."
+  plan:
+    steps:
+      - "Rewrite `observe_session_termination` to poll `SessionClient::session_status()` instead of `emit_event()` heartbeats."
+      - "When status returns ACTIVE, continue polling (same as current heartbeat)."
+      - "When status returns TERMINATED with reason=normal and exit_code=0, return SessionOutcome::Success."
+      - "When status returns TERMINATED with any other reason/exit_code, return SessionOutcome::Failure."
+      - "When status returns error (session not found), return SessionOutcome::Failure (fail-closed preserved)."
+      - "Use actual_tokens_consumed from the TERMINATED response if available, falling back to wall-clock estimate."
+      - "Remove CONSERVATIVE_TOKENS_PER_SECOND estimation when actual data is available."
+      - "Add tests verifying Success/Failure mapping from termination reasons."
+  definition_of_done:
+    criteria:
+      - "`apm2 coordinate` correctly reports Success for sessions that exit cleanly (exit_code=0)."
+      - "`apm2 coordinate` correctly reports Failure for sessions that crash or timeout."
+      - "Budget tracking uses actual token consumption when available."
+      - "Fall-back to wall-clock estimate preserved when actual data unavailable."
+      - "Circuit breaker (3 consecutive failures = abort) still works correctly."
+      - "Fail-closed behavior preserved for socket-unavailable scenarios."
+  notes:
+    context: |
+      The coordinate command's `observe_session_termination` function (coordinate.rs
+      lines 910-1017) polls session liveness by emitting heartbeat events via the
+      session socket. When the daemon rejects a heartbeat, the session is presumed
+      terminated. But the code forces ALL terminations to FAILURE:
+
+        let mut clean_exit = false;  // line 934
+        ...
+        clean_exit = false;          // line 975
+        break;
+
+      The variable `clean_exit` is never set to `true`. The code comments state:
+        "Reserved for future: explicit daemon success signal path" (line 986)
+
+      TCK-00385 provides that signal. This ticket consumes it.
+
+      Additionally, token estimation uses a crude wall-clock heuristic:
+        CONSERVATIVE_TOKENS_PER_SECOND = 100
+        estimated_tokens = elapsed_secs * 100
+      This yields wildly inaccurate budget accounting. With TCK-00384 providing
+      real telemetry data, we can replace this with actual measurements.
+    files: |
+      - crates/apm2-cli/src/commands/coordinate.rs (lines 910-1017: observe_session_termination)
+      - crates/apm2-cli/src/commands/coordinate.rs (line 693: SESSION_OBSERVATION_TIMEOUT)
+      - crates/apm2-cli/src/commands/coordinate.rs (line 1019: estimate_token_consumption)
+      - crates/apm2-cli/src/client/protocol.rs (SessionClient::session_status)

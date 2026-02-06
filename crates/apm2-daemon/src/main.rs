@@ -102,6 +102,14 @@ struct Args {
     #[arg(long)]
     ledger_db: Option<PathBuf>,
 
+    /// Path to durable content-addressed storage (CAS) directory (TCK-00383)
+    ///
+    /// When provided with `--ledger-db`, enables full session dispatcher wiring
+    /// via `with_persistence_and_cas()`. The directory is created with mode
+    /// 0700 if it does not exist.
+    #[arg(long)]
+    cas_path: Option<PathBuf>,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -133,6 +141,8 @@ struct DaemonConfig {
     state_file_path: PathBuf,
     /// Ledger database path (`SQLite`).
     ledger_db_path: Option<PathBuf>,
+    /// CAS directory path for durable content-addressed storage (TCK-00383).
+    cas_path: Option<PathBuf>,
     /// Port for Prometheus metrics HTTP endpoint (TCK-00268).
     metrics_port: u16,
     /// Whether to disable the metrics endpoint.
@@ -171,6 +181,12 @@ impl DaemonConfig {
         // Ledger DB path from args (config fallback not yet standard)
         let ledger_db_path = args.ledger_db.clone();
 
+        // TCK-00383: CAS path from CLI args, falling back to config file
+        let cas_path = args
+            .cas_path
+            .clone()
+            .or_else(|| config.daemon.cas_path.clone());
+
         Ok(Self {
             config,
             operator_socket_path,
@@ -178,6 +194,7 @@ impl DaemonConfig {
             pid_path,
             state_file_path,
             ledger_db_path,
+            cas_path,
             metrics_port: args.metrics_port,
             metrics_disabled: args.no_metrics,
         })
@@ -675,12 +692,39 @@ async fn async_main(args: Args) -> Result<()> {
     // TCK-00342: Wire daemon state into dispatcher for process management.
     // This enables ListProcesses, ProcessStatus, StartProcess, StopProcess,
     // RestartProcess, and ReloadProcess handlers to query the Supervisor.
+    //
+    // TCK-00383: When both ledger and CAS are configured, use
+    // with_persistence_and_cas() to wire the session dispatcher with ToolBroker,
+    // DurableCas, ledger event emitter, and holonic clock. This enables session-
+    // scoped operations: tool execution, event emission, and evidence publishing.
     let dispatcher_state: SharedDispatcherState = Arc::new(
-        DispatcherState::with_persistence(
-            state.session_registry().clone(),
-            metrics_registry.clone(),
-            sqlite_conn.clone(),
-        )
+        if let (Some(conn), Some(cas_path)) = (&sqlite_conn, &daemon_config.cas_path) {
+            info!(
+                cas_path = %cas_path.display(),
+                "Using with_persistence_and_cas: session dispatcher fully wired"
+            );
+            DispatcherState::with_persistence_and_cas(
+                state.session_registry().clone(),
+                metrics_registry.clone(),
+                Arc::clone(conn),
+                cas_path,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("CAS initialization failed for {}: {e}", cas_path.display())
+            })?
+        } else {
+            if daemon_config.cas_path.is_some() && sqlite_conn.is_none() {
+                warn!(
+                    "--cas-path provided without --ledger-db; \
+                     CAS requires a ledger database. Falling back to with_persistence()"
+                );
+            }
+            DispatcherState::with_persistence(
+                state.session_registry().clone(),
+                metrics_registry.clone(),
+                sqlite_conn.clone(),
+            )
+        }
         .with_daemon_state(Arc::clone(&state)),
     );
 

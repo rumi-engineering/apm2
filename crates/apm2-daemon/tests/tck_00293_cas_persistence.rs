@@ -37,7 +37,7 @@ fn cas_persistence_restart_basic() {
 
     // First "daemon instance": store content
     {
-        let config = DurableCasConfig::new(temp_dir.path());
+        let config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = DurableCas::new(config).unwrap();
         let result = cas.store(content).unwrap();
         hash = result.hash;
@@ -46,7 +46,7 @@ fn cas_persistence_restart_basic() {
 
     // Simulate daemon restart: create new CAS instance
     {
-        let config = DurableCasConfig::new(temp_dir.path());
+        let config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = DurableCas::new(config).unwrap();
 
         // Content should still exist
@@ -75,7 +75,7 @@ fn cas_persistence_restart_multiple_artifacts() {
 
     // First instance: store all artifacts
     {
-        let config = DurableCasConfig::new(temp_dir.path());
+        let config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = DurableCas::new(config).unwrap();
 
         for artifact in &artifacts {
@@ -86,7 +86,7 @@ fn cas_persistence_restart_multiple_artifacts() {
 
     // Second instance: verify all artifacts
     {
-        let config = DurableCasConfig::new(temp_dir.path());
+        let config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = DurableCas::new(config).unwrap();
 
         for (i, (artifact, hash)) in artifacts.iter().zip(&hashes).enumerate() {
@@ -107,7 +107,7 @@ fn cas_persistence_restart_total_size() {
 
     // First instance: store artifacts
     {
-        let config = DurableCasConfig::new(temp_dir.path());
+        let config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = DurableCas::new(config).unwrap();
         cas.store(artifact1).unwrap();
         cas.store(artifact2).unwrap();
@@ -120,7 +120,7 @@ fn cas_persistence_restart_total_size() {
 
     // Second instance: verify total size persisted
     {
-        let config = DurableCasConfig::new(temp_dir.path());
+        let config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = DurableCas::new(config).unwrap();
         assert_eq!(
             cas.total_size(),
@@ -138,7 +138,7 @@ fn cas_persistence_restart_total_size() {
 #[test]
 fn cas_size_limit_per_artifact() {
     let temp_dir = TempDir::new().unwrap();
-    let config = DurableCasConfig::new(temp_dir.path()).with_max_artifact_size(100);
+    let config = DurableCasConfig::new(temp_dir.path().join("cas")).with_max_artifact_size(100);
     let cas = DurableCas::new(config).unwrap();
 
     // Content within limit should succeed
@@ -159,7 +159,7 @@ fn cas_size_limit_per_artifact() {
 #[test]
 fn cas_size_limit_total_storage() {
     let temp_dir = TempDir::new().unwrap();
-    let config = DurableCasConfig::new(temp_dir.path())
+    let config = DurableCasConfig::new(temp_dir.path().join("cas"))
         .with_max_artifact_size(100)
         .with_max_total_size(200);
     let cas = DurableCas::new(config).unwrap();
@@ -182,7 +182,7 @@ fn cas_size_limit_total_storage() {
 #[test]
 fn cas_hash_verification_on_retrieve() {
     let temp_dir = TempDir::new().unwrap();
-    let config = DurableCasConfig::new(temp_dir.path());
+    let config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas = DurableCas::new(config).unwrap();
 
     let content = b"test content for hash verification";
@@ -210,7 +210,7 @@ fn cas_hash_verification_on_retrieve() {
 #[test]
 fn cas_reject_empty_content() {
     let temp_dir = TempDir::new().unwrap();
-    let config = DurableCasConfig::new(temp_dir.path());
+    let config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas = DurableCas::new(config).unwrap();
 
     let result = cas.store(b"");
@@ -224,7 +224,7 @@ fn cas_reject_empty_content() {
 #[test]
 fn cas_deduplication() {
     let temp_dir = TempDir::new().unwrap();
-    let config = DurableCasConfig::new(temp_dir.path());
+    let config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas = DurableCas::new(config).unwrap();
 
     let content = b"deduplicated content";
@@ -248,7 +248,7 @@ fn cas_deduplication() {
 #[test]
 fn cas_trait_implementation() {
     let temp_dir = TempDir::new().unwrap();
-    let config = DurableCasConfig::new(temp_dir.path());
+    let config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas = Arc::new(DurableCas::new(config).unwrap());
 
     // Use via trait object (as would be done in ToolBroker)
@@ -281,8 +281,8 @@ fn cas_deterministic_hash() {
     let temp_dir1 = TempDir::new().unwrap();
     let temp_dir2 = TempDir::new().unwrap();
 
-    let config1 = DurableCasConfig::new(temp_dir1.path());
-    let config2 = DurableCasConfig::new(temp_dir2.path());
+    let config1 = DurableCasConfig::new(temp_dir1.path().join("cas"));
+    let config2 = DurableCasConfig::new(temp_dir2.path().join("cas"));
 
     let cas1 = DurableCas::new(config1).unwrap();
     let cas2 = DurableCas::new(config2).unwrap();
@@ -312,7 +312,7 @@ fn cas_recovery_from_corrupted_metadata() {
 
     // First instance: store content
     {
-        let config = DurableCasConfig::new(temp_dir.path());
+        let config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = DurableCas::new(config).unwrap();
         let result = cas.store(content).unwrap();
         hash = result.hash;
@@ -320,12 +320,16 @@ fn cas_recovery_from_corrupted_metadata() {
     }
 
     // Corrupt the metadata file
-    let metadata_file = temp_dir.path().join("metadata").join("total_size");
+    let metadata_file = temp_dir
+        .path()
+        .join("cas")
+        .join("metadata")
+        .join("total_size");
     std::fs::write(&metadata_file, "invalid").unwrap();
 
     // New instance should recover by recalculating
     {
-        let config = DurableCasConfig::new(temp_dir.path());
+        let config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = DurableCas::new(config).unwrap();
 
         // Content should still be retrievable

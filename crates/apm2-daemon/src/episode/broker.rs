@@ -2122,9 +2122,9 @@ mod tests {
 
         use crate::cas::{DurableCas, DurableCasConfig};
 
-        // Create a durable CAS
+        // Create a durable CAS (use subdirectory so DurableCas creates it with 0700)
         let temp_dir = TempDir::new().unwrap();
-        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = Arc::new(DurableCas::new(cas_config).unwrap());
 
         // Create broker with durable CAS via builder pattern
@@ -2141,9 +2141,9 @@ mod tests {
 
         use crate::cas::{DurableCas, DurableCasConfig};
 
-        // Create a durable CAS
+        // Create a durable CAS (use subdirectory so DurableCas creates it with 0700)
         let temp_dir = TempDir::new().unwrap();
-        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = Arc::new(DurableCas::new(cas_config).unwrap());
 
         // Create shared broker with durable CAS
@@ -4200,9 +4200,9 @@ policy:
         use crate::cas::{DurableCas, DurableCasConfig};
         use crate::episode::executor::ContentAddressedStore as CasTrait;
 
-        // Create a durable CAS
+        // Create a durable CAS (use subdirectory so DurableCas creates it with 0700)
         let temp_dir = TempDir::new().unwrap();
-        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = Arc::new(DurableCas::new(cas_config).unwrap());
 
         // Create broker with durable CAS
@@ -4252,9 +4252,9 @@ policy:
 
         use crate::cas::{DurableCas, DurableCasConfig};
 
-        // Create a durable CAS
+        // Create a durable CAS (use subdirectory so DurableCas creates it with 0700)
         let temp_dir = TempDir::new().unwrap();
-        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = Arc::new(DurableCas::new(cas_config).unwrap());
 
         // Create broker with durable CAS
@@ -4281,9 +4281,9 @@ policy:
 
         use crate::cas::{DurableCas, DurableCasConfig};
 
-        // Create a durable CAS
+        // Create a durable CAS (use subdirectory so DurableCas creates it with 0700)
         let temp_dir = TempDir::new().unwrap();
-        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = Arc::new(DurableCas::new(cas_config).unwrap());
 
         // Create broker with durable CAS
@@ -4330,9 +4330,9 @@ policy:
 
         use crate::cas::{DurableCas, DurableCasConfig};
 
-        // Create a durable CAS (empty)
+        // Create a durable CAS (empty; use subdir for 0700 permissions)
         let temp_dir = TempDir::new().unwrap();
-        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = Arc::new(DurableCas::new(cas_config).unwrap());
 
         // Create broker with durable CAS
@@ -4391,9 +4391,9 @@ policy:
             }
         }
 
-        // Create a durable CAS
+        // Create a durable CAS (use subdirectory so DurableCas creates it with 0700)
         let temp_dir = TempDir::new().unwrap();
-        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = Arc::new(DurableCas::new(cas_config).unwrap());
 
         // Create broker with durable CAS
@@ -4457,9 +4457,9 @@ policy:
         use crate::cas::{DurableCas, DurableCasConfig};
         use crate::episode::executor::ContentAddressedStore as CasTrait;
 
-        // Create a durable CAS
+        // Create a durable CAS (use subdirectory so DurableCas creates it with 0700)
         let temp_dir = TempDir::new().unwrap();
-        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
         let cas = Arc::new(DurableCas::new(cas_config).unwrap());
 
         // Create a tampered manifest JSON with wrong hash

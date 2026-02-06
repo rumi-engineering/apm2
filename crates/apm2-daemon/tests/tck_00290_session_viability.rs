@@ -352,7 +352,7 @@ fn session_event_evidence_persist_publish_evidence_success() {
     let temp_dir = TempDir::new().unwrap();
     let minter = test_minter();
     let store = Arc::new(InMemoryManifestStore::new());
-    let cas_config = DurableCasConfig::new(temp_dir.path());
+    let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
 
     let dispatcher =
@@ -447,7 +447,7 @@ fn session_event_evidence_persist_stream_telemetry_not_implemented() {
 
     // Even with all stores configured, StreamTelemetry should be NOT_IMPLEMENTED
     let temp_dir = TempDir::new().unwrap();
-    let cas_config = DurableCasConfig::new(temp_dir.path());
+    let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
 
     let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
@@ -497,7 +497,7 @@ fn session_event_evidence_persist_full_config_integration() {
     let minter = test_minter();
     let store = Arc::new(InMemoryManifestStore::new());
     let ledger = Arc::new(StubLedgerEventEmitter::new());
-    let cas_config = DurableCasConfig::new(temp_dir.path());
+    let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
     let clock = test_clock();
 
@@ -634,7 +634,7 @@ fn session_event_evidence_persist_publish_evidence_retention_hints() {
     let temp_dir = TempDir::new().unwrap();
     let minter = test_minter();
     let store = Arc::new(InMemoryManifestStore::new());
-    let cas_config = DurableCasConfig::new(temp_dir.path());
+    let cas_config = DurableCasConfig::new(temp_dir.path().join("cas"));
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
 
     let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store).with_cas(cas);

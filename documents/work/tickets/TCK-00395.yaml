@@ -1,0 +1,108 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00395"
+    title: "Emit ledger events from privileged IPC handlers for work lifecycle observability"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_ORCHESTRATION"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00383"
+        reason: "Ledger must be wired to privileged dispatcher for event emission."
+  scope:
+    in_scope:
+      - "Extend ClaimWork handler to emit WorkTransitioned(Open->Claimed) event to ledger after work_claimed event."
+      - "Extend SpawnEpisode handler to emit WorkTransitioned(Claimed->InProgress) event to ledger after session_started event."
+      - "Add emit_work_transitioned method to LedgerEventEmitter trait and SqliteLedgerEventEmitter."
+      - "Add emit_session_terminated method to LedgerEventEmitter trait and SqliteLedgerEventEmitter."
+      - "Wire session termination callbacks (from episode runtime) to emit SessionTerminated event to ledger."
+      - "Ensure all emitted events use domain-separated signatures and HTF-compliant timestamps."
+      - "Add integration test: ClaimWork -> verify WorkTransitioned in ledger, SpawnEpisode -> verify WorkTransitioned in ledger, session terminates -> verify SessionTerminated in ledger."
+    out_of_scope:
+      - "Work reducer state machine changes (WorkTransitioned is already supported by the reducer at reducer.rs line 218)."
+      - "WorkTransitioned proto event definition (already exists in apm2.kernel.v1.rs line 320)."
+      - "Session dispatcher wiring (TCK-00383 handles CAS/broker/ledger/clock)."
+      - "Coordinate command changes to consume these events (TCK-00386)."
+      - "EpisodeSpawned event type (domain prefix exists at canonical.rs line 79 but no struct/emission exists yet -- defer to future ticket)."
+  plan:
+    steps:
+      - "Add emit_work_transitioned(work_id, from_state, to_state, rationale_code, previous_transition_count, actor_id, timestamp_ns) method to LedgerEventEmitter trait (dispatch.rs line 196)."
+      - "Implement emit_work_transitioned in SqliteLedgerEventEmitter (ledger.rs): create WorkTransitioned proto event, sign with JCS canonical encoding, persist to SQLite."
+      - "In handle_claim_work (dispatch.rs line 3149): after emit_work_claimed at line 3297, call emit_work_transitioned(work_id, 'Open', 'Claimed', 'work_claimed_via_ipc', 0, actor_id, timestamp_ns)."
+      - "In handle_spawn_episode (dispatch.rs line 3355): after emit_session_started at line 3935, call emit_work_transitioned(work_id, 'Claimed', 'InProgress', 'episode_spawned_via_ipc', 1, actor_id, timestamp_ns)."
+      - "Add emit_session_terminated(session_id, work_id, exit_code, termination_reason, actor_id, timestamp_ns) to LedgerEventEmitter trait."
+      - "Implement emit_session_terminated in SqliteLedgerEventEmitter."
+      - "In the episode runtime termination callback path (episode/mod.rs), when a session process exits, emit SessionTerminated event to ledger via the event_emitter."
+      - "Ensure the work state reducer's transition_count validation (reducer.rs line 257) is satisfied by tracking previous_transition_count from the ledger."
+      - "Add integration test: full lifecycle ClaimWork -> SpawnEpisode -> session terminates, query ledger for all 3 event types."
+      - "Verify existing tests still pass (especially the 7,377 existing tests)."
+  definition_of_done:
+    criteria:
+      - "ClaimWork IPC handler emits both work_claimed and WorkTransitioned(Open->Claimed) events to ledger."
+      - "SpawnEpisode IPC handler emits both session_started and WorkTransitioned(Claimed->InProgress) events to ledger."
+      - "Session termination emits SessionTerminated event to ledger."
+      - "WorkTransitioned events include correct from_state, to_state, rationale_code, and previous_transition_count."
+      - "All events use HTF-compliant timestamps and domain-separated signatures."
+      - "FAC CLI 'apm2 fac work status' can observe work state transitions from the ledger."
+      - "GateOrchestrator (TCK-00388) can observe SessionTerminated events in the ledger to trigger gate lifecycle."
+      - "Integration test validates full event chain from ClaimWork through session termination."
+  notes:
+    context: |
+      Work claimed via IPC (ClaimWork) currently emits a work_claimed event (dispatch.rs line 3297
+      via emit_work_claimed) but does NOT emit a WorkTransitioned event. Similarly, SpawnEpisode
+      emits session_started (line 3935 via emit_session_started) but no WorkTransitioned event.
+      Session termination emits no ledger event at all.
+
+      This means the ledger (the source of truth for FAC) is disconnected from the IPC work
+      lifecycle. The FAC CLI ('apm2 fac work status') queries the ledger and finds work_claimed
+      but cannot determine the current work state because no WorkTransitioned events exist.
+
+      The GateOrchestrator (TCK-00388) watches for session_terminated ledger events to trigger
+      the gate lifecycle, but those events are never emitted by the current IPC flow. Without
+      this ticket, the autonomous pipeline stalls after session termination -- gates never start.
+
+      The work reducer (crates/apm2-core/src/work/reducer.rs) supports these transitions:
+      - Open -> Claimed (line 162, handle_transitioned at line 218)
+      - Claimed -> InProgress (line 163)
+      - InProgress -> Review (line 164)
+      - Review -> Completed (line 166, via WorkCompleted)
+
+      The WorkTransitioned proto event (apm2.kernel.v1.rs line 320) has: work_id, from_state,
+      to_state, rationale_code, previous_transition_count. The reducer validates that from_state
+      matches current state (line 235) and checks transition_count for replay protection (line 257).
+
+      The LedgerEventEmitter trait (dispatch.rs line 196) currently has: emit_work_claimed,
+      emit_session_started, emit_session_event, emit_defect_recorded, emit_episode_event,
+      emit_review_receipt, emit_episode_run_attributed. It does NOT have emit_work_transitioned
+      or emit_session_terminated -- these need to be added.
+
+      The EPISODE_SPAWNED_DOMAIN_PREFIX exists (canonical.rs line 79) but no EpisodeSpawned
+      struct or emission exists. This is deferred -- WorkTransitioned events are sufficient for
+      the gate orchestrator to observe work state changes.
+    files: |
+      - crates/apm2-daemon/src/protocol/dispatch.rs (LedgerEventEmitter trait at line 196, ClaimWork handler at line 3149 with emit_work_claimed at line 3297, SpawnEpisode handler at line 3355 with emit_session_started at line 3935)
+      - crates/apm2-daemon/src/ledger.rs (SqliteLedgerEventEmitter, emit_work_claimed at line 74, emit_session_started at line 174, needs emit_work_transitioned and emit_session_terminated)
+      - crates/apm2-core/src/work/reducer.rs (work state machine at lines 160-168, WorkTransitioned handling at line 218, transition_count validation at line 257)
+      - crates/apm2-core/src/events/apm2.kernel.v1.rs (WorkTransitioned proto at line 320)
+      - crates/apm2-core/src/events/canonical.rs (WORK_CLAIMED_DOMAIN_PREFIX at line 77, EPISODE_SPAWNED_DOMAIN_PREFIX at line 79)
+      - crates/apm2-daemon/src/episode/mod.rs (episode runtime, termination callback path)
+      - crates/apm2-daemon/src/protocol/topic_derivation.rs (WorkTransitioned topic routing at line 286)
+    security: |
+      WorkTransitioned events must use domain-separated signatures to prevent cross-domain
+      replay. The previous_transition_count field provides replay protection -- the reducer
+      rejects events with stale counts (reducer.rs line 257). The handler must validate
+      that the actor_id performing the transition has appropriate permissions (operator
+      socket peer credential verification). SessionTerminated events must include the
+      actual exit code and termination reason for audit trail completeness. The transition
+      rationale_code must be specific ('work_claimed_via_ipc', 'episode_spawned_via_ipc')
+      to distinguish IPC-initiated transitions from other sources. All timestamps must be
+      HTF-compliant to maintain ledger temporal consistency.

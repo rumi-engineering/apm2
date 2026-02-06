@@ -1,0 +1,111 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00391"
+    title: "Autonomous FAC end-to-end integration test: full lifecycle without xtask"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_ORCHESTRATION"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00388"
+        reason: "Gate orchestrator must be implemented to exercise gate lease/execution/receipt steps."
+      - ticket_id: "TCK-00389"
+        reason: "Review ingestion must be wired for ReviewReceiptRecorded verification."
+      - ticket_id: "TCK-00390"
+        reason: "Merge executor must be wired for MergeReceipt verification."
+      - ticket_id: "TCK-00287"
+        reason: "ProtocolServer dispatchers must handle all FAC IPC requests."
+      - ticket_id: "TCK-00288"
+        reason: "Protocol clients provide the dual-socket IPC transport."
+  scope:
+    in_scope:
+      - "Create `crates/apm2-daemon/tests/fac_autonomous_e2e.rs` integration test."
+      - "Test harness starts daemon in-process with all dependencies wired (CAS, ledger, broker)."
+      - "Exercise full FAC lifecycle: ClaimWork -> SpawnEpisode -> simulate session work -> SessionTerminated -> GateLeaseIssued -> GateReceipt(PASS) -> ReviewReceiptRecorded -> MergeReceipt -> WorkCompleted."
+      - "Verify every ledger event is emitted in correct order with valid signatures."
+      - "Verify projection receipts are generated for each state transition."
+      - "Verify work state transitions: Open -> Claimed -> InProgress -> CiPending -> ReadyForReview -> Review -> Completed."
+      - "Verify metrics counters match expected values at each step."
+      - "Use mock GitHub adapter for merge verification (no real GitHub calls)."
+    out_of_scope:
+      - "Real GitHub API integration tests."
+      - "Performance or load testing."
+      - "Agent adapter spawning (use mock harness from tests/common/mock_harness.rs)."
+      - "xtask CLI invocation (test drives daemon directly via in-process wiring)."
+  plan:
+    steps:
+      - "Scaffold `fac_autonomous_e2e.rs` under `crates/apm2-daemon/tests/` using the existing mock_harness pattern from `tests/common/mock_harness.rs`."
+      - "Wire in-process daemon with SqliteLedgerEventEmitter, CAS store, work registry, session registry, and broker."
+      - "Implement helper that sends ClaimWork via OperatorClient and asserts work transitions to Claimed."
+      - "Implement helper that sends SpawnEpisode via OperatorClient and asserts session creation and work transitions to InProgress."
+      - "Simulate session work completion (tool invocations, workspace snapshot) via SessionClient."
+      - "Send SessionTerminated and verify work transitions to CiPending."
+      - "Send GateLeaseIssued, simulate gate execution, and send GateReceipt(PASS); verify transition to ReadyForReview."
+      - "Send ReviewReceiptRecorded with PASS verdict; verify transition to Review."
+      - "Send MergeReceipt with success; verify transition to Completed."
+      - "Assert full ledger event sequence in order: WorkClaimed, EpisodeSpawned, SessionTerminated, GateLeaseIssued, GateReceiptRecorded, ReviewReceiptRecorded, MergeReceiptRecorded, WorkCompleted."
+      - "Assert all events carry valid HMAC signatures matching the holonic clock."
+      - "Assert projection receipts exist for each event."
+      - "Assert metrics counters (work_claimed_total, episodes_spawned_total, gates_passed_total, reviews_completed_total, merges_completed_total) match expected counts."
+      - "Add negative test: GateReceipt(FAIL) halts lifecycle at CiPending and does not advance to review."
+      - "Add negative test: ReviewReceipt with REJECT verdict transitions work to NeedsInput, not Completed."
+  definition_of_done:
+    criteria:
+      - "Test `test_fac_autonomous_full_lifecycle` passes exercising all 8 FAC state transitions through daemon IPC."
+      - "Ledger events are emitted in correct causal order with valid signatures."
+      - "Projection receipts are generated for every ledger event."
+      - "Work state machine reaches Completed from Open through all intermediate states."
+      - "Metrics counters match expected values after full lifecycle."
+      - "Negative tests verify gate failure and review rejection halt the lifecycle correctly."
+      - "No real GitHub API calls are made (mock adapter only)."
+      - "All 7,377+ existing tests continue to pass."
+  notes:
+    context: |
+      The existing `hef_fac_v0_e2e.rs` test validates CAS->ledger->workspace->review receipt
+      flow but does not exercise the full daemon IPC path. It focuses on REQ-HEF-0009,
+      REQ-HEF-0010, and REQ-HEF-0011 evidence collection rather than autonomous lifecycle
+      orchestration.
+
+      The existing `protocol_integration.rs` tests validate IPC message framing and dispatch
+      but do not exercise the FAC lifecycle state machine.
+
+      The full FAC state machine is:
+        work claim -> episode spawn -> session terminate -> policy resolution ->
+        gate lease -> gate execution -> gate receipt -> review receipt ->
+        merge receipt -> work complete
+
+      All 7,377 existing tests pass, but none exercise the full autonomous cycle through
+      the daemon's dual-socket IPC (operator socket for privileged commands, session socket
+      for agent commands). This test closes that coverage gap.
+
+      The coordinate command (`crates/apm2-cli/src/commands/coordinate.rs`) drives the
+      claim-work and spawn-episode portion via OperatorClient, but does not exercise
+      gates, review, or merge.
+
+      The work state enum (`WorkState` in `crates/apm2-core/src/work/state.rs`) defines
+      the full lifecycle: Open(0), Claimed(1), InProgress(2), Review(3), NeedsInput(4),
+      NeedsAdjudication(5), Completed(6), Aborted(7).
+    files: |
+      - crates/apm2-daemon/tests/fac_autonomous_e2e.rs (new file)
+      - crates/apm2-daemon/tests/common/mock_harness.rs (reuse mock infrastructure)
+      - crates/apm2-daemon/tests/hef_fac_v0_e2e.rs (existing partial E2E, reference pattern)
+      - crates/apm2-daemon/src/protocol/dispatch.rs (PrivilegedDispatcher handles FAC IPC)
+      - crates/apm2-cli/src/client/protocol.rs (OperatorClient and SessionClient)
+      - crates/apm2-cli/src/commands/coordinate.rs (coordination flow reference)
+      - crates/apm2-core/src/work/state.rs (WorkState enum and transitions)
+      - crates/apm2-core/src/work/reducer.rs (work state reducer logic)
+      - crates/apm2-daemon/src/ledger.rs (SqliteLedgerEventEmitter)
+    security: |
+      The test must not make real GitHub API calls. Ensure GITHUB_TOKEN and GH_TOKEN
+      environment variables are unset in the test harness (consistent with EVID-HEF-0012
+      constraints). Mock adapters must not leak credentials. All HMAC signatures in
+      ledger events must be verified for integrity.
