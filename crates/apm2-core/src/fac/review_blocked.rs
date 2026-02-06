@@ -157,6 +157,12 @@ pub enum ReasonCode {
     /// the taint policy denies the flow. Per REQ-0016, taint tracking prevents
     /// untrusted content from silently influencing high-risk decisions.
     TaintFlowDenied,
+    /// Merge conflict detected during autonomous merge execution (TCK-00390).
+    ///
+    /// This code is emitted when the merge executor attempts a squash merge
+    /// via the GitHub API and the merge fails due to a merge conflict.
+    /// The work item remains in Review state for manual intervention.
+    MergeConflict,
 }
 
 impl std::fmt::Display for ReasonCode {
@@ -175,6 +181,7 @@ impl std::fmt::Display for ReasonCode {
             Self::ContextPackInvalid => write!(f, "CONTEXT_PACK_INVALID"),
             Self::AdapterMisconfigured => write!(f, "ADAPTER_MISCONFIGURED"),
             Self::TaintFlowDenied => write!(f, "TAINT_FLOW_DENIED"),
+            Self::MergeConflict => write!(f, "MERGE_CONFLICT"),
         }
     }
 }
@@ -197,6 +204,7 @@ impl std::str::FromStr for ReasonCode {
             "CONTEXT_PACK_INVALID" => Ok(Self::ContextPackInvalid),
             "ADAPTER_MISCONFIGURED" => Ok(Self::AdapterMisconfigured),
             "TAINT_FLOW_DENIED" => Ok(Self::TaintFlowDenied),
+            "MERGE_CONFLICT" => Ok(Self::MergeConflict),
             _ => Err(ReviewBlockedError::InvalidReasonCode(s.to_string())),
         }
     }
@@ -232,6 +240,7 @@ impl ReasonCode {
             Self::ContextPackInvalid => 11,
             Self::AdapterMisconfigured => 12,
             Self::TaintFlowDenied => 13,
+            Self::MergeConflict => 14,
         }
     }
 
@@ -255,6 +264,7 @@ impl ReasonCode {
             11 => Ok(Self::ContextPackInvalid),
             12 => Ok(Self::AdapterMisconfigured),
             13 => Ok(Self::TaintFlowDenied),
+            14 => Ok(Self::MergeConflict),
             0 => Err(ReviewBlockedError::InvalidReasonCode(
                 "UNSPECIFIED (0) is not a valid reason code".to_string(),
             )),
@@ -842,15 +852,16 @@ mod tests {
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        // Values 1-13 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9,
-        // TCK-00326 added 10-11, TCK-00328 added 12, TCK-00339 added 13)
-        for code in 1..=13u8 {
+        // Values 1-14 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9,
+        // TCK-00326 added 10-11, TCK-00328 added 12, TCK-00339 added 13,
+        // TCK-00390 added 14)
+        for code in 1..=14u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
         }
-        // 0 (UNSPECIFIED) and 14+ are invalid
+        // 0 (UNSPECIFIED) and 15+ are invalid
         assert!(ReasonCode::from_code(0).is_err());
-        assert!(ReasonCode::from_code(14).is_err());
+        assert!(ReasonCode::from_code(15).is_err());
     }
 
     #[test]

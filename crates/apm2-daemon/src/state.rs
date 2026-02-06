@@ -38,7 +38,7 @@ use crate::episode::{
     PersistentRegistryError, PersistentSessionRegistry, SharedToolBroker, ToolBrokerConfig,
     new_shared_broker_with_cas,
 };
-use crate::gate::{GateOrchestrator, GateOrchestratorEvent, SessionTerminatedInfo};
+use crate::gate::{GateOrchestrator, GateOrchestratorEvent, MergeExecutor, SessionTerminatedInfo};
 use crate::governance::GovernancePolicyResolver;
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
@@ -144,9 +144,15 @@ pub struct DispatcherState {
     /// When set, the dispatcher invokes
     /// [`GateOrchestrator::on_session_terminated`] from the production
     /// session termination path, returning ledger events for persistence.
-    /// The full ledger subscription integration is deferred to
-    /// TCK-00390 (merge automation).
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
+
+    /// Merge executor for autonomous merge after gate approval (TCK-00390).
+    ///
+    /// When set, the merge executor is available for triggering the
+    /// autonomous merge lifecycle when all gate receipts reach PASS verdict.
+    /// It verifies policy hash, executes squash merge via GitHub API,
+    /// creates a signed `MergeReceipt`, and transitions work to Completed.
+    merge_executor: Option<Arc<MergeExecutor>>,
 }
 
 impl DispatcherState {
@@ -252,6 +258,7 @@ impl DispatcherState {
             privileged_dispatcher,
             session_dispatcher,
             gate_orchestrator: None,
+            merge_executor: None,
         }
     }
 
@@ -335,6 +342,7 @@ impl DispatcherState {
             privileged_dispatcher,
             session_dispatcher,
             gate_orchestrator: None,
+            merge_executor: None,
         }
     }
 
@@ -499,6 +507,7 @@ impl DispatcherState {
             privileged_dispatcher,
             session_dispatcher,
             gate_orchestrator: None,
+            merge_executor: None,
         }
     }
 
@@ -717,6 +726,7 @@ impl DispatcherState {
             privileged_dispatcher,
             session_dispatcher,
             gate_orchestrator: None,
+            merge_executor: None,
         })
     }
 
@@ -752,6 +762,24 @@ impl DispatcherState {
     #[must_use]
     pub const fn gate_orchestrator(&self) -> Option<&Arc<GateOrchestrator>> {
         self.gate_orchestrator.as_ref()
+    }
+
+    /// Sets the merge executor for autonomous merge after gate approval
+    /// (TCK-00390).
+    ///
+    /// When set, [`merge_executor`](Self::merge_executor) returns the executor
+    /// that the caller can invoke to trigger the autonomous merge lifecycle
+    /// when all gates pass.
+    #[must_use]
+    pub fn with_merge_executor(mut self, executor: Arc<MergeExecutor>) -> Self {
+        self.merge_executor = Some(executor);
+        self
+    }
+
+    /// Returns a reference to the merge executor, if configured.
+    #[must_use]
+    pub const fn merge_executor(&self) -> Option<&Arc<MergeExecutor>> {
+        self.merge_executor.as_ref()
     }
 
     /// Notifies the gate orchestrator that a session has terminated.
