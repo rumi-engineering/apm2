@@ -1301,6 +1301,512 @@ impl EpisodeEnvelopeBuilder {
     }
 }
 
+// ============================================================================
+// TCK-00350: EpisodeEnvelopeV1 — envelope with receipt binding fields
+// ============================================================================
+
+/// V1 envelope that extends [`EpisodeEnvelope`] with receipt binding fields
+/// required by REQ-0004.
+///
+/// Per REQ-0004:
+/// - All authoritative effects MUST bind `envelope_hash`,
+///   `capability_manifest_hash`, and `view_commitment_hash` in receipts.
+/// - `EpisodeEnvelopeV1` MUST bind `freshness_pinset_hash` (deterministic
+///   pinned-snapshot commitment).
+/// - Delegated episodes MUST bind `permeability_receipt_hash`.
+/// - Spawn or resume without valid envelope bindings MUST be denied.
+///
+/// # Fail-closed Semantics
+///
+/// All hash fields are validated as non-zero at construction time. Attempts
+/// to build an `EpisodeEnvelopeV1` with zero hashes are rejected, enforcing
+/// fail-closed behavior.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EpisodeEnvelopeV1 {
+    /// The inner episode envelope with all base fields.
+    inner: EpisodeEnvelope,
+
+    /// BLAKE3 hash of the `ViewCommitmentV1` binding.
+    ///
+    /// This hash commits to the specific view of the world that the episode
+    /// is operating against. Receipts MUST include this hash to enable
+    /// replay verification.
+    view_commitment_hash: [u8; 32],
+
+    /// BLAKE3 hash of the deterministic freshness pinset commitment.
+    ///
+    /// Per REQ-0004, the envelope MUST bind a deterministic pinned-snapshot
+    /// commitment hash, ensuring that the freshness of referenced artifacts
+    /// is verifiable during replay.
+    freshness_pinset_hash: [u8; 32],
+
+    /// Optional BLAKE3 hash of the permeability receipt for delegated
+    /// episodes.
+    ///
+    /// Per REQ-0004, delegated episodes MUST bind `permeability_receipt_hash`.
+    /// Non-delegated episodes leave this as `None`.
+    permeability_receipt_hash: Option<[u8; 32]>,
+}
+
+impl EpisodeEnvelopeV1 {
+    /// Creates a new V1 envelope builder.
+    #[must_use]
+    pub const fn builder() -> EpisodeEnvelopeV1Builder {
+        EpisodeEnvelopeV1Builder::new()
+    }
+
+    /// Returns the inner base envelope.
+    #[must_use]
+    pub const fn inner(&self) -> &EpisodeEnvelope {
+        &self.inner
+    }
+
+    /// Returns the BLAKE3 digest of the inner envelope.
+    ///
+    /// This is the `envelope_hash` bound into all receipts.
+    #[must_use]
+    pub fn envelope_hash(&self) -> [u8; 32] {
+        self.inner.digest()
+    }
+
+    /// Returns the capability manifest hash from the inner envelope.
+    #[must_use]
+    pub fn capability_manifest_hash(&self) -> &[u8] {
+        self.inner.capability_manifest_hash()
+    }
+
+    /// Returns the view commitment hash.
+    #[must_use]
+    pub const fn view_commitment_hash(&self) -> &[u8; 32] {
+        &self.view_commitment_hash
+    }
+
+    /// Returns the freshness pinset hash.
+    #[must_use]
+    pub const fn freshness_pinset_hash(&self) -> &[u8; 32] {
+        &self.freshness_pinset_hash
+    }
+
+    /// Returns the permeability receipt hash, if present.
+    #[must_use]
+    pub const fn permeability_receipt_hash(&self) -> Option<&[u8; 32]> {
+        self.permeability_receipt_hash.as_ref()
+    }
+
+    /// Returns `true` if this is a delegated episode (has permeability
+    /// receipt).
+    #[must_use]
+    pub const fn is_delegated(&self) -> bool {
+        self.permeability_receipt_hash.is_some()
+    }
+
+    /// Extracts the [`EnvelopeBindings`] for embedding into receipts.
+    ///
+    /// Per REQ-0004, every authoritative receipt MUST carry these three
+    /// binding hashes.
+    #[must_use]
+    pub fn bindings(&self) -> EnvelopeBindings {
+        let mut cap_hash = [0u8; 32];
+        let cap_slice = self.inner.capability_manifest_hash();
+        if cap_slice.len() == 32 {
+            cap_hash.copy_from_slice(cap_slice);
+        }
+        EnvelopeBindings {
+            envelope_hash: self.envelope_hash(),
+            capability_manifest_hash: cap_hash,
+            view_commitment_hash: self.view_commitment_hash,
+        }
+    }
+
+    /// Validates that this envelope is well-formed for spawn/resume.
+    ///
+    /// # Fail-closed
+    ///
+    /// Returns an error if any required binding is missing or zero. This
+    /// is the enforcement point for the spawn/resume gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeV1Error`] if validation fails.
+    pub fn validate_for_spawn(&self) -> Result<(), EnvelopeV1Error> {
+        // Envelope hash is derived from inner, always non-zero if inner is
+        // valid. But double-check as defense-in-depth.
+        if self.envelope_hash() == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroEnvelopeHash);
+        }
+
+        // Capability manifest hash must be non-zero
+        if self.inner.capability_manifest_hash() == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroCapabilityManifestHash);
+        }
+
+        // View commitment hash must be non-zero
+        if self.view_commitment_hash == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroViewCommitmentHash);
+        }
+
+        // Freshness pinset hash must be non-zero
+        if self.freshness_pinset_hash == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroFreshnessPinsetHash);
+        }
+
+        Ok(())
+    }
+
+    /// Validates that this envelope is well-formed for a delegated
+    /// spawn/resume.
+    ///
+    /// In addition to the base spawn validation, delegated episodes
+    /// MUST have a non-zero `permeability_receipt_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeV1Error`] if validation fails.
+    pub fn validate_for_delegated_spawn(&self) -> Result<(), EnvelopeV1Error> {
+        self.validate_for_spawn()?;
+
+        match &self.permeability_receipt_hash {
+            None => Err(EnvelopeV1Error::MissingPermeabilityReceiptHash),
+            Some(hash) if *hash == [0u8; 32] => Err(EnvelopeV1Error::ZeroPermeabilityReceiptHash),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+/// Receipt binding triplet extracted from an `EpisodeEnvelopeV1`.
+///
+/// Per REQ-0004, every authoritative effect receipt MUST carry these
+/// three binding hashes. Receipts emitted without these bindings MUST
+/// be rejected (fail-closed).
+///
+/// # Validation
+///
+/// Use [`EnvelopeBindings::validate`] to ensure all bindings are
+/// present and non-zero before signing a receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EnvelopeBindings {
+    /// BLAKE3 hash of the `EpisodeEnvelope` canonical bytes.
+    pub envelope_hash: [u8; 32],
+
+    /// BLAKE3 hash of the capability manifest.
+    pub capability_manifest_hash: [u8; 32],
+
+    /// BLAKE3 hash of the `ViewCommitmentV1`.
+    pub view_commitment_hash: [u8; 32],
+}
+
+impl EnvelopeBindings {
+    /// Validates that all binding hashes are non-zero.
+    ///
+    /// # Fail-closed
+    ///
+    /// Receipts MUST NOT be signed if any binding is zero. This method
+    /// enforces that invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeV1Error`] if any binding hash is zero.
+    pub fn validate(&self) -> Result<(), EnvelopeV1Error> {
+        if self.envelope_hash == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroEnvelopeHash);
+        }
+        if self.capability_manifest_hash == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroCapabilityManifestHash);
+        }
+        if self.view_commitment_hash == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroViewCommitmentHash);
+        }
+        Ok(())
+    }
+
+    /// Verifies that these bindings match the given envelope.
+    ///
+    /// This is the replay verification path: given a receipt's bindings
+    /// and the CAS-stored envelope, verify consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeV1Error::BindingMismatch`] if any hash does
+    /// not match.
+    pub fn verify_against(&self, envelope: &EpisodeEnvelopeV1) -> Result<(), EnvelopeV1Error> {
+        let expected = envelope.bindings();
+
+        if self.envelope_hash != expected.envelope_hash {
+            return Err(EnvelopeV1Error::BindingMismatch {
+                field: "envelope_hash",
+            });
+        }
+        if self.capability_manifest_hash != expected.capability_manifest_hash {
+            return Err(EnvelopeV1Error::BindingMismatch {
+                field: "capability_manifest_hash",
+            });
+        }
+        if self.view_commitment_hash != expected.view_commitment_hash {
+            return Err(EnvelopeV1Error::BindingMismatch {
+                field: "view_commitment_hash",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns hex-encoded representations for JSON inclusion in ledger
+    /// events.
+    #[must_use]
+    pub fn to_hex_map(&self) -> (String, String, String) {
+        (
+            hex::encode(self.envelope_hash),
+            hex::encode(self.capability_manifest_hash),
+            hex::encode(self.view_commitment_hash),
+        )
+    }
+}
+
+/// Error type for `EpisodeEnvelopeV1` operations (TCK-00350).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EnvelopeV1Error {
+    /// Inner envelope construction failed.
+    #[error("inner envelope error: {0}")]
+    InnerEnvelopeError(#[from] EnvelopeError),
+
+    /// View commitment hash is missing (zero).
+    #[error("view_commitment_hash is zero (fail-closed)")]
+    ZeroViewCommitmentHash,
+
+    /// Freshness pinset hash is missing (zero).
+    #[error("freshness_pinset_hash is zero (fail-closed)")]
+    ZeroFreshnessPinsetHash,
+
+    /// Envelope hash is zero (should never happen with valid inner).
+    #[error("envelope_hash is zero (fail-closed)")]
+    ZeroEnvelopeHash,
+
+    /// Capability manifest hash is zero.
+    #[error("capability_manifest_hash is zero (fail-closed)")]
+    ZeroCapabilityManifestHash,
+
+    /// Permeability receipt hash is required for delegated episodes.
+    #[error("permeability_receipt_hash is required for delegated episodes")]
+    MissingPermeabilityReceiptHash,
+
+    /// Permeability receipt hash is zero.
+    #[error("permeability_receipt_hash is zero (fail-closed)")]
+    ZeroPermeabilityReceiptHash,
+
+    /// Binding mismatch during replay verification.
+    #[error("{field} does not match envelope")]
+    BindingMismatch {
+        /// The field that mismatched.
+        field: &'static str,
+    },
+}
+
+/// Builder for [`EpisodeEnvelopeV1`].
+///
+/// Follows the same pattern as [`EpisodeEnvelopeBuilder`] but adds
+/// V1-specific fields.
+#[derive(Debug, Clone, Default)]
+pub struct EpisodeEnvelopeV1Builder {
+    /// Inner envelope builder.
+    inner: EpisodeEnvelopeBuilder,
+    /// View commitment hash.
+    view_commitment_hash: [u8; 32],
+    /// Freshness pinset hash.
+    freshness_pinset_hash: [u8; 32],
+    /// Permeability receipt hash (for delegated episodes).
+    permeability_receipt_hash: Option<[u8; 32]>,
+}
+
+impl EpisodeEnvelopeV1Builder {
+    /// Creates a new V1 builder.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            inner: EpisodeEnvelopeBuilder::new(),
+            view_commitment_hash: [0u8; 32],
+            freshness_pinset_hash: [0u8; 32],
+            permeability_receipt_hash: None,
+        }
+    }
+
+    /// Sets the episode ID (required).
+    #[must_use]
+    pub fn episode_id(mut self, id: impl Into<String>) -> Self {
+        self.inner = self.inner.episode_id(id);
+        self
+    }
+
+    /// Sets the actor ID (required).
+    #[must_use]
+    pub fn actor_id(mut self, id: impl Into<String>) -> Self {
+        self.inner = self.inner.actor_id(id);
+        self
+    }
+
+    /// Sets the work ID (optional).
+    #[must_use]
+    pub fn work_id(mut self, id: impl Into<String>) -> Self {
+        self.inner = self.inner.work_id(id);
+        self
+    }
+
+    /// Sets the lease ID (required).
+    #[must_use]
+    pub fn lease_id(mut self, id: impl Into<String>) -> Self {
+        self.inner = self.inner.lease_id(id);
+        self
+    }
+
+    /// Sets the budget.
+    #[must_use]
+    pub fn budget(mut self, budget: EpisodeBudget) -> Self {
+        self.inner = self.inner.budget(budget);
+        self
+    }
+
+    /// Sets the stop conditions.
+    #[must_use]
+    pub fn stop_conditions(mut self, conditions: StopConditions) -> Self {
+        self.inner = self.inner.stop_conditions(conditions);
+        self
+    }
+
+    /// Sets the pinned snapshot.
+    #[must_use]
+    pub fn pinned_snapshot(mut self, snapshot: PinnedSnapshot) -> Self {
+        self.inner = self.inner.pinned_snapshot(snapshot);
+        self
+    }
+
+    /// Sets the capability manifest hash.
+    #[must_use]
+    pub fn capability_manifest_hash(mut self, hash: [u8; 32]) -> Self {
+        self.inner = self.inner.capability_manifest_hash(hash);
+        self
+    }
+
+    /// Sets the risk tier.
+    #[must_use]
+    pub fn risk_tier(mut self, tier: RiskTier) -> Self {
+        self.inner = self.inner.risk_tier(tier);
+        self
+    }
+
+    /// Sets the determinism class.
+    #[must_use]
+    pub fn determinism_class(mut self, class: DeterminismClass) -> Self {
+        self.inner = self.inner.determinism_class(class);
+        self
+    }
+
+    /// Sets the context refs.
+    #[must_use]
+    pub fn context_refs(mut self, refs: ContextRefs) -> Self {
+        self.inner = self.inner.context_refs(refs);
+        self
+    }
+
+    /// Sets the view commitment hash (required).
+    #[must_use]
+    pub const fn view_commitment_hash(mut self, hash: [u8; 32]) -> Self {
+        self.view_commitment_hash = hash;
+        self
+    }
+
+    /// Sets the freshness pinset hash (required).
+    #[must_use]
+    pub const fn freshness_pinset_hash(mut self, hash: [u8; 32]) -> Self {
+        self.freshness_pinset_hash = hash;
+        self
+    }
+
+    /// Sets the permeability receipt hash (required for delegated episodes).
+    #[must_use]
+    pub const fn permeability_receipt_hash(mut self, hash: [u8; 32]) -> Self {
+        self.permeability_receipt_hash = Some(hash);
+        self
+    }
+
+    /// Builds the V1 envelope, validating all required fields.
+    ///
+    /// # Fail-closed
+    ///
+    /// In addition to base envelope validation, this checks that:
+    /// - `view_commitment_hash` is non-zero
+    /// - `freshness_pinset_hash` is non-zero
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeV1Error`] if any required field is missing or
+    /// invalid.
+    pub fn build(self) -> Result<EpisodeEnvelopeV1, EnvelopeV1Error> {
+        let inner = self.inner.build()?;
+
+        // Fail-closed: view_commitment_hash must be non-zero
+        if self.view_commitment_hash == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroViewCommitmentHash);
+        }
+
+        // Fail-closed: freshness_pinset_hash must be non-zero
+        if self.freshness_pinset_hash == [0u8; 32] {
+            return Err(EnvelopeV1Error::ZeroFreshnessPinsetHash);
+        }
+
+        // Fail-closed: permeability_receipt_hash, if present, must be non-zero
+        if let Some(ref hash) = self.permeability_receipt_hash {
+            if *hash == [0u8; 32] {
+                return Err(EnvelopeV1Error::ZeroPermeabilityReceiptHash);
+            }
+        }
+
+        Ok(EpisodeEnvelopeV1 {
+            inner,
+            view_commitment_hash: self.view_commitment_hash,
+            freshness_pinset_hash: self.freshness_pinset_hash,
+            permeability_receipt_hash: self.permeability_receipt_hash,
+        })
+    }
+}
+
+/// Validates envelope bindings at the spawn/resume gate.
+///
+/// This is the top-level enforcement point. Callers MUST invoke this
+/// before allowing a spawn or resume to proceed.
+///
+/// # Fail-closed
+///
+/// Returns an error if:
+/// - The envelope is `None` (absent)
+/// - The envelope fails validation
+/// - For delegated episodes: `permeability_receipt_hash` is missing
+///
+/// # Arguments
+///
+/// * `envelope` - The V1 envelope, or `None` if absent
+/// * `is_delegated` - Whether this is a delegated episode
+///
+/// # Errors
+///
+/// Returns [`EnvelopeV1Error`] if the gate check fails.
+pub fn validate_spawn_gate(
+    envelope: Option<&EpisodeEnvelopeV1>,
+    is_delegated: bool,
+) -> Result<&EpisodeEnvelopeV1, EnvelopeV1Error> {
+    let env = envelope.ok_or(EnvelopeV1Error::ZeroEnvelopeHash)?;
+
+    if is_delegated {
+        env.validate_for_delegated_spawn()?;
+    } else {
+        env.validate_for_spawn()?;
+    }
+
+    Ok(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2663,5 +3169,349 @@ mod tests {
             ),
             "build() must reject oversized goal_predicate, got: {result:?}"
         );
+    }
+
+    // ========================================================================
+    // TCK-00350: EpisodeEnvelopeV1 tests
+    // ========================================================================
+
+    /// Helper to create a minimal valid V1 envelope.
+    fn minimal_v1_envelope() -> EpisodeEnvelopeV1 {
+        EpisodeEnvelopeV1::builder()
+            .episode_id("ep-001")
+            .actor_id("agent-007")
+            .lease_id("lease-123")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .build()
+            .expect("valid V1 envelope")
+    }
+
+    #[test]
+    fn test_v1_envelope_builder_minimal() {
+        let env = minimal_v1_envelope();
+
+        assert_eq!(env.inner().episode_id(), "ep-001");
+        assert_eq!(env.inner().actor_id(), "agent-007");
+        assert_eq!(env.inner().lease_id(), "lease-123");
+        assert_eq!(env.view_commitment_hash(), &[0xcc; 32]);
+        assert_eq!(env.freshness_pinset_hash(), &[0xdd; 32]);
+        assert!(env.permeability_receipt_hash().is_none());
+        assert!(!env.is_delegated());
+    }
+
+    #[test]
+    fn test_v1_envelope_delegated() {
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-del")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash([0xee; 32])
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        assert!(env.is_delegated());
+        assert_eq!(env.permeability_receipt_hash(), Some(&[0xee; 32]));
+    }
+
+    #[test]
+    fn test_v1_envelope_rejects_zero_view_commitment() {
+        let result = EpisodeEnvelopeV1::builder()
+            .episode_id("ep")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0u8; 32]) // zero — must fail
+            .freshness_pinset_hash([0xdd; 32])
+            .build();
+
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::ZeroViewCommitmentHash)),
+            "expected ZeroViewCommitmentHash, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_envelope_rejects_zero_freshness_pinset() {
+        let result = EpisodeEnvelopeV1::builder()
+            .episode_id("ep")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0u8; 32]) // zero — must fail
+            .build();
+
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::ZeroFreshnessPinsetHash)),
+            "expected ZeroFreshnessPinsetHash, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_envelope_rejects_zero_permeability_receipt() {
+        let result = EpisodeEnvelopeV1::builder()
+            .episode_id("ep")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash([0u8; 32]) // zero — must fail
+            .build();
+
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::ZeroPermeabilityReceiptHash)),
+            "expected ZeroPermeabilityReceiptHash, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_envelope_inner_error_propagated() {
+        // Missing episode_id should propagate through V1 builder
+        let result = EpisodeEnvelopeV1::builder()
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .build();
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeV1Error::InnerEnvelopeError(
+                    EnvelopeError::MissingEpisodeId
+                ))
+            ),
+            "expected inner MissingEpisodeId, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_bindings_extraction() {
+        let env = minimal_v1_envelope();
+        let bindings = env.bindings();
+
+        // envelope_hash should be the BLAKE3 digest of inner canonical bytes
+        assert_eq!(bindings.envelope_hash, env.envelope_hash());
+        assert_eq!(bindings.capability_manifest_hash, [0xab; 32]);
+        assert_eq!(bindings.view_commitment_hash, [0xcc; 32]);
+    }
+
+    #[test]
+    fn test_v1_bindings_validate_passes() {
+        let env = minimal_v1_envelope();
+        let bindings = env.bindings();
+
+        assert!(bindings.validate().is_ok());
+    }
+
+    #[test]
+    fn test_v1_bindings_validate_rejects_zero_envelope_hash() {
+        let bindings = EnvelopeBindings {
+            envelope_hash: [0u8; 32],
+            capability_manifest_hash: [0xab; 32],
+            view_commitment_hash: [0xcc; 32],
+        };
+
+        assert!(matches!(
+            bindings.validate(),
+            Err(EnvelopeV1Error::ZeroEnvelopeHash)
+        ));
+    }
+
+    #[test]
+    fn test_v1_bindings_validate_rejects_zero_capability_hash() {
+        let bindings = EnvelopeBindings {
+            envelope_hash: [0x11; 32],
+            capability_manifest_hash: [0u8; 32],
+            view_commitment_hash: [0xcc; 32],
+        };
+
+        assert!(matches!(
+            bindings.validate(),
+            Err(EnvelopeV1Error::ZeroCapabilityManifestHash)
+        ));
+    }
+
+    #[test]
+    fn test_v1_bindings_validate_rejects_zero_view_hash() {
+        let bindings = EnvelopeBindings {
+            envelope_hash: [0x11; 32],
+            capability_manifest_hash: [0xab; 32],
+            view_commitment_hash: [0u8; 32],
+        };
+
+        assert!(matches!(
+            bindings.validate(),
+            Err(EnvelopeV1Error::ZeroViewCommitmentHash)
+        ));
+    }
+
+    #[test]
+    fn test_v1_bindings_verify_against_matching_envelope() {
+        let env = minimal_v1_envelope();
+        let bindings = env.bindings();
+
+        assert!(bindings.verify_against(&env).is_ok());
+    }
+
+    #[test]
+    fn test_v1_bindings_verify_against_mismatched_envelope() {
+        let env1 = minimal_v1_envelope();
+        let bindings = env1.bindings();
+
+        // Build a different envelope (different view_commitment_hash)
+        let env2 = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-001")
+            .actor_id("agent-007")
+            .lease_id("lease-123")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xff; 32]) // different
+            .freshness_pinset_hash([0xdd; 32])
+            .build()
+            .expect("valid V1 envelope");
+
+        let result = bindings.verify_against(&env2);
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeV1Error::BindingMismatch {
+                    field: "view_commitment_hash"
+                })
+            ),
+            "expected view_commitment_hash mismatch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_validate_for_spawn_passes() {
+        let env = minimal_v1_envelope();
+        assert!(env.validate_for_spawn().is_ok());
+    }
+
+    #[test]
+    fn test_v1_validate_for_delegated_spawn_requires_permeability() {
+        let env = minimal_v1_envelope();
+        // Non-delegated envelope should fail delegated validation
+        let result = env.validate_for_delegated_spawn();
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::MissingPermeabilityReceiptHash)),
+            "expected MissingPermeabilityReceiptHash, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_validate_for_delegated_spawn_passes_with_hash() {
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-del")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash([0xee; 32])
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        assert!(env.validate_for_delegated_spawn().is_ok());
+    }
+
+    #[test]
+    fn test_spawn_gate_rejects_absent_envelope() {
+        let result = validate_spawn_gate(None, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_spawn_gate_accepts_valid_envelope() {
+        let env = minimal_v1_envelope();
+        let result = validate_spawn_gate(Some(&env), false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_spawn_gate_rejects_delegated_without_permeability() {
+        let env = minimal_v1_envelope();
+        let result = validate_spawn_gate(Some(&env), true);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::MissingPermeabilityReceiptHash)),
+            "expected MissingPermeabilityReceiptHash for delegated spawn, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_v1_bindings_to_hex_map() {
+        let env = minimal_v1_envelope();
+        let bindings = env.bindings();
+        let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
+
+        assert_eq!(env_hex.len(), 64);
+        assert_eq!(cap_hex, hex::encode([0xab; 32]));
+        assert_eq!(view_hex, hex::encode([0xcc; 32]));
+    }
+
+    #[test]
+    fn test_v1_envelope_hash_is_inner_digest() {
+        let env = minimal_v1_envelope();
+        // The envelope_hash should exactly equal the inner envelope's BLAKE3
+        // digest
+        assert_eq!(env.envelope_hash(), env.inner().digest());
+    }
+
+    #[test]
+    fn test_v1_replay_verification_roundtrip() {
+        // Simulate full lifecycle:
+        // 1. Build envelope
+        // 2. Extract bindings for receipt
+        // 3. Verify bindings against original envelope
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-replay")
+            .actor_id("agent-replay")
+            .work_id("work-replay")
+            .lease_id("lease-replay")
+            .capability_manifest_hash([0x11; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(50))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0x22; 32])
+            .freshness_pinset_hash([0x33; 32])
+            .build()
+            .expect("valid V1 envelope");
+
+        // Step 2: Extract bindings (as would be embedded in receipt)
+        let receipt_bindings = env.bindings();
+
+        // Step 3: Validate bindings
+        assert!(receipt_bindings.validate().is_ok());
+
+        // Step 4: Verify against the original envelope (replay path)
+        assert!(receipt_bindings.verify_against(&env).is_ok());
     }
 }
