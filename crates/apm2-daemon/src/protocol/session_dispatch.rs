@@ -1057,6 +1057,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         frame: &Bytes,
         ctx: &ConnectionContext,
     ) -> ProtocolResult<SessionResponse> {
+        // TCK-00349: Check session phase BEFORE any message processing.
+        // No session-scoped IPC is permitted before SessionOpen.
+        if !ctx.phase().allows_dispatch() {
+            warn!(
+                phase = %ctx.phase(),
+                "Session dispatch rejected: connection not in SessionOpen phase"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                format!(
+                    "dispatch rejected: connection is in {} phase, not SessionOpen",
+                    ctx.phase()
+                ),
+            ));
+        }
+
         // INV-SESS-003: Check that connection is NOT privileged
         if ctx.is_privileged() {
             debug!(
@@ -2729,7 +2745,7 @@ mod tests {
     }
 
     fn make_session_ctx() -> ConnectionContext {
-        ConnectionContext::session(
+        ConnectionContext::session_open(
             Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -2740,7 +2756,7 @@ mod tests {
     }
 
     fn make_privileged_ctx() -> ConnectionContext {
-        ConnectionContext::privileged(Some(PeerCredentials {
+        ConnectionContext::privileged_session_open(Some(PeerCredentials {
             uid: 1000,
             gid: 1000,
             pid: Some(12345),
@@ -4669,7 +4685,7 @@ mod tests {
                 let session_id = episode_id.as_str().to_string();
 
                 // Build a ConnectionContext tied to this session_id
-                let ctx = ConnectionContext::session(
+                let ctx = ConnectionContext::session_open(
                     Some(crate::protocol::credentials::PeerCredentials {
                         uid: 1000,
                         gid: 1000,

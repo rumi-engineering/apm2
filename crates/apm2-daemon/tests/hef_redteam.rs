@@ -178,7 +178,7 @@ async fn test_unauthorized_subscribe() {
     let token_json = serde_json::to_string(&token).unwrap();
 
     // Create session context
-    let ctx = ConnectionContext::session(None, Some("sess-1".to_string()));
+    let ctx = ConnectionContext::session_open(None, Some("sess-1".to_string()));
 
     // Attempt to subscribe to restricted topic
     let req = SubscribePulseRequest {
@@ -231,7 +231,7 @@ async fn test_unauthorized_publish() {
     let dispatcher = SessionDispatcher::new(minter);
 
     // Create session context
-    let ctx = ConnectionContext::session(None, Some("sess-1".to_string()));
+    let ctx = ConnectionContext::session_open(None, Some("sess-1".to_string()));
 
     // Attempt to send PulseEvent (server->client only)
     // Tag 68 + dummy payload
@@ -271,7 +271,7 @@ async fn test_protocol_downgrade_rejection() {
     let dispatcher = SessionDispatcher::new(minter);
 
     // Create session context
-    let ctx = ConnectionContext::session(None, Some("sess-1".to_string()));
+    let ctx = ConnectionContext::session_open(None, Some("sess-1".to_string()));
 
     // Attempt to send legacy JSON frame
     let json_frame = Bytes::from(r#"{"method":"subscribe","params":{}}"#);
@@ -330,7 +330,7 @@ async fn test_allocation_bomb_rejected() {
         max_pulses_per_sec: 10,
     };
 
-    let ctx = ConnectionContext::session(None, Some("sess-1".to_string()));
+    let ctx = ConnectionContext::session_open(None, Some("sess-1".to_string()));
     let frame = encode_subscribe_pulse_request(&req);
     let result = dispatcher.dispatch(&frame, &ctx).unwrap();
 
@@ -368,7 +368,7 @@ async fn test_oversize_frame_rejected() {
     frame.extend_from_slice(&large_payload);
     let frame_bytes = Bytes::from(frame);
 
-    let ctx = ConnectionContext::session(None, Some("sess-1".to_string()));
+    let ctx = ConnectionContext::session_open(None, Some("sess-1".to_string()));
 
     // Dispatch validates decode limits
     let result = dispatcher.dispatch(&frame_bytes, &ctx);
@@ -426,7 +426,7 @@ async fn test_subscription_explosion_rejected() {
 
     // Use privileged context (operator) to bypass ACLs
     // Must reuse same context to keep connection_id stable
-    let ctx = ConnectionContext::privileged(None);
+    let ctx = ConnectionContext::privileged_session_open(None);
 
     // Fill the subscription slots
     for i in 0..5 {
@@ -763,7 +763,7 @@ async fn test_out_of_order_spawn_rejected() {
         registry,
     );
 
-    let ctx = ConnectionContext::privileged(None);
+    let ctx = ConnectionContext::privileged_session_open(None);
 
     // Attempt Spawn without Claim
     let req = SpawnEpisodeRequest {
@@ -828,11 +828,12 @@ async fn test_claim_work_replay_rejected() {
         registry,
     );
 
-    let ctx = ConnectionContext::privileged(Some(apm2_daemon::protocol::PeerCredentials {
-        uid: 1000,
-        gid: 1000,
-        pid: Some(12345),
-    }));
+    let ctx =
+        ConnectionContext::privileged_session_open(Some(apm2_daemon::protocol::PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        }));
 
     let req = ClaimWorkRequest {
         actor_id: "actor:replay".to_string(),

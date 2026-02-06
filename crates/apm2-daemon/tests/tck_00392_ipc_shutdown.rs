@@ -37,7 +37,7 @@ use apm2_daemon::state::DaemonStateHandle;
 // =============================================================================
 
 fn make_privileged_ctx() -> ConnectionContext {
-    ConnectionContext::privileged(Some(PeerCredentials {
+    ConnectionContext::privileged_session_open(Some(PeerCredentials {
         uid: 1000,
         gid: 1000,
         pid: Some(99999),
@@ -45,7 +45,7 @@ fn make_privileged_ctx() -> ConnectionContext {
 }
 
 fn make_session_ctx() -> ConnectionContext {
-    ConnectionContext::session(
+    ConnectionContext::session_open(
         Some(PeerCredentials {
             uid: 1000,
             gid: 1000,

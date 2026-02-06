@@ -98,12 +98,13 @@ fn spawn_server_loop(
                     }
 
                     let ctx = match socket_type {
-                        SocketType::Operator => {
-                            ConnectionContext::privileged(connection.peer_credentials().cloned())
-                        },
-                        SocketType::Session => {
-                            ConnectionContext::session(connection.peer_credentials().cloned(), None)
-                        },
+                        SocketType::Operator => ConnectionContext::privileged_session_open(
+                            connection.peer_credentials().cloned(),
+                        ),
+                        SocketType::Session => ConnectionContext::session_open(
+                            connection.peer_credentials().cloned(),
+                            None,
+                        ),
                     };
 
                     let priv_dispatcher = conn_ds.privileged_dispatcher();

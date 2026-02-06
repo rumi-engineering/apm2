@@ -60,7 +60,7 @@ fn test_token(minter: &TokenMinter) -> apm2_daemon::protocol::session_token::Ses
 }
 
 fn make_session_ctx() -> ConnectionContext {
-    ConnectionContext::session(
+    ConnectionContext::session_open(
         Some(PeerCredentials {
             uid: 1000,
             gid: 1000,

@@ -1,0 +1,63 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0003"
+  title: "Session-typed state machine evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that the connection phase state machine enforces strict
+    forward-only progression (Connected -> HandshakeComplete -> SessionOpen)
+    and that IPC dispatch is rejected before the connection reaches
+    SessionOpen phase (fail-closed).
+
+    Production wiring:
+    - ConnectionPhase enum is defined in connection_handler.rs with three
+      variants: Connected, HandshakeComplete, SessionOpen.
+    - ConnectionContext carries a phase field initialized to Connected by
+      the privileged() and session() constructors.
+    - After handshake completion in main.rs handle_dual_socket_connection(),
+      the context is advanced through HandshakeComplete -> SessionOpen via
+      advance_to_handshake_complete() and advance_to_session_open().
+    - PrivilegedDispatcher::dispatch() checks ctx.phase().allows_dispatch()
+      before routing any IPC message. If phase is not SessionOpen, returns
+      PermissionDenied error (fail-closed).
+    - SessionDispatcher::dispatch() performs the same phase check.
+    - Phase transitions are forward-only: attempting to skip phases or
+      regress returns ConnectionPhaseError::IllegalTransition.
+    - Convenience constructors privileged_session_open() and session_open()
+      are provided for test ergonomics (create contexts already in
+      SessionOpen phase).
+
+  requirement_ids:
+    - "REQ-0003"
+  source_refs:
+    - "crates/apm2-daemon/src/protocol/connection_handler.rs"
+    - "crates/apm2-daemon/src/protocol/dispatch.rs"
+    - "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+    - "crates/apm2-daemon/src/main.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Connection phase state machine tests in connection_handler.rs:
+        - test_phase_connected_to_handshake_complete: Connected -> HandshakeComplete succeeds
+        - test_phase_handshake_complete_to_session_open: HandshakeComplete -> SessionOpen succeeds
+        - test_phase_connected_cannot_skip_to_session_open: skip prevention (fail-closed)
+        - test_phase_session_open_cannot_regress_to_handshake: regression prevention
+        - test_phase_session_open_cannot_regress_to_connected: regression prevention
+        - test_phase_connected_dispatch_rejected: dispatch blocked before SessionOpen
+        - test_phase_handshake_complete_dispatch_rejected: dispatch blocked in HandshakeComplete
+        - test_phase_session_open_allows_dispatch: dispatch allowed in SessionOpen
+        - test_privileged_dispatch_rejected_before_session_open: full dispatcher rejects pre-SessionOpen
+        - test_session_dispatch_rejected_before_session_open: session dispatcher rejects pre-SessionOpen
+        - test_privileged_dispatch_succeeds_after_session_open: full lifecycle progression allows dispatch
+
+        Session state machine tests in dispatch.rs (tck_00349_session_state_machine module):
+        - test_context_starts_in_connected_phase: ConnectionContext initializes to Connected
+        - test_context_full_phase_progression: full Connected -> HandshakeComplete -> SessionOpen
+        - test_dispatch_rejected_in_connected_phase: PermissionDenied in Connected phase
+        - test_dispatch_rejected_in_handshake_complete_phase: PermissionDenied in HandshakeComplete
+        - test_dispatch_succeeds_in_session_open_phase: ClaimWork routes after SessionOpen
+        - test_unknown_tag_returns_protocol_error: unknown tag returns error (fail-closed)
+        - test_privileged_session_open_constructor: convenience constructor phase check
+        - test_session_open_constructor: session convenience constructor phase check
+      ref: "cargo test -p apm2-daemon --lib protocol::connection_handler::tests && cargo test -p apm2-daemon --lib protocol::dispatch::tests::tck_00349"

@@ -1117,10 +1117,10 @@ async fn protocol_dispatch_cutover_json_downgrade_rejection() {
         SessionDispatcher::new(TokenMinter::new(TokenMinter::generate_secret()));
 
     // Create privileged context (operator socket)
-    let privileged_ctx = ConnectionContext::privileged(None);
+    let privileged_ctx = ConnectionContext::privileged_session_open(None);
 
     // Create session context (session socket)
-    let session_ctx = ConnectionContext::session(None, None);
+    let session_ctx = ConnectionContext::session_open(None, None);
 
     // Test 1: JSON object frame `{"method":"shutdown"}` - should fail
     let json_object_frame = Bytes::from(r#"{"method":"shutdown"}"#);
@@ -1205,8 +1205,8 @@ async fn protocol_dispatch_cutover_tag_routing() {
         SessionDispatcher::new(TokenMinter::new(TokenMinter::generate_secret()));
 
     // Test 1: Privileged dispatcher rejects session connections
-    let session_ctx = ConnectionContext::session(None, None);
-    let privileged_ctx = ConnectionContext::privileged(None);
+    let session_ctx = ConnectionContext::session_open(None, None);
+    let privileged_ctx = ConnectionContext::privileged_session_open(None);
 
     // Any frame to privileged dispatcher from session context should be denied
     let dummy_frame = bytes::Bytes::from(vec![1u8]); // ClaimWork tag

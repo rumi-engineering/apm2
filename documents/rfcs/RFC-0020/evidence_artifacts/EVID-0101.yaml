@@ -1,0 +1,63 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0101"
+  title: "Fail-closed decoding and bounded decode enforcement evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that all protocol enum decoding is fail-closed (unknown values
+    rejected, no wildcard defaults) and that bounded decode enforces
+    payload size limits before deserialization.
+
+    Fail-closed enum decoding:
+    - PrivilegedMessageType::from_tag() returns None for all tags not in
+      the explicit match arms. The dispatch loop maps None to a protocol
+      error (anyhow::bail), never a default handler.
+    - SessionMessageType::from_tag() follows the same pattern.
+    - HandshakeErrorCode uses serde rename_all="snake_case" with no
+      default variant, so unknown JSON strings fail deserialization.
+    - HelloNack uses #[serde(deny_unknown_fields)] to reject any JSON
+      keys not in the struct definition, preventing field injection in
+      signed/hashed JSON messages.
+
+    Bounded decode enforcement:
+    - BoundedDecode trait in messages.rs checks payload.len() against
+      DecodeConfig::max_message_size BEFORE calling prost::Message::decode.
+    - DecodeConfig provides documented constants: DEFAULT_MAX_MESSAGE_SIZE
+      (16 MiB) and DEFAULT_MAX_REPEATED_FIELD_COUNT (10,000).
+    - Oversized payloads are rejected with DecodeError::MessageTooLarge,
+      preventing allocation-based denial of service.
+
+  requirement_ids:
+    - "REQ-0101"
+  source_refs:
+    - "crates/apm2-daemon/src/protocol/connection_handler.rs"
+    - "crates/apm2-daemon/src/protocol/dispatch.rs"
+    - "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+    - "crates/apm2-daemon/src/protocol/messages.rs"
+    - "crates/apm2-daemon/src/protocol/handshake.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Fail-closed enum decoding tests in connection_handler.rs:
+        - test_unknown_privileged_message_type_returns_none: all valid tags return Some,
+          unknown tags (0, 18-20, 27, 50, 63, 65, 67, 69, 71, 100, 255) return None
+        - test_unknown_session_message_type_returns_none: all valid session tags return
+          Some, unknown tags (0, 7-8, 50, 63, 65, 67, 69, 100, 255) return None
+        - test_unknown_handshake_error_code_fails_closed: valid HandshakeErrorCode
+          variants deserialize, "unknown_code" and empty string fail deserialization
+        - test_signed_json_rejects_unknown_fields_hello_nack: HelloNack with extra
+          "unknown_field" key fails deserialization (deny_unknown_fields)
+
+        Bounded decode tests in connection_handler.rs:
+        - test_bounded_decode_rejects_oversized_payload: 128-byte payload rejected
+          with MessageTooLarge when config limit is 64 bytes
+        - test_bounded_decode_accepts_within_bounds: valid ShutdownRequest payload
+          decodes successfully with default config
+        - test_decode_config_defaults_are_bounded: DEFAULT_MAX_MESSAGE_SIZE and
+          DEFAULT_MAX_REPEATED_FIELD_COUNT are non-zero and within sane upper bounds
+
+        Fail-closed dispatch test in dispatch.rs:
+        - test_unknown_tag_returns_protocol_error: tag 200 returns protocol error,
+          not a default handler (fail-closed)
+      ref: "cargo test -p apm2-daemon --lib protocol::connection_handler::tests && cargo test -p apm2-daemon --lib protocol::dispatch::tests::tck_00349"
