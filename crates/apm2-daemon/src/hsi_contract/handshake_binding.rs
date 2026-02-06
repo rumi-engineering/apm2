@@ -285,8 +285,19 @@ pub fn evaluate_mismatch_policy(
 ) -> MismatchOutcome {
     let mut mismatches = Vec::new();
 
+    // TCK-00348 BLOCKER 2: If the server hash is empty/unavailable at Tier2+,
+    // treat it as a hard gate failure (fail-closed). The daemon cannot verify
+    // contract compatibility without a valid manifest.
+    if server_hash.is_empty() && risk_tier.requires_deny_on_mismatch() {
+        mismatches.push(
+            "server contract hash unavailable (manifest build failed); \
+             Tier2+ sessions denied (fail-closed)"
+                .to_string(),
+        );
+    }
+
     // Check contract hash mismatch
-    if !client_hash.is_empty() && client_hash != server_hash {
+    if !client_hash.is_empty() && !server_hash.is_empty() && client_hash != server_hash {
         mismatches.push(format!(
             "contract hash mismatch: client='{}' server='{}'",
             truncate_for_log(client_hash, 80),
@@ -756,6 +767,59 @@ mod tests {
         assert!(
             !outcome.is_denied(),
             "Empty client canonicalizers at Tier0 should NOT be denied"
+        );
+    }
+
+    /// TCK-00348 BLOCKER 2: Empty server hash at Tier2+ is denied
+    /// (fail-closed). If the daemon cannot build its manifest, it MUST NOT
+    /// admit Tier2+ sessions.
+    #[test]
+    fn empty_server_hash_tier2_denied() {
+        let outcome = evaluate_mismatch_policy("blake3:client_hash", "", &[], &[], RiskTier::Tier2);
+        assert!(
+            outcome.is_denied(),
+            "Empty server hash at Tier2 must be denied (fail-closed)"
+        );
+        if let MismatchOutcome::Denied { detail, .. } = &outcome {
+            assert!(
+                detail.contains("server contract hash unavailable"),
+                "detail should mention unavailable server hash: {detail}"
+            );
+        }
+    }
+
+    /// TCK-00348 BLOCKER 2: Empty server hash at Tier0 is allowed (degraded
+    /// mode). Tier0/Tier1 sessions can still proceed when the manifest is
+    /// unavailable.
+    #[test]
+    fn empty_server_hash_tier0_allowed() {
+        let outcome = evaluate_mismatch_policy("blake3:client_hash", "", &[], &[], RiskTier::Tier0);
+        assert!(
+            !outcome.is_denied(),
+            "Empty server hash at Tier0 should NOT be denied"
+        );
+    }
+
+    /// TCK-00348 BLOCKER 2: Both hashes empty at Tier2+ is denied
+    /// (fail-closed). Even if both sides have empty hashes, the server
+    /// cannot verify contract compatibility.
+    #[test]
+    fn both_hashes_empty_tier2_denied() {
+        let outcome = evaluate_mismatch_policy("", "", &[], &[], RiskTier::Tier2);
+        assert!(
+            outcome.is_denied(),
+            "Both empty hashes at Tier2 must be denied (fail-closed)"
+        );
+    }
+
+    /// TCK-00348 BLOCKER 2: Both hashes empty at Tier0 is allowed
+    /// (backward compat, degraded mode).
+    #[test]
+    fn both_hashes_empty_tier0_allowed() {
+        let outcome = evaluate_mismatch_policy("", "", &[], &[], RiskTier::Tier0);
+        assert!(
+            outcome.is_match(),
+            "Both empty hashes at Tier0 should be a match (backward compat)"
         );
     }
 

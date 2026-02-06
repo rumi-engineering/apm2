@@ -2042,7 +2042,7 @@ async fn run_socket_manager_server(
 async fn handle_dual_socket_connection(
     mut connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
-    _state: SharedState,
+    state: SharedState,
     dispatcher_state: SharedDispatcherState,
 ) -> Result<()> {
     use bytes::Bytes;
@@ -2059,10 +2059,19 @@ async fn handle_dual_socket_connection(
     // TCK-00348: Build handshake config from real HSI contract manifest.
     // The server contract hash is computed from the dispatch registry so
     // that real connections enforce the tiered mismatch policy.
-    let handshake_config = HandshakeConfig::from_manifest();
+    //
+    // TCK-00348 MAJOR: Wire DaemonMetrics into HandshakeConfig so the
+    // contract_mismatch_total counter is emitted from the production path.
+    let handshake_config = {
+        let mut config = HandshakeConfig::from_manifest();
+        if let Some(metrics_reg) = state.metrics_registry() {
+            config = config.with_metrics(metrics_reg.daemon_metrics().clone());
+        }
+        config
+    };
 
     // Perform mandatory handshake
-    let _contract_binding = match perform_handshake(&mut connection, &handshake_config).await? {
+    let contract_binding = match perform_handshake(&mut connection, &handshake_config).await? {
         HandshakeResult::Success { contract_binding } => {
             info!(
                 socket_type = %socket_type,
@@ -2092,6 +2101,33 @@ async fn handle_dual_socket_connection(
             ConnectionContext::session(connection.peer_credentials().cloned(), None)
         },
     };
+
+    // TCK-00348 BLOCKER 1: Persist contract binding evidence via ledger.
+    // Use the connection ID as session_id since formal session IDs are
+    // assigned later during SpawnEpisode. The connection-level binding
+    // record establishes which contract state was active when this
+    // connection was admitted.
+    {
+        let emitter = dispatcher_state.event_emitter();
+        let connection_id_for_binding = ctx.connection_id().to_string();
+        // Use a best-effort timestamp. In production, the emitter's
+        // persistence timestamp is the authoritative audit record.
+        #[allow(clippy::cast_possible_truncation)]
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if let Err(e) = emitter.emit_contract_binding_recorded(
+            &connection_id_for_binding,
+            &contract_binding,
+            timestamp_ns,
+        ) {
+            warn!(
+                error = %e,
+                "Failed to persist contract binding event (non-fatal)"
+            );
+        }
+    }
 
     // TCK-00287 Item 1 & 2: Use shared dispatchers from DispatcherState.
     // These dispatchers persist across connections and use stable secrets.

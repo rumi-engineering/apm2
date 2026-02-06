@@ -80,6 +80,13 @@ pub struct HandshakeConfig {
 
     /// Optional metrics handle for emitting `contract_mismatch_total`.
     pub metrics: Option<DaemonMetrics>,
+
+    /// Whether the manifest build failed or produced an empty hash.
+    ///
+    /// When `true`, Tier2+ sessions MUST be denied (fail-closed per
+    /// RFC-0020 section 4). The daemon cannot verify contract
+    /// compatibility without a valid manifest.
+    pub manifest_unavailable: bool,
 }
 
 impl Default for HandshakeConfig {
@@ -97,6 +104,7 @@ impl Default for HandshakeConfig {
             }],
             risk_tier: RiskTier::Tier1,
             metrics: None,
+            manifest_unavailable: false,
         }
     }
 }
@@ -105,9 +113,9 @@ impl HandshakeConfig {
     /// Builds a `HandshakeConfig` from the current HSI contract manifest.
     ///
     /// Computes the server contract hash from the dispatch registry
-    /// manifest. Falls back to empty hash on build failure (logged as
-    /// warning) so the daemon can still accept connections in degraded
-    /// mode.
+    /// manifest. On build failure, logs a warning and marks the config
+    /// as `manifest_unavailable` so that Tier2+ sessions are denied
+    /// (fail-closed per RFC-0020 section 4).
     #[must_use]
     pub fn from_manifest() -> Self {
         let cli_version = crate::hsi_contract::CliVersion {
@@ -115,16 +123,31 @@ impl HandshakeConfig {
             build_hash: String::new(),
         };
 
-        let server_contract_hash = match crate::hsi_contract::build_manifest(cli_version) {
-            Ok(manifest) => manifest.content_hash().unwrap_or_default(),
-            Err(e) => {
-                tracing::warn!("Failed to build HSI contract manifest for handshake: {e}");
-                String::new()
-            },
-        };
+        let (server_contract_hash, manifest_unavailable) =
+            match crate::hsi_contract::build_manifest(cli_version) {
+                Ok(manifest) => {
+                    let hash = manifest.content_hash().unwrap_or_default();
+                    let unavailable = hash.is_empty();
+                    if unavailable {
+                        tracing::warn!(
+                            "HSI contract manifest content_hash() returned empty \
+                             (Tier2+ sessions will be denied)"
+                        );
+                    }
+                    (hash, unavailable)
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to build HSI contract manifest for handshake: {e} \
+                         (Tier2+ sessions will be denied)"
+                    );
+                    (String::new(), true)
+                },
+            };
 
         Self {
             server_contract_hash,
+            manifest_unavailable,
             ..Self::default()
         }
     }
@@ -470,6 +493,7 @@ mod tests {
             }],
             risk_tier: RiskTier::Tier2,
             metrics: None,
+            manifest_unavailable: false,
         };
 
         let hs_config_clone = hs_config.clone();
@@ -541,6 +565,7 @@ mod tests {
             }],
             risk_tier: RiskTier::Tier1,
             metrics: None,
+            manifest_unavailable: false,
         };
 
         let hs_config_clone = hs_config.clone();
@@ -613,6 +638,7 @@ mod tests {
             server_canonicalizers: vec![],
             risk_tier: RiskTier::Tier0,
             metrics: Some(metrics.clone()),
+            manifest_unavailable: false,
         };
 
         let hs_config_clone = hs_config.clone();

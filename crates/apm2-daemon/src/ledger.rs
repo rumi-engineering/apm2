@@ -1453,6 +1453,89 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         Ok(signed_event)
     }
+
+    /// TCK-00348 BLOCKER 1: Persist contract binding metadata to `SQLite`.
+    ///
+    /// Overrides the default no-op to durably persist `SessionContractBinding`
+    /// alongside the `SessionStarted` event. This ensures audit trail of
+    /// which contract hash was active when each session was admitted.
+    fn emit_contract_binding_recorded(
+        &self,
+        session_id: &str,
+        binding: &crate::hsi_contract::SessionContractBinding,
+        timestamp_ns: u64,
+    ) -> Result<(), LedgerEventError> {
+        const DOMAIN_PREFIX: &[u8] = b"apm2.event.contract_binding_recorded:";
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        let payload = serde_json::json!({
+            "event_type": "contract_binding_recorded",
+            "session_id": session_id,
+            "cli_contract_hash": binding.cli_contract_hash,
+            "server_contract_hash": binding.server_contract_hash,
+            "mismatch_waived": binding.mismatch_waived,
+            "risk_tier": binding.risk_tier,
+            "client_canonicalizers": binding.client_canonicalizers,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        let payload_json = payload.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes = Vec::with_capacity(DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "contract_binding_recorded".to_string(),
+            work_id: session_id.to_string(),
+            actor_id: "daemon".to_string(),
+            payload: payload_bytes.clone(),
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns
+            ],
+        ).map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+
+        info!(
+            event_id = %event_id,
+            session_id = %session_id,
+            mismatch_waived = %binding.mismatch_waived,
+            risk_tier = %binding.risk_tier,
+            "Persisted ContractBindingRecorded event"
+        );
+
+        Ok(())
+    }
 }
 
 /// Durable work registry backed by `SQLite`.
@@ -2064,5 +2147,54 @@ mod tests {
             2_000,
         );
         assert!(result2.is_err(), "Should fail when table is dropped");
+    }
+
+    // ====================================================================
+    // TCK-00348: Contract binding persistence tests
+    // ====================================================================
+
+    /// TCK-00348 BLOCKER 1: `emit_contract_binding_recorded` persists to
+    /// `SQLite` and can be retrieved via `get_events_by_work_id`.
+    #[test]
+    fn emit_contract_binding_recorded_sqlite() {
+        use crate::hsi_contract::RiskTier;
+        use crate::hsi_contract::handshake_binding::{CanonicalizerInfo, SessionContractBinding};
+
+        let emitter = test_emitter();
+
+        let binding = SessionContractBinding {
+            cli_contract_hash: "blake3:client_abc".to_string(),
+            server_contract_hash: "blake3:server_xyz".to_string(),
+            client_canonicalizers: vec![CanonicalizerInfo {
+                id: "apm2.canonical.v1".to_string(),
+                version: 1,
+            }],
+            mismatch_waived: true,
+            risk_tier: RiskTier::Tier1,
+        };
+
+        let result =
+            emitter.emit_contract_binding_recorded("SESS-BINDING-001", &binding, 1_000_000_000);
+        assert!(
+            result.is_ok(),
+            "emit_contract_binding_recorded should succeed"
+        );
+
+        // Verify the event was persisted (session_id is used as work_id)
+        let events = emitter.get_events_by_work_id("SESS-BINDING-001");
+        assert_eq!(
+            events.len(),
+            1,
+            "Expected 1 contract_binding_recorded event"
+        );
+        assert_eq!(events[0].event_type, "contract_binding_recorded");
+        assert_eq!(events[0].actor_id, "daemon");
+
+        // Verify payload contains binding data
+        let payload: serde_json::Value = serde_json::from_slice(&events[0].payload).unwrap();
+        assert_eq!(payload["cli_contract_hash"], "blake3:client_abc");
+        assert_eq!(payload["server_contract_hash"], "blake3:server_xyz");
+        assert_eq!(payload["mismatch_waived"], true);
+        assert_eq!(payload["session_id"], "SESS-BINDING-001");
     }
 }
