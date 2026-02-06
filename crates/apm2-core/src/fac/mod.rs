@@ -96,9 +96,11 @@ pub mod role_conformance;
 mod role_spec;
 pub mod selection_policy;
 pub mod serde_helpers;
+pub mod taint;
 mod terminal_verifier;
 pub mod transcript_binding;
 
+// Re-export taint tracking types (TCK-00339)
 // Re-export AAT receipt types
 pub use aat_receipt::{
     AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatReceiptError, AatVerdict,
@@ -265,6 +267,11 @@ pub use selection_policy::{
     AatRequirement, DEFAULT_LOW_TIER_SAMPLE_RATE, MAX_DOMAIN_LENGTH, MAX_POLICY_ID_LENGTH,
     MAX_POLICY_SIZE, MAX_WORK_ID_LENGTH, SENSITIVE_DOMAINS, SelectionContext, SelectionPolicy,
     SelectionPolicyBuilder, SelectionPolicyError, TierConfig,
+};
+pub use taint::{
+    FlowRule, MAX_FLOW_RULES, MAX_POLICY_RULE_ID_LEN, MAX_SOURCE_DESCRIPTION_LEN, MAX_TAINT_TAGS,
+    MAX_VIOLATION_DESCRIPTION_LEN, TaintAggregator, TaintFlowDecision, TaintLevel, TaintPolicy,
+    TaintSource, TaintTag, TaintViolation, TargetContext,
 };
 // Re-export terminal verifier types
 pub use terminal_verifier::{
