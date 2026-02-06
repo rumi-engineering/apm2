@@ -46,14 +46,20 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::error::{MAX_HANDSHAKE_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult};
+use crate::hsi_contract::handshake_binding::CanonicalizerInfo;
 
 /// Hello message sent by client to initiate handshake.
 ///
 /// The client sends this as the first message after connecting.
 /// The server validates the version and responds with [`HelloAck`]
 /// or [`HelloNack`].
+///
+/// # TCK-00348: Contract Binding Fields
+///
+/// Per RFC-0020 section 3.1.2, the client MUST include its
+/// `cli_contract_hash` and canonicalizer metadata so the daemon can
+/// evaluate the tiered mismatch policy (section 3.1.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct Hello {
     /// Protocol version requested by the client.
     pub protocol_version: u32,
@@ -66,6 +72,22 @@ pub struct Hello {
     /// Optional client capabilities for future extension.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+
+    /// Client's HSI contract manifest content hash (TCK-00348).
+    ///
+    /// Per RFC-0020 section 3.1.2, this MUST be included in the session
+    /// handshake. Format: `blake3:<64-hex>` (or equivalent hash scheme).
+    /// Empty string if the client does not have a contract manifest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cli_contract_hash: String,
+
+    /// Canonicalizer metadata declared by the client (TCK-00348).
+    ///
+    /// Per RFC-0020 section 3.1.2, the client declares which
+    /// canonicalizers it uses so the daemon can detect incompatible
+    /// encodings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canonicalizers: Vec<CanonicalizerInfo>,
 }
 
 impl Hello {
@@ -76,6 +98,8 @@ impl Hello {
             protocol_version: PROTOCOL_VERSION,
             client_info: client_info.into(),
             capabilities: Vec::new(),
+            cli_contract_hash: String::new(),
+            canonicalizers: Vec::new(),
         }
     }
 
@@ -86,6 +110,8 @@ impl Hello {
             protocol_version,
             client_info: client_info.into(),
             capabilities: Vec::new(),
+            cli_contract_hash: String::new(),
+            canonicalizers: Vec::new(),
         }
     }
 
@@ -95,13 +121,32 @@ impl Hello {
         self.capabilities = capabilities;
         self
     }
+
+    /// Set the client's HSI contract manifest hash (TCK-00348).
+    #[must_use]
+    pub fn with_contract_hash(mut self, hash: impl Into<String>) -> Self {
+        self.cli_contract_hash = hash.into();
+        self
+    }
+
+    /// Set the client's canonicalizer metadata (TCK-00348).
+    #[must_use]
+    pub fn with_canonicalizers(mut self, canonicalizers: Vec<CanonicalizerInfo>) -> Self {
+        self.canonicalizers = canonicalizers;
+        self
+    }
 }
 
 /// Successful handshake acknowledgment from server.
 ///
 /// Sent when the server accepts the client's Hello message.
+///
+/// # TCK-00348: Contract Binding Fields
+///
+/// Per RFC-0020 section 3.1.2, the server echoes its active contract
+/// hash and supported canonicalizers so the client can verify
+/// compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct HelloAck {
     /// Protocol version agreed upon.
     ///
@@ -124,6 +169,28 @@ pub struct HelloAck {
     /// Server capabilities for feature negotiation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+
+    /// The daemon's active HSI contract manifest content hash
+    /// (TCK-00348).
+    ///
+    /// Per RFC-0020 section 3.1.2, echoed to the client so it can
+    /// detect contract drift on its side.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_contract_hash: String,
+
+    /// Canonicalizers supported by the daemon (TCK-00348).
+    ///
+    /// Allows the client to verify canonicalizer compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_canonicalizers: Vec<CanonicalizerInfo>,
+
+    /// Whether a contract mismatch was detected and waived (TCK-00348).
+    ///
+    /// `true` if the client's `cli_contract_hash` differs from the
+    /// daemon's active contract but the session was allowed to proceed
+    /// because the risk tier is Tier0/Tier1.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub contract_mismatch_waived: bool,
 }
 
 impl HelloAck {
@@ -135,6 +202,9 @@ impl HelloAck {
             server_info: server_info.into(),
             policy_hash: None,
             capabilities: Vec::new(),
+            server_contract_hash: String::new(),
+            server_canonicalizers: Vec::new(),
+            contract_mismatch_waived: false,
         }
     }
 
@@ -149,6 +219,27 @@ impl HelloAck {
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: Vec<String>) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Set the server's active contract hash (TCK-00348).
+    #[must_use]
+    pub fn with_server_contract_hash(mut self, hash: impl Into<String>) -> Self {
+        self.server_contract_hash = hash.into();
+        self
+    }
+
+    /// Set the server's supported canonicalizers (TCK-00348).
+    #[must_use]
+    pub fn with_server_canonicalizers(mut self, canonicalizers: Vec<CanonicalizerInfo>) -> Self {
+        self.server_canonicalizers = canonicalizers;
+        self
+    }
+
+    /// Set the contract mismatch waived flag (TCK-00348).
+    #[must_use]
+    pub const fn with_contract_mismatch_waived(mut self, waived: bool) -> Self {
+        self.contract_mismatch_waived = waived;
         self
     }
 }
@@ -193,6 +284,19 @@ impl HelloNack {
             server_version: None,
         }
     }
+
+    /// Create a contract mismatch rejection (TCK-00348).
+    ///
+    /// Per RFC-0020 section 3.1.3, Tier2+ sessions MUST be denied when
+    /// the client's contract or canonicalizer metadata does not match.
+    #[must_use]
+    pub fn contract_mismatch(detail: impl Into<String>) -> Self {
+        Self {
+            error_code: HandshakeErrorCode::ContractMismatch,
+            message: detail.into(),
+            server_version: Some(PROTOCOL_VERSION),
+        }
+    }
 }
 
 /// Error codes for handshake rejection.
@@ -210,6 +314,13 @@ pub enum HandshakeErrorCode {
 
     /// Too many connections.
     TooManyConnections,
+
+    /// Contract hash or canonicalizer mismatch at Tier2+ (TCK-00348).
+    ///
+    /// Per RFC-0020 section 3.1.3, Tier2+ sessions MUST be denied when
+    /// the client's `cli_contract_hash` or canonicalizer metadata does
+    /// not match the daemon's active contract.
+    ContractMismatch,
 }
 
 /// Handshake message envelope.
@@ -342,6 +453,14 @@ pub enum HandshakeState {
 ///
 /// Validates client Hello messages and generates appropriate responses.
 ///
+/// # TCK-00348: Contract Binding and Mismatch Gates
+///
+/// When configured with a server contract hash and risk tier, the
+/// handshake evaluates the tiered mismatch policy per RFC-0020
+/// section 3.1.3:
+/// - Tier0/Tier1: mismatch is warned and waived (session proceeds)
+/// - Tier2+: mismatch is denied (`HelloNack` with `ContractMismatch`)
+///
 /// # Security Note (TCK-00248)
 ///
 /// UID-based authorization is performed at the connection accept level
@@ -361,6 +480,18 @@ pub struct ServerHandshake {
 
     /// Negotiated protocol version (after successful handshake).
     negotiated_version: Option<u32>,
+
+    /// Server's active HSI contract manifest hash (TCK-00348).
+    server_contract_hash: String,
+
+    /// Server's supported canonicalizers (TCK-00348).
+    server_canonicalizers: Vec<CanonicalizerInfo>,
+
+    /// Risk tier for mismatch policy evaluation (TCK-00348).
+    risk_tier: crate::hsi_contract::RiskTier,
+
+    /// Mismatch outcome from the last `process_hello` call (TCK-00348).
+    mismatch_outcome: Option<crate::hsi_contract::MismatchOutcome>,
 }
 
 impl ServerHandshake {
@@ -372,6 +503,10 @@ impl ServerHandshake {
             policy_hash: None,
             state: HandshakeState::AwaitingHello,
             negotiated_version: None,
+            server_contract_hash: String::new(),
+            server_canonicalizers: Vec::new(),
+            risk_tier: crate::hsi_contract::RiskTier::Tier0,
+            mismatch_outcome: None,
         }
     }
 
@@ -382,9 +517,37 @@ impl ServerHandshake {
         self
     }
 
+    /// Set the server's active contract hash (TCK-00348).
+    #[must_use]
+    pub fn with_server_contract_hash(mut self, hash: impl Into<String>) -> Self {
+        self.server_contract_hash = hash.into();
+        self
+    }
+
+    /// Set the server's supported canonicalizers (TCK-00348).
+    #[must_use]
+    pub fn with_server_canonicalizers(mut self, canonicalizers: Vec<CanonicalizerInfo>) -> Self {
+        self.server_canonicalizers = canonicalizers;
+        self
+    }
+
+    /// Set the risk tier for mismatch policy evaluation (TCK-00348).
+    #[must_use]
+    pub const fn with_risk_tier(mut self, tier: crate::hsi_contract::RiskTier) -> Self {
+        self.risk_tier = tier;
+        self
+    }
+
     /// Process a client Hello message.
     ///
     /// Returns the response to send to the client.
+    ///
+    /// # TCK-00348: Contract Mismatch Gates
+    ///
+    /// After version validation, this method evaluates the tiered
+    /// mismatch policy. If the outcome is `Denied`, the handshake
+    /// returns a `HelloNack` with `ContractMismatch` error code.
+    /// Admission is checked BEFORE any state transition to `Completed`.
     ///
     /// # Security Note
     ///
@@ -402,19 +565,56 @@ impl ServerHandshake {
             ));
         }
 
-        // Validate protocol version
+        // Validate protocol version BEFORE mismatch evaluation
         if !Self::is_version_compatible(hello.protocol_version) {
             self.state = HandshakeState::Failed;
             return Ok(HelloNack::version_mismatch(hello.protocol_version).into());
         }
 
-        // Handshake successful
+        // TCK-00348: Evaluate contract mismatch policy.
+        // Check admission BEFORE mutating state to Completed (transactional
+        // state mutation pattern).
+        let outcome = crate::hsi_contract::evaluate_mismatch_policy(
+            &hello.cli_contract_hash,
+            &self.server_contract_hash,
+            &hello.canonicalizers,
+            &self.server_canonicalizers,
+            self.risk_tier,
+        );
+
+        // Fail-closed: deny on mismatch for Tier2+
+        if outcome.is_denied() {
+            self.state = HandshakeState::Failed;
+            let detail =
+                if let crate::hsi_contract::MismatchOutcome::Denied { detail, .. } = &outcome {
+                    detail.clone()
+                } else {
+                    "contract mismatch denied".to_string()
+                };
+            self.mismatch_outcome = Some(outcome);
+            return Ok(HelloNack::contract_mismatch(detail).into());
+        }
+
+        let mismatch_waived = outcome.is_waived();
+        self.mismatch_outcome = Some(outcome);
+
+        // Handshake successful (admission passed)
         self.state = HandshakeState::Completed;
         self.negotiated_version = Some(hello.protocol_version.min(PROTOCOL_VERSION));
 
         let mut ack = HelloAck::new(&self.server_info);
         if let Some(ref hash) = self.policy_hash {
             ack = ack.with_policy_hash(hash);
+        }
+        // TCK-00348: Include contract binding in HelloAck
+        if !self.server_contract_hash.is_empty() {
+            ack = ack.with_server_contract_hash(&self.server_contract_hash);
+        }
+        if !self.server_canonicalizers.is_empty() {
+            ack = ack.with_server_canonicalizers(self.server_canonicalizers.clone());
+        }
+        if mismatch_waived {
+            ack = ack.with_contract_mismatch_waived(true);
         }
 
         Ok(ack.into())
@@ -446,6 +646,16 @@ impl ServerHandshake {
     #[must_use]
     pub const fn is_completed(&self) -> bool {
         matches!(self.state, HandshakeState::Completed)
+    }
+
+    /// Returns the mismatch outcome from the last `process_hello` call
+    /// (TCK-00348).
+    ///
+    /// This is used by the caller to emit mismatch counters with
+    /// risk-tier labels after the handshake completes.
+    #[must_use]
+    pub const fn mismatch_outcome(&self) -> Option<&crate::hsi_contract::MismatchOutcome> {
+        self.mismatch_outcome.as_ref()
     }
 }
 
@@ -682,11 +892,28 @@ mod tests {
     }
 
     #[test]
-    fn test_deny_unknown_fields() {
-        // Hello should reject unknown fields (defense against injection)
+    fn test_hello_accepts_unknown_fields_for_forward_compat() {
+        // TCK-00348: Hello no longer uses deny_unknown_fields to allow
+        // forward-compatible field additions (e.g., cli_contract_hash,
+        // canonicalizers). Unknown fields are silently ignored per standard
+        // serde behavior.
         let json = r#"{"protocol_version": 1, "client_info": "test", "unknown": "field"}"#;
         let result: Result<Hello, _> = serde_json::from_str(json);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "Hello should accept unknown fields for forward compatibility"
+        );
+        let hello = result.unwrap();
+        assert_eq!(hello.client_info, "test");
+    }
+
+    #[test]
+    fn test_hello_nack_still_denies_unknown_fields() {
+        // HelloNack retains deny_unknown_fields since it is server-generated
+        // and should be strict.
+        let json = r#"{"error_code": "rejected", "message": "test", "unknown": "field"}"#;
+        let result: Result<HelloNack, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "HelloNack should reject unknown fields");
     }
 
     #[test]
@@ -807,4 +1034,325 @@ mod tests {
     // Integration-level UID rejection tests are not feasible because both
     // client and server run as the same process UID, and SO_PEERCRED cannot
     // be spoofed.
+
+    // =========================================================================
+    // TCK-00348: Contract binding and mismatch gate tests
+    // =========================================================================
+
+    #[test]
+    fn test_hello_with_contract_hash() {
+        let hello = Hello::new("cli/1.0").with_contract_hash("blake3:aabbccdd");
+        assert_eq!(hello.cli_contract_hash, "blake3:aabbccdd");
+
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("cli_contract_hash"));
+        assert!(json.contains("blake3:aabbccdd"));
+
+        let parsed: Hello = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cli_contract_hash, "blake3:aabbccdd");
+    }
+
+    #[test]
+    fn test_hello_without_contract_hash_omits_field() {
+        let hello = Hello::new("cli/1.0");
+        assert!(hello.cli_contract_hash.is_empty());
+
+        let json = serde_json::to_string(&hello).unwrap();
+        // skip_serializing_if = "String::is_empty" should omit the field
+        assert!(
+            !json.contains("cli_contract_hash"),
+            "empty cli_contract_hash should be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn test_hello_with_canonicalizers() {
+        let hello = Hello::new("cli/1.0").with_canonicalizers(vec![CanonicalizerInfo {
+            id: "apm2.canonical.v1".to_string(),
+            version: 1,
+        }]);
+        assert_eq!(hello.canonicalizers.len(), 1);
+        assert_eq!(hello.canonicalizers[0].id, "apm2.canonical.v1");
+
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("canonicalizers"));
+        assert!(json.contains("apm2.canonical.v1"));
+    }
+
+    #[test]
+    fn test_hello_without_canonicalizers_omits_field() {
+        let hello = Hello::new("cli/1.0");
+        assert!(hello.canonicalizers.is_empty());
+
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(
+            !json.contains("canonicalizers"),
+            "empty canonicalizers should be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn test_hello_ack_with_contract_binding_fields() {
+        let ack = HelloAck::new("daemon/1.0")
+            .with_server_contract_hash("blake3:server_hash")
+            .with_server_canonicalizers(vec![CanonicalizerInfo {
+                id: "apm2.canonical.v1".to_string(),
+                version: 1,
+            }])
+            .with_contract_mismatch_waived(true);
+
+        assert_eq!(ack.server_contract_hash, "blake3:server_hash");
+        assert_eq!(ack.server_canonicalizers.len(), 1);
+        assert!(ack.contract_mismatch_waived);
+
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.contains("server_contract_hash"));
+        assert!(json.contains("contract_mismatch_waived"));
+
+        let parsed: HelloAck = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ack);
+    }
+
+    #[test]
+    fn test_hello_ack_omits_empty_contract_fields() {
+        let ack = HelloAck::new("daemon/1.0");
+        let json = serde_json::to_string(&ack).unwrap();
+
+        assert!(
+            !json.contains("server_contract_hash"),
+            "empty server_contract_hash should be omitted"
+        );
+        assert!(
+            !json.contains("server_canonicalizers"),
+            "empty server_canonicalizers should be omitted"
+        );
+        assert!(
+            !json.contains("contract_mismatch_waived"),
+            "false contract_mismatch_waived should be omitted"
+        );
+    }
+
+    #[test]
+    fn test_hello_nack_contract_mismatch() {
+        let nack = HelloNack::contract_mismatch("contract hash mismatch at Tier2");
+        assert_eq!(nack.error_code, HandshakeErrorCode::ContractMismatch);
+        assert!(nack.message.contains("contract hash mismatch"));
+        assert_eq!(nack.server_version, Some(PROTOCOL_VERSION));
+
+        let json = serde_json::to_string(&nack).unwrap();
+        assert!(json.contains("contract_mismatch"));
+    }
+
+    #[test]
+    fn test_contract_mismatch_error_code_serialization() {
+        let code = HandshakeErrorCode::ContractMismatch;
+        let json = serde_json::to_string(&code).unwrap();
+        // HandshakeErrorCode uses rename_all = "snake_case"
+        assert_eq!(json, "\"contract_mismatch\"");
+
+        let parsed: HandshakeErrorCode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, HandshakeErrorCode::ContractMismatch);
+    }
+
+    #[test]
+    fn test_server_handshake_contract_match_tier2() {
+        // When client and server hashes match, handshake succeeds even at Tier2.
+        let mut server = ServerHandshake::new("daemon/1.0")
+            .with_server_contract_hash("blake3:same_hash")
+            .with_risk_tier(crate::hsi_contract::RiskTier::Tier2);
+
+        let hello = Hello::new("cli/1.0").with_contract_hash("blake3:same_hash");
+        let response = server.process_hello(&hello).unwrap();
+
+        assert!(matches!(response, HandshakeMessage::HelloAck(_)));
+        assert!(server.is_completed());
+
+        // Mismatch outcome should be Match
+        let outcome = server.mismatch_outcome().unwrap();
+        assert!(outcome.is_match());
+    }
+
+    #[test]
+    fn test_server_handshake_contract_mismatch_tier0_waived() {
+        // Tier0 mismatches are waived - handshake succeeds with mismatch_waived flag.
+        let mut server = ServerHandshake::new("daemon/1.0")
+            .with_server_contract_hash("blake3:server_hash")
+            .with_risk_tier(crate::hsi_contract::RiskTier::Tier0);
+
+        let hello = Hello::new("cli/1.0").with_contract_hash("blake3:client_hash");
+        let response = server.process_hello(&hello).unwrap();
+
+        if let HandshakeMessage::HelloAck(ack) = response {
+            assert!(
+                ack.contract_mismatch_waived,
+                "Tier0 mismatch should set waived flag"
+            );
+            assert_eq!(ack.server_contract_hash, "blake3:server_hash");
+        } else {
+            panic!("Expected HelloAck for Tier0 mismatch waiver");
+        }
+
+        assert!(server.is_completed());
+
+        let outcome = server.mismatch_outcome().unwrap();
+        assert!(outcome.is_waived());
+        assert_eq!(outcome.tier_label(), Some("tier0"));
+    }
+
+    #[test]
+    fn test_server_handshake_contract_mismatch_tier2_denied() {
+        // Tier2 mismatches MUST be denied (fail-closed).
+        let mut server = ServerHandshake::new("daemon/1.0")
+            .with_server_contract_hash("blake3:server_hash")
+            .with_risk_tier(crate::hsi_contract::RiskTier::Tier2);
+
+        let hello = Hello::new("cli/1.0").with_contract_hash("blake3:client_hash");
+        let response = server.process_hello(&hello).unwrap();
+
+        if let HandshakeMessage::HelloNack(nack) = response {
+            assert_eq!(nack.error_code, HandshakeErrorCode::ContractMismatch);
+            assert!(nack.message.contains("contract hash mismatch"));
+        } else {
+            panic!("Expected HelloNack for Tier2 mismatch denial");
+        }
+
+        assert_eq!(server.state(), HandshakeState::Failed);
+
+        let outcome = server.mismatch_outcome().unwrap();
+        assert!(outcome.is_denied());
+        assert_eq!(outcome.tier_label(), Some("tier2"));
+    }
+
+    #[test]
+    fn test_server_handshake_missing_client_hash_tier2_denied() {
+        // Tier2+ with missing client hash: fail-closed.
+        let mut server = ServerHandshake::new("daemon/1.0")
+            .with_server_contract_hash("blake3:server_hash")
+            .with_risk_tier(crate::hsi_contract::RiskTier::Tier2);
+
+        let hello = Hello::new("cli/1.0"); // no contract hash
+        let response = server.process_hello(&hello).unwrap();
+
+        assert!(
+            matches!(response, HandshakeMessage::HelloNack(ref nack) if nack.error_code == HandshakeErrorCode::ContractMismatch),
+            "Missing client hash at Tier2 should be denied"
+        );
+    }
+
+    #[test]
+    fn test_server_handshake_missing_client_hash_tier0_allowed() {
+        // Tier0 with missing client hash: acceptable (backward compat).
+        let mut server = ServerHandshake::new("daemon/1.0")
+            .with_server_contract_hash("blake3:server_hash")
+            .with_risk_tier(crate::hsi_contract::RiskTier::Tier0);
+
+        let hello = Hello::new("cli/1.0"); // no contract hash
+        let response = server.process_hello(&hello).unwrap();
+
+        assert!(
+            matches!(response, HandshakeMessage::HelloAck(_)),
+            "Missing client hash at Tier0 should be allowed"
+        );
+        assert!(server.is_completed());
+    }
+
+    #[test]
+    fn test_server_handshake_version_mismatch_takes_precedence_over_contract() {
+        // Version mismatch should fail BEFORE contract evaluation.
+        let mut server = ServerHandshake::new("daemon/1.0")
+            .with_server_contract_hash("blake3:server_hash")
+            .with_risk_tier(crate::hsi_contract::RiskTier::Tier4);
+
+        let hello = Hello::with_version(99, "cli/1.0").with_contract_hash("blake3:different");
+        let response = server.process_hello(&hello).unwrap();
+
+        if let HandshakeMessage::HelloNack(nack) = response {
+            assert_eq!(
+                nack.error_code,
+                HandshakeErrorCode::VersionMismatch,
+                "Version mismatch should take precedence over contract mismatch"
+            );
+        } else {
+            panic!("Expected HelloNack for version mismatch");
+        }
+    }
+
+    #[test]
+    fn test_server_handshake_hello_ack_includes_server_canonicalizers() {
+        let server_canons = vec![CanonicalizerInfo {
+            id: "apm2.canonical.v1".to_string(),
+            version: 1,
+        }];
+
+        let mut server = ServerHandshake::new("daemon/1.0")
+            .with_server_contract_hash("blake3:hash")
+            .with_server_canonicalizers(server_canons.clone())
+            .with_risk_tier(crate::hsi_contract::RiskTier::Tier0);
+
+        let hello = Hello::new("cli/1.0")
+            .with_contract_hash("blake3:hash")
+            .with_canonicalizers(vec![CanonicalizerInfo {
+                id: "apm2.canonical.v1".to_string(),
+                version: 1,
+            }]);
+        let response = server.process_hello(&hello).unwrap();
+
+        if let HandshakeMessage::HelloAck(ack) = response {
+            assert_eq!(ack.server_canonicalizers, server_canons);
+            assert!(!ack.contract_mismatch_waived);
+        } else {
+            panic!("Expected HelloAck");
+        }
+    }
+
+    #[test]
+    fn test_server_handshake_no_contract_config_succeeds() {
+        // When server has no contract hash configured, handshake succeeds.
+        let mut server = ServerHandshake::new("daemon/1.0");
+        // No with_server_contract_hash called — defaults to empty
+
+        let hello = Hello::new("cli/1.0").with_contract_hash("blake3:anything");
+        let response = server.process_hello(&hello).unwrap();
+
+        // Empty server hash matches empty (both sides empty is Match),
+        // but client has a hash. The mismatch function treats
+        // non-empty client vs empty server as a mismatch check:
+        // client_hash is non-empty, server_hash is empty, so it's a mismatch.
+        // But at Tier0 (default), it should be waived.
+        assert!(matches!(response, HandshakeMessage::HelloAck(_)));
+        assert!(server.is_completed());
+    }
+
+    #[test]
+    fn test_backward_compat_hello_without_contract_fields() {
+        // A Hello from an old client without contract fields should
+        // deserialize successfully.
+        let json = r#"{"type":"hello","protocol_version":1,"client_info":"old-cli/0.1"}"#;
+        let parsed: HandshakeMessage = serde_json::from_str(json).unwrap();
+
+        if let HandshakeMessage::Hello(hello) = parsed {
+            assert_eq!(hello.client_info, "old-cli/0.1");
+            assert!(hello.cli_contract_hash.is_empty());
+            assert!(hello.canonicalizers.is_empty());
+        } else {
+            panic!("Expected Hello message");
+        }
+    }
+
+    #[test]
+    fn test_backward_compat_hello_ack_without_contract_fields() {
+        // A HelloAck from an old server without contract fields should
+        // deserialize successfully.
+        let json = r#"{"type":"hello_ack","protocol_version":1,"server_info":"old-daemon/0.1"}"#;
+        let parsed: HandshakeMessage = serde_json::from_str(json).unwrap();
+
+        if let HandshakeMessage::HelloAck(ack) = parsed {
+            assert_eq!(ack.server_info, "old-daemon/0.1");
+            assert!(ack.server_contract_hash.is_empty());
+            assert!(ack.server_canonicalizers.is_empty());
+            assert!(!ack.contract_mismatch_waived);
+        } else {
+            panic!("Expected HelloAck message");
+        }
+    }
 }
