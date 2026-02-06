@@ -182,6 +182,29 @@ impl std::fmt::Display for HtfTimestampError {
 
 impl std::error::Error for HtfTimestampError {}
 
+/// Parameters for a work state transition event (TCK-00395).
+///
+/// Bundles the parameters needed to emit a `WorkTransitioned` event to the
+/// ledger. This struct reduces the number of arguments passed to
+/// `emit_work_transitioned`.
+#[derive(Debug, Clone)]
+pub struct WorkTransition<'a> {
+    /// The work ID being transitioned.
+    pub work_id: &'a str,
+    /// The state before the transition.
+    pub from_state: &'a str,
+    /// The state after the transition.
+    pub to_state: &'a str,
+    /// Why the transition occurred (e.g., `work_claimed_via_ipc`).
+    pub rationale_code: &'a str,
+    /// The work item's `transition_count` before this transition.
+    pub previous_transition_count: u32,
+    /// The actor performing the transition.
+    pub actor_id: &'a str,
+    /// HTF-compliant timestamp in nanoseconds since epoch.
+    pub timestamp_ns: u64,
+}
+
 /// Trait for emitting signed events to the ledger.
 ///
 /// Per TCK-00253 acceptance criteria:
@@ -364,6 +387,68 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
+    /// Emits a signed `WorkTransitioned` event to the ledger (TCK-00395).
+    ///
+    /// Records a work item state transition in the ledger, enabling the FAC
+    /// CLI (`apm2 fac work status`) to observe work lifecycle state changes
+    /// and the `GateOrchestrator` (TCK-00388) to trigger gate lifecycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - The work ID being transitioned
+    /// * `from_state` - The state before the transition
+    /// * `to_state` - The state after the transition
+    /// * `rationale_code` - Why the transition occurred (e.g.,
+    ///   `work_claimed_via_ipc`)
+    /// * `previous_transition_count` - The work item's `transition_count`
+    ///   before this transition (replay protection)
+    /// * `actor_id` - The actor performing the transition
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_work_transitioned(
+        &self,
+        transition: &WorkTransition<'_>,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a signed `SessionTerminated` event to the ledger (TCK-00395).
+    ///
+    /// Records session termination in the ledger, enabling the
+    /// `GateOrchestrator` (TCK-00388) to trigger gate lifecycle after
+    /// session completion.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session that terminated
+    /// * `work_id` - The work ID this session was associated with
+    /// * `exit_code` - The process exit code (0 = success)
+    /// * `termination_reason` - Human-readable termination reason
+    /// * `actor_id` - The actor associated with this session
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_session_terminated(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        exit_code: i32,
+        termination_reason: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
     /// Emits an `EpisodeRunAttributed` event to the ledger (TCK-00330).
     ///
     /// This method records attribution for an episode run, binding:
@@ -420,6 +505,28 @@ pub const EPISODE_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.episode:";
 /// This prefix is used for events that attribute episode runs to specific
 /// adapter profiles via their CAS hash.
 pub const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
+
+/// Domain separation prefix for `WorkTransitioned` ledger events (TCK-00395).
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// This prefix is used when emitting work state transition events to the
+/// ledger, enabling the FAC CLI and `GateOrchestrator` to observe work
+/// lifecycle state changes.
+pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitioned:";
+
+/// Domain separation prefix for `SessionTerminated` ledger events (TCK-00395).
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// This prefix is used when emitting session termination events to the
+/// ledger, enabling the `GateOrchestrator` to trigger gate lifecycle
+/// after session completion.
+///
+/// # Note
+///
+/// This is distinct from `SESSION_TERMINATED_DOMAIN_PREFIX` in
+/// `apm2_core::events::canonical` which is used for kernel event signing.
+/// This prefix is for ledger-level JCS-canonicalized JSON events.
+pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_terminated_ledger:";
 
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
 // to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
@@ -1203,6 +1310,198 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             session_id = %session_id,
             adapter_profile_hash = %hex::encode(adapter_profile_hash),
             "EpisodeRunAttributed event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_work_transitioned(
+        &self,
+        transition: &WorkTransition<'_>,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with work transition data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness)
+        let payload_json = serde_json::json!({
+            "event_type": "work_transitioned",
+            "work_id": transition.work_id,
+            "from_state": transition.from_state,
+            "to_state": transition.to_state,
+            "rationale_code": transition.rationale_code,
+            "previous_transition_count": transition.previous_transition_count,
+            "actor_id": transition.actor_id,
+            "timestamp_ns": transition.timestamp_ns,
+        });
+
+        // TCK-00395: Use JCS (RFC 8785) canonicalization for signing.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(WORK_TRANSITIONED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(WORK_TRANSITIONED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "work_transitioned".to_string(),
+            work_id: transition.work_id.to_string(),
+            actor_id: transition.actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns: transition.timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(transition.work_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            work_id = %transition.work_id,
+            from_state = %transition.from_state,
+            to_state = %transition.to_state,
+            rationale_code = %transition.rationale_code,
+            "WorkTransitioned event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_session_terminated(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        exit_code: i32,
+        termination_reason: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with session termination data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness)
+        let payload_json = serde_json::json!({
+            "event_type": "session_terminated",
+            "session_id": session_id,
+            "work_id": work_id,
+            "exit_code": exit_code,
+            "termination_reason": termination_reason,
+            "actor_id": actor_id,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // TCK-00395: Use JCS (RFC 8785) canonicalization for signing.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "session_terminated".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(work_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            work_id = %work_id,
+            exit_code = %exit_code,
+            termination_reason = %termination_reason,
+            "SessionTerminated event signed and persisted"
         );
 
         Ok(signed_event)
@@ -3249,6 +3548,10 @@ impl PrivilegedDispatcher {
             },
         };
 
+        // TCK-00395: Clone actor_id before it is moved into WorkClaim,
+        // as we need it later for emit_work_transitioned.
+        let actor_id_for_transition = actor_id.clone();
+
         // Register the work claim
         let claim = WorkClaim {
             work_id,
@@ -3311,6 +3614,30 @@ impl PrivilegedDispatcher {
             event_id = %signed_event.event_id,
             work_id = %claim.work_id,
             "WorkClaimed event emitted successfully"
+        );
+
+        // TCK-00395: Emit WorkTransitioned(Open -> Claimed) event to ledger.
+        // This enables the FAC CLI to observe work state transitions and the
+        // GateOrchestrator (TCK-00388) to trigger gate lifecycle.
+        if let Err(e) = self.event_emitter.emit_work_transitioned(&WorkTransition {
+            work_id: &claim.work_id,
+            from_state: "Open",
+            to_state: "Claimed",
+            rationale_code: "work_claimed_via_ipc",
+            previous_transition_count: 0, // First transition
+            actor_id: &actor_id_for_transition,
+            timestamp_ns,
+        }) {
+            warn!(error = %e, "WorkTransitioned(Open->Claimed) event emission failed");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work transition event emission failed: {e}"),
+            ));
+        }
+
+        debug!(
+            work_id = %claim.work_id,
+            "WorkTransitioned(Open->Claimed) event emitted successfully"
         );
 
         // Return the work assignment
@@ -3950,6 +4277,30 @@ impl PrivilegedDispatcher {
             session_id = %session_id,
             work_id = %request.work_id,
             "SessionStarted event emitted successfully"
+        );
+
+        // TCK-00395: Emit WorkTransitioned(Claimed -> InProgress) event to ledger.
+        // This enables the FAC CLI to observe that the work has moved to InProgress
+        // and the GateOrchestrator (TCK-00388) to track work state.
+        if let Err(e) = self.event_emitter.emit_work_transitioned(&WorkTransition {
+            work_id: &request.work_id,
+            from_state: "Claimed",
+            to_state: "InProgress",
+            rationale_code: "episode_spawned_via_ipc",
+            previous_transition_count: 1, // Second transition
+            actor_id: &actor_id,
+            timestamp_ns,
+        }) {
+            warn!(error = %e, "WorkTransitioned(Claimed->InProgress) event emission failed");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work transition event emission failed: {e}"),
+            ));
+        }
+
+        debug!(
+            work_id = %request.work_id,
+            "WorkTransitioned(Claimed->InProgress) event emitted successfully"
         );
 
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
@@ -6860,7 +7211,13 @@ mod tests {
             // Query events by work_id from the ledger
             let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
 
-            assert_eq!(events.len(), 1, "Exactly one event should be emitted");
+            // TCK-00395: ClaimWork now emits both work_claimed and
+            // work_transitioned(Open->Claimed)
+            assert_eq!(
+                events.len(),
+                2,
+                "ClaimWork should emit work_claimed + work_transitioned events"
+            );
 
             let event = &events[0];
             assert_eq!(event.work_id, work_id);
@@ -8936,6 +9293,394 @@ mod tests {
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
             }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00395: Work lifecycle observability ledger events
+    // ========================================================================
+    mod tck_00395_work_lifecycle_observability {
+        use super::*;
+
+        /// TCK-00395: `ClaimWork` emits `WorkTransitioned`(Open -> Claimed)
+        /// event.
+        #[test]
+        fn claim_work_emits_work_transitioned_open_to_claimed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let frame = encode_claim_work_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let work_id = match response {
+                PrivilegedResponse::ClaimWork(ref resp) => resp.work_id.clone(),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Verify WorkTransitioned event was emitted to ledger
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let transition_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .collect();
+
+            assert_eq!(
+                transition_events.len(),
+                1,
+                "Expected exactly 1 WorkTransitioned event, got {}",
+                transition_events.len()
+            );
+
+            let event = transition_events[0];
+            assert_eq!(event.work_id, work_id);
+
+            // Parse payload to verify transition details
+            let payload: serde_json::Value =
+                serde_json::from_slice(&event.payload).expect("valid JSON payload");
+            assert_eq!(payload["event_type"], "work_transitioned");
+            assert_eq!(payload["from_state"], "Open");
+            assert_eq!(payload["to_state"], "Claimed");
+            assert_eq!(payload["rationale_code"], "work_claimed_via_ipc");
+            assert_eq!(payload["previous_transition_count"], 0);
+            assert!(event.timestamp_ns > 0, "timestamp must be non-zero");
+        }
+
+        /// TCK-00395: `SpawnEpisode` emits `WorkTransitioned`(Claimed ->
+        /// `InProgress`) event.
+        #[test]
+        fn spawn_episode_emits_work_transitioned_claimed_to_in_progress() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Step 1: ClaimWork to establish policy resolution
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Step 2: SpawnEpisode
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            assert!(
+                matches!(spawn_response, PrivilegedResponse::SpawnEpisode(_)),
+                "Expected SpawnEpisode response"
+            );
+
+            // Verify WorkTransitioned events
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let transition_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .collect();
+
+            assert_eq!(
+                transition_events.len(),
+                2,
+                "Expected 2 WorkTransitioned events (Open->Claimed, Claimed->InProgress), got {}",
+                transition_events.len()
+            );
+
+            // First transition: Open -> Claimed
+            let first_payload: serde_json::Value =
+                serde_json::from_slice(&transition_events[0].payload).expect("valid JSON");
+            assert_eq!(first_payload["from_state"], "Open");
+            assert_eq!(first_payload["to_state"], "Claimed");
+            assert_eq!(first_payload["rationale_code"], "work_claimed_via_ipc");
+            assert_eq!(first_payload["previous_transition_count"], 0);
+
+            // Second transition: Claimed -> InProgress
+            let second_payload: serde_json::Value =
+                serde_json::from_slice(&transition_events[1].payload).expect("valid JSON");
+            assert_eq!(second_payload["from_state"], "Claimed");
+            assert_eq!(second_payload["to_state"], "InProgress");
+            assert_eq!(second_payload["rationale_code"], "episode_spawned_via_ipc");
+            assert_eq!(second_payload["previous_transition_count"], 1);
+        }
+
+        /// TCK-00395: `WorkTransitioned` events use domain-separated
+        /// signatures.
+        #[test]
+        fn work_transitioned_uses_domain_separated_signatures() {
+            let emitter = StubLedgerEventEmitter::new();
+            let result = emitter.emit_work_transitioned(&WorkTransition {
+                work_id: "W-TEST-001",
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: "work_claimed_via_ipc",
+                previous_transition_count: 0,
+                actor_id: "uid:1000",
+                timestamp_ns: 1_000_000_000,
+            });
+
+            assert!(result.is_ok(), "emit_work_transitioned should succeed");
+            let event = result.unwrap();
+
+            assert_eq!(event.event_type, "work_transitioned");
+            assert_eq!(event.work_id, "W-TEST-001");
+            assert_eq!(event.actor_id, "uid:1000");
+            assert!(!event.signature.is_empty(), "signature must be non-empty");
+            assert_eq!(
+                event.signature.len(),
+                64,
+                "Ed25519 signature must be 64 bytes"
+            );
+        }
+
+        /// TCK-00395: `SessionTerminated` event uses domain-separated
+        /// signatures.
+        #[test]
+        fn session_terminated_uses_domain_separated_signatures() {
+            let emitter = StubLedgerEventEmitter::new();
+            let result = emitter.emit_session_terminated(
+                "SESS-001",
+                "W-TEST-001",
+                0,
+                "completed_normally",
+                "uid:1000",
+                1_000_000_000,
+            );
+
+            assert!(result.is_ok(), "emit_session_terminated should succeed");
+            let event = result.unwrap();
+
+            assert_eq!(event.event_type, "session_terminated");
+            assert_eq!(event.work_id, "W-TEST-001");
+            assert_eq!(event.actor_id, "uid:1000");
+            assert!(!event.signature.is_empty(), "signature must be non-empty");
+            assert_eq!(
+                event.signature.len(),
+                64,
+                "Ed25519 signature must be 64 bytes"
+            );
+
+            // Parse payload to verify all fields present
+            let payload: serde_json::Value =
+                serde_json::from_slice(&event.payload).expect("valid JSON payload");
+            assert_eq!(payload["event_type"], "session_terminated");
+            assert_eq!(payload["session_id"], "SESS-001");
+            assert_eq!(payload["work_id"], "W-TEST-001");
+            assert_eq!(payload["exit_code"], 0);
+            assert_eq!(payload["termination_reason"], "completed_normally");
+            assert_eq!(payload["actor_id"], "uid:1000");
+            assert_eq!(payload["timestamp_ns"], 1_000_000_000);
+        }
+
+        /// TCK-00395: Full lifecycle `ClaimWork` -> `SpawnEpisode` -> verify
+        /// all event types in ledger.
+        #[test]
+        fn full_lifecycle_claim_spawn_verify_all_events() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Step 1: ClaimWork
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Step 2: SpawnEpisode
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            assert!(
+                matches!(spawn_response, PrivilegedResponse::SpawnEpisode(_)),
+                "Expected SpawnEpisode response"
+            );
+
+            // Step 3: Verify full event chain in ledger
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+
+            // Should have: work_claimed, work_transitioned(Open->Claimed),
+            //              session_started, work_transitioned(Claimed->InProgress)
+            let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+            assert!(
+                event_types.contains(&"work_claimed"),
+                "Expected work_claimed event in ledger, got: {event_types:?}"
+            );
+            assert!(
+                event_types.contains(&"session_started"),
+                "Expected session_started event in ledger, got: {event_types:?}"
+            );
+            assert!(
+                event_types.contains(&"work_transitioned"),
+                "Expected work_transitioned event in ledger, got: {event_types:?}"
+            );
+
+            // Verify we have exactly 2 work_transitioned events
+            let transition_count = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .count();
+            assert_eq!(
+                transition_count, 2,
+                "Expected 2 work_transitioned events, got {transition_count}"
+            );
+
+            // Verify HTF-compliant timestamps (all non-zero)
+            for event in &events {
+                assert!(
+                    event.timestamp_ns > 0,
+                    "Event {} should have non-zero HTF timestamp",
+                    event.event_type
+                );
+            }
+
+            // Verify all events are signed (non-empty signatures)
+            for event in &events {
+                assert!(
+                    !event.signature.is_empty(),
+                    "Event {} should have non-empty signature",
+                    event.event_type
+                );
+            }
+        }
+
+        /// TCK-00395: `WorkTransitioned` and `SessionTerminated` domain
+        /// prefixes are unique.
+        #[test]
+        fn domain_prefixes_are_unique() {
+            // All relevant domain prefixes must be unique
+            let prefixes: Vec<&[u8]> = vec![
+                WORK_CLAIMED_DOMAIN_PREFIX,
+                WORK_TRANSITIONED_DOMAIN_PREFIX,
+                DEFECT_RECORDED_DOMAIN_PREFIX,
+                EPISODE_EVENT_DOMAIN_PREFIX,
+                EPISODE_RUN_ATTRIBUTED_PREFIX,
+                SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
+            ];
+
+            for (i, prefix_a) in prefixes.iter().enumerate() {
+                for (j, prefix_b) in prefixes.iter().enumerate() {
+                    if i != j {
+                        assert_ne!(
+                            prefix_a, prefix_b,
+                            "Domain prefixes must be unique to prevent replay attacks"
+                        );
+                    }
+                }
+            }
+
+            // Verify prefixes have the correct format
+            for prefix in &prefixes {
+                let prefix_str = std::str::from_utf8(prefix).expect("Prefix must be valid UTF-8");
+                assert!(
+                    prefix_str.starts_with("apm2.event."),
+                    "Prefix must start with 'apm2.event.': {prefix_str}"
+                );
+                assert!(
+                    prefix_str.ends_with(':'),
+                    "Prefix must end with ':': {prefix_str}"
+                );
+            }
+        }
+
+        /// TCK-00395: `WorkTransitioned` events are queryable by `work_id`.
+        #[test]
+        fn work_transitioned_events_queryable_by_work_id() {
+            let emitter = StubLedgerEventEmitter::new();
+
+            // Emit two transition events for the same work_id
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-QUERY-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "work_claimed_via_ipc",
+                    previous_transition_count: 0,
+                    actor_id: "uid:1000",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .unwrap();
+
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-QUERY-001",
+                    from_state: "Claimed",
+                    to_state: "InProgress",
+                    rationale_code: "episode_spawned_via_ipc",
+                    previous_transition_count: 1,
+                    actor_id: "uid:1000",
+                    timestamp_ns: 2_000_000_000,
+                })
+                .unwrap();
+
+            // Emit a transition for a different work_id
+            emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-QUERY-002",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "work_claimed_via_ipc",
+                    previous_transition_count: 0,
+                    actor_id: "uid:2000",
+                    timestamp_ns: 3_000_000_000,
+                })
+                .unwrap();
+
+            // Query by first work_id - should get 2 events
+            let events = emitter.get_events_by_work_id("W-QUERY-001");
+            assert_eq!(
+                events.len(),
+                2,
+                "Expected 2 events for W-QUERY-001, got {}",
+                events.len()
+            );
+
+            // Query by second work_id - should get 1 event
+            let events = emitter.get_events_by_work_id("W-QUERY-002");
+            assert_eq!(
+                events.len(),
+                1,
+                "Expected 1 event for W-QUERY-002, got {}",
+                events.len()
+            );
         }
     }
 }

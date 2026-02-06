@@ -1416,6 +1416,79 @@ impl EpisodeRuntime {
         Ok(())
     }
 
+    /// Stops an episode and emits a `SessionTerminated` ledger event
+    /// (TCK-00395).
+    ///
+    /// This is a convenience wrapper around [`Self::stop`] that additionally
+    /// emits a `SessionTerminated` event to the ledger when a
+    /// `ledger_emitter` is configured. This enables the `GateOrchestrator`
+    /// (TCK-00388) to observe session termination and trigger gate lifecycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode to stop
+    /// * `termination_class` - How the episode terminated
+    /// * `timestamp_ns` - Current timestamp in nanoseconds since epoch
+    /// * `session_id` - The session being terminated
+    /// * `work_id` - The work ID this session is associated with
+    /// * `actor_id` - The actor associated with this session
+    ///
+    /// # Errors
+    ///
+    /// Returns `EpisodeError` if the episode stop fails or ledger emission
+    /// fails.
+    pub async fn stop_with_session_context(
+        &self,
+        episode_id: &EpisodeId,
+        termination_class: TerminationClass,
+        timestamp_ns: u64,
+        session_id: &str,
+        work_id: &str,
+        actor_id: &str,
+    ) -> Result<(), EpisodeError> {
+        // Perform the normal stop
+        self.stop(episode_id, termination_class, timestamp_ns)
+            .await?;
+
+        // TCK-00395: Emit SessionTerminated event to ledger if emitter is configured
+        if let Some(ref emitter) = self.ledger_emitter {
+            let exit_code = match termination_class {
+                TerminationClass::Success => 0,
+                _ => 1,
+            };
+            let termination_reason = format!("{termination_class}");
+
+            if let Err(e) = emitter.emit_session_terminated(
+                session_id,
+                work_id,
+                exit_code,
+                &termination_reason,
+                actor_id,
+                timestamp_ns,
+            ) {
+                warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    work_id = %work_id,
+                    "SessionTerminated ledger event emission failed"
+                );
+                return Err(EpisodeError::LedgerFailure {
+                    id: episode_id.as_str().to_string(),
+                    message: format!("session terminated event emission failed: {e}"),
+                });
+            }
+
+            info!(
+                session_id = %session_id,
+                work_id = %work_id,
+                episode_id = %episode_id,
+                "SessionTerminated ledger event emitted"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Quarantines an episode, transitioning it from RUNNING to QUARANTINED.
     ///
     /// # Arguments
