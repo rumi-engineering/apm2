@@ -975,6 +975,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Err(resp) => return Ok(resp),
         };
 
+        // TCK-00395 Security BLOCKER 2: Enforce active-session check.
+        // HMAC token validation alone is not sufficient because EndSession
+        // revokes only session-registry state. A retained token could
+        // continue tool actions after EndSession if we don't verify
+        // the session still exists in the registry.
+        if let Some(ref registry) = self.session_registry {
+            if registry.get_session(&token.session_id).is_none() {
+                warn!(
+                    session_id = %token.session_id,
+                    "RequestTool rejected: session not found in registry (may have been terminated)"
+                );
+                return Ok(SessionResponse::session_invalid(
+                    "session not found or already terminated",
+                ));
+            }
+        }
+
         info!(
             session_id = %token.session_id,
             tool_id = %request.tool_id,

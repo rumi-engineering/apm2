@@ -4378,12 +4378,31 @@ impl PrivilegedDispatcher {
             }
         };
 
+        // TCK-00395 Security BLOCKER 1: Write the episode_id back to the
+        // session in the registry. Without this write-back, EndSession cannot
+        // resolve the episode binding and will skip runtime stop, allowing
+        // the episode to continue running after session termination.
         if let Some(ref episode_id) = episode_id_opt {
+            if let Err(e) = self
+                .session_registry
+                .update_episode_id(&session_id, episode_id.to_string())
+            {
+                warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    episode_id = %episode_id,
+                    "Failed to write episode_id back to session registry - failing closed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("session episode_id update failed: {e}"),
+                ));
+            }
             debug!(
                 session_id = %session_id,
                 episode_id = %episode_id,
                 workspace_root = %request.workspace_root,
-                "Episode created and started with workspace root"
+                "Episode created, started, and bound to session"
             );
         }
 
@@ -4856,13 +4875,44 @@ impl PrivilegedDispatcher {
         };
 
         // ---- Phase 2: Stop runtime BEFORE emitting ledger events ----
-        // Security BLOCKER 2 / Quality BLOCKER 1: Runtime must be stopped
-        // BEFORE writing success/completion facts to the ledger. If the
-        // runtime stop fails, we fail closed without writing incorrect
-        // success facts. Uses `stop_with_session_context` per Quality
-        // MAJOR 1 to ensure the episode transitions to Terminated and
-        // emits `episode.stopped`.
-        if let Some(ref episode_id_str) = session.episode_id {
+        // Security BLOCKER 1: Fail closed if the session has no resolvable
+        // episode binding. SpawnEpisode now writes back the episode_id
+        // (see update_episode_id call above). If the session still lacks
+        // an episode_id, it means the episode was never created or the
+        // write-back failed, so we must not emit termination facts.
+        //
+        // In test mode (no tokio runtime), episode_id may legitimately be
+        // None. Production sessions always have an episode_id after
+        // SpawnEpisode succeeds.
+        let episode_id_str = match session.episode_id {
+            Some(ref id) => id.clone(),
+            None => {
+                // In cfg(test), allow sessions without episode_id for
+                // backward compatibility with sync unit tests.
+                #[cfg(test)]
+                {
+                    debug!(
+                        session_id = %request.session_id,
+                        "EndSession: session lacks episode_id (test mode) - skipping runtime stop"
+                    );
+                    String::new()
+                }
+                #[cfg(not(test))]
+                {
+                    warn!(
+                        session_id = %request.session_id,
+                        "EndSession: session has no episode_id binding - failing closed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "session has no episode binding: cannot stop runtime",
+                    ));
+                }
+            },
+        };
+
+        // Stop the runtime episode if we have a valid episode_id.
+        if !episode_id_str.is_empty() {
             if let Ok(episode_id_parsed) = EpisodeId::new(episode_id_str.clone()) {
                 let termination_class = if exit_code == 0 {
                     TerminationClass::Success
@@ -4930,38 +4980,24 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00395 MAJOR 3: Emit WorkTransitioned(InProgress -> Completed)
-        // if session terminated successfully. Failure is propagated as part
-        // of the operation contract (fail-closed).
-        if exit_code == 0 {
-            let transition_count = self
-                .event_emitter
-                .get_work_transition_count(&session.work_id);
-            if let Err(e) = self.event_emitter.emit_work_transitioned(&WorkTransition {
-                work_id: &session.work_id,
-                from_state: "InProgress",
-                to_state: "Completed",
-                rationale_code: "session_completed_via_ipc",
-                previous_transition_count: transition_count,
-                actor_id: &actor_id,
-                timestamp_ns,
-            }) {
-                warn!(
-                    error = %e,
-                    "WorkTransitioned(InProgress->Completed) event emission failed - failing closed"
-                );
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("work transition emission failed: {e}"),
-                ));
-            }
-        }
+        // TCK-00395 Quality BLOCKER 2: DO NOT emit
+        // WorkTransitioned(InProgress -> Completed) on EndSession.
+        // The InProgress -> Completed transition violates core work-state
+        // transition rules (state.rs only allows InProgress -> Review,
+        // CiPending, NeedsInput, NeedsAdjudication, or Aborted).
+        // Work state completion belongs to a separate workflow path
+        // (gate orchestration), not EndSession.
 
-        // ---- Phase 4: POST-COMMIT session removal ----
+        // ---- Phase 4: POST-COMMIT session + manifest removal ----
         // Remove session from registry only after ALL fallible operations
         // (runtime stop + ledger emission) have succeeded. This prevents
-        // the session from being orphaned if a downstream step fails
-        // (Security BLOCKER 1 / Quality BLOCKER 2).
+        // the session from being orphaned if a downstream step fails.
+        //
+        // TCK-00395 Security BLOCKER 2: Also remove the manifest entry
+        // to prevent retained session tokens from passing manifest lookup
+        // in RequestTool after EndSession.
+        self.manifest_store.remove(&request.session_id);
+
         if let Err(e) = self.session_registry.remove_session(&request.session_id) {
             warn!(
                 error = %e,
@@ -10147,10 +10183,15 @@ mod tests {
             assert_eq!(payload["termination_reason"], "completed_normally");
         }
 
-        /// FIX-BLOCKER: `EndSession` also emits `WorkTransitioned` for
-        /// successful termination.
+        /// Quality BLOCKER 2: `EndSession` does NOT emit
+        /// `WorkTransitioned(InProgress -> Completed)`.
+        ///
+        /// The `InProgress` -> `Completed` transition violates core
+        /// work-state rules (`state.rs`). Work completion belongs to
+        /// gate orchestration, not `EndSession`. `EndSession` only emits
+        /// `session_terminated`.
         #[test]
-        fn end_session_success_emits_work_transitioned_completed() {
+        fn end_session_success_does_not_emit_completed_transition() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
@@ -10194,29 +10235,33 @@ mod tests {
             let end_frame = encode_end_session_request(&end_request);
             dispatcher.dispatch(&end_frame, &ctx).unwrap();
 
-            // Verify WorkTransitioned(InProgress -> Completed) emitted
+            // Verify NO WorkTransitioned(InProgress -> Completed) is emitted.
+            // Per Quality BLOCKER 2: work completion belongs to gate
+            // orchestration, not EndSession.
             let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
-            let completed_transitions: Vec<_> = events
+            let completed_count = events
                 .iter()
                 .filter(|e| e.event_type == "work_transitioned")
                 .filter(|e| {
                     let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
                     p["to_state"] == "Completed"
                 })
-                .collect();
+                .count();
 
             assert_eq!(
-                completed_transitions.len(),
-                1,
-                "Expected 1 Completed transition, got {}",
-                completed_transitions.len()
+                completed_count, 0,
+                "EndSession must NOT emit WorkTransitioned(Completed) - work completion belongs to gate orchestration"
             );
 
-            let payload: serde_json::Value =
-                serde_json::from_slice(&completed_transitions[0].payload).unwrap();
-            assert_eq!(payload["from_state"], "InProgress");
-            assert_eq!(payload["to_state"], "Completed");
-            assert_eq!(payload["rationale_code"], "session_completed_via_ipc");
+            // Verify session_terminated was still emitted
+            let terminated_count = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .count();
+            assert_eq!(
+                terminated_count, 1,
+                "EndSession should emit session_terminated"
+            );
         }
 
         /// FIX-BLOCKER: `EndSession` rejects unknown session ID.
@@ -10737,181 +10782,13 @@ mod tests {
             }
         }
 
-        /// MAJOR 3: `EndSession` returns error when `WorkTransitioned` emission
-        /// fails (fail-closed).
+        /// Quality BLOCKER 2: `EndSession` succeeds regardless of
+        /// `emit_work_transitioned` status because `EndSession` no longer
+        /// emits work transitions. Work completion belongs to gate
+        /// orchestration.
         #[test]
-        fn end_session_fails_closed_on_work_transition_emission_failure() {
-            use std::sync::atomic::{AtomicBool, Ordering};
-
-            /// A test emitter that fails `emit_work_transitioned` on demand.
-            struct FailingTransitionEmitter {
-                inner: StubLedgerEventEmitter,
-                fail_transition: AtomicBool,
-            }
-
-            impl FailingTransitionEmitter {
-                fn new() -> Self {
-                    Self {
-                        inner: StubLedgerEventEmitter::new(),
-                        fail_transition: AtomicBool::new(false),
-                    }
-                }
-            }
-
-            impl LedgerEventEmitter for FailingTransitionEmitter {
-                fn emit_work_claimed(
-                    &self,
-                    claim: &WorkClaim,
-                    timestamp_ns: u64,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner.emit_work_claimed(claim, timestamp_ns)
-                }
-                fn emit_session_started(
-                    &self,
-                    session_id: &str,
-                    work_id: &str,
-                    lease_id: &str,
-                    actor_id: &str,
-                    timestamp_ns: u64,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner.emit_session_started(
-                        session_id,
-                        work_id,
-                        lease_id,
-                        actor_id,
-                        timestamp_ns,
-                    )
-                }
-                fn emit_session_event(
-                    &self,
-                    session_id: &str,
-                    event_type: &str,
-                    payload: &[u8],
-                    actor_id: &str,
-                    timestamp_ns: u64,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner.emit_session_event(
-                        session_id,
-                        event_type,
-                        payload,
-                        actor_id,
-                        timestamp_ns,
-                    )
-                }
-                fn emit_defect_recorded(
-                    &self,
-                    defect: &DefectRecorded,
-                    timestamp_ns: u64,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner.emit_defect_recorded(defect, timestamp_ns)
-                }
-                fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent> {
-                    self.inner.get_event(event_id)
-                }
-                fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
-                    self.inner.get_events_by_work_id(work_id)
-                }
-                fn emit_episode_event(
-                    &self,
-                    episode_id: &str,
-                    event_type: &str,
-                    payload: &[u8],
-                    timestamp_ns: u64,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner
-                        .emit_episode_event(episode_id, event_type, payload, timestamp_ns)
-                }
-                fn emit_review_receipt(
-                    &self,
-                    episode_id: &str,
-                    receipt_id: &str,
-                    changeset_digest: &[u8; 32],
-                    artifact_bundle_hash: &[u8; 32],
-                    reviewer_actor_id: &str,
-                    timestamp_ns: u64,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner.emit_review_receipt(
-                        episode_id,
-                        receipt_id,
-                        changeset_digest,
-                        artifact_bundle_hash,
-                        reviewer_actor_id,
-                        timestamp_ns,
-                    )
-                }
-                fn get_work_transition_count(&self, work_id: &str) -> u32 {
-                    self.inner.get_work_transition_count(work_id)
-                }
-                fn emit_work_transitioned(
-                    &self,
-                    transition: &WorkTransition<'_>,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    if self.fail_transition.load(Ordering::Relaxed) {
-                        return Err(LedgerEventError::PersistenceFailed {
-                            message: "injected failure".to_string(),
-                        });
-                    }
-                    self.inner.emit_work_transitioned(transition)
-                }
-                fn emit_session_terminated(
-                    &self,
-                    session_id: &str,
-                    work_id: &str,
-                    exit_code: i32,
-                    termination_reason: &str,
-                    actor_id: &str,
-                    timestamp_ns: u64,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner.emit_session_terminated(
-                        session_id,
-                        work_id,
-                        exit_code,
-                        termination_reason,
-                        actor_id,
-                        timestamp_ns,
-                    )
-                }
-                fn emit_episode_run_attributed(
-                    &self,
-                    work_id: &str,
-                    episode_id: &str,
-                    session_id: &str,
-                    adapter_profile_hash: &[u8; 32],
-                    timestamp_ns: u64,
-                ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner.emit_episode_run_attributed(
-                        work_id,
-                        episode_id,
-                        session_id,
-                        adapter_profile_hash,
-                        timestamp_ns,
-                    )
-                }
-            }
-
-            let emitter = Arc::new(FailingTransitionEmitter::new());
-            let session_registry = Arc::new(InMemorySessionRegistry::default());
-            let holonic_clock = Arc::new(
-                HolonicClock::new(ClockConfig::default(), None)
-                    .expect("default ClockConfig should always succeed"),
-            );
-            let subscription_registry = Arc::new(SubscriptionRegistry::with_defaults());
-
-            let dispatcher = PrivilegedDispatcher::with_dependencies(
-                DecodeConfig::default(),
-                Arc::new(StubPolicyResolver),
-                Arc::new(StubWorkRegistry::default()),
-                emitter.clone(),
-                Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
-                session_registry,
-                Arc::new(StubLeaseValidator::new()),
-                holonic_clock,
-                Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
-                Arc::new(InMemoryManifestStore::new()),
-                Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
-                subscription_registry,
-            );
-
+        fn end_session_succeeds_without_work_transition() {
+            let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -10935,7 +10812,7 @@ mod tests {
             // SpawnEpisode
             let spawn_request = SpawnEpisodeRequest {
                 workspace_root: test_workspace_root(),
-                work_id,
+                work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
             };
@@ -10946,11 +10823,7 @@ mod tests {
                 _ => panic!("Expected SpawnEpisode response"),
             };
 
-            // Arm the failure injection BEFORE EndSession
-            emitter.fail_transition.store(true, Ordering::Relaxed);
-
-            // EndSession with success reason should fail because
-            // WorkTransitioned emission fails (fail-closed)
+            // EndSession with success
             let end_request = EndSessionRequest {
                 session_id: session_id.clone(),
                 reason: "completed_normally".to_string(),
@@ -10958,25 +10831,37 @@ mod tests {
             };
             let end_frame = encode_end_session_request(&end_request);
             let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+
+            // EndSession should succeed (no work transition emitted)
             match response {
-                PrivilegedResponse::Error(err) => {
-                    assert!(
-                        err.message.contains("work transition emission failed"),
-                        "Expected work transition failure, got: {}",
-                        err.message
-                    );
+                PrivilegedResponse::EndSession(resp) => {
+                    assert_eq!(resp.message, "session terminated");
                 },
-                other => panic!("Expected error response for failed transition, got: {other:?}"),
+                other => panic!("Expected EndSession response, got: {other:?}"),
             }
 
-            // Security BLOCKER 2: Verify session is NOT removed from registry
-            // when a downstream ledger step fails (POST-COMMIT removal).
+            // Session should be removed from registry after success
             assert!(
                 dispatcher
                     .session_registry()
                     .get_session(&session_id)
-                    .is_some(),
-                "Session MUST be preserved in registry when ledger step fails"
+                    .is_none(),
+                "Session MUST be removed from registry after successful EndSession"
+            );
+
+            // Verify no Completed transitions were emitted
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let completed_count = events
+                .iter()
+                .filter(|e| e.event_type == "work_transitioned")
+                .filter(|e| {
+                    let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                    p["to_state"] == "Completed"
+                })
+                .count();
+            assert_eq!(
+                completed_count, 0,
+                "EndSession must not emit WorkTransitioned(Completed)"
             );
         }
 
@@ -11020,8 +10905,8 @@ mod tests {
                 (work_id, session_id)
             };
 
-            // Test 1: TerminationOutcome::Success -> exit_code 0,
-            //         WorkTransitioned(Completed) emitted.
+            // Test 1: TerminationOutcome::Success -> exit_code 0.
+            // Quality BLOCKER 2: NO WorkTransitioned(Completed) emitted.
             let (work_id, session_id) = setup(&dispatcher);
             let end_request = EndSessionRequest {
                 session_id,
@@ -11039,15 +10924,17 @@ mod tests {
             let payload: serde_json::Value =
                 serde_json::from_slice(&terminated[0].payload).unwrap();
             assert_eq!(payload["exit_code"], 0, "Success outcome -> exit_code 0");
-            // Should also have WorkTransitioned to Completed
+            // Quality BLOCKER 2: EndSession must NOT emit
+            // WorkTransitioned(Completed). Work completion belongs to
+            // gate orchestration.
             assert!(
-                events.iter().any(|e| {
+                !events.iter().any(|e| {
                     e.event_type == "work_transitioned" && {
                         let p: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
                         p["to_state"] == "Completed"
                     }
                 }),
-                "Success outcome should emit WorkTransitioned(Completed)"
+                "Success outcome must NOT emit WorkTransitioned(Completed) per Quality BLOCKER 2"
             );
 
             // Test 2: TerminationOutcome::Failure -> exit_code 1,
@@ -11235,7 +11122,9 @@ mod tests {
                 "SessionTerminated event should be in ledger"
             );
 
-            // Verify: WorkTransitioned(InProgress->Completed) in ledger
+            // Quality BLOCKER 2: EndSession must NOT emit
+            // WorkTransitioned(InProgress->Completed). Work completion
+            // belongs to gate orchestration.
             let completed_count = events
                 .iter()
                 .filter(|e| e.event_type == "work_transitioned")
@@ -11244,7 +11133,10 @@ mod tests {
                     p["to_state"] == "Completed"
                 })
                 .count();
-            assert_eq!(completed_count, 1, "Expected WorkTransitioned to Completed");
+            assert_eq!(
+                completed_count, 0,
+                "EndSession must NOT emit WorkTransitioned(Completed)"
+            );
 
             // Verify: repeated EndSession is rejected
             let end_frame2 = encode_end_session_request(&end_request);

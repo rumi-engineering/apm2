@@ -203,6 +203,25 @@ pub trait SessionRegistry: Send + Sync {
         &self,
         session_id: &str,
     ) -> Result<Option<SessionState>, SessionRegistryError>;
+
+    /// Updates the `episode_id` for an existing session (TCK-00395 Security
+    /// BLOCKER 1).
+    ///
+    /// After `SpawnEpisode` creates and starts an episode via
+    /// `episode_runtime.create()` + `start_with_workspace()`, the returned
+    /// episode ID must be written back to the session in the registry.
+    /// Without this write-back, `EndSession` cannot resolve the episode
+    /// binding and will skip runtime stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SessionRegistryError` if the session is not found or
+    /// persistence fails (fail-closed).
+    fn update_episode_id(
+        &self,
+        session_id: &str,
+        episode_id: String,
+    ) -> Result<(), SessionRegistryError>;
 }
 
 /// Error type for session registry operations.

@@ -3544,6 +3544,13 @@ mod tests {
         ) -> Option<(crate::session::SessionState, SessionTerminationInfo)> {
             None
         }
+        fn update_episode_id(
+            &self,
+            _session_id: &str,
+            _episode_id: String,
+        ) -> Result<(), crate::session::SessionRegistryError> {
+            Ok(())
+        }
     }
 
     /// TCK-00385 MAJOR 1: `stop()` returns `SessionTerminationFailed` when

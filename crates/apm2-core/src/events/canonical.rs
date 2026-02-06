@@ -76,6 +76,14 @@ pub const SESSION_TERMINATED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_termina
 /// 1.
 pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
 
+/// Domain prefix for `WorkTransitioned` events (TCK-00395).
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// This prefix is used for work lifecycle state transition events emitted
+/// by `SpawnEpisode` (`Claimed` -> `InProgress`) and `ClaimWork` (`Open` ->
+/// `Claimed`).
+pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitioned:";
+
 /// Domain prefix for `EpisodeSpawned` events.
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
