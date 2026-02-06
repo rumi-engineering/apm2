@@ -143,6 +143,9 @@ pub mod tool_handler;
 // TCK-00311: Workspace snapshot and apply
 pub mod workspace;
 
+// TCK-00387: Crash recovery wiring
+pub mod crash_recovery;
+
 // Re-export envelope types (TCK-00159)
 // Re-export adapter types (TCK-00162)
 pub use adapter::{

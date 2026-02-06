@@ -328,11 +328,16 @@ impl DispatcherState {
     /// * `sqlite_conn` - Optional `SQLite` connection for persistent ledger. If
     ///   provided, uses durable `Sqlite*` implementations. Otherwise uses
     ///   stubs.
+    /// * `ledger_signing_key` - Optional ledger signing key. When provided, the
+    ///   dispatcher reuses this key instead of generating a new ephemeral one.
+    ///   Per Security Review v5 MAJOR 2, there must be ONE signing key per
+    ///   daemon lifecycle, shared between crash recovery and the dispatcher.
     #[must_use]
     pub fn with_persistence(
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
         sqlite_conn: Option<Arc<Mutex<Connection>>>,
+        ledger_signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Self {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
@@ -354,8 +359,13 @@ impl DispatcherState {
 
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
-            use rand::rngs::OsRng;
-            let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+            // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
+            // if provided, otherwise generate a new one. This ensures recovery
+            // and dispatcher events are signed with the same key.
+            let signing_key = ledger_signing_key.unwrap_or_else(|| {
+                use rand::rngs::OsRng;
+                ed25519_dalek::SigningKey::generate(&mut OsRng)
+            });
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
             let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
@@ -492,8 +502,35 @@ impl DispatcherState {
         sqlite_conn: Arc<Mutex<Connection>>,
         cas_path: impl AsRef<Path>,
     ) -> Result<Self, crate::cas::DurableCasError> {
-        use rand::rngs::OsRng;
+        Self::with_persistence_and_cas_and_key(
+            session_registry,
+            metrics_registry,
+            sqlite_conn,
+            cas_path,
+            None,
+        )
+    }
 
+    /// Creates new dispatcher state with persistent ledger, CAS,
+    /// `ToolBroker`, and an optional pre-existing ledger signing key
+    /// (TCK-00387 Security Review v5 MAJOR 2).
+    ///
+    /// When `ledger_signing_key` is `Some`, that key is reused for the ledger
+    /// event emitter instead of generating a new ephemeral one. This ensures
+    /// ONE signing key per daemon lifecycle, shared between crash recovery and
+    /// the dispatcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CAS initialization fails.
+    #[allow(clippy::needless_pass_by_value)] // Arc is intentionally moved for shared ownership
+    pub fn with_persistence_and_cas_and_key(
+        session_registry: Arc<dyn SessionRegistry>,
+        metrics_registry: Option<SharedMetricsRegistry>,
+        sqlite_conn: Arc<Mutex<Connection>>,
+        cas_path: impl AsRef<Path>,
+        ledger_signing_key: Option<ed25519_dalek::SigningKey>,
+    ) -> Result<Self, crate::cas::DurableCasError> {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -521,8 +558,13 @@ impl DispatcherState {
         let clock =
             Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
-        // Use real implementations
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
+        // if provided, otherwise generate a new one. This ensures recovery
+        // and dispatcher events are signed with the same key.
+        let signing_key = ledger_signing_key.unwrap_or_else(|| {
+            use rand::rngs::OsRng;
+            ed25519_dalek::SigningKey::generate(&mut OsRng)
+        });
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());
         let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&sqlite_conn)));
