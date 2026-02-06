@@ -16242,7 +16242,7 @@ mod tests {
 
             // Create a context with DIFFERENT peer credentials (uid=9999)
             // so the authenticated identity won't match the lease executor.
-            let wrong_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let wrong_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 9999,
                 gid: 9999,
                 pid: Some(99999),
@@ -16288,7 +16288,7 @@ mod tests {
 
             // Caller supplies the correct reviewer_actor_id in the request,
             // but connects with DIFFERENT peer credentials.
-            let wrong_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let wrong_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 7777,
                 gid: 7777,
                 pid: Some(77777),
@@ -16325,7 +16325,7 @@ mod tests {
             let (dispatcher, _ctx) =
                 setup_dispatcher_with_lease("lease-no-creds", "W-NC", "gate-nc", "unused");
 
-            let ctx_no_creds = ConnectionContext::privileged(None);
+            let ctx_no_creds = ConnectionContext::privileged_session_open(None);
 
             let request = IngestReviewReceiptRequest {
                 lease_id: "lease-no-creds".to_string(),
@@ -17063,7 +17063,7 @@ mod tests {
                 "gate-001",
                 &executor_actor_id,
             );
-            let ctx = ConnectionContext::privileged(Some(peer_creds));
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
 
             let request = IngestReviewReceiptRequest {
                 lease_id: "lease-no-claim".to_string(),
@@ -17202,7 +17202,7 @@ mod tests {
                 &caller_actor,
             );
 
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -17258,7 +17258,7 @@ mod tests {
             ));
             let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
             // Do NOT register any parent lease
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -17331,7 +17331,7 @@ mod tests {
                 signer,
             ));
             let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -17366,7 +17366,7 @@ mod tests {
                 signer,
             ));
             let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -17397,7 +17397,7 @@ mod tests {
         fn test_delegate_sublease_no_orchestrator_rejected() {
             // Dispatcher without gate orchestrator configured
             let dispatcher = PrivilegedDispatcher::new();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -17433,7 +17433,7 @@ mod tests {
                 "executor-001",
             );
             // Non-privileged context
-            let ctx = ConnectionContext::session(
+            let ctx = ConnectionContext::session_open(
                 Some(PeerCredentials {
                     uid: 1000,
                     gid: 1000,
@@ -17499,7 +17499,7 @@ mod tests {
                 "totally-different-actor",
             );
 
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -17543,7 +17543,7 @@ mod tests {
             );
 
             // Context with NO peer credentials
-            let ctx = ConnectionContext::privileged(None);
+            let ctx = ConnectionContext::privileged_session_open(None);
 
             let request = DelegateSubleaseRequest {
                 parent_lease_id: "parent-no-creds".to_string(),
@@ -17763,7 +17763,7 @@ mod tests {
                 &caller_actor,
             );
 
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -17922,7 +17922,7 @@ mod tests {
                 &caller_actor,
             );
 
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -18075,7 +18075,7 @@ mod tests {
                 subscription_registry,
             );
 
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
                 pid: Some(12345),
@@ -18397,7 +18397,7 @@ mod tests {
                     &caller_actor,
                 );
 
-            let ctx = ConnectionContext::privileged(Some(test_creds));
+            let ctx = ConnectionContext::privileged_session_open(Some(test_creds));
 
             // Exercise DelegateSublease through production-wired dispatcher
             let request = DelegateSubleaseRequest {
@@ -18542,7 +18542,7 @@ mod tests {
                 pid: Some(12345),
             };
             let caller_actor = derive_actor_id(&test_creds);
-            let ctx = ConnectionContext::privileged(Some(test_creds));
+            let ctx = ConnectionContext::privileged_session_open(Some(test_creds));
 
             // Step 1: Use GovernancePolicyResolver to produce the PolicyResolution
             // (this is what ClaimWork calls in production with_persistence path)
