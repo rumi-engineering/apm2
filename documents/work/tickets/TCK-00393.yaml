@@ -1,0 +1,99 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00393"
+    title: "Wire divergence watchdog into daemon main loop"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_SECURITY"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00390"
+        reason: "Merge executor must produce MergeReceipt events for the watchdog to compare against external trunk HEAD."
+  scope:
+    in_scope:
+      - "Instantiate DivergenceWatchdog in main.rs with daemon signer and DivergenceWatchdogConfig."
+      - "Wire DivergenceWatchdog to SqliteLedgerEventEmitter for DefectRecorded event emission."
+      - "Implement external trunk HEAD polling via GitHub API (separate from GitHubProjectionAdapter which is write-only)."
+      - "Spawn background tokio task in daemon main loop that calls check_divergence() at poll_interval."
+      - "On divergence detection, emit DefectRecorded event and InterventionFreeze to halt admissions."
+      - "Add DivergenceWatchdog configuration to ecosystem.toml (poll_interval, repo_id)."
+      - "Add integration test: simulate divergence between ledger MergeReceipt HEAD and external trunk HEAD, verify DefectRecorded and InterventionFreeze events are emitted."
+    out_of_scope:
+      - "DivergenceWatchdog implementation (already fully implemented in divergence_watchdog.rs)."
+      - "FreezeRegistry enforcement (already implemented, checks freeze status before admissions)."
+      - "InterventionUnfreeze adjudication flow (separate concern, requires operator intervention)."
+      - "GitHubProjectionAdapter changes (write-only adapter, trunk HEAD fetch uses separate API call)."
+  plan:
+    steps:
+      - "Import DivergenceWatchdog and DivergenceWatchdogConfig in main.rs."
+      - "Create DivergenceWatchdogConfig from ecosystem config (repo_id, poll_interval default 30s, actor_id from daemon identity)."
+      - "Instantiate DivergenceWatchdog::new(signer.clone(), config) after signer is initialized in main.rs."
+      - "Implement a trunk_head_fetcher function that queries GitHub API for the default branch HEAD SHA (using reqwest or octocrab, NOT GitHubProjectionAdapter which is write-only per its module doc)."
+      - "Implement a merge_receipt_head_fetcher function that queries the ledger for the latest MergeReceipt result_selector."
+      - "Spawn a tokio task in the main select! block (alongside protocol_server_task, signal_task, metrics_task, projection_worker_handle at lines 941-975) that loops: sleep(poll_interval) -> fetch both HEADs -> call watchdog.check_divergence() -> if Some(result), emit result.defect_event via ledger.emit_defect_recorded()."
+      - "Handle the case where no MergeReceipt exists yet (first run) -- skip divergence check until first merge."
+      - "Add ecosystem.toml config for divergence watchdog: [daemon.divergence_watchdog] section with repo_id and poll_interval_secs."
+      - "Add integration test using DivergenceWatchdog::with_time_source() for deterministic testing."
+      - "Verify existing tests still pass."
+  definition_of_done:
+    criteria:
+      - "DivergenceWatchdog is instantiated in daemon main loop when ledger and signer are available."
+      - "Background task polls at configured poll_interval (default 30s)."
+      - "Divergence between ledger MergeReceipt HEAD and external trunk HEAD emits DefectRecorded event."
+      - "InterventionFreeze is emitted on divergence, halting new admissions."
+      - "Idempotent: repeated divergence checks for the same divergence do not produce duplicate events (FreezeRegistry already_frozen check)."
+      - "No-op when no MergeReceipt exists in ledger (startup case)."
+      - "Integration test validates divergence detection and event emission."
+  notes:
+    context: |
+      The DivergenceWatchdog (crates/apm2-daemon/src/projection/divergence_watchdog.rs) is fully
+      implemented but explicitly not wired into the daemon main loop. The file header (lines 4-30)
+      contains a 5-step integration TODO tagged `TCK-00307 Security Review - BLOCKER 2`:
+      1. Instantiate watchdog in main.rs with signer + config
+      2. Wire to ledger for DefectRecorded emission
+      3. Source external trunk HEAD from GitHub
+      4. Spawn background tokio task at poll_interval
+      5. Handle divergence results -> emit DefectRecorded
+
+      The watchdog struct (line 2021) has: signer, config, FreezeRegistry, atomic counters, and
+      time_source. The check_divergence() method (line 2178) takes merge_receipt_head and
+      external_trunk_head as [u8; 32] arrays and returns Option<DivergenceResult>. The
+      DivergenceResult (line 366) contains: freeze (InterventionFreeze), defect (DefectRecord),
+      and defect_event (DefectRecorded) -- all ready for emission.
+
+      The DivergenceWatchdogConfig (line 1404) has: repo_id, poll_interval (default 30s),
+      actor_id, time_envelope_pattern.
+
+      IMPORTANT: GitHubProjectionAdapter is write-only (module doc: "The adapter NEVER reads
+      GitHub status as truth"). External trunk HEAD must be fetched via a separate GitHub API
+      call (e.g., GET /repos/{owner}/{repo}/git/ref/heads/{branch}).
+
+      Without this ticket, the autonomous FAC has no defense-in-depth against unauthorized
+      external merges. The merge executor (TCK-00390) produces MergeReceipt events, but nothing
+      compares them against the actual GitHub trunk HEAD to detect divergence.
+    files: |
+      - crates/apm2-daemon/src/projection/divergence_watchdog.rs (DivergenceWatchdog at line 2021, check_divergence at line 2178, DivergenceResult at line 366, config at line 1404)
+      - crates/apm2-daemon/src/main.rs (main select! block at lines 941-975, signer initialization, DispatcherState construction at line 678)
+      - crates/apm2-daemon/src/ledger.rs (SqliteLedgerEventEmitter::emit_defect_recorded at line 338)
+      - crates/apm2-daemon/src/projection/github_sync.rs (GitHubProjectionAdapter is write-only, NOT for reading trunk HEAD)
+      - ecosystem.example.toml (add [daemon.divergence_watchdog] section)
+    security: |
+      The divergence watchdog is a security-critical defense-in-depth mechanism. Without it,
+      an attacker who gains GitHub merge permissions can push arbitrary code to the trunk
+      without detection by the FAC pipeline. The watchdog MUST emit DefectRecorded with
+      S0 severity for any divergence, triggering InterventionFreeze to halt all new
+      admissions until adjudication. The freeze is enforced by FreezeRegistry which is
+      checked before any new gate lease issuance. The watchdog signer must use the daemon's
+      identity key to prevent spoofed divergence reports. Poll interval should be
+      configurable but default to 30s to balance detection latency vs API rate limits.
+      The trunk HEAD fetch must authenticate with the daemon's GitHub credential to access
+      private repositories.

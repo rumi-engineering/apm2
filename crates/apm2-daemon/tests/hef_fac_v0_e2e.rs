@@ -168,9 +168,9 @@ impl FacV0TestHarness {
         let capability_validator =
             CapabilityValidator::new(reviewer_manifest).expect("valid capability validator");
 
-        // Create CAS
+        // Create CAS (let DurableCas::new create the directory with secure 0700
+        // permissions)
         let cas_dir = temp_dir.path().join("cas");
-        std::fs::create_dir_all(&cas_dir).expect("create cas dir");
         let cas_config = DurableCasConfig::new(&cas_dir);
         let cas: Arc<dyn ContentAddressedStore> =
             Arc::new(DurableCas::new(cas_config).expect("create cas"));

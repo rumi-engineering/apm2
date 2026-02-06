@@ -102,6 +102,14 @@ struct Args {
     #[arg(long)]
     ledger_db: Option<PathBuf>,
 
+    /// Path to durable content-addressed storage (CAS) directory (TCK-00383)
+    ///
+    /// When provided with `--ledger-db`, enables full session dispatcher wiring
+    /// via `with_persistence_and_cas()`. The directory is created with mode
+    /// 0700 if it does not exist.
+    #[arg(long)]
+    cas_path: Option<PathBuf>,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -133,6 +141,8 @@ struct DaemonConfig {
     state_file_path: PathBuf,
     /// Ledger database path (`SQLite`).
     ledger_db_path: Option<PathBuf>,
+    /// CAS directory path for durable content-addressed storage (TCK-00383).
+    cas_path: Option<PathBuf>,
     /// Port for Prometheus metrics HTTP endpoint (TCK-00268).
     metrics_port: u16,
     /// Whether to disable the metrics endpoint.
@@ -171,6 +181,12 @@ impl DaemonConfig {
         // Ledger DB path from args (config fallback not yet standard)
         let ledger_db_path = args.ledger_db.clone();
 
+        // TCK-00383: CAS path from CLI args, falling back to config file
+        let cas_path = args
+            .cas_path
+            .clone()
+            .or_else(|| config.daemon.cas_path.clone());
+
         Ok(Self {
             config,
             operator_socket_path,
@@ -178,6 +194,7 @@ impl DaemonConfig {
             pid_path,
             state_file_path,
             ledger_db_path,
+            cas_path,
             metrics_port: args.metrics_port,
             metrics_disabled: args.no_metrics,
         })
@@ -313,41 +330,136 @@ fn init_supervisor(config: &EcosystemConfig) -> Supervisor {
     supervisor
 }
 
-/// Graceful shutdown: stop all running processes.
-async fn shutdown_all_processes(state: &SharedState) {
+/// Collect all running process instances from the supervisor.
+///
+/// Returns a list of `(name, instance)` pairs for every process instance
+/// whose supervisor handle reports a running state.
+async fn collect_running_processes(state: &SharedState) -> Vec<(String, u32)> {
+    let inner = state.read().await;
+    inner
+        .supervisor
+        .specs()
+        .flat_map(|spec| {
+            (0..spec.instances)
+                .filter(|i| {
+                    inner
+                        .supervisor
+                        .get_handle(&spec.name, *i)
+                        .is_some_and(|h| h.state.is_running())
+                })
+                .map(|i| (spec.name.clone(), i))
+        })
+        .collect()
+}
+
+/// Read the start time (field 22) from `/proc/{pid}/stat`.
+///
+/// This is used to uniquely identify a process beyond its PID. After a
+/// process exits, the kernel may recycle its PID for a new, unrelated
+/// process. By recording the start time at snapshot time and re-reading it
+/// before sending a kill signal, we can detect PID reuse and avoid killing
+/// an innocent process.
+///
+/// Returns `Some(starttime)` on success, or `None` if the proc entry does
+/// not exist or cannot be parsed (e.g. the process already exited).
+#[cfg(unix)]
+fn read_proc_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let contents = std::fs::read_to_string(stat_path).ok()?;
+
+    // Field 2 (comm) is enclosed in parentheses and may contain spaces,
+    // parens, and other special characters. The safe way to parse is to
+    // find the LAST ')' in the line, then split everything after it.
+    let after_comm = contents.rsplit_once(')')?.1;
+
+    // Fields after comm (field 2) start at field 3.  We need field 22
+    // (starttime), which is field index 22 - 3 = 19 in the remaining
+    // whitespace-separated tokens.
+    let tokens: Vec<&str> = after_comm.split_whitespace().collect();
+    // Index 19 corresponds to field 22 (starttime).
+    tokens.get(19)?.parse::<u64>().ok()
+}
+
+/// Collect tracked PIDs for all running process instances, together with
+/// each process's kernel start time for identity validation.
+///
+/// Returns a map of `PID -> starttime` that the force-kill phase can use
+/// to verify a PID still belongs to the originally managed child before
+/// sending `SIGKILL`. This prevents false-positive kills when the kernel
+/// recycles a PID between the graceful and force-kill phases.
+async fn collect_tracked_pids(state: &SharedState) -> std::collections::HashMap<u32, Option<u64>> {
+    let inner = state.read().await;
+    let mut pids = std::collections::HashMap::new();
+    for spec in inner.supervisor.specs() {
+        for i in 0..spec.instances {
+            if let Some(handle) = inner.supervisor.get_handle(&spec.name, i) {
+                if handle.state.is_running() {
+                    if let Some(pid) = handle.pid {
+                        #[cfg(unix)]
+                        let start_time = read_proc_start_time(pid);
+                        #[cfg(not(unix))]
+                        let start_time = None;
+                        pids.insert(pid, start_time);
+                    }
+                }
+            }
+        }
+    }
+    pids
+}
+
+/// Graceful shutdown: stop all running processes using a deadline-driven
+/// loop.
+///
+/// **Cancellation safety (TCK-00392 BLOCKER fix):**
+///
+/// Unlike the previous implementation, this function is NOT wrapped in an
+/// outer `tokio::time::timeout`. Instead it uses an internal deadline: each
+/// process stop is attempted within the remaining time budget. When the
+/// deadline is exceeded the loop breaks and the caller proceeds to the
+/// force-kill phase.
+///
+/// Runners are NOT removed from daemon state until the stop call has
+/// completed (or been skipped due to deadline). This ensures that
+/// `force_kill_all_processes` can always find the runner handle if needed.
+///
+/// Returns `true` if all processes were stopped within the deadline, or
+/// `false` if the deadline was exceeded (force-kill is required).
+async fn shutdown_all_processes(state: &SharedState, deadline: tokio::time::Instant) -> bool {
     info!("Stopping all running processes...");
 
-    let timeout = Duration::from_secs(10);
-
-    // Collect all running processes
-    let processes_to_stop: Vec<(String, u32)> = {
-        let inner = state.read().await;
-        inner
-            .supervisor
-            .specs()
-            .flat_map(|spec| {
-                (0..spec.instances)
-                    .filter(|i| {
-                        inner
-                            .supervisor
-                            .get_handle(&spec.name, *i)
-                            .is_some_and(|h| h.state.is_running())
-                    })
-                    .map(|i| (spec.name.clone(), i))
-            })
-            .collect()
-    };
+    let processes_to_stop = collect_running_processes(state).await;
 
     if processes_to_stop.is_empty() {
         info!("No running processes to stop");
-        return;
+        return true;
     }
 
     info!("Stopping {} process instance(s)", processes_to_stop.len());
 
-    // Stop each process
+    let mut all_stopped = true;
+
     for (name, instance) in processes_to_stop {
-        // Take the runner out
+        // Check deadline BEFORE starting a new stop attempt.
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            warn!(
+                process = %name,
+                instance,
+                "Graceful shutdown deadline exceeded — skipping remaining processes"
+            );
+            all_stopped = false;
+            break;
+        }
+
+        let remaining = deadline - now;
+        // Cap per-process timeout to the remaining deadline budget.
+        let per_process_timeout = remaining.min(Duration::from_secs(10));
+
+        // Take the runner out of state, stop it, then update supervisor.
+        // We hold the write lock briefly to take the runner. The actual
+        // stop (which may block for up to `per_process_timeout`) happens
+        // OUTSIDE the lock.
         let runner = {
             let mut inner = state.write().await;
             let spec_id = inner.supervisor.get_spec(&name).map(|s| s.id);
@@ -357,13 +469,13 @@ async fn shutdown_all_processes(state: &SharedState) {
         if let Some(mut runner) = runner {
             if runner.state().is_running() {
                 info!("Stopping {}-{}", name, instance);
-                if let Err(e) = runner.stop(timeout).await {
+                if let Err(e) = runner.stop(per_process_timeout).await {
                     warn!("Error stopping {}-{}: {}", name, instance, e);
                 }
             }
         }
 
-        // Update supervisor state
+        // Update supervisor state to reflect the stop.
         {
             let mut inner = state.write().await;
             inner.supervisor.update_state(
@@ -375,7 +487,129 @@ async fn shutdown_all_processes(state: &SharedState) {
         }
     }
 
-    info!("All processes stopped");
+    if all_stopped {
+        info!("All processes stopped gracefully");
+    }
+    all_stopped
+}
+
+/// Force-kill any child processes that are still running.
+///
+/// **Containment invariant**: This function MUST NOT be wrapped in a
+/// cancellable timeout. It runs unconditionally after the graceful shutdown
+/// phase (whether that phase completed or the deadline was exceeded) to
+/// guarantee that no managed child process survives daemon exit.
+///
+/// **PID-tracking safety (TCK-00392 BLOCKER fix):**
+///
+/// In addition to iterating runners still present in daemon state, this
+/// function also accepts a map of `PID -> starttime` that was recorded
+/// _before_ the graceful phase started. If a runner was dropped mid-stop
+/// (e.g. due to deadline expiry) and the process was spawned with
+/// `kill_on_drop(false)`, the child may still be alive. The PID map lets
+/// us issue an OS-level `SIGKILL` even when the runner handle is gone.
+///
+/// **PID-reuse safety (v3 security review BLOCKER fix):**
+///
+/// Before sending `SIGKILL` to any PID from the pre-shutdown snapshot, we
+/// re-read `/proc/{pid}/stat` and verify that the kernel start time still
+/// matches the value recorded at snapshot time. If the start time differs
+/// (or the proc entry is gone), the PID has been recycled and the kill is
+/// skipped. This prevents false-positive kills of unrelated processes.
+async fn force_kill_all_processes(
+    state: &SharedState,
+    pre_shutdown_pids: &std::collections::HashMap<u32, Option<u64>>,
+) {
+    // Phase A: kill processes still tracked in supervisor state.
+    let still_running = collect_running_processes(state).await;
+
+    if !still_running.is_empty() {
+        warn!(
+            count = still_running.len(),
+            "Force-killing remaining child processes after graceful shutdown timeout"
+        );
+
+        for (name, instance) in still_running {
+            let runner = {
+                let mut inner = state.write().await;
+                let spec_id = inner.supervisor.get_spec(&name).map(|s| s.id);
+                spec_id.and_then(|id| inner.remove_runner(id, instance))
+            };
+
+            if let Some(mut runner) = runner {
+                if runner.state().is_running() {
+                    warn!("Force-killing {}-{}", name, instance);
+                    // runner.stop with a zero-second timeout will send SIGTERM
+                    // then immediately SIGKILL.
+                    if let Err(e) = runner.stop(Duration::ZERO).await {
+                        warn!("Error force-killing {}-{}: {}", name, instance, e);
+                    }
+                }
+            }
+
+            // Update supervisor state
+            {
+                let mut inner = state.write().await;
+                inner.supervisor.update_state(
+                    &name,
+                    instance,
+                    ProcessState::Stopped { exit_code: None },
+                );
+                inner.supervisor.update_pid(&name, instance, None);
+            }
+        }
+    }
+
+    // Phase B: OS-level kill for any PID in the pre-shutdown map that is
+    // still alive AND still the same process (validated via start time).
+    // This catches processes whose runner was dropped mid-stop
+    // (cancellation / deadline expiry) and were spawned with
+    // `kill_on_drop(false)`.
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        for (&pid, &snapshot_start_time) in pre_shutdown_pids {
+            // Check if the process is still alive (signal 0 = no-op probe).
+            #[allow(clippy::cast_possible_wrap)]
+            let target = Pid::from_raw(pid as i32);
+            if kill(target, None).is_ok() {
+                // PID-reuse safety: verify the process identity before killing.
+                // If we recorded a start time at snapshot, the current process
+                // at this PID must have the same start time. A mismatch means
+                // the original child exited and the PID was recycled.
+                if let Some(expected_start) = snapshot_start_time {
+                    let current_start = read_proc_start_time(pid);
+                    if current_start != Some(expected_start) {
+                        warn!(
+                            pid,
+                            expected_start,
+                            ?current_start,
+                            "PID reuse detected — skipping kill of unrelated process"
+                        );
+                        continue;
+                    }
+                } else {
+                    // Snapshot start time was None — we cannot verify whether
+                    // this PID still belongs to our original child.  Fail-closed:
+                    // do NOT kill an unverified PID.  Phase A (runner handles)
+                    // is responsible for these processes.
+                    warn!(
+                        pid,
+                        "Snapshot start time unavailable — skipping SIGKILL \
+                         (cannot verify PID identity)"
+                    );
+                    continue;
+                }
+                warn!(pid, "Orphan process still alive — sending SIGKILL");
+                #[allow(clippy::cast_possible_wrap)]
+                let _ = kill(target, Signal::SIGKILL);
+            }
+        }
+    }
+
+    info!("Force-kill of remaining processes complete");
 }
 
 /// Perform daemonization via double-fork pattern.
@@ -675,12 +909,39 @@ async fn async_main(args: Args) -> Result<()> {
     // TCK-00342: Wire daemon state into dispatcher for process management.
     // This enables ListProcesses, ProcessStatus, StartProcess, StopProcess,
     // RestartProcess, and ReloadProcess handlers to query the Supervisor.
+    //
+    // TCK-00383: When both ledger and CAS are configured, use
+    // with_persistence_and_cas() to wire the session dispatcher with ToolBroker,
+    // DurableCas, ledger event emitter, and holonic clock. This enables session-
+    // scoped operations: tool execution, event emission, and evidence publishing.
     let dispatcher_state: SharedDispatcherState = Arc::new(
-        DispatcherState::with_persistence(
-            state.session_registry().clone(),
-            metrics_registry.clone(),
-            sqlite_conn.clone(),
-        )
+        if let (Some(conn), Some(cas_path)) = (&sqlite_conn, &daemon_config.cas_path) {
+            info!(
+                cas_path = %cas_path.display(),
+                "Using with_persistence_and_cas: session dispatcher fully wired"
+            );
+            DispatcherState::with_persistence_and_cas(
+                state.session_registry().clone(),
+                metrics_registry.clone(),
+                Arc::clone(conn),
+                cas_path,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("CAS initialization failed for {}: {e}", cas_path.display())
+            })?
+        } else {
+            if daemon_config.cas_path.is_some() && sqlite_conn.is_none() {
+                warn!(
+                    "--cas-path provided without --ledger-db; \
+                     CAS requires a ledger database. Falling back to with_persistence()"
+                );
+            }
+            DispatcherState::with_persistence(
+                state.session_registry().clone(),
+                metrics_registry.clone(),
+                sqlite_conn.clone(),
+            )
+        }
         .with_daemon_state(Arc::clone(&state)),
     );
 
@@ -974,9 +1235,41 @@ async fn async_main(args: Args) -> Result<()> {
         }
     }
 
-    // Graceful shutdown
+    // Graceful shutdown with deadline-driven loop (TCK-00392).
+    //
+    // **Cancellation-safe design:**
+    //
+    // Phase 1 uses an internal deadline (NOT an outer `tokio::time::timeout`
+    // wrapping an async future). This avoids the cancellation-safety hazard
+    // where a runner could be removed from daemon state but not yet fully
+    // stopped — if the outer timeout fired at that point the runner handle
+    // would be dropped without killing the child (spawned with
+    // `kill_on_drop(false)`).
+    //
+    // Phase 2 runs unconditionally. It uses both the runner handles that
+    // remain in daemon state AND a pre-recorded PID set to guarantee
+    // containment even for processes whose runner was dropped mid-stop.
     info!("Shutting down daemon...");
-    shutdown_all_processes(&state).await;
+
+    // Record all tracked PIDs BEFORE the graceful phase so we can always
+    // find orphans in the force-kill phase.
+    let pre_shutdown_pids = collect_tracked_pids(&state).await;
+
+    let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let all_graceful = shutdown_all_processes(&state, shutdown_deadline).await;
+
+    if !all_graceful {
+        warn!(
+            timeout_secs = 30,
+            "Graceful shutdown deadline exceeded — force-killing remaining processes"
+        );
+    }
+
+    // Phase 2: Force-kill any survivors. This is NOT wrapped in a timeout
+    // because the containment invariant requires that every managed child
+    // process is terminated before the daemon exits. The pre-shutdown PID
+    // set ensures we can kill orphans even if their runner was dropped.
+    force_kill_all_processes(&state, &pre_shutdown_pids).await;
 
     // Cleanup sockets (SocketManager handles this in Drop, but explicit cleanup is
     // safer)

@@ -4114,12 +4114,21 @@ impl PrivilegedDispatcher {
         ))
     }
 
-    /// Handles Shutdown requests (IPC-PRIV-004).
+    /// Handles Shutdown requests (IPC-PRIV-004, TCK-00392).
     ///
-    /// # Stub Implementation
+    /// Triggers graceful daemon shutdown by setting the atomic shutdown flag
+    /// on `SharedState`. The main event loop detects this flag and initiates
+    /// the shutdown sequence: stop all processes, clean up sockets, remove
+    /// the PID file.
     ///
-    /// This is a stub handler that logs the request and returns acknowledgment.
-    /// Full implementation requires integration with daemon state.
+    /// The shutdown flag is set first, then the response is constructed and
+    /// returned. Because the main event loop runs on a separate task, the
+    /// caller still receives acknowledgment before the daemon acts on the
+    /// flag.
+    ///
+    /// If `daemon_state` is `None` (test/stub mode), logs a warning and
+    /// returns a stub response without triggering shutdown.
+    #[allow(clippy::option_if_let_else)] // Both branches have logging side effects; if-let is clearer
     fn handle_shutdown(
         &self,
         payload: &[u8],
@@ -4132,17 +4141,35 @@ impl PrivilegedDispatcher {
                 }
             })?;
 
-        warn!(
-            reason = ?request.reason,
-            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "Shutdown request received (stub handler)"
-        );
+        let reason_display = request.reason.as_deref().unwrap_or("no reason provided");
 
-        // STUB: Return acknowledgment
-        // Full implementation requires daemon state integration
-        Ok(PrivilegedResponse::Shutdown(ShutdownResponse {
-            message: "Shutdown acknowledged (stub)".to_string(),
-        }))
+        if let Some(state) = &self.daemon_state {
+            info!(
+                reason = %reason_display,
+                peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+                "Shutdown request received via IPC, initiating graceful shutdown"
+            );
+
+            // Set the atomic shutdown flag. The main event loop polls
+            // `is_shutdown_requested()` and will trigger the graceful
+            // shutdown sequence (stop processes, cleanup sockets, remove
+            // PID file).
+            state.request_shutdown();
+
+            Ok(PrivilegedResponse::Shutdown(ShutdownResponse {
+                message: format!("Shutdown initiated (reason: {reason_display})"),
+            }))
+        } else {
+            warn!(
+                reason = %reason_display,
+                peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+                "Shutdown request received but daemon state not configured (test mode)"
+            );
+
+            Ok(PrivilegedResponse::Shutdown(ShutdownResponse {
+                message: "Shutdown acknowledged (stub — daemon state not configured)".to_string(),
+            }))
+        }
     }
 
     /// Handles `WorkStatus` requests (IPC-PRIV-005, TCK-00344).
@@ -6363,6 +6390,7 @@ mod tests {
         }
     }
 
+    /// IT-00392-01: Shutdown without daemon state returns stub response.
     #[test]
     fn test_privileged_shutdown_stub() {
         let dispatcher = PrivilegedDispatcher::new();
@@ -6378,12 +6406,94 @@ mod tests {
         match response {
             PrivilegedResponse::Shutdown(resp) => {
                 assert!(!resp.message.is_empty());
+                assert!(
+                    resp.message.contains("stub"),
+                    "stub response should indicate daemon state not configured: {}",
+                    resp.message
+                );
             },
             PrivilegedResponse::Error(err) => {
                 panic!("Unexpected error: {err:?}");
             },
             _ => panic!("Expected Shutdown response"),
         }
+    }
+
+    /// IT-00392-02: Shutdown with daemon state sets shutdown flag.
+    #[test]
+    fn test_shutdown_with_daemon_state_sets_flag() {
+        let (dispatcher, shared_state) = create_dispatcher_with_processes();
+        let ctx = make_privileged_ctx();
+
+        // Verify shutdown is not yet requested
+        assert!(
+            !shared_state.is_shutdown_requested(),
+            "shutdown should not be requested before sending Shutdown"
+        );
+
+        let request = ShutdownRequest {
+            reason: Some("operator requested stop".to_string()),
+        };
+        let frame = encode_shutdown_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        // Verify response is success (not error)
+        match &response {
+            PrivilegedResponse::Shutdown(resp) => {
+                assert!(
+                    resp.message.contains("Shutdown initiated"),
+                    "response should confirm shutdown initiation: {}",
+                    resp.message
+                );
+                assert!(
+                    resp.message.contains("operator requested stop"),
+                    "response should echo the reason: {}",
+                    resp.message
+                );
+            },
+            PrivilegedResponse::Error(err) => {
+                panic!("Unexpected error: {err:?}");
+            },
+            other => panic!("Expected Shutdown response, got {other:?}"),
+        }
+
+        // Verify the atomic shutdown flag was set
+        assert!(
+            shared_state.is_shutdown_requested(),
+            "shutdown flag should be set after Shutdown command"
+        );
+    }
+
+    /// IT-00392-03: Shutdown with no reason uses default display.
+    #[test]
+    fn test_shutdown_with_no_reason() {
+        let (dispatcher, shared_state) = create_dispatcher_with_processes();
+        let ctx = make_privileged_ctx();
+
+        let request = ShutdownRequest { reason: None };
+        let frame = encode_shutdown_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match &response {
+            PrivilegedResponse::Shutdown(resp) => {
+                assert!(
+                    resp.message.contains("no reason provided"),
+                    "response should indicate no reason: {}",
+                    resp.message
+                );
+            },
+            PrivilegedResponse::Error(err) => {
+                panic!("Unexpected error: {err:?}");
+            },
+            other => panic!("Expected Shutdown response, got {other:?}"),
+        }
+
+        assert!(
+            shared_state.is_shutdown_requested(),
+            "shutdown flag should be set even without reason"
+        );
     }
 
     // ========================================================================

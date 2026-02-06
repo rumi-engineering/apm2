@@ -53,8 +53,14 @@ pub struct DaemonConfig {
     pub state_file: PathBuf,        // Default: /var/lib/apm2/state.json
     #[serde(default)]
     pub audit: AuditConfig,         // Audit event retention policy
+    #[serde(default)]
+    pub cas_path: Option<PathBuf>,  // Optional CAS directory (TCK-00383)
 }
 ```
+
+**CAS Configuration (TCK-00383):**
+- `cas_path`: Optional path to the durable content-addressed storage (CAS) directory. When provided, the daemon wires `ToolBroker`, `DurableCas`, ledger event emitter, and holonic clock via `with_persistence_and_cas()`. Without this, session-scoped operations (tool execution, event emission, evidence publishing) fail closed.
+- **Security constraints**: The path must be absolute, must not contain symbolic link components, and the directory is created with mode 0700 (owner-only access). Existing directories are verified to be owned by the daemon UID with no group/other permissions. Violations cause fail-closed initialization failure.
 
 **Dual-Socket Architecture (TCK-00249, TCK-00280):**
 - `operator_socket`: Used for privileged operations (process control, credential management). Mode 0600 restricts to owner.
@@ -300,6 +306,7 @@ INV-CFG-08  instances defaults to 1
 INV-CFG-09  Audit retention defaults to 30 days / 1GB
 INV-CFG-10  operator_socket and session_socket are required in TOML (TCK-00280)
 INV-CFG-11  Legacy 'socket' field is rejected with DD-009 error
+INV-CFG-12  cas_path must be absolute, symlink-free, and created with mode 0700 (TCK-00383)
 ```
 
 ## Contract Summary
