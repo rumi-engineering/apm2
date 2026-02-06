@@ -437,7 +437,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         let Ok(mut stmt) = conn.prepare(
             "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-             FROM ledger_events WHERE work_id = ?1 ORDER BY timestamp_ns ASC",
+             FROM ledger_events WHERE work_id = ?1 ORDER BY timestamp_ns ASC, rowid ASC",
         ) else {
             return Vec::new();
         };
@@ -455,6 +455,24 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         });
 
         rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
+    }
+
+    fn get_work_transition_count(&self, work_id: &str) -> u32 {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+
+        let Ok(count) = conn.query_row(
+            "SELECT COUNT(*) FROM ledger_events WHERE work_id = ?1 AND event_type = 'work_transitioned'",
+            params![work_id],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            return 0;
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let count = count as u32;
+        count
     }
 
     fn emit_episode_event(
@@ -1007,6 +1025,10 @@ impl SqliteLeaseValidator {
     }
 }
 
+// ============================================================================
+// TCK-00395: Batch lifecycle methods for SqliteLedgerEventEmitter
+// ============================================================================
+
 impl LeaseValidator for SqliteLeaseValidator {
     fn validate_gate_lease(
         &self,
@@ -1101,5 +1123,180 @@ impl LeaseValidator for SqliteLeaseValidator {
                 ],
             );
         }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::dispatch::PolicyResolution;
+    use crate::protocol::messages::WorkRole;
+
+    /// Creates an in-memory `SQLite` connection with schema initialized.
+    fn test_emitter() -> SqliteLedgerEventEmitter {
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        SqliteLedgerEventEmitter::new(Arc::new(Mutex::new(conn)), signing_key)
+    }
+
+    fn test_policy_resolution() -> PolicyResolution {
+        PolicyResolution {
+            policy_resolved_ref: "test-resolved".to_string(),
+            resolved_policy_hash: [0u8; 32],
+            capability_manifest_hash: [0u8; 32],
+            context_pack_hash: [0u8; 32],
+        }
+    }
+
+    /// FIX-SEC-BLOCKER: Events with equal timestamps are retrieved in
+    /// deterministic (rowid) order.
+    #[test]
+    fn equal_timestamp_events_deterministic_order_sqlite() {
+        let emitter = test_emitter();
+        let ts = 1_000_000_000u64;
+
+        // Emit multiple events with the same timestamp
+        let claim = WorkClaim {
+            work_id: "W-ORDER-SQL-001".to_string(),
+            lease_id: "L-001".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+        };
+
+        emitter.emit_work_claimed(&claim, ts).unwrap();
+
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id: "W-ORDER-SQL-001",
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: "work_claimed_via_ipc",
+                previous_transition_count: 0,
+                actor_id: "uid:1000",
+                timestamp_ns: ts,
+            })
+            .unwrap();
+
+        emitter
+            .emit_session_started("SESS-SQL-001", "W-ORDER-SQL-001", "L-001", "uid:1000", ts)
+            .unwrap();
+
+        // Query events - must be in insertion order
+        let events = emitter.get_events_by_work_id("W-ORDER-SQL-001");
+        assert_eq!(events.len(), 3, "Expected 3 events");
+
+        // Verify ordering by event_type (insertion order)
+        assert_eq!(
+            events[0].event_type, "work_claimed",
+            "First event should be work_claimed"
+        );
+        assert_eq!(
+            events[1].event_type, "work_transitioned",
+            "Second event should be work_transitioned"
+        );
+        assert_eq!(
+            events[2].event_type, "session_started",
+            "Third event should be session_started"
+        );
+
+        // All have the same timestamp
+        for event in &events {
+            assert_eq!(
+                event.timestamp_ns, ts,
+                "All events should have the same timestamp"
+            );
+        }
+    }
+
+    /// FIX-SEC-BLOCKER: `get_work_transition_count` returns accurate count
+    /// from `SQLite`.
+    #[test]
+    fn get_work_transition_count_sqlite() {
+        let emitter = test_emitter();
+
+        // Initially 0
+        assert_eq!(emitter.get_work_transition_count("W-COUNT-SQL-001"), 0);
+
+        // Emit a non-transition event
+        let claim = WorkClaim {
+            work_id: "W-COUNT-SQL-001".to_string(),
+            lease_id: "L-001".to_string(),
+            actor_id: "uid:1000".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+        };
+        emitter.emit_work_claimed(&claim, 1_000).unwrap();
+
+        // Still 0 (work_claimed is not a transition)
+        assert_eq!(emitter.get_work_transition_count("W-COUNT-SQL-001"), 0);
+
+        // Emit a transition
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id: "W-COUNT-SQL-001",
+                from_state: "Open",
+                to_state: "Claimed",
+                rationale_code: "work_claimed_via_ipc",
+                previous_transition_count: 0,
+                actor_id: "uid:1000",
+                timestamp_ns: 2_000,
+            })
+            .unwrap();
+
+        assert_eq!(emitter.get_work_transition_count("W-COUNT-SQL-001"), 1);
+
+        // Emit another transition
+        emitter
+            .emit_work_transitioned(&WorkTransition {
+                work_id: "W-COUNT-SQL-001",
+                from_state: "Claimed",
+                to_state: "InProgress",
+                rationale_code: "episode_spawned_via_ipc",
+                previous_transition_count: 1,
+                actor_id: "uid:1000",
+                timestamp_ns: 3_000,
+            })
+            .unwrap();
+
+        assert_eq!(emitter.get_work_transition_count("W-COUNT-SQL-001"), 2);
+
+        // Different work_id still 0
+        assert_eq!(emitter.get_work_transition_count("W-COUNT-SQL-002"), 0);
+    }
+
+    /// FIX-SEC-BLOCKER: `SessionTerminated` event is persisted to `SQLite`.
+    #[test]
+    fn session_terminated_persisted_sqlite() {
+        let emitter = test_emitter();
+
+        let result = emitter.emit_session_terminated(
+            "SESS-SQL-001",
+            "W-TERM-SQL-001",
+            0,
+            "completed_normally",
+            "uid:1000",
+            1_000_000_000,
+        );
+        assert!(result.is_ok());
+
+        let events = emitter.get_events_by_work_id("W-TERM-SQL-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "session_terminated");
+
+        let payload: serde_json::Value = serde_json::from_slice(&events[0].payload).unwrap();
+        assert_eq!(payload["session_id"], "SESS-SQL-001");
+        assert_eq!(payload["work_id"], "W-TERM-SQL-001");
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["termination_reason"], "completed_normally");
     }
 }

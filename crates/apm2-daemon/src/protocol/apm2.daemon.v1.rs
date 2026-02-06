@@ -438,6 +438,26 @@ pub struct WorkStatusResponse {
     #[prost(uint64, optional, tag = "8")]
     pub claimed_at_ns: ::core::option::Option<u64>,
 }
+/// Request to end an active session.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EndSessionRequest {
+    /// Identifier of the session to terminate.
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// Human-readable reason for termination.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// Response confirming session termination.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EndSessionResponse {
+    /// Identifier of the terminated session.
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// Human-readable confirmation message.
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
 /// Credential profile metadata (secrets are never included).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CredentialProfile {
