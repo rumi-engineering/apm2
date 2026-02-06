@@ -1506,6 +1506,108 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         Ok(signed_event)
     }
+
+    /// TCK-00350: Emits a receipt with envelope bindings persisted in the
+    /// payload.
+    ///
+    /// Overrides the default to include `envelope_hash`,
+    /// `capability_manifest_hash`, and `view_commitment_hash` in the
+    /// signed JSON payload. Fail-closed: bindings are validated before
+    /// emission.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_receipt_with_bindings(
+        &self,
+        episode_id: &str,
+        receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
+        reviewer_actor_id: &str,
+        timestamp_ns: u64,
+        bindings: &crate::episode::EnvelopeBindings,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Fail-closed: validate bindings before emission
+        bindings
+            .validate()
+            .map_err(|e| LedgerEventError::ValidationFailed {
+                message: format!("envelope binding validation failed: {e}"),
+            })?;
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // TCK-00350: Include envelope bindings in signed payload.
+        // This ensures receipts carry immutable proof of the envelope,
+        // capability manifest, and view commitment that were active.
+        let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
+        let payload_json = serde_json::json!({
+            "event_type": "review_receipt_recorded",
+            "episode_id": episode_id,
+            "receipt_id": receipt_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
+            "envelope_hash": env_hex,
+            "capability_manifest_hash": cap_hex,
+            "view_commitment_hash": view_hex,
+        });
+
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes =
+            Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "review_receipt_recorded".to_string(),
+            work_id: episode_id.to_string(),
+            actor_id: reviewer_actor_id.to_string(),
+            payload: payload_bytes.clone(),
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns
+            ],
+        ).map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+
+        info!(
+            event_id = %event_id,
+            episode_id = %episode_id,
+            receipt_id = %receipt_id,
+            envelope_hash = %env_hex,
+            "Persisted ReviewReceiptRecorded event with envelope bindings"
+        );
+
+        Ok(signed_event)
+    }
 }
 
 /// Durable work registry backed by `SQLite`.
