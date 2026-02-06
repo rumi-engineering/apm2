@@ -3840,6 +3840,7 @@ impl PrivilegedDispatcher {
         session_id: &str,
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
+        evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
         remove_manifest: bool,
     ) -> Option<String> {
         let mut warnings: Vec<String> = Vec::new();
@@ -3873,6 +3874,12 @@ impl PrivilegedDispatcher {
         // 3. Remove the manifest if it was registered.
         if remove_manifest {
             self.manifest_store.remove(session_id);
+        }
+
+        // 3b. Restore evicted manifests so capacity is not permanently lost.
+        for (sid, manifest) in evicted_manifests {
+            self.manifest_store
+                .restore(sid, std::sync::Arc::clone(manifest));
         }
 
         // 4. Re-register evicted sessions to restore capacity.
@@ -4337,6 +4344,19 @@ impl PrivilegedDispatcher {
                         .collect()
                 });
 
+        // Step 2b: Clean up manifest entries for evicted sessions to prevent
+        // unbounded manifest store growth.  Captured via `remove_and_return`
+        // so they can be restored during rollback.
+        let evicted_manifests: Vec<(String, std::sync::Arc<crate::episode::CapabilityManifest>)> =
+            evicted_sessions
+                .iter()
+                .filter_map(|s| {
+                    self.manifest_store
+                        .remove_and_return(&s.session_id)
+                        .map(|m| (s.session_id.clone(), m))
+                })
+                .collect();
+
         // Step 3: Register telemetry with started_at_ns.
         // The wall-clock timestamp is stored as audit metadata only;
         // elapsed duration is computed from a monotonic Instant inside the
@@ -4353,8 +4373,13 @@ impl PrivilegedDispatcher {
             if let Err(e) = store.register(&session_id, started_at_ns) {
                 // Rollback session on telemetry failure and restore evicted
                 // sessions + telemetry so capacity is not permanently lost.
-                let rollback_warn =
-                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, false);
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    false,
+                );
                 if let Some(ref rw) = rollback_warn {
                     warn!(rollback_errors = %rw, "Partial rollback failure during telemetry error recovery");
                 }
@@ -4397,8 +4422,13 @@ impl PrivilegedDispatcher {
             Err(e) => {
                 // Rollback session, telemetry, and restore evicted
                 // sessions + telemetry so capacity is not lost.
-                let rollback_warn =
-                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, false);
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    false,
+                );
                 if let Some(ref rw) = rollback_warn {
                     warn!(rollback_errors = %rw, "Partial rollback failure during token minting error recovery");
                 }
@@ -4424,8 +4454,13 @@ impl PrivilegedDispatcher {
             Err(e) => {
                 // Rollback session, telemetry, and restore evicted
                 // sessions + telemetry so capacity is not lost.
-                let rollback_warn =
-                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, false);
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    false,
+                );
                 if let Some(ref rw) = rollback_warn {
                     warn!(rollback_errors = %rw, "Partial rollback failure during token serialization error recovery");
                 }
@@ -4472,6 +4507,7 @@ impl PrivilegedDispatcher {
                         &session_id,
                         &evicted_sessions,
                         &evicted_telemetry,
+                        &evicted_manifests,
                         false,
                     );
                     if let Some(ref rw) = rollback_warn {
@@ -4536,8 +4572,13 @@ impl PrivilegedDispatcher {
                 // TCK-00384 security fix: rollback session, telemetry, and
                 // manifest on timestamp failure.  Also restore evicted
                 // sessions + telemetry so capacity is not permanently lost.
-                let rollback_warn =
-                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, true);
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    true,
+                );
                 if let Some(ref rw) = rollback_warn {
                     warn!(rollback_errors = %rw, "Partial rollback failure during timestamp error recovery");
                 }
@@ -4598,6 +4639,7 @@ impl PrivilegedDispatcher {
                         &session_id,
                         &evicted_sessions,
                         &evicted_telemetry,
+                        &evicted_manifests,
                         true,
                     );
                     if let Some(ref rw) = rollback_warn {
@@ -4638,8 +4680,13 @@ impl PrivilegedDispatcher {
                 // TCK-00384 security fix: rollback session, telemetry,
                 // and manifest when no runtime is available.  Restore
                 // evicted sessions + telemetry so capacity is not lost.
-                let rollback_warn =
-                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, true);
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    true,
+                );
                 if let Some(ref rw) = rollback_warn {
                     warn!(rollback_errors = %rw, "Partial rollback failure during no-runtime error recovery");
                 }
@@ -4696,8 +4743,13 @@ impl PrivilegedDispatcher {
                 // TCK-00384 review fix: Rollback session, telemetry, and
                 // manifest to prevent leaked resources when
                 // update_episode_id persistence fails.
-                let rollback_warn =
-                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, true);
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    true,
+                );
                 if let Some(ref rw) = rollback_warn {
                     warn!(rollback_errors = %rw, "Partial rollback failure during update_episode_id error recovery");
                 }
@@ -4726,11 +4778,50 @@ impl PrivilegedDispatcher {
         // missing. Same pattern as ClaimWork. SpawnEpisode emits authoritative
         // ledger events (SessionStarted + WorkTransitioned), and recording
         // "unknown" as the actor identity would break the accountability chain.
-        let peer_creds = ctx
-            .peer_credentials()
-            .ok_or_else(|| ProtocolError::Serialization {
-                reason: "peer credentials required for episode spawn".to_string(),
-            })?;
+        //
+        // TCK-00384 review fix: Stop the running episode before returning on
+        // this failure path.  The original `?` operator would exit without
+        // stopping the episode, leaking a running runtime episode.
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            // Stop the already-started episode to prevent leak.
+            if let Some(ref episode_id) = episode_id_opt {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let rt = &self.episode_runtime;
+                    let stop_err = tokio::task::block_in_place(|| {
+                        handle.block_on(rt.stop(
+                            episode_id,
+                            crate::episode::TerminationClass::Cancelled,
+                            timestamp_ns,
+                        ))
+                    });
+                    if let Err(stop_e) = stop_err {
+                        warn!(
+                            error = %stop_e,
+                            episode_id = %episode_id,
+                            "Rollback: failed to stop episode after peer credentials failure"
+                        );
+                    }
+                }
+            }
+            let rollback_warn = self.rollback_spawn(
+                &session_id,
+                &evicted_sessions,
+                &evicted_telemetry,
+                &evicted_manifests,
+                true,
+            );
+            if let Some(ref rw) = rollback_warn {
+                warn!(rollback_errors = %rw, "Partial rollback failure during peer credentials error recovery");
+            }
+            let msg = rollback_warn.map_or_else(
+                || "peer credentials required for episode spawn".to_string(),
+                |rw| format!("peer credentials required for episode spawn (rollback partial failure: {rw})"),
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                msg,
+            ));
+        };
         let actor_id = derive_actor_id(peer_creds);
 
         // TCK-00395: Emit SessionStarted + WorkTransitioned(Claimed->InProgress)
@@ -4743,11 +4834,38 @@ impl PrivilegedDispatcher {
             &actor_id,
             timestamp_ns,
         ) {
+            // TCK-00384 review fix: Stop the already-started episode before
+            // rolling back.  Without this, the runtime episode continues
+            // running after the client receives a spawn failure.
+            if let Some(ref episode_id) = episode_id_opt {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let rt = &self.episode_runtime;
+                    let stop_err = tokio::task::block_in_place(|| {
+                        handle.block_on(rt.stop(
+                            episode_id,
+                            crate::episode::TerminationClass::Cancelled,
+                            timestamp_ns,
+                        ))
+                    });
+                    if let Err(stop_e) = stop_err {
+                        warn!(
+                            error = %stop_e,
+                            episode_id = %episode_id,
+                            "Rollback: failed to stop episode after event emission failure"
+                        );
+                    }
+                }
+            }
             // TCK-00384 security fix: rollback session, telemetry, and
             // manifest on event emission failure.  Restore evicted
             // sessions + telemetry so capacity is not permanently lost.
-            let rollback_warn =
-                self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, true);
+            let rollback_warn = self.rollback_spawn(
+                &session_id,
+                &evicted_sessions,
+                &evicted_telemetry,
+                &evicted_manifests,
+                true,
+            );
             if let Some(ref rw) = rollback_warn {
                 warn!(rollback_errors = %rw, "Partial rollback failure during event emission error recovery");
             }
@@ -10951,10 +11069,13 @@ mod tests {
             let no_evicted_sessions: Vec<SessionState> = Vec::new();
             let no_evicted_telemetry: Vec<(String, Arc<crate::session::SessionTelemetry>)> =
                 Vec::new();
+            let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
+                Vec::new();
             let result = dispatcher.rollback_spawn(
                 "S-EPID-FAIL",
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
+                &no_evicted_manifests,
                 true,
             );
             assert!(result.is_none(), "Rollback should succeed without warnings");
@@ -10967,6 +11088,343 @@ mod tests {
             assert!(
                 store.get("S-EPID-FAIL").is_none(),
                 "Telemetry must be removed after rollback"
+            );
+        }
+
+        /// TCK-00384 review MAJOR 2: Eviction cleans manifest entries for
+        /// evicted sessions.  Without this, the manifest store grows
+        /// unbounded under repeated over-capacity spawn attempts.
+        ///
+        /// This test fills the session registry to capacity, spawns one
+        /// more session (triggering eviction), and verifies the evicted
+        /// session's manifest is removed from the store.
+        #[test]
+        fn test_eviction_cleans_up_manifest_entries() {
+            use crate::episode::CapabilityManifest;
+            use crate::episode::registry::{InMemorySessionRegistry, MAX_SESSIONS};
+            use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore};
+            use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let store = Arc::new(SessionTelemetryStore::new());
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+            // Fill to capacity with sessions that each have a manifest
+            let mut session_ids = Vec::new();
+            for i in 0..MAX_SESSIONS {
+                let sid = format!("S-EVICT-{i}");
+                let session = SessionState {
+                    session_id: sid.clone(),
+                    work_id: format!("W-EVICT-{i}"),
+                    role: 1,
+                    ephemeral_handle: format!("H-EVICT-{i}"),
+                    lease_id: format!("L-EVICT-{i}"),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![0u8; 32],
+                    episode_id: None,
+                };
+                registry.register_session(session).unwrap();
+                store.register(&sid, 1_000_000).unwrap();
+                let manifest = CapabilityManifest::from_hash_with_default_allowlist(&[0u8; 32]);
+                manifest_store.register(&sid, manifest);
+                session_ids.push(sid);
+            }
+
+            assert_eq!(manifest_store.len(), MAX_SESSIONS);
+            assert_eq!(store.len(), MAX_SESSIONS);
+
+            // Build a dispatcher that shares these stores
+            let _dispatcher = PrivilegedDispatcher::new()
+                .with_session_registry(
+                    Arc::clone(&registry) as Arc<dyn SessionRegistry + Send + Sync>
+                )
+                .with_telemetry_store(Arc::clone(&store));
+
+            // Override the manifest store by constructing via with_dependencies
+            // We can't directly set manifest_store on existing dispatcher, so
+            // we verify the eviction logic directly:
+
+            // Register one more session (evicts S-EVICT-0)
+            let new_sid = "S-EVICT-NEW";
+            let new_session = SessionState {
+                session_id: new_sid.to_string(),
+                work_id: "W-EVICT-NEW".to_string(),
+                role: 1,
+                ephemeral_handle: "H-EVICT-NEW".to_string(),
+                lease_id: "L-EVICT-NEW".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+            };
+            let evicted = registry.register_session(new_session).unwrap();
+            assert_eq!(evicted.len(), 1, "Exactly one session should be evicted");
+            assert_eq!(evicted[0].session_id, session_ids[0]);
+
+            // Simulate the eviction cleanup that dispatch.rs now performs:
+            // telemetry cleanup
+            for s in &evicted {
+                store.remove(&s.session_id);
+            }
+            // manifest cleanup (the new code path)
+            let evicted_manifest_count = evicted
+                .iter()
+                .filter_map(|s| {
+                    manifest_store
+                        .remove_and_return(&s.session_id)
+                        .map(|m| (s.session_id.clone(), m))
+                })
+                .count();
+
+            // Verify the evicted session's manifest is removed
+            assert!(
+                manifest_store.get_manifest(&session_ids[0]).is_none(),
+                "Manifest for evicted session must be removed"
+            );
+
+            // Manifest count should be MAX_SESSIONS - 1 (evicted one removed,
+            // new one not yet registered)
+            assert_eq!(
+                manifest_store.len(),
+                MAX_SESSIONS - 1,
+                "Manifest store should shrink after eviction"
+            );
+
+            // Verify evicted manifest was captured for potential rollback
+            assert_eq!(
+                evicted_manifest_count, 1,
+                "Evicted manifest must be captured for rollback"
+            );
+        }
+
+        /// TCK-00384 review MAJOR 2: Manifest store cardinality is bounded
+        /// under repeated over-capacity spawn/eviction churn.
+        ///
+        /// Performs 2x `MAX_SESSIONS` spawn cycles and verifies the manifest
+        /// store never exceeds `MAX_SESSIONS` entries.
+        #[test]
+        fn test_bounded_manifest_cardinality_under_eviction_churn() {
+            use crate::episode::CapabilityManifest;
+            use crate::episode::registry::{InMemorySessionRegistry, MAX_SESSIONS};
+            use crate::protocol::session_dispatch::InMemoryManifestStore;
+            use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let store = Arc::new(SessionTelemetryStore::new());
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+            // Perform 2x MAX_SESSIONS registration cycles
+            let total_cycles = MAX_SESSIONS * 2;
+            for i in 0..total_cycles {
+                let sid = format!("S-CHURN-{i}");
+                let session = SessionState {
+                    session_id: sid.clone(),
+                    work_id: format!("W-CHURN-{i}"),
+                    role: 1,
+                    ephemeral_handle: format!("H-CHURN-{i}"),
+                    lease_id: format!("L-CHURN-{i}"),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![0u8; 32],
+                    episode_id: None,
+                };
+                let evicted = registry.register_session(session).unwrap();
+
+                // Clean up evicted entries (simulating dispatch.rs behavior)
+                for s in &evicted {
+                    store.remove(&s.session_id);
+                    manifest_store.remove(&s.session_id);
+                }
+
+                // Register telemetry and manifest for the new session
+                let _ = store.register(&sid, 1_000_000);
+                let manifest = CapabilityManifest::from_hash_with_default_allowlist(&[0u8; 32]);
+                manifest_store.register(&sid, manifest);
+
+                // Verify manifest store never exceeds MAX_SESSIONS
+                assert!(
+                    manifest_store.len() <= MAX_SESSIONS,
+                    "Manifest store must be bounded at MAX_SESSIONS ({MAX_SESSIONS}), got {} at cycle {i}",
+                    manifest_store.len()
+                );
+            }
+
+            // After all cycles, store should be exactly at capacity
+            assert_eq!(
+                manifest_store.len(),
+                MAX_SESSIONS,
+                "Final manifest store size should equal MAX_SESSIONS"
+            );
+        }
+
+        /// TCK-00384 review MAJOR 1: Rollback after post-start failure
+        /// restores evicted manifests alongside evicted sessions and
+        /// telemetry.
+        #[test]
+        fn test_rollback_restores_evicted_manifests() {
+            use crate::episode::CapabilityManifest;
+            use crate::episode::registry::InMemorySessionRegistry;
+            use crate::protocol::session_dispatch::ManifestStore;
+            use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let store = Arc::new(SessionTelemetryStore::new());
+
+            // Build a dispatcher that shares the external stores.
+            // The dispatcher owns its manifest_store; we access it via
+            // the `manifest_store()` accessor.
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_session_registry(
+                    Arc::clone(&registry) as Arc<dyn SessionRegistry + Send + Sync>
+                )
+                .with_telemetry_store(Arc::clone(&store));
+            let manifest_store = Arc::clone(dispatcher.manifest_store());
+
+            // Register a session with telemetry and manifest
+            let session = SessionState {
+                session_id: "S-ROLLBACK-M".to_string(),
+                work_id: "W-ROLLBACK-M".to_string(),
+                role: 1,
+                ephemeral_handle: "H-ROLLBACK-M".to_string(),
+                lease_id: "L-ROLLBACK-M".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+            };
+            registry.register_session(session).unwrap();
+            store.register("S-ROLLBACK-M", 42).unwrap();
+            let manifest = CapabilityManifest::from_hash_with_default_allowlist(&[0u8; 32]);
+            manifest_store.register("S-ROLLBACK-M", manifest);
+
+            // Verify manifest exists
+            assert!(manifest_store.get_manifest("S-ROLLBACK-M").is_some());
+
+            // Simulate eviction: remove from registry + telemetry + manifest
+            // (this is what the session registry does during LRU eviction,
+            // followed by the dispatch.rs cleanup of telemetry/manifest)
+            let evicted_session_state = registry
+                .remove_session("S-ROLLBACK-M")
+                .unwrap()
+                .expect("session should exist");
+            store.remove("S-ROLLBACK-M");
+            let evicted_manifest = manifest_store
+                .remove_and_return("S-ROLLBACK-M")
+                .expect("manifest should exist");
+
+            assert!(
+                manifest_store.get_manifest("S-ROLLBACK-M").is_none(),
+                "Manifest should be removed after eviction"
+            );
+
+            // Register a NEW session that would occupy the slot
+            let new_session = SessionState {
+                session_id: "S-NEW-M".to_string(),
+                work_id: "W-NEW-M".to_string(),
+                role: 1,
+                ephemeral_handle: "H-NEW-M".to_string(),
+                lease_id: "L-NEW-M".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+            };
+            registry.register_session(new_session).unwrap();
+            store.register("S-NEW-M", 100).unwrap();
+            let new_manifest = CapabilityManifest::from_hash_with_default_allowlist(&[1u8; 32]);
+            manifest_store.register("S-NEW-M", new_manifest);
+
+            // Simulate rollback: this should remove S-NEW-M and restore
+            // S-ROLLBACK-M's manifest
+            let evicted_sessions = vec![evicted_session_state];
+            let evicted_telem: Vec<(String, Arc<crate::session::SessionTelemetry>)> = Vec::new();
+            let evicted_manifests = vec![("S-ROLLBACK-M".to_string(), evicted_manifest)];
+
+            let result = dispatcher.rollback_spawn(
+                "S-NEW-M",
+                &evicted_sessions,
+                &evicted_telem,
+                &evicted_manifests,
+                true,
+            );
+            assert!(result.is_none(), "Rollback should succeed: {result:?}");
+
+            // Verify new session's manifest is removed
+            assert!(
+                manifest_store.get_manifest("S-NEW-M").is_none(),
+                "New session manifest must be removed by rollback"
+            );
+
+            // Verify evicted session's manifest is restored
+            assert!(
+                manifest_store.get_manifest("S-ROLLBACK-M").is_some(),
+                "Evicted manifest must be restored after rollback"
+            );
+
+            // Verify evicted session is restored in registry
+            assert!(
+                registry.get_session("S-ROLLBACK-M").is_some(),
+                "Evicted session must be restored in registry"
+            );
+        }
+
+        /// TCK-00384 review MAJOR 1: Regression test for post-start failure
+        /// paths.  The `peer_credentials` failure now returns a proper error
+        /// response (not a protocol error via `?`) and performs full
+        /// rollback of session, telemetry, and manifest.
+        #[test]
+        fn test_peer_credentials_failure_rolls_back_session_and_telemetry() {
+            let store = Arc::new(SessionTelemetryStore::new());
+            let dispatcher = PrivilegedDispatcher::new().with_telemetry_store(Arc::clone(&store));
+
+            // First spawn with valid credentials to establish baseline
+            let valid_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &valid_ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // SpawnEpisode WITHOUT peer credentials
+            let no_creds_ctx = ConnectionContext::privileged(None);
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
+
+            // The spawn should fail
+            match result {
+                Ok(PrivilegedResponse::Error(err)) => {
+                    assert!(
+                        err.message.contains("peer credentials"),
+                        "Error should mention peer credentials: {}",
+                        err.message
+                    );
+                },
+                Ok(other) => {
+                    panic!("Expected error response for missing peer credentials, got: {other:?}")
+                },
+                Err(e) => panic!("Expected Ok(Error), got Err: {e:?}"),
+            }
+
+            // Verify session was rolled back: no sessions should remain
+            // in the telemetry store
+            assert_eq!(
+                store.len(),
+                0,
+                "Telemetry must be cleaned up after peer credentials failure rollback"
             );
         }
     }

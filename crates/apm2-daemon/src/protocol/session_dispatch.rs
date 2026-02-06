@@ -385,6 +385,37 @@ impl InMemoryManifestStore {
         let mut manifests = self.manifests.write().expect("lock poisoned");
         manifests.remove(session_id);
     }
+
+    /// Removes a manifest for a session and returns it.
+    ///
+    /// This is used during eviction to capture the manifest entry so it can
+    /// be restored during rollback if a later spawn step fails.
+    pub fn remove_and_return(&self, session_id: &str) -> Option<Arc<CapabilityManifest>> {
+        let mut manifests = self.manifests.write().expect("lock poisoned");
+        manifests.remove(session_id)
+    }
+
+    /// Restores a previously removed manifest entry.
+    ///
+    /// Used during rollback to re-insert an evicted manifest that was captured
+    /// via [`Self::remove_and_return`].
+    pub fn restore(&self, session_id: impl Into<String>, manifest: Arc<CapabilityManifest>) {
+        let mut manifests = self.manifests.write().expect("lock poisoned");
+        manifests.insert(session_id.into(), manifest);
+    }
+
+    /// Returns the number of manifests stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let manifests = self.manifests.read().expect("lock poisoned");
+        manifests.len()
+    }
+
+    /// Returns `true` if the store contains no manifests.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl ManifestStore for InMemoryManifestStore {
