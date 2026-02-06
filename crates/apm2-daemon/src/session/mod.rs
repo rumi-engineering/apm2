@@ -205,6 +205,21 @@ pub trait SessionRegistry: Send + Sync {
     fn clear_all_sessions(&self) -> Result<(), SessionRegistryError> {
         Ok(())
     }
+
+    /// Removes specific sessions by ID and persists the updated state.
+    ///
+    /// Used after partial crash recovery (e.g., when session collection was
+    /// truncated to `MAX_RECOVERY_SESSIONS`) to clear only the recovered
+    /// subset without discarding unrecovered sessions.
+    ///
+    /// Default implementation is a no-op (suitable for in-memory registries).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SessionRegistryError` if persistence fails.
+    fn clear_sessions_by_ids(&self, _session_ids: &[String]) -> Result<(), SessionRegistryError> {
+        Ok(())
+    }
 }
 
 /// Error type for session registry operations.

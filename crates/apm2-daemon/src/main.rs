@@ -1332,9 +1332,9 @@ async fn perform_crash_recovery(
     // registry. The PersistentSessionRegistry was populated from the state file
     // during `DaemonStateHandle::new_with_persistent_sessions`.
     let session_registry = state.session_registry();
-    let sessions = apm2_daemon::episode::crash_recovery::collect_sessions(session_registry);
+    let collected = apm2_daemon::episode::crash_recovery::collect_sessions(session_registry);
 
-    if sessions.is_empty() {
+    if collected.sessions.is_empty() {
         let elapsed_ms = start.elapsed().as_millis() as u32;
         info!(
             elapsed_ms = elapsed_ms,
@@ -1345,7 +1345,9 @@ async fn perform_crash_recovery(
     }
 
     info!(
-        stale_sessions = sessions.len(),
+        stale_sessions = collected.sessions.len(),
+        total_in_registry = collected.total_in_registry,
+        was_truncated = collected.was_truncated,
         "Found stale sessions from previous daemon instance"
     );
 
@@ -1360,7 +1362,7 @@ async fn perform_crash_recovery(
     // TCK-00387: Perform crash recovery -- emit LEASE_REVOKED events and clean
     // up work claims for each stale session.
     let result = apm2_daemon::episode::crash_recovery::recover_stale_sessions(
-        &sessions,
+        &collected.sessions,
         emitter.as_ref(),
         sqlite_conn,
         timeout,
@@ -1375,17 +1377,24 @@ async fn perform_crash_recovery(
                 recovery_time_ms = outcome.recovery_time_ms,
                 "Crash recovery completed"
             );
+
+            // TCK-00387: Only clear registry on successful recovery.
+            // When truncated, clear only the recovered subset so unrecovered
+            // sessions are preserved for the next startup cycle.
+            apm2_daemon::episode::crash_recovery::clear_session_registry(
+                session_registry,
+                &collected,
+            );
         },
         Err(e) => {
-            warn!("Crash recovery encountered errors: {e}");
-            // Continue -- partial recovery is better than none
+            // Registry is NOT cleared on error -- unrecovered sessions are
+            // preserved so they can be retried on the next startup.
+            warn!(
+                error = %e,
+                "Crash recovery failed; session registry preserved for retry on next startup"
+            );
         },
     }
-
-    // TCK-00387: Clear the persistent session registry after recovery.
-    // This is idempotent -- a second startup with the same state file will not
-    // double-emit events because the sessions are cleared.
-    apm2_daemon::episode::crash_recovery::clear_session_registry(session_registry);
 
     let elapsed_ms = start.elapsed().as_millis() as u32;
     let timeout_ms = timeout.as_millis() as u32;

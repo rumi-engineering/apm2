@@ -22,9 +22,14 @@
 //!
 //! # Fail-Safety
 //!
-//! Recovery failure does not prevent daemon startup. Errors are logged and
-//! the daemon continues. Orphaned leases will eventually time out via HTF
-//! time envelopes even without explicit revocation.
+//! Recovery failure does not prevent daemon startup. On error (including
+//! timeout), the session registry is **preserved** so unrecovered sessions
+//! can be retried on the next startup. Only successful recovery clears the
+//! registry.
+//!
+//! When session collection is truncated (exceeds `MAX_RECOVERY_SESSIONS`),
+//! only the recovered subset is cleared from the registry. Remaining
+//! sessions are preserved for the next startup cycle.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,6 +61,19 @@ pub struct CrashRecoveryOutcome {
     pub work_claims_released: u32,
     /// Time taken for recovery in milliseconds.
     pub recovery_time_ms: u32,
+}
+
+/// Result of session collection for recovery.
+#[derive(Debug, Clone)]
+pub struct CollectedSessions {
+    /// The sessions collected for recovery (may be a truncated subset).
+    pub sessions: Vec<SessionState>,
+    /// Whether the collection was truncated to `MAX_RECOVERY_SESSIONS`.
+    /// When `true`, the registry contains more sessions than were collected,
+    /// and only the collected subset should be cleared after recovery.
+    pub was_truncated: bool,
+    /// Total number of sessions in the registry before truncation.
+    pub total_in_registry: usize,
 }
 
 /// Error type for crash recovery operations.
@@ -92,22 +110,35 @@ pub enum CrashRecoveryError {
 /// state file. For `InMemorySessionRegistry`, this returns an empty vec
 /// (default implementation) since in-memory state doesn't survive restarts.
 ///
+/// Returns a [`CollectedSessions`] that indicates whether truncation
+/// occurred, so the caller can decide whether to clear all sessions or
+/// only the recovered subset.
+///
 /// # Arguments
 ///
 /// * `registry` - The session registry (typically a
 ///   `PersistentSessionRegistry`)
 #[must_use]
-pub fn collect_sessions(registry: &Arc<dyn SessionRegistry>) -> Vec<SessionState> {
+pub fn collect_sessions(registry: &Arc<dyn SessionRegistry>) -> CollectedSessions {
     let sessions = registry.all_sessions_for_recovery();
+    let total_in_registry = sessions.len();
     if sessions.len() > MAX_RECOVERY_SESSIONS {
         warn!(
             total = sessions.len(),
             max = MAX_RECOVERY_SESSIONS,
-            "Truncating recovery sessions to maximum"
+            "Truncating recovery sessions to maximum; remaining sessions preserved for next startup"
         );
-        sessions.into_iter().take(MAX_RECOVERY_SESSIONS).collect()
+        CollectedSessions {
+            sessions: sessions.into_iter().take(MAX_RECOVERY_SESSIONS).collect(),
+            was_truncated: true,
+            total_in_registry,
+        }
     } else {
-        sessions
+        CollectedSessions {
+            sessions,
+            was_truncated: false,
+            total_in_registry,
+        }
     }
 }
 
@@ -216,27 +247,58 @@ pub fn recover_stale_sessions(
     })
 }
 
-/// Clears the persistent session registry after recovery.
+/// Clears the persistent session registry after successful recovery.
 ///
-/// Uses the `clear_all_sessions()` trait method added in TCK-00387. For
-/// `PersistentSessionRegistry`, this clears the in-memory state and persists
-/// the empty state to disk. For `InMemorySessionRegistry`, this is a no-op
-/// (default implementation).
+/// When `collected.was_truncated` is `false`, clears all sessions using
+/// `clear_all_sessions()`. When truncation occurred, only clears the
+/// recovered subset using `clear_sessions_by_ids()` so unrecovered
+/// sessions are preserved for the next startup.
 ///
 /// # Arguments
 ///
 /// * `registry` - The session registry to clear
-pub fn clear_session_registry(registry: &Arc<dyn SessionRegistry>) {
-    match registry.clear_all_sessions() {
-        Ok(()) => {
-            info!("Cleared session registry after crash recovery");
-        },
-        Err(e) => {
-            warn!(
-                error = %e,
-                "Failed to clear session registry after recovery"
-            );
-        },
+/// * `collected` - The collection result from [`collect_sessions`], used to
+///   determine whether to clear all or only the recovered subset
+pub fn clear_session_registry(registry: &Arc<dyn SessionRegistry>, collected: &CollectedSessions) {
+    if collected.was_truncated {
+        // Only clear the sessions that were actually recovered.
+        // Remaining sessions stay in the registry for the next startup.
+        let session_ids: Vec<String> = collected
+            .sessions
+            .iter()
+            .map(|s| s.session_id.clone())
+            .collect();
+        info!(
+            cleared = session_ids.len(),
+            remaining = collected.total_in_registry - session_ids.len(),
+            "Clearing recovered subset (truncated recovery); remaining sessions preserved"
+        );
+        match registry.clear_sessions_by_ids(&session_ids) {
+            Ok(()) => {
+                info!(
+                    cleared = session_ids.len(),
+                    "Cleared recovered sessions from registry (partial)"
+                );
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to clear recovered sessions from registry"
+                );
+            },
+        }
+    } else {
+        match registry.clear_all_sessions() {
+            Ok(()) => {
+                info!("Cleared session registry after crash recovery");
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to clear session registry after recovery"
+                );
+            },
+        }
     }
 }
 
@@ -546,15 +608,19 @@ mod tests {
         let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
 
         // Collect sessions (simulates first startup)
-        let sessions = collect_sessions(&registry);
-        assert_eq!(sessions.len(), 1);
+        let collected = collect_sessions(&registry);
+        assert_eq!(collected.sessions.len(), 1);
+        assert!(!collected.was_truncated);
 
         // Clear after recovery
-        clear_session_registry(&registry);
+        clear_session_registry(&registry, &collected);
 
         // Now collect again (simulates second startup after reload)
-        let sessions_after = collect_sessions(&registry);
-        assert!(sessions_after.is_empty(), "Sessions should be cleared");
+        let collected_after = collect_sessions(&registry);
+        assert!(
+            collected_after.sessions.is_empty(),
+            "Sessions should be cleared"
+        );
     }
 
     // =========================================================================
@@ -614,8 +680,10 @@ mod tests {
         // InMemorySessionRegistry should return empty (no persistence)
         let registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
 
-        let sessions = collect_sessions(&registry);
-        assert!(sessions.is_empty());
+        let collected = collect_sessions(&registry);
+        assert!(collected.sessions.is_empty());
+        assert!(!collected.was_truncated);
+        assert_eq!(collected.total_in_registry, 0);
     }
 
     #[test]
@@ -634,8 +702,10 @@ mod tests {
             .unwrap();
 
         let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
-        let sessions = collect_sessions(&registry);
-        assert_eq!(sessions.len(), 2);
+        let collected = collect_sessions(&registry);
+        assert_eq!(collected.sessions.len(), 2);
+        assert!(!collected.was_truncated);
+        assert_eq!(collected.total_in_registry, 2);
     }
 
     // =========================================================================
@@ -671,13 +741,14 @@ mod tests {
         assert_eq!(loaded_registry.session_count(), 2);
 
         let registry: Arc<dyn SessionRegistry> = Arc::new(loaded_registry);
-        let sessions = collect_sessions(&registry);
-        assert_eq!(sessions.len(), 2);
+        let collected = collect_sessions(&registry);
+        assert_eq!(collected.sessions.len(), 2);
+        assert!(!collected.was_truncated);
 
         // Phase 3: Perform crash recovery
         let emitter = make_emitter(&conn);
         let result = recover_stale_sessions(
-            &sessions,
+            &collected.sessions,
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
@@ -709,11 +780,11 @@ mod tests {
         drop(db);
 
         // Phase 4: Clear registry (idempotency)
-        clear_session_registry(&registry);
+        clear_session_registry(&registry, &collected);
 
         // Phase 5: Verify second recovery finds nothing
-        let sessions_after = collect_sessions(&registry);
-        assert!(sessions_after.is_empty());
+        let collected_after = collect_sessions(&registry);
+        assert!(collected_after.sessions.is_empty());
     }
 
     // =========================================================================
@@ -751,5 +822,198 @@ mod tests {
         // emit_session_event uses session_id as work_id for indexing
         assert_eq!(work_id, "sess-1");
         assert_eq!(actor_id, "daemon");
+    }
+
+    // =========================================================================
+    // Regression Tests: BLOCKER 1 -- Registry preserved on recovery error
+    // =========================================================================
+
+    /// Regression test: when recovery times out, the session registry must NOT
+    /// be cleared. Stale sessions must be preserved for retry on next startup.
+    #[test]
+    fn test_timeout_preserves_registry() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        // Create registry with sessions
+        let registry = PersistentSessionRegistry::new(&state_path);
+        registry
+            .register_session(make_session("sess-1", "work-1"))
+            .unwrap();
+        registry
+            .register_session(make_session("sess-2", "work-2"))
+            .unwrap();
+        assert_eq!(registry.session_count(), 2);
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+        let collected = collect_sessions(&registry);
+        assert_eq!(collected.sessions.len(), 2);
+
+        let conn = setup_sqlite();
+        let emitter = make_emitter(&conn);
+
+        // Force timeout by using 0ms timeout
+        let result = recover_stale_sessions(
+            &collected.sessions,
+            Some(&emitter),
+            Some(&conn),
+            Duration::from_millis(0),
+        );
+
+        // Recovery should fail with timeout
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CrashRecoveryError::Timeout { .. }
+        ));
+
+        // CRITICAL: Do NOT clear registry on error (simulating what main.rs
+        // now does -- only clear on Ok)
+        // clear_session_registry is NOT called here.
+
+        // Verify sessions are still present in the registry
+        let collected_after = collect_sessions(&registry);
+        assert_eq!(
+            collected_after.sessions.len(),
+            2,
+            "Registry must preserve all sessions after timeout"
+        );
+    }
+
+    // =========================================================================
+    // Regression Tests: BLOCKER 2 -- Truncated recovery clears only subset
+    // =========================================================================
+
+    /// Regression test: when session collection is truncated to
+    /// `MAX_RECOVERY_SESSIONS`, `clear_session_registry` must only remove the
+    /// recovered subset, preserving unrecovered sessions for the next startup.
+    #[test]
+    fn test_truncated_recovery_preserves_unrecovered_sessions() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        // Create a persistent registry with more sessions than the cap.
+        // We can't easily create 10,001 sessions (MAX_RECOVERY_SESSIONS + 1)
+        // in a unit test, so we test the mechanism directly: build a
+        // CollectedSessions with was_truncated=true and verify
+        // clear_session_registry removes only the listed subset.
+        let registry = PersistentSessionRegistry::new(&state_path);
+        for i in 0..5 {
+            registry
+                .register_session(make_session(&format!("sess-{i}"), &format!("work-{i}")))
+                .unwrap();
+        }
+        assert_eq!(registry.session_count(), 5);
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+
+        // Simulate a truncated collection that only includes 3 of 5 sessions
+        let truncated = CollectedSessions {
+            sessions: vec![
+                make_session("sess-0", "work-0"),
+                make_session("sess-1", "work-1"),
+                make_session("sess-2", "work-2"),
+            ],
+            was_truncated: true,
+            total_in_registry: 5,
+        };
+
+        // Clear only the recovered subset
+        clear_session_registry(&registry, &truncated);
+
+        // Verify: only the 2 unrecovered sessions remain
+        let remaining = collect_sessions(&registry);
+        assert_eq!(
+            remaining.sessions.len(),
+            2,
+            "Only unrecovered sessions should remain"
+        );
+
+        // Verify the remaining sessions are the ones NOT in the truncated set
+        let remaining_ids: Vec<String> = remaining
+            .sessions
+            .iter()
+            .map(|s| s.session_id.clone())
+            .collect();
+        assert!(
+            remaining_ids.contains(&"sess-3".to_string()),
+            "sess-3 should be preserved"
+        );
+        assert!(
+            remaining_ids.contains(&"sess-4".to_string()),
+            "sess-4 should be preserved"
+        );
+        assert!(
+            !remaining_ids.contains(&"sess-0".to_string()),
+            "sess-0 should be cleared"
+        );
+    }
+
+    /// Regression test: `CollectedSessions` correctly reports truncation.
+    #[test]
+    fn test_collect_sessions_reports_truncation() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        // With fewer than MAX_RECOVERY_SESSIONS, was_truncated should be false
+        let registry = PersistentSessionRegistry::new(&state_path);
+        registry
+            .register_session(make_session("sess-1", "work-1"))
+            .unwrap();
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+        let collected = collect_sessions(&registry);
+        assert!(!collected.was_truncated);
+        assert_eq!(collected.total_in_registry, 1);
+        assert_eq!(collected.sessions.len(), 1);
+    }
+
+    /// Full end-to-end test: non-truncated successful recovery clears all
+    /// sessions from registry.
+    #[test]
+    fn test_non_truncated_success_clears_all() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+        let conn = setup_sqlite();
+        let emitter = make_emitter(&conn);
+
+        let registry = PersistentSessionRegistry::new(&state_path);
+        registry
+            .register_session(make_session("sess-1", "work-1"))
+            .unwrap();
+        registry
+            .register_session(make_session("sess-2", "work-2"))
+            .unwrap();
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+        let collected = collect_sessions(&registry);
+        assert_eq!(collected.sessions.len(), 2);
+        assert!(!collected.was_truncated);
+
+        // Successful recovery
+        let result = recover_stale_sessions(
+            &collected.sessions,
+            Some(&emitter),
+            Some(&conn),
+            Duration::from_secs(5),
+        );
+        assert!(result.is_ok());
+
+        // Clear -- should clear all since not truncated
+        clear_session_registry(&registry, &collected);
+
+        let after = collect_sessions(&registry);
+        assert!(
+            after.sessions.is_empty(),
+            "All sessions should be cleared on non-truncated success"
+        );
     }
 }

@@ -1985,6 +1985,20 @@ impl SessionRegistry for PersistentSessionRegistry {
                 message: format!("Failed to clear and persist: {e}"),
             })
     }
+
+    /// Removes specific sessions by ID and persists the updated state.
+    ///
+    /// Used after partial/truncated recovery so only the recovered subset is
+    /// removed, preserving any sessions that were not yet processed.
+    fn clear_sessions_by_ids(&self, session_ids: &[String]) -> Result<(), SessionRegistryError> {
+        for id in session_ids {
+            self.inner.remove_session(id);
+        }
+        self.persist()
+            .map_err(|e| SessionRegistryError::RegistrationFailed {
+                message: format!("Failed to persist after partial clear: {e}"),
+            })
+    }
 }
 
 #[cfg(test)]
