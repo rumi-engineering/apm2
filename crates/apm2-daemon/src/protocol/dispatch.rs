@@ -8387,36 +8387,158 @@ impl PrivilegedDispatcher {
         // return it) or reject as conflict.
         if let Err(e) = self.lease_validator.register_full_lease(&sublease) {
             // Check if this is a duplicate: the lease_id already exists.
-            // If it does, treat as idempotent if the existing lease matches.
+            // If it does, treat as idempotent if the existing lease matches
+            // ALL fields including parent lineage. Otherwise reject as conflict.
             if let Some(existing) = self.lease_validator.get_gate_lease(&sublease.lease_id) {
-                if existing.work_id == sublease.work_id
+                // SECURITY (v11 BLOCKER 2 -- Full-Field Duplicate Validation):
+                //
+                // The duplicate resolution after register_full_lease failure
+                // MUST verify the SAME fields as the Phase 2b pre-check path:
+                // work_id, gate_id, executor_actor_id, expires_at, AND parent
+                // lineage (changeset_digest, policy_hash, parent_lease_id).
+                //
+                // Without parent lineage verification, a concurrent request
+                // with a different parent_lease_id could silently receive an
+                // idempotent response for a sublease delegated from a different
+                // parent, enabling confused-deputy / capability laundering.
+                let fields_match = existing.work_id == sublease.work_id
                     && existing.gate_id == sublease.gate_id
                     && existing.executor_actor_id == sublease.executor_actor_id
                     && existing.expires_at == sublease.expires_at
-                {
-                    // Idempotent: return the existing sublease (lease was
-                    // persisted by a concurrent request with identical params).
-                    let original_event = self
-                        .event_emitter
-                        .get_events_by_work_id(&existing.lease_id)
-                        .into_iter()
-                        .find(|ev| ev.event_type == "SubleaseIssued");
-                    let event_id = original_event.map(|ev| ev.event_id).unwrap_or_default();
-                    info!(
+                    && existing.changeset_digest == sublease.changeset_digest
+                    && existing.policy_hash == sublease.policy_hash
+                    && existing.issuer_actor_id == sublease.issuer_actor_id;
+
+                if !fields_match {
+                    warn!(
                         sublease_id = %sublease.lease_id,
-                        "Concurrent duplicate sublease persisted -- idempotent return"
+                        error = %e,
+                        "Lease persistence duplicate with field mismatch -- conflict"
                     );
-                    return Ok(PrivilegedResponse::DelegateSublease(
-                        DelegateSubleaseResponse {
-                            sublease_id: existing.lease_id,
-                            parent_lease_id: request.parent_lease_id,
-                            delegatee_actor_id: request.delegatee_actor_id,
-                            gate_id: existing.gate_id,
-                            expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
-                            event_id,
-                        },
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease_id '{}' already exists with different parameters",
+                            sublease.lease_id
+                        ),
                     ));
                 }
+
+                // SECURITY (v11 BLOCKER 2 -- Parent Lineage Binding):
+                //
+                // Look up the original SubleaseIssued event and verify its
+                // parent_lease_id matches the current request. This mirrors
+                // the Phase 2b lineage verification logic: even if
+                // changeset_digest/policy_hash match, two different parent
+                // leases could share those inherited cryptographic fields.
+                let Some(original_event) = self
+                    .event_emitter
+                    .get_events_by_work_id(&existing.lease_id)
+                    .into_iter()
+                    .find(|ev| ev.event_type == "SubleaseIssued")
+                else {
+                    // SECURITY (v11 MAJOR 1 -- Fail-Closed Event Lookup):
+                    //
+                    // If the original SubleaseIssued event cannot be found,
+                    // we MUST fail-closed. Returning an empty event_id would
+                    // violate the response contract and prevent callers from
+                    // verifying the ledger trail.
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        "Concurrent duplicate sublease: original SubleaseIssued \
+                         event not found in ledger -- failing closed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' exists but its original SubleaseIssued \
+                             ledger event is missing -- cannot verify ledger trail",
+                            sublease.lease_id
+                        ),
+                    ));
+                };
+
+                // Extract parent_lease_id from the event payload using the
+                // same logic as Phase 2b: try hex-decoded inner payload first,
+                // then fall back to top-level field.
+                let parent_id_from_event =
+                    serde_json::from_slice::<serde_json::Value>(&original_event.payload)
+                        .ok()
+                        .and_then(|wrapper| {
+                            // Try hex-encoded inner payload first (stub emitter format)
+                            wrapper
+                                .get("payload")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|hex_str| hex::decode(hex_str).ok())
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                })
+                                .and_then(|inner| {
+                                    inner
+                                        .get("parent_lease_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(String::from)
+                                })
+                                .or_else(|| {
+                                    // Fallback: parent_lease_id at top level
+                                    // (production SQLite emitter stores raw payload).
+                                    wrapper
+                                        .get("parent_lease_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(String::from)
+                                })
+                        });
+
+                // SECURITY: Fail-closed -- if parent_lease_id cannot be
+                // extracted, reject the idempotent replay.
+                let Some(original_parent_id) = parent_id_from_event else {
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        "Concurrent duplicate sublease: cannot extract \
+                         parent_lease_id from event payload -- failing closed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' exists but parent_lease_id cannot be \
+                             extracted from its event payload for lineage verification",
+                            sublease.lease_id
+                        ),
+                    ));
+                };
+
+                if original_parent_id != request.parent_lease_id {
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        original_parent = %original_parent_id,
+                        requested_parent = %request.parent_lease_id,
+                        "Concurrent duplicate sublease: parent_lease_id mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' was originally delegated from parent \
+                             '{}', not '{}'",
+                            sublease.lease_id, original_parent_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
+                info!(
+                    sublease_id = %sublease.lease_id,
+                    event_id = %original_event.event_id,
+                    "Concurrent duplicate sublease persisted -- idempotent return"
+                );
+                return Ok(PrivilegedResponse::DelegateSublease(
+                    DelegateSubleaseResponse {
+                        sublease_id: existing.lease_id,
+                        parent_lease_id: request.parent_lease_id,
+                        delegatee_actor_id: request.delegatee_actor_id,
+                        gate_id: existing.gate_id,
+                        expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
+                        event_id: original_event.event_id,
+                    },
+                ));
             }
             warn!(
                 sublease_id = %sublease.lease_id,
@@ -8450,7 +8572,30 @@ impl PrivilegedDispatcher {
             "expires_at": sublease.expires_at,
             "issued_at": sublease.issued_at,
         });
-        let event_payload_bytes = serde_json::to_vec(&event_payload).unwrap_or_default();
+        // SECURITY (v10 MAJOR — Fail-closed serialization):
+        //
+        // Event payload serialization MUST NOT silently produce empty bytes.
+        // An empty payload would persist a signed event without
+        // lineage-critical fields (parent_lease_id, delegatee, gate_id),
+        // making audit verification impossible. Fail closed instead.
+        let event_payload_bytes = match serde_json::to_vec(&event_payload) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(
+                    sublease_id = %sublease.lease_id,
+                    error = %e,
+                    "SubleaseIssued event payload serialization failed -- failing closed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "sublease '{}' lease persisted but event payload serialization \
+                         failed: {e} -- failing closed",
+                        sublease.lease_id
+                    ),
+                ));
+            },
+        };
 
         let signed_event = match self.event_emitter.emit_session_event(
             &sublease.lease_id,
@@ -8461,26 +8606,37 @@ impl PrivilegedDispatcher {
         ) {
             Ok(evt) => evt,
             Err(e) => {
-                // Lease is persisted (authoritative state). Event emission
-                // failure is non-fatal: the lease exists and the event is
-                // an audit trail that follows. Log a warning and return
-                // success with an empty event_id so the caller knows the
-                // sublease was created but the audit event is missing.
+                // SECURITY (v10 BLOCKER 2 — Fail-closed on emission failure):
+                //
+                // The response contract requires `event_id` to be the ledger
+                // identity of the `SubleaseIssued` event. Returning success
+                // with an empty `event_id` violates proof-carrying effect
+                // guarantees and breaks audit verification.
+                //
+                // Even though the lease is persisted (authoritative state),
+                // we MUST fail-closed here because:
+                // 1. The proto contract defines `event_id` as a required
+                //    ledger event identity for `SubleaseIssued`.
+                // 2. A retry will hit the idempotent `register_full_lease`
+                //    duplicate path, which will find the existing lease and
+                //    attempt to look up the event. If the event still cannot
+                //    be emitted, the retry will also fail-closed.
+                // 3. The persisted lease anchor ensures no authority is lost;
+                //    the caller simply needs to retry when the event emitter
+                //    recovers.
                 warn!(
                     sublease_id = %sublease.lease_id,
                     error = %e,
-                    "SubleaseIssued event emission failed after lease persistence -- \
-                     returning success (lease is authoritative)"
+                    "SubleaseIssued event emission failed after lease persistence \
+                     -- failing closed (lease persisted, event missing)"
                 );
-                return Ok(PrivilegedResponse::DelegateSublease(
-                    DelegateSubleaseResponse {
-                        sublease_id: sublease.lease_id,
-                        parent_lease_id: request.parent_lease_id,
-                        delegatee_actor_id: request.delegatee_actor_id,
-                        gate_id: sublease.gate_id,
-                        expires_at_ns: sublease.expires_at.saturating_mul(1_000_000),
-                        event_id: String::new(),
-                    },
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "sublease '{}' lease persisted but SubleaseIssued event \
+                         emission failed: {e} -- retry to complete",
+                        sublease.lease_id
+                    ),
                 ));
             },
         };
