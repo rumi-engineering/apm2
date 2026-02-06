@@ -31,6 +31,7 @@ pub enum ReviewType {
 
 impl ReviewType {
     /// Get the status check context name for this review type.
+    #[allow(dead_code)]
     pub const fn status_context(self) -> &'static str {
         match self {
             Self::Security => "ai-review/security",
@@ -79,6 +80,8 @@ impl ReviewType {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
@@ -86,8 +89,19 @@ impl ReviewType {
 /// - The PR URL is invalid
 /// - The PR cannot be found
 /// - The review prompt is missing
-pub fn run_security(pr_url: &str, emit_internal: bool) -> Result<()> {
-    run_review(pr_url, ReviewType::Security, emit_internal)
+pub fn run_security(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    run_review(
+        pr_url,
+        ReviewType::Security,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
 }
 
 /// Run a code quality review for a PR.
@@ -103,6 +117,8 @@ pub fn run_security(pr_url: &str, emit_internal: bool) -> Result<()> {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
@@ -110,8 +126,19 @@ pub fn run_security(pr_url: &str, emit_internal: bool) -> Result<()> {
 /// - The PR URL is invalid
 /// - The PR cannot be found
 /// - The review prompt is missing
-pub fn run_quality(pr_url: &str, emit_internal: bool) -> Result<()> {
-    run_review(pr_url, ReviewType::Quality, emit_internal)
+pub fn run_quality(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    run_review(
+        pr_url,
+        ReviewType::Quality,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
 }
 
 /// Run a UAT (User Acceptance Testing) sign-off for a PR.
@@ -125,18 +152,37 @@ pub fn run_quality(pr_url: &str, emit_internal: bool) -> Result<()> {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The PR URL is invalid
 /// - The status update fails
-pub fn run_uat(pr_url: &str, emit_internal: bool) -> Result<()> {
-    run_review(pr_url, ReviewType::Uat, emit_internal)
+pub fn run_uat(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    run_review(
+        pr_url,
+        ReviewType::Uat,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
 }
 
 /// Run a review of the specified type.
-fn run_review(pr_url: &str, review_type: ReviewType, emit_internal: bool) -> Result<()> {
+fn run_review(
+    pr_url: &str,
+    review_type: ReviewType,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
 
     // TCK-00295: Check if internal emission is enabled (flag or env var)
@@ -170,11 +216,27 @@ fn run_review(pr_url: &str, review_type: ReviewType, emit_internal: bool) -> Res
     match review_type {
         ReviewType::Uat => {
             // UAT is a manual sign-off
-            run_uat_signoff(&sh, pr_url, &owner_repo, &head_sha)?;
+            run_uat_signoff(
+                &sh,
+                pr_url,
+                &owner_repo,
+                &head_sha,
+                emit_receipt_only,
+                allow_github_write,
+            )?;
         },
         ReviewType::Security | ReviewType::Quality => {
             // AI reviews use prompts and tools
-            run_ai_review(&sh, pr_url, &owner_repo, &head_sha, &repo_root, review_type)?;
+            run_ai_review(
+                &sh,
+                pr_url,
+                &owner_repo,
+                &head_sha,
+                &repo_root,
+                review_type,
+                emit_receipt_only,
+                allow_github_write,
+            )?;
         },
     }
 
@@ -211,8 +273,46 @@ fn run_review(pr_url: &str, review_type: ReviewType, emit_internal: bool) -> Res
 }
 
 /// Run UAT sign-off.
-fn run_uat_signoff(sh: &Shell, pr_url: &str, owner_repo: &str, head_sha: &str) -> Result<()> {
-    println!("\n[1/2] Posting UAT approval comment...");
+///
+/// # TCK-00297 (Stage X3): Status writes permanently removed
+///
+/// Direct GitHub status writes have been removed. This function logs what the
+/// UAT signoff would have been. The comment posting is still performed since
+/// comments are informational, not status writes.
+fn run_uat_signoff(
+    sh: &Shell,
+    pr_url: &str,
+    owner_repo: &str,
+    head_sha: &str,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    use crate::util::{StatusWriteDecision, check_status_write_with_flags};
+
+    // TCK-00297 (Stage X3): Status writes are permanently removed.
+    // check_status_write_with_flags always returns Removed as of TCK-00297.
+    match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
+        StatusWriteDecision::Removed => {
+            println!(
+                "  [TCK-00297] GitHub status writes removed. UAT signoff on {owner_repo}@{head_sha}:"
+            );
+            println!("    context: ai-review/uat");
+            println!("    state:   success");
+            println!("    desc:    UAT approved");
+            crate::util::print_status_writes_removed_notice();
+        },
+        // Legacy variants preserved for backwards compatibility but never returned.
+        StatusWriteDecision::EmitReceiptOnly
+        | StatusWriteDecision::SkipHefProjection
+        | StatusWriteDecision::BlockStrictMode
+        | StatusWriteDecision::Proceed => {
+            // TCK-00297: Even if somehow reached, do not write.
+            println!("  [TCK-00297] GitHub status writes removed. UAT signoff not performed.");
+        },
+    }
+
+    // Post UAT comment (informational, not a status write)
+    println!("\nPosting UAT approval comment...");
 
     let comment_body = "## UAT Review\n\n\
         **Status:** APPROVED\n\n\
@@ -226,23 +326,14 @@ fn run_uat_signoff(sh: &Shell, pr_url: &str, owner_repo: &str, head_sha: &str) -
 
     println!("  Comment posted.");
 
-    println!("\n[2/2] Updating status check...");
-    update_status(
-        sh,
-        owner_repo,
-        head_sha,
-        ReviewType::Uat,
-        true,
-        "UAT approved",
-    )?;
-
     println!("\nUAT review complete!");
-    println!("  Status: ai-review/uat = success");
+    println!("  [TCK-00297] Direct status update removed. Comment posted only.");
 
     Ok(())
 }
 
 /// Run an AI-powered review (security or quality).
+#[allow(clippy::too_many_arguments)]
 fn run_ai_review(
     sh: &Shell,
     pr_url: &str,
@@ -250,7 +341,20 @@ fn run_ai_review(
     head_sha: &str,
     repo_root: &str,
     review_type: ReviewType,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
 ) -> Result<()> {
+    // Note: AI reviews spawn background processes that write their own status.
+    // The cutover flags are checked in update_status when the AI reviewer
+    // completes. For now, we just log that the flags are set.
+    if emit_receipt_only && !allow_github_write {
+        eprintln!(
+            "  [TCK-00324] Note: emit-receipt-only mode active. AI reviewer will handle cutover."
+        );
+    }
+    // Store flags for use in manual status update hint
+    let _ = (emit_receipt_only, allow_github_write);
+
     let prompt_path = review_type
         .prompt_path()
         .expect("AI review types have prompt paths");
@@ -399,7 +503,11 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
 /// Per RFC-0018, direct GitHub status writes from xtask have been removed.
 /// This function logs what the status would have been for diagnostic purposes
 /// and returns `Ok(())`. The `_sh` parameter is retained for call-site
-/// compatibility.
+/// compatibility. The `emit_receipt_only` and `allow_github_write` parameters
+/// are retained for call-site compatibility with TCK-00324 callers but are
+/// ignored.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn update_status(
     _sh: &Shell,
     owner_repo: &str,
@@ -407,14 +515,19 @@ fn update_status(
     review_type: ReviewType,
     success: bool,
     description: &str,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
 ) -> Result<()> {
-    use crate::util::{StatusWriteDecision, check_status_write_allowed};
+    use crate::util::{
+        StatusWriteDecision, check_status_write_with_flags, emit_projection_request_receipt,
+    };
 
     let context = review_type.status_context();
     let state = if success { "success" } else { "failure" };
 
     // TCK-00297 (Stage X3): Status writes are permanently removed.
-    match check_status_write_allowed() {
+    // check_status_write_with_flags always returns Removed as of TCK-00297.
+    match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
         StatusWriteDecision::Removed => {
             println!(
                 "  [TCK-00297] GitHub status write removed. Would have set on {owner_repo}@{head_sha}:"
@@ -430,6 +543,25 @@ fn update_status(
             println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
             println!("  [HEF] Status would be: {context} = {success} - {description}");
             Ok(())
+        },
+        StatusWriteDecision::EmitReceiptOnly => {
+            // TCK-00324: Emit receipt only, no direct GitHub write
+            let state = if success { "success" } else { "failure" };
+            let payload = serde_json::json!({
+                "context": context,
+                "state": state,
+                "description": description
+            });
+            let correlation_id = format!("status-{context}-{head_sha}");
+            emit_projection_request_receipt(
+                "status_write",
+                owner_repo,
+                head_sha,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+            println!("  [CUTOVER] Status update receipt emitted: {context} = {state}");
+            return Ok(());
         },
         StatusWriteDecision::BlockStrictMode => {
             bail!(

@@ -486,7 +486,9 @@ fn update_status(
     success: bool,
     description: &str,
 ) -> Result<()> {
-    use crate::util::{StatusWriteDecision, check_status_write_allowed};
+    use crate::util::{
+        StatusWriteDecision, check_status_write_allowed, emit_projection_request_receipt,
+    };
 
     let state = if success { "success" } else { "failure" };
 
@@ -507,6 +509,27 @@ fn update_status(
             println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
             println!("  [HEF] Status would be: {STATUS_CONTEXT} = {success} - {description}");
             Ok(())
+        },
+        StatusWriteDecision::EmitReceiptOnly => {
+            // TCK-00324: Emit receipt only, no direct GitHub write
+            let state = if success { "success" } else { "failure" };
+            let payload = serde_json::json!({
+                "context": STATUS_CONTEXT,
+                "state": state,
+                "description": description
+            });
+            let correlation_id = format!("security-exec-{head_sha}");
+            emit_projection_request_receipt(
+                "status_write",
+                owner_repo,
+                head_sha,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+            println!(
+                "  [CUTOVER] Security review status receipt emitted: {STATUS_CONTEXT} = {state}"
+            );
+            return Ok(());
         },
         StatusWriteDecision::BlockStrictMode => {
             bail!(

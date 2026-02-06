@@ -187,7 +187,7 @@ pub fn use_hef_projection() -> bool {
 }
 
 // =============================================================================
-// Status Write Gating (TCK-00296)
+// Status Write Gating (TCK-00296 + TCK-00324)
 // =============================================================================
 
 /// Name of the environment variable enabling strict mode.
@@ -204,6 +204,61 @@ pub const XTASK_STRICT_MODE_ENV: &str = "XTASK_STRICT_MODE";
 /// enables development workflows while maintaining fail-closed security
 /// posture.
 pub const XTASK_ALLOW_STATUS_WRITES_ENV: &str = "XTASK_ALLOW_STATUS_WRITES";
+
+// =============================================================================
+// Cutover Stage 1 Feature Flags (TCK-00324)
+// =============================================================================
+
+/// Name of the environment variable enabling emit-receipt-only mode.
+///
+/// Per TCK-00324 (REQ-0007), when set to "true", xtask will NOT perform direct
+/// GitHub writes. Instead, it will emit internal receipts and rely on the
+/// projection worker to perform the actual writes.
+///
+/// This is Stage 1 of the xtask authority reduction, implementing the principle
+/// of least authority.
+pub const XTASK_EMIT_RECEIPT_ONLY_ENV: &str = "XTASK_EMIT_RECEIPT_ONLY";
+
+/// Name of the environment variable allowing direct GitHub writes.
+///
+/// Per TCK-00324 (REQ-0007), this flag must be explicitly set to "true" to
+/// allow direct GitHub writes when emit-receipt-only mode is enabled (which
+/// is the new default in cutover stage 1).
+///
+/// This provides an explicit opt-in for development/debugging scenarios where
+/// the projection worker is not available.
+pub const XTASK_ALLOW_GITHUB_WRITE_ENV: &str = "XTASK_ALLOW_GITHUB_WRITE";
+
+/// Checks if emit-receipt-only mode is enabled via environment variable.
+///
+/// Returns `true` if the `XTASK_EMIT_RECEIPT_ONLY` environment variable is set
+/// to "true" (case-insensitive).
+///
+/// Per TCK-00324 (REQ-0007), this flag defaults to `false` for backward
+/// compatibility during the Stage 1 rollout. In Stage 2, this will become
+/// `true` by default.
+///
+/// When `true`, xtask will emit internal receipts and NOT perform direct
+/// GitHub writes, relying on the projection worker instead.
+pub fn emit_receipt_only_from_env() -> bool {
+    std::env::var(XTASK_EMIT_RECEIPT_ONLY_ENV)
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Checks if direct GitHub writes are allowed via environment variable.
+///
+/// Returns `true` if the `XTASK_ALLOW_GITHUB_WRITE` environment variable is set
+/// to "true" (case-insensitive).
+///
+/// Per TCK-00324 (REQ-0007), this flag provides explicit opt-in for direct
+/// GitHub writes when emit-receipt-only mode is active. It allows development
+/// and debugging workflows when the projection worker is not available.
+pub fn allow_github_write_from_env() -> bool {
+    std::env::var(XTASK_ALLOW_GITHUB_WRITE_ENV)
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
 
 /// Checks if strict mode is enabled.
 ///
@@ -242,6 +297,12 @@ pub enum StatusWriteDecision {
     SkipHefProjection,
     /// Block the status write (strict mode without allow flag).
     BlockStrictMode,
+    /// Emit receipt only, do NOT write directly to GitHub (TCK-00324).
+    ///
+    /// When this is returned, xtask should emit an internal receipt and
+    /// return without performing the direct GitHub API call. The projection
+    /// worker will handle the actual write.
+    EmitReceiptOnly,
     /// Status writes permanently removed (TCK-00297, Stage X3).
     ///
     /// Per RFC-0018, direct GitHub status writes from xtask have been removed.
@@ -262,8 +323,8 @@ pub enum StatusWriteDecision {
 /// non-authoritative development scaffolding and must not write GitHub
 /// statuses.
 ///
-/// The previous gating logic (TCK-00296 strict mode, TCK-00309 HEF projection)
-/// is superseded by this unconditional removal.
+/// The previous gating logic (TCK-00296 strict mode, TCK-00309 HEF projection,
+/// TCK-00324 cutover stage 1) is superseded by this unconditional removal.
 ///
 /// # Returns
 ///
@@ -286,7 +347,33 @@ pub enum StatusWriteDecision {
 pub const fn check_status_write_allowed() -> StatusWriteDecision {
     // TCK-00297 (Stage X3): Direct GitHub status writes are permanently removed.
     // Replacement paths (daemon projection, FAC v0 harness) are live.
-    // All previous gating logic (strict mode, HEF projection flag) is superseded.
+    // All previous gating logic (strict mode, HEF projection flag, cutover) is superseded.
+    StatusWriteDecision::Removed
+}
+
+/// Extended check for GitHub writes with CLI flag override.
+///
+/// # TCK-00297 (Stage X3): Status writes permanently removed
+///
+/// As of TCK-00297, this function always returns `StatusWriteDecision::Removed`,
+/// regardless of CLI flags. The `emit_receipt_only_flag` and
+/// `allow_github_write_flag` parameters are retained for call-site compatibility
+/// with TCK-00324 callers but are ignored.
+///
+/// # Arguments
+///
+/// * `_emit_receipt_only_flag` - CLI --emit-receipt-only flag (ignored, TCK-00297)
+/// * `_allow_github_write_flag` - CLI --allow-github-write flag (ignored, TCK-00297)
+///
+/// # Returns
+///
+/// Always returns `StatusWriteDecision::Removed`.
+pub fn check_status_write_with_flags(
+    _emit_receipt_only_flag: bool,
+    _allow_github_write_flag: bool,
+) -> StatusWriteDecision {
+    // TCK-00297 (Stage X3): Direct GitHub status writes are permanently removed.
+    // All previous gating logic (HEF projection, cutover, strict mode) is superseded.
     StatusWriteDecision::Removed
 }
 
@@ -309,6 +396,85 @@ pub const STATUS_WRITES_REMOVED_NOTICE: &str = r"
 /// paths are now live.
 pub fn print_status_writes_removed_notice() {
     eprintln!("{STATUS_WRITES_REMOVED_NOTICE}");
+}
+
+// =============================================================================
+// Emit-Receipt-Only Mode Messages (TCK-00324)
+// =============================================================================
+
+/// Message printed when emit-receipt-only mode is active.
+///
+/// Per TCK-00324, this message informs the operator that direct GitHub writes
+/// are disabled and the projection worker will handle the actual writes.
+pub const EMIT_RECEIPT_ONLY_MESSAGE: &str = r"
+================================================================================
+                         EMIT-RECEIPT-ONLY MODE (TCK-00324)
+================================================================================
+  Direct GitHub writes are DISABLED. Emitting projection request receipt only.
+
+  The projection worker will perform the actual GitHub API write.
+  To force direct writes, use --allow-github-write or set XTASK_ALLOW_GITHUB_WRITE=true.
+
+  This is Stage 1 of the xtask authority reduction per RFC-0019 REQ-0007.
+================================================================================
+";
+
+/// Prints the emit-receipt-only mode message.
+///
+/// Call this function when emit-receipt-only mode is active to inform the
+/// operator that direct GitHub writes are disabled.
+pub fn print_emit_receipt_only_message() {
+    eprintln!("{EMIT_RECEIPT_ONLY_MESSAGE}");
+}
+
+/// Emits a projection request receipt for GitHub status/comment writes.
+///
+/// Per TCK-00324, when emit-receipt-only mode is active, xtask emits a receipt
+/// that requests the projection worker to perform the actual GitHub write.
+///
+/// # Arguments
+///
+/// * `operation` - Description of the requested operation (e.g.,
+///   `status_write`, `comment_post`)
+/// * `owner_repo` - GitHub owner/repo (e.g., "owner/repo")
+/// * `target_ref` - Target reference (SHA or PR number)
+/// * `payload` - Operation-specific payload (JSON)
+/// * `correlation_id` - Correlation ID for event tracing
+///
+/// # Returns
+///
+/// * `Ok(Some(receipt_id))` if the receipt was successfully emitted
+/// * `Ok(None)` if the daemon is unavailable (non-blocking)
+/// * `Err(_)` only for non-recoverable errors
+pub fn emit_projection_request_receipt(
+    operation: &str,
+    owner_repo: &str,
+    target_ref: &str,
+    payload: &str,
+    correlation_id: &str,
+) -> Result<Option<String>> {
+    print_emit_receipt_only_message();
+
+    let event_payload = serde_json::json!({
+        "type": "projection_request",
+        "operation": operation,
+        "owner_repo": owner_repo,
+        "target_ref": target_ref,
+        "payload": payload,
+        "cutover_stage": 1,
+        "source": "xtask",
+        "non_authoritative": true,
+    });
+
+    eprintln!(
+        "  [CUTOVER] Emitting projection request receipt: {operation} for {owner_repo}/{target_ref}"
+    );
+
+    try_emit_internal_receipt(
+        "projection.request.created",
+        event_payload.to_string().as_bytes(),
+        correlation_id,
+    )
 }
 
 // =============================================================================
@@ -956,6 +1122,220 @@ mod tests {
         assert!(
             NON_AUTHORITATIVE_BANNER.len() > 200,
             "Banner should be a substantial warning"
+        );
+    }
+
+    // =============================================================================
+    // TCK-00324 Cutover Stage 1 Tests
+    // =============================================================================
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_emit_receipt_only_from_env() {
+        // SERIAL TEST: Modifies environment variables
+
+        // 1. Default (unset) -> false
+        unsafe { std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV) };
+        assert!(
+            !emit_receipt_only_from_env(),
+            "Default should be false (backward compatible)"
+        );
+
+        // 2. "TRUE" -> true
+        unsafe { std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "TRUE") };
+        assert!(emit_receipt_only_from_env(), "TRUE should be true");
+
+        // 3. "true" -> true
+        unsafe { std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true") };
+        assert!(emit_receipt_only_from_env(), "true should be true");
+
+        // 4. "false" -> false
+        unsafe { std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "false") };
+        assert!(!emit_receipt_only_from_env(), "false should be false");
+
+        // Cleanup
+        unsafe { std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV) };
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_allow_github_write_from_env() {
+        // SERIAL TEST: Modifies environment variables
+
+        // 1. Default (unset) -> false
+        unsafe { std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV) };
+        assert!(!allow_github_write_from_env(), "Default should be false");
+
+        // 2. "TRUE" -> true
+        unsafe { std::env::set_var(XTASK_ALLOW_GITHUB_WRITE_ENV, "TRUE") };
+        assert!(allow_github_write_from_env(), "TRUE should be true");
+
+        // 3. "true" -> true
+        unsafe { std::env::set_var(XTASK_ALLOW_GITHUB_WRITE_ENV, "true") };
+        assert!(allow_github_write_from_env(), "true should be true");
+
+        // 4. "false" -> false
+        unsafe { std::env::set_var(XTASK_ALLOW_GITHUB_WRITE_ENV, "false") };
+        assert!(!allow_github_write_from_env(), "false should be false");
+
+        // Cleanup
+        unsafe { std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV) };
+    }
+
+    /// IT-00297-02: Verify that TCK-00324 cutover flags do not override removal.
+    ///
+    /// Per TCK-00297 (Stage X3), `check_status_write_allowed()` and
+    /// `check_status_write_with_flags()` must unconditionally return
+    /// `StatusWriteDecision::Removed`, even when TCK-00324 cutover flags are
+    /// set. This test verifies that the cutover flags are superseded.
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_check_status_write_allowed_emit_receipt_only_superseded() {
+        // TCK-00324 emit-receipt-only mode -> still Removed (TCK-00297)
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
+            std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
+        }
+
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Removed,
+            "TCK-00324 emit-receipt-only must not override Removed (TCK-00297)"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+            std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_check_status_write_allowed_emit_receipt_only_with_override_superseded() {
+        // TCK-00324 allow-github-write override -> still Removed (TCK-00297)
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
+            std::env::set_var(XTASK_ALLOW_GITHUB_WRITE_ENV, "true");
+        }
+
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Removed,
+            "TCK-00324 allow-github-write must not override Removed (TCK-00297)"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+            std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_check_status_write_with_flags_all_return_removed() {
+        // TCK-00297: CLI flags must not override Removed
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+            std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
+        }
+
+        // CLI flag emit_receipt_only=true -> still Removed
+        assert_eq!(
+            check_status_write_with_flags(true, false),
+            StatusWriteDecision::Removed,
+            "CLI emit_receipt_only=true must not override Removed (TCK-00297)"
+        );
+
+        // CLI flag allow_github_write=true -> still Removed
+        assert_eq!(
+            check_status_write_with_flags(true, true),
+            StatusWriteDecision::Removed,
+            "CLI allow_github_write=true must not override Removed (TCK-00297)"
+        );
+
+        // Both flags false -> still Removed
+        assert_eq!(
+            check_status_write_with_flags(false, false),
+            StatusWriteDecision::Removed,
+            "Both flags false must still return Removed (TCK-00297)"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+            std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_hef_projection_superseded_by_removal() {
+        // TCK-00297: HEF projection flag must not override Removed
+        unsafe {
+            std::env::set_var(USE_HEF_PROJECTION_ENV, "true");
+            std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
+            std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
+        }
+
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Removed,
+            "HEF projection must not override Removed (TCK-00297)"
+        );
+
+        // HEF projection via CLI flags -> still Removed
+        assert_eq!(
+            check_status_write_with_flags(true, false),
+            StatusWriteDecision::Removed,
+            "HEF projection with CLI flags must not override Removed (TCK-00297)"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+            std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
+        }
+    }
+
+    #[test]
+    fn test_emit_receipt_only_message_contains_key_phrases() {
+        // Verify the emit-receipt-only message contains all required info
+        assert!(
+            EMIT_RECEIPT_ONLY_MESSAGE.contains("TCK-00324"),
+            "Message must mention TCK-00324"
+        );
+        assert!(
+            EMIT_RECEIPT_ONLY_MESSAGE.contains("EMIT-RECEIPT-ONLY"),
+            "Message must mention EMIT-RECEIPT-ONLY"
+        );
+        assert!(
+            EMIT_RECEIPT_ONLY_MESSAGE.contains("projection worker"),
+            "Message must mention projection worker"
+        );
+        assert!(
+            EMIT_RECEIPT_ONLY_MESSAGE.contains("allow-github-write"),
+            "Message must mention allow-github-write override"
         );
     }
 }

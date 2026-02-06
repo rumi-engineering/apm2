@@ -57,11 +57,16 @@ pub fn commit(message: &str, skip_checks: bool) -> Result<()> {
 ///
 /// Delegates to the push module for the actual implementation.
 ///
+/// # Arguments
+///
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
+///
 /// # Errors
 ///
 /// Returns an error if the push fails. See [`push::run`] for details.
-pub fn push() -> Result<()> {
-    push::run()
+pub fn push(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
+    push::run(emit_receipt_only, allow_github_write)
 }
 
 /// Show ticket and PR status.
@@ -111,13 +116,20 @@ pub fn finish() -> Result<()> {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
 /// Returns an error if the review fails. See [`review::run_security`] for
 /// details.
-pub fn review_security(pr_url: &str, emit_internal: bool) -> Result<()> {
-    review::run_security(pr_url, emit_internal)
+pub fn review_security(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    review::run_security(pr_url, emit_internal, emit_receipt_only, allow_github_write)
 }
 
 /// Run a code quality review for a PR.
@@ -128,13 +140,20 @@ pub fn review_security(pr_url: &str, emit_internal: bool) -> Result<()> {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
 /// Returns an error if the review fails. See [`review::run_quality`] for
 /// details.
-pub fn review_quality(pr_url: &str, emit_internal: bool) -> Result<()> {
-    review::run_quality(pr_url, emit_internal)
+pub fn review_quality(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    review::run_quality(pr_url, emit_internal, emit_receipt_only, allow_github_write)
 }
 
 /// Run a UAT sign-off for a PR.
@@ -145,12 +164,19 @@ pub fn review_quality(pr_url: &str, emit_internal: bool) -> Result<()> {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
 ///
 /// # Errors
 ///
 /// Returns an error if the review fails. See [`review::run_uat`] for details.
-pub fn review_uat(pr_url: &str, emit_internal: bool) -> Result<()> {
-    review::run_uat(pr_url, emit_internal)
+pub fn review_uat(
+    pr_url: &str,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    review::run_uat(pr_url, emit_internal, emit_receipt_only, allow_github_write)
 }
 
 /// Approve a PR after security review.

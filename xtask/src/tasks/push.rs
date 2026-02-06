@@ -26,13 +26,18 @@ use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_tick
 /// 5. Creates a PR if one doesn't exist
 /// 6. Enables auto-merge if available
 ///
+/// # Arguments
+///
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - Not on a valid ticket branch
 /// - Rebase fails (conflicts need manual resolution)
 /// - Push or PR creation fails
-pub fn run() -> Result<()> {
+pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
 
     // Get current branch and validate it's a ticket branch
@@ -164,7 +169,7 @@ pub fn run() -> Result<()> {
 
     // Trigger AI reviews
     println!("\nTriggering AI reviews...");
-    trigger_ai_reviews(&sh, &pr_url)?;
+    trigger_ai_reviews(&sh, &pr_url, emit_receipt_only, allow_github_write)?;
 
     println!();
     println!("Push complete!");
@@ -247,7 +252,17 @@ fn create_pr(sh: &Shell, branch_name: &str, ticket_id: &str) -> Result<String> {
 ///
 /// The AI reviewers are responsible for updating their status to
 /// success/failure.
-fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
+///
+/// # Arguments
+///
+/// * `emit_receipt_only` - If true, emit receipt only (TCK-00324 cutover)
+/// * `allow_github_write` - If true, allow direct GitHub writes
+fn trigger_ai_reviews(
+    sh: &Shell,
+    pr_url: &str,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
     let head_sha = cmd!(sh, "git rev-parse HEAD")
         .read()
         .context("Failed to get HEAD SHA")?
@@ -287,7 +302,13 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
     if owner_repo.is_empty() {
         println!("    Warning: Could not determine owner/repo from remote URL");
     } else {
-        create_pending_statuses(sh, owner_repo, &head_sha);
+        create_pending_statuses(
+            sh,
+            owner_repo,
+            &head_sha,
+            emit_receipt_only,
+            allow_github_write,
+        );
     }
 
     // Try to spawn Codex for security review
@@ -357,22 +378,36 @@ fn parse_owner_repo(remote_url: &str) -> &str {
 /// Per RFC-0018, direct GitHub status writes from xtask have been removed.
 /// This function logs what statuses would have been created for diagnostic
 /// purposes. The `_sh` parameter is retained for call-site compatibility.
-fn create_pending_statuses(_sh: &Shell, owner_repo: &str, head_sha: &str) {
-    use crate::util::{StatusWriteDecision, check_status_write_allowed};
+/// The `_emit_receipt_only` and `_allow_github_write` parameters are retained
+/// for call-site compatibility with TCK-00324 callers but are ignored.
+fn create_pending_statuses(
+    _sh: &Shell,
+    owner_repo: &str,
+    head_sha: &str,
+    _emit_receipt_only: bool,
+    _allow_github_write: bool,
+) {
+    use crate::util::{StatusWriteDecision, check_status_write_with_flags};
 
     // TCK-00297 (Stage X3): Status writes are permanently removed.
-    match check_status_write_allowed() {
+    // check_status_write_with_flags always returns Removed as of TCK-00297.
+    match check_status_write_with_flags(_emit_receipt_only, _allow_github_write) {
         StatusWriteDecision::Removed => {
             println!(
                 "    [TCK-00297] GitHub status writes removed. Would have created pending statuses on {owner_repo}@{head_sha}:"
             );
             println!("      - ai-review/security  = pending (Waiting for security review)");
-            println!("      - ai-review/code-quality = pending (Waiting for code quality review)");
+            println!(
+                "      - ai-review/code-quality = pending (Waiting for code quality review)"
+            );
             crate::util::print_status_writes_removed_notice();
         },
         // Legacy variants preserved for backwards compatibility but never returned.
         StatusWriteDecision::SkipHefProjection => {
             println!("    [HEF] Skipping pending status creation (USE_HEF_PROJECTION=true)");
+        },
+        StatusWriteDecision::EmitReceiptOnly => {
+            println!("    [TCK-00297] Status writes removed (emit-receipt-only path disabled).");
         },
         StatusWriteDecision::BlockStrictMode => {
             println!("    [STRICT] Status writes blocked.");
