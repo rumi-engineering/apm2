@@ -92,6 +92,7 @@ fn register_work_claim(conn: &Arc<Mutex<Connection>>, work_id: &str) {
             resolved_policy_hash: [0u8; 32],
             capability_manifest_hash: [0u8; 32],
             context_pack_hash: [0u8; 32],
+            resolved_risk_tier: 0,
         },
         executor_custody_domains: Vec::new(),
         author_custody_domains: Vec::new(),

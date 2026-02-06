@@ -754,6 +754,11 @@ impl DispatcherState {
         // BLOCKER 1 fix).
         self.session_dispatcher
             .set_gate_orchestrator(Arc::clone(&orchestrator));
+        // Wire orchestrator into privileged dispatcher so DelegateSublease
+        // can access the orchestrator for sublease issuance (Quality BLOCKER 4 fix).
+        self.privileged_dispatcher = self
+            .privileged_dispatcher
+            .with_gate_orchestrator(Arc::clone(&orchestrator));
         self.gate_orchestrator = Some(orchestrator);
         self
     }

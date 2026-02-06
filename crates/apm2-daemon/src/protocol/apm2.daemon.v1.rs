@@ -1527,6 +1527,47 @@ pub struct IngestReviewReceiptResponse {
     #[prost(string, tag = "3")]
     pub event_id: ::prost::alloc::string::String,
 }
+/// Request to delegate a sublease from a parent gate lease (TCK-00340).
+///
+/// The daemon validates the parent lease, checks strict-subset constraints,
+/// and issues a signed sublease for the delegatee actor.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DelegateSubleaseRequest {
+    /// Parent lease ID to delegate from.
+    #[prost(string, tag = "1")]
+    pub parent_lease_id: ::prost::alloc::string::String,
+    /// Actor ID of the delegatee (child holon).
+    #[prost(string, tag = "2")]
+    pub delegatee_actor_id: ::prost::alloc::string::String,
+    /// Requested expiry timestamp in nanoseconds since epoch.
+    #[prost(uint64, tag = "3")]
+    pub requested_expiry_ns: u64,
+    /// Sublease ID to assign (must be unique).
+    #[prost(string, tag = "4")]
+    pub sublease_id: ::prost::alloc::string::String,
+}
+/// Response confirming sublease delegation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DelegateSubleaseResponse {
+    /// The sublease ID that was issued.
+    #[prost(string, tag = "1")]
+    pub sublease_id: ::prost::alloc::string::String,
+    /// The parent lease ID that was delegated from.
+    #[prost(string, tag = "2")]
+    pub parent_lease_id: ::prost::alloc::string::String,
+    /// The delegatee actor ID.
+    #[prost(string, tag = "3")]
+    pub delegatee_actor_id: ::prost::alloc::string::String,
+    /// The gate ID from the parent lease.
+    #[prost(string, tag = "4")]
+    pub gate_id: ::prost::alloc::string::String,
+    /// Expiry timestamp of the sublease in nanoseconds.
+    #[prost(uint64, tag = "5")]
+    pub expires_at_ns: u64,
+    /// Ledger event ID for the SubleaseIssued event.
+    #[prost(string, tag = "6")]
+    pub event_id: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {

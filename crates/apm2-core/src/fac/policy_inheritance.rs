@@ -38,6 +38,15 @@ use thiserror::Error;
 use super::lease::GateLease;
 use super::policy_resolution::RiskTier;
 
+/// Internal helper used only for deserializing `AttestationRequirements`
+/// before validation.
+#[derive(Deserialize)]
+struct AttestationRequirementsRaw {
+    tool_execution: [AttestationLevel; 5],
+    review: [AttestationLevel; 5],
+    projection: [AttestationLevel; 5],
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -99,6 +108,30 @@ pub enum PolicyInheritanceError {
         actual: usize,
         /// Maximum allowed.
         max: usize,
+    },
+
+    /// Sublease `gate_id` does not match parent `gate_id` (scope bypass
+    /// attempt).
+    #[error(
+        "gate_id mismatch: parent gate_id='{parent_gate_id}', sublease gate_id='{sublease_gate_id}'"
+    )]
+    GateIdMismatch {
+        /// Parent lease `gate_id`.
+        parent_gate_id: String,
+        /// Sublease `gate_id` that does not match.
+        sublease_gate_id: String,
+    },
+
+    /// Monotonic ratchet violation detected during deserialization.
+    ///
+    /// `AttestationRequirements` loaded from config/wire must satisfy the
+    /// monotonic non-decreasing invariant. This error is returned when
+    /// a deserialized table has a higher tier requiring less attestation
+    /// than a lower tier.
+    #[error("non-monotonic attestation table: {reason}")]
+    NonMonotonicTable {
+        /// Human-readable description of the violation.
+        reason: String,
     },
 }
 
@@ -234,7 +267,7 @@ impl std::fmt::Display for ReceiptKind {
 ///
 /// The ratchet is monotonically non-decreasing: a higher tier never requires
 /// less attestation than a lower tier. This is enforced at construction time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttestationRequirements {
     /// Minimum attestation for `ToolExecutionReceipt` per risk tier (index =
     /// tier).
@@ -245,6 +278,29 @@ pub struct AttestationRequirements {
     /// Minimum attestation for `ProjectionReceiptRecorded` per risk tier
     /// (index = tier).
     projection: [AttestationLevel; 5],
+}
+
+/// Custom `Deserialize` implementation that enforces the monotonic ratchet
+/// invariant on deserialization.
+///
+/// This prevents accepting downgraded / non-monotonic tables loaded from
+/// config or wire. Any violation fails closed with a deserialization error.
+impl<'de> Deserialize<'de> for AttestationRequirements {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = AttestationRequirementsRaw::deserialize(deserializer)?;
+        let requirements = Self {
+            tool_execution: raw.tool_execution,
+            review: raw.review,
+            projection: raw.projection,
+        };
+        requirements
+            .validate_monotonic()
+            .map_err(serde::de::Error::custom)?;
+        Ok(requirements)
+    }
 }
 
 impl Default for AttestationRequirements {
@@ -283,6 +339,27 @@ impl AttestationRequirements {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates attestation requirements from explicit per-kind arrays,
+    /// validating the monotonic ratchet invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyInheritanceError::NonMonotonicTable`] if any array
+    /// violates the monotonically non-decreasing invariant.
+    pub fn try_new(
+        tool_execution: [AttestationLevel; 5],
+        review: [AttestationLevel; 5],
+        projection: [AttestationLevel; 5],
+    ) -> Result<Self, PolicyInheritanceError> {
+        let requirements = Self {
+            tool_execution,
+            review,
+            projection,
+        };
+        requirements.validate_monotonic()?;
+        Ok(requirements)
     }
 
     /// Returns the minimum attestation level required for the given receipt
@@ -335,7 +412,8 @@ impl AttestationRequirements {
     ///
     /// # Errors
     ///
-    /// Returns error if any tier requires less attestation than a lower tier.
+    /// Returns [`PolicyInheritanceError::NonMonotonicTable`] if any tier
+    /// requires less attestation than a lower tier.
     pub fn validate_monotonic(&self) -> Result<(), PolicyInheritanceError> {
         for (name, levels) in [
             ("tool_execution", &self.tool_execution),
@@ -344,10 +422,7 @@ impl AttestationRequirements {
         ] {
             for i in 1..levels.len() {
                 if (levels[i] as u8) < (levels[i - 1] as u8) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    // i is bounded by levels.len() (5), so truncation cannot occur.
-                    return Err(PolicyInheritanceError::AttestationNotMet {
-                        tier: RiskTier::try_from(i as u8).unwrap_or(RiskTier::Tier4),
+                    return Err(PolicyInheritanceError::NonMonotonicTable {
                         reason: format!(
                             "monotonic ratchet violated for {name}: tier {i} requires \
                              {} but tier {} requires {}",
@@ -400,11 +475,21 @@ impl PolicyInheritanceValidator {
     ///
     /// Returns [`PolicyInheritanceError::SubleaseViolation`] if any constraint
     /// is violated.
+    #[allow(clippy::too_many_lines)]
     pub fn validate_sublease(
         parent: &GateLease,
         sublease: &GateLease,
     ) -> Result<(), PolicyInheritanceError> {
-        // 1. work_id must match
+        // 1. gate_id must match — prevents scope bypass by switching gates while
+        //    preserving work/policy/hash/time fields.
+        if parent.gate_id != sublease.gate_id {
+            return Err(PolicyInheritanceError::GateIdMismatch {
+                parent_gate_id: parent.gate_id.clone(),
+                sublease_gate_id: sublease.gate_id.clone(),
+            });
+        }
+
+        // 2. work_id must match
         if parent.work_id != sublease.work_id {
             return Err(PolicyInheritanceError::SubleaseViolation {
                 parent_id: parent.lease_id.clone(),
@@ -416,7 +501,7 @@ impl PolicyInheritanceValidator {
             });
         }
 
-        // 2. changeset_digest must match (constant-time)
+        // 3. changeset_digest must match (constant-time)
         if !bool::from(parent.changeset_digest.ct_eq(&sublease.changeset_digest)) {
             return Err(PolicyInheritanceError::SubleaseViolation {
                 parent_id: parent.lease_id.clone(),
@@ -425,7 +510,7 @@ impl PolicyInheritanceValidator {
             });
         }
 
-        // 3. policy_hash must match (constant-time)
+        // 4. policy_hash must match (constant-time)
         if !bool::from(parent.policy_hash.ct_eq(&sublease.policy_hash)) {
             return Err(PolicyInheritanceError::SubleaseViolation {
                 parent_id: parent.lease_id.clone(),
@@ -434,7 +519,7 @@ impl PolicyInheritanceValidator {
             });
         }
 
-        // 4. Time bounds: sublease must be within parent bounds
+        // 5. Time bounds: sublease must be within parent bounds
         if sublease.issued_at < parent.issued_at {
             return Err(PolicyInheritanceError::SubleaseViolation {
                 parent_id: parent.lease_id.clone(),
@@ -457,10 +542,9 @@ impl PolicyInheritanceValidator {
             });
         }
 
-        // 5. If parent has no AAT extension, sublease must not have one either (cannot
+        // 6. If parent has no AAT extension, sublease must not have one either (cannot
         //    escalate privileges). If parent has AAT extension and sublease also has
-        //    one, the sublease AAT extension must reference the same RCP manifest hash
-        //    and profile.
+        //    one, ALL authority-relevant fields must match.
         if parent.aat_extension.is_none() && sublease.aat_extension.is_some() {
             return Err(PolicyInheritanceError::SubleaseViolation {
                 parent_id: parent.lease_id.clone(),
@@ -473,6 +557,19 @@ impl PolicyInheritanceValidator {
 
         if let (Some(parent_ext), Some(sub_ext)) = (&parent.aat_extension, &sublease.aat_extension)
         {
+            // view_commitment_hash must match (constant-time)
+            if !bool::from(
+                parent_ext
+                    .view_commitment_hash
+                    .ct_eq(&sub_ext.view_commitment_hash),
+            ) {
+                return Err(PolicyInheritanceError::SubleaseViolation {
+                    parent_id: parent.lease_id.clone(),
+                    sublease_id: sublease.lease_id.clone(),
+                    reason: "aat_extension view_commitment_hash mismatch".to_string(),
+                });
+            }
+
             // RCP manifest hash must match (constant-time)
             if !bool::from(
                 parent_ext
@@ -494,6 +591,18 @@ impl PolicyInheritanceValidator {
                     reason: format!(
                         "aat_extension rcp_profile_id mismatch: parent='{}', sublease='{}'",
                         parent_ext.rcp_profile_id, sub_ext.rcp_profile_id,
+                    ),
+                });
+            }
+
+            // selection_policy_id must match
+            if parent_ext.selection_policy_id != sub_ext.selection_policy_id {
+                return Err(PolicyInheritanceError::SubleaseViolation {
+                    parent_id: parent.lease_id.clone(),
+                    sublease_id: sublease.lease_id.clone(),
+                    reason: format!(
+                        "aat_extension selection_policy_id mismatch: parent='{}', sublease='{}'",
+                        parent_ext.selection_policy_id, sub_ext.selection_policy_id,
                     ),
                 });
             }
@@ -856,12 +965,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sublease_aat_escalation_rejected() {
+    fn test_sublease_aat_escalation_with_gate_switch_rejected() {
         let signer = Signer::generate();
-        // Parent has NO AAT extension
+        // Parent has NO AAT extension (gate-build)
         let parent = make_parent_lease(&signer);
 
-        // Sublease tries to add AAT extension (privilege escalation)
+        // Sublease tries to switch to gate-aat AND add AAT extension.
+        // The gate_id mismatch check fires first (fail-closed).
         let sublease = GateLeaseBuilder::new("sub-001", "work-001", "gate-aat")
             .changeset_digest([0x42; 32])
             .executor_actor_id("sub-executor")
@@ -881,8 +991,39 @@ mod tests {
         let result = PolicyInheritanceValidator::validate_sublease(&parent, &sublease);
         assert!(matches!(
             result,
-            Err(PolicyInheritanceError::SubleaseViolation { ref reason, .. })
-            if reason.contains("cannot escalate AAT privileges")
+            Err(PolicyInheritanceError::GateIdMismatch {
+                ref parent_gate_id,
+                ref sublease_gate_id,
+            })
+            if parent_gate_id == "gate-build" && sublease_gate_id == "gate-aat"
+        ));
+    }
+
+    #[test]
+    fn test_sublease_gate_id_mismatch_rejected() {
+        let signer = Signer::generate();
+        let parent = make_parent_lease(&signer); // gate_id = "gate-build"
+
+        // Sublease uses a different gate_id — must be rejected even though
+        // all other fields match.
+        let sublease = GateLeaseBuilder::new("sub-001", "work-001", "gate-quality")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("sub-executor")
+            .issued_at(1_100_000)
+            .expires_at(1_900_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("sub-issuer")
+            .time_envelope_ref("htf:tick:200")
+            .build_and_sign(&signer);
+
+        let result = PolicyInheritanceValidator::validate_sublease(&parent, &sublease);
+        assert!(matches!(
+            result,
+            Err(PolicyInheritanceError::GateIdMismatch {
+                ref parent_gate_id,
+                ref sublease_gate_id,
+            })
+            if parent_gate_id == "gate-build" && sublease_gate_id == "gate-quality"
         ));
     }
 
@@ -1589,5 +1730,239 @@ mod tests {
             AttestationLevel::ThresholdSigned.as_str(),
             "THRESHOLD_SIGNED"
         );
+    }
+
+    // =========================================================================
+    // BLOCKER 1: gate_id scope enforcement tests
+    // =========================================================================
+
+    #[test]
+    fn test_sublease_gate_id_match_accepted() {
+        // Same gate_id on both parent and sublease — must pass.
+        let signer = Signer::generate();
+        let parent = make_parent_lease(&signer); // gate-build
+        let sublease = make_sublease(
+            &signer, "sub-001", "work-001", [0x42; 32], [0xAB; 32], 1_100_000, 1_900_000,
+        ); // also gate-build
+        assert!(PolicyInheritanceValidator::validate_sublease(&parent, &sublease).is_ok());
+    }
+
+    #[test]
+    fn test_sublease_gate_id_mismatch_is_first_check() {
+        // Ensure gate_id is validated before anything else so that a
+        // gate-switching attack is caught even if all other fields match.
+        let signer = Signer::generate();
+        let parent = make_parent_lease(&signer); // gate-build
+
+        let sublease = GateLeaseBuilder::new("sub-001", "work-001", "gate-security")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("sub-executor")
+            .issued_at(1_100_000)
+            .expires_at(1_900_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("sub-issuer")
+            .time_envelope_ref("htf:tick:200")
+            .build_and_sign(&signer);
+
+        let result = PolicyInheritanceValidator::validate_sublease(&parent, &sublease);
+        assert!(matches!(
+            result,
+            Err(PolicyInheritanceError::GateIdMismatch { .. })
+        ));
+    }
+
+    // =========================================================================
+    // MAJOR 1: Non-monotonic deserialization rejection tests
+    // =========================================================================
+
+    #[test]
+    fn test_try_new_valid_monotonic() {
+        let result = AttestationRequirements::try_new(
+            [
+                AttestationLevel::None,
+                AttestationLevel::SelfSigned,
+                AttestationLevel::SelfSigned,
+                AttestationLevel::CounterSigned,
+                AttestationLevel::CounterSigned,
+            ],
+            [
+                AttestationLevel::None,
+                AttestationLevel::SelfSigned,
+                AttestationLevel::CounterSigned,
+                AttestationLevel::CounterSigned,
+                AttestationLevel::ThresholdSigned,
+            ],
+            [
+                AttestationLevel::None,
+                AttestationLevel::SelfSigned,
+                AttestationLevel::SelfSigned,
+                AttestationLevel::CounterSigned,
+                AttestationLevel::CounterSigned,
+            ],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_new_non_monotonic_rejected() {
+        // tool_execution tier 2 < tier 1 — violates monotonic invariant
+        let result = AttestationRequirements::try_new(
+            [
+                AttestationLevel::None,
+                AttestationLevel::CounterSigned, // tier 1
+                AttestationLevel::SelfSigned,    // tier 2 < tier 1: violation!
+                AttestationLevel::CounterSigned,
+                AttestationLevel::ThresholdSigned,
+            ],
+            [
+                AttestationLevel::None,
+                AttestationLevel::SelfSigned,
+                AttestationLevel::CounterSigned,
+                AttestationLevel::CounterSigned,
+                AttestationLevel::ThresholdSigned,
+            ],
+            [
+                AttestationLevel::None,
+                AttestationLevel::SelfSigned,
+                AttestationLevel::SelfSigned,
+                AttestationLevel::CounterSigned,
+                AttestationLevel::CounterSigned,
+            ],
+        );
+        assert!(
+            matches!(
+                result,
+                Err(PolicyInheritanceError::NonMonotonicTable { ref reason })
+                if reason.contains("monotonic ratchet violated")
+            ),
+            "non-monotonic table must be rejected with NonMonotonicTable variant, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_non_monotonic_table_rejected() {
+        // Construct a JSON payload where tool_execution is non-monotonic.
+        let json = r#"{
+            "tool_execution": ["SELF_SIGNED", "NONE", "SELF_SIGNED", "COUNTER_SIGNED", "THRESHOLD_SIGNED"],
+            "review": ["NONE", "SELF_SIGNED", "COUNTER_SIGNED", "COUNTER_SIGNED", "THRESHOLD_SIGNED"],
+            "projection": ["NONE", "SELF_SIGNED", "SELF_SIGNED", "COUNTER_SIGNED", "COUNTER_SIGNED"]
+        }"#;
+
+        let result: Result<AttestationRequirements, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "deserializing non-monotonic table must fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("monotonic"),
+            "error should mention monotonic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_valid_monotonic_table_accepted() {
+        let json = r#"{
+            "tool_execution": ["NONE", "SELF_SIGNED", "SELF_SIGNED", "COUNTER_SIGNED", "COUNTER_SIGNED"],
+            "review": ["NONE", "SELF_SIGNED", "COUNTER_SIGNED", "COUNTER_SIGNED", "THRESHOLD_SIGNED"],
+            "projection": ["NONE", "SELF_SIGNED", "SELF_SIGNED", "COUNTER_SIGNED", "COUNTER_SIGNED"]
+        }"#;
+
+        let result: Result<AttestationRequirements, _> = serde_json::from_str(json);
+        assert!(result.is_ok(), "valid monotonic table should deserialize");
+        let req = result.unwrap();
+        assert!(req.validate_monotonic().is_ok());
+    }
+
+    // =========================================================================
+    // MAJOR 2: AAT extension full authority field checks
+    // =========================================================================
+
+    #[test]
+    fn test_sublease_aat_view_commitment_hash_mismatch_rejected() {
+        let signer = Signer::generate();
+
+        let parent = GateLeaseBuilder::new("parent-001", "work-001", "gate-aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:100")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x33; 32],
+                rcp_manifest_hash: [0x11; 32],
+                rcp_profile_id: "profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&signer);
+
+        let sublease = GateLeaseBuilder::new("sub-001", "work-001", "gate-aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("sub-executor")
+            .issued_at(1_100_000)
+            .expires_at(1_900_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("sub-issuer")
+            .time_envelope_ref("htf:tick:200")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0xFF; 32], // DIFFERENT
+                rcp_manifest_hash: [0x11; 32],
+                rcp_profile_id: "profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&signer);
+
+        let result = PolicyInheritanceValidator::validate_sublease(&parent, &sublease);
+        assert!(matches!(
+            result,
+            Err(PolicyInheritanceError::SubleaseViolation { ref reason, .. })
+            if reason.contains("view_commitment_hash mismatch")
+        ));
+    }
+
+    #[test]
+    fn test_sublease_aat_selection_policy_id_mismatch_rejected() {
+        let signer = Signer::generate();
+
+        let parent = GateLeaseBuilder::new("parent-001", "work-001", "gate-aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_000_000)
+            .expires_at(2_000_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:100")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x33; 32],
+                rcp_manifest_hash: [0x11; 32],
+                rcp_profile_id: "profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&signer);
+
+        let sublease = GateLeaseBuilder::new("sub-001", "work-001", "gate-aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("sub-executor")
+            .issued_at(1_100_000)
+            .expires_at(1_900_000)
+            .policy_hash([0xAB; 32])
+            .issuer_actor_id("sub-issuer")
+            .time_envelope_ref("htf:tick:200")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x33; 32],
+                rcp_manifest_hash: [0x11; 32],
+                rcp_profile_id: "profile-001".to_string(),
+                selection_policy_id: "policy-DIFFERENT".to_string(), // DIFFERENT
+            })
+            .build_and_sign(&signer);
+
+        let result = PolicyInheritanceValidator::validate_sublease(&parent, &sublease);
+        assert!(matches!(
+            result,
+            Err(PolicyInheritanceError::SubleaseViolation { ref reason, .. })
+            if reason.contains("selection_policy_id mismatch")
+        ));
     }
 }

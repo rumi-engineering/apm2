@@ -36,7 +36,10 @@ use apm2_core::credentials::{
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::evidence::ContentAddressedStore;
-use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
+use apm2_core::fac::{
+    AttestationLevel, AttestationRequirements, REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation,
+    ReceiptKind, RiskTier, validate_receipt_attestation,
+};
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
 use prost::Message;
@@ -64,6 +67,9 @@ use super::messages::{
     CredentialAuthMethod as ProtoAuthMethod,
     CredentialProvider as ProtoProvider,
     DecodeConfig,
+    // TCK-00340: Sublease delegation types
+    DelegateSubleaseRequest,
+    DelegateSubleaseResponse,
     EndSessionRequest,
     EndSessionResponse,
     // TCK-00389: Review receipt ingestion types
@@ -365,6 +371,31 @@ pub trait LedgerEventEmitter: Send + Sync {
 
     /// Queries events by work ID.
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent>;
+
+    /// Queries a signed event by `receipt_id` embedded in the payload.
+    ///
+    /// This searches for events of type `review_receipt_recorded` or
+    /// `review_blocked_recorded` whose JSON payload contains a matching
+    /// `receipt_id` field. Used by `handle_ingest_review_receipt` for
+    /// idempotency: if a receipt with the same `receipt_id` was already
+    /// ingested, the existing event is returned to avoid duplicate ledger
+    /// entries.
+    ///
+    /// # Why not `get_event`?
+    ///
+    /// `get_event` looks up by `event_id` (the random `EVT-<uuid>` primary
+    /// key), which is different from `receipt_id` (the caller-supplied
+    /// idempotency key). Using `get_event(&receipt_id)` would never match
+    /// because `receipt_id` is not stored as the `event_id`.
+    ///
+    /// # Default
+    ///
+    /// Returns `None`. Implementations that support receipt-based lookup
+    /// should override this.
+    fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
+        let _ = receipt_id;
+        None
+    }
 
     /// Emits an episode lifecycle event to the ledger (TCK-00321).
     ///
@@ -1371,6 +1402,31 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             .unwrap_or_default()
     }
 
+    fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        // Search all review receipt events for a matching receipt_id in the
+        // JCS-canonicalized JSON payload. Both `review_receipt_recorded` and
+        // `review_blocked_recorded` events embed `receipt_id` in the payload.
+        for event in guard.1.values() {
+            if event.event_type != "review_receipt_recorded"
+                && event.event_type != "review_blocked_recorded"
+            {
+                continue;
+            }
+            // The payload is JCS-canonicalized JSON stored as bytes.
+            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&event.payload) {
+                if payload
+                    .get("receipt_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(receipt_id)
+                {
+                    return Some(event.clone());
+                }
+            }
+        }
+        None
+    }
+
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
         let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
         let guard = self.events.read().expect("lock poisoned");
@@ -2172,6 +2228,26 @@ pub struct PolicyResolution {
 
     /// BLAKE3 hash of the sealed context pack.
     pub context_pack_hash: [u8; 32],
+
+    /// Resolved risk tier (0-4) from `PolicyResolvedForChangeSet`.
+    ///
+    /// Used by `handle_ingest_review_receipt` to enforce attestation
+    /// ratcheting: higher tiers require stronger attestation levels.
+    /// SECURITY: Defaults to `4` (Tier4, most restrictive) via
+    /// `risk_tier_fail_closed` to prevent attestation downgrade via
+    /// schema drift or tampered persistence (fail-closed semantics).
+    #[serde(default = "risk_tier_fail_closed")]
+    pub resolved_risk_tier: u8,
+}
+
+/// Serde default for `resolved_risk_tier`: returns `4` (Tier4, most
+/// restrictive).
+///
+/// SECURITY: This ensures that missing or omitted `resolved_risk_tier` values
+/// fail closed to the most restrictive tier, preventing attestation downgrade
+/// via schema drift or tampered persistence.
+const fn risk_tier_fail_closed() -> u8 {
+    4
 }
 
 /// Error type for policy resolution operations.
@@ -2339,6 +2415,7 @@ impl PolicyResolver for StubPolicyResolver {
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: manifest_hash,
             context_pack_hash,
+            resolved_risk_tier: 0, // Stub resolver: Tier0 default
         })
     }
 }
@@ -2935,6 +3012,9 @@ pub enum PrivilegedMessageType {
     // --- ChangeSet Publishing (RFC-0018, TCK-00394) ---
     /// `PublishChangeSet` request (IPC-PRIV-017)
     PublishChangeSet    = 70,
+    // --- Sublease Delegation (RFC-0019, TCK-00340) ---
+    /// `DelegateSublease` request (IPC-PRIV-072)
+    DelegateSublease    = 72,
 }
 
 impl PrivilegedMessageType {
@@ -2977,6 +3057,8 @@ impl PrivilegedMessageType {
             68 => Some(Self::PulseEvent),
             // ChangeSet publishing (TCK-00394)
             70 => Some(Self::PublishChangeSet),
+            // Sublease delegation (TCK-00340)
+            72 => Some(Self::DelegateSublease),
             _ => None,
         }
     }
@@ -3022,6 +3104,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse,
             Self::UnsubscribePulse,
             Self::PublishChangeSet,
+            Self::DelegateSublease,
         ]
     }
 
@@ -3064,7 +3147,8 @@ impl PrivilegedMessageType {
             | Self::LoginCredential
             | Self::SubscribePulse
             | Self::UnsubscribePulse
-            | Self::PublishChangeSet => true,
+            | Self::PublishChangeSet
+            | Self::DelegateSublease => true,
             // Server-to-client notification only — not a client request.
             Self::PulseEvent => false,
         }
@@ -3104,6 +3188,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse => "hsi.pulse.subscribe",
             Self::UnsubscribePulse => "hsi.pulse.unsubscribe",
             Self::PublishChangeSet => "hsi.changeset.publish",
+            Self::DelegateSublease => "hsi.sublease.delegate",
             Self::PulseEvent => "hsi.pulse.event",
         }
     }
@@ -3138,6 +3223,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse => "SUBSCRIBE_PULSE",
             Self::UnsubscribePulse => "UNSUBSCRIBE_PULSE",
             Self::PublishChangeSet => "PUBLISH_CHANGESET",
+            Self::DelegateSublease => "DELEGATE_SUBLEASE",
             Self::PulseEvent => "PULSE_EVENT",
         }
     }
@@ -3172,6 +3258,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse => "apm2.subscribe_pulse_request.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_request.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_request.v1",
+            Self::DelegateSublease => "apm2.delegate_sublease_request.v1",
             Self::PulseEvent => "apm2.pulse_event_request.v1",
         }
     }
@@ -3206,6 +3293,7 @@ impl PrivilegedMessageType {
             Self::SubscribePulse => "apm2.subscribe_pulse_response.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_response.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_response.v1",
+            Self::DelegateSublease => "apm2.delegate_sublease_response.v1",
             Self::PulseEvent => "apm2.pulse_event_response.v1",
         }
     }
@@ -3274,6 +3362,8 @@ pub enum PrivilegedResponse {
     ConsensusMetrics(ConsensusMetricsResponse),
     /// Successful `PublishChangeSet` response (TCK-00394).
     PublishChangeSet(PublishChangeSetResponse),
+    /// Successful `DelegateSublease` response (TCK-00340).
+    DelegateSublease(DelegateSubleaseResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -3414,6 +3504,10 @@ impl PrivilegedResponse {
             },
             Self::PublishChangeSet(resp) => {
                 buf.push(PrivilegedMessageType::PublishChangeSet.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::DelegateSublease(resp) => {
+                buf.push(PrivilegedMessageType::DelegateSublease.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -3560,6 +3654,62 @@ pub trait LeaseValidator: Send + Sync {
         let _ = executor_actor_id;
         self.register_lease(lease_id, work_id, gate_id);
     }
+
+    /// Returns the `work_id` bound to a lease (TCK-00340).
+    ///
+    /// Used by `handle_ingest_review_receipt` to resolve the work claim
+    /// and its associated risk tier for attestation ratcheting.
+    ///
+    /// # Returns
+    ///
+    /// `Some(work_id)` if the lease exists, `None` otherwise.
+    fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
+        let _ = lease_id;
+        None
+    }
+
+    /// Returns the full `GateLease` for a given lease ID (TCK-00340).
+    ///
+    /// Used by `DelegateSublease` to retrieve the parent lease for
+    /// strict-subset validation and sublease issuance.
+    ///
+    /// # Trust Model (v7 Finding 1)
+    ///
+    /// The returned lease is trusted because it comes from the daemon-owned
+    /// `SQLite` ledger (same-process trust boundary). The lease's embedded
+    /// `issuer_signature` field preserves the original Ed25519 signature
+    /// for downstream verification, but callers within the daemon process
+    /// do NOT need to call `GateLease::validate_signature()` -- the ledger
+    /// integrity is guaranteed by the process trust boundary.
+    ///
+    /// See `SqliteLeaseValidator::register_full_lease()` for the full trust
+    /// model documentation.
+    ///
+    /// # Returns
+    ///
+    /// `Some(GateLease)` if the lease exists, `None` otherwise.
+    fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
+        let _ = lease_id;
+        None
+    }
+
+    /// Registers a full `GateLease` for sublease delegation (TCK-00340).
+    ///
+    /// This method exists to support test fixtures and production paths
+    /// that need full lease objects for sublease delegation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the lease could not be persisted
+    /// (serialization failure, database write failure, etc.). Callers
+    /// MUST fail closed when this returns `Err` to preserve the
+    /// single-effect guarantee (LAW-11) -- a sublease event emitted
+    /// without a corresponding persisted lease anchor would leave the
+    /// system in an inconsistent state.
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
+        let _ = lease;
+        Ok(())
+    }
 }
 
 /// Entry for a registered lease.
@@ -3598,6 +3748,8 @@ pub struct StubLeaseValidator {
         std::collections::VecDeque<String>,
         std::collections::HashMap<String, LeaseEntry>,
     )>,
+    /// Full gate leases for sublease delegation (TCK-00340).
+    full_leases: std::sync::RwLock<std::collections::HashMap<String, apm2_core::fac::GateLease>>,
 }
 
 impl StubLeaseValidator {
@@ -3609,6 +3761,7 @@ impl StubLeaseValidator {
                 std::collections::VecDeque::new(),
                 std::collections::HashMap::new(),
             )),
+            full_leases: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -3648,6 +3801,12 @@ impl LeaseValidator for StubLeaseValidator {
         leases
             .get(lease_id)
             .map(|entry| entry.executor_actor_id.clone())
+    }
+
+    fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
+        let guard = self.leases.read().expect("lock poisoned");
+        let (_, leases) = &*guard;
+        leases.get(lease_id).map(|entry| entry.work_id.clone())
     }
 
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
@@ -3699,6 +3858,26 @@ impl LeaseValidator for StubLeaseValidator {
                 executor_actor_id: executor_actor_id.to_string(),
             },
         );
+    }
+
+    fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
+        let guard = self.full_leases.read().expect("lock poisoned");
+        guard.get(lease_id).cloned()
+    }
+
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) -> Result<(), String> {
+        let mut guard = self.full_leases.write().expect("lock poisoned");
+        // SECURITY (v10 BLOCKER 2): Enforce uniqueness at the persistence
+        // layer. If a lease with this ID already exists, return an error
+        // so the caller can handle it (idempotent or conflict). This makes
+        // the store the source of truth for uniqueness, preventing TOCTOU
+        // races where two concurrent requests both pass the in-memory
+        // pre-check and create conflicting leases.
+        if guard.contains_key(&lease.lease_id) {
+            return Err(format!("duplicate lease_id: {}", lease.lease_id));
+        }
+        guard.insert(lease.lease_id.clone(), lease.clone());
+        Ok(())
     }
 }
 
@@ -3879,6 +4058,14 @@ pub struct PrivilegedDispatcher {
     /// CAS and returns the content hash for ledger event binding. When `None`,
     /// the handler returns an error indicating CAS is not configured.
     cas: Option<Arc<dyn ContentAddressedStore>>,
+
+    /// Gate orchestrator for sublease delegation (TCK-00340).
+    ///
+    /// When present, `DelegateSublease` delegates to the orchestrator to
+    /// issue signed subleases with strict-subset validation. When `None`,
+    /// the handler returns an error indicating the orchestrator is not
+    /// configured.
+    gate_orchestrator: Option<Arc<crate::gate::GateOrchestrator>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -3953,6 +4140,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -4010,6 +4198,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -4086,6 +4275,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -4139,6 +4329,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -4191,6 +4382,16 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Sets the gate orchestrator for sublease delegation (TCK-00340).
+    #[must_use]
+    pub fn with_gate_orchestrator(
+        mut self,
+        orchestrator: Arc<crate::gate::GateOrchestrator>,
+    ) -> Self {
+        self.gate_orchestrator = Some(orchestrator);
         self
     }
 
@@ -4534,6 +4735,8 @@ impl PrivilegedDispatcher {
             )),
             // TCK-00394: ChangeSet publishing for daemon-anchored submission
             PrivilegedMessageType::PublishChangeSet => self.handle_publish_changeset(payload, ctx),
+            // TCK-00340: Sublease delegation for child holon authorization
+            PrivilegedMessageType::DelegateSublease => self.handle_delegate_sublease(payload, ctx),
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -4574,6 +4777,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::PulseEvent => "PulseEvent",
                 // TCK-00394
                 PrivilegedMessageType::PublishChangeSet => "PublishChangeSet",
+                // TCK-00340
+                PrivilegedMessageType::DelegateSublease => "DelegateSublease",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -6522,10 +6727,29 @@ impl PrivilegedDispatcher {
                 reason: format!("invalid IngestReviewReceiptRequest: {e}"),
             })?;
 
+        // ---- Phase -1 (v6 Finding 1): Bind reviewer identity to authenticated caller
+        // ----
+        //
+        // SECURITY: The reviewer identity MUST be derived from peer credentials,
+        // not trusted from the caller-supplied `reviewer_actor_id`. Without this
+        // binding, any operator-socket process could submit receipts as any
+        // reviewer. The authenticated identity is used for:
+        //   - Reviewer-vs-executor comparison (Phase 1)
+        //   - Attestation signer identity (Phase 1b)
+        //   - Event actor attribution (Phase 4)
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "peer credentials required for review receipt ingestion",
+            ));
+        };
+        let authenticated_reviewer_id = derive_actor_id(peer_creds);
+
         info!(
             lease_id = %request.lease_id,
             receipt_id = %request.receipt_id,
-            reviewer_actor_id = %request.reviewer_actor_id,
+            claimed_reviewer_actor_id = %request.reviewer_actor_id,
+            authenticated_reviewer_id = %authenticated_reviewer_id,
             verdict = %request.verdict,
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
             "IngestReviewReceipt request received"
@@ -6640,37 +6864,178 @@ impl PrivilegedDispatcher {
 
         // SEC-TIMING-001: Constant-time comparison to prevent timing
         // side-channel attacks on reviewer identity.
-        let identity_matches = expected_actor_id.len() == request.reviewer_actor_id.len()
+        //
+        // SECURITY (v6 Finding 1): Compare the AUTHENTICATED reviewer identity
+        // (derived from peer credentials) against the lease executor — NOT the
+        // caller-supplied `request.reviewer_actor_id`. This prevents any
+        // operator-socket process from submitting receipts as an arbitrary
+        // reviewer.
+        let identity_matches = expected_actor_id.len() == authenticated_reviewer_id.len()
             && bool::from(
                 expected_actor_id
                     .as_bytes()
-                    .ct_eq(request.reviewer_actor_id.as_bytes()),
+                    .ct_eq(authenticated_reviewer_id.as_bytes()),
             );
 
         if !identity_matches {
             warn!(
                 lease_id = %request.lease_id,
+                authenticated_reviewer = %authenticated_reviewer_id,
                 claimed_reviewer = %request.reviewer_actor_id,
-                "Reviewer identity mismatch - rejecting review receipt"
+                "Authenticated reviewer identity mismatch - rejecting review receipt"
             );
             return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                "reviewer_actor_id does not match gate lease executor",
+                PrivilegedErrorCode::PermissionDenied,
+                "authenticated caller identity does not match gate lease executor",
             ));
         }
 
+        // ---- Phase 1b (TCK-00340): Attestation ratchet validation ----
+        //
+        // SECURITY: Resolve the real risk tier from the work item's policy
+        // resolution state. Higher tiers require stronger attestation
+        // (CounterSigned / ThresholdSigned). Fail-closed: if risk tier
+        // cannot be resolved, default to Tier4 (most restrictive).
+        {
+            let changeset_digest: [u8; 32] = request
+                .changeset_digest
+                .as_slice()
+                .try_into()
+                .expect("validated to be 32 bytes above");
+
+            // Resolve risk tier via: lease_id -> work_id -> work_claim -> policy_resolution
+            let (risk_tier, resolved_policy_hash) =
+                if let Some(wid) = self.lease_validator.get_lease_work_id(&request.lease_id) {
+                    if let Some(claim) = self.work_registry.get_claim(&wid) {
+                        let tier_u8 = claim.policy_resolution.resolved_risk_tier;
+                        let tier = RiskTier::try_from(tier_u8).unwrap_or_else(|_| {
+                            // FAIL-CLOSED: invalid tier value -> Tier4 (most restrictive)
+                            warn!(
+                                lease_id = %request.lease_id,
+                                work_id = %wid,
+                                tier_value = tier_u8,
+                                "Invalid risk tier value in policy resolution — \
+                                 defaulting to Tier4 (fail-closed)"
+                            );
+                            RiskTier::Tier4
+                        });
+                        (tier, claim.policy_resolution.resolved_policy_hash)
+                    } else {
+                        // FAIL-CLOSED: no work claim -> Tier4
+                        warn!(
+                            lease_id = %request.lease_id,
+                            work_id = %wid,
+                            "Work claim not found for lease — \
+                             defaulting to Tier4 (fail-closed)"
+                        );
+                        (RiskTier::Tier4, changeset_digest)
+                    }
+                } else {
+                    // FAIL-CLOSED: no work_id from lease -> Tier4
+                    warn!(
+                        lease_id = %request.lease_id,
+                        "Could not resolve work_id from lease — \
+                         defaulting to Tier4 (fail-closed)"
+                    );
+                    (RiskTier::Tier4, changeset_digest)
+                };
+
+            // SECURITY (v5 Finding 4): Instead of hard-rejecting all non-Tier0
+            // requests, consult the ratchet table first. The ratchet table
+            // explicitly allows Tier1 with SelfSigned attestation. Only reject
+            // if the tier's required attestation level exceeds what this
+            // endpoint can provide (SelfSigned). This restores Tier1 throughput
+            // while maintaining fail-closed semantics for higher tiers.
+            let requirements = AttestationRequirements::new();
+            let required_level = requirements.required_level(ReceiptKind::Review, risk_tier);
+            if !AttestationLevel::SelfSigned.satisfies(required_level) {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    risk_tier = ?risk_tier,
+                    required_level = %required_level,
+                    "Risk tier requires attestation stronger than SelfSigned — \
+                     rejecting (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "review receipt endpoint provides SelfSigned attestation; \
+                         {risk_tier:?} requires {required_level} which this endpoint cannot produce"
+                    ),
+                ));
+            }
+
+            // SECURITY (v6 Finding 1): Use authenticated reviewer identity
+            // for attestation signer, not the caller-supplied value.
+            let attestation = ReceiptAttestation {
+                kind: ReceiptKind::Review,
+                level: AttestationLevel::SelfSigned,
+                policy_hash: resolved_policy_hash,
+                signer_identity: authenticated_reviewer_id.clone(),
+                counter_signer_identity: None,
+                threshold_signer_count: None,
+            };
+
+            // Validate attestation against requirements using the resolved
+            // policy hash from the work item's policy resolution (not the
+            // raw changeset_digest). This binds the attestation to the
+            // governance-resolved policy state.
+            if let Err(e) = validate_receipt_attestation(
+                &attestation,
+                risk_tier,
+                &resolved_policy_hash,
+                &requirements,
+            ) {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    error = %e,
+                    "Receipt attestation validation failed - rejecting (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("attestation validation failed: {e}"),
+                ));
+            }
+        }
+
         // ---- Phase 2: Idempotency check ----
-        // Check if a receipt with this ID already exists in the ledger.
-        if let Some(existing) = self.event_emitter.get_event(&request.receipt_id) {
+        //
+        // SECURITY (v10 MAJOR 1 -- receipt_id idempotency fix):
+        //
+        // Use `get_event_by_receipt_id` to look up existing events by the
+        // caller-supplied `receipt_id` embedded in the event payload. The
+        // previous approach using `get_event(&receipt_id)` was broken because
+        // `get_event` looks up by `event_id` (auto-generated `EVT-<uuid>`),
+        // not by `receipt_id`. The intermediate `get_events_by_work_id` approach
+        // also had a gap: `emit_review_blocked_receipt` stores `work_id` as
+        // `receipt_id` (not `lease_id`), so blocked receipts would not be found
+        // when querying by `lease_id`.
+        //
+        // `get_event_by_receipt_id` searches the payload JSON directly for the
+        // matching `receipt_id` field across both `review_receipt_recorded` and
+        // `review_blocked_recorded` event types, regardless of `work_id`.
+        if let Some(existing) = self
+            .event_emitter
+            .get_event_by_receipt_id(&request.receipt_id)
+        {
             info!(
                 receipt_id = %request.receipt_id,
                 existing_event_id = %existing.event_id,
                 "Duplicate receipt_id detected - returning existing event (idempotent)"
             );
+            // Map the internal event_type to the response-level event type.
+            // The ledger stores snake_case event types ("review_receipt_recorded",
+            // "review_blocked_recorded"), but the response contract uses
+            // PascalCase ("ReviewReceiptRecorded", "ReviewBlockedRecorded").
+            let response_event_type = match existing.event_type.as_str() {
+                "review_receipt_recorded" => "ReviewReceiptRecorded".to_string(),
+                "review_blocked_recorded" => "ReviewBlockedRecorded".to_string(),
+                other => other.to_string(),
+            };
             return Ok(PrivilegedResponse::IngestReviewReceipt(
                 IngestReviewReceiptResponse {
                     receipt_id: request.receipt_id,
-                    event_type: existing.event_type,
+                    event_type: response_event_type,
                     event_id: existing.event_id,
                 },
             ));
@@ -6702,6 +7067,8 @@ impl PrivilegedDispatcher {
                     .try_into()
                     .expect("validated to be 32 bytes above");
 
+                // SECURITY (v6 Finding 1): Use authenticated reviewer identity
+                // for event actor attribution, not the caller-supplied value.
                 let event = self
                     .event_emitter
                     .emit_review_receipt(
@@ -6709,7 +7076,7 @@ impl PrivilegedDispatcher {
                         &request.receipt_id,
                         &changeset_digest,
                         &artifact_bundle_hash,
-                        &request.reviewer_actor_id,
+                        &authenticated_reviewer_id,
                         timestamp_ns,
                     )
                     .map_err(|e| ProtocolError::Serialization {
@@ -6725,13 +7092,15 @@ impl PrivilegedDispatcher {
                     .try_into()
                     .expect("validated to be 32 bytes above");
 
+                // SECURITY (v6 Finding 1): Use authenticated reviewer identity
+                // for event actor attribution, not the caller-supplied value.
                 let event = self
                     .event_emitter
                     .emit_review_blocked_receipt(
                         &request.receipt_id,
                         request.blocked_reason_code,
                         &blocked_log_hash,
-                        &request.reviewer_actor_id,
+                        &authenticated_reviewer_id,
                         timestamp_ns,
                     )
                     .map_err(|e| ProtocolError::Serialization {
@@ -6753,7 +7122,7 @@ impl PrivilegedDispatcher {
             receipt_id = %request.receipt_id,
             event_type = %event_type,
             event_id = %signed_event.event_id,
-            reviewer = %request.reviewer_actor_id,
+            reviewer = %authenticated_reviewer_id,
             "Review receipt ingested successfully"
         );
 
@@ -7529,6 +7898,771 @@ impl PrivilegedDispatcher {
                 changeset_digest: hex::encode(changeset_digest),
                 cas_hash: hex::encode(cas_hash),
                 work_id: request.work_id,
+                event_id: signed_event.event_id,
+            },
+        ))
+    }
+
+    // =========================================================================
+    // TCK-00340: DelegateSublease Handler
+    // =========================================================================
+
+    /// Handles `DelegateSublease` requests (IPC-PRIV-072, TCK-00340).
+    ///
+    /// Delegates a sublease from a parent gate lease to a child holon,
+    /// validating strict-subset constraints before signing the sublease.
+    ///
+    /// # Security Invariants
+    ///
+    /// - **Admission before mutation**: Parent lease existence and validity are
+    ///   checked before any sublease issuance.
+    /// - **Fail-closed**: Any validation failure rejects the request.
+    /// - **Gate-scope enforcement**: Sublease inherits the parent's `gate_id`.
+    /// - **Strict-subset**: Sublease constraints cannot exceed parent bounds.
+    fn handle_delegate_sublease(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = DelegateSubleaseRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid DelegateSubleaseRequest: {e}"),
+            })?;
+
+        info!(
+            parent_lease_id = %request.parent_lease_id,
+            delegatee_actor_id = %request.delegatee_actor_id,
+            sublease_id = %request.sublease_id,
+            requested_expiry_ns = request.requested_expiry_ns,
+            "DelegateSublease request received"
+        );
+
+        // ---- Phase 0a: Caller authorization (fail-closed) ----
+        //
+        // SECURITY: Verify the caller is authorized to delegate from the
+        // parent lease. The caller's identity (derived from peer credentials)
+        // must match the parent lease's `executor_actor_id` — only the
+        // lease holder can delegate subleases from their lease.
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "peer credentials required for sublease delegation",
+            ));
+        };
+        let caller_actor_id = derive_actor_id(peer_creds);
+
+        // ---- Phase 0b: Validate required fields (admission checks) ----
+
+        if request.parent_lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "parent_lease_id is required",
+            ));
+        }
+        if request.parent_lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("parent_lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.delegatee_actor_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "delegatee_actor_id is required",
+            ));
+        }
+        if request.delegatee_actor_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("delegatee_actor_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.sublease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "sublease_id is required",
+            ));
+        }
+        if request.sublease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("sublease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.requested_expiry_ns == 0 {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "requested_expiry_ns must be non-zero",
+            ));
+        }
+
+        // ---- Phase 1: Gate orchestrator availability ----
+        let Some(gate_orchestrator) = &self.gate_orchestrator else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "gate orchestrator not configured",
+            ));
+        };
+
+        // ---- Phase 2: Retrieve parent lease (admission check) ----
+        //
+        // SECURITY (v7 Finding 1 — Trust Model for Persisted Leases):
+        //
+        // The parent lease is deserialized from the daemon-owned SQLite ledger.
+        // We do NOT call `GateLease::validate_signature()` here because the
+        // ledger is a **same-process trusted store**: only the daemon writes
+        // to it (via authenticated IPC handlers that enforce admission checks
+        // before persisting). The SQLite file is not externally writable.
+        //
+        // The GateLease's `issuer_signature` (Ed25519 over canonical bytes)
+        // IS preserved in the serialized `full_lease` field and can be
+        // verified by downstream consumers that need cryptographic proof of
+        // issuance (e.g., cross-node replication). Within the daemon process,
+        // the ledger's integrity is guaranteed by the process trust boundary.
+        //
+        // See `SqliteLeaseValidator::register_full_lease()` in ledger.rs for
+        // the full trust model documentation (v6 Finding 2).
+        //
+        // TODO(RFC-0019): When cross-node lease federation is implemented,
+        // add signature verification here for leases received from external
+        // nodes (where the process trust boundary does not apply).
+        let Some(parent_lease) = self
+            .lease_validator
+            .get_gate_lease(&request.parent_lease_id)
+        else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::GateLeaseMissing,
+                format!("parent gate lease not found: {}", request.parent_lease_id),
+            ));
+        };
+
+        // ---- Phase 2a: Caller authorization against parent lease ----
+        //
+        // SECURITY: The caller must be the executor authorized by the parent
+        // lease, OR the issuer of the parent lease. Only the lease holder
+        // (executor) or the lease issuer should be able to delegate subleases.
+        // This prevents confused-deputy / capability laundering attacks where
+        // an unauthorized caller delegates from another entity's lease.
+        if parent_lease.executor_actor_id != caller_actor_id
+            && parent_lease.issuer_actor_id != caller_actor_id
+        {
+            warn!(
+                parent_lease_id = %request.parent_lease_id,
+                caller = %caller_actor_id,
+                executor = %parent_lease.executor_actor_id,
+                issuer = %parent_lease.issuer_actor_id,
+                "Caller not authorized to delegate from parent lease"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "caller is not authorized to delegate from lease '{}'",
+                    request.parent_lease_id
+                ),
+            ));
+        }
+
+        // ---- Phase 2b: Sublease ID uniqueness check (admission before mutation) ----
+        //
+        // SECURITY (v10 — Defense-in-Depth Uniqueness):
+        //
+        // This application-level check provides the idempotent fast-path for
+        // duplicate sublease requests. However, since `dispatch()` takes
+        // `&self` (not `&mut self`), concurrent dispatch of two requests
+        // with the same `sublease_id` could theoretically race past this
+        // check. Two database-level constraints enforce authoritative
+        // uniqueness (see `SqliteLedgerEventEmitter::init_schema`):
+        //
+        // 1. `idx_unique_full_lease_id`: Partial unique index on `json_extract(payload,
+        //    '$.lease_id')` for `gate_lease_issued` events with `full_lease`. This
+        //    prevents duplicate lease persistence via `register_full_lease`.
+        //
+        // 2. `idx_unique_sublease_issued`: Partial unique index on `(event_type,
+        //    work_id)` for `SubleaseIssued` events. For these events, `work_id` =
+        //    `sublease_id`, so the index enforces at-most-once event emission per
+        //    sublease.
+        //
+        // If a duplicate races past the application check, either
+        // `register_full_lease` or `emit_session_event` will fail with a
+        // UNIQUE constraint violation, and the handler will fail-closed or
+        // resolve via the idempotent duplicate path.
+        if let Some(existing) = self.lease_validator.get_gate_lease(&request.sublease_id) {
+            // Idempotent return: if the existing sublease has identical
+            // parameters, return it. Otherwise reject as a conflict.
+            // Compare executor_actor_id of existing sublease against the
+            // requested delegatee — these are intentionally different field
+            // names (the sublease's executor IS the delegatee).
+            //
+            // SECURITY (v6 Finding 3): The idempotent equality check MUST
+            // cover the FULL request tuple, not just (work_id, gate_id,
+            // delegatee). Omitting parent_lease_id or requested_expiry_ns
+            // would allow a request with a different parent lineage or
+            // different expiry to silently receive the cached sublease.
+            //
+            // Since GateLease does not store parent_lease_id directly, we
+            // verify parent lineage by comparing the sublease's inherited
+            // changeset_digest and policy_hash against the current parent
+            // lease's values. A different parent_lease_id will have different
+            // policy/changeset hashes (or fail the v5 revalidation below).
+            //
+            // For requested_expiry_ns, convert to ms and compare against
+            // the existing sublease's expires_at (which is stored in ms).
+            let delegatee_matches = existing.executor_actor_id == request.delegatee_actor_id;
+            let expiry_ms = request.requested_expiry_ns / 1_000_000;
+            let expiry_matches = existing.expires_at == expiry_ms;
+            let lineage_matches = existing.changeset_digest == parent_lease.changeset_digest
+                && existing.policy_hash == parent_lease.policy_hash;
+            if existing.work_id == parent_lease.work_id
+                && existing.gate_id == parent_lease.gate_id
+                && delegatee_matches
+                && expiry_matches
+                && lineage_matches
+            {
+                // SECURITY (v5 Finding 1): Revalidate the existing sublease
+                // against the PROVIDED parent lease. A stale sublease issued
+                // under a previous parent boundary must not be returned if it
+                // violates the current parent's constraints (time bounds,
+                // policy hash, changeset digest, AAT extension).
+                if let Err(e) = crate::gate::GateOrchestrator::validate_sublease_delegation(
+                    &parent_lease,
+                    &existing,
+                ) {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        parent_lease_id = %request.parent_lease_id,
+                        error = %e,
+                        "Idempotent sublease failed revalidation against current parent lease"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "existing sublease '{}' is incompatible with parent lease '{}': {e}",
+                            request.sublease_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
+                // Look up the original SubleaseIssued event from the
+                // ledger. The emit_session_event call stored the event with
+                // work_id = sublease.lease_id, so we query by that key and
+                // filter for event_type == "SubleaseIssued".
+                //
+                // SECURITY (v7 Finding 1 — Fail-Closed Idempotent Replay):
+                //
+                // The response contract defines event_id as the ledger event
+                // identity for SubleaseIssued. If the original event cannot be
+                // found, we MUST fail-closed rather than returning an empty
+                // event_id. An empty event_id would violate the response
+                // contract and prevent callers from verifying the ledger trail
+                // of the sublease. This can happen if the ledger was truncated
+                // or if there's a storage inconsistency.
+                let Some(original_event) = self
+                    .event_emitter
+                    .get_events_by_work_id(&existing.lease_id)
+                    .into_iter()
+                    .find(|e| e.event_type == "SubleaseIssued")
+                else {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        "Idempotent sublease replay failed: original SubleaseIssued event not found in ledger"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' exists but its original SubleaseIssued ledger event \
+                             is missing — cannot verify ledger trail",
+                            request.sublease_id
+                        ),
+                    ));
+                };
+
+                // SECURITY (v9 Finding 2 — Fail-Closed Parent Lineage Binding):
+                //
+                // Verify that the original `SubleaseIssued` event was bound to
+                // the same `parent_lease_id` as the current request. Even though
+                // the `changeset_digest`/`policy_hash` comparison above provides
+                // indirect lineage verification, we MUST also check the
+                // explicit `parent_lease_id` from the event payload to prevent
+                // lineage ambiguity when two different parent leases happen
+                // to share inherited cryptographic fields.
+                //
+                // SECURITY: This extraction MUST be fail-closed. If the event
+                // payload cannot be parsed, or if `parent_lease_id` cannot be
+                // extracted from either the hex-encoded inner payload or the
+                // top-level wrapper, the idempotent replay MUST be rejected.
+                // Silently bypassing this check on parse failure would allow
+                // corrupted or legacy payloads to return success without
+                // verifying lineage, weakening confused-deputy resistance.
+                //
+                // NOTE: The event payload is a wrapper JSON containing the
+                // original payload as a hex-encoded string in the "payload"
+                // field. We must decode that inner payload to extract the
+                // `parent_lease_id` field.
+                let wrapper =
+                    match serde_json::from_slice::<serde_json::Value>(&original_event.payload) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            warn!(
+                                sublease_id = %request.sublease_id,
+                                error = %e,
+                                "Idempotent sublease replay rejected: cannot parse event payload \
+                                 for lineage verification"
+                            );
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::CapabilityRequestRejected,
+                                format!(
+                                    "sublease '{}' exists but its event payload cannot be parsed \
+                                 for lineage verification: {e}",
+                                    request.sublease_id
+                                ),
+                            ));
+                        },
+                    };
+
+                // Extract the inner payload: it may be hex-encoded (stub
+                // emitter) or directly embedded depending on the emitter.
+                // Try hex-decoding the "payload" field first, then fall
+                // back to checking `parent_lease_id` at the top level.
+                let original_parent_id = wrapper
+                    .get("payload")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|hex_str| hex::decode(hex_str).ok())
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|inner| {
+                        inner
+                            .get("parent_lease_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from)
+                    })
+                    .or_else(|| {
+                        // Fallback: `parent_lease_id` at top level (e.g.,
+                        // production SQLite emitter stores raw payload).
+                        wrapper
+                            .get("parent_lease_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from)
+                    });
+
+                // SECURITY: Fail-closed -- if parent_lease_id cannot be
+                // extracted from the event payload, reject the idempotent
+                // replay rather than silently bypassing lineage verification.
+                let Some(original_parent_id) = original_parent_id else {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        "Idempotent sublease replay rejected: cannot extract parent_lease_id \
+                         from event payload for lineage verification"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' exists but parent_lease_id cannot be extracted \
+                             from its event payload for lineage verification",
+                            request.sublease_id
+                        ),
+                    ));
+                };
+
+                if original_parent_id != request.parent_lease_id {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        original_parent = %original_parent_id,
+                        requested_parent = %request.parent_lease_id,
+                        "Idempotent sublease replay rejected: parent_lease_id mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' was originally delegated from parent '{}', \
+                             not '{}'",
+                            request.sublease_id, original_parent_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
+                info!(
+                    sublease_id = %request.sublease_id,
+                    event_id = %original_event.event_id,
+                    "Sublease already exists with identical parameters - idempotent return"
+                );
+                // Convert ms -> ns for response (existing.expires_at is in ms)
+                return Ok(PrivilegedResponse::DelegateSublease(
+                    DelegateSubleaseResponse {
+                        sublease_id: existing.lease_id.clone(),
+                        parent_lease_id: request.parent_lease_id,
+                        delegatee_actor_id: request.delegatee_actor_id,
+                        gate_id: existing.gate_id.clone(),
+                        expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
+                        event_id: original_event.event_id,
+                    },
+                ));
+            }
+            warn!(
+                sublease_id = %request.sublease_id,
+                "Sublease ID conflict: existing sublease has different parameters"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease_id '{}' already exists with different parameters",
+                    request.sublease_id
+                ),
+            ));
+        }
+        // Also check if a lease (non-sublease) with this ID already exists
+        // via the executor lookup (covers leases registered through
+        // register_lease_with_executor).
+        if self
+            .lease_validator
+            .get_lease_executor_actor_id(&request.sublease_id)
+            .is_some()
+        {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease_id '{}' conflicts with an existing lease",
+                    request.sublease_id
+                ),
+            ));
+        }
+
+        // ---- Phase 3: Get HTF timestamp ----
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // ---- Phase 4: Issue sublease via orchestrator (validates strict-subset) ----
+        //
+        // SECURITY (v5 Finding 2): Convert nanosecond values from the proto
+        // wire format to milliseconds at the handler boundary. GateLease uses
+        // milliseconds internally (issued_at, expires_at), but the proto
+        // fields are `requested_expiry_ns` / `expires_at_ns`. Passing raw
+        // nanosecond values through would cause temporal comparison mismatches
+        // against parent lease bounds (which are in milliseconds).
+        let expiry_millis = request.requested_expiry_ns / 1_000_000;
+        let issued_at_millis = timestamp_ns / 1_000_000;
+        let sublease = match gate_orchestrator.issue_delegated_sublease(
+            &parent_lease,
+            &request.sublease_id,
+            &request.delegatee_actor_id,
+            issued_at_millis,
+            expiry_millis,
+        ) {
+            Ok(lease) => lease,
+            Err(e) => {
+                warn!(
+                    parent_lease_id = %request.parent_lease_id,
+                    error = %e,
+                    "Sublease delegation rejected"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("sublease delegation failed: {e}"),
+                ));
+            },
+        };
+
+        // ---- Phase 5: Persist sublease BEFORE event emission ----
+        //
+        // SECURITY (v10 BLOCKER 1 -- Non-atomic DelegateSublease fix):
+        //
+        // Lease persistence MUST happen BEFORE event emission. If we emitted
+        // the SubleaseIssued event first and register_full_lease then failed,
+        // we'd have an orphan event in the ledger with no corresponding lease
+        // anchor. Retries would emit duplicate events. By persisting the
+        // lease first:
+        //   - If register_full_lease fails, no event is emitted (clean).
+        //   - If emit_session_event fails after successful persistence, the lease
+        //     exists (authoritative state) and we log a warning but return success --
+        //     the event is an audit trail that follows.
+        //
+        // SECURITY (v10 BLOCKER 2 -- Sublease ID uniqueness via DB):
+        //
+        // register_full_lease is the authoritative uniqueness gate. The
+        // pre-check in Phase 2b (get_gate_lease) is a fast-path optimization
+        // only. If two concurrent requests pass the pre-check, the first to
+        // call register_full_lease succeeds and the second gets a duplicate
+        // error, which we handle as idempotent (look up existing lease and
+        // return it) or reject as conflict.
+        if let Err(e) = self.lease_validator.register_full_lease(&sublease) {
+            // Check if this is a duplicate: the lease_id already exists.
+            // If it does, treat as idempotent if the existing lease matches
+            // ALL fields including parent lineage. Otherwise reject as conflict.
+            if let Some(existing) = self.lease_validator.get_gate_lease(&sublease.lease_id) {
+                // SECURITY (v11 BLOCKER 2 -- Full-Field Duplicate Validation):
+                //
+                // The duplicate resolution after register_full_lease failure
+                // MUST verify the SAME fields as the Phase 2b pre-check path:
+                // work_id, gate_id, executor_actor_id, expires_at, AND parent
+                // lineage (changeset_digest, policy_hash, parent_lease_id).
+                //
+                // Without parent lineage verification, a concurrent request
+                // with a different parent_lease_id could silently receive an
+                // idempotent response for a sublease delegated from a different
+                // parent, enabling confused-deputy / capability laundering.
+                let fields_match = existing.work_id == sublease.work_id
+                    && existing.gate_id == sublease.gate_id
+                    && existing.executor_actor_id == sublease.executor_actor_id
+                    && existing.expires_at == sublease.expires_at
+                    && existing.changeset_digest == sublease.changeset_digest
+                    && existing.policy_hash == sublease.policy_hash
+                    && existing.issuer_actor_id == sublease.issuer_actor_id;
+
+                if !fields_match {
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        error = %e,
+                        "Lease persistence duplicate with field mismatch -- conflict"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease_id '{}' already exists with different parameters",
+                            sublease.lease_id
+                        ),
+                    ));
+                }
+
+                // SECURITY (v11 BLOCKER 2 -- Parent Lineage Binding):
+                //
+                // Look up the original SubleaseIssued event and verify its
+                // parent_lease_id matches the current request. This mirrors
+                // the Phase 2b lineage verification logic: even if
+                // changeset_digest/policy_hash match, two different parent
+                // leases could share those inherited cryptographic fields.
+                let Some(original_event) = self
+                    .event_emitter
+                    .get_events_by_work_id(&existing.lease_id)
+                    .into_iter()
+                    .find(|ev| ev.event_type == "SubleaseIssued")
+                else {
+                    // SECURITY (v11 MAJOR 1 -- Fail-Closed Event Lookup):
+                    //
+                    // If the original SubleaseIssued event cannot be found,
+                    // we MUST fail-closed. Returning an empty event_id would
+                    // violate the response contract and prevent callers from
+                    // verifying the ledger trail.
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        "Concurrent duplicate sublease: original SubleaseIssued \
+                         event not found in ledger -- failing closed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' exists but its original SubleaseIssued \
+                             ledger event is missing -- cannot verify ledger trail",
+                            sublease.lease_id
+                        ),
+                    ));
+                };
+
+                // Extract parent_lease_id from the event payload using the
+                // same logic as Phase 2b: try hex-decoded inner payload first,
+                // then fall back to top-level field.
+                let parent_id_from_event =
+                    serde_json::from_slice::<serde_json::Value>(&original_event.payload)
+                        .ok()
+                        .and_then(|wrapper| {
+                            // Try hex-encoded inner payload first (stub emitter format)
+                            wrapper
+                                .get("payload")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|hex_str| hex::decode(hex_str).ok())
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                })
+                                .and_then(|inner| {
+                                    inner
+                                        .get("parent_lease_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(String::from)
+                                })
+                                .or_else(|| {
+                                    // Fallback: parent_lease_id at top level
+                                    // (production SQLite emitter stores raw payload).
+                                    wrapper
+                                        .get("parent_lease_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(String::from)
+                                })
+                        });
+
+                // SECURITY: Fail-closed -- if parent_lease_id cannot be
+                // extracted, reject the idempotent replay.
+                let Some(original_parent_id) = parent_id_from_event else {
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        "Concurrent duplicate sublease: cannot extract \
+                         parent_lease_id from event payload -- failing closed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' exists but parent_lease_id cannot be \
+                             extracted from its event payload for lineage verification",
+                            sublease.lease_id
+                        ),
+                    ));
+                };
+
+                if original_parent_id != request.parent_lease_id {
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        original_parent = %original_parent_id,
+                        requested_parent = %request.parent_lease_id,
+                        "Concurrent duplicate sublease: parent_lease_id mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' was originally delegated from parent \
+                             '{}', not '{}'",
+                            sublease.lease_id, original_parent_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
+                info!(
+                    sublease_id = %sublease.lease_id,
+                    event_id = %original_event.event_id,
+                    "Concurrent duplicate sublease persisted -- idempotent return"
+                );
+                return Ok(PrivilegedResponse::DelegateSublease(
+                    DelegateSubleaseResponse {
+                        sublease_id: existing.lease_id,
+                        parent_lease_id: request.parent_lease_id,
+                        delegatee_actor_id: request.delegatee_actor_id,
+                        gate_id: existing.gate_id,
+                        expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
+                        event_id: original_event.event_id,
+                    },
+                ));
+            }
+            warn!(
+                sublease_id = %sublease.lease_id,
+                error = %e,
+                "Lease persistence failed -- failing closed without emitting event"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease '{}' lease persistence failed: {e} \
+                     -- no event emitted (fail-closed)",
+                    sublease.lease_id
+                ),
+            ));
+        }
+
+        // ---- Phase 6: Emit SubleaseIssued event (after successful persistence) ----
+        //
+        // SECURITY (v5 Finding 3): The event's actor_id MUST be the
+        // authenticated caller (from peer credentials), NOT the
+        // caller-controlled `delegatee_actor_id`. The delegatee is included
+        // as a separate field in the event payload so the audit trail records
+        // BOTH who performed the delegation and who received the sublease.
+        let event_payload = serde_json::json!({
+            "parent_lease_id": request.parent_lease_id,
+            "sublease_id": sublease.lease_id,
+            "delegator_actor_id": caller_actor_id,
+            "delegatee_actor_id": request.delegatee_actor_id,
+            "gate_id": sublease.gate_id,
+            "work_id": sublease.work_id,
+            "expires_at": sublease.expires_at,
+            "issued_at": sublease.issued_at,
+        });
+        // SECURITY (v10 MAJOR — Fail-closed serialization):
+        //
+        // Event payload serialization MUST NOT silently produce empty bytes.
+        // An empty payload would persist a signed event without
+        // lineage-critical fields (parent_lease_id, delegatee, gate_id),
+        // making audit verification impossible. Fail closed instead.
+        let event_payload_bytes = match serde_json::to_vec(&event_payload) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(
+                    sublease_id = %sublease.lease_id,
+                    error = %e,
+                    "SubleaseIssued event payload serialization failed -- failing closed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "sublease '{}' lease persisted but event payload serialization \
+                         failed: {e} -- failing closed",
+                        sublease.lease_id
+                    ),
+                ));
+            },
+        };
+
+        let signed_event = match self.event_emitter.emit_session_event(
+            &sublease.lease_id,
+            "SubleaseIssued",
+            &event_payload_bytes,
+            &caller_actor_id,
+            timestamp_ns,
+        ) {
+            Ok(evt) => evt,
+            Err(e) => {
+                // SECURITY (v10 BLOCKER 2 — Fail-closed on emission failure):
+                //
+                // The response contract requires `event_id` to be the ledger
+                // identity of the `SubleaseIssued` event. Returning success
+                // with an empty `event_id` violates proof-carrying effect
+                // guarantees and breaks audit verification.
+                //
+                // Even though the lease is persisted (authoritative state),
+                // we MUST fail-closed here because:
+                // 1. The proto contract defines `event_id` as a required ledger event identity
+                //    for `SubleaseIssued`.
+                // 2. A retry will hit the idempotent `register_full_lease` duplicate path,
+                //    which will find the existing lease and attempt to look up the event. If
+                //    the event still cannot be emitted, the retry will also fail-closed.
+                // 3. The persisted lease anchor ensures no authority is lost; the caller simply
+                //    needs to retry when the event emitter recovers.
+                warn!(
+                    sublease_id = %sublease.lease_id,
+                    error = %e,
+                    "SubleaseIssued event emission failed after lease persistence \
+                     -- failing closed (lease persisted, event missing)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "sublease '{}' lease persisted but SubleaseIssued event \
+                         emission failed: {e} -- retry to complete",
+                        sublease.lease_id
+                    ),
+                ));
+            },
+        };
+
+        info!(
+            parent_lease_id = %request.parent_lease_id,
+            sublease_id = %sublease.lease_id,
+            gate_id = %sublease.gate_id,
+            event_id = %signed_event.event_id,
+            "Sublease delegation completed successfully"
+        );
+
+        // Convert ms -> ns for the proto response wire format.
+        Ok(PrivilegedResponse::DelegateSublease(
+            DelegateSubleaseResponse {
+                sublease_id: sublease.lease_id,
+                parent_lease_id: request.parent_lease_id,
+                delegatee_actor_id: request.delegatee_actor_id,
+                gate_id: sublease.gate_id,
+                expires_at_ns: sublease.expires_at.saturating_mul(1_000_000),
                 event_id: signed_event.event_id,
             },
         ))
@@ -8457,6 +9591,14 @@ pub fn encode_ingest_review_receipt_request(request: &IngestReviewReceiptRequest
     Bytes::from(buf)
 }
 
+/// Encodes a `DelegateSublease` request to bytes for sending (TCK-00340).
+#[must_use]
+pub fn encode_delegate_sublease_request(request: &DelegateSubleaseRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::DelegateSublease.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
 // ============================================================================
 // Process Management Request Encoding (TCK-00342)
 // ============================================================================
@@ -8750,6 +9892,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -9061,6 +10204,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             author_custody_domains: vec![],
             executor_custody_domains: vec![],
@@ -10428,6 +11572,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -10460,6 +11605,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
@@ -10529,6 +11675,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()],
@@ -10588,6 +11735,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
@@ -10651,6 +11799,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec![], // Empty - resolution failed
@@ -10711,6 +11860,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
@@ -11467,6 +12617,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -13835,6 +14986,7 @@ mod tests {
                             resolved_policy_hash: [0u8; 32],
                             capability_manifest_hash: [0u8; 32],
                             context_pack_hash: [0u8; 32],
+                            resolved_risk_tier: 0,
                         },
                         executor_custody_domains: vec![],
                         author_custody_domains: vec![],
@@ -13903,6 +15055,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -13946,6 +15099,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -15302,25 +16456,75 @@ mod tests {
     mod ingest_review_receipt {
         use super::*;
 
-        /// Creates a dispatcher with a registered lease for testing.
+        /// Standard peer credentials used by all `IngestReviewReceipt` tests.
+        fn test_peer_credentials() -> PeerCredentials {
+            PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }
+        }
+
+        /// Creates a dispatcher with a registered lease and Tier0 work claim
+        /// for testing. The work claim is registered so risk-tier
+        /// resolution can succeed (fail-closed semantics mean missing
+        /// claims -> Tier4 rejection).
+        ///
+        /// SECURITY (v6 Finding 1): The `executor_actor_id` is derived from the
+        /// test peer credentials, ensuring the authenticated caller identity
+        /// matches the lease executor. The `_executor_hint` parameter is
+        /// ignored — it exists only for backward compatibility with test
+        /// call sites that previously passed an arbitrary reviewer name.
         fn setup_dispatcher_with_lease(
             lease_id: &str,
             work_id: &str,
             gate_id: &str,
-            executor_actor_id: &str,
+            _executor_hint: &str,
         ) -> (PrivilegedDispatcher, ConnectionContext) {
+            setup_dispatcher_with_lease_and_tier(lease_id, work_id, gate_id, "", 0)
+        }
+
+        /// Creates a dispatcher with a registered lease and a work claim at the
+        /// specified risk tier. Used to test attestation ratcheting behavior.
+        ///
+        /// SECURITY (v6 Finding 1): Registers the lease executor as the
+        /// identity derived from `test_peer_credentials()`, binding the test
+        /// lease to the same identity the handler will derive from the
+        /// `ConnectionContext`.
+        fn setup_dispatcher_with_lease_and_tier(
+            lease_id: &str,
+            work_id: &str,
+            gate_id: &str,
+            _executor_hint: &str,
+            risk_tier: u8,
+        ) -> (PrivilegedDispatcher, ConnectionContext) {
+            let peer_creds = test_peer_credentials();
+            let executor_actor_id = derive_actor_id(&peer_creds);
             let dispatcher = PrivilegedDispatcher::new();
             dispatcher.lease_validator.register_lease_with_executor(
                 lease_id,
                 work_id,
                 gate_id,
-                executor_actor_id,
+                &executor_actor_id,
             );
-            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
-                uid: 1000,
-                gid: 1000,
-                pid: Some(12345),
-            }));
+            // Register work claim so risk-tier resolution succeeds
+            let claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: executor_actor_id,
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: risk_tier,
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
             (dispatcher, ctx)
         }
 
@@ -15386,15 +16590,27 @@ mod tests {
             }
         }
 
+        /// v6 Finding 1: Reviewer identity is now derived from peer
+        /// credentials, not from the request's `reviewer_actor_id`. To
+        /// trigger a mismatch, the caller must have DIFFERENT peer
+        /// credentials than the lease executor.
         #[test]
         fn test_ingest_review_receipt_reviewer_identity_mismatch() {
-            let (dispatcher, ctx) =
+            let (dispatcher, _ctx) =
                 setup_dispatcher_with_lease("lease-003", "W-003", "gate-003", "reviewer-gamma");
+
+            // Create a context with DIFFERENT peer credentials (uid=9999)
+            // so the authenticated identity won't match the lease executor.
+            let wrong_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 9999,
+                gid: 9999,
+                pid: Some(99999),
+            }));
 
             let request = IngestReviewReceiptRequest {
                 lease_id: "lease-003".to_string(),
                 receipt_id: "RR-002".to_string(),
-                reviewer_actor_id: "impersonator".to_string(), // Wrong reviewer
+                reviewer_actor_id: "does-not-matter".to_string(), // Ignored by handler
                 changeset_digest: vec![0x42; 32],
                 artifact_bundle_hash: vec![0x33; 32],
                 verdict: ReviewReceiptVerdict::Approve.into(),
@@ -15403,7 +16619,7 @@ mod tests {
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
-            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let response = dispatcher.dispatch(&frame, &wrong_ctx).unwrap();
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
@@ -15413,6 +16629,85 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        /// v6 Finding 1 negative test: caller with wrong peer credentials is
+        /// rejected even if they supply the correct `reviewer_actor_id` in the
+        /// request payload. The handler must ignore the request field and
+        /// use the authenticated identity.
+        #[test]
+        fn test_ingest_review_receipt_wrong_peer_creds_correct_request_field_rejected() {
+            // Register lease with the derived identity from standard test creds
+            let (dispatcher, _ctx) =
+                setup_dispatcher_with_lease("lease-neg", "W-NEG", "gate-neg", "unused");
+
+            // The correct executor_actor_id as registered on the lease
+            let correct_actor_id = derive_actor_id(&test_peer_credentials());
+
+            // Caller supplies the correct reviewer_actor_id in the request,
+            // but connects with DIFFERENT peer credentials.
+            let wrong_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 7777,
+                gid: 7777,
+                pid: Some(77777),
+            }));
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-neg".to_string(),
+                receipt_id: "RR-NEG".to_string(),
+                reviewer_actor_id: correct_actor_id, // Correct value, but ignored
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &wrong_ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("does not match gate lease executor"),
+                        "Should reject despite correct request field, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected rejection for wrong peer creds, got {other:?}"),
+            }
+        }
+
+        /// v6 Finding 1: missing peer credentials must be rejected.
+        #[test]
+        fn test_ingest_review_receipt_missing_peer_credentials_rejected() {
+            let (dispatcher, _ctx) =
+                setup_dispatcher_with_lease("lease-no-creds", "W-NC", "gate-nc", "unused");
+
+            let ctx_no_creds = ConnectionContext::privileged_session_open(None);
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-no-creds".to_string(),
+                receipt_id: "RR-NC".to_string(),
+                reviewer_actor_id: "any".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx_no_creds).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("peer credentials required"),
+                        "Expected peer credentials error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for missing creds, got {other:?}"),
             }
         }
 
@@ -15684,6 +16979,11 @@ mod tests {
             let (dispatcher, ctx) =
                 setup_dispatcher_with_lease("lease-010", "W-010", "gate-010", "reviewer-zeta");
 
+            // v6 Finding 1: reviewer_actor_id in request is now ignored by
+            // the handler — the authenticated identity from peer credentials
+            // is used instead.
+            let expected_actor_id = derive_actor_id(&test_peer_credentials());
+
             let request = IngestReviewReceiptRequest {
                 lease_id: "lease-010".to_string(),
                 receipt_id: "RR-010".to_string(),
@@ -15710,7 +17010,9 @@ mod tests {
             );
             let event = stored_event.unwrap();
             assert_eq!(event.event_type, "review_receipt_recorded");
-            assert_eq!(event.actor_id, "reviewer-zeta");
+            // v6 Finding 1: actor_id must be the authenticated identity,
+            // not the caller-supplied reviewer_actor_id.
+            assert_eq!(event.actor_id, expected_actor_id);
             assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
         }
 
@@ -15797,6 +17099,1963 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        // =================================================================
+        // TCK-00340: Attestation enforcement tests
+        // =================================================================
+
+        #[test]
+        fn test_ingest_review_receipt_attestation_validates_signer_identity() {
+            // Verify the attestation ratchet is wired into the production path
+            // by confirming that a valid Tier0 request with proper reviewer
+            // identity passes the attestation check. The attestation check
+            // verifies:
+            // 1. Internal consistency (non-empty signer_identity)
+            // 2. Policy hash binding (changeset_digest match)
+            // 3. Ratchet level (SelfSigned >= Tier0 requirement of None)
+            //
+            // The pre-attestation validation already rejects empty
+            // reviewer_actor_id, so the attestation check provides
+            // defense-in-depth for any future code paths that skip that guard.
+            let (dispatcher, ctx) = setup_dispatcher_with_lease(
+                "lease-attest-002",
+                "W-ATT-002",
+                "gate-attest",
+                "reviewer-attest",
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-attest-002".to_string(),
+                receipt_id: "RR-ATT-002".to_string(),
+                reviewer_actor_id: "reviewer-attest".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-ATT-002");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Attestation-validated Tier0 receipt should be accepted"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!("Valid attestation should pass, got error: {}", err.message);
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_tier0_constraint_fail_closed_semantics() {
+            // Verify fail-closed semantics: the risk_tier variable is currently
+            // hardcoded to Tier0 with an explicit guard that rejects non-Tier0.
+            // When the work registry is wired (TODO RFC-0019), a non-Tier0 work
+            // item MUST be rejected because this endpoint only provides
+            // SelfSigned attestation, which is insufficient for Tier1+.
+            //
+            // This test validates that the attestation requirements table
+            // correctly rejects SelfSigned at higher tiers (proving the
+            // fail-closed guard is necessary and would work if activated).
+            use apm2_core::fac::RiskTier;
+            use apm2_core::fac::policy_inheritance::{
+                AttestationLevel, AttestationRequirements, ReceiptAttestation, ReceiptKind,
+                validate_receipt_attestation,
+            };
+
+            let requirements = AttestationRequirements::new();
+            let changeset_digest = [0x42; 32];
+
+            // Tier0 with SelfSigned should pass (current behavior)
+            let tier0_attestation = ReceiptAttestation {
+                kind: ReceiptKind::Review,
+                level: AttestationLevel::SelfSigned,
+                policy_hash: changeset_digest,
+                signer_identity: "reviewer-001".to_string(),
+                counter_signer_identity: None,
+                threshold_signer_count: None,
+            };
+            assert!(
+                validate_receipt_attestation(
+                    &tier0_attestation,
+                    RiskTier::Tier0,
+                    &changeset_digest,
+                    &requirements,
+                )
+                .is_ok(),
+                "Tier0 SelfSigned must pass"
+            );
+
+            // Tier2 with SelfSigned should FAIL (requires CounterSigned for Review)
+            // This proves the Tier0-only constraint is security-relevant.
+            let tier2_result = validate_receipt_attestation(
+                &tier0_attestation,
+                RiskTier::Tier2,
+                &changeset_digest,
+                &requirements,
+            );
+            assert!(
+                tier2_result.is_err(),
+                "Tier2 with only SelfSigned must be rejected - proves the \
+                 Tier0-only endpoint constraint is necessary for security"
+            );
+
+            // Tier4 with SelfSigned should FAIL (requires ThresholdSigned for Review)
+            let tier4_result = validate_receipt_attestation(
+                &tier0_attestation,
+                RiskTier::Tier4,
+                &changeset_digest,
+                &requirements,
+            );
+            assert!(
+                tier4_result.is_err(),
+                "Tier4 with only SelfSigned must be rejected - proves the \
+                 Tier0-only endpoint constraint prevents attestation bypass"
+            );
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_tier0_self_signed_accepted() {
+            // Verify that a valid Tier0 receipt with proper SelfSigned attestation
+            // passes through the attestation check in the production path.
+            let (dispatcher, ctx) = setup_dispatcher_with_lease(
+                "lease-t0-001",
+                "W-T0-001",
+                "gate-001",
+                "reviewer-tier0",
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-t0-001".to_string(),
+                receipt_id: "RR-T0-001".to_string(),
+                reviewer_actor_id: "reviewer-tier0".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-T0-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Tier0 SelfSigned review receipt should be accepted"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Tier0 SelfSigned should be accepted, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        // ====================================================================
+        // TCK-00340: Risk-tier resolution integration tests
+        // ====================================================================
+
+        #[test]
+        fn test_ingest_review_receipt_tier2_self_signed_rejected() {
+            // Tier2 work items require CounterSigned attestation for Review
+            // receipts. SelfSigned is insufficient — must be rejected.
+            let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
+                "lease-t2-001",
+                "W-T2-001",
+                "gate-001",
+                "reviewer-tier2",
+                2, // Tier2
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-t2-001".to_string(),
+                receipt_id: "RR-T2-001".to_string(),
+                reviewer_actor_id: "reviewer-tier2".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("SelfSigned") || err.message.contains("requires"),
+                        "Tier2 SelfSigned must be rejected, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("Tier2"),
+                        "Error must mention the resolved tier, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected rejection for Tier2 SelfSigned attestation, got {other:?}")
+                },
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_tier4_self_signed_rejected() {
+            // Tier4 is the highest risk tier — requires ThresholdSigned.
+            // SelfSigned must be rejected (fail-closed).
+            let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
+                "lease-t4-001",
+                "W-T4-001",
+                "gate-001",
+                "reviewer-tier4",
+                4, // Tier4
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-t4-001".to_string(),
+                receipt_id: "RR-T4-001".to_string(),
+                reviewer_actor_id: "reviewer-tier4".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("SelfSigned") || err.message.contains("requires"),
+                        "Tier4 SelfSigned must be rejected, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("Tier4"),
+                        "Error must mention the resolved tier, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected rejection for Tier4 SelfSigned attestation, got {other:?}")
+                },
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_tier0_resolved_passes_end_to_end() {
+            // Tier0 with SelfSigned through the FULL production path:
+            // lease -> work_id -> work_claim -> risk_tier=0 -> attestation ok -> event
+            let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
+                "lease-e2e-001",
+                "W-E2E-001",
+                "gate-001",
+                "reviewer-e2e",
+                0, // Tier0
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-e2e-001".to_string(),
+                receipt_id: "RR-E2E-001".to_string(),
+                reviewer_actor_id: "reviewer-e2e".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-E2E-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Tier0 work with SelfSigned must pass attestation end-to-end"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "event_id must be non-empty on success"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Tier0 SelfSigned should pass end-to-end, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_unresolvable_risk_tier_fails_closed() {
+            // When work_id can be resolved from the lease but no work claim
+            // exists in the registry, the risk tier is unresolvable.
+            // FAIL-CLOSED: must default to Tier4 and reject SelfSigned.
+            let peer_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let executor_actor_id = derive_actor_id(&peer_creds);
+            let dispatcher = PrivilegedDispatcher::new();
+            // Register lease but do NOT register a work claim
+            dispatcher.lease_validator.register_lease_with_executor(
+                "lease-no-claim",
+                "W-NO-CLAIM",
+                "gate-001",
+                &executor_actor_id,
+            );
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-no-claim".to_string(),
+                receipt_id: "RR-NO-CLAIM".to_string(),
+                reviewer_actor_id: "ignored-by-handler".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("SelfSigned")
+                            || err.message.contains("requires")
+                            || err.message.contains("Tier4"),
+                        "Unresolvable risk tier must fail-closed (Tier4 rejection), got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected fail-closed rejection for unresolvable risk tier, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_tier1_self_signed_accepted() {
+            // v5 Finding 4: Tier1 requires SelfSigned for review receipts per
+            // the ratchet table. This endpoint provides SelfSigned attestation,
+            // so Tier1 requests MUST be accepted (not hard-rejected).
+            let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
+                "lease-t1-001",
+                "W-T1-001",
+                "gate-001",
+                "reviewer-tier1",
+                1, // Tier1
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-t1-001".to_string(),
+                receipt_id: "RR-T1-001".to_string(),
+                reviewer_actor_id: "reviewer-tier1".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(
+                        resp.receipt_id, "RR-T1-001",
+                        "Tier1 SelfSigned must be accepted per ratchet table"
+                    );
+                    assert_eq!(resp.event_type, "ReviewReceiptRecorded");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty for accepted Tier1 receipt"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Tier1 SelfSigned must be accepted per ratchet table, got error: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected IngestReviewReceipt for Tier1 SelfSigned, got {other:?}")
+                },
+            }
+        }
+
+        /// v10 MAJOR 1: Duplicate `receipt_id` replay returns the original
+        /// event (idempotent) instead of creating a new event. This verifies
+        /// the fix for the broken idempotency check that previously looked up
+        /// events by `event_id` (auto-generated UUID) instead of searching
+        /// payloads for the caller-supplied `receipt_id`.
+        #[test]
+        fn test_ingest_review_receipt_duplicate_receipt_id_idempotent() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-dup-001", "W-DUP-001", "gate-001", "reviewer-a");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-001".to_string(),
+                receipt_id: "RR-DUP-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+
+            // First submission should succeed
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response1 = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let (event_id_1, event_type_1) = match &response1 {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-DUP-001");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "First event_id must be non-empty"
+                    );
+                    (resp.event_id.clone(), resp.event_type.clone())
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            };
+
+            // Second submission with same receipt_id should return idempotent
+            // result with the SAME event_id as the first submission.
+            let frame2 = encode_ingest_review_receipt_request(&request);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match &response2 {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(
+                        resp.receipt_id, "RR-DUP-001",
+                        "Idempotent replay must return same receipt_id"
+                    );
+                    assert_eq!(
+                        resp.event_id, event_id_1,
+                        "Idempotent replay must return the ORIGINAL event_id, not a new one"
+                    );
+                    assert_eq!(
+                        resp.event_type, event_type_1,
+                        "Idempotent replay must return same event_type"
+                    );
+                },
+                other => panic!("Expected idempotent IngestReviewReceipt, got {other:?}"),
+            }
+
+            // Verify only ONE event was created in the ledger (not two)
+            let events = dispatcher
+                .event_emitter
+                .get_events_by_work_id("lease-dup-001");
+            let receipt_event_count = events
+                .iter()
+                .filter(|e| e.event_type == "review_receipt_recorded")
+                .count();
+            assert_eq!(
+                receipt_event_count, 1,
+                "Duplicate receipt_id submission must NOT create a second event"
+            );
+        }
+
+        // ====================================================================
+        // TCK-00340: DelegateSublease IPC Integration Tests
+        // ====================================================================
+
+        /// Helper: build a dispatcher with a gate orchestrator and a registered
+        /// parent lease for sublease delegation tests.
+        ///
+        /// The parent lease's `executor_actor_id` is set to match the caller's
+        /// derived actor ID (from uid=1000, gid=1000) so that the caller
+        /// authorization check in `handle_delegate_sublease` passes.
+        fn setup_dispatcher_with_orchestrator(
+            parent_lease_id: &str,
+            work_id: &str,
+            gate_id: &str,
+            _executor_actor_id: &str,
+        ) -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            apm2_core::fac::GateLease,
+        ) {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer.clone(),
+            ));
+
+            // Derive the actor ID from the test peer credentials (uid=1000,
+            // gid=1000) so the caller authorization check passes.
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+
+            let parent_lease =
+                apm2_core::fac::GateLeaseBuilder::new(parent_lease_id, work_id, gate_id)
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id(&caller_actor)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("issuer-001")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_lease)
+                .expect("register_full_lease should succeed in test");
+            dispatcher.lease_validator.register_lease_with_executor(
+                parent_lease_id,
+                work_id,
+                gate_id,
+                &caller_actor,
+            );
+
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            (dispatcher, ctx, parent_lease)
+        }
+
+        #[test]
+        fn test_delegate_sublease_valid_succeeds() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-001",
+                "W-DS-001",
+                "gate-quality",
+                "executor-001",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-001".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-001");
+                    assert_eq!(resp.parent_lease_id, "parent-lease-001");
+                    assert_eq!(resp.delegatee_actor_id, "child-executor-001");
+                    assert_eq!(resp.gate_id, "gate-quality");
+                    // v5 Finding 2: expires_at_ns in response is in nanoseconds
+                    // (converted from internal ms representation).
+                    assert_eq!(resp.expires_at_ns, 1_900_000_000_000);
+                    assert!(!resp.event_id.is_empty(), "event_id must be non-empty");
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Expected DelegateSublease success, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected DelegateSublease, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_parent_not_found_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            // Do NOT register any parent lease
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "nonexistent-lease".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-002".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("parent gate lease not found"),
+                        "Error should mention parent lease not found: {}",
+                        err.message
+                    );
+                    assert_eq!(
+                        err.code,
+                        i32::from(PrivilegedErrorCode::GateLeaseMissing),
+                        "Error code should be GateLeaseMissing"
+                    );
+                },
+                other => panic!("Expected error for missing parent, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_expired_parent_rejected() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-exp",
+                "W-DS-EXP",
+                "gate-quality",
+                "executor-001",
+            );
+
+            // Request sublease with expiry EXCEEDING parent bounds (parent
+            // expires at 2_000_000, sublease requests 3_000_000).
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-exp".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 3_000_000_000_000, /* Exceeds parent's expires_at (3_000_000
+                                                         * ms) */
+                sublease_id: "sublease-overflow".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("sublease delegation failed"),
+                        "Error should mention sublease delegation failure: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for expiry overflow, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_empty_parent_lease_id_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: String::new(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-003".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("parent_lease_id is required"),
+                        "Error should mention missing parent_lease_id: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for empty parent_lease_id, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_empty_delegatee_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-001".to_string(),
+                delegatee_actor_id: String::new(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-004".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("delegatee_actor_id is required"),
+                        "Error should mention missing delegatee_actor_id: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for empty delegatee_actor_id, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_no_orchestrator_rejected() {
+            // Dispatcher without gate orchestrator configured
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-001".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-005".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("gate orchestrator not configured"),
+                        "Error should mention orchestrator not configured: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for missing orchestrator, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_non_privileged_rejected() {
+            let (dispatcher, _ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-np",
+                "W-DS-NP",
+                "gate-quality",
+                "executor-001",
+            );
+            // Non-privileged context
+            let ctx = ConnectionContext::session_open(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                }),
+                Some("test-session".to_string()),
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-np".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-006".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("permission denied"),
+                        "Non-privileged connections must be rejected: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected permission denied, got {other:?}"),
+            }
+        }
+
+        /// Security BLOCKER: Unauthorized caller (different actor ID) must be
+        /// explicitly rejected when attempting to delegate from a parent lease
+        /// they do not own.
+        #[test]
+        fn test_delegate_sublease_unauthorized_caller_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer.clone(),
+            ));
+
+            // Register parent lease with executor_actor_id that does NOT
+            // match the caller (uid=1000, gid=1000).
+            let parent_lease =
+                apm2_core::fac::GateLeaseBuilder::new("parent-authz", "W-AUTHZ", "gate-authz")
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id("totally-different-actor")
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("also-different-issuer")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_lease)
+                .expect("register_full_lease should succeed in test");
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-authz",
+                "W-AUTHZ",
+                "gate-authz",
+                "totally-different-actor",
+            );
+
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-authz".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-authz".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("not authorized to delegate"),
+                        "Unauthorized caller must get explicit rejection: {}",
+                        err.message
+                    );
+                    assert_eq!(
+                        err.code,
+                        i32::from(PrivilegedErrorCode::PermissionDenied),
+                        "Error code should be PermissionDenied"
+                    );
+                },
+                other => panic!("Expected PermissionDenied for unauthorized caller, got {other:?}"),
+            }
+        }
+
+        /// Security BLOCKER: Caller with no peer credentials must be rejected
+        /// (fail-closed).
+        #[test]
+        fn test_delegate_sublease_no_peer_credentials_rejected() {
+            let (dispatcher, _ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-no-creds",
+                "W-NC",
+                "gate-quality",
+                "executor-001",
+            );
+
+            // Context with NO peer credentials
+            let ctx = ConnectionContext::privileged_session_open(None);
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-no-creds".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-no-creds".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("peer credentials required"),
+                        "Missing creds must fail closed: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected rejection for missing peer creds, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_message_type_tag() {
+            assert_eq!(PrivilegedMessageType::DelegateSublease.tag(), 72);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(72),
+                Some(PrivilegedMessageType::DelegateSublease)
+            );
+        }
+
+        #[test]
+        fn test_delegate_sublease_response_encoding() {
+            let resp = PrivilegedResponse::DelegateSublease(DelegateSubleaseResponse {
+                sublease_id: "sub-001".to_string(),
+                parent_lease_id: "parent-001".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                gate_id: "gate-quality".to_string(),
+                expires_at_ns: 1_900_000,
+                event_id: "evt-001".to_string(),
+            });
+            let encoded = resp.encode();
+            assert_eq!(
+                encoded[0],
+                PrivilegedMessageType::DelegateSublease.tag(),
+                "First byte should be DelegateSublease tag (72)"
+            );
+            assert!(
+                encoded.len() > 1,
+                "Encoded response should have payload after tag"
+            );
+        }
+
+        #[test]
+        fn test_delegate_sublease_ledger_event_emitted() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-evt",
+                "W-DS-EVT",
+                "gate-quality",
+                "executor-001",
+            );
+
+            // Derive the expected caller actor_id (same credentials as
+            // setup_dispatcher_with_orchestrator uses: uid=1000, gid=1000).
+            let expected_caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-evt".to_string(),
+                delegatee_actor_id: "child-executor-evt".to_string(),
+                requested_expiry_ns: 1_900_000_000_000, // ns
+                sublease_id: "sublease-evt-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let event_id = match response {
+                PrivilegedResponse::DelegateSublease(resp) => resp.event_id,
+                other => panic!("Expected DelegateSublease, got {other:?}"),
+            };
+
+            // Verify the event was persisted to the emitter
+            let stored_event = dispatcher.event_emitter.get_event(&event_id);
+            assert!(
+                stored_event.is_some(),
+                "SubleaseIssued event should be persisted in emitter"
+            );
+            let event = stored_event.unwrap();
+            assert_eq!(event.event_type, "SubleaseIssued");
+            // v5 Finding 3: actor_id must be the authenticated CALLER, not the
+            // caller-controlled delegatee_actor_id.
+            assert_eq!(
+                event.actor_id, expected_caller_actor,
+                "SubleaseIssued event must record authenticated caller, not delegatee"
+            );
+            assert_ne!(
+                event.actor_id, "child-executor-evt",
+                "actor_id must NOT be the delegatee"
+            );
+            assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
+        }
+
+        #[test]
+        fn test_delegate_sublease_duplicate_id_idempotent() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-dup",
+                "W-DS-DUP",
+                "gate-quality",
+                "executor-dup",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-dup".to_string(),
+                delegatee_actor_id: "child-executor-dup".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-dup-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            // First call: should succeed and return a non-empty event_id
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let original_event_id = match &response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-dup-001");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "First delegation must return non-empty event_id"
+                    );
+                    resp.event_id.clone()
+                },
+                other => panic!("Expected DelegateSublease success, got {other:?}"),
+            };
+
+            // Second call with same parameters: should return idempotent
+            // result with the ORIGINAL event_id (not empty).
+            let response2 = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(
+                        resp.sublease_id, "sublease-dup-001",
+                        "Idempotent return should have same sublease_id"
+                    );
+                    assert_eq!(
+                        resp.event_id, original_event_id,
+                        "Idempotent return must replay the original SubleaseIssued event_id"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Idempotent event_id must not be empty"
+                    );
+                },
+                other => panic!("Expected idempotent DelegateSublease, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_duplicate_id_conflict_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer.clone(),
+            ));
+
+            // Derive the actor ID from the test peer credentials so the
+            // caller authorization check passes for both parent leases.
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+
+            // Create parent lease in gate "gate-A"
+            let parent_a = apm2_core::fac::GateLeaseBuilder::new("parent-A", "W-A", "gate-A")
+                .changeset_digest([0x42; 32])
+                .executor_actor_id(&caller_actor)
+                .issued_at(1_000_000)
+                .expires_at(2_000_000)
+                .policy_hash([0xAB; 32])
+                .issuer_actor_id("issuer-001")
+                .time_envelope_ref("htf:tick:100")
+                .build_and_sign(&signer);
+
+            // Create parent lease in gate "gate-B" (different parameters)
+            let parent_b = apm2_core::fac::GateLeaseBuilder::new("parent-B", "W-B", "gate-B")
+                .changeset_digest([0x42; 32])
+                .executor_actor_id(&caller_actor)
+                .issued_at(1_000_000)
+                .expires_at(2_000_000)
+                .policy_hash([0xAB; 32])
+                .issuer_actor_id("issuer-001")
+                .time_envelope_ref("htf:tick:200")
+                .build_and_sign(&signer);
+
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_a)
+                .expect("register_full_lease should succeed in test");
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_b)
+                .expect("register_full_lease should succeed in test");
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-A",
+                "W-A",
+                "gate-A",
+                &caller_actor,
+            );
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-B",
+                "W-B",
+                "gate-B",
+                &caller_actor,
+            );
+
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // First call: issue sublease under parent A
+            let req1 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-A".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "shared-sublease-id".to_string(),
+            };
+            let frame1 = encode_delegate_sublease_request(&req1);
+            let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(resp1, PrivilegedResponse::DelegateSublease(_)),
+                "First sublease should succeed"
+            );
+
+            // Second call: try to issue sublease with SAME ID under parent B
+            // (different work_id/gate_id) — must be rejected as conflict
+            let req2 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-B".to_string(),
+                delegatee_actor_id: "child-002".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "shared-sublease-id".to_string(),
+            };
+            let frame2 = encode_delegate_sublease_request(&req2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match resp2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("already exists with different parameters"),
+                        "Must reject conflicting sublease_id, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected conflict rejection, got {other:?}"),
+            }
+        }
+
+        /// v6 Finding 3: Same `sublease_id`, same work/gate/delegatee, but a
+        /// different `requested_expiry_ns` must NOT be treated as idempotent.
+        /// The full request tuple (including expiry) must match for
+        /// idempotent return.
+        #[test]
+        fn test_delegate_sublease_different_expiry_rejected_as_conflict() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-exp",
+                "W-DS-EXP",
+                "gate-quality",
+                "executor-exp",
+            );
+
+            // First request with expiry = 1_900_000_000_000 ns
+            let req1 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-exp".to_string(),
+                delegatee_actor_id: "child-exp".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-exp-001".to_string(),
+            };
+            let frame1 = encode_delegate_sublease_request(&req1);
+            let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(resp1, PrivilegedResponse::DelegateSublease(_)),
+                "First sublease should succeed"
+            );
+
+            // Second request with DIFFERENT expiry but same sublease_id
+            let req2 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-exp".to_string(),
+                delegatee_actor_id: "child-exp".to_string(),
+                requested_expiry_ns: 1_800_000_000_000, // Different expiry
+                sublease_id: "sublease-exp-001".to_string(),
+            };
+            let frame2 = encode_delegate_sublease_request(&req2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match resp2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("already exists with different parameters"),
+                        "Different expiry should be rejected as conflict, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected conflict rejection for different expiry, got {other:?}"),
+            }
+        }
+
+        /// v7 Finding 2: Idempotent replay with the same `sublease_id` but a
+        /// different `parent_lease_id` must be rejected even when inherited
+        /// fields (changeset digest, policy hash) happen to match. The
+        /// parent lineage check uses the `SubleaseIssued` event payload's
+        /// parent lease ID field to enforce exact lineage binding.
+        #[test]
+        fn test_delegate_sublease_idempotent_rejects_different_parent_lineage() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer.clone(),
+            ));
+
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+
+            // Create two parent leases with IDENTICAL inherited fields
+            // (changeset_digest, policy_hash) but different lease IDs.
+            // This is the edge case where the changeset_digest/policy_hash
+            // comparison alone would incorrectly treat them as equivalent.
+            let parent_a =
+                apm2_core::fac::GateLeaseBuilder::new("parent-lin-A", "W-LIN", "gate-lin")
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id(&caller_actor)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("issuer-001")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            let parent_b = apm2_core::fac::GateLeaseBuilder::new("parent-lin-B", "W-LIN", "gate-lin")
+                    .changeset_digest([0x42; 32]) // Same digest
+                    .executor_actor_id(&caller_actor)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32]) // Same policy hash
+                    .issuer_actor_id("issuer-001")
+                    .time_envelope_ref("htf:tick:200")
+                    .build_and_sign(&signer);
+
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_a)
+                .expect("register_full_lease should succeed in test");
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_b)
+                .expect("register_full_lease should succeed in test");
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-lin-A",
+                "W-LIN",
+                "gate-lin",
+                &caller_actor,
+            );
+            dispatcher.lease_validator.register_lease_with_executor(
+                "parent-lin-B",
+                "W-LIN",
+                "gate-lin",
+                &caller_actor,
+            );
+
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // First call: issue sublease under parent A
+            let req1 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lin-A".to_string(),
+                delegatee_actor_id: "child-lin".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-lineage-001".to_string(),
+            };
+            let frame1 = encode_delegate_sublease_request(&req1);
+            let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(resp1, PrivilegedResponse::DelegateSublease(_)),
+                "First sublease should succeed"
+            );
+
+            // Second call: same sublease_id but different parent_lease_id.
+            // Since both parents have identical changeset_digest/policy_hash,
+            // the indirect lineage check (changeset_digest + policy_hash) would
+            // pass, but the direct parent_lease_id check in the event payload
+            // MUST reject this.
+            let req2 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lin-B".to_string(),
+                delegatee_actor_id: "child-lin".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-lineage-001".to_string(),
+            };
+            let frame2 = encode_delegate_sublease_request(&req2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match resp2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("originally delegated from parent")
+                            || err
+                                .message
+                                .contains("already exists with different parameters"),
+                        "Must reject sublease with different parent lineage, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected parent lineage rejection, got {other:?}"),
+            }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00340: Serde fail-closed default tests
+    // ========================================================================
+    mod serde_fail_closed {
+        use super::*;
+
+        #[test]
+        fn test_policy_resolution_missing_risk_tier_defaults_to_tier4() {
+            // SECURITY: When `resolved_risk_tier` is missing from JSON,
+            // it must default to Tier4 (4), not Tier0 (0).
+            let json = r#"{
+                "policy_resolved_ref": "test-ref",
+                "resolved_policy_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "capability_manifest_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "context_pack_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+            }"#;
+
+            let resolution: PolicyResolution = serde_json::from_str(json)
+                .expect("PolicyResolution should deserialize without resolved_risk_tier");
+            assert_eq!(
+                resolution.resolved_risk_tier, 4,
+                "Missing resolved_risk_tier must default to Tier4 (4), not Tier0 (0) — fail-closed"
+            );
+        }
+
+        #[test]
+        fn test_policy_resolution_explicit_tier0_preserved() {
+            // When `resolved_risk_tier` is explicitly set to 0, it must be preserved.
+            let json = r#"{
+                "policy_resolved_ref": "test-ref",
+                "resolved_policy_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "capability_manifest_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "context_pack_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "resolved_risk_tier": 0
+            }"#;
+
+            let resolution: PolicyResolution = serde_json::from_str(json)
+                .expect("PolicyResolution should deserialize with explicit Tier0");
+            assert_eq!(
+                resolution.resolved_risk_tier, 0,
+                "Explicit Tier0 must be preserved"
+            );
+        }
+    }
+
+    // ========================================================================
+    // TCK-00340: SQLite integration tests (production path)
+    // ========================================================================
+    mod sqlite_integration {
+        use std::sync::{Arc, Mutex};
+
+        use rusqlite::Connection;
+
+        use super::*;
+        use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
+
+        /// Creates a `PrivilegedDispatcher` backed by real `SQLite`
+        /// implementations for testing the production persistence path.
+        fn setup_sqlite_dispatcher() -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            Arc<Mutex<Connection>>,
+        ) {
+            let conn = Connection::open_in_memory().unwrap();
+            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteWorkRegistry::init_schema(&conn).unwrap();
+            let conn = Arc::new(Mutex::new(conn));
+
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let policy_resolver = Arc::new(StubPolicyResolver);
+            let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
+            let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
+                Arc::clone(&conn),
+                signing_key,
+            ));
+            let lease_validator: Arc<dyn LeaseValidator> =
+                Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
+            let session_registry: Arc<dyn SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None).expect("clock creation failed"),
+            );
+            let token_minter = Arc::new(TokenMinter::new(TokenMinter::generate_secret()));
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest_loader: Arc<dyn ManifestLoader> =
+                Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest());
+            let subscription_registry: SharedSubscriptionRegistry =
+                Arc::new(SubscriptionRegistry::with_defaults());
+
+            let dispatcher = PrivilegedDispatcher::with_dependencies(
+                DecodeConfig::default(),
+                policy_resolver,
+                work_registry,
+                event_emitter,
+                Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
+                session_registry,
+                lease_validator,
+                clock,
+                token_minter,
+                manifest_store,
+                manifest_loader,
+                subscription_registry,
+            );
+
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            (dispatcher, ctx, conn)
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_sqlite_tier0_passes() {
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            // v6 Finding 1: Derive executor_actor_id from peer credentials
+            // to match what the handler will derive.
+            let executor_actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            // Register lease via SqliteLeaseValidator (production path)
+            dispatcher.lease_validator.register_lease_with_executor(
+                "sqlite-lease-001",
+                "W-SQL-001",
+                "gate-sql",
+                &executor_actor_id,
+            );
+
+            // Register work claim via SqliteWorkRegistry (production path)
+            let claim = WorkClaim {
+                work_id: "W-SQL-001".to_string(),
+                lease_id: "sqlite-lease-001".to_string(),
+                actor_id: executor_actor_id,
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-SQL-001".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0, // Tier0
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "sqlite-lease-001".to_string(),
+                receipt_id: "RR-SQL-001".to_string(),
+                reviewer_actor_id: "ignored-by-handler".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-SQL-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Tier0 with SelfSigned must pass through sqlite path"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty on sqlite success"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Tier0 SelfSigned should pass on sqlite path, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_sqlite_higher_tier_rejected() {
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            // v6 Finding 1: Derive executor_actor_id from peer credentials
+            let executor_actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            // Register lease via SqliteLeaseValidator
+            dispatcher.lease_validator.register_lease_with_executor(
+                "sqlite-lease-t2",
+                "W-SQL-T2",
+                "gate-sql",
+                &executor_actor_id,
+            );
+
+            // Register work claim at Tier2 (should be rejected)
+            let claim = WorkClaim {
+                work_id: "W-SQL-T2".to_string(),
+                lease_id: "sqlite-lease-t2".to_string(),
+                actor_id: executor_actor_id,
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-SQL-T2".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 2, // Tier2
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "sqlite-lease-t2".to_string(),
+                receipt_id: "RR-SQL-T2".to_string(),
+                reviewer_actor_id: "ignored-by-handler".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("SelfSigned")
+                            || err.message.contains("requires")
+                            || err.message.contains("attestation"),
+                        "Tier2 SelfSigned must be rejected on sqlite path, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected Tier2 rejection on sqlite path, got {other:?}");
+                },
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_valid_succeeds() {
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                Arc::clone(&signer),
+            ));
+
+            // Derive the actor ID from the test peer credentials (uid=1000,
+            // gid=1000) so the caller authorization check passes.
+            let caller_actor = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
+            let parent_lease =
+                apm2_core::fac::GateLeaseBuilder::new("sql-parent", "W-SQL-DS", "gate-sql-ds")
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id(&caller_actor)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("issuer-001")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            // Use production SqliteLeaseValidator path to register full lease
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_lease)
+                .expect("register_full_lease should succeed in test");
+            dispatcher.lease_validator.register_lease_with_executor(
+                "sql-parent",
+                "W-SQL-DS",
+                "gate-sql-ds",
+                &caller_actor,
+            );
+
+            // Wire orchestrator after construction (mimics DispatcherState flow)
+            let dispatcher = dispatcher.with_gate_orchestrator(orch);
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "sql-parent".to_string(),
+                delegatee_actor_id: "child-sql-exec".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-sql-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-sql-001");
+                    assert_eq!(resp.gate_id, "gate-sql-ds");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty on sqlite success"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "DelegateSublease should succeed on sqlite path, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected DelegateSublease, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_invalid_parent_rejected() {
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+
+            let dispatcher = dispatcher.with_gate_orchestrator(orch);
+
+            // Don't register any parent lease — should fail
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "nonexistent-parent".to_string(),
+                delegatee_actor_id: "child-sql".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-sql-invalid".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("parent gate lease not found"),
+                        "Must reject when parent lease not in sqlite, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected parent-not-found rejection, got {other:?}"),
+            }
+        }
+
+        /// Quality MAJOR: Integration test using `DispatcherState` production
+        /// wiring to exercise `DelegateSublease` and `IngestReviewReceipt`
+        /// through the production composition path. This proves that
+        /// `DispatcherState` properly wires `gate_orchestrator` into the
+        /// privileged dispatcher.
+        #[test]
+        fn test_dispatcher_state_delegate_sublease_production_wiring() {
+            use crate::state::DispatcherState;
+
+            let conn = Connection::open_in_memory().unwrap();
+            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteWorkRegistry::init_schema(&conn).unwrap();
+            let conn = Arc::new(Mutex::new(conn));
+
+            let session_registry: Arc<dyn SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            // Construct via production DispatcherState path
+            let state = DispatcherState::with_persistence(
+                session_registry,
+                None, // no metrics
+                Some(Arc::clone(&conn)),
+                None, // generate fresh signing key
+            );
+
+            // Wire gate orchestrator via production path
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                Arc::clone(&signer),
+            ));
+            let state = state.with_gate_orchestrator(orch);
+
+            // Derive caller actor from test peer credentials
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+
+            // Register parent lease in the sqlite-backed dispatcher
+            let parent_lease =
+                apm2_core::fac::GateLeaseBuilder::new("ds-parent-prod", "W-PROD-001", "gate-prod")
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id(&caller_actor)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("issuer-prod")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            state
+                .privileged_dispatcher()
+                .lease_validator
+                .register_full_lease(&parent_lease)
+                .expect("register_full_lease should succeed in test");
+            state
+                .privileged_dispatcher()
+                .lease_validator
+                .register_lease_with_executor(
+                    "ds-parent-prod",
+                    "W-PROD-001",
+                    "gate-prod",
+                    &caller_actor,
+                );
+
+            let ctx = ConnectionContext::privileged_session_open(Some(test_creds));
+
+            // Exercise DelegateSublease through production-wired dispatcher
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "ds-parent-prod".to_string(),
+                delegatee_actor_id: "child-prod-exec".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-prod-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = state
+                .privileged_dispatcher()
+                .dispatch(&frame, &ctx)
+                .unwrap();
+            match response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-prod-001");
+                    assert_eq!(resp.gate_id, "gate-prod");
+                    assert_eq!(resp.delegatee_actor_id, "child-prod-exec");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty in production wiring path"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "DelegateSublease must succeed via DispatcherState wiring, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected DelegateSublease via production path, got {other:?}"),
+            }
+
+            // Also exercise IngestReviewReceipt through production wiring
+            // to verify get_lease_work_id works with SqliteLeaseValidator.
+            //
+            // v6 Finding 1: The lease executor must be the derived actor_id
+            // from peer credentials, since the handler now authenticates the
+            // reviewer identity via peer credentials (not the request field).
+            state
+                .privileged_dispatcher()
+                .lease_validator
+                .register_lease_with_executor(
+                    "review-lease-prod",
+                    "W-REVIEW-001",
+                    "gate-review",
+                    &caller_actor,
+                );
+
+            let claim = WorkClaim {
+                work_id: "W-REVIEW-001".to_string(),
+                lease_id: "review-lease-prod".to_string(),
+                actor_id: caller_actor,
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-REVIEW-001".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0, // Tier0
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            state
+                .privileged_dispatcher()
+                .work_registry
+                .register_claim(claim)
+                .unwrap();
+
+            let review_request = IngestReviewReceiptRequest {
+                lease_id: "review-lease-prod".to_string(),
+                receipt_id: "RR-PROD-001".to_string(),
+                reviewer_actor_id: "reviewer-prod".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let review_frame = encode_ingest_review_receipt_request(&review_request);
+
+            let review_response = state
+                .privileged_dispatcher()
+                .dispatch(&review_frame, &ctx)
+                .unwrap();
+            match review_response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-PROD-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Tier0 SelfSigned must pass through DispatcherState production path"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty on production path success"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "IngestReviewReceipt must succeed via DispatcherState wiring, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected IngestReviewReceipt via production path, got {other:?}"),
+            }
+        }
+
+        /// Integration test: exercises the production `GovernancePolicyResolver
+        /// -> ClaimWork -> IngestReviewReceipt` path end-to-end.
+        /// Verifies that the governance resolver's transitional Tier1
+        /// mapping permits `SelfSigned` attestation through the review
+        /// receipt handler.
+        ///
+        /// This test was added as part of TCK-00340 quality fix to prevent
+        /// regression where hardcoded Tier4 would block all production claims.
+        #[test]
+        fn test_governance_resolver_claim_then_ingest_review_receipt_production_path() {
+            use crate::governance::GovernancePolicyResolver;
+            use crate::state::DispatcherState;
+
+            let conn = Connection::open_in_memory().unwrap();
+            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteWorkRegistry::init_schema(&conn).unwrap();
+            let conn = Arc::new(Mutex::new(conn));
+
+            let session_registry: Arc<dyn SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            // Construct via production DispatcherState path
+            let state = DispatcherState::with_persistence(
+                session_registry,
+                None, // no metrics
+                Some(Arc::clone(&conn)),
+                None, // generate fresh signing key
+            );
+
+            // Derive caller actor from test peer credentials
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+            let ctx = ConnectionContext::privileged_session_open(Some(test_creds));
+
+            // Step 1: Use GovernancePolicyResolver to produce the PolicyResolution
+            // (this is what ClaimWork calls in production with_persistence path)
+            let governance_resolver = GovernancePolicyResolver::new();
+            let policy_resolution = governance_resolver
+                .resolve_for_claim("W-GOV-001", WorkRole::Reviewer, &caller_actor)
+                .expect("GovernancePolicyResolver must succeed");
+
+            // Verify the governance resolver returns Tier1 (not Tier4)
+            assert_eq!(
+                policy_resolution.resolved_risk_tier, 1,
+                "GovernancePolicyResolver must return Tier1 for transitional mapping"
+            );
+
+            // Step 2: Register the work claim with the governance-produced resolution
+            let claim = WorkClaim {
+                work_id: "W-GOV-001".to_string(),
+                lease_id: "lease-gov-001".to_string(),
+                actor_id: caller_actor.clone(),
+                role: WorkRole::Reviewer,
+                policy_resolution,
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            state
+                .privileged_dispatcher()
+                .work_registry
+                .register_claim(claim)
+                .expect("Claim registration must succeed");
+
+            // Step 3: Register the lease for reviewer identity validation
+            state
+                .privileged_dispatcher()
+                .lease_validator
+                .register_lease_with_executor(
+                    "lease-gov-001",
+                    "W-GOV-001",
+                    "gate-gov",
+                    &caller_actor,
+                );
+
+            // Step 4: Submit IngestReviewReceipt with SelfSigned attestation
+            let review_request = IngestReviewReceiptRequest {
+                lease_id: "lease-gov-001".to_string(),
+                receipt_id: "RR-GOV-001".to_string(),
+                reviewer_actor_id: caller_actor,
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let review_frame = encode_ingest_review_receipt_request(&review_request);
+
+            let review_response = state
+                .privileged_dispatcher()
+                .dispatch(&review_frame, &ctx)
+                .unwrap();
+            match review_response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-GOV-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Governance-resolved Tier1 claim with SelfSigned attestation \
+                         must pass through production path"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty for governance-resolved production path"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "IngestReviewReceipt MUST succeed for governance-resolved Tier1 claim \
+                         with SelfSigned attestation. Got error: {}. This is the TCK-00340 \
+                         regression where hardcoded Tier4 blocked all production claims.",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected IngestReviewReceipt via governance-resolved path, got {other:?}"
+                ),
             }
         }
     }
