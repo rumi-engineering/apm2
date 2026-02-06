@@ -695,13 +695,15 @@ const SESSION_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 /// Conservative token estimation rate: tokens per second of wall-clock time.
 ///
-/// When the daemon does not report actual token consumption, we estimate
-/// conservatively based on elapsed wall time. This rate (100 tokens/sec)
-/// is deliberately over-estimated to ensure budget enforcement errs on the
-/// side of caution — modern LLM agents routinely achieve 50-100+ tokens/sec,
-/// so this upper bound ensures Safe-Fail behavior. A real session may consume
-/// fewer tokens, but we must never undercount (which would bypass budget
-/// limits).
+/// **Fallback only**: When the daemon reports `actual_tokens_consumed` via
+/// `SessionStatus` (TCK-00384/TCK-00386), that value is used instead. This
+/// rate is only applied when `actual_tokens_consumed` is `None`.
+///
+/// The rate (100 tokens/sec) is deliberately over-estimated to ensure budget
+/// enforcement errs on the side of caution — modern LLM agents routinely
+/// achieve 50-100+ tokens/sec, so this upper bound ensures Safe-Fail behavior.
+/// A real session may consume fewer tokens, but we must never undercount
+/// (which would bypass budget limits).
 const CONSERVATIVE_TOKENS_PER_SECOND: u64 = 100;
 
 /// Minimum token cost per session, regardless of elapsed time.
@@ -887,31 +889,40 @@ async fn run_coordination_loop(
     }
 }
 
-/// Observes session termination by polling via the session socket.
+/// Observes session termination by polling `SessionStatus` via the session
+/// socket.
 ///
-/// **Security: Fail-Closed Design**
+/// # TCK-00386: Session Termination Signal
+///
+/// Polls `SessionClient::session_status_with_termination()` to detect when a
+/// session transitions from `ACTIVE` to `TERMINATED`. The daemon populates
+/// `termination_reason`, `exit_code`, and `actual_tokens_consumed` on the
+/// `TERMINATED` response, allowing us to distinguish clean exits from crashes.
+///
+/// ## Security: Fail-Closed Design
 ///
 /// This function follows fail-closed principles throughout:
-/// - If the session socket is unavailable, the session is recorded as FAILED
+/// - If the session socket is unavailable, the session is recorded as FAILURE
 ///   (we cannot verify outcome, so we assume failure).
-/// - If the session becomes unreachable (heartbeat rejected), the session is
-///   recorded as FAILED (unexpected disconnection is not a clean completion).
-/// - If observation times out, the session is recorded as FAILED.
-/// - Only an explicit clean-completion signal from the daemon would warrant
-///   recording SUCCESS. Since the daemon does not yet provide such a signal,
-///   all termination paths currently record FAILURE.
+/// - If the status query returns an error (session not found), the session is
+///   recorded as FAILURE (fail-closed: no evidence of success).
+/// - If observation times out without a TERMINATED response, the session is
+///   recorded as FAILURE.
+/// - SUCCESS is only recorded when the daemon explicitly reports
+///   `termination_reason == "normal"` **and** `exit_code == 0`.
 ///
-/// **Token Estimation**
+/// ## Token Accounting
 ///
-/// Since the daemon does not yet report actual token consumption, we use a
-/// conservative wall-time-based estimate: `max(elapsed_secs * RATE,
-/// MIN_TOKENS_PER_SESSION)`. This ensures budget tracking never reports zero
-/// tokens (which would bypass budget limits).
+/// When the daemon reports `actual_tokens_consumed`, that value is used
+/// directly (with a floor of [`MIN_TOKENS_PER_SESSION`] to prevent zero-cost
+/// sessions). When the daemon does not report actual consumption (field is
+/// `None`), we fall back to the conservative wall-clock estimate via
+/// [`estimate_token_consumption`].
 async fn observe_session_termination(
     session_socket: &Path,
     session_token: &str,
     session_id: &str,
-    correlation_id: &str,
+    _correlation_id: &str,
     quiet: bool,
 ) -> (SessionOutcome, u64) {
     use crate::client::protocol::SessionClient;
@@ -923,34 +934,47 @@ async fn observe_session_termination(
 
     match session_client {
         Ok(mut client) => {
-            // Poll for session termination by emitting heartbeat events.
-            // The daemon returns errors once the session has terminated,
-            // which we use as a signal that the session is no longer active.
-            //
-            // SECURITY: A heartbeat rejection means the session became
-            // unreachable. This could be a clean exit, a crash, or an OOM
-            // kill. Without an explicit success signal from the daemon, we
-            // MUST treat this as failure (fail-closed).
-            let mut clean_exit = false;
-
+            // Poll session status until TERMINATED or timeout.
+            // TCK-00386: Uses session_status_with_termination() which returns
+            // termination details (reason, exit_code, tokens) for ended sessions.
             while observation_start.elapsed() < SESSION_OBSERVATION_TIMEOUT {
                 tokio::time::sleep(SESSION_POLL_INTERVAL).await;
 
-                // Emit a coordination heartbeat event to check session liveness.
-                // If the session has terminated, the daemon will reject the event
-                // with an error (session not found / token invalid).
-                let poll_result = client
-                    .emit_event(
-                        session_token,
-                        "coordination.session_heartbeat",
-                        b"{}",
-                        correlation_id,
-                    )
-                    .await;
+                let status_result = client.session_status_with_termination(session_token).await;
 
-                match poll_result {
-                    Ok(_response) => {
-                        // Session is still alive, continue polling
+                match status_result {
+                    Ok(response) => {
+                        if response.state == "TERMINATED" {
+                            // Session has ended — map outcome from termination details.
+                            let outcome = map_termination_to_outcome(
+                                response.termination_reason.as_deref(),
+                                response.exit_code,
+                            );
+
+                            // TCK-00386: Use actual token consumption when available,
+                            // fall back to wall-clock estimate otherwise.
+                            let tokens = resolve_token_consumption(
+                                response.actual_tokens_consumed,
+                                observation_start.elapsed().as_secs(),
+                            );
+
+                            if !quiet {
+                                eprintln!(
+                                    "Session {session_id} terminated: reason={}, exit_code={}, \
+                                     outcome={}, tokens={tokens} ({:.1}s elapsed)",
+                                    response.termination_reason.as_deref().unwrap_or("unknown"),
+                                    response
+                                        .exit_code
+                                        .map_or_else(|| "N/A".to_string(), |c| c.to_string()),
+                                    outcome.as_str(),
+                                    observation_start.elapsed().as_secs_f64(),
+                                );
+                            }
+
+                            return (outcome, tokens);
+                        }
+
+                        // Session is still ACTIVE (or SUSPENDED), continue polling.
                         if !quiet {
                             eprintln!(
                                 "Session {session_id} still active ({:.1}s elapsed)",
@@ -959,43 +983,33 @@ async fn observe_session_termination(
                         }
                     },
                     Err(_e) => {
-                        // Session became unreachable (daemon rejected heartbeat).
-                        // This could be clean exit, crash, or OOM kill.
-                        // FAIL-CLOSED: Without an explicit success signal from
-                        // the daemon, we record as Failure. Only a future
-                        // daemon API providing a "session completed successfully"
-                        // status query would justify recording Success here.
+                        // FAIL-CLOSED: Status query failed (session not found, socket
+                        // error, or decode failure). We have no evidence of success,
+                        // so we must record as Failure.
                         if !quiet {
                             eprintln!(
-                                "Session {session_id} became unreachable ({:.1}s elapsed); \
-                                 recording as FAILURE (no explicit success signal)",
+                                "Session {session_id} status query failed ({:.1}s elapsed); \
+                                 recording as FAILURE (fail-closed)",
                                 observation_start.elapsed().as_secs_f64()
                             );
                         }
-                        clean_exit = false;
-                        break;
+                        let tokens =
+                            estimate_token_consumption(observation_start.elapsed().as_secs());
+                        return (SessionOutcome::Failure, tokens);
                     },
                 }
             }
 
-            // Compute conservative token estimate based on observation duration
-            let estimated_tokens =
-                estimate_token_consumption(observation_start.elapsed().as_secs());
-
-            if clean_exit {
-                // Reserved for future: explicit daemon success signal path
-                (SessionOutcome::Success, estimated_tokens)
-            } else {
-                // FAIL-CLOSED: timeout or unexpected disconnect -> Failure
-                if !quiet && observation_start.elapsed() >= SESSION_OBSERVATION_TIMEOUT {
-                    eprintln!(
-                        "Session {session_id} observation timed out after {}s; \
-                         recording as FAILURE",
-                        SESSION_OBSERVATION_TIMEOUT.as_secs()
-                    );
-                }
-                (SessionOutcome::Failure, estimated_tokens)
+            // FAIL-CLOSED: Observation timed out without a TERMINATED response.
+            if !quiet {
+                eprintln!(
+                    "Session {session_id} observation timed out after {}s; \
+                     recording as FAILURE",
+                    SESSION_OBSERVATION_TIMEOUT.as_secs()
+                );
             }
+            let tokens = estimate_token_consumption(observation_start.elapsed().as_secs());
+            (SessionOutcome::Failure, tokens)
         },
         Err(_e) => {
             // FAIL-CLOSED: Session socket unavailable means we cannot observe
@@ -1009,11 +1023,51 @@ async fn observe_session_termination(
             }
             // Use minimum token cost since we don't know how long the session
             // ran, but must not report zero.
-            let estimated_tokens =
-                estimate_token_consumption(observation_start.elapsed().as_secs());
-            (SessionOutcome::Failure, estimated_tokens)
+            let tokens = estimate_token_consumption(observation_start.elapsed().as_secs());
+            (SessionOutcome::Failure, tokens)
         },
     }
+}
+
+/// Maps daemon-reported termination details to a [`SessionOutcome`].
+///
+/// # TCK-00386: Termination Reason Mapping
+///
+/// Only `termination_reason == "normal"` **and** `exit_code == Some(0)` produce
+/// [`SessionOutcome::Success`]. All other combinations produce
+/// [`SessionOutcome::Failure`] (fail-closed):
+///
+/// | `termination_reason` | `exit_code` | Outcome   |
+/// |----------------------|-------------|-----------|
+/// | `Some("normal")`     | `Some(0)`   | Success   |
+/// | `Some("normal")`     | `Some(1)`   | Failure   |
+/// | `Some("normal")`     | `None`      | Failure   |
+/// | `Some("crash")`      | any         | Failure   |
+/// | `Some("timeout")`    | any         | Failure   |
+/// | `None`               | any         | Failure   |
+fn map_termination_to_outcome(
+    termination_reason: Option<&str>,
+    exit_code: Option<i32>,
+) -> SessionOutcome {
+    match (termination_reason, exit_code) {
+        (Some("normal"), Some(0)) => SessionOutcome::Success,
+        _ => SessionOutcome::Failure,
+    }
+}
+
+/// Resolves token consumption: prefers actual daemon-reported value, falls back
+/// to wall-clock estimate.
+///
+/// # TCK-00386: Token Accounting
+///
+/// When `actual_tokens` is `Some(n)`, returns `max(n, MIN_TOKENS_PER_SESSION)`
+/// to prevent zero-cost sessions. When `None`, delegates to
+/// [`estimate_token_consumption`] which uses the conservative wall-clock rate.
+fn resolve_token_consumption(actual_tokens: Option<u64>, elapsed_secs: u64) -> u64 {
+    actual_tokens.map_or_else(
+        || estimate_token_consumption(elapsed_secs),
+        |tokens| tokens.max(MIN_TOKENS_PER_SESSION),
+    )
 }
 
 /// Estimates token consumption based on elapsed wall-clock seconds.
@@ -2329,5 +2383,186 @@ mod tests {
     #[test]
     fn tck_00346_token_rate_is_strict_upper_bound() {
         const { assert!(CONSERVATIVE_TOKENS_PER_SECOND >= 100) };
+    }
+
+    // =========================================================================
+    // TCK-00386: Session Termination Signal Tests
+    // =========================================================================
+
+    /// TCK-00386: Normal exit with code 0 maps to Success.
+    #[test]
+    fn tck_00386_normal_exit_zero_maps_to_success() {
+        let outcome = map_termination_to_outcome(Some("normal"), Some(0));
+        assert_eq!(outcome, SessionOutcome::Success);
+    }
+
+    /// TCK-00386: Normal exit with non-zero code maps to Failure.
+    #[test]
+    fn tck_00386_normal_exit_nonzero_maps_to_failure() {
+        let outcome = map_termination_to_outcome(Some("normal"), Some(1));
+        assert_eq!(outcome, SessionOutcome::Failure);
+
+        let outcome = map_termination_to_outcome(Some("normal"), Some(137));
+        assert_eq!(outcome, SessionOutcome::Failure);
+
+        let outcome = map_termination_to_outcome(Some("normal"), Some(-1));
+        assert_eq!(outcome, SessionOutcome::Failure);
+    }
+
+    /// TCK-00386: Normal exit with missing `exit_code` maps to Failure
+    /// (fail-closed).
+    #[test]
+    fn tck_00386_normal_exit_no_code_maps_to_failure() {
+        let outcome = map_termination_to_outcome(Some("normal"), None);
+        assert_eq!(outcome, SessionOutcome::Failure);
+    }
+
+    /// TCK-00386: Crash termination maps to Failure regardless of exit code.
+    #[test]
+    fn tck_00386_crash_maps_to_failure() {
+        let outcome = map_termination_to_outcome(Some("crash"), Some(0));
+        assert_eq!(outcome, SessionOutcome::Failure);
+
+        let outcome = map_termination_to_outcome(Some("crash"), Some(1));
+        assert_eq!(outcome, SessionOutcome::Failure);
+
+        let outcome = map_termination_to_outcome(Some("crash"), None);
+        assert_eq!(outcome, SessionOutcome::Failure);
+    }
+
+    /// TCK-00386: Timeout termination maps to Failure regardless of exit code.
+    #[test]
+    fn tck_00386_timeout_maps_to_failure() {
+        let outcome = map_termination_to_outcome(Some("timeout"), Some(0));
+        assert_eq!(outcome, SessionOutcome::Failure);
+
+        let outcome = map_termination_to_outcome(Some("timeout"), None);
+        assert_eq!(outcome, SessionOutcome::Failure);
+    }
+
+    /// TCK-00386: Quarantined termination maps to Failure.
+    #[test]
+    fn tck_00386_quarantined_maps_to_failure() {
+        let outcome = map_termination_to_outcome(Some("quarantined"), Some(0));
+        assert_eq!(outcome, SessionOutcome::Failure);
+    }
+
+    /// TCK-00386: Budget-exhausted termination maps to Failure.
+    #[test]
+    fn tck_00386_budget_exhausted_maps_to_failure() {
+        let outcome = map_termination_to_outcome(Some("budget_exhausted"), Some(0));
+        assert_eq!(outcome, SessionOutcome::Failure);
+    }
+
+    /// TCK-00386: Missing termination reason maps to Failure (fail-closed).
+    #[test]
+    fn tck_00386_no_reason_maps_to_failure() {
+        let outcome = map_termination_to_outcome(None, Some(0));
+        assert_eq!(outcome, SessionOutcome::Failure);
+
+        let outcome = map_termination_to_outcome(None, None);
+        assert_eq!(outcome, SessionOutcome::Failure);
+    }
+
+    /// TCK-00386: Unknown termination reason maps to Failure (fail-closed).
+    #[test]
+    fn tck_00386_unknown_reason_maps_to_failure() {
+        let outcome = map_termination_to_outcome(Some("alien_abduction"), Some(0));
+        assert_eq!(outcome, SessionOutcome::Failure);
+    }
+
+    /// TCK-00386: Actual token consumption is used when available.
+    #[test]
+    fn tck_00386_resolve_tokens_uses_actual_when_available() {
+        // Actual tokens reported by daemon: should be used directly
+        let tokens = resolve_token_consumption(Some(5000), 60);
+        assert_eq!(tokens, 5000);
+
+        // Large actual value is preserved
+        let tokens = resolve_token_consumption(Some(1_000_000), 10);
+        assert_eq!(tokens, 1_000_000);
+    }
+
+    /// TCK-00386: Actual token consumption is floored at
+    /// `MIN_TOKENS_PER_SESSION`.
+    #[test]
+    fn tck_00386_resolve_tokens_floors_actual_at_minimum() {
+        // Daemon reports zero tokens: should be clamped to minimum
+        let tokens = resolve_token_consumption(Some(0), 60);
+        assert_eq!(tokens, MIN_TOKENS_PER_SESSION);
+
+        // Daemon reports below minimum: should be clamped
+        let tokens = resolve_token_consumption(Some(1), 60);
+        assert_eq!(tokens, MIN_TOKENS_PER_SESSION);
+
+        // Daemon reports exactly minimum: preserved
+        let tokens = resolve_token_consumption(Some(MIN_TOKENS_PER_SESSION), 60);
+        assert_eq!(tokens, MIN_TOKENS_PER_SESSION);
+    }
+
+    /// TCK-00386: Falls back to wall-clock estimate when actual is unavailable.
+    #[test]
+    fn tck_00386_resolve_tokens_falls_back_to_estimate() {
+        // No actual tokens: should use wall-clock estimate
+        let tokens = resolve_token_consumption(None, 60);
+        assert_eq!(tokens, estimate_token_consumption(60));
+        assert_eq!(tokens, 60 * CONSERVATIVE_TOKENS_PER_SECOND);
+
+        // No actual tokens, zero elapsed: should use minimum
+        let tokens = resolve_token_consumption(None, 0);
+        assert_eq!(tokens, MIN_TOKENS_PER_SESSION);
+    }
+
+    /// TCK-00386: Token resolution never returns zero.
+    #[test]
+    fn tck_00386_resolve_tokens_never_zero() {
+        // Every combination must produce > 0
+        assert!(resolve_token_consumption(Some(0), 0) > 0);
+        assert!(resolve_token_consumption(None, 0) > 0);
+        assert!(resolve_token_consumption(Some(0), 60) > 0);
+        assert!(resolve_token_consumption(None, 60) > 0);
+    }
+
+    /// TCK-00386: Only one specific combination produces Success.
+    ///
+    /// Exhaustively verify that the only path to Success is
+    /// (`reason="normal"`, `exit_code=0`). This is a binding test —
+    /// it proves the fail-closed invariant by checking multiple
+    /// distinct failure paths, not just one.
+    #[test]
+    fn tck_00386_fail_closed_only_normal_zero_succeeds() {
+        let reasons: &[Option<&str>] = &[
+            None,
+            Some("normal"),
+            Some("crash"),
+            Some("timeout"),
+            Some("quarantined"),
+            Some("budget_exhausted"),
+            Some("unknown"),
+        ];
+        let codes: &[Option<i32>] = &[None, Some(-1), Some(0), Some(1), Some(137)];
+
+        let mut success_count = 0u32;
+        let mut failure_count = 0u32;
+
+        for reason in reasons {
+            for code in codes {
+                let outcome = map_termination_to_outcome(*reason, *code);
+                match outcome {
+                    SessionOutcome::Success => success_count += 1,
+                    SessionOutcome::Failure => failure_count += 1,
+                }
+            }
+        }
+
+        // Exactly one combination produces Success
+        assert_eq!(success_count, 1, "Expected exactly 1 Success path");
+        // All others produce Failure
+        #[allow(clippy::cast_possible_truncation)] // Test data is small
+        let expected_failures = (reasons.len() * codes.len()) as u32 - 1;
+        assert_eq!(
+            failure_count, expected_failures,
+            "Expected all other paths to produce Failure"
+        );
     }
 }

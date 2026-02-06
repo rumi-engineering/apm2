@@ -2288,7 +2288,6 @@ impl SessionClient {
     ///
     /// Session status including state, work association, telemetry summary,
     /// and termination details (if applicable).
-    #[allow(dead_code)] // Scaffolding for TCK-00386 coordinate command
     pub async fn session_status_with_termination(
         &mut self,
         session_token: &str,
