@@ -941,6 +941,17 @@ impl std::error::Error for ReplayViolation {}
 /// # `DoS` Protection
 ///
 /// The trace size is bounded by [`MAX_REPLAY_ENTRIES`].
+///
+/// # Production Integration Status
+///
+/// TODO(TCK-00356): Integrate `ReplayVerifier::verify` into the production
+/// replay/evidence validation pipeline.  Currently the verifier is only
+/// exercised in unit and integration tests (this module's `tests` section).
+/// The production replay pipeline does not exist yet -- when it is
+/// implemented (TCK-00356: Replay Evidence Pipeline), this verifier MUST
+/// be invoked on every replayed episode trace before the trace is accepted
+/// as valid evidence.  The verifier logic is complete and fully tested;
+/// only the production call site is missing.
 pub struct ReplayVerifier;
 
 impl ReplayVerifier {

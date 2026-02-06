@@ -347,6 +347,19 @@ impl Default for GovernanceFreshnessConfig {
 /// monitor.check_freshness();
 /// ```
 ///
+/// # TODO(TCK-00364): Production Instantiation
+///
+/// This monitor is defined and fully functional but is NOT yet
+/// instantiated in production (`state.rs`).  The `StopStatus::Uncertain`
+/// denial path is therefore unreachable in production.  TCK-00364
+/// (`FreshnessPolicyV1`) will:
+/// 1. Instantiate `GovernanceFreshnessMonitor` in `state.rs` production
+///    constructors.
+/// 2. Share the same `StopAuthority` between the monitor and the
+///    `PreActuationGate`.
+/// 3. Spawn a background task that calls `check_freshness()` at the configured
+///    `poll_interval_ms`.
+///
 /// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
 pub struct GovernanceFreshnessMonitor {
     /// Shared stop authority whose `governance_uncertain` flag is mutated.

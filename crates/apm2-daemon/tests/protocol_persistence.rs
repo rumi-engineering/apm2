@@ -108,6 +108,8 @@ async fn test_persistence_end_to_end() {
         role: WorkRole::GateExecutor.into(),
         lease_id: Some(lease_id),
         workspace_root: "/tmp".to_string(),
+        max_episodes: None,
+        escalation_predicate: None,
     };
     let spawn_frame = encode_spawn_episode_request(&spawn_req);
     let spawn_resp = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -148,6 +150,8 @@ async fn test_persistence_end_to_end() {
         role: WorkRole::Implementer.into(),
         lease_id: Some(lease_id_impl),
         workspace_root: "/tmp".to_string(),
+        max_episodes: None,
+        escalation_predicate: None,
     };
     let spawn_frame_impl = encode_spawn_episode_request(&spawn_req_impl);
     let spawn_resp_impl = dispatcher.dispatch(&spawn_frame_impl, &ctx).unwrap();

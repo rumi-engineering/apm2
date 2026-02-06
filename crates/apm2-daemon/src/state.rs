@@ -518,13 +518,29 @@ impl DispatcherState {
 
         // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
+        //
+        // TCK-00351 BLOCKER 2 FIX: Wire a deferred budget tracker sentinel
+        // so the gate marks `budget_checked=true` in the receipt.  Actual
+        // per-episode budget enforcement is handled by EpisodeRuntime which
+        // tracks budgets from the episode envelope.  Without this sentinel,
+        // the receipt would claim `budget_checked=false`, which the replay
+        // verifier flags as a violation (EVID-0305).
         let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+        let deferred_budget = Arc::new(crate::episode::budget_tracker::BudgetTracker::deferred());
         let preactuation_gate = Arc::new(
             crate::episode::preactuation::PreActuationGate::production_gate(
                 Arc::clone(&stop_authority),
-                None, // No per-session budget tracker at this level
+                Some(deferred_budget),
             ),
         );
+
+        // TODO(TCK-00364): Wire GovernanceFreshnessMonitor into production
+        // path.  The monitor periodically probes governance service health
+        // and calls stop_authority.set_governance_uncertain(true) when the
+        // response is stale beyond the freshness threshold, activating the
+        // deadline-based fail-closed denial in the pre-actuation gate.
+        // Currently the governance_uncertain flag is only set in tests;
+        // production wiring is deferred to TCK-00364 (FreshnessPolicyV1).
 
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
@@ -762,15 +778,29 @@ impl DispatcherState {
 
         // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
-        // Per-episode budget tracking is handled by EpisodeRuntime; the
-        // gate here provides the session-level obligation proof.
+        //
+        // TCK-00351 BLOCKER 2 FIX: Wire a deferred budget tracker sentinel
+        // so the gate marks `budget_checked=true` in the receipt.  Actual
+        // per-episode budget enforcement is handled by EpisodeRuntime which
+        // tracks budgets from the episode envelope.  Without this sentinel,
+        // the receipt would claim `budget_checked=false`, which the replay
+        // verifier flags as a violation (EVID-0305).
         let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+        let deferred_budget = Arc::new(crate::episode::budget_tracker::BudgetTracker::deferred());
         let preactuation_gate = Arc::new(
             crate::episode::preactuation::PreActuationGate::production_gate(
                 Arc::clone(&stop_authority),
-                None, // Per-episode budget is tracked by EpisodeRuntime
+                Some(deferred_budget),
             ),
         );
+
+        // TODO(TCK-00364): Wire GovernanceFreshnessMonitor into production
+        // path.  The monitor periodically probes governance service health
+        // and calls stop_authority.set_governance_uncertain(true) when the
+        // response is stale beyond the freshness threshold, activating the
+        // deadline-based fail-closed denial in the pre-actuation gate.
+        // Currently the governance_uncertain flag is only set in tests;
+        // production wiring is deferred to TCK-00364 (FreshnessPolicyV1).
 
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries

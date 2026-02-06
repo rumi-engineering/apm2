@@ -726,9 +726,27 @@ impl SessionStopConditionsStore {
     }
 
     /// Removes stop conditions for a session.
+    ///
+    /// TCK-00351 BLOCKER 3 FIX: Must be called from the same termination
+    /// and eviction paths that clean up telemetry entries.  Without this,
+    /// stop condition entries accumulate on every spawn/end cycle, causing
+    /// the store to reach capacity and reject new registrations (`DoS`).
     pub fn remove(&self, session_id: &str) {
         let mut entries = self.entries.write().expect("lock poisoned");
         entries.remove(session_id);
+    }
+
+    /// Returns the number of stored entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let entries = self.entries.read().expect("lock poisoned");
+        entries.len()
+    }
+
+    /// Returns `true` if no entries are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -1096,5 +1114,122 @@ mod telemetry_tests {
             "duration_ms should be small, got {}",
             snap.duration_ms,
         );
+    }
+
+    // =========================================================================
+    // TCK-00351 BLOCKER 3: SessionStopConditionsStore lifecycle tests
+    // =========================================================================
+
+    #[test]
+    fn test_stop_conditions_store_new_is_empty() {
+        let store = SessionStopConditionsStore::new();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_stop_conditions_store_register_and_get() {
+        let store = SessionStopConditionsStore::new();
+        let conditions = crate::episode::envelope::StopConditions::max_episodes(5);
+        store.register("sess-1", conditions).unwrap();
+
+        assert_eq!(store.len(), 1);
+        let got = store.get("sess-1").expect("should have conditions");
+        assert_eq!(got.max_episodes, 5);
+    }
+
+    #[test]
+    fn test_stop_conditions_store_remove() {
+        let store = SessionStopConditionsStore::new();
+        let conditions = crate::episode::envelope::StopConditions::max_episodes(10);
+        store.register("sess-1", conditions).unwrap();
+        assert_eq!(store.len(), 1);
+
+        store.remove("sess-1");
+        assert!(store.is_empty());
+        assert!(store.get("sess-1").is_none());
+    }
+
+    #[test]
+    fn test_stop_conditions_store_remove_nonexistent() {
+        let store = SessionStopConditionsStore::new();
+        store.remove("nonexistent"); // Should not panic
+        assert!(store.is_empty());
+    }
+
+    /// TCK-00351 BLOCKER 3: Churn regression test.
+    ///
+    /// Simulates repeated spawn/terminate cycles and verifies that
+    /// `remove()` keeps the store size stable.  Without the fix,
+    /// entries accumulate and eventually hit the capacity limit.
+    #[test]
+    fn test_stop_conditions_store_churn_regression() {
+        let store = SessionStopConditionsStore::new();
+        let cycles = 100;
+
+        for cycle in 0..cycles {
+            let session_id = format!("sess-churn-{cycle}");
+            let conditions = crate::episode::envelope::StopConditions::max_episodes(10);
+
+            // Spawn: register conditions
+            store.register(&session_id, conditions).unwrap();
+            assert_eq!(
+                store.len(),
+                1,
+                "cycle {cycle}: store should have exactly 1 entry during active session"
+            );
+
+            // Terminate: remove conditions
+            store.remove(&session_id);
+            assert!(
+                store.is_empty(),
+                "cycle {cycle}: store should be empty after termination"
+            );
+        }
+
+        // After all cycles, store must be empty (no leaked entries)
+        assert_eq!(
+            store.len(),
+            0,
+            "store must be empty after {cycles} churn cycles"
+        );
+    }
+
+    /// TCK-00351 BLOCKER 3: Capacity regression test.
+    ///
+    /// Fills the store to capacity, removes entries, and verifies that
+    /// new registrations succeed after removal.  Proves that `remove()`
+    /// actually frees capacity slots.
+    #[test]
+    fn test_stop_conditions_store_capacity_reclaim() {
+        let store = SessionStopConditionsStore::new();
+
+        // Fill to capacity
+        for i in 0..MAX_TELEMETRY_SESSIONS {
+            let conditions = crate::episode::envelope::StopConditions::max_episodes(1);
+            store
+                .register(&format!("sess-cap-{i}"), conditions)
+                .unwrap();
+        }
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS);
+
+        // Next registration should fail (at capacity)
+        let result = store.register(
+            "one-too-many",
+            crate::episode::envelope::StopConditions::default(),
+        );
+        assert!(result.is_err(), "should reject at capacity");
+
+        // Remove one entry to free a slot
+        store.remove("sess-cap-0");
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS - 1);
+
+        // Now registration should succeed
+        let result = store.register(
+            "reclaimed",
+            crate::episode::envelope::StopConditions::max_episodes(42),
+        );
+        assert!(result.is_ok(), "should succeed after capacity reclaim");
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS);
     }
 }

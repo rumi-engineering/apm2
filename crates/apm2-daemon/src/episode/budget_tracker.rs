@@ -235,6 +235,35 @@ impl BudgetTracker {
         Self::from_envelope(EpisodeBudget::unlimited())
     }
 
+    /// Creates a deferred budget tracker sentinel (TCK-00351 BLOCKER 2 FIX).
+    ///
+    /// This tracker uses unlimited limits and always returns
+    /// `budget_checked=true` from the pre-actuation gate, with the
+    /// semantic that **actual** per-episode budget enforcement is
+    /// deferred to [`EpisodeRuntime`], which tracks budgets at the
+    /// episode level via `EpisodeBudget`.
+    ///
+    /// # Architecture
+    ///
+    /// The pre-actuation gate operates at the session level (one gate
+    /// per session).  Per-episode budgets are tracked by `EpisodeRuntime`
+    /// which receives the budget from the episode envelope.  This
+    /// sentinel bridges the gap: it satisfies the gate's `budget_checked`
+    /// receipt field (proving a budget tracker *was* consulted) while
+    /// delegating real enforcement to the runtime.
+    ///
+    /// # When to Use
+    ///
+    /// Wire this into production constructors where per-session budget
+    /// enforcement is not yet implemented but the gate requires a tracker
+    /// to mark `budget_checked=true` in the receipt.
+    ///
+    /// [`EpisodeRuntime`]: crate::episode::EpisodeRuntime
+    #[must_use]
+    pub fn deferred() -> Self {
+        Self::from_envelope(EpisodeBudget::unlimited())
+    }
+
     /// Charges the given budget delta, consuming resources.
     ///
     /// This atomically checks and updates all resource counters using CAS

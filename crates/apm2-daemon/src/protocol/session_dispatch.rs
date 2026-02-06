@@ -1452,14 +1452,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
             // TCK-00351 BLOCKER 1 v3 FIX: Load real stop conditions from the
             // per-session store.  If no store is wired or the session has no
-            // conditions registered, fall back to default (unlimited).  This
-            // ensures max_episodes and escalation_predicate are actually
-            // evaluated against the session's envelope-specified limits.
+            // conditions registered, fall back to fail-closed defaults
+            // (max_episodes=1) rather than StopConditions::default() which
+            // is permissive (max_episodes=0 = unlimited).  This ensures
+            // sessions without explicit limits are constrained rather than
+            // unbounded.
             let conditions = self
                 .stop_conditions_store
                 .as_ref()
                 .and_then(|store| store.get(&token.session_id))
-                .unwrap_or_default();
+                .unwrap_or_else(|| crate::episode::envelope::StopConditions::max_episodes(1));
 
             // TCK-00351 MAJOR v3 FIX: Hard-deny when telemetry is missing for
             // an active session.  An active session MUST have telemetry
@@ -2097,6 +2099,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 // TCK-00384: Clean up telemetry on session termination to
                 // free capacity in the bounded store.
                 if let Some(ref store) = self.telemetry_store {
+                    store.remove(session_id);
+                }
+
+                // TCK-00351 BLOCKER 3 FIX: Clean up stop conditions on
+                // session termination to free capacity in the bounded
+                // store.  Same lifecycle as telemetry cleanup above.
+                if let Some(ref store) = self.stop_conditions_store {
                     store.remove(session_id);
                 }
 

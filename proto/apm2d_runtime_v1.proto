@@ -303,6 +303,15 @@ message SpawnEpisodeRequest {
   // All file operations will be confined to this directory.
   // REQUIRED: Episodes cannot be spawned without a workspace root.
   string workspace_root = 4;
+  // TCK-00351 BLOCKER 1: Authoritative stop conditions from the episode
+  // envelope.  When present, these override StopConditions::default() so
+  // that max_episodes and escalation_predicate are actually enforced.
+  // When absent, the handler falls back to fail-closed defaults
+  // (max_episodes=1, empty predicates).
+  optional uint64 max_episodes = 5;
+  // Escalation predicate from the episode envelope (free-form v1).
+  // Non-empty string triggers EscalationTriggered stop denial.
+  optional string escalation_predicate = 6;
 }
 
 message SpawnEpisodeResponse {

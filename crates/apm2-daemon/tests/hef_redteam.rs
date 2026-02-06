@@ -771,6 +771,8 @@ async fn test_out_of_order_spawn_rejected() {
         role: WorkRole::Implementer.into(),
         lease_id: None,
         workspace_root: "/tmp".to_string(),
+        max_episodes: None,
+        escalation_predicate: None,
     };
     let frame = encode_spawn_episode_request(&req);
 

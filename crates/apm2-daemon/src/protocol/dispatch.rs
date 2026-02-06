@@ -5710,6 +5710,17 @@ impl PrivilegedDispatcher {
                 })
                 .collect();
 
+        // Step 2c: TCK-00351 BLOCKER 3 FIX: Clean up stop conditions for
+        // evicted sessions to prevent unbounded store growth.  Unlike
+        // telemetry and manifests, stop conditions are immutable once
+        // registered and don't need rollback restoration -- the evicted
+        // session is gone and its conditions are no longer relevant.
+        if let Some(ref store) = self.stop_conditions_store {
+            for evicted in &evicted_sessions {
+                store.remove(&evicted.session_id);
+            }
+        }
+
         // Step 3: Register telemetry with started_at_ns.
         // The wall-clock timestamp is stored as audit metadata only;
         // elapsed duration is computed from a monotonic Instant inside the
@@ -5759,11 +5770,22 @@ impl PrivilegedDispatcher {
 
         // Step 3b: Register stop conditions for the session (TCK-00351 v4).
         // The pre-actuation gate reads from this store to enforce
-        // max_episodes / escalation_predicate limits.  Default conditions
-        // (unlimited) are registered when no envelope-specific limits are
-        // available, ensuring the store always has an entry for the gate.
+        // max_episodes / escalation_predicate limits.
+        //
+        // TCK-00351 BLOCKER 1 FIX: Derive stop conditions from the
+        // authoritative SpawnEpisodeRequest fields instead of using
+        // StopConditions::default() (which is permissive: max_episodes=0
+        // means unlimited).  When the request does not carry stop condition
+        // fields, we fall back to fail-closed defaults (max_episodes=1)
+        // so that sessions without explicit limits are constrained rather
+        // than unlimited.
         if let Some(ref store) = self.stop_conditions_store {
-            let conditions = crate::episode::envelope::StopConditions::default();
+            let conditions = crate::episode::envelope::StopConditions {
+                max_episodes: request.max_episodes.unwrap_or(1),
+                escalation_predicate: request.escalation_predicate.clone().unwrap_or_default(),
+                goal_predicate: String::new(),
+                failure_predicate: String::new(),
+            };
             if let Err(e) = store.register(&session_id, conditions) {
                 // Rollback session, telemetry, and restore evicted entries.
                 let rollback_warn = self.rollback_spawn(
@@ -6971,6 +6993,16 @@ impl PrivilegedDispatcher {
         // spawn/end cycles exhaust MAX_TELEMETRY_SESSIONS and block new
         // spawns (DoS). Mirrors the cleanup in session_dispatch.rs:1421.
         if let Some(ref store) = self.telemetry_store {
+            store.remove(&request.session_id);
+        }
+
+        // TCK-00351 BLOCKER 3 FIX: Clean up stop conditions on EndSession
+        // to free capacity in the bounded store.  Without this, stop
+        // conditions entries accumulate on every spawn/end cycle and are
+        // never reclaimed, causing the store to reach capacity and reject
+        // new registrations (DoS).  Same lifecycle as telemetry cleanup
+        // above.
+        if let Some(ref store) = self.stop_conditions_store {
             store.remove(&request.session_id);
         }
 
@@ -10161,6 +10193,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
 
@@ -10277,6 +10311,8 @@ mod tests {
                     work_id: "W-001".to_string(),
                     role: WorkRole::Implementer.into(),
                     lease_id: None,
+                    max_episodes: None,
+                    escalation_predicate: None,
                 }),
                 encode_issue_capability_request(&IssueCapabilityRequest {
                     session_id: "S-001".to_string(),
@@ -10358,6 +10394,8 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: None,
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -10468,6 +10506,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11138,6 +11178,8 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: None, // Missing required lease_id
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11183,6 +11225,8 @@ mod tests {
             work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some(lease_id), // Use the correct lease_id from ClaimWork
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11233,6 +11277,8 @@ mod tests {
             work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-WRONG-LEASE-ID".to_string()), // Wrong!
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11287,6 +11333,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: None, // Missing! Should fail because claim has a lease_id
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11336,6 +11384,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id), // Correct lease_id
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11379,6 +11429,8 @@ mod tests {
             work_id: work_id.clone(),
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -11431,6 +11483,8 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-UNKNOWN".to_string()), // Not registered
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11473,6 +11527,8 @@ mod tests {
             work_id: "W-002".to_string(), // Mismatched work_id
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-001".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11516,6 +11572,8 @@ mod tests {
             work_id: "W-VALID".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-VALID".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11653,6 +11711,8 @@ mod tests {
             work_id: "W-NONEXISTENT".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: None,
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11708,6 +11768,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -11774,6 +11836,8 @@ mod tests {
             work_id,
             role: WorkRole::Reviewer.into(), // Different from claimed role
             lease_id: None,
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -11831,6 +11895,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -12003,6 +12069,8 @@ mod tests {
             work_id: "W-team-alpha-test123".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -12066,6 +12134,8 @@ mod tests {
             work_id: "W-team-dev-test456".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-non-overlap-123".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -12131,6 +12201,8 @@ mod tests {
             work_id: "W-unknown-work-789".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-empty-authors-456".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -12186,6 +12258,8 @@ mod tests {
             work_id: "W-team-alpha-impl123".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: Some("L-implementer-789".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -13108,6 +13182,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -13208,6 +13284,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -13923,6 +14001,8 @@ mod tests {
                     work_id: work_id.clone(),
                     role: WorkRole::Implementer.into(),
                     lease_id: Some(lease_id),
+                    max_episodes: None,
+                    escalation_predicate: None,
                 };
                 let spawn_frame = encode_spawn_episode_request(&spawn_request);
                 let spawn_resp = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -14347,6 +14427,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
@@ -14677,6 +14759,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -14816,6 +14900,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15011,6 +15097,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15092,6 +15180,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15482,6 +15572,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15569,6 +15661,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15636,6 +15730,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15696,6 +15792,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15776,6 +15874,8 @@ mod tests {
                     work_id: work_id.clone(),
                     role: WorkRole::Implementer.into(),
                     lease_id: Some(lease_id),
+                    max_episodes: None,
+                    escalation_predicate: None,
                 };
                 let spawn_frame = encode_spawn_episode_request(&spawn_request);
                 let spawn_response = d.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15964,6 +16064,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -16066,6 +16168,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &valid_ctx).unwrap();
@@ -16158,6 +16262,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
@@ -19761,6 +19867,8 @@ mod tests {
                 work_id: "W-V3-SCOPE-NONE".to_string(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some("L-V3-001".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -19820,6 +19928,8 @@ mod tests {
                 work_id: "W-V3-SCOPE-NARROW".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-002".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -19883,6 +19993,8 @@ mod tests {
                 work_id: "W-V3-RISK-CEIL".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-003".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -19944,6 +20056,8 @@ mod tests {
                 work_id: "W-V3-RISK-INV".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-004".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
