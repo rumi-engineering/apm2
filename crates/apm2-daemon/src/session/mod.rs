@@ -155,7 +155,17 @@ pub trait SessionRegistry: Send + Sync {
     /// Returns the removed session state, or `None` if the session was not
     /// found. Used for transactional rollback when post-registration steps
     /// fail (TCK-00384 security fix).
-    fn remove_session(&self, session_id: &str) -> Option<SessionState>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionRegistryError::PersistenceFailed`] if the removal
+    /// succeeds in-memory but fails to persist to durable storage.
+    /// Persistent backends MUST propagate persistence errors so callers
+    /// know the on-disk state may be stale (TCK-00384 security BLOCKER 2).
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError>;
 
     /// Queries a session by session ID.
     fn get_session(&self, session_id: &str) -> Option<SessionState>;
@@ -222,6 +232,20 @@ pub enum SessionRegistryError {
     #[error("session registration failed: {message}")]
     RegistrationFailed {
         /// Error message.
+        message: String,
+    },
+
+    /// Persistence failed after an in-memory mutation.
+    ///
+    /// TCK-00384 security BLOCKER 2: persistent backends MUST propagate
+    /// persistence errors instead of silently swallowing them.  When this
+    /// error is returned from `remove_session`, the in-memory state has
+    /// already been updated but the on-disk state is stale.  Callers
+    /// should treat this as a critical failure and avoid assuming the
+    /// removal was durable.
+    #[error("persistence failed: {message}")]
+    PersistenceFailed {
+        /// Error message describing the persistence failure.
         message: String,
     },
 }
@@ -471,6 +495,50 @@ impl SessionTelemetryStore {
     pub fn remove(&self, session_id: &str) {
         let mut entries = self.entries.write().expect("lock poisoned");
         entries.remove(session_id);
+    }
+
+    /// Removes telemetry for a session and returns the entry.
+    ///
+    /// TCK-00384 security BLOCKER 1: Used during spawn eviction to capture
+    /// the evicted telemetry entry BEFORE removal.  If a later spawn step
+    /// fails, the caller can pass this entry to [`Self::restore`] alongside
+    /// the re-registered session to make the rollback complete.
+    #[must_use]
+    pub fn remove_and_return(&self, session_id: &str) -> Option<Arc<SessionTelemetry>> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.remove(session_id)
+    }
+
+    /// Restores a previously removed telemetry entry.
+    ///
+    /// TCK-00384 security BLOCKER 1: Complements [`Self::remove_and_return`].
+    /// On rollback, callers pass back the `Arc<SessionTelemetry>` obtained
+    /// during eviction so counters and timestamps are preserved exactly.
+    ///
+    /// If the session ID already exists (idempotent case), the existing
+    /// entry is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryStoreError::AtCapacity`] if the store is full and
+    /// the entry is not already present.
+    pub fn restore(
+        &self,
+        session_id: &str,
+        entry: Arc<SessionTelemetry>,
+    ) -> Result<(), TelemetryStoreError> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        if entries.contains_key(session_id) {
+            return Ok(());
+        }
+        if entries.len() >= MAX_TELEMETRY_SESSIONS {
+            return Err(TelemetryStoreError::AtCapacity {
+                session_id: session_id.to_string(),
+                max: MAX_TELEMETRY_SESSIONS,
+            });
+        }
+        entries.insert(session_id.to_string(), entry);
+        Ok(())
     }
 
     /// Returns the number of tracked sessions.

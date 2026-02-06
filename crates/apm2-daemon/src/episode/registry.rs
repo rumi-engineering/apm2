@@ -971,15 +971,18 @@ impl SessionRegistry for InMemorySessionRegistry {
         Ok(evicted)
     }
 
-    fn remove_session(&self, session_id: &str) -> Option<SessionState> {
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError> {
         let mut state = self.state.write().expect("lock poisoned");
 
         if let Some(session) = state.by_id.remove(session_id) {
             state.by_handle.remove(&session.ephemeral_handle);
             state.queue.retain(|id| id != session_id);
-            Some(session)
+            Ok(Some(session))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -1904,23 +1907,21 @@ impl SessionRegistry for PersistentSessionRegistry {
         Ok(evicted)
     }
 
-    fn remove_session(&self, session_id: &str) -> Option<SessionState> {
-        let removed = self.inner.remove_session(session_id);
+    fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionState>, SessionRegistryError> {
+        let removed = self.inner.remove_session(session_id)?;
         if removed.is_some() {
-            // TCK-00384 security fix: persist after removal so the delete
-            // is durable across restarts (prevents session ghosts).
-            if let Err(e) = self.persist() {
-                // Log but don't fail -- the in-memory state is already
-                // consistent.  A subsequent register_session or graceful
-                // shutdown will re-persist the full state.
-                tracing::warn!(
-                    session_id,
-                    error = %e,
-                    "Failed to persist state after session removal"
-                );
-            }
+            // TCK-00384 security BLOCKER 2: persist after removal so the
+            // delete is durable across restarts.  Persistence failures are
+            // now propagated (fail-closed) instead of silently swallowed.
+            self.persist()
+                .map_err(|e| SessionRegistryError::PersistenceFailed {
+                    message: format!("Failed to persist state after session removal: {e}"),
+                })?;
         }
-        removed
+        Ok(removed)
     }
 
     fn get_session(&self, session_id: &str) -> Option<SessionState> {
@@ -2067,7 +2068,7 @@ mod session_registry_tests {
             SessionRegistryError::DuplicateSessionId { session_id } => {
                 assert_eq!(session_id, "sess-1");
             },
-            other @ SessionRegistryError::RegistrationFailed { .. } => {
+            other => {
                 panic!("Expected DuplicateSessionId, got: {other:?}")
             },
         }
@@ -2433,7 +2434,7 @@ mod session_registry_tests {
             let registry = PersistentSessionRegistry::load_from_file(path).unwrap();
             assert_eq!(registry.session_count(), 2);
 
-            let removed = registry.remove_session("sess-remove");
+            let removed = registry.remove_session("sess-remove").unwrap();
             assert!(removed.is_some());
             assert_eq!(removed.unwrap().session_id, "sess-remove");
             assert_eq!(registry.session_count(), 1);
@@ -2484,7 +2485,7 @@ mod session_registry_tests {
         assert_eq!(evicted_session.work_id, "work-sess-0");
 
         // Simulate rollback: remove new session and re-register evicted one
-        registry.remove_session("sess-overflow");
+        registry.remove_session("sess-overflow").unwrap();
         let restore_result = registry.register_session(evicted_session.clone());
         assert!(
             restore_result.is_ok(),
@@ -2498,6 +2499,61 @@ mod session_registry_tests {
             registry.get_session("sess-overflow").is_none(),
             "Rolled-back session should be gone"
         );
+    }
+
+    /// TCK-00384 Security BLOCKER 2: Verify that
+    /// `PersistentSessionRegistry::remove_session` propagates persistence
+    /// failures via `SessionRegistryError::PersistenceFailed` instead of
+    /// silently logging them.
+    #[test]
+    fn test_persistent_remove_session_propagates_persistence_error() {
+        // Point the persistent registry at a read-only directory so that
+        // `persist()` will fail when we try to write the state file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let registry = PersistentSessionRegistry::new(&path);
+
+        // Register a session (this creates the state file)
+        let session = make_session("sess-persist-err", "handle-persist-err");
+        registry.register_session(session).unwrap();
+
+        // Make the state file's parent directory read-only so that the
+        // atomic rename in persist() fails.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+
+            // remove_session should now return Err(PersistenceFailed)
+            let result = registry.remove_session("sess-persist-err");
+            assert!(
+                result.is_err(),
+                "remove_session must propagate persistence failure"
+            );
+            match result.unwrap_err() {
+                SessionRegistryError::PersistenceFailed { message } => {
+                    assert!(
+                        message.contains("persist"),
+                        "Error message should mention persistence: {message}"
+                    );
+                },
+                other => {
+                    panic!("Expected PersistenceFailed, got: {other:?}");
+                },
+            }
+
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // On non-unix platforms, persistence should succeed normally
+        #[cfg(not(unix))]
+        {
+            let result = registry.remove_session("sess-persist-err");
+            assert!(result.is_ok());
+        }
     }
 }
 
