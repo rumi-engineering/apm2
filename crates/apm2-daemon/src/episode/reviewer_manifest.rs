@@ -133,6 +133,14 @@ pub fn reviewer_v0_manifest_hash() -> &'static [u8; 32] {
 /// Returns an error if manifest validation fails (should not happen for
 /// the canonical manifest).
 pub fn build_reviewer_v0_manifest() -> Result<CapabilityManifest, CapabilityError> {
+    // TCK-00352 BLOCKER 2 fix: V1 minting requires a non-zero expiry.
+    // Use a deterministic far-future timestamp (2099-01-01T00:00:00Z)
+    // so that the canonical manifest hash remains stable while still
+    // satisfying V1 expiry requirements. Without this, V1 minting
+    // always fails for the reviewer manifest, leaving sessions without
+    // V1 scope enforcement (fail-open).
+    const REVIEWER_V0_EXPIRY: u64 = 4_070_908_800; // 2099-01-01 UTC
+
     // Use a deterministic timestamp for canonical manifest
     // This ensures the manifest hash is stable across builds
     let created_at = 0u64; // Epoch timestamp for canonical version
@@ -140,6 +148,7 @@ pub fn build_reviewer_v0_manifest() -> Result<CapabilityManifest, CapabilityErro
     CapabilityManifestBuilder::new(REVIEWER_V0_MANIFEST_ID)
         .delegator(DAEMON_DELEGATOR_ID)
         .created_at(created_at)
+        .expires_at(REVIEWER_V0_EXPIRY)
         // Read capability: file reading for code review
         .capability(
             Capability::builder("cap-reviewer-read", ToolClass::Read)
@@ -198,14 +207,20 @@ pub fn build_reviewer_v0_manifest_dynamic(
     manifest_id: &str,
     delegator_id: &str,
 ) -> Result<CapabilityManifest, CapabilityError> {
+    // TCK-00352 BLOCKER 2 fix: dynamic manifests also need non-zero
+    // expiry for V1 compatibility. Default to 24 hours from now.
+    const DEFAULT_MANIFEST_TTL_SECS: u64 = 86400; // 24 hours
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs();
+    let expires_at = now + DEFAULT_MANIFEST_TTL_SECS;
 
     CapabilityManifestBuilder::new(manifest_id)
         .delegator(delegator_id)
         .created_at(now)
+        .expires_at(expires_at)
         .capability(
             Capability::builder("cap-reviewer-read", ToolClass::Read)
                 .scope(CapabilityScope::allow_all())
@@ -365,11 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn test_reviewer_v0_manifest_no_expiration() {
+    fn test_reviewer_v0_manifest_has_v1_compatible_expiry() {
         let manifest = reviewer_v0_manifest();
+        // TCK-00352 BLOCKER 2 fix: V1 manifests require non-zero expiry.
+        // The canonical reviewer manifest uses a deterministic far-future
+        // expiry (2099-01-01 UTC) to ensure V1 minting succeeds.
+        assert!(
+            manifest.expires_at > 0,
+            "Canonical manifest must have non-zero expiry for V1 compatibility"
+        );
         assert_eq!(
-            manifest.expires_at, 0,
-            "Canonical manifest should not expire"
+            manifest.expires_at, 4_070_908_800,
+            "Canonical manifest expiry must be deterministic (2099-01-01 UTC)"
         );
         assert!(!manifest.is_expired());
     }

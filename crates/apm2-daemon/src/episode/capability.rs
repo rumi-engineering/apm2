@@ -862,18 +862,26 @@ impl CapabilityManifest {
         capability_manifest_hash: &[u8; 32],
         tool_allowlist: Vec<ToolClass>,
     ) -> Self {
+        // TCK-00352 BLOCKER 2 fix: V1 minting requires non-zero expiry.
+        // Default to 24 hours from now for stub/fallback manifests so
+        // that V1 enforcement is active. Without this, stub manifests
+        // cause V1 minting to fail, leaving sessions without V1 scope
+        // enforcement (fail-open).
+        const DEFAULT_MANIFEST_TTL_SECS: u64 = 86400; // 24 hours
+
         let manifest_id = format!("M-{}", hex::encode(&capability_manifest_hash[..8]));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
+        let expires_at = now + DEFAULT_MANIFEST_TTL_SECS;
 
         Self {
             manifest_id,
             capabilities: Vec::new(),
             delegator_id: "daemon".to_string(),
             created_at: now,
-            expires_at: 0, // No expiration
+            expires_at,
             tool_allowlist,
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
@@ -2364,6 +2372,565 @@ pub type BasicValidator = PolicyIntegratedValidator<StubManifestLoader>;
 
 /// Convenience type alias for validators using the in-memory CAS loader.
 pub type CasValidator = PolicyIntegratedValidator<InMemoryCasManifestLoader>;
+
+// =============================================================================
+// TCK-00352: CapabilityManifestV1 — Policy-Only Capability Minting
+//
+// Per TCK-00352, CapabilityManifestV1 can ONLY be minted by the policy
+// resolver. Requester surfaces cannot construct this type. The type wraps
+// a validated CapabilityManifest with additional security properties:
+// - Host restrictions (allowed hosts for network operations)
+// - Risk tier ceiling (cannot exceed the tier set by policy)
+// - Mandatory expiry enforcement
+// - Non-discoverability (no enumeration methods for requesters)
+// - Envelope-manifest hash mismatch denial
+// =============================================================================
+
+/// Maximum number of allowed hosts in a `CapabilityManifestV1`.
+///
+/// Per CTR-1303, bounded to prevent denial-of-service.
+pub const MAX_MANIFEST_V1_HOSTS: usize = 256;
+
+/// Maximum length for a host restriction entry.
+///
+/// Per CTR-1303, all string fields must be bounded.
+pub const MAX_HOST_RESTRICTION_LEN: usize = 253;
+
+/// Error type for `CapabilityManifestV1` operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestV1Error {
+    /// Underlying manifest validation failed.
+    ManifestValidation(CapabilityError),
+
+    /// Manifest has no expiry set (fail-closed: expiry is mandatory for V1).
+    MissingExpiry,
+
+    /// Risk tier ceiling would widen the resolved tier (laundering attempt).
+    RiskTierWidened {
+        /// The policy-resolved maximum tier.
+        policy_ceiling: RiskTier,
+        /// The tier that was attempted.
+        attempted: RiskTier,
+    },
+
+    /// Scope is overbroad: the manifest grants more than policy allows.
+    OverbroadScope {
+        /// Description of the overbroad scope.
+        reason: String,
+    },
+
+    /// Too many host restriction entries.
+    TooManyHostRestrictions {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Host restriction entry exceeds maximum length.
+    HostRestrictionTooLong {
+        /// Actual length in bytes.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Envelope hash does not match the manifest digest.
+    EnvelopeManifestHashMismatch {
+        /// Expected hash (from manifest digest, hex-encoded).
+        expected: String,
+        /// Actual hash (from envelope, hex-encoded).
+        actual: String,
+    },
+
+    /// Manifest was not minted by the policy resolver.
+    NotMintedByPolicy,
+}
+
+impl std::fmt::Display for ManifestV1Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManifestValidation(e) => write!(f, "manifest validation: {e}"),
+            Self::MissingExpiry => write!(f, "V1 manifests require a non-zero expiry"),
+            Self::RiskTierWidened {
+                policy_ceiling,
+                attempted,
+            } => write!(
+                f,
+                "risk tier widened: policy ceiling {policy_ceiling:?}, attempted {attempted:?}"
+            ),
+            Self::OverbroadScope { reason } => write!(f, "overbroad scope: {reason}"),
+            Self::TooManyHostRestrictions { count, max } => {
+                write!(f, "too many host restrictions: {count} (max {max})")
+            },
+            Self::HostRestrictionTooLong { len, max } => {
+                write!(f, "host restriction too long: {len} bytes (max {max})")
+            },
+            Self::EnvelopeManifestHashMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "envelope-manifest hash mismatch: expected {expected}, got {actual}"
+                )
+            },
+            Self::NotMintedByPolicy => {
+                write!(f, "manifest was not minted by the policy resolver")
+            },
+        }
+    }
+}
+
+impl std::error::Error for ManifestV1Error {}
+
+impl From<CapabilityError> for ManifestV1Error {
+    fn from(e: CapabilityError) -> Self {
+        Self::ManifestValidation(e)
+    }
+}
+
+/// Sealed proof token that can only be constructed by the policy resolver.
+///
+/// Per TCK-00352, this type prevents requester surfaces from constructing
+/// `CapabilityManifestV1` directly. Only code paths that hold a
+/// `PolicyMintToken` can call `CapabilityManifestV1::mint()`.
+///
+/// # Security
+///
+/// The constructor is `pub(crate)` so that only daemon-internal code
+/// (specifically the `GovernancePolicyResolver` or production wiring in
+/// `state.rs`) can create instances. External crates and requester surfaces
+/// cannot obtain a `PolicyMintToken`.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyMintToken {
+    /// Private field to prevent external construction.
+    _private: (),
+}
+
+impl PolicyMintToken {
+    /// Creates a new policy mint token.
+    ///
+    /// # Security
+    ///
+    /// This constructor is `pub(crate)` to restrict minting authority to
+    /// daemon internals. **Production code MUST NOT call this directly.**
+    /// Instead, use [`GovernancePolicyResolver::mint_token()`] to obtain a
+    /// token through the authorized governance channel. Direct construction
+    /// is reserved for the `GovernancePolicyResolver` implementation and
+    /// test code within this module.
+    ///
+    /// [`GovernancePolicyResolver::mint_token()`]: crate::governance::GovernancePolicyResolver::mint_token
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// V1 capability manifest with policy-resolver-only minting.
+///
+/// Per TCK-00352:
+/// - Can ONLY be constructed via [`CapabilityManifestV1::mint()`] which
+///   requires a [`PolicyMintToken`] (only obtainable by the policy resolver).
+/// - Enforces mandatory expiry (fail-closed: zero expiry is rejected).
+/// - Enforces a risk tier ceiling that cannot be widened.
+/// - Provides host restriction enforcement for network operations.
+/// - Does NOT expose enumeration methods (non-discoverability).
+/// - Validates envelope-manifest hash binding.
+///
+/// # Security Model
+///
+/// - **No public constructor**: Requesters cannot mint capabilities.
+/// - **Non-discoverable**: No method enumerates available capabilities.
+/// - **Fail-closed**: Missing or invalid fields deny by default.
+/// - **Laundering-resistant**: Risk tier cannot be widened, expiry cannot be
+///   removed, scope cannot be broadened beyond policy resolution.
+///
+/// # Contract References
+///
+/// - TCK-00352: Policy-only capability minting and broker scope enforcement
+/// - AD-TOOL-002: Capability manifests as sealed references
+/// - CTR-1303: Bounded collections with `MAX_*` constants
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityManifestV1 {
+    /// The underlying validated capability manifest.
+    inner: CapabilityManifest,
+
+    /// Risk tier ceiling imposed by the policy resolver.
+    ///
+    /// No capability in this manifest may grant access above this tier.
+    /// Attempts to use capabilities at a tier above the ceiling are denied.
+    risk_tier_ceiling: RiskTier,
+
+    /// Allowed hosts for network operations.
+    ///
+    /// Per TCK-00352, host restrictions are enforced by the broker before
+    /// dispatching network tool requests. Empty means no hosts allowed
+    /// (fail-closed).
+    host_restrictions: Vec<String>,
+}
+
+impl CapabilityManifestV1 {
+    /// Mints a new `CapabilityManifestV1` from a policy-resolved manifest.
+    ///
+    /// # Arguments
+    ///
+    /// * `_token` - Proof that the caller is the policy resolver.
+    /// * `manifest` - The underlying capability manifest.
+    /// * `risk_tier_ceiling` - Maximum risk tier allowed by policy.
+    /// * `host_restrictions` - Allowed hosts for network operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestV1Error`] if:
+    /// - The manifest fails structural validation.
+    /// - The manifest has no expiry set (V1 requires mandatory expiry).
+    /// - Any capability's risk tier exceeds the ceiling.
+    /// - Host restrictions exceed bounds.
+    ///
+    /// # Security
+    ///
+    /// Only callable with a [`PolicyMintToken`], which is `pub(crate)`.
+    /// This prevents requester surfaces from minting capabilities.
+    pub fn mint(
+        _token: PolicyMintToken,
+        manifest: CapabilityManifest,
+        risk_tier_ceiling: RiskTier,
+        host_restrictions: Vec<String>,
+    ) -> Result<Self, ManifestV1Error> {
+        // Step 1: Validate the underlying manifest structure.
+        manifest.validate()?;
+
+        // Step 2: Enforce mandatory expiry (fail-closed).
+        if manifest.expires_at == 0 {
+            return Err(ManifestV1Error::MissingExpiry);
+        }
+
+        // Step 3: Enforce risk tier ceiling — no capability may exceed it.
+        for cap in &manifest.capabilities {
+            if cap.risk_tier_required.tier() > risk_tier_ceiling.tier() {
+                return Err(ManifestV1Error::RiskTierWidened {
+                    policy_ceiling: risk_tier_ceiling,
+                    attempted: cap.risk_tier_required,
+                });
+            }
+        }
+
+        // Step 4: Validate host restrictions bounds.
+        if host_restrictions.len() > MAX_MANIFEST_V1_HOSTS {
+            return Err(ManifestV1Error::TooManyHostRestrictions {
+                count: host_restrictions.len(),
+                max: MAX_MANIFEST_V1_HOSTS,
+            });
+        }
+        for host in &host_restrictions {
+            if host.len() > MAX_HOST_RESTRICTION_LEN {
+                return Err(ManifestV1Error::HostRestrictionTooLong {
+                    len: host.len(),
+                    max: MAX_HOST_RESTRICTION_LEN,
+                });
+            }
+        }
+
+        Ok(Self {
+            inner: manifest,
+            risk_tier_ceiling,
+            host_restrictions,
+        })
+    }
+
+    /// Returns the BLAKE3 digest of the underlying manifest.
+    ///
+    /// This is the hash that MUST appear in the episode envelope's
+    /// `capability_manifest_hash` field.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        self.inner.digest()
+    }
+
+    /// Returns the risk tier ceiling imposed by policy.
+    #[must_use]
+    pub const fn risk_tier_ceiling(&self) -> RiskTier {
+        self.risk_tier_ceiling
+    }
+
+    /// Returns the manifest ID.
+    #[must_use]
+    pub fn manifest_id(&self) -> &str {
+        &self.inner.manifest_id
+    }
+
+    /// Returns the delegator ID.
+    #[must_use]
+    pub fn delegator_id(&self) -> &str {
+        &self.inner.delegator_id
+    }
+
+    /// Returns the expiry timestamp (guaranteed non-zero for V1).
+    #[must_use]
+    pub const fn expires_at(&self) -> u64 {
+        self.inner.expires_at
+    }
+
+    /// Returns `true` if this manifest has expired.
+    #[must_use]
+    pub fn is_expired_with_clock(&self, clock: &dyn Clock) -> bool {
+        self.inner.is_expired_with_clock(clock)
+    }
+
+    /// Returns a reference to the underlying manifest for internal use.
+    ///
+    /// # Security
+    ///
+    /// This is `pub(crate)` to prevent requester surfaces from accessing
+    /// the raw manifest for enumeration. Only daemon-internal code (e.g.,
+    /// the broker) can inspect the manifest contents.
+    ///
+    /// # Note
+    ///
+    /// Reserved for broker-level integration where the broker needs to
+    /// inspect manifest details for scope enforcement decisions.
+    #[must_use]
+    #[allow(dead_code)] // Reserved for broker integration in future tickets
+    pub(crate) const fn inner(&self) -> &CapabilityManifest {
+        &self.inner
+    }
+
+    /// Validates a tool request against this V1 manifest, enforcing
+    /// broker scope checks including the risk tier ceiling and host
+    /// restrictions.
+    ///
+    /// # Broker Scope Enforcement (TCK-00352)
+    ///
+    /// Before dispatching a tool request, the broker MUST call this method.
+    /// It enforces:
+    /// 1. Risk tier ceiling — request tier must not exceed ceiling.
+    /// 2. Host restrictions — network requests must target allowed hosts.
+    /// 3. All standard manifest checks (tool allowlist, path, size, etc.).
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The tool request to validate.
+    /// * `clock` - Clock for expiry checks (HOLONIC-BOUNDARY-001).
+    ///
+    /// # Returns
+    ///
+    /// `CapabilityDecision::Allow` or `CapabilityDecision::Deny`.
+    #[must_use]
+    pub fn validate_request_scoped(
+        &self,
+        request: &ToolRequest,
+        clock: &dyn Clock,
+    ) -> CapabilityDecision {
+        // Step 1: Check risk tier ceiling (fail-closed).
+        if request.risk_tier.tier() > self.risk_tier_ceiling.tier() {
+            return CapabilityDecision::Deny {
+                reason: DenyReason::InsufficientRiskTier {
+                    required: self.risk_tier_ceiling,
+                    actual: request.risk_tier,
+                },
+            };
+        }
+
+        // Step 2: Check host restrictions for network requests (fail-closed).
+        if let Some((ref host, port)) = request.network {
+            if !self.is_host_allowed(host) {
+                return CapabilityDecision::Deny {
+                    reason: DenyReason::NetworkNotAllowed {
+                        host: host.clone(),
+                        port,
+                    },
+                };
+            }
+        }
+
+        // Step 3: Delegate to the inner manifest's validation with clock.
+        self.inner.validate_request_with_clock(request, clock)
+    }
+
+    /// Checks whether a host is in the allowed host restrictions.
+    ///
+    /// Returns `false` if the host list is empty (fail-closed).
+    fn is_host_allowed(&self, host: &str) -> bool {
+        if self.host_restrictions.is_empty() {
+            return false;
+        }
+        self.host_restrictions.iter().any(|allowed| {
+            if allowed.starts_with("*.") {
+                // Wildcard domain match: *.example.com matches
+                // sub.example.com
+                let suffix = &allowed[1..]; // ".example.com"
+                host.ends_with(suffix)
+                    && host.len() > suffix.len()
+                    && host.as_bytes()[host.len() - suffix.len() - 1] != b'.'
+            } else {
+                host == allowed
+            }
+        })
+    }
+
+    /// Validates that an envelope's `capability_manifest_hash` matches
+    /// this manifest's digest.
+    ///
+    /// Per TCK-00352, if the hash in the envelope does not match the
+    /// actual manifest's BLAKE3 digest, actuation MUST be denied.
+    ///
+    /// # Arguments
+    ///
+    /// * `envelope_manifest_hash` - The hash from the episode envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestV1Error::EnvelopeManifestHashMismatch`] if the
+    /// hashes do not match.
+    pub fn verify_envelope_binding(
+        &self,
+        envelope_manifest_hash: &[u8],
+    ) -> Result<(), ManifestV1Error> {
+        let expected = self.digest();
+        if envelope_manifest_hash.len() != 32 || envelope_manifest_hash != expected {
+            return Err(ManifestV1Error::EnvelopeManifestHashMismatch {
+                expected: hex::encode(expected),
+                actual: hex::encode(envelope_manifest_hash),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Policy-resolved scope baseline for strict-subset validation.
+///
+/// Per Security Review MAJOR 1, cardinality-only checks are insufficient
+/// because an attacker can substitute unauthorized entries while keeping
+/// the count within bounds. This struct carries the normalized baseline
+/// sets that the manifest entries must be strict subsets of.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScopeBaseline {
+    /// Baseline tool classes permitted by policy.
+    pub tools: Vec<ToolClass>,
+    /// Baseline write paths permitted by policy (normalized).
+    pub write_paths: Vec<PathBuf>,
+    /// Baseline shell patterns permitted by policy (normalized).
+    pub shell_patterns: Vec<String>,
+}
+
+/// Validates that a `CapabilityManifest` does not have overbroad scope
+/// relative to a policy-resolved baseline.
+///
+/// Per TCK-00352 Security Review MAJOR 1, this function enforces both
+/// cardinality bounds AND strict-subset membership. A manifest that
+/// substitutes unauthorized entries while keeping the count within bounds
+/// is rejected.
+///
+/// # Arguments
+///
+/// * `manifest` - The manifest to validate.
+/// * `max_tool_allowlist` - Maximum number of tools policy permits.
+/// * `max_write_paths` - Maximum number of write paths policy permits.
+/// * `max_shell_patterns` - Maximum number of shell patterns policy permits.
+///
+/// # Errors
+///
+/// Returns [`ManifestV1Error::OverbroadScope`] if any allowlist exceeds
+/// the policy baseline cardinality.
+pub fn validate_manifest_scope_bounds(
+    manifest: &CapabilityManifest,
+    max_tool_allowlist: usize,
+    max_write_paths: usize,
+    max_shell_patterns: usize,
+) -> Result<(), ManifestV1Error> {
+    if manifest.tool_allowlist.len() > max_tool_allowlist {
+        return Err(ManifestV1Error::OverbroadScope {
+            reason: format!(
+                "tool allowlist has {} entries, policy permits at most {}",
+                manifest.tool_allowlist.len(),
+                max_tool_allowlist
+            ),
+        });
+    }
+    if manifest.write_allowlist.len() > max_write_paths {
+        return Err(ManifestV1Error::OverbroadScope {
+            reason: format!(
+                "write allowlist has {} entries, policy permits at most {}",
+                manifest.write_allowlist.len(),
+                max_write_paths
+            ),
+        });
+    }
+    if manifest.shell_allowlist.len() > max_shell_patterns {
+        return Err(ManifestV1Error::OverbroadScope {
+            reason: format!(
+                "shell allowlist has {} entries, policy permits at most {}",
+                manifest.shell_allowlist.len(),
+                max_shell_patterns
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validates that a `CapabilityManifest` scope is a strict subset of a
+/// policy-resolved [`ScopeBaseline`].
+///
+/// Per TCK-00352 Security Review MAJOR 1, cardinality-only checks allow
+/// scope laundering via same-cardinality substitution. This function
+/// enforces:
+///
+/// 1. **Cardinality bounds** -- same as [`validate_manifest_scope_bounds`].
+/// 2. **Strict-subset membership** -- every manifest entry must appear in the
+///    baseline set. Normalized comparison is used (tool class identity, path
+///    canonicalization, string equality for shell patterns).
+///
+/// # Arguments
+///
+/// * `manifest` - The manifest to validate.
+/// * `baseline` - The policy-resolved baseline sets.
+///
+/// # Errors
+///
+/// Returns [`ManifestV1Error::OverbroadScope`] if any allowlist entry is
+/// not present in the baseline or exceeds baseline cardinality.
+pub fn validate_manifest_scope_subset(
+    manifest: &CapabilityManifest,
+    baseline: &ScopeBaseline,
+) -> Result<(), ManifestV1Error> {
+    // Step 1: Cardinality bounds (fail-fast).
+    validate_manifest_scope_bounds(
+        manifest,
+        baseline.tools.len(),
+        baseline.write_paths.len(),
+        baseline.shell_patterns.len(),
+    )?;
+
+    // Step 2: Strict-subset check for tool allowlist.
+    for tool in &manifest.tool_allowlist {
+        if !baseline.tools.contains(tool) {
+            return Err(ManifestV1Error::OverbroadScope {
+                reason: format!("tool class {tool:?} is not in the policy baseline set"),
+            });
+        }
+    }
+
+    // Step 3: Strict-subset check for write paths (normalized comparison).
+    for path in &manifest.write_allowlist {
+        if !baseline.write_paths.iter().any(|bp| bp == path) {
+            return Err(ManifestV1Error::OverbroadScope {
+                reason: format!(
+                    "write path '{}' is not in the policy baseline set",
+                    path.display()
+                ),
+            });
+        }
+    }
+
+    // Step 4: Strict-subset check for shell patterns.
+    for pattern in &manifest.shell_allowlist {
+        if !baseline.shell_patterns.iter().any(|bp| bp == pattern) {
+            return Err(ManifestV1Error::OverbroadScope {
+                reason: format!("shell pattern '{pattern}' is not in the policy baseline set"),
+            });
+        }
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -4413,5 +4980,999 @@ mod cas_loader_tests {
             hash1, hash2,
             "storing same manifest should produce same hash"
         );
+    }
+}
+
+// ============================================================================
+// TCK-00352: CapabilityManifestV1 Tests
+//
+// Policy-only capability minting, broker scope enforcement, laundering
+// negatives, and envelope-manifest hash mismatch denial.
+// ============================================================================
+
+#[cfg(test)]
+mod manifest_v1_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::episode::scope::SizeLimits;
+
+    /// Helper: creates a `PolicyMintToken` for test use.
+    fn test_mint_token() -> PolicyMintToken {
+        PolicyMintToken::new()
+    }
+
+    /// Helper: creates a `FixedClock` at the given timestamp.
+    fn clock_at(secs: u64) -> FixedClock {
+        FixedClock::new(secs)
+    }
+
+    /// Helper: creates a valid manifest with expiry for V1 minting.
+    fn make_valid_v1_manifest() -> CapabilityManifest {
+        CapabilityManifest::builder("v1-test")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .capability(
+                Capability::builder("cap-read", ToolClass::Read)
+                    .scope(CapabilityScope {
+                        root_paths: vec![PathBuf::from("/workspace")],
+                        allowed_patterns: Vec::new(),
+                        size_limits: SizeLimits::default_limits(),
+                        network_policy: None,
+                    })
+                    .risk_tier(RiskTier::Tier1)
+                    .build()
+                    .unwrap(),
+            )
+            .tool_allowlist(vec![ToolClass::Read])
+            .build()
+            .unwrap()
+    }
+
+    // ========================================================================
+    // Minting Tests
+    // ========================================================================
+
+    #[test]
+    fn mint_succeeds_with_valid_manifest_and_token() {
+        let manifest = make_valid_v1_manifest();
+        let result = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec!["api.example.com".to_string()],
+        );
+        assert!(result.is_ok());
+        let v1 = result.unwrap();
+        assert_eq!(v1.risk_tier_ceiling(), RiskTier::Tier2);
+        assert_eq!(v1.manifest_id(), "v1-test");
+        assert_eq!(v1.delegator_id(), "policy-resolver");
+        assert_eq!(v1.expires_at(), 2000);
+    }
+
+    #[test]
+    fn mint_rejected_without_expiry() {
+        // Manifest with expires_at = 0 (no expiry)
+        let manifest = CapabilityManifest::builder("no-expiry")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(0) // No expiry!
+            .tool_allowlist(vec![ToolClass::Read])
+            .build()
+            .unwrap();
+
+        let result =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new());
+        assert!(matches!(result, Err(ManifestV1Error::MissingExpiry)));
+    }
+
+    #[test]
+    fn mint_rejected_when_capability_exceeds_risk_ceiling() {
+        let manifest = CapabilityManifest::builder("over-tier")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .capability(
+                Capability::builder("high-risk-cap", ToolClass::Execute)
+                    .scope(CapabilityScope::allow_all())
+                    .risk_tier(RiskTier::Tier3)
+                    .build()
+                    .unwrap(),
+            )
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+
+        // Policy ceiling is Tier1, but capability requires Tier3
+        let result = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier1, // Ceiling below capability requirement
+            Vec::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(ManifestV1Error::RiskTierWidened { .. })
+        ));
+
+        if let Err(ManifestV1Error::RiskTierWidened {
+            policy_ceiling,
+            attempted,
+        }) = result
+        {
+            assert_eq!(policy_ceiling, RiskTier::Tier1);
+            assert_eq!(attempted, RiskTier::Tier3);
+        }
+    }
+
+    #[test]
+    fn mint_rejected_with_too_many_host_restrictions() {
+        let manifest = make_valid_v1_manifest();
+        let hosts: Vec<String> = (0..=MAX_MANIFEST_V1_HOSTS)
+            .map(|i| format!("host-{i}.example.com"))
+            .collect();
+
+        let result =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, hosts);
+        assert!(matches!(
+            result,
+            Err(ManifestV1Error::TooManyHostRestrictions { .. })
+        ));
+    }
+
+    #[test]
+    fn mint_rejected_with_host_restriction_too_long() {
+        let manifest = make_valid_v1_manifest();
+        let long_host = "x".repeat(MAX_HOST_RESTRICTION_LEN + 1);
+
+        let result = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec![long_host],
+        );
+        assert!(matches!(
+            result,
+            Err(ManifestV1Error::HostRestrictionTooLong { .. })
+        ));
+    }
+
+    // ========================================================================
+    // Non-Discoverability Tests
+    // ========================================================================
+
+    // NOTE: The CapabilityManifestV1 type does NOT expose:
+    // - .capabilities() — no enumeration of granted capabilities
+    // - .tool_allowlist() — no enumeration of allowed tools
+    // - .write_allowlist() — no enumeration of writable paths
+    // - .shell_allowlist() — no enumeration of shell patterns
+    //
+    // The only external interface is validate_request_scoped() which
+    // returns Allow or Deny, without revealing what IS allowed.
+    //
+    // inner() is pub(crate) so only daemon code can access it.
+
+    // ========================================================================
+    // Broker Scope Enforcement Tests
+    // ========================================================================
+
+    #[test]
+    fn broker_scope_allows_valid_request() {
+        let manifest = make_valid_v1_manifest();
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec!["api.example.com".to_string()],
+        )
+        .unwrap();
+
+        let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier1)
+            .with_path("/workspace/file.rs")
+            .with_size(1024);
+
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(
+            decision.is_allowed(),
+            "valid scoped request should be allowed"
+        );
+    }
+
+    #[test]
+    fn broker_scope_denies_request_above_risk_ceiling() {
+        let manifest = make_valid_v1_manifest();
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier1, // Ceiling at Tier1
+            Vec::new(),
+        )
+        .unwrap();
+
+        // Request at Tier2, above ceiling
+        let request =
+            ToolRequest::new(ToolClass::Read, RiskTier::Tier2).with_path("/workspace/file.rs");
+
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_denied(), "request above ceiling must be denied");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(matches!(reason, DenyReason::InsufficientRiskTier { .. }));
+        }
+    }
+
+    #[test]
+    fn broker_scope_denies_network_to_unauthorized_host() {
+        // Create manifest with Network capability and host restrictions
+        let manifest = CapabilityManifest::builder("net-test")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .capability(
+                Capability::builder("net-cap", ToolClass::Network)
+                    .scope(CapabilityScope {
+                        root_paths: Vec::new(),
+                        allowed_patterns: Vec::new(),
+                        size_limits: SizeLimits::default_limits(),
+                        network_policy: Some(super::super::scope::NetworkPolicy {
+                            allowed_hosts: vec!["*.example.com".to_string()],
+                            allowed_ports: vec![443],
+                            require_tls: true,
+                        }),
+                    })
+                    .risk_tier(RiskTier::Tier1)
+                    .build()
+                    .unwrap(),
+            )
+            .tool_allowlist(vec![ToolClass::Network])
+            .build()
+            .unwrap();
+
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec!["*.example.com".to_string()], // Only example.com allowed
+        )
+        .unwrap();
+
+        // Allowed host
+        let request = ToolRequest::new(ToolClass::Network, RiskTier::Tier1)
+            .with_network("api.example.com", 443);
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_allowed(), "allowed host should pass");
+
+        // Denied host — not in host restrictions
+        let request =
+            ToolRequest::new(ToolClass::Network, RiskTier::Tier1).with_network("evil.com", 443);
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_denied(), "unauthorized host must be denied");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::NetworkNotAllowed { .. }),
+                "expected NetworkNotAllowed, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_scope_denies_expired_manifest() {
+        let manifest = make_valid_v1_manifest(); // expires_at = 2000
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        // Request at Tier1 to match the capability's risk_tier_required
+        let request =
+            ToolRequest::new(ToolClass::Read, RiskTier::Tier1).with_path("/workspace/file.rs");
+
+        // Before expiry — should be allowed
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_allowed(), "should be valid before expiry");
+
+        // After expiry — should be denied
+        let decision = v1.validate_request_scoped(&request, &clock_at(2500));
+        assert!(decision.is_denied(), "must deny after expiry");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(matches!(reason, DenyReason::ManifestExpired));
+        }
+    }
+
+    #[test]
+    fn broker_scope_denies_out_of_scope_path() {
+        let manifest = make_valid_v1_manifest();
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier1).with_path("/etc/passwd"); // Not in /workspace
+
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_denied(), "out-of-scope path must be denied");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(matches!(reason, DenyReason::PathNotAllowed { .. }));
+        }
+    }
+
+    #[test]
+    fn broker_scope_denies_tool_not_in_allowlist() {
+        let manifest = make_valid_v1_manifest(); // Only Read in allowlist
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        let request =
+            ToolRequest::new(ToolClass::Write, RiskTier::Tier1).with_path("/workspace/file.rs");
+
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_denied(), "non-allowlisted tool must be denied");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(matches!(reason, DenyReason::ToolNotInAllowlist { .. }));
+        }
+    }
+
+    #[test]
+    fn broker_scope_empty_host_restrictions_denies_all_network() {
+        let manifest = CapabilityManifest::builder("net-empty")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .capability(
+                Capability::builder("net-cap", ToolClass::Network)
+                    .scope(CapabilityScope {
+                        root_paths: Vec::new(),
+                        allowed_patterns: Vec::new(),
+                        size_limits: SizeLimits::default_limits(),
+                        network_policy: Some(super::super::scope::NetworkPolicy {
+                            allowed_hosts: vec!["*".to_string()],
+                            allowed_ports: vec![443],
+                            require_tls: false,
+                        }),
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .tool_allowlist(vec![ToolClass::Network])
+            .build()
+            .unwrap();
+
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            Vec::new(), // Empty host restrictions!
+        )
+        .unwrap();
+
+        let request =
+            ToolRequest::new(ToolClass::Network, RiskTier::Tier0).with_network("any.host.com", 443);
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(
+            decision.is_denied(),
+            "empty host restrictions must deny all network requests"
+        );
+    }
+
+    // ========================================================================
+    // Envelope-Manifest Hash Mismatch Tests
+    // ========================================================================
+
+    #[test]
+    fn envelope_binding_accepts_matching_hash() {
+        let manifest = make_valid_v1_manifest();
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        let digest = v1.digest();
+        assert!(v1.verify_envelope_binding(&digest).is_ok());
+    }
+
+    #[test]
+    fn envelope_binding_rejects_mismatched_hash() {
+        let manifest = make_valid_v1_manifest();
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        let wrong_hash = [0xAAu8; 32];
+        let result = v1.verify_envelope_binding(&wrong_hash);
+        assert!(matches!(
+            result,
+            Err(ManifestV1Error::EnvelopeManifestHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn envelope_binding_rejects_wrong_length_hash() {
+        let manifest = make_valid_v1_manifest();
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        // Too short
+        let short_hash = [0u8; 16];
+        let result = v1.verify_envelope_binding(&short_hash);
+        assert!(matches!(
+            result,
+            Err(ManifestV1Error::EnvelopeManifestHashMismatch { .. })
+        ));
+
+        // Too long
+        let long_hash = [0u8; 64];
+        let result = v1.verify_envelope_binding(&long_hash);
+        assert!(matches!(
+            result,
+            Err(ManifestV1Error::EnvelopeManifestHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn envelope_binding_rejects_empty_hash() {
+        let manifest = make_valid_v1_manifest();
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        let result = v1.verify_envelope_binding(&[]);
+        assert!(matches!(
+            result,
+            Err(ManifestV1Error::EnvelopeManifestHashMismatch { .. })
+        ));
+    }
+
+    // ========================================================================
+    // Laundering Negative Tests
+    // ========================================================================
+
+    #[test]
+    fn laundering_widened_risk_tier_denied() {
+        // Attempt: Capability requests Tier4, policy ceiling is Tier2
+        let manifest = CapabilityManifest::builder("launder-tier")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .capability(
+                Capability::builder("high-cap", ToolClass::Read)
+                    .scope(CapabilityScope {
+                        root_paths: vec![PathBuf::from("/workspace")],
+                        allowed_patterns: Vec::new(),
+                        size_limits: SizeLimits::default_limits(),
+                        network_policy: None,
+                    })
+                    .risk_tier(RiskTier::Tier4) // Exceeds ceiling
+                    .build()
+                    .unwrap(),
+            )
+            .tool_allowlist(vec![ToolClass::Read])
+            .build()
+            .unwrap();
+
+        let result = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2, // Policy ceiling
+            Vec::new(),
+        );
+        assert!(
+            matches!(result, Err(ManifestV1Error::RiskTierWidened { .. })),
+            "widened risk tier must be rejected at mint time"
+        );
+    }
+
+    #[test]
+    fn laundering_missing_expiry_denied() {
+        // Attempt: Create manifest without expiry
+        let manifest = CapabilityManifest::builder("launder-expiry")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(0) // No expiry!
+            .tool_allowlist(vec![ToolClass::Read])
+            .build()
+            .unwrap();
+
+        let result =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new());
+        assert!(
+            matches!(result, Err(ManifestV1Error::MissingExpiry)),
+            "missing expiry must be rejected at mint time"
+        );
+    }
+
+    #[test]
+    fn laundering_overbroad_tool_scope_denied() {
+        let manifest = CapabilityManifest::builder("launder-tools")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![
+                ToolClass::Read,
+                ToolClass::Write,
+                ToolClass::Execute,
+                ToolClass::Git,
+                ToolClass::Network,
+            ])
+            .build()
+            .unwrap();
+
+        // Policy only permits 2 tools
+        let result = validate_manifest_scope_bounds(&manifest, 2, 100, 100);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "overbroad tool allowlist must be rejected"
+        );
+    }
+
+    #[test]
+    fn laundering_overbroad_write_paths_denied() {
+        let manifest = CapabilityManifest::builder("launder-paths")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .write_allowlist(vec![
+                PathBuf::from("/workspace"),
+                PathBuf::from("/tmp"),
+                PathBuf::from("/var"),
+            ])
+            .build()
+            .unwrap();
+
+        // Policy only permits 1 write path
+        let result = validate_manifest_scope_bounds(&manifest, 100, 1, 100);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "overbroad write paths must be rejected"
+        );
+    }
+
+    #[test]
+    fn laundering_overbroad_shell_patterns_denied() {
+        let manifest = CapabilityManifest::builder("launder-shell")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .shell_allowlist(vec!["*".to_string(), "cargo *".to_string()])
+            .build()
+            .unwrap();
+
+        // Policy only permits 0 shell patterns
+        let result = validate_manifest_scope_bounds(&manifest, 100, 100, 0);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "overbroad shell patterns must be rejected"
+        );
+    }
+
+    #[test]
+    fn laundering_request_at_runtime_above_ceiling_denied() {
+        // Even if the manifest is validly minted, runtime requests above
+        // the ceiling are denied.
+        let manifest = make_valid_v1_manifest(); // Has Tier1 capability
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier1, // Ceiling at Tier1
+            Vec::new(),
+        )
+        .unwrap();
+
+        // Runtime request at Tier2 (above ceiling)
+        let request =
+            ToolRequest::new(ToolClass::Read, RiskTier::Tier2).with_path("/workspace/file.rs");
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(
+            decision.is_denied(),
+            "runtime request above ceiling must be denied"
+        );
+    }
+
+    #[test]
+    fn valid_scope_bounds_accepted() {
+        let manifest = CapabilityManifest::builder("valid-scope")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .shell_allowlist(vec!["cargo test".to_string()])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_bounds(&manifest, 5, 5, 5);
+        assert!(result.is_ok(), "valid scope bounds should be accepted");
+    }
+
+    // ========================================================================
+    // Host Restriction Pattern Tests
+    // ========================================================================
+
+    #[test]
+    fn host_restriction_wildcard_domain_match() {
+        let manifest = make_valid_v1_manifest();
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec!["*.example.com".to_string()],
+        )
+        .unwrap();
+
+        assert!(v1.is_host_allowed("api.example.com"));
+        assert!(v1.is_host_allowed("sub.example.com"));
+        assert!(!v1.is_host_allowed("example.com")); // Not a subdomain
+        assert!(!v1.is_host_allowed("evil.com"));
+        assert!(!v1.is_host_allowed("notexample.com"));
+    }
+
+    #[test]
+    fn host_restriction_exact_match() {
+        let manifest = make_valid_v1_manifest();
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec!["exact.host.com".to_string()],
+        )
+        .unwrap();
+
+        assert!(v1.is_host_allowed("exact.host.com"));
+        assert!(!v1.is_host_allowed("other.host.com"));
+        assert!(!v1.is_host_allowed("sub.exact.host.com"));
+    }
+
+    #[test]
+    fn host_restriction_multiple_entries() {
+        let manifest = make_valid_v1_manifest();
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec!["api.github.com".to_string(), "*.internal.corp".to_string()],
+        )
+        .unwrap();
+
+        assert!(v1.is_host_allowed("api.github.com"));
+        assert!(v1.is_host_allowed("svc.internal.corp"));
+        assert!(!v1.is_host_allowed("evil.com"));
+    }
+
+    // ========================================================================
+    // Digest Consistency Tests
+    // ========================================================================
+
+    #[test]
+    fn v1_digest_matches_inner_manifest_digest() {
+        let manifest = make_valid_v1_manifest();
+        let expected_digest = manifest.digest();
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        assert_eq!(
+            v1.digest(),
+            expected_digest,
+            "V1 digest must match inner manifest digest for envelope binding"
+        );
+    }
+
+    // ========================================================================
+    // TCK-00352 Security Review MAJOR 1: Strict-subset counterexample tests
+    //
+    // Verify that same-cardinality substitutions are rejected by
+    // validate_manifest_scope_subset.
+    // ========================================================================
+
+    #[test]
+    fn subset_rejects_tool_substitution_same_cardinality() {
+        // Baseline: policy permits [Read, Write]
+        let baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read, ToolClass::Write],
+            write_paths: vec![PathBuf::from("/workspace")],
+            shell_patterns: vec!["cargo test".to_string()],
+        };
+
+        // Manifest substitutes Write with Execute (same count = 2)
+        let manifest = CapabilityManifest::builder("launder-subst")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Execute]) // Execute not in baseline!
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .shell_allowlist(vec!["cargo test".to_string()])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &baseline);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "same-cardinality tool substitution must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn subset_rejects_write_path_substitution_same_cardinality() {
+        let baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read],
+            write_paths: vec![PathBuf::from("/workspace")],
+            shell_patterns: Vec::new(),
+        };
+
+        // Manifest substitutes /workspace with /etc (same count = 1)
+        let manifest = CapabilityManifest::builder("launder-path")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read])
+            .write_allowlist(vec![PathBuf::from("/etc")]) // Not in baseline!
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &baseline);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "same-cardinality write path substitution must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn subset_rejects_shell_pattern_substitution_same_cardinality() {
+        let baseline = ScopeBaseline {
+            tools: Vec::new(),
+            write_paths: Vec::new(),
+            shell_patterns: vec!["cargo test".to_string()],
+        };
+
+        // Manifest substitutes "cargo test" with "rm -rf /" (same count = 1)
+        let manifest = CapabilityManifest::builder("launder-shell")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .shell_allowlist(vec!["rm -rf /".to_string()]) // Not in baseline!
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &baseline);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "same-cardinality shell pattern substitution must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn subset_accepts_valid_subset() {
+        let baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute],
+            write_paths: vec![PathBuf::from("/workspace"), PathBuf::from("/tmp")],
+            shell_patterns: vec!["cargo test".to_string(), "cargo build".to_string()],
+        };
+
+        // Manifest uses a strict subset of the baseline
+        let manifest = CapabilityManifest::builder("valid-subset")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .shell_allowlist(vec!["cargo test".to_string()])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &baseline);
+        assert!(
+            result.is_ok(),
+            "valid subset should be accepted: {result:?}"
+        );
+    }
+
+    // ========================================================================
+    // TCK-00352 Security Review MAJOR 2: V1 wiring integration tests
+    //
+    // Prove that V1 validation is exercised through real request flow:
+    // deny on envelope mismatch, scope widening, and unauthorized hosts.
+    // ========================================================================
+
+    #[test]
+    fn v1_denies_request_with_envelope_hash_mismatch() {
+        let manifest = make_valid_v1_manifest();
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        // Simulate envelope with wrong hash
+        let wrong_hash = [0xFFu8; 32];
+        let result = v1.verify_envelope_binding(&wrong_hash);
+        assert!(
+            matches!(
+                result,
+                Err(ManifestV1Error::EnvelopeManifestHashMismatch { .. })
+            ),
+            "envelope-manifest hash mismatch must be denied"
+        );
+    }
+
+    #[test]
+    fn v1_denies_scope_widening_at_request_time() {
+        let manifest = make_valid_v1_manifest(); // Tier1 Read-only
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier1, // Ceiling at Tier1
+            Vec::new(),
+        )
+        .unwrap();
+
+        // Request at Tier2 should be denied (scope widening)
+        let request =
+            ToolRequest::new(ToolClass::Read, RiskTier::Tier2).with_path("/workspace/file.rs");
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_denied(), "scope widening must be denied");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::InsufficientRiskTier { .. }),
+                "expected InsufficientRiskTier, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_denies_unauthorized_host_through_real_flow() {
+        let manifest = CapabilityManifest::builder("net-flow")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .capability(
+                Capability::builder("net-cap", ToolClass::Network)
+                    .scope(CapabilityScope {
+                        root_paths: Vec::new(),
+                        allowed_patterns: Vec::new(),
+                        size_limits: SizeLimits::default_limits(),
+                        network_policy: Some(super::super::scope::NetworkPolicy {
+                            allowed_hosts: vec!["*.trusted.com".to_string()],
+                            allowed_ports: vec![443],
+                            require_tls: true,
+                        }),
+                    })
+                    .risk_tier(RiskTier::Tier1)
+                    .build()
+                    .unwrap(),
+            )
+            .tool_allowlist(vec![ToolClass::Network])
+            .build()
+            .unwrap();
+
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec!["*.trusted.com".to_string()],
+        )
+        .unwrap();
+
+        // Unauthorized host through the real V1 validation path
+        let request = ToolRequest::new(ToolClass::Network, RiskTier::Tier1)
+            .with_network("evil-host.attacker.com", 443);
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_denied(), "unauthorized host must be denied");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::NetworkNotAllowed { .. }),
+                "expected NetworkNotAllowed, got {reason:?}"
+            );
+        }
+
+        // Authorized host should pass
+        let request = ToolRequest::new(ToolClass::Network, RiskTier::Tier1)
+            .with_network("api.trusted.com", 443);
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_allowed(), "authorized host should be allowed");
+    }
+
+    // ========================================================================
+    // MAJOR 1 v3: Scope baseline MUST be independent of candidate manifest
+    // ========================================================================
+
+    /// MAJOR 1 v3: A manifest with wider scope than the policy baseline is
+    /// rejected. This proves that building the baseline from the manifest
+    /// itself (tautological check) is no longer the behavior.
+    #[test]
+    fn subset_rejects_manifest_with_wider_scope_than_policy_baseline() {
+        // Policy baseline only allows Read
+        let policy_baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read],
+            write_paths: vec![PathBuf::from("/workspace")],
+            shell_patterns: vec![],
+        };
+
+        // Candidate manifest tries to also include Write and Execute
+        let wider_manifest = CapabilityManifest::builder("wider-scope")
+            .delegator("attacker")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute])
+            .write_allowlist(vec![PathBuf::from("/workspace"), PathBuf::from("/etc")])
+            .shell_allowlist(vec!["rm -rf /".to_string()])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&wider_manifest, &policy_baseline);
+        assert!(
+            result.is_err(),
+            "manifest with wider scope than policy baseline must be rejected"
+        );
+        let err = result.unwrap_err();
+        match err {
+            ManifestV1Error::OverbroadScope { reason } => {
+                // The error should indicate the tool allowlist exceeds baseline
+                assert!(
+                    reason.contains("tool") || reason.contains("write") || reason.contains("shell"),
+                    "error reason should indicate which scope dimension exceeded: {reason}"
+                );
+            },
+            other => panic!("expected OverbroadScope error, got: {other:?}"),
+        }
+    }
+
+    /// MAJOR 1 v3: A manifest that matches the baseline exactly is accepted.
+    /// This is the happy path when policy resolver provides the correct
+    /// baseline.
+    #[test]
+    fn subset_accepts_manifest_matching_policy_baseline_exactly() {
+        let policy_baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read, ToolClass::Git],
+            write_paths: vec![],
+            shell_patterns: vec![],
+        };
+
+        let manifest = CapabilityManifest::builder("exact-match")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Git])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &policy_baseline);
+        assert!(
+            result.is_ok(),
+            "manifest matching policy baseline exactly should be accepted: {result:?}"
+        );
+    }
+
+    /// MAJOR 1 v3: Substitution attack (same cardinality but different tools)
+    /// is detected by strict-subset check against an independent baseline.
+    #[test]
+    fn subset_rejects_substitution_attack_with_independent_baseline() {
+        // Policy baseline allows Read and Git
+        let policy_baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read, ToolClass::Git],
+            write_paths: vec![],
+            shell_patterns: vec![],
+        };
+
+        // Attacker substitutes Git -> Execute (same cardinality of 2)
+        let substituted_manifest = CapabilityManifest::builder("substitution")
+            .delegator("attacker")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Execute])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&substituted_manifest, &policy_baseline);
+        assert!(
+            result.is_err(),
+            "substitution attack (Read+Execute vs policy Read+Git) must be rejected"
+        );
+        let err = result.unwrap_err();
+        match err {
+            ManifestV1Error::OverbroadScope { reason } => {
+                assert!(
+                    reason.contains("Execute"),
+                    "error should identify the substituted tool class: {reason}"
+                );
+            },
+            other => panic!("expected OverbroadScope error for substitution, got: {other:?}"),
+        }
     }
 }

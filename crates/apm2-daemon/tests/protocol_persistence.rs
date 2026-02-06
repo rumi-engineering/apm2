@@ -154,7 +154,13 @@ async fn test_persistence_end_to_end() {
 
     let session_id = match spawn_resp_impl {
         PrivilegedResponse::SpawnEpisode(resp) => resp.session_id,
-        _ => panic!("Expected SpawnEpisode response"),
+        PrivilegedResponse::Error(err) => {
+            panic!(
+                "Expected SpawnEpisode response, got error: code={}, msg={}",
+                err.code, err.message
+            );
+        },
+        other => panic!("Expected SpawnEpisode response, got: {other:?}"),
     };
 
     // 6. IssueCapability

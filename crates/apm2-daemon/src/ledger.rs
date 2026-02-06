@@ -2130,6 +2130,7 @@ mod tests {
             capability_manifest_hash: [0u8; 32],
             context_pack_hash: [0u8; 32],
             resolved_risk_tier: 0,
+            resolved_scope_baseline: None,
         }
     }
 

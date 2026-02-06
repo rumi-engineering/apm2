@@ -161,15 +161,22 @@ pub use broker::{
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 // Re-export tool execution types (TCK-00165)
 pub use budget_tracker::{BudgetExhaustedError, BudgetSnapshot, BudgetTracker};
-// Re-export capability types (TCK-00163, TCK-00254, TCK-00258, TCK-00317)
+// Re-export capability types (TCK-00163, TCK-00254, TCK-00258, TCK-00317, TCK-00352)
+// NOTE: PolicyMintToken is intentionally NOT re-exported. It is pub(crate) and
+// only accessible to daemon-internal code (specifically GovernancePolicyResolver
+// and state.rs). This prevents external crates and requester surfaces from
+// minting capabilities. See Security Review BLOCKER 1.
 pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
-    CapabilityManifestBuilder, CapabilityValidator, CustodyDomainError, CustodyDomainId,
-    DenyReason, InMemoryCasManifestLoader, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
+    CapabilityManifestBuilder, CapabilityManifestV1, CapabilityValidator, CustodyDomainError,
+    CustodyDomainId, DenyReason, InMemoryCasManifestLoader, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
     MAX_CAPABILITY_ID_LEN, MAX_CUSTODY_DOMAINS_PER_REQUEST, MAX_MANIFEST_ID_LEN,
-    MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ManifestLoader, ToolRequest,
-    validate_custody_domain_overlap,
+    MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ManifestLoader,
+    ManifestV1Error, ScopeBaseline, ToolRequest, validate_custody_domain_overlap,
+    validate_manifest_scope_bounds, validate_manifest_scope_subset,
 };
+// NOTE: PolicyMintToken is accessed via crate::episode::capability::PolicyMintToken
+// by governance.rs. No re-export needed here since direct path access is used.
 // Re-export Claude Code adapter types (TCK-00173)
 pub use claude_code::{
     ClaudeCodeAdapter, ClaudeCodeHolon, ClaudeCodeOutput, ClaudeCodeState, SharedClaudeCodeState,

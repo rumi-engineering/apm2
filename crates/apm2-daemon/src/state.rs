@@ -46,7 +46,9 @@ use crate::metrics::SharedMetricsRegistry;
 use crate::protocol::dispatch::PrivilegedDispatcher;
 use crate::protocol::messages::DecodeConfig;
 use crate::protocol::resource_governance::{SharedSubscriptionRegistry, SubscriptionRegistry};
-use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore, SessionDispatcher};
+use crate::protocol::session_dispatch::{
+    InMemoryManifestStore, ManifestStore, SessionDispatcher, V1ManifestStore,
+};
 use crate::protocol::session_token::TokenMinter;
 use crate::session::{SessionRegistry, SessionTelemetryStore};
 
@@ -385,6 +387,9 @@ impl DispatcherState {
         // TCK-00343: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
+        // TCK-00352: Create shared V1 manifest store for scope enforcement
+        let v1_manifest_store = Arc::new(V1ManifestStore::new());
+
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
             // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
@@ -464,6 +469,8 @@ impl DispatcherState {
                 Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
                 Arc::clone(&subscription_registry),
             )
+            // TCK-00352: Wire V1 manifest store into production path
+            .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
         } else {
             // Use stubs
             let clock = Arc::new(
@@ -497,11 +504,13 @@ impl DispatcherState {
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
+        // TCK-00352: Wire V1 manifest store for scope enforcement
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
-                .with_telemetry_store(telemetry_store);
+                .with_telemetry_store(telemetry_store)
+                .with_v1_manifest_store(v1_manifest_store);
 
         Self {
             privileged_dispatcher,
@@ -677,6 +686,9 @@ impl DispatcherState {
         // TCK-00343: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
+        // TCK-00352: Create shared V1 manifest store for scope enforcement
+        let v1_manifest_store = Arc::new(V1ManifestStore::new());
+
         let privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
             DecodeConfig::default(),
             policy_resolver,
@@ -692,7 +704,9 @@ impl DispatcherState {
             Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             Arc::clone(&subscription_registry),
         )
-        .with_credential_store(credential_store);
+        .with_credential_store(credential_store)
+        // TCK-00352: Wire V1 manifest store into production path
+        .with_v1_manifest_store(Arc::clone(&v1_manifest_store));
 
         let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(Arc::clone(metrics))
@@ -711,6 +725,7 @@ impl DispatcherState {
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
+        // TCK-00352: Wire V1 manifest store for scope enforcement
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -720,7 +735,8 @@ impl DispatcherState {
                 .with_clock(clock)
                 .with_broker(broker)
                 .with_episode_runtime(episode_runtime)
-                .with_telemetry_store(telemetry_store);
+                .with_telemetry_store(telemetry_store)
+                .with_v1_manifest_store(v1_manifest_store);
 
         Ok(Self {
             privileged_dispatcher,
