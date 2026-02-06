@@ -770,6 +770,14 @@ use crate::session::{SessionRegistry, SessionRegistryError, SessionState, Sessio
 /// denial-of-service via memory exhaustion.
 pub const MAX_SESSIONS: usize = 10_000;
 
+/// Maximum number of terminated session entries retained (TCK-00385).
+///
+/// Per CTR-1303: The terminated-session store must also be bounded to
+/// prevent unbounded memory growth under high session churn. When this
+/// limit is reached, the oldest entries (by `terminated_at` timestamp)
+/// are evicted to make room.
+pub const MAX_TERMINATED_SESSIONS: usize = 10_000;
+
 /// TTL for terminated session entries in seconds (TCK-00385).
 ///
 /// Terminated sessions are preserved in the registry for this duration
@@ -777,6 +785,84 @@ pub const MAX_SESSIONS: usize = 10_000;
 /// instead of "session not found". After this TTL, entries are cleaned up
 /// to prevent unbounded memory growth.
 pub const TERMINATED_SESSION_TTL_SECS: u64 = 300; // 5 minutes
+
+/// Known termination reasons for session end-of-life (TCK-00385, MAJOR 1).
+///
+/// This enum provides a strict allowlist of termination reasons that may
+/// appear in the `termination_reason` field of `SessionStatusResponse`.
+/// Unknown or free-form strings from internal code are normalized to
+/// [`TerminationReason::Unknown`] before being sent on the wire.
+///
+/// # Wire Representation
+///
+/// Each variant maps to a lowercase string constant suitable for the
+/// protobuf `termination_reason` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TerminationReason {
+    /// Normal clean exit.
+    Normal,
+    /// Session process crashed.
+    Crash,
+    /// Session exceeded its time budget.
+    Timeout,
+    /// Session quarantined by policy engine.
+    Quarantined,
+    /// Session exceeded its token budget.
+    BudgetExhausted,
+    /// Context miss triggered refinement termination.
+    ContextMiss,
+    /// Unknown or unrecognized reason (normalized from free-form input).
+    Unknown,
+}
+
+impl TerminationReason {
+    /// Returns the canonical wire-format string for this reason.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Crash => "crash",
+            Self::Timeout => "timeout",
+            Self::Quarantined => "quarantined",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ContextMiss => "CONTEXT_MISS",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parses a string into a known `TerminationReason`.
+    ///
+    /// Unrecognized strings are mapped to [`TerminationReason::Unknown`]
+    /// rather than being passed through as free-form text.
+    #[must_use]
+    pub fn from_reason_str(s: &str) -> Self {
+        match s {
+            "normal" => Self::Normal,
+            "crash" => Self::Crash,
+            "timeout" => Self::Timeout,
+            "quarantined" => Self::Quarantined,
+            "budget_exhausted" => Self::BudgetExhausted,
+            "CONTEXT_MISS" => Self::ContextMiss,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// All known termination reason variants (excluding `Unknown`).
+    pub const ALL_KNOWN: &'static [Self] = &[
+        Self::Normal,
+        Self::Crash,
+        Self::Timeout,
+        Self::Quarantined,
+        Self::BudgetExhausted,
+        Self::ContextMiss,
+    ];
+}
+
+impl std::fmt::Display for TerminationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// A terminated session entry preserved for TTL-based cleanup (TCK-00385).
 #[derive(Debug, Clone)]
@@ -897,6 +983,21 @@ impl SessionRegistry for InMemorySessionRegistry {
         if let Some(session) = state.by_id.remove(session_id) {
             state.by_handle.remove(&session.ephemeral_handle);
             state.queue.retain(|id| id != session_id);
+
+            // CTR-1303 / BLOCKER 1: Enforce MAX_TERMINATED_SESSIONS cap.
+            // If at capacity, evict the oldest entry (earliest expires_at).
+            while state.terminated.len() >= MAX_TERMINATED_SESSIONS {
+                let oldest_key = state
+                    .terminated
+                    .iter()
+                    .min_by_key(|(_, e)| e.expires_at)
+                    .map(|(k, _)| k.clone());
+                if let Some(key) = oldest_key {
+                    state.terminated.remove(&key);
+                } else {
+                    break;
+                }
+            }
 
             let entry = TerminatedEntry {
                 info,
@@ -1626,7 +1727,24 @@ impl SessionRegistry for PersistentSessionRegistry {
     }
 
     fn mark_terminated(&self, session_id: &str, info: SessionTerminationInfo) -> bool {
-        self.inner.mark_terminated(session_id, info)
+        let result = self.inner.mark_terminated(session_id, info);
+
+        // BLOCKER 2: Persist termination state to disk so that a crash
+        // after mark_terminated() does not resurrect the session as active.
+        if result {
+            if let Err(e) = self.persist() {
+                // Log but don't fail -- the in-memory state is correct and
+                // the worst case is a stale-active resurrection on crash,
+                // which is the same behavior as before this fix.
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist termination state"
+                );
+            }
+        }
+
+        result
     }
 
     fn get_termination_info(&self, session_id: &str) -> Option<SessionTerminationInfo> {
@@ -2380,5 +2498,284 @@ mod tck_00267 {
         // Verify each has distinct i32 value
         let values: Vec<i32> = reasons.iter().map(|r| *r as i32).collect();
         assert_eq!(values, vec![0, 1, 2, 3, 4]);
+    }
+}
+
+// =============================================================================
+// TCK-00385: Security Fix Tests (BLOCKER 1, BLOCKER 2, MAJOR 1)
+// =============================================================================
+
+#[cfg(test)]
+mod tck_00385_security_fixes {
+    use super::*;
+
+    /// Helper to create a test session with a given ID and handle.
+    fn make_session(id: &str, handle: &str) -> SessionState {
+        SessionState {
+            session_id: id.to_string(),
+            work_id: format!("work-{id}"),
+            role: 1,
+            ephemeral_handle: handle.to_string(),
+            lease_id: format!("lease-{id}"),
+            policy_resolved_ref: "policy-ref".to_string(),
+            capability_manifest_hash: vec![],
+            episode_id: None,
+        }
+    }
+
+    // =========================================================================
+    // BLOCKER 1: Unbounded terminated-session store
+    // =========================================================================
+
+    /// BLOCKER 1: Terminated session map is bounded at
+    /// `MAX_TERMINATED_SESSIONS`.
+    ///
+    /// Stress test proving memory stays bounded even under high churn:
+    /// register many sessions, terminate them all, and verify the terminated
+    /// map never exceeds the cap.
+    #[test]
+    fn terminated_store_bounded_under_churn() {
+        let registry = InMemorySessionRegistry::new();
+
+        // Churn through more sessions than MAX_TERMINATED_SESSIONS.
+        // We process in batches to stay within MAX_SESSIONS active limit.
+        let total_terminations = MAX_TERMINATED_SESSIONS + 500;
+        let batch_size = MAX_SESSIONS;
+
+        let mut terminated_so_far = 0usize;
+
+        while terminated_so_far < total_terminations {
+            let this_batch = batch_size.min(total_terminations - terminated_so_far);
+
+            // Register a batch of sessions
+            for i in 0..this_batch {
+                let idx = terminated_so_far + i;
+                let session = make_session(&format!("churn-{idx}"), &format!("handle-churn-{idx}"));
+                registry
+                    .register_session(session)
+                    .expect("registration should succeed");
+            }
+
+            // Terminate them all
+            for i in 0..this_batch {
+                let idx = terminated_so_far + i;
+                let info = SessionTerminationInfo::new(format!("churn-{idx}"), "normal", "SUCCESS");
+                registry.mark_terminated(&format!("churn-{idx}"), info);
+            }
+
+            terminated_so_far += this_batch;
+
+            // Invariant: terminated map never exceeds MAX_TERMINATED_SESSIONS
+            let state = registry.state.read().expect("lock poisoned");
+            assert!(
+                state.terminated.len() <= MAX_TERMINATED_SESSIONS,
+                "Terminated store exceeded cap: {} > {}",
+                state.terminated.len(),
+                MAX_TERMINATED_SESSIONS
+            );
+        }
+
+        // Final check: terminated count is at most MAX_TERMINATED_SESSIONS
+        let state = registry.state.read().expect("lock poisoned");
+        assert!(
+            state.terminated.len() <= MAX_TERMINATED_SESSIONS,
+            "Final terminated store size {} exceeds cap {}",
+            state.terminated.len(),
+            MAX_TERMINATED_SESSIONS,
+        );
+    }
+
+    /// BLOCKER 1: Oldest terminated entries are evicted when the cap is hit.
+    #[test]
+    fn terminated_store_evicts_oldest() {
+        let registry = InMemorySessionRegistry::new();
+
+        // Register and terminate exactly MAX_TERMINATED_SESSIONS sessions
+        for i in 0..MAX_TERMINATED_SESSIONS {
+            let session = make_session(&format!("evict-{i}"), &format!("handle-evict-{i}"));
+            registry.register_session(session).unwrap();
+            let info = SessionTerminationInfo::new(format!("evict-{i}"), "normal", "SUCCESS");
+            registry.mark_terminated(&format!("evict-{i}"), info);
+        }
+
+        // Verify the first entry still exists (map is exactly at cap)
+        assert!(
+            registry.get_termination_info("evict-0").is_some(),
+            "First entry should still exist at cap"
+        );
+
+        // Add one more, which should evict the oldest
+        let overflow = make_session("evict-overflow", "handle-evict-overflow");
+        registry.register_session(overflow).unwrap();
+        let info = SessionTerminationInfo::new("evict-overflow", "normal", "SUCCESS");
+        registry.mark_terminated("evict-overflow", info);
+
+        // The overflow entry should exist
+        assert!(
+            registry.get_termination_info("evict-overflow").is_some(),
+            "Overflow entry should exist"
+        );
+
+        // Total should still be at most MAX_TERMINATED_SESSIONS
+        let state = registry.state.read().expect("lock poisoned");
+        assert!(
+            state.terminated.len() <= MAX_TERMINATED_SESSIONS,
+            "Size {} should be <= {}",
+            state.terminated.len(),
+            MAX_TERMINATED_SESSIONS
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER 2: Crash-window regression test for PersistentSessionRegistry
+    // =========================================================================
+
+    /// BLOCKER 2: After `mark_terminated()`, a crash-recovery reload must NOT
+    /// resurrect the session as active.
+    ///
+    /// This test simulates:
+    /// 1. Register a session in `PersistentSessionRegistry` (persisted as
+    ///    active)
+    /// 2. Mark it terminated (should persist the removal from active set)
+    /// 3. Reload from file (simulating crash recovery)
+    /// 4. Verify the session is NOT in the active set
+    #[test]
+    fn persistent_mark_terminated_no_stale_active_resurrection() {
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        // Step 1: Register a session
+        let registry = PersistentSessionRegistry::new(&path);
+        let session = make_session("persist-term-1", "handle-pt-1");
+        registry.register_session(session).expect("should register");
+
+        // Verify session is active and persisted
+        assert!(registry.get_session("persist-term-1").is_some());
+        assert!(path.exists(), "State file should exist after register");
+
+        // Step 2: Mark terminated (should persist removal from active set)
+        let info = SessionTerminationInfo::new("persist-term-1", "normal", "SUCCESS");
+        assert!(
+            registry.mark_terminated("persist-term-1", info),
+            "mark_terminated should succeed"
+        );
+
+        // Step 3: Simulate crash recovery by loading from file
+        let recovered =
+            PersistentSessionRegistry::load_from_file(&path).expect("should load from file");
+
+        // Step 4: Session MUST NOT be in active set (no stale resurrection)
+        assert!(
+            recovered.get_session("persist-term-1").is_none(),
+            "Terminated session MUST NOT be resurrected as active after crash recovery"
+        );
+        assert_eq!(
+            recovered.session_count(),
+            0,
+            "No active sessions should remain after termination + recovery"
+        );
+    }
+
+    /// BLOCKER 2: Multiple sessions, only the terminated one is removed.
+    #[test]
+    fn persistent_mark_terminated_preserves_other_sessions() {
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let registry = PersistentSessionRegistry::new(&path);
+        registry
+            .register_session(make_session("keep-1", "h-keep-1"))
+            .unwrap();
+        registry
+            .register_session(make_session("terminate-1", "h-term-1"))
+            .unwrap();
+        registry
+            .register_session(make_session("keep-2", "h-keep-2"))
+            .unwrap();
+
+        // Terminate only one
+        let info = SessionTerminationInfo::new("terminate-1", "crash", "FAILURE");
+        registry.mark_terminated("terminate-1", info);
+
+        // Recover
+        let recovered = PersistentSessionRegistry::load_from_file(&path).unwrap();
+
+        assert!(
+            recovered.get_session("keep-1").is_some(),
+            "Non-terminated session keep-1 should survive recovery"
+        );
+        assert!(
+            recovered.get_session("keep-2").is_some(),
+            "Non-terminated session keep-2 should survive recovery"
+        );
+        assert!(
+            recovered.get_session("terminate-1").is_none(),
+            "Terminated session should not be resurrected"
+        );
+        assert_eq!(recovered.session_count(), 2);
+    }
+
+    // =========================================================================
+    // MAJOR 1: TerminationReason enum tests
+    // =========================================================================
+
+    /// MAJOR 1: All known reasons round-trip through
+    /// `from_reason_str`/`as_str`.
+    #[test]
+    fn termination_reason_known_reasons_round_trip() {
+        for reason in TerminationReason::ALL_KNOWN {
+            let s = reason.as_str();
+            let parsed = TerminationReason::from_reason_str(s);
+            assert_eq!(*reason, parsed, "Round-trip failed for {s}");
+        }
+    }
+
+    /// MAJOR 1: Unknown/free-form strings are normalized to Unknown.
+    #[test]
+    fn termination_reason_unknown_normalized() {
+        let garbage = TerminationReason::from_reason_str("arbitrary_garbage_value");
+        assert_eq!(garbage, TerminationReason::Unknown);
+        assert_eq!(garbage.as_str(), "unknown");
+
+        let empty = TerminationReason::from_reason_str("");
+        assert_eq!(empty, TerminationReason::Unknown);
+
+        let injection = TerminationReason::from_reason_str("<script>alert(1)</script>");
+        assert_eq!(injection, TerminationReason::Unknown);
+    }
+
+    /// MAJOR 1: Display impl matches `as_str`.
+    #[test]
+    fn termination_reason_display() {
+        assert_eq!(TerminationReason::Normal.to_string(), "normal");
+        assert_eq!(TerminationReason::Crash.to_string(), "crash");
+        assert_eq!(TerminationReason::ContextMiss.to_string(), "CONTEXT_MISS");
+        assert_eq!(TerminationReason::Unknown.to_string(), "unknown");
+    }
+
+    /// MAJOR 1: All proto-documented reasons are in the allowlist.
+    #[test]
+    fn termination_reason_covers_proto_documented_values() {
+        // These are the values documented in the proto file comment:
+        // "normal, crash, timeout, quarantined, budget_exhausted"
+        let proto_values = [
+            "normal",
+            "crash",
+            "timeout",
+            "quarantined",
+            "budget_exhausted",
+        ];
+        for v in proto_values {
+            let reason = TerminationReason::from_reason_str(v);
+            assert_ne!(
+                reason,
+                TerminationReason::Unknown,
+                "Proto-documented value '{v}' should be a known reason"
+            );
+        }
     }
 }

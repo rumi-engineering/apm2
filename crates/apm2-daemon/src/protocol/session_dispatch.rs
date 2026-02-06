@@ -89,6 +89,7 @@ use crate::episode::capability::StubManifestLoader;
 use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
+use crate::episode::registry::TerminationReason;
 use crate::episode::{CapabilityManifest, EpisodeId, EpisodeRuntime, SharedToolBroker, ToolClass};
 use crate::htf::{ClockError, HolonicClock};
 
@@ -1303,6 +1304,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     "Tool request triggered session termination"
                 );
 
+                // MAJOR 2: Wire session end-of-life to mark_terminated()
+                // so production sessions transition to TERMINATED state.
+                if let Some(session_registry) = &self.session_registry {
+                    session_registry.mark_terminated(session_id, *termination_info.clone());
+                }
+
                 // TCK-00307: Emit DefectRecorded for ContextMiss
                 if termination_info.rationale_code == "CONTEXT_MISS" {
                     if let Some(event_bytes) = refinement_event {
@@ -1711,8 +1718,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     events_emitted: 0,
                     started_at_ns: 0,
                     duration_ms: 0,
-                    // TCK-00385: Populate termination details
-                    termination_reason: Some(term_info.rationale_code),
+                    // TCK-00385 / MAJOR 1: Normalize termination reason
+                    // through TerminationReason enum to prevent free-form
+                    // strings on the wire.
+                    termination_reason: Some(
+                        TerminationReason::from_reason_str(&term_info.rationale_code)
+                            .as_str()
+                            .to_string(),
+                    ),
                     exit_code: term_info.exit_code,
                     terminated_at_ns: Some(term_info.terminated_at_ns),
                     actual_tokens_consumed: term_info.actual_tokens_consumed,
@@ -4339,6 +4352,146 @@ mod tests {
                 registry.get_session_by_handle("handle-h").is_none(),
                 "Handle should not resolve after termination"
             );
+        }
+
+        /// IT-00385-10 (MAJOR 2): Production session lifecycle results in
+        /// TERMINATED status via `mark_terminated`.
+        ///
+        /// This integration test demonstrates that a session registered in the
+        /// registry, when terminated via `mark_terminated` (as wired from the
+        /// `ToolDecision::Terminate` handler), produces a `SessionStatus`
+        /// response with state=TERMINATED and populated termination
+        /// details.
+        #[test]
+        fn test_session_lifecycle_to_terminated() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+
+            // Step 1: Register a session (simulates SpawnEpisode)
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-LIFECYCLE".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-LIFECYCLE".to_string(),
+                ephemeral_handle: "handle-lifecycle".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-LIFECYCLE".to_string()),
+            };
+            registry
+                .register_session(session)
+                .expect("registration should succeed");
+
+            // Step 2: Verify session is ACTIVE
+            let dyn_registry: Arc<dyn crate::session::SessionRegistry> = registry.clone();
+            let dispatcher =
+                SessionDispatcher::new(minter.clone()).with_session_registry(dyn_registry);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(resp.state, "ACTIVE");
+                    assert!(
+                        resp.termination_reason.is_none(),
+                        "Active session should have no termination_reason"
+                    );
+                },
+                other => panic!("Expected SessionStatus, got: {other:?}"),
+            }
+
+            // Step 3: Simulate production termination (as wired from
+            // ToolDecision::Terminate handler via session_registry.mark_terminated)
+            let term_info =
+                SessionTerminationInfo::new("session-001", "budget_exhausted", "FAILURE")
+                    .with_exit_code(1)
+                    .with_tokens_consumed(500_000);
+            registry.mark_terminated("session-001", term_info);
+
+            // Step 4: Verify session is now TERMINATED with details
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(
+                        resp.state, "TERMINATED",
+                        "Session should be TERMINATED after mark_terminated"
+                    );
+                    assert_eq!(
+                        resp.termination_reason,
+                        Some("budget_exhausted".to_string()),
+                        "Termination reason should be populated"
+                    );
+                    assert_eq!(resp.exit_code, Some(1));
+                    assert!(
+                        resp.terminated_at_ns.is_some() && resp.terminated_at_ns.unwrap() > 0,
+                        "terminated_at_ns should be set"
+                    );
+                    assert_eq!(resp.actual_tokens_consumed, Some(500_000));
+                    assert_eq!(resp.work_id, "W-LIFECYCLE");
+                    assert_eq!(resp.episode_id, Some("E-LIFECYCLE".to_string()));
+                },
+                other => panic!("Expected SessionStatus, got: {other:?}"),
+            }
+        }
+
+        /// IT-00385-11 (MAJOR 1): Unknown termination reasons are normalized
+        /// to "unknown" on the wire.
+        #[test]
+        fn test_unknown_termination_reason_normalized() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-NORM".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-NORM".to_string(),
+                ephemeral_handle: "handle-norm".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            registry.register_session(session).unwrap();
+
+            // Use a free-form garbage string as termination reason
+            let term_info = SessionTerminationInfo::new(
+                "session-001",
+                "some_arbitrary_freeform_reason",
+                "FAILURE",
+            );
+            registry.mark_terminated("session-001", term_info);
+
+            let dyn_registry: Arc<dyn crate::session::SessionRegistry> = registry;
+            let dispatcher =
+                SessionDispatcher::new(minter.clone()).with_session_registry(dyn_registry);
+
+            let token = test_token(&minter);
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::SessionStatus(resp) => {
+                    assert_eq!(
+                        resp.termination_reason,
+                        Some("unknown".to_string()),
+                        "Free-form reason should be normalized to 'unknown'"
+                    );
+                },
+                other => panic!("Expected SessionStatus, got: {other:?}"),
+            }
         }
     }
 }
