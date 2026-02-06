@@ -172,6 +172,7 @@ multiple_crate_versions = "allow"  # Caused by transitive dependencies
 # Allow nursery lints that are overly strict
 significant_drop_tightening = "allow"  # RwLock guard patterns are fine
 large_stack_frames = "allow"  # Test harness with 2900+ tests exceeds threshold
+large_stack_arrays = "allow"  # Test vectors may exceed 16KiB threshold
 
 [profile.release]
 lto = true

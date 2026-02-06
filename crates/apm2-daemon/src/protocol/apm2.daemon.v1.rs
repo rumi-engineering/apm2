@@ -750,6 +750,18 @@ pub struct SessionStatusResponse {
     /// Session duration in milliseconds.
     #[prost(uint64, tag = "9")]
     pub duration_ms: u64,
+    /// Termination reason (normal, crash, timeout, quarantined, budget_exhausted).
+    #[prost(string, optional, tag = "10")]
+    pub termination_reason: ::core::option::Option<::prost::alloc::string::String>,
+    /// Process exit code (0 = success).
+    #[prost(int32, optional, tag = "11")]
+    pub exit_code: ::core::option::Option<i32>,
+    /// Timestamp when session terminated (nanoseconds since epoch).
+    #[prost(uint64, optional, tag = "12")]
+    pub terminated_at_ns: ::core::option::Option<u64>,
+    /// Actual tokens consumed by the session (if available from agent adapter).
+    #[prost(uint64, optional, tag = "13")]
+    pub actual_tokens_consumed: ::core::option::Option<u64>,
 }
 /// Generic error response for session-scoped endpoints.
 #[derive(Clone, PartialEq, ::prost::Message)]

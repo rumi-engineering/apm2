@@ -333,6 +333,9 @@ impl DispatcherState {
         // TCK-00344: Clone session_registry before it is moved into the
         // privileged dispatcher so we can also wire it into the session dispatcher.
         let session_registry_for_session = Arc::clone(&session_registry);
+        // TCK-00385 BLOCKER 1: Clone session_registry for EpisodeRuntime so that
+        // stop()/quarantine() can call mark_terminated() in production.
+        let session_registry_for_runtime = Arc::clone(&session_registry);
 
         // TCK-00343: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
@@ -387,7 +390,10 @@ impl DispatcherState {
                 // SearchHandler - searches files within workspace
                 .with_rooted_handler_factory(|root| {
                     Box::new(SearchHandler::with_root(root))
-                });
+                })
+                // TCK-00385 BLOCKER 1: Wire session registry so stop()/quarantine()
+                // call mark_terminated() in production.
+                .with_session_registry(session_registry_for_runtime);
 
             let episode_runtime = Arc::new(episode_runtime);
             let clock =
@@ -486,6 +492,9 @@ impl DispatcherState {
         // TCK-00344: Clone session_registry before it is moved into the
         // privileged dispatcher so we can also wire it into the session dispatcher.
         let session_registry_for_session = Arc::clone(&session_registry);
+        // TCK-00385 BLOCKER 1: Clone session_registry for EpisodeRuntime so that
+        // stop()/quarantine() can call mark_terminated() in production.
+        let session_registry_for_runtime = Arc::clone(&session_registry);
 
         // TCK-00316: Create durable CAS
         let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
@@ -564,7 +573,10 @@ impl DispatcherState {
             // SearchHandler - searches files within workspace
             .with_rooted_handler_factory(|root| {
                 Box::new(SearchHandler::with_root(root))
-            });
+            })
+            // TCK-00385 BLOCKER 1: Wire session registry so stop()/quarantine()
+            // call mark_terminated() in production.
+            .with_session_registry(session_registry_for_runtime);
 
         let episode_runtime = Arc::new(episode_runtime);
 
