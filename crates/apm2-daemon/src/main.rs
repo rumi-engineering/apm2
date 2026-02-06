@@ -867,13 +867,12 @@ async fn async_main(args: Args) -> Result<()> {
     // emit LEASE_REVOKED events to the ledger, clean up stale work claims, and
     // clear the persistent session registry.
     //
-    // Security Review v5 BLOCKER 1: Recovery integrity failures (where sessions
-    // were processed but clearing the registry failed) are startup-fatal. If
-    // `perform_crash_recovery` emits ledger events but then fails to clear
-    // recovered sessions from state, the next startup would re-emit those
-    // events (duplicate revocation). Only non-integrity errors (e.g. no
-    // sessions to recover, HTF clock creation failure before any side-effects)
-    // are warning-continue.
+    // Security Review v5 BLOCKER 1 + Quality Review: All recovery failures
+    // are startup-fatal (fail-closed). If `perform_crash_recovery` encounters
+    // any error -- integrity failure, timeout, partial recovery, or other --
+    // the daemon must NOT proceed to accept connections. Succeeded sessions
+    // are checkpointed before the error is returned so partial progress is
+    // preserved for the next startup attempt.
     perform_crash_recovery(&state, sqlite_conn.as_ref()).await?;
 
     info!(
@@ -1443,6 +1442,15 @@ async fn perform_crash_recovery(
                     )
                 })?;
             }
+            // Quality Review: fail-closed -- timeout means incomplete recovery,
+            // daemon must not start with un-recovered sessions.
+            return Err(anyhow::anyhow!(
+                "Crash recovery timed out after {elapsed_ms}ms \
+                 (limit {timeout_ms}ms, {sessions_completed} of {total} sessions recovered); \
+                 succeeded subset checkpointed, startup aborted (fail-closed)",
+                sessions_completed = outcome.sessions_recovered,
+                total = collected.sessions.len(),
+            ));
         },
         Err(apm2_daemon::episode::crash_recovery::CrashRecoveryError::PartialRecovery {
             failed_count,
@@ -1471,6 +1479,12 @@ async fn perform_crash_recovery(
                  (fail-closed to prevent repeated side-effects): {e}"
                 )
             })?;
+            // Quality Review: fail-closed -- partial recovery means some
+            // sessions could not be recovered; daemon must not start.
+            return Err(anyhow::anyhow!(
+                "Crash recovery partially failed ({failed_count} of {total_count} sessions \
+                 failed); succeeded subset checkpointed, startup aborted (fail-closed)"
+            ));
         },
         Err(e) => {
             // Security Review BLOCKER 1 (PR #434): All recovery failures are

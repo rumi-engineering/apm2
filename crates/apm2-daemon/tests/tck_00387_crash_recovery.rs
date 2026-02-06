@@ -124,13 +124,14 @@ fn count_work_claims(conn: &Arc<Mutex<Connection>>) -> i64 {
 /// 1. Load persisted sessions via `collect_sessions`
 /// 2. Create emitter + HTF clock
 /// 3. Call `recover_stale_sessions`
-/// 4. On `Ok`: clear succeeded sessions from registry
-/// 5. On `Timeout`/`PartialRecovery`: clear only succeeded subset
-/// 6. On other `Err`: preserve registry for retry
+/// 4. On `Ok`: clear succeeded sessions from registry, return `Ok`
+/// 5. On `Timeout`/`PartialRecovery`: checkpoint succeeded subset, then return
+///    `Err` (fail-closed -- daemon must not start)
+/// 6. On other `Err`: preserve registry for retry, return `Err`
 ///
-/// Per Security Review v5 BLOCKER 1, all recovery errors (including clearing
-/// failures) are now startup-fatal. This helper returns `Ok(())` on success
-/// or propagates the error.
+/// Per Security Review v5 BLOCKER 1 + Quality Review, ALL recovery failures
+/// (including timeout and partial recovery) are startup-fatal. Only a fully
+/// successful recovery returns `Ok(())`.
 fn simulate_startup_recovery(
     session_registry: &Arc<dyn SessionRegistry>,
     sqlite_conn: &Arc<Mutex<Connection>>,
@@ -164,7 +165,7 @@ fn simulate_startup_recovery(
             Ok(())
         },
         Err(CrashRecoveryError::Timeout { outcome, .. }) => {
-            // Mirror main.rs: checkpoint succeeded subset
+            // Mirror main.rs: checkpoint succeeded subset, then fail-closed
             if !outcome.succeeded_session_ids.is_empty() {
                 clear_session_registry(
                     session_registry,
@@ -172,16 +173,28 @@ fn simulate_startup_recovery(
                     Some(&outcome.succeeded_session_ids),
                 )?;
             }
-            Ok(())
+            Err(Box::new(CrashRecoveryError::Timeout {
+                elapsed_ms: 0,
+                timeout_ms: 0,
+                outcome,
+            }))
         },
-        Err(CrashRecoveryError::PartialRecovery { outcome, .. }) => {
-            // Mirror main.rs: clear only succeeded sessions
+        Err(CrashRecoveryError::PartialRecovery {
+            failed_count,
+            total_count,
+            outcome,
+        }) => {
+            // Mirror main.rs: clear only succeeded sessions, then fail-closed
             clear_session_registry(
                 session_registry,
                 &collected,
                 Some(&outcome.succeeded_session_ids),
             )?;
-            Ok(())
+            Err(Box::new(CrashRecoveryError::PartialRecovery {
+                failed_count,
+                total_count,
+                outcome,
+            }))
         },
         Err(e) => {
             // Mirror main.rs: registry NOT cleared, error propagated
@@ -540,14 +553,14 @@ fn tck_00387_startup_full_cycle_with_persisted_state() {
 }
 
 // ============================================================================
-// IT-00387-05: Recovery with timeout still allows daemon to continue
+// IT-00387-05: Recovery timeout is fail-closed (daemon must not start)
 // ============================================================================
 
-/// Verifies that a recovery timeout with partial progress is handled
-/// correctly: succeeded sessions are checkpointed, and the timeout error
-/// does not propagate (timeouts are expected during large recoveries).
+/// Verifies that a recovery timeout is treated as a startup-fatal error
+/// (fail-closed). Even though succeeded sessions are checkpointed for
+/// the next attempt, the daemon must NOT proceed with un-recovered sessions.
 #[test]
-fn tck_00387_startup_recovery_handles_timeout() {
+fn tck_00387_startup_recovery_fails_on_timeout() {
     let temp_dir = TempDir::new().unwrap();
     let state_path = temp_dir.path().join("state.json");
 
@@ -570,7 +583,86 @@ fn tck_00387_startup_recovery_handles_timeout() {
     let sqlite_conn = setup_sqlite();
 
     // Use 0ms timeout to force immediate timeout.
-    // Timeout is handled (succeeded subset checkpointed), so Ok is returned.
-    simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_millis(0))
-        .expect("Timeout with checkpoint should succeed");
+    // Fail-closed: timeout must return Err, daemon must not start.
+    let result =
+        simulate_startup_recovery(&session_registry, &sqlite_conn, Duration::from_millis(0));
+    assert!(
+        result.is_err(),
+        "Timeout must be fail-closed (startup aborted), got Ok"
+    );
+}
+
+// ============================================================================
+// IT-00387-06: Partial recovery is fail-closed (daemon must not start)
+// ============================================================================
+
+/// Verifies that partial recovery (some sessions failed) is treated as a
+/// startup-fatal error (fail-closed). Succeeded sessions are checkpointed,
+/// but the daemon must NOT proceed with failed un-recovered sessions.
+#[test]
+fn tck_00387_startup_recovery_fails_on_partial_recovery() {
+    let temp_dir = TempDir::new().unwrap();
+    let state_path = temp_dir.path().join("state.json");
+
+    // Phase 1: Create persisted sessions
+    {
+        let registry = PersistentSessionRegistry::new(&state_path);
+        registry
+            .register_session(make_stale_session("sess-pr-1", "work-pr-1"))
+            .unwrap();
+        registry
+            .register_session(make_stale_session("sess-pr-2", "work-pr-2"))
+            .unwrap();
+    }
+
+    // Phase 2: Load registry
+    let loaded_registry = PersistentSessionRegistry::load_from_file(&state_path).unwrap();
+    assert_eq!(loaded_registry.session_count(), 2);
+    let session_registry: Arc<dyn SessionRegistry> = Arc::new(loaded_registry);
+
+    // Phase 3: Set up SQLite and poison the connection to force ledger emit
+    // failures, which will produce a PartialRecovery error.
+    let sqlite_conn = setup_sqlite();
+    let emitter = make_emitter(&sqlite_conn);
+
+    // Poison the mutex
+    let conn_clone = Arc::clone(&sqlite_conn);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = conn_clone.lock().unwrap();
+        panic!("intentional poison for test");
+    }));
+
+    // Phase 4: Attempt recovery with poisoned connection directly (since
+    // simulate_startup_recovery creates its own emitter, we call the
+    // recovery function directly to control the poisoned emitter).
+    let collected = collect_sessions(&session_registry);
+    assert_eq!(collected.sessions.len(), 2);
+
+    let clock = make_clock();
+    let result = recover_stale_sessions(
+        &collected.sessions,
+        Some(&emitter),
+        None,
+        Duration::from_secs(5),
+        &clock,
+    );
+
+    // Partial recovery should be an error
+    assert!(
+        result.is_err(),
+        "Partial recovery must return Err (fail-closed)"
+    );
+
+    // Verify the error is PartialRecovery
+    match result {
+        Err(CrashRecoveryError::PartialRecovery {
+            failed_count,
+            total_count,
+            ..
+        }) => {
+            assert_eq!(failed_count, 2);
+            assert_eq!(total_count, 2);
+        },
+        other => panic!("Expected PartialRecovery error, got: {other:?}"),
+    }
 }
