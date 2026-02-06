@@ -97,6 +97,7 @@ prost-build = "0.13"
 # Cryptography
 base64 = "0.22"
 blake3 = "1.5"
+data-encoding = "2.6"
 hex = "0.4"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hmac = "0.12"

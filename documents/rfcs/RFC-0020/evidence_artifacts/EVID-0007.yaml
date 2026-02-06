@@ -1,0 +1,47 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0007"
+  title: "Canonical key identifier conformance evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that PublicKeyIdV1 and KeySetIdV1 canonical identifiers enforce
+    strict grammar rules and produce lossless binary/text round-trips. The
+    conformance vector suite covers 61 individual checks across 5 valid
+    PublicKeyIdV1 vectors, 4 valid KeySetIdV1 vectors, and 25 invalid input
+    vectors testing rejection of mixed case, whitespace, padding, wrong
+    prefix, truncated payloads, invalid base32 characters, and too-long
+    inputs.
+  requirement_ids:
+    - "REQ-0007"
+  source_refs:
+    - "crates/apm2-daemon/src/identity/mod.rs"
+    - "crates/apm2-daemon/src/identity/public_key_id.rs"
+    - "crates/apm2-daemon/src/identity/keyset_id.rs"
+    - "crates/apm2-daemon/src/identity/conformance.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Conformance test suite verifies:
+        - all_conformance_vectors_pass: 61 vector checks all PASS
+        - valid_pk_vectors_are_distinct: 5 unique PublicKeyIdV1 identifiers
+        - valid_ks_vectors_are_distinct: 4 unique KeySetIdV1 identifiers
+        - invalid_vector_count: exactly 25 invalid input vectors
+        - pk_parser_differential_valid: text/binary parsers agree on all valid PK vectors
+        - ks_parser_differential_valid: text/binary parsers agree on all valid KS vectors
+        - invalid_vectors_rejected: all 25 invalid inputs rejected
+        - pk_binary_text_binary_round_trip: lossless round-trip for all PK vectors
+        - ks_binary_text_binary_round_trip: lossless round-trip for all KS vectors
+      ref: "cargo test -p apm2-daemon identity::conformance"
+    - type: "test_output"
+      description: |
+        Unit tests verify individual type behaviors:
+        - PublicKeyIdV1: text/binary round-trip, reject mixed case, reject whitespace,
+          reject padding, reject empty, reject truncated, reject unknown algorithm tag,
+          reject wrong prefix, reject invalid base32 chars, bounded text length,
+          deterministic derivation, distinct IDs for distinct keys
+        - KeySetIdV1: text/binary round-trip, member-order independence, reject mixed case,
+          reject whitespace, reject padding, reject empty, reject truncated,
+          reject unknown set tag, reject wrong prefix, bounded text length,
+          deterministic derivation, distinct IDs for distinct member sets
+      ref: "cargo test -p apm2-daemon identity::"

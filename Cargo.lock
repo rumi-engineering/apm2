@@ -204,6 +204,7 @@ dependencies = [
  "clap",
  "criterion",
  "ctrlc",
+ "data-encoding",
  "directories",
  "ed25519-dalek",
  "futures",

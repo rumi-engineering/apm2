@@ -1,0 +1,29 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0303"
+  title: "Rollout phase S0.75 evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence for rollout phase S0.75 gate: canonical key identifier types
+    (PublicKeyIdV1 and KeySetIdV1) are implemented with strict grammar
+    enforcement, lossless binary/text round-trips, and cross-language
+    conformance vectors. This is delivered by ticket TCK-00353.
+  requirement_ids:
+    - "REQ-0007"
+  source_refs:
+    - "crates/apm2-daemon/src/identity/mod.rs"
+    - "crates/apm2-daemon/src/identity/public_key_id.rs"
+    - "crates/apm2-daemon/src/identity/keyset_id.rs"
+    - "crates/apm2-daemon/src/identity/conformance.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Canonical key identifier conformance tests covering:
+        - 5 valid PublicKeyIdV1 vectors (ed25519 algorithm)
+        - 4 valid KeySetIdV1 vectors (multisig and threshold modes)
+        - 25 invalid input vectors (mixed case, whitespace, padding, wrong prefix,
+          truncated, invalid base32, too long)
+        - Parser differential tests (text vs binary parsers agree)
+        - Binary-text-binary lossless round-trip verification
+      ref: "cargo test -p apm2-daemon identity"
