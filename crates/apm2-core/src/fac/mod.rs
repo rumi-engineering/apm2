@@ -13,6 +13,8 @@
 //!   changesets
 //! - **Gate Receipts**: Versioned envelopes for gate execution results
 //! - **Terminal Verifiers**: Machine-checkable predicates for AAT outcomes
+//! - **Policy Inheritance**: Multi-holon policy inheritance enforcement and
+//!   attestation ratcheting (TCK-00340)
 //!
 //! # Security Model
 //!
@@ -84,6 +86,7 @@ pub mod harness_sandbox;
 mod key_policy;
 mod lease;
 pub mod merge_receipt;
+pub mod policy_inheritance;
 mod policy_resolution;
 pub mod projection_receipt_recorded;
 pub mod quarantine;
@@ -207,6 +210,12 @@ pub use lease::{
 pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
+};
+// Re-export policy inheritance types (TCK-00340)
+pub use policy_inheritance::{
+    AttestationLevel, AttestationRequirements, MAX_ACTOR_ID_LENGTH, MAX_REASON_LENGTH,
+    MAX_SUBLEASE_BATCH_SIZE, PolicyInheritanceError, PolicyInheritanceValidator,
+    ReceiptAttestation, ReceiptKind, validate_receipt_attestation,
 };
 // Re-export policy resolution types
 pub use policy_resolution::{
