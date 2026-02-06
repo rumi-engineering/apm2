@@ -18,6 +18,10 @@
 //!   SIGTERM (trap '' TERM) and verifies the force-kill phase escalates to
 //!   SIGKILL, proving containment even under adversarial workloads.
 //!
+//! - `tck_00392_pid_reuse_no_false_positive_kill`: Validates that the PID
+//!   identity guard (start-time comparison) prevents false-positive kills when
+//!   the kernel recycles a PID between the snapshot and the force-kill phase.
+//!
 //! - `tck_00392_e2e_daemon_shutdown_cleans_processes`: An improved E2E test
 //!   that starts a real daemon accept loop with running processes, triggers
 //!   shutdown via the operator socket, and verifies processes are stopped and
@@ -29,10 +33,11 @@
 //! cargo test -p apm2-daemon tck_00392_shutdown_containment
 //! cargo test -p apm2-daemon tck_00392_deadline
 //! cargo test -p apm2-daemon tck_00392_term_resistant
+//! cargo test -p apm2-daemon tck_00392_pid_reuse
 //! cargo test -p apm2-daemon tck_00392_e2e_daemon_shutdown_cleans
 //! ```
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,16 +87,32 @@ async fn collect_running(state: &SharedState) -> Vec<(String, u32)> {
         .collect()
 }
 
-/// Collects tracked PIDs — mirrors `collect_tracked_pids` in `main.rs`.
-async fn collect_pids(state: &SharedState) -> HashSet<u32> {
+/// Read the start time (field 22) from `/proc/{pid}/stat`.
+/// Mirrors `read_proc_start_time` in `main.rs`.
+#[cfg(unix)]
+fn read_proc_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let contents = std::fs::read_to_string(stat_path).ok()?;
+    let after_comm = contents.rsplit_once(')')?.1;
+    let tokens: Vec<&str> = after_comm.split_whitespace().collect();
+    tokens.get(19)?.parse::<u64>().ok()
+}
+
+/// Collects tracked PIDs with start times — mirrors `collect_tracked_pids`
+/// in `main.rs`.
+async fn collect_pids(state: &SharedState) -> HashMap<u32, Option<u64>> {
     let inner = state.read().await;
-    let mut pids = HashSet::new();
+    let mut pids = HashMap::new();
     for spec in inner.supervisor.specs() {
         for i in 0..spec.instances {
             if let Some(handle) = inner.supervisor.get_handle(&spec.name, i) {
                 if handle.state.is_running() {
                     if let Some(pid) = handle.pid {
-                        pids.insert(pid);
+                        #[cfg(unix)]
+                        let start_time = read_proc_start_time(pid);
+                        #[cfg(not(unix))]
+                        let start_time = None;
+                        pids.insert(pid, start_time);
                     }
                 }
             }
@@ -145,8 +166,11 @@ async fn shutdown_all_processes(state: &SharedState, deadline: tokio::time::Inst
 }
 
 /// Mirrors `force_kill_all_processes` from `main.rs` with PID-tracking
-/// safety.
-async fn force_kill_all_processes(state: &SharedState, pre_shutdown_pids: &HashSet<u32>) {
+/// safety and PID-reuse validation.
+async fn force_kill_all_processes(
+    state: &SharedState,
+    pre_shutdown_pids: &HashMap<u32, Option<u64>>,
+) {
     // Phase A: runners still in state
     let still_running = collect_running(state).await;
     for (name, instance) in still_running {
@@ -173,16 +197,24 @@ async fn force_kill_all_processes(state: &SharedState, pre_shutdown_pids: &HashS
         }
     }
 
-    // Phase B: OS-level kill for orphaned PIDs
+    // Phase B: OS-level kill for orphaned PIDs with identity validation
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
 
-        for &pid in pre_shutdown_pids {
+        for (&pid, &snapshot_start_time) in pre_shutdown_pids {
             #[allow(clippy::cast_possible_wrap)]
             let target = Pid::from_raw(pid as i32);
             if kill(target, None).is_ok() {
+                // PID-reuse safety: verify process identity before killing.
+                if let Some(expected_start) = snapshot_start_time {
+                    let current_start = read_proc_start_time(pid);
+                    if current_start != Some(expected_start) {
+                        // PID was recycled — do NOT kill.
+                        continue;
+                    }
+                }
                 #[allow(clippy::cast_possible_wrap)]
                 let _ = kill(target, Signal::SIGKILL);
             }
@@ -245,7 +277,7 @@ async fn tck_00392_deadline_expired_process_is_force_killed() {
     // Pre-shutdown: collect PIDs (mirrors daemon behavior)
     let pre_shutdown_pids = collect_pids(&state).await;
     assert!(
-        pre_shutdown_pids.contains(&pid),
+        pre_shutdown_pids.contains_key(&pid),
         "PID must be in pre-shutdown set"
     );
 
@@ -333,6 +365,100 @@ async fn tck_00392_term_resistant_child_is_killed() {
         !pid_alive(pid),
         "TERM-resistant process must be dead after force-kill — containment breach!"
     );
+}
+
+// =============================================================================
+// IT-00392-BLOCKER-03: PID-reuse does NOT cause false-positive kill
+// =============================================================================
+
+/// Verifies that the force-kill phase does NOT kill an unrelated process
+/// that inherited a recycled PID.
+///
+/// Strategy:
+/// 1. Spawn a short-lived child, record its PID + start time in a snapshot.
+/// 2. Kill the child so its PID becomes available for reuse.
+/// 3. Spawn a new, unrelated process (the "bystander").
+/// 4. Build a fake pre-shutdown map containing the OLD PID with the OLD start
+///    time.
+/// 5. Run force-kill. If the bystander happens to get the same PID, the
+///    start-time check must detect the mismatch and skip the kill. If the
+///    bystander gets a different PID, it is trivially safe.
+///
+/// Since we cannot guarantee the kernel will recycle a specific PID, this
+/// test takes a dual-assertion approach:
+/// - **If PIDs match**: assert the bystander survives (start-time guard).
+/// - **If PIDs differ**: assert the bystander survives (PID not in map).
+///
+/// Either way, the bystander MUST survive.
+#[tokio::test]
+async fn tck_00392_pid_reuse_no_false_positive_kill() {
+    use std::process::Command;
+
+    // Step 1: Spawn a child and record its identity.
+    let mut original = Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("failed to spawn original child");
+    let original_pid = original.id();
+
+    // Give the process a moment to start so /proc entry exists.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    #[cfg(unix)]
+    let original_start_time = read_proc_start_time(original_pid);
+    #[cfg(not(unix))]
+    let original_start_time: Option<u64> = None;
+
+    // Step 2: Kill the original child — free its PID for potential reuse.
+    original.kill().expect("failed to kill original child");
+    original.wait().expect("failed to wait for original child");
+
+    // Give the kernel a moment to fully clean up the process.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Step 3: Spawn a bystander process (unrelated workload).
+    let mut bystander = Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("failed to spawn bystander");
+    let bystander_pid = bystander.id();
+
+    // Give the bystander a moment to start.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        pid_alive(bystander_pid),
+        "bystander must be alive before force-kill"
+    );
+
+    // Step 4: Build a fake pre-shutdown map with the ORIGINAL PID's identity.
+    let mut fake_snapshot: HashMap<u32, Option<u64>> = HashMap::new();
+    fake_snapshot.insert(original_pid, original_start_time);
+
+    // Step 5: Create a minimal daemon state (no runners — Phase A is a no-op).
+    let spec = ProcessSpec::builder()
+        .name("dummy")
+        .command("true")
+        .instances(1)
+        .build();
+    let state = create_state_with_spec(&spec);
+
+    // Run force-kill with the stale snapshot.
+    force_kill_all_processes(&state, &fake_snapshot).await;
+
+    // Give the kernel a moment in case a signal was sent.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Step 6: Assert the bystander survived.
+    assert!(
+        pid_alive(bystander_pid),
+        "bystander process was killed — PID-reuse guard failed! \
+         original_pid={original_pid}, bystander_pid={bystander_pid}"
+    );
+
+    // Cleanup: kill the bystander ourselves.
+    bystander.kill().expect("failed to kill bystander");
+    bystander.wait().expect("failed to wait for bystander");
 }
 
 // =============================================================================

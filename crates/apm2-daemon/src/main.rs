@@ -352,21 +352,54 @@ async fn collect_running_processes(state: &SharedState) -> Vec<(String, u32)> {
         .collect()
 }
 
-/// Collect tracked PIDs for all running process instances.
+/// Read the start time (field 22) from `/proc/{pid}/stat`.
 ///
-/// Returns a set of OS PIDs that the supervisor has recorded for running
-/// processes. This is used as a **secondary PID ledger** by the force-kill
-/// phase so that orphaned children can be reaped even if their
-/// `ProcessRunner` handle has been dropped.
-async fn collect_tracked_pids(state: &SharedState) -> std::collections::HashSet<u32> {
+/// This is used to uniquely identify a process beyond its PID. After a
+/// process exits, the kernel may recycle its PID for a new, unrelated
+/// process. By recording the start time at snapshot time and re-reading it
+/// before sending a kill signal, we can detect PID reuse and avoid killing
+/// an innocent process.
+///
+/// Returns `Some(starttime)` on success, or `None` if the proc entry does
+/// not exist or cannot be parsed (e.g. the process already exited).
+#[cfg(unix)]
+fn read_proc_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let contents = std::fs::read_to_string(stat_path).ok()?;
+
+    // Field 2 (comm) is enclosed in parentheses and may contain spaces,
+    // parens, and other special characters. The safe way to parse is to
+    // find the LAST ')' in the line, then split everything after it.
+    let after_comm = contents.rsplit_once(')')?.1;
+
+    // Fields after comm (field 2) start at field 3.  We need field 22
+    // (starttime), which is field index 22 - 3 = 19 in the remaining
+    // whitespace-separated tokens.
+    let tokens: Vec<&str> = after_comm.split_whitespace().collect();
+    // Index 19 corresponds to field 22 (starttime).
+    tokens.get(19)?.parse::<u64>().ok()
+}
+
+/// Collect tracked PIDs for all running process instances, together with
+/// each process's kernel start time for identity validation.
+///
+/// Returns a map of `PID -> starttime` that the force-kill phase can use
+/// to verify a PID still belongs to the originally managed child before
+/// sending `SIGKILL`. This prevents false-positive kills when the kernel
+/// recycles a PID between the graceful and force-kill phases.
+async fn collect_tracked_pids(state: &SharedState) -> std::collections::HashMap<u32, Option<u64>> {
     let inner = state.read().await;
-    let mut pids = std::collections::HashSet::new();
+    let mut pids = std::collections::HashMap::new();
     for spec in inner.supervisor.specs() {
         for i in 0..spec.instances {
             if let Some(handle) = inner.supervisor.get_handle(&spec.name, i) {
                 if handle.state.is_running() {
                     if let Some(pid) = handle.pid {
-                        pids.insert(pid);
+                        #[cfg(unix)]
+                        let start_time = read_proc_start_time(pid);
+                        #[cfg(not(unix))]
+                        let start_time = None;
+                        pids.insert(pid, start_time);
                     }
                 }
             }
@@ -470,14 +503,22 @@ async fn shutdown_all_processes(state: &SharedState, deadline: tokio::time::Inst
 /// **PID-tracking safety (TCK-00392 BLOCKER fix):**
 ///
 /// In addition to iterating runners still present in daemon state, this
-/// function also accepts a set of PIDs that were recorded _before_ the
-/// graceful phase started. If a runner was dropped mid-stop (e.g. due to
-/// deadline expiry) and the process was spawned with `kill_on_drop(false)`,
-/// the child may still be alive. The PID set lets us issue an OS-level
-/// `SIGKILL` even when the runner handle is gone.
+/// function also accepts a map of `PID -> starttime` that was recorded
+/// _before_ the graceful phase started. If a runner was dropped mid-stop
+/// (e.g. due to deadline expiry) and the process was spawned with
+/// `kill_on_drop(false)`, the child may still be alive. The PID map lets
+/// us issue an OS-level `SIGKILL` even when the runner handle is gone.
+///
+/// **PID-reuse safety (v3 security review BLOCKER fix):**
+///
+/// Before sending `SIGKILL` to any PID from the pre-shutdown snapshot, we
+/// re-read `/proc/{pid}/stat` and verify that the kernel start time still
+/// matches the value recorded at snapshot time. If the start time differs
+/// (or the proc entry is gone), the PID has been recycled and the kill is
+/// skipped. This prevents false-positive kills of unrelated processes.
 async fn force_kill_all_processes(
     state: &SharedState,
-    pre_shutdown_pids: &std::collections::HashSet<u32>,
+    pre_shutdown_pids: &std::collections::HashMap<u32, Option<u64>>,
 ) {
     // Phase A: kill processes still tracked in supervisor state.
     let still_running = collect_running_processes(state).await;
@@ -519,8 +560,9 @@ async fn force_kill_all_processes(
         }
     }
 
-    // Phase B: OS-level kill for any PID in the pre-shutdown set that is
-    // still alive. This catches processes whose runner was dropped mid-stop
+    // Phase B: OS-level kill for any PID in the pre-shutdown map that is
+    // still alive AND still the same process (validated via start time).
+    // This catches processes whose runner was dropped mid-stop
     // (cancellation / deadline expiry) and were spawned with
     // `kill_on_drop(false)`.
     #[cfg(unix)]
@@ -528,11 +570,27 @@ async fn force_kill_all_processes(
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
 
-        for &pid in pre_shutdown_pids {
+        for (&pid, &snapshot_start_time) in pre_shutdown_pids {
             // Check if the process is still alive (signal 0 = no-op probe).
             #[allow(clippy::cast_possible_wrap)]
             let target = Pid::from_raw(pid as i32);
             if kill(target, None).is_ok() {
+                // PID-reuse safety: verify the process identity before killing.
+                // If we recorded a start time at snapshot, the current process
+                // at this PID must have the same start time. A mismatch means
+                // the original child exited and the PID was recycled.
+                if let Some(expected_start) = snapshot_start_time {
+                    let current_start = read_proc_start_time(pid);
+                    if current_start != Some(expected_start) {
+                        warn!(
+                            pid,
+                            expected_start,
+                            ?current_start,
+                            "PID reuse detected — skipping kill of unrelated process"
+                        );
+                        continue;
+                    }
+                }
                 warn!(pid, "Orphan process still alive — sending SIGKILL");
                 #[allow(clippy::cast_possible_wrap)]
                 let _ = kill(target, Signal::SIGKILL);
