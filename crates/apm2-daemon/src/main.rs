@@ -2047,7 +2047,7 @@ async fn handle_dual_socket_connection(
 ) -> Result<()> {
     use bytes::Bytes;
     use futures::{SinkExt, StreamExt};
-    use protocol::connection_handler::{HandshakeResult, perform_handshake};
+    use protocol::connection_handler::{HandshakeConfig, HandshakeResult, perform_handshake};
     use protocol::dispatch::ConnectionContext;
 
     info!(
@@ -2056,10 +2056,21 @@ async fn handle_dual_socket_connection(
         "New ProtocolServer connection"
     );
 
+    // TCK-00348: Build handshake config from real HSI contract manifest.
+    // The server contract hash is computed from the dispatch registry so
+    // that real connections enforce the tiered mismatch policy.
+    let handshake_config = HandshakeConfig::from_manifest();
+
     // Perform mandatory handshake
-    match perform_handshake(&mut connection).await? {
-        HandshakeResult::Success => {
-            info!(socket_type = %socket_type, "Handshake completed successfully");
+    let _contract_binding = match perform_handshake(&mut connection, &handshake_config).await? {
+        HandshakeResult::Success { contract_binding } => {
+            info!(
+                socket_type = %socket_type,
+                mismatch_waived = contract_binding.mismatch_waived,
+                risk_tier = %contract_binding.risk_tier,
+                "Handshake completed successfully"
+            );
+            contract_binding
         },
         HandshakeResult::Failed => {
             warn!(socket_type = %socket_type, "Handshake failed, closing connection");
@@ -2069,7 +2080,7 @@ async fn handle_dual_socket_connection(
             info!(socket_type = %socket_type, "Connection closed during handshake");
             return Ok(());
         },
-    }
+    };
 
     // TCK-00287: Wire up tag-based ProtocolServer dispatchers
     // Create connection context based on socket type

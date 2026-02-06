@@ -339,6 +339,22 @@ impl OperatorClient {
         })
     }
 
+    /// Computes the client's HSI contract manifest hash (TCK-00348).
+    ///
+    /// Per RFC-0020 section 3.1.2, the client MUST include its contract hash
+    /// in the Hello message. This is derived from the same dispatch registry
+    /// as the daemon's manifest.
+    fn client_contract_hash() -> String {
+        let cli_version = apm2_daemon::hsi_contract::CliVersion {
+            semver: env!("CARGO_PKG_VERSION").to_string(),
+            build_hash: String::new(),
+        };
+        apm2_daemon::hsi_contract::build_manifest(cli_version).map_or_else(
+            |_| String::new(),
+            |manifest| manifest.content_hash().unwrap_or_default(),
+        )
+    }
+
     /// Performs the Hello/HelloAck handshake.
     async fn perform_handshake(
         framed: &mut Framed<UnixStream, FrameCodec>,
@@ -346,8 +362,15 @@ impl OperatorClient {
     ) -> Result<String, ProtocolClientError> {
         let mut client_handshake = ClientHandshake::new(CLIENT_INFO);
 
-        // Send Hello
-        let hello = client_handshake.create_hello();
+        // TCK-00348 BLOCKER-3: Populate Hello with client contract hash
+        // and canonicalizer metadata per RFC-0020 section 3.1.2.
+        let hello = client_handshake
+            .create_hello()
+            .with_contract_hash(Self::client_contract_hash())
+            .with_canonicalizers(vec![apm2_daemon::hsi_contract::CanonicalizerInfo {
+                id: "apm2.canonical.v1".to_string(),
+                version: 1,
+            }]);
         let hello_msg: HandshakeMessage = hello.into();
         let hello_bytes = serialize_handshake_message(&hello_msg)?;
 

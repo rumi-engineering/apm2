@@ -301,6 +301,18 @@ pub fn evaluate_mismatch_policy(
         }
     }
 
+    // TCK-00348 BLOCKER-5: For Tier2+, empty/missing client canonicalizers
+    // are treated as a mismatch (fail-closed). A client that omits
+    // canonicalizer metadata cannot prove encoding compatibility.
+    if client_canonicalizers.is_empty()
+        && !server_canonicalizers.is_empty()
+        && risk_tier.requires_deny_on_mismatch()
+    {
+        mismatches.push(
+            "client did not provide canonicalizer metadata (required for Tier2+)".to_string(),
+        );
+    }
+
     // Check canonicalizer mismatches
     for client_canon in client_canonicalizers {
         let server_match = server_canonicalizers
@@ -697,6 +709,54 @@ mod tests {
         let outcome =
             evaluate_mismatch_policy("blake3:same", "blake3:same", &[], &[], RiskTier::Tier4);
         assert!(outcome.is_match());
+    }
+
+    /// TCK-00348 BLOCKER-5: Missing client canonicalizers at Tier2+ must be
+    /// treated as mismatch (fail-closed). A client that omits canonicalizer
+    /// metadata cannot prove encoding compatibility.
+    #[test]
+    fn missing_client_canonicalizers_tier2_denied() {
+        let outcome = evaluate_mismatch_policy(
+            "blake3:same",
+            "blake3:same",
+            &[], // empty client canonicalizers
+            &[CanonicalizerInfo {
+                id: "apm2.canonical.v1".to_string(),
+                version: 1,
+            }], // non-empty server canonicalizers
+            RiskTier::Tier2,
+        );
+        assert!(
+            outcome.is_denied(),
+            "Empty client canonicalizers at Tier2 with non-empty server must be denied"
+        );
+        if let MismatchOutcome::Denied { detail, .. } = &outcome {
+            assert!(
+                detail.contains("did not provide canonicalizer metadata"),
+                "detail should mention missing canonicalizers: {detail}"
+            );
+        }
+    }
+
+    /// TCK-00348 BLOCKER-5: Missing client canonicalizers at Tier0 should
+    /// be allowed (backward compat, not treated as a mismatch at Tier0).
+    #[test]
+    fn missing_client_canonicalizers_tier0_allowed() {
+        let outcome = evaluate_mismatch_policy(
+            "blake3:same",
+            "blake3:same",
+            &[], // empty client canonicalizers
+            &[CanonicalizerInfo {
+                id: "apm2.canonical.v1".to_string(),
+                version: 1,
+            }],
+            RiskTier::Tier0,
+        );
+        // Tier0 does not flag missing canonicalizers — it's acceptable
+        assert!(
+            !outcome.is_denied(),
+            "Empty client canonicalizers at Tier0 should NOT be denied"
+        );
     }
 
     #[test]

@@ -967,7 +967,9 @@ async fn test_legacy_protocol_server_path_not_used_by_daemon() {
 async fn test_perform_handshake_integration() {
     use std::sync::Arc;
 
-    use apm2_daemon::protocol::connection_handler::{HandshakeResult, perform_handshake};
+    use apm2_daemon::protocol::connection_handler::{
+        HandshakeConfig, HandshakeResult, perform_handshake,
+    };
     use apm2_daemon::protocol::{
         ClientHandshake, Connection, HandshakeMessage, SocketManagerConfig,
         parse_handshake_message, serialize_handshake_message,
@@ -981,12 +983,14 @@ async fn test_perform_handshake_integration() {
     let config = SocketManagerConfig::new(&operator_path, &session_path);
     let manager = Arc::new(apm2_daemon::protocol::SocketManager::bind(config).unwrap());
 
+    let hs_config = HandshakeConfig::default();
+
     // Spawn server using perform_handshake from the library
     let manager_clone = manager.clone();
     let server_handle = tokio::spawn(async move {
         let (mut conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
         // Test the handshake function directly
-        let result = perform_handshake(&mut conn).await.unwrap();
+        let result = perform_handshake(&mut conn, &hs_config).await.unwrap();
         (result, socket_type)
     });
 
@@ -1027,7 +1031,7 @@ async fn test_perform_handshake_integration() {
         .expect("server task panicked");
 
     assert!(
-        matches!(result, HandshakeResult::Success),
+        matches!(result, HandshakeResult::Success { .. }),
         "Handshake should succeed"
     );
     assert_eq!(socket_type, SocketType::Operator);
@@ -1051,12 +1055,20 @@ fn test_handshake_types_are_in_library() {
 
     // Verify HandshakeResult enum variants are accessible
     // Simply constructing each variant proves they exist and are public
-    let success = HandshakeResult::Success;
+    let success = HandshakeResult::Success {
+        contract_binding: apm2_daemon::hsi_contract::SessionContractBinding {
+            cli_contract_hash: String::new(),
+            server_contract_hash: String::new(),
+            client_canonicalizers: Vec::new(),
+            mismatch_waived: false,
+            risk_tier: apm2_daemon::hsi_contract::RiskTier::Tier0,
+        },
+    };
     let failed = HandshakeResult::Failed;
     let closed = HandshakeResult::ConnectionClosed;
 
     // Use the values to avoid unused warnings
-    assert!(matches!(success, HandshakeResult::Success));
+    assert!(matches!(success, HandshakeResult::Success { .. }));
     assert!(matches!(failed, HandshakeResult::Failed));
     assert!(matches!(closed, HandshakeResult::ConnectionClosed));
 

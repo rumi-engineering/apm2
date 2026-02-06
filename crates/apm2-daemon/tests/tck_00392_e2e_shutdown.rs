@@ -25,7 +25,7 @@ use std::time::Duration;
 use apm2_core::Supervisor;
 use apm2_core::config::EcosystemConfig;
 use apm2_core::schema_registry::InMemorySchemaRegistry;
-use apm2_daemon::protocol::connection_handler::perform_handshake;
+use apm2_daemon::protocol::connection_handler::{HandshakeConfig, perform_handshake};
 use apm2_daemon::protocol::dispatch::{ConnectionContext, encode_shutdown_request};
 use apm2_daemon::protocol::messages::{
     BoundedDecode, DecodeConfig, PrivilegedError, ShutdownRequest, ShutdownResponse,
@@ -89,7 +89,8 @@ fn spawn_server_loop(
                 let conn_ds = Arc::clone(&dispatcher_state);
                 tokio::spawn(async move {
                     // Perform handshake
-                    if perform_handshake(&mut connection).await.is_err() {
+                    let hs_cfg = HandshakeConfig::default();
+                    if perform_handshake(&mut connection, &hs_cfg).await.is_err() {
                         return;
                     }
 

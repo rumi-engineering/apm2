@@ -545,7 +545,7 @@ async fn tck_00392_unknown_identity_pid_not_killed() {
 /// any running child processes.
 #[tokio::test]
 async fn tck_00392_e2e_daemon_shutdown_cleans_processes() {
-    use apm2_daemon::protocol::connection_handler::perform_handshake;
+    use apm2_daemon::protocol::connection_handler::{HandshakeConfig, perform_handshake};
     use apm2_daemon::protocol::dispatch::{ConnectionContext, encode_shutdown_request};
     use apm2_daemon::protocol::messages::{
         BoundedDecode, DecodeConfig, ShutdownRequest, ShutdownResponse,
@@ -620,7 +620,8 @@ async fn tck_00392_e2e_daemon_shutdown_cleans_processes() {
                 let cs = loop_state.clone();
                 let ds = Arc::clone(&loop_ds);
                 tokio::spawn(async move {
-                    if perform_handshake(&mut conn).await.is_err() {
+                    let hs_cfg = HandshakeConfig::default();
+                    if perform_handshake(&mut conn, &hs_cfg).await.is_err() {
                         return;
                     }
                     let ctx = match st {

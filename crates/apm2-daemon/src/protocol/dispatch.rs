@@ -710,6 +710,32 @@ pub trait LedgerEventEmitter: Send + Sync {
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a `ContractBindingRecorded` event to the ledger (TCK-00348).
+    ///
+    /// Per RFC-0020 section 3.1.2, the contract binding metadata from the
+    /// Hello/HelloAck handshake MUST be persisted as an authoritative
+    /// session-level audit record.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Ok(())` (no-op). Implementors that persist events should
+    /// override this to store the binding alongside the `SessionStarted`
+    /// event.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session that was started
+    /// * `binding` - The contract binding metadata from the handshake
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    fn emit_contract_binding_recorded(
+        &self,
+        _session_id: &str,
+        _binding: &crate::hsi_contract::SessionContractBinding,
+        _timestamp_ns: u64,
+    ) -> Result<(), LedgerEventError> {
+        Ok(())
+    }
 }
 
 /// Domain separation prefix for `WorkClaimed` events.
@@ -1952,6 +1978,89 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         );
 
         Ok(signed_event)
+    }
+
+    fn emit_contract_binding_recorded(
+        &self,
+        session_id: &str,
+        binding: &crate::hsi_contract::SessionContractBinding,
+        timestamp_ns: u64,
+    ) -> Result<(), LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        const DOMAIN_PREFIX: &[u8] = b"apm2.event.contract_binding_recorded:";
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+        let payload = serde_json::json!({
+            "event_type": "contract_binding_recorded",
+            "session_id": session_id,
+            "cli_contract_hash": binding.cli_contract_hash,
+            "server_contract_hash": binding.server_contract_hash,
+            "mismatch_waived": binding.mismatch_waived,
+            "risk_tier": binding.risk_tier,
+            "client_canonicalizers": binding.client_canonicalizers,
+        });
+
+        let payload_bytes =
+            serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("payload serialization failed: {e}"),
+            })?;
+
+        let mut canonical_bytes = Vec::with_capacity(DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "contract_binding_recorded".to_string(),
+            work_id: session_id.to_string(),
+            actor_id: "daemon".to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // Persist to bounded in-memory store
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event);
+            events_by_work
+                .entry(session_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            session_id = %session_id,
+            mismatch_waived = binding.mismatch_waived,
+            risk_tier = %binding.risk_tier,
+            "ContractBindingRecorded event persisted"
+        );
+
+        Ok(())
     }
 }
 

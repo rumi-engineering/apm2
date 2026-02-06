@@ -571,6 +571,19 @@ impl ServerHandshake {
             return Ok(HelloNack::version_mismatch(hello.protocol_version).into());
         }
 
+        // TCK-00348 BLOCKER-2: Validate untrusted contract binding fields
+        // BEFORE mismatch evaluation. Reject over-limit payloads fail-closed.
+        let binding = crate::hsi_contract::ContractBinding {
+            cli_contract_hash: hello.cli_contract_hash.clone(),
+            canonicalizers: hello.canonicalizers.clone(),
+        };
+        if let Err(e) = crate::hsi_contract::validate_contract_binding(&binding) {
+            self.state = HandshakeState::Failed;
+            return Ok(
+                HelloNack::rejected(format!("contract binding validation failed: {e}")).into(),
+            );
+        }
+
         // TCK-00348: Evaluate contract mismatch policy.
         // Check admission BEFORE mutating state to Completed (transactional
         // state mutation pattern).
@@ -1354,5 +1367,47 @@ mod tests {
         } else {
             panic!("Expected HelloAck message");
         }
+    }
+
+    /// TCK-00348 BLOCKER-2: Validate contract binding bounds in
+    /// `process_hello`. Over-limit contract hash must be rejected before
+    /// mismatch evaluation.
+    #[test]
+    fn test_process_hello_rejects_oversized_contract_hash() {
+        let mut server =
+            ServerHandshake::new("daemon/1.0").with_risk_tier(crate::hsi_contract::RiskTier::Tier0);
+
+        let hello = Hello::new("cli/1.0").with_contract_hash("x".repeat(200)); // exceeds MAX_CONTRACT_HASH_LEN (128)
+
+        let response = server.process_hello(&hello).unwrap();
+        assert!(
+            matches!(response, HandshakeMessage::HelloNack(ref nack) if nack.error_code == HandshakeErrorCode::Rejected),
+            "Over-limit contract hash should be rejected"
+        );
+        assert_eq!(server.state(), HandshakeState::Failed);
+    }
+
+    /// TCK-00348 BLOCKER-2: Too many canonicalizer entries must be rejected.
+    #[test]
+    fn test_process_hello_rejects_too_many_canonicalizers() {
+        let mut server =
+            ServerHandshake::new("daemon/1.0").with_risk_tier(crate::hsi_contract::RiskTier::Tier0);
+
+        let canons: Vec<CanonicalizerInfo> = (0
+            ..=crate::hsi_contract::handshake_binding::MAX_CANONICALIZER_ENTRIES)
+            .map(|i| CanonicalizerInfo {
+                id: format!("canon.{i}"),
+                version: 1,
+            })
+            .collect();
+
+        let hello = Hello::new("cli/1.0").with_canonicalizers(canons);
+
+        let response = server.process_hello(&hello).unwrap();
+        assert!(
+            matches!(response, HandshakeMessage::HelloNack(ref nack) if nack.error_code == HandshakeErrorCode::Rejected),
+            "Too many canonicalizers should be rejected"
+        );
+        assert_eq!(server.state(), HandshakeState::Failed);
     }
 }
