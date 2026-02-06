@@ -194,6 +194,23 @@ pub enum PersistTrigger {
         /// Error code if available.
         code: Option<String>,
     },
+
+    /// Taint flow policy denied an untrusted content flow (TCK-00339).
+    ///
+    /// Emitted when untrusted or adversarial content attempts to flow into
+    /// a restricted target context (receipt, high-authority prompt, etc.)
+    /// and the taint policy denies the flow. This is a security trigger
+    /// that requires immediate attention.
+    TaintFlowDenied {
+        /// Source type of the tainted content.
+        source: String,
+        /// Taint level classification.
+        taint_level: String,
+        /// Target context that was protected.
+        target_context: String,
+        /// Policy rule that triggered the denial.
+        rule_id: String,
+    },
 }
 
 impl PersistTrigger {
@@ -294,6 +311,22 @@ impl PersistTrigger {
         }
     }
 
+    /// Creates a taint flow denied trigger from a `TaintViolation` (TCK-00339).
+    #[must_use]
+    pub fn taint_flow_denied(
+        source: impl Into<String>,
+        taint_level: impl Into<String>,
+        target_context: impl Into<String>,
+        rule_id: impl Into<String>,
+    ) -> Self {
+        Self::TaintFlowDenied {
+            source: truncate_string(source.into(), MAX_RESOURCE_LEN),
+            taint_level: truncate_string(taint_level.into(), MAX_RESOURCE_LEN),
+            target_context: truncate_string(target_context.into(), MAX_RESOURCE_LEN),
+            rule_id: truncate_string(rule_id.into(), MAX_RULE_ID_LEN),
+        }
+    }
+
     // =========================================================================
     // Accessors
     // =========================================================================
@@ -304,7 +337,8 @@ impl PersistTrigger {
         match self {
             Self::GateFailure { .. }
             | Self::PolicyViolation { .. }
-            | Self::QuarantineEntry { .. } => TriggerCategory::Security,
+            | Self::QuarantineEntry { .. }
+            | Self::TaintFlowDenied { .. } => TriggerCategory::Security,
             Self::BudgetExhausted { .. } | Self::WatchdogTimeout { .. } => {
                 TriggerCategory::Resource
             },
@@ -331,6 +365,7 @@ impl PersistTrigger {
                 | Self::PolicyViolation { .. }
                 | Self::QuarantineEntry { .. }
                 | Self::ProcessKilled { .. }
+                | Self::TaintFlowDenied { .. }
         )
     }
 
@@ -347,6 +382,7 @@ impl PersistTrigger {
             Self::QuarantineEntry { .. } => "quarantine_entry",
             Self::WatchdogTimeout { .. } => "watchdog_timeout",
             Self::InternalError { .. } => "internal_error",
+            Self::TaintFlowDenied { .. } => "taint_flow_denied",
         }
     }
 
@@ -405,6 +441,17 @@ impl PersistTrigger {
                 || format!("Internal error: {message}"),
                 |c| format!("Internal error [{c}]: {message}"),
             ),
+            Self::TaintFlowDenied {
+                source,
+                taint_level,
+                target_context,
+                rule_id,
+            } => {
+                format!(
+                    "Taint flow denied: {taint_level} content from {source} \
+                     blocked from {target_context} (rule: {rule_id})"
+                )
+            },
         }
     }
 }
@@ -667,11 +714,48 @@ mod tests {
             PersistTrigger::quarantine("reason"),
             PersistTrigger::watchdog_timeout(1000, 500),
             PersistTrigger::internal_error("message", None),
+            PersistTrigger::taint_flow_denied(
+                "DIFF",
+                "UNTRUSTED",
+                "RECEIPT",
+                "DEFAULT_TRUST_CHECK",
+            ),
         ];
 
         for trigger in triggers {
             let summary = trigger.summary();
             assert!(!summary.is_empty(), "trigger {trigger:?} has empty summary");
         }
+    }
+
+    #[test]
+    fn test_taint_flow_denied_trigger() {
+        let trigger = PersistTrigger::taint_flow_denied(
+            "DIFF",
+            "UNTRUSTED",
+            "RECEIPT",
+            "DEFAULT_TRUST_CHECK",
+        );
+
+        assert_eq!(trigger.trigger_type(), "taint_flow_denied");
+        assert_eq!(trigger.category(), TriggerCategory::Security);
+        assert!(trigger.is_security_related());
+        assert!(trigger.requires_immediate_attention());
+        assert!(trigger.summary().contains("UNTRUSTED"));
+        assert!(trigger.summary().contains("DIFF"));
+        assert!(trigger.summary().contains("RECEIPT"));
+    }
+
+    #[test]
+    fn test_taint_flow_denied_trigger_serialization() {
+        let trigger = PersistTrigger::taint_flow_denied(
+            "WEB_CONTENT",
+            "ADVERSARIAL",
+            "HIGH_AUTHORITY_PROMPT",
+            "RULE_001",
+        );
+        let json = serde_json::to_string(&trigger).unwrap();
+        let deserialized: PersistTrigger = serde_json::from_str(&json).unwrap();
+        assert_eq!(trigger, deserialized);
     }
 }

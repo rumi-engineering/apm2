@@ -150,6 +150,13 @@ pub enum ReasonCode {
     /// configuration issues. Per RFC-0019 Addendum, profiles must be explicitly
     /// selected by hash; ambient defaults are forbidden.
     AdapterMisconfigured,
+    /// Taint flow policy denied the operation (TCK-00339).
+    ///
+    /// This code is emitted when untrusted or adversarial content attempts to
+    /// flow into a high-authority context (receipt, prompt, policy input) and
+    /// the taint policy denies the flow. Per REQ-0016, taint tracking prevents
+    /// untrusted content from silently influencing high-risk decisions.
+    TaintFlowDenied,
 }
 
 impl std::fmt::Display for ReasonCode {
@@ -167,6 +174,7 @@ impl std::fmt::Display for ReasonCode {
             Self::ContextPackMissing => write!(f, "CONTEXT_PACK_MISSING"),
             Self::ContextPackInvalid => write!(f, "CONTEXT_PACK_INVALID"),
             Self::AdapterMisconfigured => write!(f, "ADAPTER_MISCONFIGURED"),
+            Self::TaintFlowDenied => write!(f, "TAINT_FLOW_DENIED"),
         }
     }
 }
@@ -188,6 +196,7 @@ impl std::str::FromStr for ReasonCode {
             "CONTEXT_PACK_MISSING" => Ok(Self::ContextPackMissing),
             "CONTEXT_PACK_INVALID" => Ok(Self::ContextPackInvalid),
             "ADAPTER_MISCONFIGURED" => Ok(Self::AdapterMisconfigured),
+            "TAINT_FLOW_DENIED" => Ok(Self::TaintFlowDenied),
             _ => Err(ReviewBlockedError::InvalidReasonCode(s.to_string())),
         }
     }
@@ -206,6 +215,7 @@ impl ReasonCode {
     /// - 10 = `CONTEXT_PACK_MISSING` (TCK-00326)
     /// - 11 = `CONTEXT_PACK_INVALID` (TCK-00326)
     /// - 12 = `ADAPTER_MISCONFIGURED` (TCK-00328)
+    /// - 13 = `TAINT_FLOW_DENIED` (TCK-00339)
     #[must_use]
     pub const fn to_code(self) -> u8 {
         match self {
@@ -221,6 +231,7 @@ impl ReasonCode {
             Self::ContextPackMissing => 10,
             Self::ContextPackInvalid => 11,
             Self::AdapterMisconfigured => 12,
+            Self::TaintFlowDenied => 13,
         }
     }
 
@@ -243,6 +254,7 @@ impl ReasonCode {
             10 => Ok(Self::ContextPackMissing),
             11 => Ok(Self::ContextPackInvalid),
             12 => Ok(Self::AdapterMisconfigured),
+            13 => Ok(Self::TaintFlowDenied),
             0 => Err(ReviewBlockedError::InvalidReasonCode(
                 "UNSPECIFIED (0) is not a valid reason code".to_string(),
             )),
@@ -821,20 +833,24 @@ mod tests {
             "ADAPTER_MISCONFIGURED".parse::<ReasonCode>().unwrap(),
             ReasonCode::AdapterMisconfigured
         );
+        assert_eq!(
+            "TAINT_FLOW_DENIED".parse::<ReasonCode>().unwrap(),
+            ReasonCode::TaintFlowDenied
+        );
         assert!("UNKNOWN".parse::<ReasonCode>().is_err());
     }
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        // Values 1-12 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9,
-        // TCK-00326 added 10-11, TCK-00328 added 12)
-        for code in 1..=12u8 {
+        // Values 1-13 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9,
+        // TCK-00326 added 10-11, TCK-00328 added 12, TCK-00339 added 13)
+        for code in 1..=13u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
         }
-        // 0 (UNSPECIFIED) and 13+ are invalid
+        // 0 (UNSPECIFIED) and 14+ are invalid
         assert!(ReasonCode::from_code(0).is_err());
-        assert!(ReasonCode::from_code(13).is_err());
+        assert!(ReasonCode::from_code(14).is_err());
     }
 
     #[test]
@@ -858,6 +874,7 @@ mod tests {
             ReasonCode::AdapterMisconfigured.to_string(),
             "ADAPTER_MISCONFIGURED"
         );
+        assert_eq!(ReasonCode::TaintFlowDenied.to_string(), "TAINT_FLOW_DENIED");
     }
 
     #[test]
@@ -875,6 +892,8 @@ mod tests {
         // AdapterMisconfigured is NOT retryable - requires operator intervention
         // (TCK-00328)
         assert!(!ReasonCode::AdapterMisconfigured.is_retryable());
+        // TaintFlowDenied is NOT retryable - requires policy change (TCK-00339)
+        assert!(!ReasonCode::TaintFlowDenied.is_retryable());
     }
 
     #[test]
@@ -1172,6 +1191,20 @@ mod tests {
         assert_eq!(ReasonCode::AdapterMisconfigured.to_code(), 12);
         // Adapter misconfigured is NOT retryable - requires operator intervention
         assert!(!ReasonCode::AdapterMisconfigured.is_retryable());
+    }
+
+    #[test]
+    fn test_taint_flow_denied_reason_code() {
+        // TCK-00339: Test the new taint flow denied reason code
+        assert_eq!(
+            "TAINT_FLOW_DENIED".parse::<ReasonCode>().unwrap(),
+            ReasonCode::TaintFlowDenied
+        );
+        assert_eq!(ReasonCode::TaintFlowDenied.to_string(), "TAINT_FLOW_DENIED");
+        // TCK-00339 reserved code 13 for TaintFlowDenied
+        assert_eq!(ReasonCode::TaintFlowDenied.to_code(), 13);
+        // Taint flow denied is NOT retryable - requires policy change
+        assert!(!ReasonCode::TaintFlowDenied.is_retryable());
     }
 
     #[test]
