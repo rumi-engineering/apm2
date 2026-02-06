@@ -101,6 +101,15 @@ pub struct DaemonMetrics {
 
     /// Total session terminations by rationale.
     session_terminations_total: CounterVec,
+
+    /// Total contract mismatches during handshake, labeled by `risk_tier`
+    /// and `outcome` (TCK-00348).
+    ///
+    /// Per RFC-0020 section 11.4, this counter tracks:
+    /// - `outcome="waived"`: mismatch detected but session allowed
+    ///   (Tier0/Tier1)
+    /// - `outcome="denied"`: mismatch detected and session denied (Tier2+)
+    contract_mismatch_total: CounterVec,
 }
 
 impl DaemonMetrics {
@@ -171,6 +180,16 @@ impl DaemonMetrics {
         )?;
         registry.register(Box::new(session_terminations_total.clone()))?;
 
+        // TCK-00348: Contract mismatch counter per RFC-0020 section 11.4
+        let contract_mismatch_total = CounterVec::new(
+            Opts::new(
+                "apm2_daemon_contract_mismatch_total",
+                "Total contract mismatches during handshake",
+            ),
+            &["risk_tier", "outcome"],
+        )?;
+        registry.register(Box::new(contract_mismatch_total.clone()))?;
+
         Ok(Self {
             sessions_active,
             tool_mediation_latency,
@@ -178,6 +197,7 @@ impl DaemonMetrics {
             capability_grants_total,
             context_firewall_denials_total,
             session_terminations_total,
+            contract_mismatch_total,
         })
     }
 
@@ -331,6 +351,37 @@ impl DaemonMetrics {
         let rationale = truncate_label(rationale);
         self.session_terminations_total
             .with_label_values(&[rationale])
+            .get()
+    }
+
+    // ========================================================================
+    // Contract Mismatch Metrics (TCK-00348)
+    // ========================================================================
+
+    /// Records a contract mismatch event during handshake.
+    ///
+    /// Per RFC-0020 section 11.4, this counter is incremented whenever the
+    /// mismatch policy evaluation produces a waiver or denial.
+    ///
+    /// # Arguments
+    ///
+    /// * `risk_tier` - The risk tier label (e.g., `"tier0"`, `"tier2"`)
+    /// * `outcome` - The mismatch outcome (e.g., `"waived"`, `"denied"`)
+    pub fn contract_mismatch(&self, risk_tier: &str, outcome: &str) {
+        let risk_tier = truncate_label(risk_tier);
+        let outcome = truncate_label(outcome);
+        self.contract_mismatch_total
+            .with_label_values(&[risk_tier, outcome])
+            .inc();
+    }
+
+    /// Returns the total contract mismatches for testing purposes.
+    #[must_use]
+    pub fn contract_mismatch_count(&self, risk_tier: &str, outcome: &str) -> f64 {
+        let risk_tier = truncate_label(risk_tier);
+        let outcome = truncate_label(outcome);
+        self.contract_mismatch_total
+            .with_label_values(&[risk_tier, outcome])
             .get()
     }
 }
@@ -536,7 +587,7 @@ mod tests {
         let registry = MetricsRegistry::new().unwrap();
         let metrics = registry.daemon_metrics();
 
-        // Record metrics for all 6 families to ensure they appear in output.
+        // Record metrics for all 7 families to ensure they appear in output.
         // Prometheus only outputs metrics that have been observed.
         metrics.session_spawned("implementer");
         metrics.ipc_request_completed("Ping", "success");
@@ -544,10 +595,11 @@ mod tests {
         metrics.capability_granted("implementer", "file_read");
         metrics.context_firewall_denied("path_traversal");
         metrics.session_terminated("normal");
+        metrics.contract_mismatch("tier0", "waived");
 
         let output = registry.encode_text().unwrap();
 
-        // Verify all 6 metric families are present
+        // Verify all 7 metric families are present
         assert!(
             output.contains("apm2_daemon_sessions_active"),
             "missing sessions_active"
@@ -571,6 +623,10 @@ mod tests {
         assert!(
             output.contains("apm2_daemon_session_terminations_total"),
             "missing session_terminations_total"
+        );
+        assert!(
+            output.contains("apm2_daemon_contract_mismatch_total"),
+            "missing contract_mismatch_total"
         );
     }
 
@@ -661,6 +717,26 @@ mod tests {
         assert!(truncated.len() <= MAX_LABEL_VALUE_LEN);
         assert_eq!(truncated.len() % 4, 0); // emoji is 4 bytes
         assert_eq!(truncated.len(), 64); // exactly 16 emojis fit
+    }
+
+    #[test]
+    fn test_contract_mismatch_counter() {
+        let registry = MetricsRegistry::new().unwrap();
+        let metrics = registry.daemon_metrics();
+
+        // Initial state
+        assert_eq!(metrics.contract_mismatch_count("tier0", "waived"), 0.0);
+        assert_eq!(metrics.contract_mismatch_count("tier2", "denied"), 0.0);
+
+        // Record mismatches
+        metrics.contract_mismatch("tier0", "waived");
+        metrics.contract_mismatch("tier0", "waived");
+        metrics.contract_mismatch("tier2", "denied");
+        metrics.contract_mismatch("tier3", "denied");
+
+        assert_eq!(metrics.contract_mismatch_count("tier0", "waived"), 2.0);
+        assert_eq!(metrics.contract_mismatch_count("tier2", "denied"), 1.0);
+        assert_eq!(metrics.contract_mismatch_count("tier3", "denied"), 1.0);
     }
 
     #[test]

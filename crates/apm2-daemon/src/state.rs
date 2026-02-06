@@ -827,6 +827,16 @@ impl DispatcherState {
     pub const fn subscription_registry(&self) -> &SharedSubscriptionRegistry {
         self.privileged_dispatcher.subscription_registry()
     }
+
+    /// Returns the ledger event emitter from the privileged dispatcher
+    /// (TCK-00348).
+    ///
+    /// Used by the connection handler to persist contract binding events
+    /// after successful handshake.
+    #[must_use]
+    pub fn event_emitter(&self) -> &Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> {
+        self.privileged_dispatcher.event_emitter()
+    }
 }
 
 /// Shared dispatcher state type alias.
