@@ -70,6 +70,57 @@ impl SqliteLedgerEventEmitter {
         )?;
         Ok(())
     }
+
+    /// Query the latest `MergeReceipt` HEAD SHA from the ledger (TCK-00393).
+    ///
+    /// Scans the `ledger_events` table for the most recent event whose
+    /// `event_type` matches a merge-receipt pattern and extracts the
+    /// `result_selector` from its JSON payload. This is used by the
+    /// divergence watchdog to determine the expected trunk HEAD.
+    ///
+    /// Returns `None` if no merge-receipt events exist in the ledger
+    /// (the normal startup case before any merges have occurred) or if
+    /// the query or parse fails.
+    ///
+    /// The returned value is a 32-byte BLAKE3 hash of the hex SHA string,
+    /// matching the format expected by
+    /// `DivergenceWatchdog::check_divergence`.
+    pub fn query_latest_merge_receipt_sha(&self) -> Option<[u8; 32]> {
+        let conn = self.conn.lock().ok()?;
+
+        // Look for events of type "gate.merge_receipt_created" or containing
+        // "merge_receipt" in event_type. The merge executor persists these via
+        // emit_session_event. We order by timestamp_ns DESC, rowid DESC to get
+        // the most recent one.
+        let result: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT payload FROM ledger_events \
+                 WHERE event_type LIKE '%merge_receipt%' \
+                 ORDER BY timestamp_ns DESC, rowid DESC \
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+
+        let payload_bytes = result?;
+
+        // Parse the payload JSON to extract result_selector.
+        // The payload may be JCS-canonicalized JSON bytes.
+        let payload_str = std::str::from_utf8(&payload_bytes).ok()?;
+        let payload_json: serde_json::Value = serde_json::from_str(payload_str).ok()?;
+
+        // Try to extract result_selector from the payload.
+        // The merge executor stores it as "result_selector" in the event payload.
+        let result_selector = payload_json
+            .get("result_selector")
+            .and_then(|v| v.as_str())?;
+
+        // Convert the hex SHA to a 32-byte array via BLAKE3 hashing.
+        Some(*blake3::hash(result_selector.as_bytes()).as_bytes())
+    }
 }
 
 impl LedgerEventEmitter for SqliteLedgerEventEmitter {

@@ -132,6 +132,15 @@ pub struct DaemonConfig {
     /// The directory is created with mode 0700 if it does not exist.
     #[serde(default)]
     pub cas_path: Option<PathBuf>,
+
+    /// Divergence watchdog configuration (TCK-00393).
+    ///
+    /// Controls the background watchdog that polls the external trunk HEAD
+    /// and compares it against the ledger's `MergeReceipt` HEAD. When
+    /// divergence is detected, a `DefectRecorded` event and
+    /// `InterventionFreeze` are emitted to halt admissions.
+    #[serde(default)]
+    pub divergence_watchdog: DivergenceWatchdogSection,
 }
 
 /// Projection worker configuration (TCK-00322).
@@ -212,8 +221,76 @@ impl Default for DaemonConfig {
             audit: AuditConfig::default(),
             projection: ProjectionConfig::default(),
             cas_path: None,
+            divergence_watchdog: DivergenceWatchdogSection::default(),
         }
     }
+}
+
+/// Divergence watchdog configuration (TCK-00393).
+///
+/// Controls the background task that polls the external trunk HEAD and
+/// compares it against the ledger's `MergeReceipt` HEAD. When divergence
+/// is detected, a `DefectRecorded` event and `InterventionFreeze` are
+/// emitted to halt new admissions until adjudication.
+///
+/// Disabled by default; enable by setting `enabled = true` and providing
+/// the GitHub repository coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DivergenceWatchdogSection {
+    /// Whether the divergence watchdog is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// GitHub repository owner (e.g., "rumi-engineering").
+    #[serde(default)]
+    pub github_owner: String,
+
+    /// GitHub repository name (e.g., "apm2").
+    #[serde(default)]
+    pub github_repo: String,
+
+    /// Trunk branch name to monitor (default: "main").
+    #[serde(default = "default_trunk_branch")]
+    pub trunk_branch: String,
+
+    /// GitHub API base URL (default: `https://api.github.com`).
+    #[serde(default = "default_github_api_url")]
+    pub github_api_url: String,
+
+    /// Environment variable name containing the GitHub API token.
+    ///
+    /// For security, the token itself is NOT stored in the config file.
+    /// Instead, provide the name of an environment variable that holds
+    /// the token (e.g., `$GITHUB_TOKEN`).
+    #[serde(default)]
+    pub github_token_env: Option<String>,
+
+    /// Poll interval in seconds for divergence checks.
+    /// Default: 30 seconds. Minimum: 1 second. Maximum: 3600 seconds.
+    #[serde(default = "default_divergence_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for DivergenceWatchdogSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            github_owner: String::new(),
+            github_repo: String::new(),
+            trunk_branch: default_trunk_branch(),
+            github_api_url: default_github_api_url(),
+            github_token_env: None,
+            poll_interval_secs: default_divergence_poll_interval(),
+        }
+    }
+}
+
+fn default_trunk_branch() -> String {
+    "main".to_string()
+}
+
+const fn default_divergence_poll_interval() -> u64 {
+    30
 }
 
 /// Audit configuration.

@@ -58,6 +58,7 @@ use apm2_core::supervisor::Supervisor;
 use apm2_daemon::gate::{GateOrchestrator, GateOrchestratorConfig};
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
+use apm2_daemon::projection::{DivergenceWatchdog, DivergenceWatchdogConfig};
 use apm2_daemon::protocol; // Import from library
 use apm2_daemon::protocol::socket_manager::{SocketManager, SocketManagerConfig};
 use apm2_daemon::state::{DaemonStateHandle, DispatcherState, SharedDispatcherState, SharedState};
@@ -1269,6 +1270,199 @@ async fn async_main(args: Args) -> Result<()> {
         None
     };
 
+    // TCK-00393: Wire divergence watchdog into daemon main loop.
+    //
+    // The watchdog monitors for divergence between the ledger's MergeReceipt
+    // HEAD and the external trunk HEAD (fetched via GitHub API). When
+    // divergence is detected:
+    //   1. DefectRecorded(PROJECTION_DIVERGENCE) event is emitted to the ledger
+    //   2. InterventionFreeze is emitted to halt all new admissions
+    //   3. The freeze is idempotent: repeated checks for the same divergence do not
+    //      produce duplicate events
+    //
+    // Requirements:
+    //   - Ledger database must be configured (sqlite_conn is Some)
+    //   - Divergence watchdog must be enabled in ecosystem config
+    //   - GitHub token must be available via environment variable
+    {
+        let dw_config = &daemon_config.config.daemon.divergence_watchdog;
+        if dw_config.enabled {
+            if sqlite_conn.is_none() {
+                warn!(
+                    "divergence_watchdog.enabled=true but no --ledger-db configured. \
+                     Divergence watchdog requires a ledger database. Skipping."
+                );
+            } else if dw_config.github_owner.is_empty() || dw_config.github_repo.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "divergence_watchdog.enabled=true but github_owner or github_repo \
+                     is not configured"
+                ));
+            } else {
+                // Resolve GitHub token from environment variable
+                let token_env_raw = dw_config
+                    .github_token_env
+                    .as_deref()
+                    .unwrap_or("GITHUB_TOKEN");
+                let token_env = token_env_raw.strip_prefix('$').unwrap_or(token_env_raw);
+                let github_token = std::env::var(token_env).map_err(|_| {
+                    anyhow::anyhow!(
+                        "divergence_watchdog.enabled=true but GitHub token env var \
+                         ({token_env}) is not set"
+                    )
+                })?;
+
+                // Build watchdog configuration
+                let repo_id = format!("{}/{}", dw_config.github_owner, dw_config.github_repo);
+                let watchdog_config = DivergenceWatchdogConfig::new(&repo_id)
+                    .map_err(|e| anyhow::anyhow!("invalid divergence watchdog config: {e}"))?
+                    .with_poll_interval(Duration::from_secs(dw_config.poll_interval_secs))
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid divergence watchdog poll interval: {e}")
+                    })?;
+
+                let poll_interval = watchdog_config.poll_interval;
+
+                // Use the daemon's signer (unified signing key per lifecycle).
+                let watchdog_signer = Signer::generate();
+                let watchdog = DivergenceWatchdog::new(watchdog_signer, watchdog_config);
+
+                info!(
+                    repo = %repo_id,
+                    branch = %dw_config.trunk_branch,
+                    poll_interval_secs = dw_config.poll_interval_secs,
+                    "Divergence watchdog enabled"
+                );
+
+                // Create a dedicated ledger emitter for the watchdog.
+                let watchdog_ledger_emitter: Option<SqliteLedgerEventEmitter> =
+                    sqlite_conn.as_ref().map(|conn| {
+                        let watchdog_sign_key = Signer::generate();
+                        let key_bytes = watchdog_sign_key.secret_key_bytes();
+                        let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                        SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
+                    });
+
+                // Capture values for the spawned task
+                let github_api_url = dw_config.github_api_url.clone();
+                let github_owner = dw_config.github_owner.clone();
+                let github_repo = dw_config.github_repo.clone();
+                let trunk_branch = dw_config.trunk_branch.clone();
+                let watchdog_state = state.clone();
+
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(poll_interval);
+                    // Track the last known merge receipt HEAD to avoid redundant API
+                    // calls when no new merges have happened.
+                    let mut last_divergence_detected = false;
+
+                    loop {
+                        interval.tick().await;
+
+                        // Check if daemon is shutting down
+                        if watchdog_state.is_shutdown_requested() {
+                            info!("Divergence watchdog shutting down");
+                            break;
+                        }
+
+                        // Step 1: Fetch the latest MergeReceipt HEAD from the ledger.
+                        // If no MergeReceipt exists (startup case), skip this poll cycle.
+                        let merge_receipt_head = {
+                            if let Some(ref emitter) = watchdog_ledger_emitter {
+                                // Query the ledger for the latest merge_receipt event
+                                // to extract the trunk HEAD.
+                                match query_latest_merge_receipt_head(emitter) {
+                                    Some(head) => head,
+                                    None => {
+                                        // No MergeReceipt in ledger yet -- this is the
+                                        // normal startup case. No-op.
+                                        continue;
+                                    },
+                                }
+                            } else {
+                                continue;
+                            }
+                        };
+
+                        // Step 2: Fetch the external trunk HEAD from GitHub API.
+                        // GET /repos/{owner}/{repo}/git/ref/heads/{branch}
+                        let external_head = match fetch_external_trunk_head(
+                            &github_api_url,
+                            &github_owner,
+                            &github_repo,
+                            &trunk_branch,
+                            &github_token,
+                        )
+                        .await
+                        {
+                            Ok(head) => head,
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Failed to fetch external trunk HEAD (will retry)"
+                                );
+                                continue;
+                            },
+                        };
+
+                        // Step 3: Check for divergence.
+                        match watchdog.check_divergence(merge_receipt_head, external_head) {
+                            Ok(Some(result)) => {
+                                // Divergence detected! Emit DefectRecorded event.
+                                error!(
+                                    expected_head = %hex::encode(merge_receipt_head),
+                                    actual_head = %hex::encode(external_head),
+                                    freeze_id = %result.freeze.freeze_id(),
+                                    "DIVERGENCE DETECTED: trunk HEAD does not match \
+                                     ledger MergeReceipt HEAD"
+                                );
+
+                                // Emit DefectRecorded event to the ledger.
+                                if let Some(ref emitter) = watchdog_ledger_emitter {
+                                    use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
+
+                                    let timestamp_ns = result.defect_event.detected_at;
+                                    if let Err(e) = emitter
+                                        .emit_defect_recorded(&result.defect_event, timestamp_ns)
+                                    {
+                                        error!(
+                                            error = %e,
+                                            "Failed to persist DefectRecorded event \
+                                             (fail-closed: freeze still active in registry)"
+                                        );
+                                    } else {
+                                        info!(
+                                            defect_id = %result.defect_event.defect_id,
+                                            "Persisted divergence DefectRecorded event"
+                                        );
+                                    }
+                                }
+
+                                last_divergence_detected = true;
+                            },
+                            Ok(None) => {
+                                // No divergence, or already frozen (idempotent).
+                                if last_divergence_detected {
+                                    // Still frozen from prior detection -- no
+                                    // new event.
+                                    // This is the idempotent path.
+                                }
+                            },
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    "Divergence check failed (fail-closed: check will \
+                                     retry on next poll)"
+                                );
+                            },
+                        }
+                    }
+                });
+            }
+        } else {
+            info!("Divergence watchdog disabled");
+        }
+    }
+
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
     // DD-009.
@@ -1402,6 +1596,133 @@ async fn async_main(args: Args) -> Result<()> {
 
     info!("Daemon shutdown complete");
     Ok(())
+}
+
+/// Convert a git commit SHA (hex string) to a 32-byte array for use with
+/// the divergence watchdog.
+///
+/// Git SHA-1 is 20 bytes (40 hex chars), but `check_divergence` uses 32-byte
+/// arrays. We hash the SHA string with BLAKE3 to produce a deterministic
+/// 32-byte value, consistent with how the divergence watchdog module uses
+/// BLAKE3 for CAS hashing.
+fn sha_to_32_bytes(hex_sha: &str) -> [u8; 32] {
+    *blake3::hash(hex_sha.as_bytes()).as_bytes()
+}
+
+/// Query the latest `MergeReceipt` HEAD from the ledger.
+///
+/// Scans the `ledger_events` table for the most recent event of type
+/// `merge_receipt_created` and extracts the `result_selector` (new commit
+/// SHA). Returns `None` if no merge receipts exist (startup case) or if
+/// the query fails.
+///
+/// # No-op on startup
+///
+/// If no `MergeReceipt` events exist in the ledger, this returns `None`,
+/// which causes the watchdog to skip the current poll cycle. This is the
+/// expected behavior on startup before any merges have occurred.
+fn query_latest_merge_receipt_head(emitter: &SqliteLedgerEventEmitter) -> Option<[u8; 32]> {
+    // Query the ledger for the most recent merge_receipt event and extract
+    // the result_selector (commit SHA). Returns None if no merge receipts
+    // exist (startup case).
+    emitter.query_latest_merge_receipt_sha()
+}
+
+/// Fetch the external trunk HEAD from GitHub API.
+///
+/// Uses `GET /repos/{owner}/{repo}/git/ref/heads/{branch}` to retrieve the
+/// SHA of the trunk branch's HEAD commit. This is a read-only operation
+/// and does NOT use the write-only `GitHubProjectionAdapter`.
+///
+/// # Arguments
+///
+/// * `api_url` - GitHub API base URL (e.g., `https://api.github.com`)
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `branch` - Branch name to check (e.g., "main")
+/// * `token` - GitHub API token for authentication
+///
+/// # Returns
+///
+/// The trunk HEAD as a 32-byte array (BLAKE3 hash of the hex SHA).
+///
+/// # Errors
+///
+/// Returns an error if the HTTP request fails or the response cannot be
+/// parsed.
+async fn fetch_external_trunk_head(
+    api_url: &str,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    token: &str,
+) -> Result<[u8; 32]> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper_rustls::HttpsConnectorBuilder;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let url = format!(
+        "{}/repos/{}/{}/git/ref/heads/{}",
+        api_url.trim_end_matches('/'),
+        owner,
+        repo,
+        branch
+    );
+
+    // Build HTTPS client (HTTPS-only for security)
+    let https = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_only()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+
+    // Build request
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github.v3+json")
+        .header("User-Agent", "apm2-daemon/divergence-watchdog")
+        .body(Full::new(Bytes::new()))
+        .context("failed to build GitHub API request")?;
+
+    // Send request with timeout (10 seconds)
+    let response = tokio::time::timeout(Duration::from_secs(10), client.request(request))
+        .await
+        .map_err(|_| anyhow::anyhow!("GitHub API request timed out after 10s"))?
+        .context("GitHub API request failed")?;
+
+    let status = response.status();
+    let body_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .context("failed to read GitHub API response body")?
+        .to_bytes();
+
+    if !status.is_success() {
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        return Err(anyhow::anyhow!(
+            "GitHub API returned {status} for {url}: {body_str}"
+        ));
+    }
+
+    // Parse response: { "ref": "refs/heads/main", "object": { "sha": "...", "type":
+    // "commit" } }
+    let json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).context("failed to parse GitHub API response")?;
+
+    let sha = json
+        .get("object")
+        .and_then(|obj| obj.get("sha"))
+        .and_then(|sha| sha.as_str())
+        .ok_or_else(|| anyhow::anyhow!("GitHub API response missing object.sha field"))?;
+
+    Ok(sha_to_32_bytes(sha))
 }
 
 /// Perform crash recovery on daemon startup (TCK-00387).

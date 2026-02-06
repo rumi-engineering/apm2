@@ -119,8 +119,8 @@ pub mod worker;
 
 // Re-export main types
 pub use divergence_watchdog::{
-    DivergenceError, DivergenceWatchdog, DivergenceWatchdogConfig, FreezeCheck, FreezeCheckError,
-    FreezeRegistry, FreezeScope, InterventionFreeze, InterventionFreezeBuilder,
+    DivergenceError, DivergenceResult, DivergenceWatchdog, DivergenceWatchdogConfig, FreezeCheck,
+    FreezeCheckError, FreezeRegistry, FreezeScope, InterventionFreeze, InterventionFreezeBuilder,
     InterventionUnfreeze, InterventionUnfreezeBuilder, ResolutionType, SystemTimeSource,
     TimeSource,
 };
