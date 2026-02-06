@@ -494,14 +494,20 @@ impl DispatcherState {
         let privileged_dispatcher =
             privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
 
+        // TCK-00351: Create pre-actuation gate for stop/budget checks.
+        let preactuation_gate =
+            Arc::new(crate::episode::preactuation::PreActuationGate::default_gate());
+
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
+        // TCK-00351: Wire pre-actuation gate for stop/budget proof obligations
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
-                .with_telemetry_store(telemetry_store);
+                .with_telemetry_store(telemetry_store)
+                .with_preactuation_gate(preactuation_gate);
 
         Self {
             privileged_dispatcher,
@@ -708,9 +714,18 @@ impl DispatcherState {
         let privileged_dispatcher =
             privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
 
+        // TCK-00351: Create pre-actuation gate for stop/budget checks.
+        // Uses default evaluator (30s uncertainty deadline) and no budget
+        // tracker at the session-dispatcher level.  Per-episode budget
+        // tracking is handled by EpisodeRuntime; the gate here provides
+        // the session-level obligation proof.
+        let preactuation_gate =
+            Arc::new(crate::episode::preactuation::PreActuationGate::default_gate());
+
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
+        // TCK-00351: Wire pre-actuation gate for stop/budget proof obligations
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -720,7 +735,8 @@ impl DispatcherState {
                 .with_clock(clock)
                 .with_broker(broker)
                 .with_episode_runtime(episode_runtime)
-                .with_telemetry_store(telemetry_store);
+                .with_telemetry_store(telemetry_store)
+                .with_preactuation_gate(preactuation_gate);
 
         Ok(Self {
             privileged_dispatcher,

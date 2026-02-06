@@ -684,6 +684,20 @@ pub struct RequestToolResponse {
     /// TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
     #[prost(bytes = "vec", optional, tag = "6")]
     pub inline_result: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// TCK-00351: Pre-actuation stop check proof.
+    /// True indicates stop conditions were evaluated and cleared before actuation.
+    /// False or absent indicates stop check was not performed (fail-closed: deny).
+    #[prost(bool, tag = "7")]
+    pub stop_checked: bool,
+    /// TCK-00351: Pre-actuation budget check proof.
+    /// True indicates budget was evaluated and sufficient before actuation.
+    /// False or absent indicates budget check was not performed (fail-closed: deny).
+    #[prost(bool, tag = "8")]
+    pub budget_checked: bool,
+    /// TCK-00351: HTF timestamp (nanoseconds) when pre-actuation checks completed.
+    /// Provides replay-verifiable ordering proof that checks preceded actuation.
+    #[prost(uint64, tag = "9")]
+    pub preactuation_timestamp_ns: u64,
 }
 /// IPC-SESS-002: EmitEvent
 /// Emit a signed event to the ledger.

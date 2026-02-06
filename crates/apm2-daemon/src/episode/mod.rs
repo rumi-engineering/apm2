@@ -143,6 +143,9 @@ pub mod tool_handler;
 // TCK-00311: Workspace snapshot and apply
 pub mod workspace;
 
+// TCK-00351: Pre-actuation stop and budget proof obligations
+pub mod preactuation;
+
 // TCK-00387: Crash recovery wiring
 pub mod crash_recovery;
 
@@ -212,6 +215,12 @@ pub use handlers::{
 };
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
+// Re-export pre-actuation types (TCK-00351)
+pub use preactuation::{
+    BudgetStatus, DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS, MAX_REPLAY_ENTRIES, PreActuationDenial,
+    PreActuationGate, PreActuationReceipt, ReplayEntry, ReplayEntryKind, ReplayVerifier,
+    ReplayViolation, StopClass, StopConditionEvaluator, StopStatus,
+};
 pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
 pub use raw_adapter::{
     RawAdapter, RawAdapterHolon, RawAdapterOutput, RawAdapterState, SharedAdapterState,
