@@ -4406,10 +4406,16 @@ impl PrivilegedDispatcher {
             );
         }
 
-        // Derive actor_id from credentials (same pattern as ClaimWork)
-        let actor_id = ctx
+        // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
+        // missing. Same pattern as ClaimWork. SpawnEpisode emits authoritative
+        // ledger events (SessionStarted + WorkTransitioned), and recording
+        // "unknown" as the actor identity would break the accountability chain.
+        let peer_creds = ctx
             .peer_credentials()
-            .map_or_else(|| "unknown".to_string(), derive_actor_id);
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for episode spawn".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer_creds);
 
         // TCK-00395: Emit SessionStarted + WorkTransitioned(Claimed->InProgress)
         // atomically via emit_spawn_lifecycle. Both events are persisted as a
@@ -4837,10 +4843,17 @@ impl PrivilegedDispatcher {
             ));
         };
 
-        // Derive actor_id from credentials (same pattern as ClaimWork)
-        let actor_id = ctx
+        // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
+        // missing. Same pattern as ClaimWork (line 3631). EndSession emits
+        // authoritative ledger events (SessionTerminated), and recording
+        // "unknown" as the actor identity would break the accountability
+        // chain for a privileged termination action.
+        let peer_creds = ctx
             .peer_credentials()
-            .map_or_else(|| "unknown".to_string(), derive_actor_id);
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for session termination".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer_creds);
 
         // Get HTF-compliant timestamp
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -4912,46 +4925,64 @@ impl PrivilegedDispatcher {
         };
 
         // Stop the runtime episode if we have a valid episode_id.
+        // TCK-00395 Security MAJOR 1: Fail closed on EpisodeId parse failure.
+        // Previously, a malformed/corrupted episode_id would silently skip
+        // the runtime stop but still emit termination facts and clean up
+        // registry state, leaving the runtime running without accountability.
         if !episode_id_str.is_empty() {
-            if let Ok(episode_id_parsed) = EpisodeId::new(episode_id_str.clone()) {
-                let termination_class = if exit_code == 0 {
-                    TerminationClass::Success
-                } else {
-                    TerminationClass::Failure
-                };
-                let stop_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let rt = &self.episode_runtime;
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(rt.stop_with_session_context(
-                            &episode_id_parsed,
-                            termination_class,
-                            timestamp_ns,
-                            &request.session_id,
-                            &session.work_id,
-                            &actor_id,
-                        ))
-                    })
-                } else {
-                    // No tokio runtime available; fail closed rather than
-                    // skipping the runtime stop.
-                    warn!("No tokio runtime handle available for runtime stop - failing closed");
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        "runtime stop failed: no async runtime available",
-                    ));
-                };
-
-                if let Err(e) = stop_result {
+            let episode_id_parsed = match EpisodeId::new(episode_id_str.clone()) {
+                Ok(id) => id,
+                Err(e) => {
                     warn!(
                         error = %e,
                         episode_id = %episode_id_str,
-                        "Runtime stop failed - failing closed without writing success facts"
+                        session_id = %request.session_id,
+                        "EndSession: EpisodeId parse failed - failing closed before ledger emission"
                     );
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!("runtime stop failed: {e}"),
+                        format!("malformed episode_id '{episode_id_str}': {e}"),
                     ));
-                }
+                },
+            };
+
+            let termination_class = if exit_code == 0 {
+                TerminationClass::Success
+            } else {
+                TerminationClass::Failure
+            };
+            let stop_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let rt = &self.episode_runtime;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(rt.stop_with_session_context(
+                        &episode_id_parsed,
+                        termination_class,
+                        timestamp_ns,
+                        &request.session_id,
+                        &session.work_id,
+                        &actor_id,
+                    ))
+                })
+            } else {
+                // No tokio runtime available; fail closed rather than
+                // skipping the runtime stop.
+                warn!("No tokio runtime handle available for runtime stop - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "runtime stop failed: no async runtime available",
+                ));
+            };
+
+            if let Err(e) = stop_result {
+                warn!(
+                    error = %e,
+                    episode_id = %episode_id_str,
+                    "Runtime stop failed - failing closed without writing success facts"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("runtime stop failed: {e}"),
+                ));
             }
         }
 
@@ -11147,6 +11178,233 @@ mod tests {
                 },
                 other => panic!("Expected error on repeated EndSession, got: {other:?}"),
             }
+        }
+
+        // ================================================================
+        // TCK-00395 Security review v4 regression tests
+        // ================================================================
+
+        /// Security MAJOR 2: `EndSession` fails closed when peer credentials
+        /// are missing. The handler must not emit authoritative ledger events
+        /// with placeholder "unknown" actor IDs.
+        #[test]
+        fn end_session_rejects_missing_peer_credentials() {
+            let dispatcher = PrivilegedDispatcher::new();
+
+            // Create a session first (with valid credentials)
+            let valid_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &valid_ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &valid_ctx).unwrap();
+            let session_id = match spawn_response {
+                PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                _ => panic!("Expected SpawnEpisode response"),
+            };
+
+            // Now try EndSession WITHOUT peer credentials
+            let no_creds_ctx = ConnectionContext::privileged(None);
+            let end_request = EndSessionRequest {
+                session_id: session_id.clone(),
+                reason: "completed_normally".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let result = dispatcher.dispatch(&end_frame, &no_creds_ctx);
+
+            // Should fail (either Err or Error response)
+            match result {
+                Err(e) => {
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("peer credentials"),
+                        "Error should mention peer credentials: {msg}"
+                    );
+                },
+                Ok(PrivilegedResponse::Error(err)) => {
+                    assert!(
+                        err.message.contains("peer credentials")
+                            || err.message.contains("credential"),
+                        "Error should mention credentials: {}",
+                        err.message
+                    );
+                },
+                Ok(other) => panic!("Expected error for missing peer credentials, got: {other:?}"),
+            }
+
+            // Verify session is still in the registry (not cleaned up)
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_some(),
+                "Session MUST be preserved when credentials are missing"
+            );
+
+            // Verify no session_terminated events were emitted
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let terminated_count = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .count();
+            assert_eq!(
+                terminated_count, 0,
+                "No session_terminated events should be emitted without credentials"
+            );
+        }
+
+        /// Security MAJOR 2: `SpawnEpisode` fails closed when peer
+        /// credentials are missing.
+        #[test]
+        fn spawn_episode_rejects_missing_peer_credentials() {
+            let dispatcher = PrivilegedDispatcher::new();
+
+            // ClaimWork with valid credentials
+            let valid_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &valid_ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // SpawnEpisode WITHOUT peer credentials
+            let no_creds_ctx = ConnectionContext::privileged(None);
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
+
+            // Should fail
+            match result {
+                Err(e) => {
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("peer credentials"),
+                        "Error should mention peer credentials: {msg}"
+                    );
+                },
+                Ok(PrivilegedResponse::Error(err)) => {
+                    assert!(
+                        err.message.contains("peer credentials")
+                            || err.message.contains("credential"),
+                        "Error should mention credentials: {}",
+                        err.message
+                    );
+                },
+                Ok(other) => panic!("Expected error for missing peer credentials, got: {other:?}"),
+            }
+        }
+
+        /// Security MAJOR 1: `EndSession` fails closed on malformed
+        /// `episode_id`. A corrupted `episode_id` must not silently skip
+        /// the runtime stop while still emitting termination facts.
+        #[test]
+        fn end_session_rejects_malformed_episode_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // Register a session directly with a malformed episode_id
+            // (empty string after Some() - which is non-empty but invalid)
+            let session = crate::session::SessionState {
+                session_id: "SESS-MALFORMED-001".to_string(),
+                work_id: "W-MALFORMED-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-MALFORMED-001".to_string(),
+                ephemeral_handle: "handle-malformed-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                // Malformed: contains forbidden '/' characters for an EpisodeId
+                episode_id: Some("invalid/episode/id".to_string()),
+            };
+
+            dispatcher
+                .session_registry()
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            let end_request = EndSessionRequest {
+                session_id: "SESS-MALFORMED-001".to_string(),
+                reason: "test".to_string(),
+                outcome: TerminationOutcome::Success as i32,
+            };
+            let end_frame = encode_end_session_request(&end_request);
+            let response = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("malformed episode_id")
+                            || err.message.contains("episode"),
+                        "Error should mention malformed episode_id: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for malformed episode_id, got: {other:?}"),
+            }
+
+            // Session should be preserved since termination was rejected
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session("SESS-MALFORMED-001")
+                    .is_some(),
+                "Session MUST be preserved when episode_id parsing fails"
+            );
+
+            // No session_terminated events should have been emitted
+            let events = dispatcher
+                .event_emitter
+                .get_events_by_work_id("W-MALFORMED-001");
+            let terminated_count = events
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .count();
+            assert_eq!(
+                terminated_count, 0,
+                "No termination events should be emitted when episode_id is malformed"
+            );
         }
     }
 }

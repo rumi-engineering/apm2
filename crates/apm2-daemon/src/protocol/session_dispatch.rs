@@ -1454,6 +1454,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Err(resp) => return Ok(resp),
         };
 
+        // TCK-00395 Security BLOCKER 1: Enforce active-session check.
+        // HMAC token validation alone is not sufficient because EndSession
+        // revokes only session-registry state. A retained token could
+        // continue writing events to the ledger after EndSession if we
+        // don't verify the session still exists in the registry.
+        if let Some(ref registry) = self.session_registry {
+            if registry.get_session(&token.session_id).is_none() {
+                warn!(
+                    session_id = %token.session_id,
+                    "EmitEvent rejected: session not found in registry (may have been terminated)"
+                );
+                return Ok(SessionResponse::session_invalid(
+                    "session not found or already terminated",
+                ));
+            }
+        }
+
         info!(
             session_id = %token.session_id,
             event_type = %request.event_type,
@@ -1561,6 +1578,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Ok(t) => t,
             Err(resp) => return Ok(resp),
         };
+
+        // TCK-00395 Security BLOCKER 1: Enforce active-session check.
+        // HMAC token validation alone is not sufficient because EndSession
+        // revokes only session-registry state. A retained token could
+        // continue writing artifacts to CAS after EndSession if we
+        // don't verify the session still exists in the registry.
+        if let Some(ref registry) = self.session_registry {
+            if registry.get_session(&token.session_id).is_none() {
+                warn!(
+                    session_id = %token.session_id,
+                    "PublishEvidence rejected: session not found in registry (may have been terminated)"
+                );
+                return Ok(SessionResponse::session_invalid(
+                    "session not found or already terminated",
+                ));
+            }
+        }
 
         info!(
             session_id = %token.session_id,
@@ -4538,6 +4572,217 @@ mod tests {
                 },
                 other => panic!("Expected SessionStatus, got: {other:?}"),
             }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00395 Security BLOCKER 1: Post-termination revocation enforcement
+    // ========================================================================
+
+    /// Regression tests proving `EmitEvent` and `PublishEvidence` are denied
+    /// after `EndSession` removes the session from the registry.
+    mod post_termination_revocation {
+        use super::*;
+        use crate::episode::InMemorySessionRegistry;
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::protocol::dispatch::StubLedgerEventEmitter;
+        use crate::protocol::messages::{EvidenceKind, RetentionHint, WorkRole};
+        use crate::session::SessionState;
+
+        /// Helper: build a session dispatcher with a ledger, CAS, and session
+        /// registry where session "session-001" has been registered and then
+        /// removed (simulating post-`EndSession` state).
+        fn make_post_termination_dispatcher() -> SessionDispatcher<InMemoryManifestStore> {
+            let minter = test_minter();
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            // Register and then remove the session to simulate EndSession
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-REVOKE-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-REVOKE-001".to_string(),
+                ephemeral_handle: "handle-revoke-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-REVOKE-001".to_string()),
+            };
+            registry
+                .register_session(session)
+                .expect("session registration should succeed");
+            registry
+                .remove_session("session-001")
+                .expect("session removal should succeed");
+
+            let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(StubLedgerEventEmitter::new());
+            let cas: Arc<dyn crate::episode::executor::ContentAddressedStore> =
+                Arc::new(StubContentAddressedStore::new());
+
+            SessionDispatcher::new(minter)
+                .with_session_registry(registry)
+                .with_ledger(ledger)
+                .with_cas(cas)
+        }
+
+        /// TCK-00395 Security BLOCKER 1: `EmitEvent` is denied after `EndSession`.
+        ///
+        /// A retained HMAC token must not be able to write events to the
+        /// ledger after the session has been terminated.
+        #[test]
+        fn emit_event_denied_after_end_session() {
+            let dispatcher = make_post_termination_dispatcher();
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "post_termination_event".to_string(),
+                payload: vec![1, 2, 3],
+                correlation_id: "corr-revoke-001".to_string(),
+            };
+            let frame = encode_emit_event_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Expected SESSION_ERROR_INVALID for terminated session"
+                    );
+                    assert!(
+                        err.message.contains("terminated") || err.message.contains("not found"),
+                        "Error should mention session termination: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for EmitEvent after EndSession, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00395 Security BLOCKER 1: `PublishEvidence` is denied after
+        /// `EndSession`.
+        ///
+        /// A retained HMAC token must not be able to write artifacts to
+        /// CAS after the session has been terminated.
+        #[test]
+        fn publish_evidence_denied_after_end_session() {
+            let dispatcher = make_post_termination_dispatcher();
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = PublishEvidenceRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                artifact: vec![1, 2, 3, 4, 5],
+                kind: EvidenceKind::ToolIo.into(),
+                retention_hint: RetentionHint::Standard.into(),
+            };
+            let frame = encode_publish_evidence_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Expected SESSION_ERROR_INVALID for terminated session"
+                    );
+                    assert!(
+                        err.message.contains("terminated") || err.message.contains("not found"),
+                        "Error should mention session termination: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected error for PublishEvidence after EndSession, got: {other:?}")
+                },
+            }
+        }
+
+        /// TCK-00395 Security BLOCKER 1: `SessionStatus` is still allowed after
+        /// `EndSession` (the only post-termination endpoint).
+        ///
+        /// This confirms the positive case: `SessionStatus` should still work
+        /// for terminated sessions to allow agents to query final state.
+        #[test]
+        fn session_status_allowed_after_end_session() {
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            // Create dispatcher without registry - SessionStatus falls back
+            // to token-based status (always returns ACTIVE from token alone).
+            // With registry wired, it would return TERMINATED if the session
+            // was mark_terminated. Both paths allow SessionStatus.
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let token = test_token(&minter);
+
+            let request = SessionStatusRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+            };
+            let frame = encode_session_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // SessionStatus should succeed (not be blocked)
+            assert!(
+                matches!(response, SessionResponse::SessionStatus(_)),
+                "SessionStatus should be allowed post-termination, got: {response:?}"
+            );
+        }
+
+        /// TCK-00395 Security BLOCKER 1: `EmitEvent` succeeds while session is
+        /// still active (positive test / no regression).
+        #[test]
+        fn emit_event_succeeds_while_session_active() {
+            use crate::htf::{ClockConfig, HolonicClock};
+
+            let minter = test_minter();
+            let ctx = make_session_ctx();
+
+            let registry: Arc<dyn crate::session::SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+            let session = SessionState {
+                session_id: "session-001".to_string(),
+                work_id: "W-ACTIVE-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-ACTIVE-001".to_string(),
+                ephemeral_handle: "handle-active-001".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-ACTIVE-001".to_string()),
+            };
+            registry.register_session(session).unwrap();
+
+            let ledger: Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> =
+                Arc::new(StubLedgerEventEmitter::new());
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default ClockConfig should succeed"),
+            );
+
+            let dispatcher = SessionDispatcher::new(minter.clone())
+                .with_session_registry(registry)
+                .with_ledger(ledger)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let request = EmitEventRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                event_type: "active_session_event".to_string(),
+                payload: vec![1, 2, 3],
+                correlation_id: "corr-active-001".to_string(),
+            };
+            let frame = encode_emit_event_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Should succeed (EmitEvent response, not error)
+            assert!(
+                matches!(response, SessionResponse::EmitEvent(_)),
+                "EmitEvent should succeed for active session, got: {response:?}"
+            );
         }
     }
 }
