@@ -387,6 +387,33 @@ message WorkStatusResponse {
 }
 
 // =============================================================================
+// IPC-PRIV-017: PublishChangeSet (TCK-00394, RFC-0018)
+// =============================================================================
+// Accepts a ChangeSetBundleV1 payload, validates it, stores it in DurableCas,
+// emits a ChangeSetPublished ledger event, and returns the changeset_digest and
+// cas_hash for subsequent gate lease binding.
+
+// Request to publish a changeset bundle.
+message PublishChangeSetRequest {
+  // Work identifier this changeset belongs to.
+  string work_id = 1;
+  // Serialized ChangeSetBundleV1 (canonical JSON bytes).
+  bytes bundle_bytes = 2;
+}
+
+// Response confirming changeset publication.
+message PublishChangeSetResponse {
+  // BLAKE3 digest of the canonical bundle (hex-encoded, 64 chars).
+  string changeset_digest = 1;
+  // CAS hash of the stored bundle artifact (hex-encoded, 64 chars).
+  string cas_hash = 2;
+  // Work identifier this changeset belongs to.
+  string work_id = 3;
+  // Ledger event ID for the ChangeSetPublished event.
+  string event_id = 4;
+}
+
+// =============================================================================
 // IPC-PRIV-016: EndSession (TCK-00395)
 // =============================================================================
 // Terminates an active session and emits SessionTerminated + WorkTransitioned

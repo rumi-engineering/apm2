@@ -35,6 +35,7 @@ use apm2_core::credentials::{
 };
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
+use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
@@ -83,6 +84,9 @@ use super::messages::{
     ProcessStateEnum,
     ProcessStatusRequest,
     ProcessStatusResponse,
+    // TCK-00394: ChangeSet publishing types
+    PublishChangeSetRequest,
+    PublishChangeSetResponse,
     RefreshCredentialRequest,
     RefreshCredentialResponse,
     ReloadProcessRequest,
@@ -676,6 +680,36 @@ pub trait LedgerEventEmitter: Send + Sync {
         adapter_profile_hash: &[u8; 32],
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a signed `ChangeSetPublished` event to the ledger (TCK-00394).
+    ///
+    /// Records that a changeset bundle was published to CAS and anchored in
+    /// the ledger, enabling downstream gate orchestration (TCK-00388) to
+    /// bind gate leases to the changeset.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - The work ID this changeset belongs to
+    /// * `changeset_digest` - BLAKE3 digest of the canonical bundle
+    /// * `cas_hash` - CAS hash of the stored bundle artifact
+    /// * `actor_id` - The actor who published the changeset
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_changeset_published(
+        &self,
+        work_id: &str,
+        changeset_digest: &[u8; 32],
+        cas_hash: &[u8; 32],
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
 }
 
 /// Domain separation prefix for `WorkClaimed` events.
@@ -719,6 +753,15 @@ pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitione
 /// `apm2_core::events::canonical` which is used for kernel event signing.
 /// This prefix is for ledger-level JCS-canonicalized JSON events.
 pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_terminated_ledger:";
+
+/// Domain separation prefix for `ChangeSetPublished` ledger events (TCK-00394).
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// This prefix is used when emitting changeset publication events to the
+/// ledger, enabling gate orchestration (TCK-00388) to bind gate leases
+/// to published changesets.
+pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] =
+    b"apm2.event.changeset_published_ledger:";
 
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
 // to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
@@ -1814,6 +1857,102 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
         Ok(signed_event)
     }
+
+    fn emit_changeset_published(
+        &self,
+        work_id: &str,
+        changeset_digest: &[u8; 32],
+        cas_hash: &[u8; 32],
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with changeset publication data.
+        // SECURITY: timestamp_ns is included in signed payload to prevent
+        // temporal malleability per LAW-09.
+        let payload_json = serde_json::json!({
+            "event_type": "changeset_published",
+            "work_id": work_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "cas_hash": hex::encode(cas_hash),
+            "actor_id": actor_id,
+            "timestamp_ns": timestamp_ns,
+        });
+
+        // TCK-00394: Use JCS (RFC 8785) canonicalization for signing.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes = Vec::with_capacity(
+            CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX.len() + payload_bytes.len(),
+        );
+        canonical_bytes.extend_from_slice(CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "changeset_published".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(work_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            work_id = %work_id,
+            changeset_digest = %hex::encode(changeset_digest),
+            cas_hash = %hex::encode(cas_hash),
+            "ChangeSetPublished event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
 }
 
 // ============================================================================
@@ -2478,6 +2617,9 @@ pub enum PrivilegedMessageType {
     UnsubscribePulse    = 66,
     /// `PulseEvent` notification (server->client, IPC-HEF-003)
     PulseEvent          = 68,
+    // --- ChangeSet Publishing (RFC-0018, TCK-00394) ---
+    /// `PublishChangeSet` request (IPC-PRIV-017)
+    PublishChangeSet    = 70,
 }
 
 impl PrivilegedMessageType {
@@ -2518,6 +2660,8 @@ impl PrivilegedMessageType {
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
             68 => Some(Self::PulseEvent),
+            // ChangeSet publishing (TCK-00394)
+            70 => Some(Self::PublishChangeSet),
             _ => None,
         }
     }
@@ -2590,6 +2734,8 @@ pub enum PrivilegedResponse {
     ConsensusByzantineEvidence(ConsensusByzantineEvidenceResponse),
     /// Successful `ConsensusMetrics` response (TCK-00345).
     ConsensusMetrics(ConsensusMetricsResponse),
+    /// Successful `PublishChangeSet` response (TCK-00394).
+    PublishChangeSet(PublishChangeSetResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -2726,6 +2872,10 @@ impl PrivilegedResponse {
             },
             Self::ConsensusMetrics(resp) => {
                 buf.push(PrivilegedMessageType::ConsensusMetrics.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::PublishChangeSet(resp) => {
+                buf.push(PrivilegedMessageType::PublishChangeSet.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -3184,6 +3334,13 @@ pub struct PrivilegedDispatcher {
     /// with `started_at_ns` set to the current wall time. The store is
     /// shared with `SessionDispatcher` for counter updates and queries.
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
+
+    /// Content-addressed store for `ChangeSet` bundle persistence (TCK-00394).
+    ///
+    /// When present, `PublishChangeSet` stores the canonical bundle bytes in
+    /// CAS and returns the content hash for ledger event binding. When `None`,
+    /// the handler returns an error indicating CAS is not configured.
+    cas: Option<Arc<dyn ContentAddressedStore>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -3257,6 +3414,7 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            cas: None,
         }
     }
 
@@ -3313,6 +3471,7 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            cas: None,
         }
     }
 
@@ -3388,6 +3547,7 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            cas: None,
         }
     }
 
@@ -3440,6 +3600,7 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            cas: None,
         }
     }
 
@@ -3480,6 +3641,18 @@ impl PrivilegedDispatcher {
         store: Arc<crate::session::SessionTelemetryStore>,
     ) -> Self {
         self.telemetry_store = Some(store);
+        self
+    }
+
+    /// Sets the content-addressed store for changeset bundle persistence
+    /// (TCK-00394).
+    ///
+    /// When set, `PublishChangeSet` stores the canonical bundle bytes in CAS
+    /// and returns the content hash for ledger event binding. When not set,
+    /// the handler returns an error indicating CAS is not configured.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.cas = Some(cas);
         self
     }
 
@@ -3805,6 +3978,8 @@ impl PrivilegedDispatcher {
                 PrivilegedErrorCode::PermissionDenied,
                 "PulseEvent is server-to-client only",
             )),
+            // TCK-00394: ChangeSet publishing for daemon-anchored submission
+            PrivilegedMessageType::PublishChangeSet => self.handle_publish_changeset(payload, ctx),
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -3843,6 +4018,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::SubscribePulse => "SubscribePulse",
                 PrivilegedMessageType::UnsubscribePulse => "UnsubscribePulse",
                 PrivilegedMessageType::PulseEvent => "PulseEvent",
+                // TCK-00394
+                PrivilegedMessageType::PublishChangeSet => "PublishChangeSet",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -6594,8 +6771,213 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Returns a reference to the credential store, or an error response if
-    /// the store is not configured.
+    // =========================================================================
+    // TCK-00394: ChangeSet Publishing (RFC-0018)
+    // =========================================================================
+
+    /// Handles `PublishChangeSet` requests (IPC-PRIV-017).
+    ///
+    /// Accepts a `ChangeSetBundleV1` payload, validates it, stores it in CAS,
+    /// emits a `ChangeSetPublished` ledger event, and returns the
+    /// `changeset_digest` and `cas_hash` for subsequent gate lease binding.
+    ///
+    /// # Security
+    ///
+    /// - `work_id` is validated against the work registry (fail-closed)
+    /// - Bundle bytes are validated before CAS storage
+    /// - Idempotent: re-publishing the same bundle returns the same digest
+    ///   without duplicate ledger events
+    /// - Domain-separated signing prevents cross-context replay
+    /// - Actor ID is derived from peer credentials, not user input
+    fn handle_publish_changeset(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = PublishChangeSetRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid PublishChangeSetRequest: {e}"),
+            })?;
+
+        info!(
+            work_id = %request.work_id,
+            bundle_size = request.bundle_bytes.len(),
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "PublishChangeSet request received"
+        );
+
+        // --- Validation Phase (all checks BEFORE any state mutation) ---
+
+        // Validate required fields
+        if request.work_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "work_id is required",
+            ));
+        }
+
+        if request.work_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.bundle_bytes.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "bundle_bytes is required (empty payload)",
+            ));
+        }
+
+        // Validate work_id exists in registry (fail-closed: reject orphaned changesets)
+        let Some(_claim) = self.work_registry.get_claim(&request.work_id) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work_id not found in registry: {}", request.work_id),
+            ));
+        };
+
+        // Derive actor_id from peer credentials (not user input)
+        let peer_creds = ctx
+            .peer_credentials()
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for changeset publishing".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer_creds);
+
+        // Deserialize and validate the ChangeSetBundleV1
+        let bundle: apm2_core::fac::ChangeSetBundleV1 =
+            serde_json::from_slice(&request.bundle_bytes).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid ChangeSetBundleV1 JSON: {e}"),
+                }
+            })?;
+
+        // Validate bundle fields
+        if bundle.changeset_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "changeset_id is empty in bundle",
+            ));
+        }
+
+        if bundle.file_manifest.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "file_manifest is empty in bundle (at least one FileChange required)",
+            ));
+        }
+
+        // Require CAS to be configured (fail-closed)
+        let Some(cas) = &self.cas else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "content-addressed store not configured on daemon",
+            ));
+        };
+
+        // --- State Mutation Phase ---
+
+        // Store bundle bytes in CAS
+        let store_result = match cas.store(&request.bundle_bytes) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!(error = %e, "CAS store failed for changeset bundle");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("CAS storage failed: {e}"),
+                ));
+            },
+        };
+
+        let cas_hash = store_result.hash;
+        let changeset_digest = bundle.changeset_digest();
+
+        // Idempotency check: if the CAS returned is_new=false, the same
+        // bundle was already stored. Check if a ChangeSetPublished event
+        // already exists for this work_id with the same digest.
+        if !store_result.is_new {
+            let existing_events = self.event_emitter.get_events_by_work_id(&request.work_id);
+            for event in &existing_events {
+                if event.event_type == "changeset_published" {
+                    // Parse the payload to check if the digest matches
+                    if let Ok(payload_json) =
+                        serde_json::from_slice::<serde_json::Value>(&event.payload)
+                    {
+                        if let Some(existing_digest) = payload_json
+                            .get("changeset_digest")
+                            .and_then(|v| v.as_str())
+                        {
+                            if existing_digest == hex::encode(changeset_digest) {
+                                debug!(
+                                    work_id = %request.work_id,
+                                    changeset_digest = %hex::encode(changeset_digest),
+                                    "Idempotent: returning existing ChangeSetPublished event"
+                                );
+                                return Ok(PrivilegedResponse::PublishChangeSet(
+                                    PublishChangeSetResponse {
+                                        changeset_digest: hex::encode(changeset_digest),
+                                        cas_hash: hex::encode(cas_hash),
+                                        work_id: request.work_id,
+                                        event_id: event.event_id.clone(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Get HTF-compliant timestamp
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // Emit ChangeSetPublished ledger event
+        let signed_event = match self.event_emitter.emit_changeset_published(
+            &request.work_id,
+            &changeset_digest,
+            &cas_hash,
+            &actor_id,
+            timestamp_ns,
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                warn!(error = %e, "ChangeSetPublished event emission failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("changeset published event emission failed: {e}"),
+                ));
+            },
+        };
+
+        info!(
+            event_id = %signed_event.event_id,
+            work_id = %request.work_id,
+            changeset_digest = %hex::encode(changeset_digest),
+            cas_hash = %hex::encode(cas_hash),
+            "ChangeSetPublished: bundle stored in CAS and event emitted to ledger"
+        );
+
+        Ok(PrivilegedResponse::PublishChangeSet(
+            PublishChangeSetResponse {
+                changeset_digest: hex::encode(changeset_digest),
+                cas_hash: hex::encode(cas_hash),
+                work_id: request.work_id,
+                event_id: signed_event.event_id,
+            },
+        ))
+    }
+
     #[allow(clippy::result_large_err)] // Error variant is PrivilegedResponse, matching dispatch pattern
     fn require_credential_store(&self) -> Result<&CredentialStore, PrivilegedResponse> {
         self.credential_store.as_deref().ok_or_else(|| {
@@ -7641,6 +8023,18 @@ pub fn encode_consensus_metrics_request(request: &ConsensusMetricsRequest) -> By
 #[must_use]
 pub fn encode_work_status_request(request: &WorkStatusRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::WorkStatus.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+// =============================================================================
+// TCK-00394: ChangeSet Publishing Encoding (RFC-0018)
+// =============================================================================
+
+/// Encodes a `PublishChangeSet` request to bytes for sending (TCK-00394).
+#[must_use]
+pub fn encode_publish_changeset_request(request: &PublishChangeSetRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::PublishChangeSet.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -13935,6 +14329,413 @@ mod tests {
                 .collect();
             let p1: serde_json::Value = serde_json::from_slice(&t1[0].payload).unwrap();
             assert_eq!(p1["actor_id"], "daemon:shutdown");
+        }
+    }
+
+    // ========================================================================
+    // TCK-00394: PublishChangeSet IPC endpoint tests
+    // ========================================================================
+    mod publish_changeset {
+        use apm2_core::evidence::MemoryCas;
+
+        use super::*;
+
+        /// Helper to create a valid `ChangeSetBundleV1` JSON payload.
+        fn make_bundle_json(changeset_id: &str) -> Vec<u8> {
+            let bundle_json = serde_json::json!({
+                "schema": "apm2.changeset_bundle.v1",
+                "schema_version": "1.0.0",
+                "changeset_id": changeset_id,
+                "base": {
+                    "algo": "sha1",
+                    "object_kind": "commit",
+                    "object_id": "abc123def456"
+                },
+                "changeset_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+                "diff_format": "git_unified_diff",
+                "diff_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "file_manifest": [{
+                    "path": "src/main.rs",
+                    "change_kind": "MODIFY"
+                }],
+                "binary_detected": false
+            });
+            serde_json::to_vec(&bundle_json).unwrap()
+        }
+
+        /// Helper to build a dispatcher with CAS and a privileged context.
+        fn make_dispatcher_with_cas() -> (PrivilegedDispatcher, Arc<MemoryCas>) {
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            (dispatcher, cas)
+        }
+
+        fn privileged_ctx() -> ConnectionContext {
+            ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }))
+        }
+
+        /// Helper to first claim work so we have a registered `work_id`.
+        fn claim_work(dispatcher: &PrivilegedDispatcher, ctx: &ConnectionContext) -> String {
+            let request = ClaimWorkRequest {
+                actor_id: "test:actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let frame = encode_claim_work_request(&request);
+            let response = dispatcher.dispatch(&frame, ctx).unwrap();
+            match response {
+                PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_changeset_routing() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+
+            // First claim work to get a valid work_id
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let bundle_bytes = make_bundle_json("cs-001");
+            let request = PublishChangeSetRequest {
+                work_id,
+                bundle_bytes,
+            };
+            let frame = encode_publish_changeset_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            assert!(
+                matches!(response, PrivilegedResponse::PublishChangeSet(_)),
+                "Expected PublishChangeSet response, got: {response:?}"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_returns_digest_and_cas_hash() {
+            let (dispatcher, cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let bundle_bytes = make_bundle_json("cs-002");
+            let request = PublishChangeSetRequest {
+                work_id: work_id.clone(),
+                bundle_bytes: bundle_bytes.clone(),
+            };
+            let frame = encode_publish_changeset_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::PublishChangeSet(resp) => {
+                    // changeset_digest should be a 64-char hex string
+                    assert_eq!(
+                        resp.changeset_digest.len(),
+                        64,
+                        "changeset_digest should be 64 hex chars"
+                    );
+                    // cas_hash should be a 64-char hex string
+                    assert_eq!(resp.cas_hash.len(), 64, "cas_hash should be 64 hex chars");
+                    // work_id should match
+                    assert_eq!(resp.work_id, work_id);
+                    // event_id should be non-empty
+                    assert!(!resp.event_id.is_empty(), "event_id should be non-empty");
+
+                    // Verify the bundle was stored in CAS
+                    let hash_bytes: [u8; 32] =
+                        hex::decode(&resp.cas_hash).unwrap().try_into().unwrap();
+                    assert!(
+                        cas.exists(&hash_bytes).unwrap(),
+                        "Bundle should exist in CAS"
+                    );
+
+                    // Verify CAS content matches bundle bytes
+                    let stored = cas.retrieve(&hash_bytes).unwrap();
+                    assert_eq!(stored, bundle_bytes, "CAS content should match input");
+                },
+                other => panic!("Expected PublishChangeSet response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_publish_changeset_emits_ledger_event() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let bundle_bytes = make_bundle_json("cs-003");
+            let request = PublishChangeSetRequest {
+                work_id: work_id.clone(),
+                bundle_bytes,
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            let event_id = match &response {
+                PrivilegedResponse::PublishChangeSet(resp) => resp.event_id.clone(),
+                other => panic!("Expected PublishChangeSet response, got: {other:?}"),
+            };
+
+            // Query ledger for the emitted event
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let changeset_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "changeset_published")
+                .collect();
+            assert_eq!(
+                changeset_events.len(),
+                1,
+                "Should have exactly one changeset_published event"
+            );
+            assert_eq!(changeset_events[0].event_id, event_id);
+
+            // Verify event payload contains expected fields
+            let payload: serde_json::Value =
+                serde_json::from_slice(&changeset_events[0].payload).unwrap();
+            assert_eq!(payload["event_type"], "changeset_published");
+            assert_eq!(payload["work_id"], work_id);
+            assert!(payload["changeset_digest"].is_string());
+            assert!(payload["cas_hash"].is_string());
+            assert!(payload["actor_id"].is_string());
+            // Binding test evidence: timestamp_ns must be > 0
+            assert!(
+                payload["timestamp_ns"].as_u64().unwrap() > 0,
+                "timestamp_ns must be > 0"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_idempotent() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let bundle_bytes = make_bundle_json("cs-004");
+
+            // First publish
+            let request1 = PublishChangeSetRequest {
+                work_id: work_id.clone(),
+                bundle_bytes: bundle_bytes.clone(),
+            };
+            let frame1 = encode_publish_changeset_request(&request1);
+            let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            let (digest1, event_id1) = match &response1 {
+                PrivilegedResponse::PublishChangeSet(resp) => {
+                    (resp.changeset_digest.clone(), resp.event_id.clone())
+                },
+                other => panic!("Expected PublishChangeSet response, got: {other:?}"),
+            };
+
+            // Second publish with same bundle
+            let request2 = PublishChangeSetRequest {
+                work_id: work_id.clone(),
+                bundle_bytes,
+            };
+            let frame2 = encode_publish_changeset_request(&request2);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            let (digest2, event_id2) = match &response2 {
+                PrivilegedResponse::PublishChangeSet(resp) => {
+                    (resp.changeset_digest.clone(), resp.event_id.clone())
+                },
+                other => panic!("Expected PublishChangeSet response, got: {other:?}"),
+            };
+
+            // Should return same digest
+            assert_eq!(digest1, digest2, "Idempotent: digest should match");
+            // Should return same event_id (no duplicate events)
+            assert_eq!(
+                event_id1, event_id2,
+                "Idempotent: should return same event_id"
+            );
+
+            // Only one changeset_published event should exist
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let changeset_count = events
+                .iter()
+                .filter(|e| e.event_type == "changeset_published")
+                .count();
+            assert_eq!(
+                changeset_count, 1,
+                "Idempotent: only one changeset_published event"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_rejects_unknown_work_id() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+
+            let bundle_bytes = make_bundle_json("cs-005");
+            let request = PublishChangeSetRequest {
+                work_id: "W-nonexistent-001".to_string(),
+                bundle_bytes,
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(
+                matches!(response, PrivilegedResponse::Error(_)),
+                "Should reject unknown work_id"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_rejects_empty_work_id() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+
+            let request = PublishChangeSetRequest {
+                work_id: String::new(),
+                bundle_bytes: make_bundle_json("cs-006"),
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(
+                matches!(response, PrivilegedResponse::Error(_)),
+                "Should reject empty work_id"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_rejects_empty_bundle() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let request = PublishChangeSetRequest {
+                work_id,
+                bundle_bytes: vec![],
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(
+                matches!(response, PrivilegedResponse::Error(_)),
+                "Should reject empty bundle_bytes"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_rejects_invalid_json() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let request = PublishChangeSetRequest {
+                work_id,
+                bundle_bytes: b"not valid json".to_vec(),
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx);
+
+            // Should return a ProtocolError (serialization) since the JSON is invalid
+            assert!(
+                response.is_err(),
+                "Should return protocol error for invalid JSON"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_rejects_empty_file_manifest() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            // Bundle with empty file_manifest
+            let bundle_json = serde_json::json!({
+                "schema": "apm2.changeset_bundle.v1",
+                "schema_version": "1.0.0",
+                "changeset_id": "cs-empty-manifest",
+                "base": {
+                    "algo": "sha1",
+                    "object_kind": "commit",
+                    "object_id": "abc123def456"
+                },
+                "changeset_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+                "diff_format": "git_unified_diff",
+                "diff_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "file_manifest": [],
+                "binary_detected": false
+            });
+            let bundle_bytes = serde_json::to_vec(&bundle_json).unwrap();
+
+            let request = PublishChangeSetRequest {
+                work_id,
+                bundle_bytes,
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(
+                matches!(response, PrivilegedResponse::Error(_)),
+                "Should reject empty file_manifest"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_rejects_no_cas() {
+            // Dispatcher WITHOUT CAS
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let request = PublishChangeSetRequest {
+                work_id,
+                bundle_bytes: make_bundle_json("cs-no-cas"),
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(
+                matches!(response, PrivilegedResponse::Error(_)),
+                "Should reject when CAS not configured"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_permission_denied_for_non_privileged() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = ConnectionContext::session(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                }),
+                Some("session-test-001".to_string()),
+            );
+
+            let request = PublishChangeSetRequest {
+                work_id: "W-test-001".to_string(),
+                bundle_bytes: make_bundle_json("cs-perm"),
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            assert!(
+                matches!(response, PrivilegedResponse::Error(_)),
+                "Should reject non-privileged connection"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_tag_70_routing() {
+            // Verify tag 70 routes correctly
+            assert_eq!(
+                PrivilegedMessageType::PublishChangeSet.tag(),
+                70,
+                "PublishChangeSet tag should be 70"
+            );
+            assert_eq!(
+                PrivilegedMessageType::from_tag(70),
+                Some(PrivilegedMessageType::PublishChangeSet),
+                "Tag 70 should map to PublishChangeSet"
+            );
         }
     }
 
