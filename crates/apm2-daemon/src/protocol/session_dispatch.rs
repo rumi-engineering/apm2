@@ -1846,6 +1846,26 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
         });
 
+        // TCK-00375 BLOCKER 2 FIX: Drain and emit firewall violation defects
+        // after every broker request. Per REQ-0029, Tier3+ defects MUST be
+        // emitted into the authoritative event/ledger flow at decision time.
+        {
+            let defects = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async { broker.drain_firewall_defects().await })
+            });
+            for defect in &defects {
+                warn!(
+                    violation_type = ?defect.violation_type,
+                    risk_tier = defect.risk_tier,
+                    rule_id = %defect.rule_id,
+                    manifest_id = %defect.manifest_id,
+                    path = %defect.path,
+                    "TCK-00375: Firewall violation defect emitted"
+                );
+            }
+        }
+
         let response = self.handle_broker_decision(
             decision,
             &token.session_id,
@@ -1854,6 +1874,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             actuation_timestamp,
             &episode_id,
             preactuation_receipt.as_ref(),
+            &broker,
+            risk_tier,
         );
 
         // TCK-00384: Increment tool_calls counter on successful dispatch.
@@ -1896,6 +1918,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         actuation_timestamp: ReplayTimestamp,
         episode_id: &EpisodeId,
         preactuation_receipt: Option<&PreActuationReceipt>,
+        broker: &SharedToolBroker<StubManifestLoader>,
+        risk_tier: RiskTier,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -1997,6 +2021,78 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             SessionErrorCode::SessionErrorInternal,
                             sanitize_error_message(error_msg),
                         ));
+                    }
+
+                    // TCK-00375 BLOCKER 1 FIX: Wire TOCTOU hash verification
+                    // into the read execution path.  After the tool executes
+                    // successfully but BEFORE the content is delivered to the
+                    // agent, verify that the runtime content matches the hash
+                    // recorded in the context pack manifest.  If verification
+                    // fails, the read is denied (fail-closed).
+                    //
+                    // Only applies to read-type tool classes (Read, ListFiles,
+                    // Search) since those are the operations that return file
+                    // content subject to TOCTOU attacks.
+                    if matches!(
+                        tool_class,
+                        ToolClass::Read | ToolClass::ListFiles | ToolClass::Search
+                    ) {
+                        // Extract path from tool_args for TOCTOU verification.
+                        // The path was already validated by the context firewall
+                        // in broker.request(); we need it here to look up the
+                        // manifest entry for hash comparison.
+                        let toctou_path: Option<String> =
+                            serde_json::from_slice::<serde_json::Value>(request_arguments)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("path")
+                                        .or_else(|| v.get("scope"))
+                                        .and_then(|p| p.as_str().map(String::from))
+                                });
+
+                        if let Some(ref path_str) = toctou_path {
+                            let toctou_result = tokio::task::block_in_place(|| {
+                                let handle = tokio::runtime::Handle::current();
+                                handle.block_on(async {
+                                    broker
+                                        .verify_toctou(path_str, &result.output, risk_tier)
+                                        .await
+                                })
+                            });
+
+                            if let Err(e) = toctou_result {
+                                error!(
+                                    path = %path_str,
+                                    risk_tier = risk_tier.tier(),
+                                    error = %e,
+                                    "TCK-00375: TOCTOU verification failed; denying read (fail-closed)"
+                                );
+
+                                // Drain and emit any defects accumulated by
+                                // verify_toctou (BLOCKER 2 continuation).
+                                let defects = tokio::task::block_in_place(|| {
+                                    let handle = tokio::runtime::Handle::current();
+                                    handle.block_on(async { broker.drain_firewall_defects().await })
+                                });
+                                for defect in &defects {
+                                    warn!(
+                                        violation_type = ?defect.violation_type,
+                                        risk_tier = defect.risk_tier,
+                                        rule_id = %defect.rule_id,
+                                        manifest_id = %defect.manifest_id,
+                                        path = %defect.path,
+                                        "TCK-00375: TOCTOU defect emitted"
+                                    );
+                                }
+
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInternal,
+                                    sanitize_error_message(&format!(
+                                        "TOCTOU verification failed: {e}"
+                                    )),
+                                ));
+                            }
+                        }
                     }
 
                     // SEC-CTRL-FAC-0015 BLOCKER FIX: Enforce MAX_INLINE_RESULT_SIZE
@@ -4688,6 +4784,10 @@ mod tests {
 
             // Actuation timestamp is deliberately older than the check timestamp
             // to trigger ReplayVerifier::OrderingViolation in production wiring.
+            let test_broker: SharedToolBroker<StubManifestLoader> =
+                std::sync::Arc::new(crate::episode::broker::ToolBroker::new(
+                    crate::episode::broker::ToolBrokerConfig::default(),
+                ));
             let response = dispatcher
                 .handle_broker_decision(
                     Ok(decision),
@@ -4697,6 +4797,8 @@ mod tests {
                     ReplayTimestamp::new(100, 0),
                     &episode_id,
                     Some(&receipt),
+                    &test_broker,
+                    RiskTier::Tier0,
                 )
                 .expect("dispatch should return application-level error response");
 

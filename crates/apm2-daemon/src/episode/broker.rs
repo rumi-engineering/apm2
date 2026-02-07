@@ -42,7 +42,7 @@ use std::sync::Arc;
 use apm2_core::context::ContextPackManifest;
 use apm2_core::context::firewall::{
     ContextAwareValidator, ContextRiskTier, DefaultContextFirewall, FirewallViolationDefect,
-    RiskTierFirewallPolicy, ToctouVerifier,
+    RiskTierFirewallPolicy, ToctouVerifier, ValidationResult,
 };
 use apm2_core::policy::{Decision as CoreDecision, LoadedPolicy, PolicyEngine};
 use thiserror::Error;
@@ -1616,48 +1616,118 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     let firewall = DefaultContextFirewall::new(context_manifest, tier_mode);
                     let path_str = path.to_string_lossy();
 
-                    if let Err(e) = firewall.validate_read(&path_str, None) {
-                        warn!(
-                            path = %path_str,
-                            risk_tier = request.risk_tier.tier(),
-                            error = %e,
-                            "context firewall violation"
-                        );
+                    match firewall.validate_read(&path_str, None) {
+                        Ok(ValidationResult::Allowed) => {
+                            // Path is in the manifest and allowed; proceed to
+                            // capability checks.
+                        },
+                        Ok(ValidationResult::Warned { event }) => {
+                            // TCK-00375 BLOCKER 3 FIX: Warn mode returned a
+                            // warning for a path that would have been denied.
+                            // Per REQ-0029, out-of-pack reads MUST always be
+                            // denied regardless of tier mode.  The Warn mode
+                            // only applies to *in-pack* policy tweaks; it must
+                            // NOT allow out-of-pack access.
+                            warn!(
+                                path = %path_str,
+                                risk_tier = request.risk_tier.tier(),
+                                rule_id = %event.rule_id,
+                                "context firewall violation (Warned treated as deny per REQ-0029)"
+                            );
 
-                        // TCK-00375: Emit mandatory defect for Tier3+ violations
-                        if ctx_risk_tier.is_high_risk() {
-                            let defect = if e.is_toctou_mismatch() {
-                                FirewallViolationDefect::toctou_mismatch(
+                            // Emit mandatory defect for Tier3+ violations
+                            if ctx_risk_tier.is_high_risk() {
+                                let defect = FirewallViolationDefect::allowlist_denied(
                                     request.risk_tier.tier(),
                                     &context_manifest.manifest_id,
                                     &path_str,
-                                )
-                            } else {
-                                FirewallViolationDefect::allowlist_denied(
+                                );
+                                emit_defect(defect).await;
+                            }
+
+                            // Always deny out-of-pack reads: terminate for
+                            // Tier3+ or HardFail; soft-deny otherwise.
+                            if ctx_risk_tier.is_high_risk()
+                                || tier_mode == apm2_core::context::firewall::FirewallMode::HardFail
+                            {
+                                return Ok(make_terminate("CONTEXT_MISS"));
+                            }
+
+                            return Ok(ToolDecision::Deny {
+                                request_id: request.request_id.clone(),
+                                reason: DenyReason::PolicyDenied {
+                                    rule_id: "CONTEXT_FIREWALL".to_string(),
+                                    reason: format!(
+                                        "out-of-pack read denied (warned): {}",
+                                        event.reason,
+                                    ),
+                                },
+                                rule_id: Some("CONTEXT_FIREWALL".to_string()),
+                                policy_hash: self.policy.policy_hash(),
+                            });
+                        },
+                        Ok(ValidationResult::Denied { event }) => {
+                            // Firewall returned an explicit Denied result (this
+                            // can happen if a future firewall mode returns Ok(Denied)).
+                            warn!(
+                                path = %path_str,
+                                risk_tier = request.risk_tier.tier(),
+                                rule_id = %event.rule_id,
+                                "context firewall violation (Denied)"
+                            );
+                            if ctx_risk_tier.is_high_risk() {
+                                let defect = FirewallViolationDefect::allowlist_denied(
                                     request.risk_tier.tier(),
                                     &context_manifest.manifest_id,
                                     &path_str,
-                                )
-                            };
-                            emit_defect(defect).await;
-                        }
-
-                        // TCK-00375: Tier3+ always terminates
-                        if e.should_terminate_session() || ctx_risk_tier.is_high_risk() {
+                                );
+                                emit_defect(defect).await;
+                            }
                             return Ok(make_terminate("CONTEXT_MISS"));
-                        }
+                        },
+                        Err(e) => {
+                            warn!(
+                                path = %path_str,
+                                risk_tier = request.risk_tier.tier(),
+                                error = %e,
+                                "context firewall violation"
+                            );
 
-                        // Non-Tier3+ with non-terminating error: still deny but
-                        // don't terminate (SoftFail behavior)
-                        return Ok(ToolDecision::Deny {
-                            request_id: request.request_id.clone(),
-                            reason: DenyReason::PolicyDenied {
-                                rule_id: "CONTEXT_FIREWALL".to_string(),
-                                reason: e.to_string(),
-                            },
-                            rule_id: Some("CONTEXT_FIREWALL".to_string()),
-                            policy_hash: self.policy.policy_hash(),
-                        });
+                            // TCK-00375: Emit mandatory defect for Tier3+ violations
+                            if ctx_risk_tier.is_high_risk() {
+                                let defect = if e.is_toctou_mismatch() {
+                                    FirewallViolationDefect::toctou_mismatch(
+                                        request.risk_tier.tier(),
+                                        &context_manifest.manifest_id,
+                                        &path_str,
+                                    )
+                                } else {
+                                    FirewallViolationDefect::allowlist_denied(
+                                        request.risk_tier.tier(),
+                                        &context_manifest.manifest_id,
+                                        &path_str,
+                                    )
+                                };
+                                emit_defect(defect).await;
+                            }
+
+                            // TCK-00375: Tier3+ always terminates
+                            if e.should_terminate_session() || ctx_risk_tier.is_high_risk() {
+                                return Ok(make_terminate("CONTEXT_MISS"));
+                            }
+
+                            // Non-Tier3+ with non-terminating error: still deny but
+                            // don't terminate (SoftFail behavior)
+                            return Ok(ToolDecision::Deny {
+                                request_id: request.request_id.clone(),
+                                reason: DenyReason::PolicyDenied {
+                                    rule_id: "CONTEXT_FIREWALL".to_string(),
+                                    reason: e.to_string(),
+                                },
+                                rule_id: Some("CONTEXT_FIREWALL".to_string()),
+                                policy_hash: self.policy.policy_hash(),
+                            });
+                        },
                     }
                 },
                 super::tool_class::ToolClass::Write => {
@@ -4983,5 +5053,240 @@ policy:
         );
         assert!(deserialization_failed.should_emit_review_blocked());
         assert!(!deserialization_failed.is_retriable());
+    }
+
+    // =========================================================================
+    // TCK-00375 BLOCKER 3: Warn mode MUST deny out-of-pack reads
+    //
+    // Per REQ-0029, out-of-pack reads must ALWAYS be denied regardless of
+    // the firewall mode.  Even Warn mode must not permit out-of-pack access.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_warn_mode_denies_out_of_pack_reads() {
+        // TCK-00375 BLOCKER 3: Even with Warn firewall policy for low tiers,
+        // out-of-pack reads MUST be denied (not just warned).
+        use apm2_core::context::firewall::FirewallMode;
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
+            .with_firewall_policy(RiskTierFirewallPolicy {
+                low_risk_mode: FirewallMode::Warn,
+                medium_risk_mode: FirewallMode::Warn,
+            });
+
+        // Set up capability manifest allowing reads from /workspace
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Context manifest allows ONLY /workspace/allowed.rs
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/allowed.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request for out-of-pack path — MUST be denied even in Warn mode
+        let request = make_request("req-oop", ToolClass::Read, Some("/workspace/secret.rs"));
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(
+            !decision.is_allowed(),
+            "out-of-pack read MUST be denied even in Warn mode, got: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_warn_mode_allows_in_pack_reads() {
+        // TCK-00375: Warn mode for in-pack allowed paths should still succeed
+        use apm2_core::context::firewall::FirewallMode;
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
+            .with_firewall_policy(RiskTierFirewallPolicy {
+                low_risk_mode: FirewallMode::Warn,
+                medium_risk_mode: FirewallMode::Warn,
+            });
+
+        // Set up capability manifest allowing reads from /workspace
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Context manifest allows /workspace/allowed.rs
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/allowed.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request for in-pack path — should be allowed
+        let request = make_request("req-inpack", ToolClass::Read, Some("/workspace/allowed.rs"));
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(
+            decision.is_allowed(),
+            "in-pack read should be allowed in Warn mode, got: {decision:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00375 BLOCKER 2: Defect emission for Tier3+ violations
+    //
+    // Per REQ-0029, Tier3+ violations MUST emit FirewallViolationDefect.
+    // Verify that defects are accumulated and drainable.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_tier3_violation_emits_defect() {
+        // TCK-00375 BLOCKER 2: Tier3+ firewall violations MUST produce
+        // drainable defects.
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        // Set up capability manifest allowing reads from /workspace at Tier3
+        let caps = vec![Capability {
+            capability_id: "cap-read-t3".to_string(),
+            tool_class: ToolClass::Read,
+            scope: CapabilityScope {
+                root_paths: vec![PathBuf::from("/workspace")],
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier3,
+        }];
+        let manifest = make_manifest(caps);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Context manifest allows ONLY /workspace/allowed.rs
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/allowed.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request for out-of-pack path at Tier3 — should terminate AND emit defect
+        let mut req = BrokerToolRequest::new(
+            "req-t3-deny",
+            test_episode_id(),
+            ToolClass::Read,
+            test_dedupe_key("t3-deny"),
+            test_args_hash(),
+            RiskTier::Tier3,
+        );
+        req = req.with_path("/workspace/secret.rs");
+        let decision = broker.request(&req, timestamp_ns(0), None).await.unwrap();
+
+        assert!(
+            decision.is_terminate(),
+            "Tier3 out-of-pack read must terminate, got: {decision:?}"
+        );
+
+        // Drain defects — there should be at least one
+        let defects = broker.drain_firewall_defects().await;
+        assert!(
+            !defects.is_empty(),
+            "Tier3+ violation MUST emit at least one FirewallViolationDefect"
+        );
+        assert_eq!(defects[0].risk_tier, 3);
+        assert_eq!(defects[0].path, "/workspace/secret.rs");
+    }
+
+    // =========================================================================
+    // TCK-00375 BLOCKER 1: TOCTOU verification is callable and functional
+    //
+    // verify_toctou() must detect content hash mismatches.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_verify_toctou_detects_mismatch() {
+        // TCK-00375 BLOCKER 1: verify_toctou must fail when content differs
+        // from the manifest hash.
+        let content = b"fn main() { println!(\"hello\"); }";
+        let correct_hash = *blake3::hash(content).as_bytes();
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        // Context manifest with the correct hash
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/main.rs", correct_hash)],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Verify with correct content — should pass
+        let result = broker
+            .verify_toctou("/workspace/main.rs", content, RiskTier::Tier0)
+            .await;
+        assert!(result.is_ok(), "correct content should pass TOCTOU check");
+
+        // Verify with tampered content — should fail
+        let tampered = b"fn main() { std::process::exit(1); }";
+        let result = broker
+            .verify_toctou("/workspace/main.rs", tampered, RiskTier::Tier0)
+            .await;
+        assert!(result.is_err(), "tampered content must fail TOCTOU check");
+    }
+
+    #[tokio::test]
+    async fn test_verify_toctou_emits_defect_for_tier3() {
+        // TCK-00375 BLOCKER 1+2: verify_toctou at Tier3 must emit a defect
+        let content = b"fn main() {}";
+        let correct_hash = *blake3::hash(content).as_bytes();
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/main.rs", correct_hash)],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Tampered content at Tier3
+        let tampered = b"rm -rf /";
+        let result = broker
+            .verify_toctou("/workspace/main.rs", tampered, RiskTier::Tier3)
+            .await;
+        assert!(result.is_err(), "TOCTOU mismatch must fail");
+
+        let defects = broker.drain_firewall_defects().await;
+        assert!(
+            !defects.is_empty(),
+            "Tier3 TOCTOU mismatch MUST emit a defect"
+        );
+        assert_eq!(
+            defects[0].violation_type,
+            apm2_core::context::firewall::FirewallViolationType::ToctouMismatch,
+        );
+        assert_eq!(defects[0].risk_tier, 3);
     }
 }
