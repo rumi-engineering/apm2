@@ -176,7 +176,51 @@ join_continuations() {
     fi
 }
 
+# Primary gate (broad text search): reject any review artifact containing the
+# literal string "ai-review/security" UNLESS it is the security review prompt
+# itself.  This catches variable indirection, split-line assignments, and any
+# other encoding that still contains the literal context name.
+# Comment lines (starting with #) are excluded.
+log_info "Primary gate: scanning for ai-review/security literal in non-exempt files..."
+
+check_file_for_security_literal() {
+    local file="$1"
+    local file_basename="$2"
+    # The SECURITY_REVIEW_PROMPT.md is the only file permitted to reference
+    # the ai-review/security context name.
+    if [[ "$file_basename" == "SECURITY_REVIEW_PROMPT.md" ]]; then
+        return 1
+    fi
+    local line_num=0
+    while IFS= read -r raw_line; do
+        line_num=$((line_num + 1))
+        # Skip empty lines
+        [[ -z "$raw_line" ]] && continue
+        # Skip comment lines (leading whitespace then #)
+        local stripped="${raw_line#"${raw_line%%[![:space:]]*}"}"
+        [[ "$stripped" == "#"* ]] && continue
+        # Case-insensitive check for the literal context string
+        local lc="${raw_line,,}"
+        if [[ "$lc" == *"ai-review/security"* ]]; then
+            log_error "Forbidden ai-review/security literal in non-exempt review artifact:"
+            log_error "  ${file}:${line_num}: ${raw_line}"
+            log_error "  Only SECURITY_REVIEW_PROMPT.md may reference this context."
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
+while IFS= read -r review_file; do
+    file_basename="$(basename "$review_file")"
+    if check_file_for_security_literal "$review_file" "$file_basename"; then
+        VIOLATIONS=1
+    fi
+done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
+
+# Defense-in-depth: per-line pattern detection via continuation-joined lines.
 # Scan every file in the review directory for direct status writes.
+log_info "Defense-in-depth: checking per-line status-write patterns..."
 while IFS= read -r review_file; do
     file_basename="$(basename "$review_file")"
     # Process with continuation-joining so multiline commands are caught

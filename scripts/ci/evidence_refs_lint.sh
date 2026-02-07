@@ -246,6 +246,13 @@ if [[ -d "$TICKET_DIR" ]]; then
             if [[ -n "$ref_path" ]]; then
                 # Trim trailing whitespace
                 ref_path="${ref_path%"${ref_path##*[![:space:]]}"}"
+                # Containment check: canonicalize and verify path is within repo root
+                resolved="$(realpath -m "${REPO_ROOT}/${ref_path}")"
+                if [[ "$resolved" != "${REPO_ROOT}"/* ]]; then
+                    log_error "Path traversal: ${ticket_file} requirement_ref '${ref_path}' resolves outside repo root"
+                    VIOLATIONS=1
+                    continue
+                fi
                 if [[ ! -f "${REPO_ROOT}/${ref_path}" ]]; then
                     known_key="${ticket_id}:requirement_ref:${ref_path}"
                     if [[ -n "${KNOWN_TICKET_ISSUES["${known_key}"]:-}" ]]; then
@@ -264,6 +271,13 @@ if [[ -d "$TICKET_DIR" ]]; then
             ref_path=$(echo "$ref_line" | sed -n 's/.*artifact_ref:[[:space:]]*"\{0,1\}\([^"#]*\).*/\1/p')
             if [[ -n "$ref_path" ]]; then
                 ref_path="${ref_path%"${ref_path##*[![:space:]]}"}"
+                # Containment check: canonicalize and verify path is within repo root
+                resolved="$(realpath -m "${REPO_ROOT}/${ref_path}")"
+                if [[ "$resolved" != "${REPO_ROOT}"/* ]]; then
+                    log_error "Path traversal: ${ticket_file} artifact_ref '${ref_path}' resolves outside repo root"
+                    VIOLATIONS=1
+                    continue
+                fi
                 if [[ ! -f "${REPO_ROOT}/${ref_path}" ]]; then
                     known_key="${ticket_id}:artifact_ref:${ref_path}"
                     if [[ -n "${KNOWN_TICKET_ISSUES["${known_key}"]:-}" ]]; then

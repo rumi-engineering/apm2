@@ -290,7 +290,7 @@ decision_tree:
           note: |
             code-quality sets its own category status via gh api because
             the xtask review-exec command is security-category only
-            (it hardcodes the ai-review/security context).
+            (it hardcodes the security review context, not code-quality).
           run: |
             gh pr comment $PR_URL --body-file quality_findings.md
             if [ "$VERDICT_STATE" == "success" ]; then

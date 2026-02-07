@@ -43,3 +43,6 @@ curl -H "Authorization: token $TOKEN" -X POST "https://api.github.com/repos/{own
 
 # Pattern N: variable indirection with check-runs — no gh api on same line as ai-review/security
 statuses_url="/repos/{owner}/{repo}/check-runs"; gh api "$statuses_url" -f name="ai-review/security" -f conclusion="success"
+
+# Pattern O: split-line endpoint+variable — the ai-review/security literal on any line catches the indirection
+endpoint="/repos/{owner}/{repo}/statuses/$sha"; ctx="ai-review/security"; gh api "$endpoint" -f context="$ctx"

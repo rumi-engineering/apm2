@@ -66,6 +66,38 @@ while IFS= read -r line; do
 done < "${FIXTURE_DIR}/review_artifact_lint_permitted.txt"
 echo
 
+# --- Test 2b: review_artifact_lint primary gate (file-level ai-review/security literal) ---
+echo "Test 2b: review_artifact_lint primary gate (file-level ai-review/security literal scan)"
+# Provide stub log_error for the sourced function (it uses log_error internally)
+log_error() { :; }
+source <(sed -n '/^check_file_for_security_literal()/,/^}/p' "${SCRIPT_DIR}/review_artifact_lint.sh")
+
+# Test 2b-i: File containing ai-review/security literal in non-comment code → MUST FAIL
+violation_fixture="${FIXTURE_DIR}/review_file_literal_violation.md"
+if check_file_for_security_literal "$violation_fixture" "review_file_literal_violation.md"; then
+    log_pass "Primary gate caught ai-review/security literal in non-exempt file"
+else
+    log_fail "Primary gate missed ai-review/security literal in non-exempt file: $(basename "$violation_fixture")"
+fi
+
+# Test 2b-ii: File containing ai-review/security ONLY in comments → MUST PASS
+permitted_fixture="${FIXTURE_DIR}/review_file_literal_permitted.md"
+if check_file_for_security_literal "$permitted_fixture" "review_file_literal_permitted.md"; then
+    log_fail "Primary gate false positive on comment-only ai-review/security: $(basename "$permitted_fixture")"
+else
+    log_pass "Primary gate correctly permits comment-only ai-review/security reference"
+fi
+
+# Test 2b-iii: SECURITY_REVIEW_PROMPT.md is always exempt → MUST PASS
+if check_file_for_security_literal "$violation_fixture" "SECURITY_REVIEW_PROMPT.md"; then
+    log_fail "Primary gate not exempting SECURITY_REVIEW_PROMPT.md"
+else
+    log_pass "Primary gate correctly exempts SECURITY_REVIEW_PROMPT.md"
+fi
+# Remove stub log_error so it doesn't shadow real log functions
+unset -f log_error
+echo
+
 # --- Test 3: evidence_refs_lint block extraction scope ---
 # Source the extract_yaml_list_block function
 source <(sed -n '/^extract_yaml_list_block()/,/^}/p' "${SCRIPT_DIR}/evidence_refs_lint.sh")
@@ -156,14 +188,22 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 validate_ticket_ref() {
     local fixture="$1"
     local ref_key="$2"  # "requirement_ref" or "artifact_ref"
-    local expect="$3"   # "valid" or "broken"
+    local expect="$3"   # "valid", "broken", or "traversal"
 
     local has_broken=0
+    local has_traversal=0
     while IFS= read -r ref_line; do
         local ref_path
         ref_path=$(echo "$ref_line" | sed -n "s/.*${ref_key}:[[:space:]]*\"\{0,1\}\([^\"#]*\).*/\1/p")
         if [[ -n "$ref_path" ]]; then
             ref_path="${ref_path%"${ref_path##*[![:space:]]}"}"
+            # Check containment (mirrors evidence_refs_lint.sh logic)
+            local resolved
+            resolved="$(realpath -m "${REPO_ROOT}/${ref_path}")"
+            if [[ "$resolved" != "${REPO_ROOT}"/* ]]; then
+                has_traversal=1
+                continue
+            fi
             if [[ ! -f "${REPO_ROOT}/${ref_path}" ]]; then
                 has_broken=1
             fi
@@ -171,10 +211,16 @@ validate_ticket_ref() {
     done < <(grep "${ref_key}:" "$fixture" 2>/dev/null || true)
 
     if [[ "$expect" == "valid" ]]; then
-        if [[ $has_broken -eq 0 ]]; then
+        if [[ $has_broken -eq 0 ]] && [[ $has_traversal -eq 0 ]]; then
             log_pass "Valid fixture ${ref_key} refs all resolve: $(basename "$fixture")"
         else
             log_fail "Valid fixture ${ref_key} ref unexpectedly broken: $(basename "$fixture")"
+        fi
+    elif [[ "$expect" == "traversal" ]]; then
+        if [[ $has_traversal -eq 1 ]]; then
+            log_pass "Path traversal correctly detected in ${ref_key}: $(basename "$fixture")"
+        else
+            log_fail "Path traversal NOT detected in ${ref_key}: $(basename "$fixture")"
         fi
     else
         if [[ $has_broken -eq 1 ]]; then
@@ -192,6 +238,10 @@ validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_valid.yaml" "artifact_ref" "vali
 # Test 5b: Broken ticket refs should be detected
 validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_broken.yaml" "requirement_ref" "broken"
 validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_broken.yaml" "artifact_ref" "broken"
+
+# Test 5c: Path traversal refs should be detected
+validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_traversal.yaml" "requirement_ref" "traversal"
+validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_traversal.yaml" "artifact_ref" "traversal"
 echo
 
 # --- Summary ---
