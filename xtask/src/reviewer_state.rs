@@ -598,9 +598,17 @@ impl<'a> ReviewerSpawner<'a> {
             self.model.as_deref(),
         );
 
+        // TCK-00408: Propagate cutover policy to child processes so spawned
+        // reviewers/executors inherit the same emit-only enforcement.
+        let cutover_policy = crate::util::effective_cutover_policy();
+
         // Spawn the process
         let child = std::process::Command::new("sh")
             .args(["-c", &shell_cmd])
+            .env(
+                crate::util::XTASK_CUTOVER_POLICY_ENV,
+                cutover_policy.env_value(),
+            )
             .spawn()
             .ok()?;
 
@@ -688,9 +696,16 @@ impl<'a> ReviewerSpawner<'a> {
             self.model.as_deref(),
         );
 
+        // TCK-00408: Propagate cutover policy to child processes.
+        let cutover_policy = crate::util::effective_cutover_policy();
+
         // Run synchronously and wait
         let status = std::process::Command::new("sh")
             .args(["-c", &shell_cmd])
+            .env(
+                crate::util::XTASK_CUTOVER_POLICY_ENV,
+                cutover_policy.env_value(),
+            )
             .status()
             .context("Failed to run reviewer process")?;
 

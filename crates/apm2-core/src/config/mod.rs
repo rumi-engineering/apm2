@@ -271,6 +271,37 @@ pub struct DivergenceWatchdogSection {
     pub poll_interval_secs: u64,
 }
 
+impl DivergenceWatchdogSection {
+    /// Validate startup prerequisites for the divergence watchdog.
+    ///
+    /// TCK-00408: When the watchdog is enabled, a ledger database is mandatory.
+    /// The watchdog is a security control; allowing it to be enabled without
+    /// its required ledger database would silently disable divergence
+    /// detection, violating fail-closed posture.
+    ///
+    /// `has_ledger_db` indicates whether a ledger database path was configured.
+    ///
+    /// Returns `Ok(())` when:
+    /// - The watchdog is disabled (no validation needed), or
+    /// - The watchdog is enabled AND a ledger database is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` when the watchdog is enabled but no ledger
+    /// database is configured.
+    pub fn validate_startup_prerequisites(&self, has_ledger_db: bool) -> Result<(), String> {
+        if self.enabled && !has_ledger_db {
+            return Err(
+                "divergence_watchdog.enabled=true but no --ledger-db configured. \
+                 Divergence watchdog requires a ledger database. \
+                 Either provide --ledger-db or disable the watchdog."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for DivergenceWatchdogSection {
     fn default() -> Self {
         Self {

@@ -91,7 +91,7 @@ pub use aat_receipt::{
     AATReceipt, AATReceiptError, AATReceiptGenerator, BudgetConsumed as AATBudgetConsumed,
     TestSummary, verify_aat_receipt,
 };
-pub use cas::{CasError, ContentAddressedStore, MemoryCas};
+pub use cas::{CasError, ContentAddressedStore, MemoryCas, StoreResult};
 pub use category::EvidenceCategory;
 pub use classification::DataClassification;
 pub use error::EvidenceError;

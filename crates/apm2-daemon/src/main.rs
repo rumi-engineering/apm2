@@ -1287,177 +1287,177 @@ async fn async_main(args: Args) -> Result<()> {
     {
         let dw_config = &daemon_config.config.daemon.divergence_watchdog;
         if dw_config.enabled {
-            if sqlite_conn.is_none() {
-                warn!(
-                    "divergence_watchdog.enabled=true but no --ledger-db configured. \
-                     Divergence watchdog requires a ledger database. Skipping."
-                );
-            } else if dw_config.github_owner.is_empty() || dw_config.github_repo.is_empty() {
+            // TCK-00408: Fail closed when mandatory persistence dependencies
+            // are missing. Validation is in DivergenceWatchdogSection so the
+            // check is testable outside of the binary.
+            dw_config
+                .validate_startup_prerequisites(sqlite_conn.is_some())
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            if dw_config.github_owner.is_empty() || dw_config.github_repo.is_empty() {
                 return Err(anyhow::anyhow!(
                     "divergence_watchdog.enabled=true but github_owner or github_repo \
                      is not configured"
                 ));
-            } else {
-                // Resolve GitHub token from environment variable
-                let token_env_raw = dw_config
-                    .github_token_env
-                    .as_deref()
-                    .unwrap_or("GITHUB_TOKEN");
-                let token_env = token_env_raw.strip_prefix('$').unwrap_or(token_env_raw);
-                let github_token = std::env::var(token_env).map_err(|_| {
-                    anyhow::anyhow!(
-                        "divergence_watchdog.enabled=true but GitHub token env var \
-                         ({token_env}) is not set"
-                    )
-                })?;
-
-                // Build watchdog configuration
-                let repo_id = format!("{}/{}", dw_config.github_owner, dw_config.github_repo);
-                let watchdog_config = DivergenceWatchdogConfig::new(&repo_id)
-                    .map_err(|e| anyhow::anyhow!("invalid divergence watchdog config: {e}"))?
-                    .with_poll_interval(Duration::from_secs(dw_config.poll_interval_secs))
-                    .map_err(|e| {
-                        anyhow::anyhow!("invalid divergence watchdog poll interval: {e}")
-                    })?;
-
-                let poll_interval = watchdog_config.poll_interval;
-
-                // Use the daemon's signer (unified signing key per lifecycle).
-                let watchdog_signer = Signer::generate();
-                let watchdog = DivergenceWatchdog::new(watchdog_signer, watchdog_config);
-
-                info!(
-                    repo = %repo_id,
-                    branch = %dw_config.trunk_branch,
-                    poll_interval_secs = dw_config.poll_interval_secs,
-                    "Divergence watchdog enabled"
-                );
-
-                // Create a dedicated ledger emitter for the watchdog.
-                let watchdog_ledger_emitter: Option<SqliteLedgerEventEmitter> =
-                    sqlite_conn.as_ref().map(|conn| {
-                        let watchdog_sign_key = Signer::generate();
-                        let key_bytes = watchdog_sign_key.secret_key_bytes();
-                        let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
-                        SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
-                    });
-
-                // Capture values for the spawned task
-                let github_api_url = dw_config.github_api_url.clone();
-                let github_owner = dw_config.github_owner.clone();
-                let github_repo = dw_config.github_repo.clone();
-                let trunk_branch = dw_config.trunk_branch.clone();
-                let watchdog_state = state.clone();
-
-                tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(poll_interval);
-                    // Track the last known merge receipt HEAD to avoid redundant API
-                    // calls when no new merges have happened.
-                    let mut last_divergence_detected = false;
-
-                    loop {
-                        interval.tick().await;
-
-                        // Check if daemon is shutting down
-                        if watchdog_state.is_shutdown_requested() {
-                            info!("Divergence watchdog shutting down");
-                            break;
-                        }
-
-                        // Step 1: Fetch the latest MergeReceipt HEAD from the ledger.
-                        // If no MergeReceipt exists (startup case), skip this poll cycle.
-                        let merge_receipt_head = {
-                            if let Some(ref emitter) = watchdog_ledger_emitter {
-                                // Query the ledger for the latest merge_receipt event
-                                // to extract the trunk HEAD.
-                                match query_latest_merge_receipt_head(emitter) {
-                                    Some(head) => head,
-                                    None => {
-                                        // No MergeReceipt in ledger yet -- this is the
-                                        // normal startup case. No-op.
-                                        continue;
-                                    },
-                                }
-                            } else {
-                                continue;
-                            }
-                        };
-
-                        // Step 2: Fetch the external trunk HEAD from GitHub API.
-                        // GET /repos/{owner}/{repo}/git/ref/heads/{branch}
-                        let external_head = match fetch_external_trunk_head(
-                            &github_api_url,
-                            &github_owner,
-                            &github_repo,
-                            &trunk_branch,
-                            &github_token,
-                        )
-                        .await
-                        {
-                            Ok(head) => head,
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    "Failed to fetch external trunk HEAD (will retry)"
-                                );
-                                continue;
-                            },
-                        };
-
-                        // Step 3: Check for divergence.
-                        match watchdog.check_divergence(merge_receipt_head, external_head) {
-                            Ok(Some(result)) => {
-                                // Divergence detected! Emit DefectRecorded event.
-                                error!(
-                                    expected_head = %hex::encode(merge_receipt_head),
-                                    actual_head = %hex::encode(external_head),
-                                    freeze_id = %result.freeze.freeze_id(),
-                                    "DIVERGENCE DETECTED: trunk HEAD does not match \
-                                     ledger MergeReceipt HEAD"
-                                );
-
-                                // Emit DefectRecorded event to the ledger.
-                                if let Some(ref emitter) = watchdog_ledger_emitter {
-                                    use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
-
-                                    let timestamp_ns = result.defect_event.detected_at;
-                                    if let Err(e) = emitter
-                                        .emit_defect_recorded(&result.defect_event, timestamp_ns)
-                                    {
-                                        error!(
-                                            error = %e,
-                                            "Failed to persist DefectRecorded event \
-                                             (fail-closed: freeze still active in registry)"
-                                        );
-                                    } else {
-                                        info!(
-                                            defect_id = %result.defect_event.defect_id,
-                                            "Persisted divergence DefectRecorded event"
-                                        );
-                                    }
-                                }
-
-                                last_divergence_detected = true;
-                            },
-                            Ok(None) => {
-                                // No divergence, or already frozen (idempotent).
-                                if last_divergence_detected {
-                                    // Still frozen from prior detection -- no
-                                    // new event.
-                                    // This is the idempotent path.
-                                }
-                            },
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    "Divergence check failed (fail-closed: check will \
-                                     retry on next poll)"
-                                );
-                            },
-                        }
-                    }
-                });
             }
+
+            // Resolve GitHub token from environment variable
+            let token_env_raw = dw_config
+                .github_token_env
+                .as_deref()
+                .unwrap_or("GITHUB_TOKEN");
+            let token_env = token_env_raw.strip_prefix('$').unwrap_or(token_env_raw);
+            let github_token = std::env::var(token_env).map_err(|_| {
+                anyhow::anyhow!(
+                    "divergence_watchdog.enabled=true but GitHub token env var \
+                     ({token_env}) is not set"
+                )
+            })?;
+
+            // Build watchdog configuration
+            let repo_id = format!("{}/{}", dw_config.github_owner, dw_config.github_repo);
+            let watchdog_config = DivergenceWatchdogConfig::new(&repo_id)
+                .map_err(|e| anyhow::anyhow!("invalid divergence watchdog config: {e}"))?
+                .with_poll_interval(Duration::from_secs(dw_config.poll_interval_secs))
+                .map_err(|e| anyhow::anyhow!("invalid divergence watchdog poll interval: {e}"))?;
+
+            let poll_interval = watchdog_config.poll_interval;
+
+            // Use the daemon's signer (unified signing key per lifecycle).
+            let watchdog_signer = Signer::generate();
+            let watchdog = DivergenceWatchdog::new(watchdog_signer, watchdog_config);
+
+            info!(
+                repo = %repo_id,
+                branch = %dw_config.trunk_branch,
+                poll_interval_secs = dw_config.poll_interval_secs,
+                "Divergence watchdog enabled"
+            );
+
+            // Create a dedicated ledger emitter for the watchdog.
+            let watchdog_ledger_emitter: Option<SqliteLedgerEventEmitter> =
+                sqlite_conn.as_ref().map(|conn| {
+                    let watchdog_sign_key = Signer::generate();
+                    let key_bytes = watchdog_sign_key.secret_key_bytes();
+                    let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                    SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
+                });
+
+            // Capture values for the spawned task
+            let github_api_url = dw_config.github_api_url.clone();
+            let github_owner = dw_config.github_owner.clone();
+            let github_repo = dw_config.github_repo.clone();
+            let trunk_branch = dw_config.trunk_branch.clone();
+            let watchdog_state = state.clone();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(poll_interval);
+                // Track the last known merge receipt HEAD to avoid redundant API
+                // calls when no new merges have happened.
+                let mut last_divergence_detected = false;
+
+                loop {
+                    interval.tick().await;
+
+                    // Check if daemon is shutting down
+                    if watchdog_state.is_shutdown_requested() {
+                        info!("Divergence watchdog shutting down");
+                        break;
+                    }
+
+                    // Step 1: Fetch the latest MergeReceipt HEAD from the ledger.
+                    // If no MergeReceipt exists (startup case), skip this poll cycle.
+                    let merge_receipt_head = {
+                        if let Some(ref emitter) = watchdog_ledger_emitter {
+                            // Query the ledger for the latest merge_receipt event
+                            // to extract the trunk HEAD.
+                            match query_latest_merge_receipt_head(emitter) {
+                                Some(head) => head,
+                                None => {
+                                    // No MergeReceipt in ledger yet -- this is the
+                                    // normal startup case. No-op.
+                                    continue;
+                                },
+                            }
+                        } else {
+                            continue;
+                        }
+                    };
+
+                    // Step 2: Fetch the external trunk HEAD from GitHub API.
+                    // GET /repos/{owner}/{repo}/git/ref/heads/{branch}
+                    let external_head = match fetch_external_trunk_head(
+                        &github_api_url,
+                        &github_owner,
+                        &github_repo,
+                        &trunk_branch,
+                        &github_token,
+                    )
+                    .await
+                    {
+                        Ok(head) => head,
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Failed to fetch external trunk HEAD (will retry)"
+                            );
+                            continue;
+                        },
+                    };
+
+                    // Step 3: Check for divergence.
+                    match watchdog.check_divergence(merge_receipt_head, external_head) {
+                        Ok(Some(result)) => {
+                            // Divergence detected! Emit DefectRecorded event.
+                            error!(
+                                expected_head = %hex::encode(merge_receipt_head),
+                                actual_head = %hex::encode(external_head),
+                                freeze_id = %result.freeze.freeze_id(),
+                                "DIVERGENCE DETECTED: trunk HEAD does not match \
+                                 ledger MergeReceipt HEAD"
+                            );
+
+                            // Emit DefectRecorded event to the ledger.
+                            if let Some(ref emitter) = watchdog_ledger_emitter {
+                                use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
+
+                                let timestamp_ns = result.defect_event.detected_at;
+                                if let Err(e) =
+                                    emitter.emit_defect_recorded(&result.defect_event, timestamp_ns)
+                                {
+                                    error!(
+                                        error = %e,
+                                        "Failed to persist DefectRecorded event \
+                                         (fail-closed: freeze still active in registry)"
+                                    );
+                                } else {
+                                    info!(
+                                        defect_id = %result.defect_event.defect_id,
+                                        "Persisted divergence DefectRecorded event"
+                                    );
+                                }
+                            }
+
+                            last_divergence_detected = true;
+                        },
+                        Ok(None) => {
+                            // No divergence, or already frozen (idempotent).
+                            if last_divergence_detected {
+                                // Still frozen from prior detection -- no
+                                // new event.
+                                // This is the idempotent path.
+                            }
+                        },
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                "Divergence check failed (fail-closed: check will \
+                                 retry on next poll)"
+                            );
+                        },
+                    }
+                }
+            });
         } else {
             info!("Divergence watchdog disabled");
         }
