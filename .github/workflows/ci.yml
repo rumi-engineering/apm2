@@ -1,5 +1,11 @@
 # Main CI workflow
 # Runs on push and PRs to ensure code quality
+#
+# Trust boundary: This repository uses repository-scoped self-hosted runners
+# behind a private GitHub organization. All pull_request triggers execute in a
+# trusted-actor-only context — only org members can open PRs that run on these
+# runners.  The `fac-ovh` runner label restricts execution to dedicated OVH
+# instances provisioned by the infrastructure team.
 
 name: CI
 
@@ -99,6 +105,7 @@ jobs:
   # Primary bounded test execution with cgroup/systemd constraints (TCK-00410)
   bounded-test-runner:
     name: Bounded Test Runner
+    needs: [test-safety-guard]
     if: github.event_name != 'issue_comment'
     runs-on: *primary_runner
     timeout-minutes: 30
@@ -125,6 +132,7 @@ jobs:
   # Canonicalization test vectors (TCK-00130)
   test-vectors:
     name: Test Vectors
+    needs: [test-safety-guard]
     if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
@@ -179,9 +187,10 @@ jobs:
         with:
           command: check all
 
-  # Code coverage
+  # Code coverage (runs tests; depends on test-safety-guard to block destructive patterns first)
   coverage:
     name: Coverage
+    needs: [test-safety-guard]
     if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -353,6 +362,7 @@ jobs:
   # tracked content changes unexpectedly. Fail-closed semantics.
   workspace-integrity-guard:
     name: Workspace Integrity Guard
+    needs: [test-safety-guard]
     if: github.event_name != 'issue_comment'
     runs-on: *primary_runner
     timeout-minutes: 20

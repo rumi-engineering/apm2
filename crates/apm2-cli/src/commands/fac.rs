@@ -674,10 +674,22 @@ fn run_check(args: &CheckArgs, json_output: bool) -> u8 {
         let receipt_pointer = receipt_path.display().to_string();
 
         if gate_blocked {
-            let _ = fs::write(
+            if let Err(e) = fs::write(
                 &receipt_path,
                 format!("status=SKIPPED\nreason=previous gate failed\ncommand={command_display}\n"),
-            );
+            ) {
+                eprintln!("FAIL-CLOSED: receipt write failed for gate {gate_id}: {e}");
+                // Fail-closed: treat receipt write failure as gate failure
+                gates.push(FacCheckGateResult {
+                    gate_id,
+                    gate_label,
+                    status: "FAIL".to_string(),
+                    exit_code: None,
+                    command: command_display,
+                    receipt_pointer,
+                });
+                continue;
+            }
             gates.push(FacCheckGateResult {
                 gate_id,
                 gate_label,
@@ -764,13 +776,18 @@ struct GateCommandExecution {
 }
 
 /// Runs a gate command and writes a receipt log.
+///
+/// Receipt writes are fail-closed: if a receipt cannot be written, the gate
+/// is reported as failed regardless of the underlying command result.
 fn execute_gate_command(
     workspace_root: &Path,
     command: &[String],
     receipt_path: &Path,
 ) -> GateCommandExecution {
     if command.is_empty() {
-        let _ = fs::write(receipt_path, "status=FAIL\nerror=empty command\n");
+        if let Err(e) = fs::write(receipt_path, "status=FAIL\nerror=empty command\n") {
+            eprintln!("FAIL-CLOSED: receipt write failed: {e}");
+        }
         return GateCommandExecution {
             success: false,
             exit_code: 127,
@@ -789,7 +806,15 @@ fn execute_gate_command(
             log_body.push_str(&String::from_utf8_lossy(&output.stdout));
             log_body.push_str("\n=== stderr ===\n");
             log_body.push_str(&String::from_utf8_lossy(&output.stderr));
-            let _ = fs::write(receipt_path, log_body);
+
+            // Fail-closed: receipt write failure overrides command success
+            if let Err(e) = fs::write(receipt_path, log_body) {
+                eprintln!("FAIL-CLOSED: receipt write failed: {e}");
+                return GateCommandExecution {
+                    success: false,
+                    exit_code,
+                };
+            }
 
             GateCommandExecution {
                 success: output.status.success(),
@@ -799,7 +824,11 @@ fn execute_gate_command(
         Err(e) => {
             log_body.push_str("exit_code=127\n");
             let _ = writeln!(log_body, "error={e}");
-            let _ = fs::write(receipt_path, log_body);
+
+            // Fail-closed: receipt write failure is logged but gate already failed
+            if let Err(write_err) = fs::write(receipt_path, log_body) {
+                eprintln!("FAIL-CLOSED: receipt write failed: {write_err}");
+            }
             GateCommandExecution {
                 success: false,
                 exit_code: 127,
@@ -2507,7 +2536,8 @@ mod tests {
         );
     }
 
-    /// `run_check` must fail-closed when `workspace_root` is a non-existent path.
+    /// `run_check` must fail-closed when `workspace_root` is a non-existent
+    /// path.
     #[test]
     fn test_run_check_rejects_nonexistent_workspace() {
         let args = CheckArgs {

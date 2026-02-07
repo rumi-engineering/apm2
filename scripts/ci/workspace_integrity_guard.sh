@@ -59,12 +59,21 @@ USAGE
 
 hash_file() {
     local path="$1"
+
+    # Symlink safety: hash the link target path string, not dereferenced content.
+    # This prevents unbounded reads if a symlink points to /dev/zero or similar.
+    if [[ -L "${path}" ]]; then
+        readlink "${path}" | sha256sum | awk '{print $1}'
+        return
+    fi
+
+    # Per-file timeout prevents unbounded reads on special/huge files.
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "${path}" | awk '{print $1}'
+        timeout 5s sha256sum "${path}" | awk '{print $1}'
         return
     fi
     if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "${path}" | awk '{print $1}'
+        timeout 5s shasum -a 256 "${path}" | awk '{print $1}'
         return
     fi
     log_error "No SHA-256 tool found (sha256sum or shasum required)."
