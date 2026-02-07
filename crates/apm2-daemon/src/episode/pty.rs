@@ -598,31 +598,39 @@ impl PtyRunner {
         // path here (pre-fork) so the child can use `execve` with the
         // resolved path, preserving async-signal-safety.
         //
+        // Standard Unix exec semantics: PATH search only applies to bare
+        // command names (no `/`).  Commands containing `/` (absolute like
+        // `/usr/bin/foo` or relative like `./agent.sh`, `bin/agent`) are
+        // passed directly to execve — the kernel resolves them relative to
+        // cwd without consulting PATH.
+        //
         // The resolved CString is kept separate from program_cstr because
         // argv[0] should remain the original command name per POSIX
         // convention.
-        let exec_program_cstr: CString =
-            if use_custom_env && !program_path.as_os_str().as_bytes().starts_with(b"/") {
-                // Extract PATH value from the custom env entries.
-                let env_path = config
-                    .env
-                    .iter()
-                    .find_map(|(k, v)| {
-                        if k.as_bytes() == b"PATH" {
-                            v.to_str().ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or("");
+        let command_bytes = program_path.as_os_str().as_bytes();
+        let needs_path_resolution = use_custom_env && !command_bytes.contains(&b'/');
+        let exec_program_cstr: CString = if needs_path_resolution {
+            // Extract PATH value from the custom env entries.
+            let env_path = config
+                .env
+                .iter()
+                .find_map(|(k, v)| {
+                    if k.as_bytes() == b"PATH" {
+                        v.to_str().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("");
 
-                let command_str = program_path.to_str().unwrap_or("");
-                let resolved = resolve_executable_in_path(command_str, env_path)?;
-                path_to_cstring(&resolved)?
-            } else {
-                // Absolute path or no custom env — use as-is.
-                program_cstr.clone()
-            };
+            let command_str = program_path.to_str().unwrap_or("");
+            let resolved = resolve_executable_in_path(command_str, env_path)?;
+            path_to_cstring(&resolved)?
+        } else {
+            // Absolute path, relative path with `/`, or no custom env
+            // — use as-is (kernel resolves relative to cwd).
+            program_cstr.clone()
+        };
 
         // Pre-fork: build the raw pointer array for execve envp parameter.
         // Must be null-terminated.

@@ -167,11 +167,11 @@ async fn test_persistence_end_to_end() {
     let maybe_session_id = match spawn_resp_impl {
         PrivilegedResponse::SpawnEpisode(resp) => Some(resp.session_id),
         PrivilegedResponse::Error(err) => {
-            // Accept command-not-found as an expected CI failure when
-            // `claude` is not installed.
+            // Accept command-not-found / ENOENT as an expected CI failure
+            // when `claude` is not installed.  Other spawn failures are
+            // real regressions and must not be silently skipped.
             assert!(
-                err.message.contains("command not found")
-                    || err.message.contains("adapter spawn failed"),
+                err.message.contains("command not found") || err.message.contains("No such file"),
                 "unexpected spawn error: code={}, msg={}",
                 err.code,
                 err.message

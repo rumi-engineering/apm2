@@ -470,10 +470,11 @@ fn spawn_session_and_get_token(dispatcher_state: &DispatcherState) -> Option<Str
     match spawn_response {
         PrivilegedResponse::SpawnEpisode(resp) => Some(resp.session_token),
         PrivilegedResponse::Error(err) => {
-            // Accept command-not-found as expected when `claude` is not installed.
+            // Accept command-not-found / ENOENT as expected when `claude`
+            // is not installed.  Other spawn failures are real regressions
+            // and must not be silently skipped.
             assert!(
-                err.message.contains("command not found")
-                    || err.message.contains("adapter spawn failed"),
+                err.message.contains("command not found") || err.message.contains("No such file"),
                 "unexpected spawn error: code={}, msg={}",
                 err.code,
                 err.message
