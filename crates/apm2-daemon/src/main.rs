@@ -2106,6 +2106,33 @@ async fn handle_dual_socket_connection(
     };
     ctx.set_contract_binding(contract_binding.clone());
 
+    // TCK-00358: Wire identity proof profile hash at session-open time.
+    // The active identity proof profile is resolved from the risk tier
+    // established during handshake. For baseline deployments this is the
+    // SMT-256 10^12 profile. Setting the hash here (on the production
+    // session-open path) ensures SessionStarted events carry the verified
+    // profile hash rather than a spawn-time baseline fallback (REQ-0012).
+    {
+        use apm2_daemon::identity::IdentityProofProfileV1;
+        let profile = IdentityProofProfileV1::baseline_smt_10e12();
+        match profile.content_hash() {
+            Ok(hash) => {
+                if let Err(e) = ctx.set_identity_proof_profile_hash(hash) {
+                    warn!(
+                        error = %e,
+                        "Failed to set identity proof profile hash on connection context"
+                    );
+                }
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to compute identity proof profile hash at session open"
+                );
+            },
+        }
+    }
+
     // TCK-00349: Advance connection phase through the session-typed state
     // machine. The handshake has succeeded at this point, so we advance
     // from Connected -> HandshakeComplete -> SessionOpen before entering

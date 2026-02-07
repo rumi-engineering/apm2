@@ -3309,11 +3309,12 @@ impl ConnectionContext {
 
     /// Sets the active identity proof profile hash for this connection.
     ///
-    /// Called from the production session-open path when an identity proof
-    /// profile is resolved (e.g. via handshake or explicit CAS dereference).
-    /// Also used by test code to inject specific profile hashes for
-    /// verification. The production spawn path falls back to the baseline
-    /// SMT-256 10^12 profile hash when no context-bound value is set.
+    /// Called from the production session-open path in `main.rs` when
+    /// the active identity proof profile is resolved after handshake
+    /// (TCK-00358). Also used by test code to inject specific profile
+    /// hashes for verification. The spawn path emits a warning and
+    /// falls back to the baseline SMT-256 10^12 profile hash if this
+    /// method was not called at session-open time.
     pub fn set_identity_proof_profile_hash(
         &mut self,
         profile_hash: [u8; 32],
@@ -7135,17 +7136,26 @@ impl PrivilegedDispatcher {
         let actor_id = derive_actor_id(peer_creds);
 
         // TCK-00358: Resolve identity proof profile hash for SessionStarted.
-        // Prefer any context-bound value (set during handshake/session-open),
-        // falling back to the baseline SMT-256 10^12 profile hash. This
-        // ensures production sessions always include the field in the audit
-        // trail per REQ-0012. If the baseline hash computation fails we
-        // fall through to None (fail-closed: no hash rather than a wrong one).
+        // Primary path: the session-open handler in main.rs sets the profile
+        // hash on the ConnectionContext during identity materialization.
+        // Defensive fallback: if no context-bound value is set (e.g. direct
+        // test usage without session-open wiring), fall back to the baseline
+        // SMT-256 10^12 profile hash and log a warning. This ensures audit
+        // trail always includes the field per REQ-0012 while alerting
+        // operators to a missing production wiring.
         let identity_proof_profile_hash: Option<[u8; 32]> =
-            ctx.identity_proof_profile_hash().copied().or_else(|| {
-                crate::identity::IdentityProofProfileV1::baseline_smt_10e12()
-                    .content_hash()
-                    .ok()
-            });
+            ctx.identity_proof_profile_hash().copied().map_or_else(
+                || {
+                    warn!(
+                        "identity_proof_profile_hash not set on ConnectionContext at spawn time; \
+                         falling back to baseline profile hash (session-open wiring may be missing)"
+                    );
+                    crate::identity::IdentityProofProfileV1::baseline_smt_10e12()
+                        .content_hash()
+                        .ok()
+                },
+                Some,
+            );
 
         // TCK-00395: Emit SessionStarted + WorkTransitioned(Claimed->InProgress)
         // atomically via emit_spawn_lifecycle. Both events are persisted as a
@@ -18368,6 +18378,94 @@ mod tests {
                 payload["identity_proof_profile_hash"],
                 hex::encode(expected_hash),
                 "production spawn must emit baseline identity_proof_profile_hash"
+            );
+        }
+
+        /// TCK-00358 Round 2: Verify that the production session-open path
+        /// wires the identity proof profile hash into `ConnectionContext` and
+        /// that `SessionStarted` carries that hash rather than the spawn-time
+        /// baseline fallback.
+        ///
+        /// This test uses a **non-baseline** profile hash to prove the value
+        /// flows from the session-open wiring
+        /// (`set_identity_proof_profile_hash`) rather than the
+        /// spawn-time fallback to `baseline_smt_10e12()`.
+        #[test]
+        fn test_session_open_wired_profile_hash_overrides_spawn_fallback() {
+            let (dispatcher, cas, mut ctx) = dispatcher_with_cas();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            // Construct a non-baseline profile by tweaking max_proof_bytes.
+            // This produces a distinct hash from the baseline profile,
+            // proving the emitted hash comes from session-open wiring.
+            let mut custom_profile = crate::identity::IdentityProofProfileV1::baseline_smt_10e12();
+            custom_profile.max_proof_bytes = 4096; // differs from baseline 8192
+            let custom_hash = custom_profile
+                .content_hash()
+                .expect("custom profile hash should compute");
+
+            // Sanity check: the custom hash differs from the baseline.
+            let baseline_hash = crate::identity::IdentityProofProfileV1::baseline_smt_10e12()
+                .content_hash()
+                .expect("baseline hash should compute");
+            assert_ne!(
+                custom_hash, baseline_hash,
+                "precondition: custom profile hash must differ from baseline"
+            );
+
+            // Simulate the production session-open wiring in main.rs:
+            // set_identity_proof_profile_hash is called after handshake,
+            // before entering the dispatch loop.
+            ctx.set_identity_proof_profile_hash(custom_hash)
+                .expect("non-zero custom hash should be accepted");
+
+            let adapter_hash = builtin_profiles::claude_code_profile()
+                .store_in_cas(cas.as_ref())
+                .expect("builtin profile should store in CAS");
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: Some(adapter_hash.to_vec()),
+                max_episodes: None,
+                escalation_predicate: None,
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            assert!(
+                matches!(response, PrivilegedResponse::SpawnEpisode(_)),
+                "expected spawn success with session-open wired profile hash"
+            );
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let session_started: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "session_started")
+                .collect();
+            assert_eq!(
+                session_started.len(),
+                1,
+                "expected one SessionStarted event"
+            );
+
+            let payload: serde_json::Value =
+                serde_json::from_slice(&session_started[0].payload).expect("valid JSON payload");
+
+            // The emitted hash must be the custom (non-baseline) hash set
+            // at session-open time, NOT the baseline fallback.
+            assert_eq!(
+                payload["identity_proof_profile_hash"],
+                hex::encode(custom_hash),
+                "SessionStarted must carry the session-open wired profile hash, \
+                 not the spawn-time baseline fallback"
+            );
+            assert_ne!(
+                payload["identity_proof_profile_hash"],
+                hex::encode(baseline_hash),
+                "SessionStarted must NOT carry the baseline fallback hash \
+                 when session-open wiring provides a different profile"
             );
         }
     }
