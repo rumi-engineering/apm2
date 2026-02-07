@@ -128,6 +128,23 @@ pub enum LedgerError {
         /// Human-readable mismatch details.
         details: String,
     },
+
+    /// Write operation rejected because the ledger is in legacy compatibility
+    /// mode.
+    ///
+    /// When the ledger is opened against a daemon-owned `ledger_events` table
+    /// (i.e., `LedgerReadMode::LegacyLedgerEvents`), all canonical write APIs
+    /// are blocked to prevent split-brain read/write semantics. The legacy
+    /// compatibility view lacks hash-chain material (`event_hash` and
+    /// `prev_hash` are always NULL), so cryptographic append operations would
+    /// chain from genesis regardless of pre-existing history, violating
+    /// hash-chain continuity.
+    ///
+    /// To write events, first perform a canonical unification migration that
+    /// copies legacy rows into the `events` table with proper hash-chain
+    /// linking.
+    #[error("ledger is in legacy compatibility mode and is read-only")]
+    LegacyModeReadOnly,
 }
 
 /// Current record version for the event schema.
@@ -610,14 +627,37 @@ impl SqliteLedgerBackend {
         Ok(())
     }
 
+    /// Fail-closed guard: rejects all write operations in legacy compatibility
+    /// mode.
+    ///
+    /// When the ledger reads from the daemon-owned `ledger_events` table via
+    /// the compatibility view, all canonical write APIs MUST be blocked
+    /// because:
+    ///
+    /// 1. Writes go to the canonical `events` table, but reads come from
+    ///    `ledger_events` — creating split-brain read/write semantics.
+    /// 2. The compatibility view projects `event_hash` and `prev_hash` as NULL,
+    ///    so `last_event_hash()` always returns the genesis hash. Any
+    ///    cryptographic append (`append_signed`, `append_verified`) would chain
+    ///    from genesis regardless of pre-existing legacy history, breaking
+    ///    hash-chain continuity.
+    fn ensure_writable(&self) -> Result<(), LedgerError> {
+        if self.read_mode == LedgerReadMode::LegacyLedgerEvents {
+            return Err(LedgerError::LegacyModeReadOnly);
+        }
+        Ok(())
+    }
+
     /// Appends an event to the ledger.
     ///
     /// Returns the assigned sequence ID for the event.
     ///
     /// # Errors
     ///
-    /// Returns an error if the event cannot be inserted.
+    /// Returns [`LedgerError::LegacyModeReadOnly`] if the ledger is in legacy
+    /// compatibility mode, or a database error if the event cannot be inserted.
     pub fn append(&self, event: &EventRecord) -> Result<u64, LedgerError> {
+        self.ensure_writable()?;
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
@@ -653,9 +693,11 @@ impl SqliteLedgerBackend {
     ///
     /// # Errors
     ///
-    /// Returns an error if any event cannot be inserted. On error,
-    /// no events are inserted (atomic operation).
+    /// Returns [`LedgerError::LegacyModeReadOnly`] if the ledger is in legacy
+    /// compatibility mode, or a database error if any event cannot be inserted.
+    /// On error, no events are inserted (atomic operation).
     pub fn append_batch(&self, events: &[EventRecord]) -> Result<Vec<u64>, LedgerError> {
+        self.ensure_writable()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -1075,8 +1117,13 @@ impl SqliteLedgerBackend {
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails.
+    /// Returns [`LedgerError::LegacyModeReadOnly`] if the ledger is in legacy
+    /// compatibility mode (the compatibility view always projects
+    /// `event_hash` as NULL, so the returned hash would be unsound).
+    ///
+    /// Returns a database error if the query fails.
     pub fn last_event_hash(&self) -> Result<Vec<u8>, LedgerError> {
+        self.ensure_writable()?;
         let conn = self.conn.lock().unwrap();
 
         let result: Option<Option<Vec<u8>>> = match self.read_mode {
@@ -1133,6 +1180,8 @@ impl SqliteLedgerBackend {
         F: FnOnce(&[u8], &[u8]) -> Vec<u8>,
         S: FnOnce(&[u8]) -> Vec<u8>,
     {
+        self.ensure_writable()?;
+
         // Get the previous event's hash
         let prev_hash = self.last_event_hash()?;
 
@@ -1247,6 +1296,8 @@ impl SqliteLedgerBackend {
         event: &EventRecord,
         verifying_key: &crate::crypto::VerifyingKey,
     ) -> Result<u64, LedgerError> {
+        self.ensure_writable()?;
+
         // DoS protection: reject oversized payloads
         if event.payload.len() > Self::MAX_VERIFIED_PAYLOAD_SIZE {
             return Err(LedgerError::SignatureInvalid {

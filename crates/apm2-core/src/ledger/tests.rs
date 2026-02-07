@@ -1487,3 +1487,167 @@ fn tck_00265_chain_integrity_violation_detected() {
         "Expected ChainIntegrityViolation, got {result:?}"
     );
 }
+
+// =============================================================================
+// TCK-00398: Legacy-mode write rejection (fail-closed)
+//
+// Security review BLOCKERs:
+// 1. Fail-closed invariant bypassable after initialization — write paths always
+//    append to canonical `events`, creating split truth in legacy mode.
+// 2. Hash-chain continuity unsound in legacy mode — `last_event_hash` reads
+//    from the compat view where `event_hash` is always NULL, returning genesis
+//    hash.
+//
+// Quality review MAJOR: same root cause as BLOCKER #1.
+//
+// Fix: All write APIs and `last_event_hash` return `LegacyModeReadOnly` when
+// `read_mode == LegacyLedgerEvents`.
+// =============================================================================
+
+/// Helper: create a legacy-only ledger on disk and open it.
+fn open_legacy_only_ledger() -> (Ledger, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("legacy_write_guard.db");
+
+    // Seed a legacy `ledger_events` table with at least one row so the
+    // ledger opens in `LegacyLedgerEvents` mode.
+    {
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_ledger_events_table(&conn);
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "EVT-legacy-1",
+                "work_claimed",
+                "work-1",
+                "actor-1",
+                br#"{"work_id":"work-1"}"#,
+                vec![0xAA_u8],
+                100_u64
+            ],
+        )
+        .unwrap();
+    }
+
+    let ledger = Ledger::open(&path).expect("open legacy ledger");
+    (ledger, dir)
+}
+
+/// `append` must be rejected in legacy compatibility mode.
+#[test]
+fn tck_00398_legacy_mode_append_rejected() {
+    let (ledger, _dir) = open_legacy_only_ledger();
+
+    let event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+    let result = ledger.append(&event);
+
+    assert!(
+        matches!(result, Err(LedgerError::LegacyModeReadOnly)),
+        "append must fail closed in legacy mode, got {result:?}"
+    );
+}
+
+/// `append_batch` must be rejected in legacy compatibility mode.
+#[test]
+fn tck_00398_legacy_mode_append_batch_rejected() {
+    let (ledger, _dir) = open_legacy_only_ledger();
+
+    let events = vec![
+        EventRecord::new("batch.1", "session-1", "actor-1", b"first".to_vec()),
+        EventRecord::new("batch.2", "session-1", "actor-1", b"second".to_vec()),
+    ];
+    let result = ledger.append_batch(&events);
+
+    assert!(
+        matches!(result, Err(LedgerError::LegacyModeReadOnly)),
+        "append_batch must fail closed in legacy mode, got {result:?}"
+    );
+}
+
+/// `append_signed` must be rejected in legacy compatibility mode.
+#[test]
+fn tck_00398_legacy_mode_append_signed_rejected() {
+    let (ledger, _dir) = open_legacy_only_ledger();
+
+    let event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+    let result = ledger.append_signed(event, |p, h| [p, h].concat(), <[u8]>::to_vec);
+
+    assert!(
+        matches!(result, Err(LedgerError::LegacyModeReadOnly)),
+        "append_signed must fail closed in legacy mode, got {result:?}"
+    );
+}
+
+/// `append_verified` must be rejected in legacy compatibility mode.
+#[test]
+fn tck_00398_legacy_mode_append_verified_rejected() {
+    use crate::crypto::Signer;
+
+    let (ledger, _dir) = open_legacy_only_ledger();
+    let signer = Signer::generate();
+
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+    let payload = b"payload".to_vec();
+
+    let signature =
+        crate::fac::sign_with_domain(&signer, crate::events::TOOL_DECIDED_DOMAIN_PREFIX, &payload);
+
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    event.prev_hash = Some(vec![0u8; 32]);
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(
+        matches!(result, Err(LedgerError::LegacyModeReadOnly)),
+        "append_verified must fail closed in legacy mode, got {result:?}"
+    );
+}
+
+/// `last_event_hash` must be rejected in legacy compatibility mode because
+/// the compatibility view always returns NULL for `event_hash`, making the
+/// returned hash unsound (always genesis).
+#[test]
+fn tck_00398_legacy_mode_last_event_hash_rejected() {
+    let (ledger, _dir) = open_legacy_only_ledger();
+
+    let result = ledger.last_event_hash();
+
+    assert!(
+        matches!(result, Err(LedgerError::LegacyModeReadOnly)),
+        "last_event_hash must fail closed in legacy mode, got {result:?}"
+    );
+}
+
+/// Read operations must still succeed in legacy compatibility mode.
+/// Only writes are blocked.
+#[test]
+fn tck_00398_legacy_mode_reads_still_work() {
+    let (ledger, _dir) = open_legacy_only_ledger();
+
+    // read_from should succeed
+    let events = ledger.read_from(1, 10).unwrap();
+    assert_eq!(events.len(), 1, "should read legacy events");
+    assert_eq!(events[0].event_type, "work_claimed");
+
+    // read_one should succeed
+    let event = ledger.read_one(1).unwrap();
+    assert_eq!(event.event_type, "work_claimed");
+
+    // read_session should succeed
+    let by_session = ledger.read_session("work-1", 10).unwrap();
+    assert_eq!(by_session.len(), 1);
+
+    // read_by_type should succeed
+    let by_type = ledger.read_by_type("work_claimed", 1, 10).unwrap();
+    assert_eq!(by_type.len(), 1);
+
+    // head_sync should succeed
+    let head = ledger.head_sync().unwrap();
+    assert_eq!(head, 1);
+
+    // stats should succeed
+    let stats = ledger.stats().unwrap();
+    assert_eq!(stats.event_count, 1);
+}
