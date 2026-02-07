@@ -406,6 +406,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+        identity_proof_profile_hash: Option<&[u8; 32]>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Domain prefix for session events (must be at function start per clippy)
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
@@ -421,6 +422,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             adapter_profile_hash,
             role_spec_hash,
             contract_binding,
+            identity_proof_profile_hash,
         );
 
         // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
@@ -1532,6 +1534,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
+        identity_proof_profile_hash: Option<&[u8; 32]>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
 
@@ -1558,6 +1561,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             adapter_profile_hash,
             role_spec_hash,
             contract_binding,
+            identity_proof_profile_hash,
         );
         let session_payload_json = session_payload.to_string();
         let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
@@ -2371,6 +2375,7 @@ mod tests {
                 None,
                 ts,
                 None,
+                None,
             )
             .unwrap();
 
@@ -2552,6 +2557,7 @@ mod tests {
             None,
             2_000_000_000,
             None,
+            None,
         );
         assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
 
@@ -2650,6 +2656,7 @@ mod tests {
             None,
             1_000,
             None,
+            None,
         );
         assert!(result.is_ok());
         let events = emitter.get_events_by_work_id("W-ROLLBACK-003");
@@ -2672,6 +2679,7 @@ mod tests {
             &[0xAA; 32],
             None,
             2_000,
+            None,
             None,
         );
         assert!(result2.is_err(), "Should fail when table is dropped");
@@ -2820,6 +2828,7 @@ mod tests {
             None,
             1_000_000_000,
             Some(&binding),
+            None,
         );
         assert!(result.is_ok(), "emit_session_started should succeed");
 
@@ -2892,6 +2901,7 @@ mod tests {
             None,
             2_000_000_000,
             Some(&binding),
+            None,
         );
         assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
 
