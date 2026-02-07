@@ -1342,12 +1342,43 @@ impl EpisodeRuntime {
             "agent process spawned via adapter"
         );
 
-        // Store the harness handle in the episode entry
+        // BLOCKER fix: Re-validate episode state after the spawn await.
+        // If stop()/quarantine() won the race during spawn, the episode is
+        // already terminal.  Terminate the just-spawned process immediately
+        // to prevent orphaned processes surviving past terminal transition.
         {
             let mut episodes = self.episodes.write().await;
-            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
-                entry.harness_handle = Some(handle);
+            let entry =
+                episodes
+                    .get_mut(episode_id.as_str())
+                    .ok_or_else(|| EpisodeError::NotFound {
+                        id: episode_id.as_str().to_string(),
+                    })?;
+            if !matches!(entry.state, EpisodeState::Running { .. }) {
+                warn!(
+                    episode_id = %episode_id,
+                    state = entry.state.state_name(),
+                    "episode transitioned to non-Running during spawn; \
+                     terminating orphaned adapter process"
+                );
+                // Drop the write lock before async terminate to avoid
+                // holding it across await.
+                drop(episodes);
+                if let Err(e) = adapter.terminate(&handle).await {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "failed to terminate orphaned adapter process"
+                    );
+                }
+                return Err(EpisodeError::Internal {
+                    message: format!(
+                        "episode {episode_id} transitioned away from Running \
+                         during adapter spawn"
+                    ),
+                });
             }
+            entry.harness_handle = Some(handle);
         }
 
         // Spawn background bridge task to consume the event stream.

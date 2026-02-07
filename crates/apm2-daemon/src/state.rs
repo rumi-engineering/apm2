@@ -750,10 +750,16 @@ impl DispatcherState {
             // call mark_terminated() in production.
             .with_session_registry(session_registry_for_runtime);
 
-        // TCK-00399: Create adapter registry with default adapters for
-        // spawning agent CLI processes. Shared between EpisodeRuntime
-        // (lifecycle management) and PrivilegedDispatcher (spawn initiation).
-        let adapter_registry = Arc::new(crate::episode::AdapterRegistry::with_defaults());
+        // TCK-00399: Create adapter registry with explicit adapter registrations.
+        // MAJOR fix: Use explicit new() + register() instead of deprecated
+        // with_defaults() to avoid ambient defaults (DoD requires
+        // profile-explicit production path).
+        let mut adapter_registry = crate::episode::AdapterRegistry::new();
+        adapter_registry.register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
+        adapter_registry.register(Box::new(
+            crate::episode::claude_code::ClaudeCodeAdapter::new(),
+        ));
+        let adapter_registry = Arc::new(adapter_registry);
         let episode_runtime = episode_runtime.with_adapter_registry(Arc::clone(&adapter_registry));
 
         let episode_runtime = Arc::new(episode_runtime);

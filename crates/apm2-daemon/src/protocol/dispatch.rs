@@ -45,7 +45,7 @@ use bytes::Bytes;
 use prost::Message;
 use secrecy::SecretString;
 use subtle::ConstantTimeEq;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::credentials::PeerCredentials;
 use super::error::{ProtocolError, ProtocolResult};
@@ -4623,11 +4623,11 @@ impl Default for PrivilegedDispatcher {
     }
 }
 
-/// Default session token TTL (1 hour).
+/// Default session token TTL (5 minutes).
 ///
-/// Per RFC-0017, session tokens should have a reasonable TTL that matches
-/// lease expiration. 1 hour is a sensible default for development.
-pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 3600;
+/// Per WVR-0002, env-only bootstrap tokens MUST have a TTL <= 300 seconds.
+/// This was previously 3600s (1 hour) which violated the waiver constraint.
+pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 300;
 
 /// Stop-condition policy floor for untrusted `SpawnEpisode` inputs.
 ///
@@ -7228,11 +7228,20 @@ impl PrivilegedDispatcher {
                 )
                 .map_err(|e| format!("adapter profile load failed: {e}"))?;
 
+                // SECURITY: Fail-closed adapter mode mapping.  Unknown or
+                // unsupported modes MUST be denied, not silently downgraded
+                // to Raw (MAJOR: fail-open fix).
                 let adapter_type = match profile.adapter_mode {
                     apm2_core::fac::AdapterMode::StructuredOutput => {
                         crate::episode::AdapterType::ClaudeCode
                     },
-                    _ => crate::episode::AdapterType::Raw,
+                    apm2_core::fac::AdapterMode::BlackBox => crate::episode::AdapterType::Raw,
+                    unsupported => {
+                        return Err(format!(
+                            "unsupported adapter mode '{unsupported}': \
+                             only BlackBox and StructuredOutput are supported"
+                        ));
+                    },
                 };
 
                 let adapter = registry.get(adapter_type).ok_or_else(|| {
@@ -7265,14 +7274,32 @@ impl PrivilegedDispatcher {
             })();
 
             if let Err(e) = spawn_result {
-                // Log but do NOT fail SpawnEpisode. The episode is valid
-                // and running -- operator can retry or start process
-                // externally. This matches gradual rollout strategy.
-                warn!(
+                // MAJOR fix: Fail-closed on spawn errors.  A successful
+                // SpawnEpisode response with no agent process is a silent
+                // failure.  Roll back the episode and return an error.
+                error!(
                     episode_id = %episode_id,
                     error = %e,
-                    "adapter process spawn failed (episode remains running)"
+                    "adapter process spawn failed; rolling back episode"
                 );
+                let rollback_warn = self.rollback_spawn_with_episode_stop(
+                    Some(episode_id),
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    &evicted_stop_conditions,
+                    timestamp_ns,
+                    "adapter spawn failure",
+                );
+                let msg = rollback_warn.map_or_else(
+                    || format!("adapter spawn failed: {e}"),
+                    |rw| format!("adapter spawn failed: {e} (rollback partial failure: {rw})"),
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
             }
         }
 

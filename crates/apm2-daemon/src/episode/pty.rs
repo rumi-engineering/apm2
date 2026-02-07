@@ -259,7 +259,7 @@ impl ExitStatus {
 /// - `read_buffer_size`: max 64KB
 /// - `ring_buffer_capacity`: max 4096
 /// - `channel_capacity`: max 8192
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PtyConfig {
     /// Initial window size (cols, rows).
     window_size: (u16, u16),
@@ -269,6 +269,13 @@ pub struct PtyConfig {
     channel_capacity: usize,
     /// Read buffer size.
     read_buffer_size: usize,
+    /// Working directory for the child process (security-critical: prevents
+    /// inheriting the daemon's cwd).
+    cwd: Option<std::path::PathBuf>,
+    /// Environment variables for the child process.  When non-empty the child
+    /// environment is set **exactly** to these entries (no ambient
+    /// inheritance).
+    env: Vec<(CString, CString)>,
 }
 
 impl Default for PtyConfig {
@@ -278,6 +285,8 @@ impl Default for PtyConfig {
             ring_buffer_capacity: 1024,
             channel_capacity: OUTPUT_CHANNEL_CAPACITY,
             read_buffer_size: READ_BUFFER_SIZE,
+            cwd: None,
+            env: Vec::new(),
         }
     }
 }
@@ -335,6 +344,8 @@ impl PtyConfig {
             ring_buffer_capacity,
             channel_capacity,
             read_buffer_size,
+            cwd: None,
+            env: Vec::new(),
         })
     }
 
@@ -413,6 +424,42 @@ impl PtyConfig {
         };
         self
     }
+
+    /// Sets the working directory for the child process.
+    ///
+    /// # Security
+    ///
+    /// When set, the child process uses `chdir` before `execvp` instead of
+    /// inheriting the daemon's working directory.
+    #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Sets the environment for the child process (replaces ambient env).
+    ///
+    /// # Security
+    ///
+    /// When non-empty, the child environment is set to exactly these entries
+    /// via `clearenv` + `setenv`, preventing daemon env leakage.
+    #[must_use]
+    pub fn with_env(mut self, env: Vec<(CString, CString)>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Returns the configured working directory, if any.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
+    }
+
+    /// Returns the configured environment entries.
+    #[must_use]
+    pub fn env_entries(&self) -> &[(CString, CString)] {
+        &self.env
+    }
 }
 
 /// PTY runner for managing a child process with PTY I/O.
@@ -466,6 +513,7 @@ impl PtyRunner {
     ///
     /// This function uses `unsafe` for the fork/exec sequence. The child
     /// process performs minimal operations before exec to minimize risk.
+    #[allow(clippy::needless_pass_by_value)] // config is consumed across fork
     pub fn spawn<P, S>(
         program: P,
         args: &[S],
@@ -570,6 +618,42 @@ impl PtyRunner {
                 // Close the original slave fd if it's not one of 0, 1, 2
                 if slave_fd > libc::STDERR_FILENO {
                     let _ = close(slave_fd);
+                }
+
+                // SECURITY: Apply HarnessConfig cwd before exec to prevent
+                // child from inheriting daemon's working directory.
+                // SAFETY: chdir is safe in the child post-fork.
+                if let Some(ref cwd) = config.cwd {
+                    // SAFETY: _exit is safe to call from the child process
+                    #[allow(clippy::manual_let_else, clippy::option_if_let_else)]
+                    let cwd_cstr = match CString::new(cwd.as_os_str().as_bytes()) {
+                        Ok(c) => c,
+                        Err(_) => unsafe { libc::_exit(1) },
+                    };
+                    // SAFETY: chdir with a valid CString is safe.
+                    unsafe {
+                        if libc::chdir(cwd_cstr.as_ptr()) != 0 {
+                            libc::_exit(1);
+                        }
+                    }
+                }
+
+                // SECURITY: Apply HarnessConfig env before exec to prevent
+                // child from inheriting daemon's environment variables.
+                // SAFETY: clearenv/setenv are safe in the child post-fork
+                // (single-threaded context after fork).
+                if !config.env.is_empty() {
+                    // SAFETY: clearenv is safe in the post-fork child
+                    // (single-threaded).
+                    unsafe {
+                        libc::clearenv();
+                    }
+                    for (key, value) in &config.env {
+                        // SAFETY: setenv with valid CStrings is safe.
+                        unsafe {
+                            libc::setenv(key.as_ptr(), value.as_ptr(), 1);
+                        }
+                    }
                 }
 
                 // Execute the program
