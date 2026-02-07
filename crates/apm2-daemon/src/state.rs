@@ -1590,6 +1590,7 @@ mod tests {
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
             workspace_root,
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -1721,6 +1722,7 @@ mod tests {
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
             workspace_root,
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };

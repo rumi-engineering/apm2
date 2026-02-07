@@ -342,6 +342,11 @@ pub struct SpawnEpisodeRequest {
     /// Non-empty string triggers EscalationTriggered stop denial.
     #[prost(string, optional, tag = "6")]
     pub escalation_predicate: ::core::option::Option<::prost::alloc::string::String>,
+    /// TCK-00397: Optional adapter profile hash for explicit adapter binding.
+    /// Must be a 32-byte BLAKE3 digest and must resolve in CAS (fail-closed).
+    /// Tag 8 chosen to avoid renumbering existing fields (wire stability).
+    #[prost(bytes = "vec", optional, tag = "8")]
+    pub adapter_profile_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SpawnEpisodeResponse {

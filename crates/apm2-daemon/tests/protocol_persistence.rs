@@ -108,6 +108,7 @@ async fn test_persistence_end_to_end() {
         role: WorkRole::GateExecutor.into(),
         lease_id: Some(lease_id),
         workspace_root: "/tmp".to_string(),
+        adapter_profile_hash: None,
         max_episodes: None,
         escalation_predicate: None,
     };
@@ -150,6 +151,7 @@ async fn test_persistence_end_to_end() {
         role: WorkRole::Implementer.into(),
         lease_id: Some(lease_id_impl),
         workspace_root: "/tmp".to_string(),
+        adapter_profile_hash: None,
         max_episodes: None,
         escalation_predicate: None,
     };

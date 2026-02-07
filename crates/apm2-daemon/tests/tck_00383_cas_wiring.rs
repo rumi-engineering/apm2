@@ -455,6 +455,7 @@ fn spawn_session_and_get_token(dispatcher_state: &DispatcherState) -> String {
         role: WorkRole::Implementer.into(),
         lease_id: Some(lease_id),
         workspace_root: "/tmp".to_string(),
+        adapter_profile_hash: None,
         max_episodes: None,
         escalation_predicate: None,
     };

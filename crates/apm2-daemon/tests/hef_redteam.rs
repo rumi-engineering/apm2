@@ -771,6 +771,7 @@ async fn test_out_of_order_spawn_rejected() {
         role: WorkRole::Implementer.into(),
         lease_id: None,
         workspace_root: "/tmp".to_string(),
+        adapter_profile_hash: None,
         max_episodes: None,
         escalation_predicate: None,
     };

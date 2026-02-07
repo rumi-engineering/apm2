@@ -489,18 +489,21 @@ impl OperatorClient {
     ///   `GateLeaseIssued`
     /// * `workspace_root` - Workspace root directory for this episode. All file
     ///   operations will be confined to this directory (TCK-00319).
+    /// * `adapter_profile_hash` - Optional adapter profile CAS hash (32 bytes)
     pub async fn spawn_episode(
         &mut self,
         work_id: &str,
         role: WorkRole,
         lease_id: Option<&str>,
         workspace_root: &str,
+        adapter_profile_hash: Option<&[u8]>,
     ) -> Result<SpawnEpisodeResponse, ProtocolClientError> {
         let request = SpawnEpisodeRequest {
             work_id: work_id.to_string(),
             role: role.into(),
             lease_id: lease_id.map(String::from),
             workspace_root: workspace_root.to_string(),
+            adapter_profile_hash: adapter_profile_hash.map(<[u8]>::to_vec),
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -2693,6 +2696,7 @@ mod tests {
             role: WorkRole::Implementer.into(),
             lease_id: Some("lease-456".to_string()),
             workspace_root: "/tmp".to_string(),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };

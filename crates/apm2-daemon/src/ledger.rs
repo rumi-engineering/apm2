@@ -28,6 +28,7 @@ use crate::protocol::dispatch::{
     LedgerEventError, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
     STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
     WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
+    build_session_started_payload,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -401,6 +402,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         work_id: &str,
         lease_id: &str,
         actor_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
@@ -410,39 +413,15 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build payload as JSON.
-        // TCK-00348: Include contract binding fields when available.
-        let mut payload = serde_json::json!({
-            "event_type": "session_started",
-            "session_id": session_id,
-            "work_id": work_id,
-            "lease_id": lease_id,
-            "actor_id": actor_id,
-        });
-        if let Some(binding) = contract_binding {
-            let obj = payload.as_object_mut().expect("payload is object");
-            obj.insert(
-                "cli_contract_hash".to_string(),
-                serde_json::Value::String(binding.cli_contract_hash.clone()),
-            );
-            obj.insert(
-                "server_contract_hash".to_string(),
-                serde_json::Value::String(binding.server_contract_hash.clone()),
-            );
-            obj.insert(
-                "mismatch_waived".to_string(),
-                serde_json::Value::Bool(binding.mismatch_waived),
-            );
-            obj.insert(
-                "risk_tier".to_string(),
-                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
-            );
-            obj.insert(
-                "client_canonicalizers".to_string(),
-                serde_json::to_value(&binding.client_canonicalizers)
-                    .expect("CanonicalizerInfo serializes"),
-            );
-        }
+        let payload = build_session_started_payload(
+            session_id,
+            work_id,
+            lease_id,
+            actor_id,
+            adapter_profile_hash,
+            role_spec_hash,
+            contract_binding,
+        );
 
         // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
         // This ensures deterministic JSON representation per RFC-0016.
@@ -1549,6 +1528,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         work_id: &str,
         lease_id: &str,
         actor_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
@@ -1569,38 +1550,15 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         // --- Event 1: SessionStarted ---
         let session_event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-        // TCK-00348: Include contract binding in SessionStarted payload
-        let mut session_payload = serde_json::json!({
-            "event_type": "session_started",
-            "session_id": session_id,
-            "work_id": work_id,
-            "lease_id": lease_id,
-            "actor_id": actor_id,
-        });
-        if let Some(binding) = contract_binding {
-            let obj = session_payload.as_object_mut().expect("payload is object");
-            obj.insert(
-                "cli_contract_hash".to_string(),
-                serde_json::Value::String(binding.cli_contract_hash.clone()),
-            );
-            obj.insert(
-                "server_contract_hash".to_string(),
-                serde_json::Value::String(binding.server_contract_hash.clone()),
-            );
-            obj.insert(
-                "mismatch_waived".to_string(),
-                serde_json::Value::Bool(binding.mismatch_waived),
-            );
-            obj.insert(
-                "risk_tier".to_string(),
-                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
-            );
-            obj.insert(
-                "client_canonicalizers".to_string(),
-                serde_json::to_value(&binding.client_canonicalizers)
-                    .expect("CanonicalizerInfo serializes"),
-            );
-        }
+        let session_payload = build_session_started_payload(
+            session_id,
+            work_id,
+            lease_id,
+            actor_id,
+            adapter_profile_hash,
+            role_spec_hash,
+            contract_binding,
+        );
         let session_payload_json = session_payload.to_string();
         let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
             let _ = conn.execute("ROLLBACK", []);
@@ -2409,6 +2367,8 @@ mod tests {
                 "W-ORDER-SQL-001",
                 "L-001",
                 "uid:1000",
+                &[0xAA; 32],
+                None,
                 ts,
                 None,
             )
@@ -2588,6 +2548,8 @@ mod tests {
             "W-ATOMIC-SQL-002",
             "L-001",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             2_000_000_000,
             None,
         );
@@ -2684,6 +2646,8 @@ mod tests {
             "W-ROLLBACK-003",
             "L-001",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             1_000,
             None,
         );
@@ -2705,6 +2669,8 @@ mod tests {
             "W-ROLLBACK-004",
             "L-002",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             2_000,
             None,
         );
@@ -2850,6 +2816,8 @@ mod tests {
             "W-CANON-001",
             "L-001",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             1_000_000_000,
             Some(&binding),
         );
@@ -2862,6 +2830,9 @@ mod tests {
         assert_eq!(payload["cli_contract_hash"], "blake3:client_abc");
         assert_eq!(payload["server_contract_hash"], "blake3:server_xyz");
         assert_eq!(payload["mismatch_waived"], true);
+        assert_eq!(payload["adapter_profile_hash"], hex::encode([0xAA; 32]));
+        assert_eq!(payload["waiver_id"], "WVR-0002");
+        assert_eq!(payload["role_spec_hash_absent"], true);
 
         // Verify canonicalizer metadata is present
         let canonicalizers = payload["client_canonicalizers"]
@@ -2917,6 +2888,8 @@ mod tests {
             "W-CANON-002",
             "L-002",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             2_000_000_000,
             Some(&binding),
         );
@@ -2929,6 +2902,9 @@ mod tests {
         assert_eq!(payload["cli_contract_hash"], "blake3:client_def");
         assert_eq!(payload["server_contract_hash"], "blake3:server_ghi");
         assert_eq!(payload["mismatch_waived"], false);
+        assert_eq!(payload["adapter_profile_hash"], hex::encode([0xAA; 32]));
+        assert_eq!(payload["waiver_id"], "WVR-0002");
+        assert_eq!(payload["role_spec_hash_absent"], true);
 
         // Verify canonicalizer metadata is present with both entries
         let canonicalizers = payload["client_canonicalizers"]
