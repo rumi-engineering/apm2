@@ -49,7 +49,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use apm2_core::crypto::{EventHasher, HASH_SIZE, Hash};
 use thiserror::Error;
@@ -75,6 +75,12 @@ const METADATA_DIR: &str = "metadata";
 
 /// File name for total size tracking.
 const TOTAL_SIZE_FILE: &str = "total_size";
+
+/// Monotonic counter for generating unique temp-file suffixes.
+///
+/// Each `store()` call increments this counter so that concurrent writers
+/// targeting the same content hash never collide on the same temp path.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // =============================================================================
 // DurableCasError
@@ -466,11 +472,12 @@ impl DurableCas {
         }
 
         // Write atomically via temp file + rename.
-        // The temp path is deterministic (hash + ".tmp"), so concurrent stores
-        // of the same content hash will collide.  When write or rename fails we
-        // check whether a concurrent winner already placed the final file; if
-        // its content matches, we treat this as a successful dedup.
-        let temp_path = file_path.with_extension("tmp");
+        // The temp path is made unique per call (PID + monotonic counter) so
+        // that concurrent stores of the same content hash never collide on the
+        // same temp file.  The `concurrent_winner_exists` fallback is kept as
+        // belt-and-suspenders defense.
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = file_path.with_extension(format!("tmp.{}.{counter}", std::process::id()));
         if let Err(e) = self.write_file(&temp_path, content) {
             // A concurrent writer may have already completed the full
             // write-then-rename cycle.  If the final file exists with the
@@ -715,7 +722,13 @@ impl DurableCas {
                     })?;
                     let subpath = subentry.path();
 
-                    if subpath.is_file() && subpath.extension().is_none_or(|ext| ext != "tmp") {
+                    // Exclude temp files: old-style ".tmp" extension and
+                    // new-style ".tmp.{pid}.{counter}" multi-segment extension.
+                    let is_temp = subpath
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains(".tmp"));
+                    if subpath.is_file() && !is_temp {
                         let metadata = fs::metadata(&subpath).map_err(|e| {
                             DurableCasError::io(format!("stat {}", subpath.display()), e)
                         })?;
@@ -733,7 +746,8 @@ impl DurableCas {
     /// Persists the current total size to the metadata file.
     fn persist_total_size(&self) -> Result<(), DurableCasError> {
         let size_file = self.metadata_path.join(TOTAL_SIZE_FILE);
-        let temp_file = size_file.with_extension("tmp");
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_file = size_file.with_extension(format!("tmp.{}.{counter}", std::process::id()));
         let size = self.current_total_size.load(Ordering::Relaxed);
 
         fs::write(&temp_file, size.to_string())
