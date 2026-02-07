@@ -1287,17 +1287,14 @@ async fn async_main(args: Args) -> Result<()> {
     {
         let dw_config = &daemon_config.config.daemon.divergence_watchdog;
         if dw_config.enabled {
-            if sqlite_conn.is_none() {
-                // TCK-00408: Fail closed when mandatory persistence dependencies
-                // are missing. The watchdog is a security control; allowing it to
-                // be enabled without its required ledger database would silently
-                // disable divergence detection, violating fail-closed posture.
-                return Err(anyhow::anyhow!(
-                    "divergence_watchdog.enabled=true but no --ledger-db configured. \
-                     Divergence watchdog requires a ledger database. \
-                     Either provide --ledger-db or disable the watchdog."
-                ));
-            } else if dw_config.github_owner.is_empty() || dw_config.github_repo.is_empty() {
+            // TCK-00408: Fail closed when mandatory persistence dependencies
+            // are missing. Validation is in DivergenceWatchdogSection so the
+            // check is testable outside of the binary.
+            dw_config
+                .validate_startup_prerequisites(sqlite_conn.is_some())
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            if dw_config.github_owner.is_empty() || dw_config.github_repo.is_empty() {
                 return Err(anyhow::anyhow!(
                     "divergence_watchdog.enabled=true but github_owner or github_repo \
                      is not configured"
