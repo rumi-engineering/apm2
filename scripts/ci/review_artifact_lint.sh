@@ -56,21 +56,22 @@ echo
 check_dependencies
 
 # Check 1: Review prompts must not contain deprecated direct status-write commands.
-# The ONLY approved path for setting review statuses is:
+# The approved path for setting security review statuses is:
 #   cargo xtask security-review-exec (approve|deny)
-# Any direct `gh api` call to the statuses or check-runs endpoints is deprecated,
-# regardless of whether it references $reviewed_sha or any other variable.
-# Similarly, `gh pr review --approve` bypasses the review gate.
+# Direct `gh api` calls to statuses/check-runs for ai-review/security are deprecated.
+# Note: ai-review/code-quality has no xtask equivalent, so `gh api` writes targeting
+# that context are permitted.
+# Similarly, `gh pr review --approve` bypasses the review gate and is always forbidden.
 log_info "Checking for deprecated direct status-write patterns in review scripts..."
 
-# detect_direct_status_write checks whether a single line contains a direct
-# GitHub status write.  Returns 0 (true) if the line is a violation.
-# A line is a violation if it contains ALL of:
-#   - "gh" and "api" (the gh api command)
-#   - "statuses" OR "check-runs" (the endpoint)
-#   - "POST" (the HTTP method)
-# in ANY order.  Lines that are comments (leading #) are ignored.
-# Also catches: gh pr review --approve
+# detect_direct_status_write checks whether a logical line (continuations joined)
+# contains a forbidden direct GitHub status write.  Returns 0 (true) if the line
+# is a violation.
+# Patterns:
+#   A) gh api + statuses/check-runs + POST targeting ai-review/security
+#   B) gh pr review --approve (always forbidden)
+# Lines targeting ai-review/code-quality via gh api are permitted (no xtask exists).
+# Comment lines (leading #) are ignored.
 detect_direct_status_write() {
     local line="$1"
     # Skip comment lines
@@ -78,33 +79,91 @@ detect_direct_status_write() {
     if [[ "$stripped" == "#"* ]]; then
         return 1
     fi
+    # Pattern C: gh pr review --approve (always forbidden)
+    if [[ "$line" == *"gh"* ]] && [[ "$line" == *"pr"* ]] && [[ "$line" == *"review"* ]] && [[ "$line" == *"--approve"* ]]; then
+        return 0
+    fi
     # Pattern A: gh api + statuses + POST (any order)
     if [[ "$line" == *"gh"* ]] && [[ "$line" == *"api"* ]] && [[ "$line" == *"statuses"* ]] && [[ "$line" == *"POST"* ]]; then
+        # Permit writes targeting ai-review/code-quality (no xtask alternative)
+        if [[ "$line" == *"ai-review/code-quality"* ]]; then
+            return 1
+        fi
         return 0
     fi
     # Pattern B: gh api + check-runs + POST (any order)
     if [[ "$line" == *"gh"* ]] && [[ "$line" == *"api"* ]] && [[ "$line" == *"check-runs"* ]] && [[ "$line" == *"POST"* ]]; then
-        return 0
-    fi
-    # Pattern C: gh pr review --approve
-    if [[ "$line" == *"gh"* ]] && [[ "$line" == *"pr"* ]] && [[ "$line" == *"review"* ]] && [[ "$line" == *"--approve"* ]]; then
+        if [[ "$line" == *"ai-review/code-quality"* ]]; then
+            return 1
+        fi
         return 0
     fi
     return 1
 }
 
+# Also detect cross-category misuse: code-quality prompts must NOT invoke
+# security-review-exec (which writes ai-review/security status).
+detect_cross_category_exec() {
+    local line="$1"
+    local file_basename="$2"
+    local stripped="${line#"${line%%[![:space:]]*}"}"
+    if [[ "$stripped" == "#"* ]]; then
+        return 1
+    fi
+    # CODE_QUALITY prompt must not use security-review-exec
+    if [[ "$file_basename" == *"CODE_QUALITY"* ]] && [[ "$line" == *"security-review-exec"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# join_continuations: read a file and join backslash-continuation lines into
+# single logical lines, emitting "original_line_number<TAB>joined_line" for
+# each logical line (line_number is where the logical line starts).
+join_continuations() {
+    local file="$1"
+    local accum=""
+    local start_num=0
+    local num=0
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        num=$((num + 1))
+        if [[ -z "$accum" ]]; then
+            start_num=$num
+        fi
+        # Check for trailing backslash (continuation)
+        if [[ "$raw" == *'\' ]]; then
+            # Strip trailing backslash and accumulate
+            accum="${accum}${raw%\\} "
+        else
+            accum="${accum}${raw}"
+            printf '%d\t%s\n' "$start_num" "$accum"
+            accum=""
+        fi
+    done < "$file"
+    # Flush any remaining accumulation (file ending with backslash)
+    if [[ -n "$accum" ]]; then
+        printf '%d\t%s\n' "$start_num" "$accum"
+    fi
+}
+
 # Scan every file in the review directory for direct status writes.
 while IFS= read -r review_file; do
-    line_num=0
-    while IFS= read -r line; do
-        line_num=$((line_num + 1))
-        if detect_direct_status_write "$line"; then
+    file_basename="$(basename "$review_file")"
+    # Process with continuation-joining so multiline commands are caught
+    while IFS=$'\t' read -r line_num logical_line; do
+        if detect_direct_status_write "$logical_line"; then
             log_error "Deprecated direct status-write bypassing review gate:"
-            log_error "  ${review_file}:${line_num}: ${line}"
+            log_error "  ${review_file}:${line_num}: ${logical_line}"
             log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
             VIOLATIONS=1
         fi
-    done < "$review_file"
+        if detect_cross_category_exec "$logical_line" "$file_basename"; then
+            log_error "Cross-category executor misuse:"
+            log_error "  ${review_file}:${line_num}: ${logical_line}"
+            log_error "  CODE_QUALITY prompt must not invoke security-review-exec (writes ai-review/security context)."
+            VIOLATIONS=1
+        fi
+    done < <(join_continuations "$review_file")
 done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
 
 # Check 2: Review prompt metadata templates must require head_sha and pr_number binding.

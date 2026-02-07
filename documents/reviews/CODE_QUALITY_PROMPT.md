@@ -287,12 +287,22 @@ decision_tree:
           content: "$MACHINE_READABLE_METADATA_BLOCK"
         - id: POST_AND_UPDATE
           action: command
+          note: |
+            code-quality sets its own category status via gh api because
+            the xtask review-exec command is security-category only
+            (it hardcodes the ai-review/security context).
           run: |
             gh pr comment $PR_URL --body-file quality_findings.md
             if [ "$VERDICT_STATE" == "success" ]; then
-              cargo xtask security-review-exec approve $ticket_id
+              gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" \
+                -f state="success" \
+                -f context="ai-review/code-quality" \
+                -f description="Code quality review passed"
             else
-              cat quality_findings.md | cargo xtask security-review-exec deny $ticket_id --reason -
+              gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" \
+                -f state="failure" \
+                -f context="ai-review/code-quality" \
+                -f description="Code quality review found issues - see PR comments"
             fi
             rm quality_findings.md
         - id: TERMINATE
