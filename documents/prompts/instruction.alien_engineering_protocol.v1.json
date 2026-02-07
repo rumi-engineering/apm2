@@ -28,7 +28,7 @@
     "pb": "Some initial guidance is distributed across theory, strategy, and RFC artifacts but you are encouraged to use your best judgement to reinvent anything that exists that no longer serves us, and to lean on our existing technology to invent something new. This protocol prioritizes concept weaving, causal theory synthesis, and falsifiable hypothesis generation so outputs stay open-ended, novelty-seeking, and evidence-aware.",
     "t": {
       "sys": "APM2",
-      "repo": "/home/ubuntu/Projects/apm2-feb6-doc-updates",
+      "repo": "{repo_root}",
       "scope": [
         "documents/theory",
         "documents/strategy",

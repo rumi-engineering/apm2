@@ -1,5 +1,5 @@
 waiver:
-  id: WVR-0001
+  id: WVR-0101
   title: "Transitional governance freshness bypass"
   description: |
     Permits transitional governance mode to bypass stop-uncertainty

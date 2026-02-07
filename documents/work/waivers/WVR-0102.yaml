@@ -1,5 +1,5 @@
 waiver:
-  id: WVR-0002
+  id: WVR-0102
   title: "Deferred pre-actuation budget enforcement"
   description: |
     Permits production constructors to wire BudgetTracker::deferred()

@@ -370,9 +370,9 @@
           "CHK-IDENTITY-FRESHNESS-03",
           "CHK-IDENTITY-FRESHNESS-04",
           "CHK-BOUNDARY-AUTHORITY-04",
-          "WVR-0001",
-          "WVR-0002",
-          "WVR-0003"
+          "WVR-0101",
+          "WVR-0102",
+          "WVR-0103"
         ],
         "rfc_refs": ["RFC-0020 §0.1 constraint 3", "RFC-0020 §4.4", "RFC-0020 §11.3.1"],
         "general_theory_refs": ["LAW-01", "LAW-12", "LAW-14", "PRIN-092"],
@@ -528,7 +528,7 @@
           "CHK-IDENTITY-FRESHNESS-01",
           "CHK-IDENTITY-FRESHNESS-02",
           "CHK-IDENTITY-FRESHNESS-03",
-          "WVR-0001"
+          "WVR-0101"
         ],
         "rfc_refs": ["RFC-0020 §0.1 constraint 10b", "RFC-0020 §1.8", "RFC-0020 §1.9", "RFC-0020 §2.4.8"],
         "general_theory_refs": ["LAW-09", "LAW-18", "PRIN-049"],
@@ -738,7 +738,7 @@
           "SP-RUNTIME-006",
           "CHK-CONTINUITY-STOP-01",
           "RUNBOOK-ALERT-05",
-          "WVR-0002"
+          "WVR-0102"
         ],
         "rfc_refs": ["RFC-0020 §0.1 constraint 8", "RFC-0020 §2.4.3b"],
         "general_theory_refs": ["LAW-10", "LAW-12", "PRIN-049", "PRIN-051"],
@@ -811,7 +811,7 @@
           "CHK-CONTINUITY-STOP-02",
           "CHK-CONTINUITY-STOP-03",
           "RUNBOOK-ALERT-02",
-          "WVR-0001"
+          "WVR-0101"
         ],
         "rfc_refs": ["RFC-0020 §4.4", "RFC-0020 §11.3.1"],
         "general_theory_refs": ["LAW-01", "LAW-12", "LAW-14"],
@@ -1393,7 +1393,7 @@
       "note": "Active waivers represent explicit, time-bounded relaxations of security laws. Each waiver traces to the law(s) it relaxes.",
       "active_waivers": [
         {
-          "waiver_id": "WVR-0001",
+          "waiver_id": "WVR-0101",
           "title": "Transitional governance freshness bypass",
           "relaxed_laws": ["SEC-LAW-04", "SEC-LAW-06"],
           "relaxed_controls": ["SP-INV-006", "SP-RUNTIME-007"],
@@ -1401,7 +1401,7 @@
           "condition": "Only when governance_transitional_resolver=true; logged at WARN with waiver ID"
         },
         {
-          "waiver_id": "WVR-0002",
+          "waiver_id": "WVR-0102",
           "title": "Deferred pre-actuation budget enforcement",
           "relaxed_laws": ["SEC-LAW-09"],
           "relaxed_controls": ["SP-RUNTIME-006"],
@@ -1409,7 +1409,7 @@
           "condition": "Only BudgetTracker::deferred() sentinel; budget_enforcement_deferred=true bound in receipt"
         },
         {
-          "waiver_id": "WVR-0003",
+          "waiver_id": "WVR-0103",
           "title": "Deferred identity proof CAS dereference",
           "relaxed_laws": ["SEC-LAW-05"],
           "relaxed_controls": ["SP-ID-001"],

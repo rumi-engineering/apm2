@@ -190,15 +190,15 @@
             "note": "Consensus security operations and failure handling."
           },
           {
-            "file": "documents/security/waivers/WVR-0001.yaml",
+            "file": "documents/work/waivers/WVR-0101.yaml",
             "note": "Current security exception context."
           },
           {
-            "file": "documents/security/waivers/WVR-0002.yaml",
+            "file": "documents/work/waivers/WVR-0102.yaml",
             "note": "Current security exception context."
           },
           {
-            "file": "documents/security/waivers/WVR-0003.yaml",
+            "file": "documents/work/waivers/WVR-0103.yaml",
             "note": "Current security exception context."
           }
         ],
@@ -328,9 +328,9 @@
         "documents/security/SIGNING_AND_VERIFICATION.cac.json",
         "documents/security/THREAT_MODEL.cac.json",
         "documents/security/consensus-runbook.cac.json",
-        "documents/security/waivers/WVR-0001.yaml",
-        "documents/security/waivers/WVR-0002.yaml",
-        "documents/security/waivers/WVR-0003.yaml"
+        "documents/work/waivers/WVR-0101.yaml",
+        "documents/work/waivers/WVR-0102.yaml",
+        "documents/work/waivers/WVR-0103.yaml"
       ]
     ],
     "reading_expansion_policy": {

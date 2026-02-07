@@ -654,9 +654,9 @@ Required outcomes:
 
 - `documents/security/THREAT_MODEL.cac.json`
 - `documents/security/SECURITY_POLICY.cac.json`
-- `documents/security/waivers/WVR-0001.yaml`
-- `documents/security/waivers/WVR-0002.yaml`
-- `documents/security/waivers/WVR-0003.yaml`
+- `documents/work/waivers/WVR-0101.yaml`
+- `documents/work/waivers/WVR-0102.yaml`
+- `documents/work/waivers/WVR-0103.yaml`
 - `crates/apm2-daemon/src/protocol/session_dispatch.rs`
 - `crates/apm2-daemon/src/episode/preactuation.rs`
 - `crates/apm2-daemon/src/protocol/dispatch.rs`

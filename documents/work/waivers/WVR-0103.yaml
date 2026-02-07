@@ -1,5 +1,5 @@
 waiver:
-  id: WVR-0003
+  id: WVR-0103
   title: "Deferred identity proof CAS dereference at admission"
   description: |
     Permits authoritative handlers (IngestReviewReceipt, DelegateSublease)

@@ -30,7 +30,7 @@
     "pb": "RFC-0021 is drafted and can be iteratively refined so its goals are explicit, machine-checkable, FAC-compatible, and strategy-coupled without weakening containment or evidence authority.",
     "t": {
       "sys": "APM2",
-      "repo": "/home/ubuntu/Projects/apm2-feb6-doc-updates",
+      "repo": "{repo_root}",
       "scope": [
         "documents/rfcs/RFC-0021",
         "documents/strategy",

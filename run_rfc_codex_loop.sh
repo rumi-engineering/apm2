@@ -105,7 +105,9 @@ SUCCESS_CRITERIA='When evaluating your own output, consider whether it:
 build_init_prompt() {
   local rfc_num="$1"
   local seed
-  seed="$(read_seed "$rfc_num")"
+  if ! seed="$(read_seed "$rfc_num")"; then
+    return 1
+  fi
 
   cat <<PROMPT
 # Alien Engineering Protocol
@@ -165,7 +167,9 @@ build_analysis_prompt() {
   local prev_validation="$5"
   local filename="${RFC_FILENAME[$rfc_num]}"
   local seed
-  seed="$(read_seed "$rfc_num")"
+  if ! seed="$(read_seed "$rfc_num")"; then
+    return 1
+  fi
 
   cat <<PROMPT
 # Alien Engineering Protocol — Final Review
@@ -403,7 +407,10 @@ process_rfc() {
 
     log "Pass 0: Generating initial draft..."
     local init_prompt
-    init_prompt="$(build_init_prompt "$rfc_num")"
+    if ! init_prompt="$(build_init_prompt "$rfc_num")"; then
+      log "ERROR: failed to build initial prompt for RFC-${rfc_num}"
+      return 1
+    fi
     echo "$init_prompt" > "${pass0_dir}/prompt.txt"
     invoke_codex "$init_prompt" "${pass0_dir}/raw_output.md" "$dry_run"
 
@@ -435,7 +442,10 @@ process_rfc() {
     # Phase A: Analysis
     log "Phase A: Analysis..."
     local analysis_prompt
-    analysis_prompt="$(build_analysis_prompt "$rfc_num" "$pass" "$num_passes" "$rfc_path" "$prev_validation")"
+    if ! analysis_prompt="$(build_analysis_prompt "$rfc_num" "$pass" "$num_passes" "$rfc_path" "$prev_validation")"; then
+      log "ERROR: failed to build analysis prompt for RFC-${rfc_num} pass ${pass}"
+      return 1
+    fi
     echo "$analysis_prompt" > "${pass_dir}/analysis_prompt.txt"
     local analysis_output="${pass_dir}/analysis.md"
     invoke_codex "$analysis_prompt" "$analysis_output" "$dry_run"
@@ -443,7 +453,10 @@ process_rfc() {
     # Phase B: Apply
     log "Phase B: Apply..."
     local apply_prompt
-    apply_prompt="$(build_apply_prompt "$rfc_num" "$pass" "$rfc_path" "$analysis_output")"
+    if ! apply_prompt="$(build_apply_prompt "$rfc_num" "$pass" "$rfc_path" "$analysis_output")"; then
+      log "ERROR: failed to build apply prompt for RFC-${rfc_num} pass ${pass}"
+      return 1
+    fi
     echo "$apply_prompt" > "${pass_dir}/apply_prompt.txt"
     invoke_codex "$apply_prompt" "${pass_dir}/raw_output.md" "$dry_run"
 
