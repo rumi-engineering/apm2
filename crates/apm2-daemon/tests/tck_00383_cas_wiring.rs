@@ -160,7 +160,8 @@ fn tck_00383_without_cas_falls_back_to_persistence() {
 
     // Use with_persistence (no CAS) -- this is the backward-compatible path
     let dispatcher_state =
-        DispatcherState::with_persistence(session_registry, None, Some(sqlite_conn), None);
+        DispatcherState::with_persistence(session_registry, None, Some(sqlite_conn), None)
+            .expect("with_persistence should succeed in test");
 
     // Verify it was created successfully (no panic)
     let _session_dispatcher = dispatcher_state.session_dispatcher();

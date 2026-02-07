@@ -947,6 +947,7 @@ async fn async_main(args: Args) -> Result<()> {
                 Arc::clone(conn),
                 cas_path,
                 Some(ledger_signing_key),
+                daemon_config.config.daemon.adapter_rotation.clone(),
             )
             .map_err(|e| {
                 anyhow::anyhow!("CAS initialization failed for {}: {e}", cas_path.display())
@@ -958,12 +959,14 @@ async fn async_main(args: Args) -> Result<()> {
                      CAS requires a ledger database. Falling back to with_persistence()"
                 );
             }
-            DispatcherState::with_persistence(
+            DispatcherState::with_persistence_and_adapter_rotation(
                 state.session_registry().clone(),
                 metrics_registry.clone(),
                 sqlite_conn.clone(),
                 Some(ledger_signing_key),
+                &daemon_config.config.daemon.adapter_rotation,
             )
+            .map_err(|e| anyhow::anyhow!("adapter rotation initialization failed: {e}"))?
         }
         .with_daemon_state(Arc::clone(&state)),
     );

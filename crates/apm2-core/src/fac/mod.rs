@@ -69,6 +69,7 @@
 mod aat_receipt;
 pub mod aat_reuse;
 mod aat_spec;
+pub mod adapter_selection;
 mod agent_adapter_profile;
 pub mod anti_downgrade;
 mod artifact_manifest;
@@ -119,6 +120,11 @@ pub use aat_reuse::{
 pub use aat_spec::{
     AatSpec, AatSpecBuilder, AatSpecError, AatStep, AatStepBuilder, Invariant, InvariantBuilder,
     MAX_ACTION_LENGTH, MAX_INVARIANTS, MAX_STATEMENT_LENGTH, MAX_STEPS,
+};
+// Re-export adapter selection policy types (TCK-00400)
+pub use adapter_selection::{
+    AdapterSelectionError, AdapterSelectionPolicy, AdapterSelectionStrategy, ProfileWeight,
+    SelectionDecision, SelectionWeightSnapshot, monotonic_secs,
 };
 // Re-export agent adapter profile types (TCK-00328)
 pub use agent_adapter_profile::{

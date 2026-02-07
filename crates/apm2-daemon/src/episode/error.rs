@@ -222,6 +222,20 @@ pub enum EpisodeError {
         /// Error message from the registry.
         message: String,
     },
+
+    /// Adapter spawn failed (TCK-00400).
+    ///
+    /// Preserves the typed [`super::adapter::AdapterError`] so callers can
+    /// inspect the variant for structured classification (e.g.
+    /// `ResourceLimitExceeded` triggers rate-limit backoff) without
+    /// heuristic string matching.
+    #[error("adapter spawn failed for episode {episode_id}: {source}")]
+    AdapterSpawnFailed {
+        /// Episode identifier.
+        episode_id: String,
+        /// The underlying adapter error with typed variant info preserved.
+        source: super::adapter::AdapterError,
+    },
 }
 
 impl EpisodeError {
@@ -248,7 +262,24 @@ impl EpisodeError {
             Self::ExecutionFailed { .. } => "execution_failed",
             Self::LedgerFailure { .. } => "ledger_failure",
             Self::SessionTerminationFailed { .. } => "session_termination_failed",
+            Self::AdapterSpawnFailed { .. } => "adapter_spawn_failed",
         }
+    }
+
+    /// Returns `true` if this error represents a rate-limit / resource-
+    /// exhaustion condition from the adapter layer.
+    ///
+    /// Only `AdapterSpawnFailed` wrapping `AdapterError::ResourceLimitExceeded`
+    /// returns `true`; all other variants return `false` (fail-closed).
+    #[must_use]
+    pub const fn is_rate_limited(&self) -> bool {
+        matches!(
+            self,
+            Self::AdapterSpawnFailed {
+                source: super::adapter::AdapterError::ResourceLimitExceeded { .. },
+                ..
+            }
+        )
     }
 }
 

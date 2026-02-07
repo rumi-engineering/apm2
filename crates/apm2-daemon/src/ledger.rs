@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
-use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX;
+use apm2_core::fac::{REVIEW_RECEIPT_RECORDED_PREFIX, SelectionDecision};
 use ed25519_dalek::Signer;
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{info, warn};
@@ -407,6 +407,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
         identity_proof_profile_hash: Option<&[u8; 32]>,
+        selection_decision: Option<&SelectionDecision>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Domain prefix for session events (must be at function start per clippy)
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
@@ -423,6 +424,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             role_spec_hash,
             contract_binding,
             identity_proof_profile_hash,
+            selection_decision,
         );
 
         // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
@@ -1535,6 +1537,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
         identity_proof_profile_hash: Option<&[u8; 32]>,
+        selection_decision: Option<&SelectionDecision>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
 
@@ -1562,6 +1565,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             role_spec_hash,
             contract_binding,
             identity_proof_profile_hash,
+            selection_decision,
         );
         let session_payload_json = session_payload.to_string();
         let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
@@ -2377,6 +2381,7 @@ mod tests {
                 ts,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -2559,6 +2564,7 @@ mod tests {
             2_000_000_000,
             None,
             None,
+            None,
         );
         assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
 
@@ -2658,6 +2664,7 @@ mod tests {
             1_000,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
         let events = emitter.get_events_by_work_id("W-ROLLBACK-003");
@@ -2680,6 +2687,7 @@ mod tests {
             &[0xAA; 32],
             None,
             2_000,
+            None,
             None,
             None,
         );
@@ -2830,6 +2838,7 @@ mod tests {
             1_000_000_000,
             Some(&binding),
             None,
+            None,
         );
         assert!(result.is_ok(), "emit_session_started should succeed");
 
@@ -2902,6 +2911,7 @@ mod tests {
             None,
             2_000_000_000,
             Some(&binding),
+            None,
             None,
         );
         assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");

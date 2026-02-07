@@ -221,7 +221,8 @@ fn tck_00412_publish_changeset_fails_closed_without_cas() {
     let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
 
     let state =
-        DispatcherState::with_persistence(session_registry, None, Some(Arc::clone(&conn)), None);
+        DispatcherState::with_persistence(session_registry, None, Some(Arc::clone(&conn)), None)
+            .expect("dispatcher state should initialize");
 
     let dispatcher = state.privileged_dispatcher();
     let ctx = make_privileged_ctx(1000, 1000);
