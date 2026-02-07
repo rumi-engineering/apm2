@@ -225,14 +225,32 @@ pub const XTASK_CUTOVER_POLICY_ENV: &str = "XTASK_CUTOVER_POLICY";
 /// Per TCK-00408, this checks both the explicit policy env var and the
 /// emit-receipt-only flag. If either indicates emit-only mode, the policy
 /// is emit-only.
+///
+/// Note: This reads environment variables only. Prefer
+/// [`effective_cutover_policy_with_flag`] when a CLI `--emit-receipt-only`
+/// flag is available, so the CLI flag is also honoured.
 pub fn effective_cutover_policy() -> CutoverPolicy {
+    effective_cutover_policy_with_flag(false)
+}
+
+/// Returns the effective cutover policy, also considering a CLI flag.
+///
+/// Per TCK-00408, the CLI `--emit-receipt-only` flag MUST have the same
+/// effect as the `XTASK_EMIT_RECEIPT_ONLY` environment variable. This
+/// function merges both sources so that callers which have the CLI flag
+/// available can thread it through to every enforcement point.
+pub fn effective_cutover_policy_with_flag(cli_emit_receipt_only: bool) -> CutoverPolicy {
     // Explicit policy propagation takes precedence
     if let Ok(policy) = std::env::var(XTASK_CUTOVER_POLICY_ENV) {
         if policy == "emit_only" {
             return CutoverPolicy::EmitOnly;
         }
     }
-    // Fall back to legacy emit-receipt-only flag
+    // CLI flag has the same semantics as the env var
+    if cli_emit_receipt_only {
+        return CutoverPolicy::EmitOnly;
+    }
+    // Fall back to legacy emit-receipt-only env var
     if emit_receipt_only_from_env() {
         return CutoverPolicy::EmitOnly;
     }
@@ -1522,6 +1540,44 @@ mod tests {
             "XTASK_EMIT_RECEIPT_ONLY=true should infer EmitOnly policy"
         );
         unsafe {
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+    }
+
+    /// TCK-00408: CLI --emit-receipt-only flag triggers `EmitOnly` cutover
+    /// policy.
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_effective_cutover_policy_with_cli_flag() {
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+        // CLI flag false, no env vars -> Legacy
+        assert_eq!(
+            effective_cutover_policy_with_flag(false),
+            CutoverPolicy::Legacy,
+            "CLI flag false with no env vars should be Legacy"
+        );
+        // CLI flag true, no env vars -> EmitOnly
+        assert_eq!(
+            effective_cutover_policy_with_flag(true),
+            CutoverPolicy::EmitOnly,
+            "CLI flag true should trigger EmitOnly even without env vars"
+        );
+        // Explicit env var takes precedence over CLI flag=false
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, "emit_only");
+        }
+        assert_eq!(
+            effective_cutover_policy_with_flag(false),
+            CutoverPolicy::EmitOnly,
+            "Explicit env var should override CLI flag=false"
+        );
+        // Cleanup
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
             std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
         }
     }

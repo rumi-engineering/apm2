@@ -322,7 +322,9 @@ fn run_uat_signoff(
 
     // TCK-00408: Check effective cutover policy. When emit-only is active,
     // even informational comments must go through the projection layer.
-    let cutover = crate::util::effective_cutover_policy();
+    // Thread the CLI flag so --emit-receipt-only has the same effect as the env
+    // var.
+    let cutover = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
     if cutover.is_emit_only() {
         println!("  [TCK-00408] Emit-only cutover active — skipping direct GitHub comment.");
         let payload = serde_json::json!({

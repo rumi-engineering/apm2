@@ -38,6 +38,18 @@ use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_tick
 /// - Rebase fails (conflicts need manual resolution)
 /// - Push or PR creation fails
 pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
+    // TCK-00408: If the CLI --emit-receipt-only flag is set, propagate it to
+    // the environment so that all downstream code (including ReviewerSpawner)
+    // picks up the emit-only cutover policy without requiring explicit flag
+    // threading through every function signature.
+    if emit_receipt_only {
+        // SAFETY: single-threaded xtask entry point; no concurrent env reads.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(crate::util::XTASK_CUTOVER_POLICY_ENV, "emit_only");
+        }
+    }
+
     let sh = Shell::new().context("Failed to create shell")?;
 
     // Get current branch and validate it's a ticket branch
@@ -122,6 +134,11 @@ pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
     }
     println!("  Pushed to origin/{branch_name}");
 
+    // TCK-00408: Check effective cutover policy BEFORE any GitHub writes.
+    // The CLI --emit-receipt-only flag is threaded through here so it has the
+    // same effect as the XTASK_EMIT_RECEIPT_ONLY environment variable.
+    let cutover = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
+
     // Check if PR already exists
     println!("\n[4/4] Checking for existing PR...");
     let pr_exists = cmd!(sh, "gh pr view {branch_name} --json number --jq .number")
@@ -133,20 +150,41 @@ pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
         || pr_exists.contains("no pull requests")
         || pr_exists.contains("not found")
     {
-        // Create new PR
-        println!("  No existing PR found, creating one...");
-        create_pr(&sh, &branch_name, &ticket_branch.ticket_id)?
+        if cutover.is_emit_only() {
+            // TCK-00408: Emit-only mode — do NOT create a PR directly.
+            // Emit a projection event and require durable acknowledgement.
+            println!(
+                "  [TCK-00408] Emit-only cutover active — emitting PR creation projection event."
+            );
+            let payload = serde_json::json!({
+                "operation": "pr_create",
+                "branch": branch_name,
+                "ticket_id": ticket_branch.ticket_id,
+                "base": "main",
+            });
+            let correlation_id = format!("push-pr-create-{}", &ticket_branch.ticket_id);
+            crate::util::emit_projection_receipt_with_ack(
+                "pr_create",
+                "pending",
+                &branch_name,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+            // Return a placeholder URL since the PR has not been created yet.
+            format!("(pending projection: PR for {branch_name})")
+        } else {
+            // Create new PR (legacy direct write)
+            println!("  No existing PR found, creating one...");
+            create_pr(&sh, &branch_name, &ticket_branch.ticket_id)?
+        }
     } else {
-        // PR already exists
+        // PR already exists — reading its URL is a read-only operation.
         let url = cmd!(sh, "gh pr view {branch_name} --json url --jq .url")
             .read()
             .context("Failed to get PR URL")?;
         println!("  PR already exists: {}", url.trim());
         url.trim().to_string()
     };
-
-    // TCK-00408: Check effective cutover policy before any further GitHub writes.
-    let cutover = crate::util::effective_cutover_policy();
 
     // Enable auto-merge if available
     println!("\nEnabling auto-merge...");
