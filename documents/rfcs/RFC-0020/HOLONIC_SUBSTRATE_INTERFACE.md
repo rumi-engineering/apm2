@@ -2028,6 +2028,9 @@ HSI MUST support a compact proof format for verifying many receipt hashes agains
 **Normative rule:** If a sender transmits ≥ K_min receipt pointers from the same batch (implementation-defined threshold),
 it SHOULD send a multiproof rather than K independent inclusion proofs, unless prohibited by channel budgets.
 
+**Implementation phasing note (ticket decomposition):** TCK-00363 implements independent per-receipt inclusion proofs
+for `ReceiptMultiProofV1`; compact shared-sibling encoding (`proof_nodes[]` + `proof_structure`) is deferred to TCK-00370.
+
 This reduces both network fanout and verifier hashing work at high volume.
 
 #### 9.5.6 Hierarchical batch forests (normative shape)

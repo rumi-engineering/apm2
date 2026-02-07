@@ -66,7 +66,6 @@ KNOWN_TICKET_ISSUES["TCK-00359:artifact_ref:documents/rfcs/RFC-0020/evidence_art
 KNOWN_TICKET_ISSUES["TCK-00360:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0014.yaml"]=1
 KNOWN_TICKET_ISSUES["TCK-00361:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0015.yaml"]=1
 KNOWN_TICKET_ISSUES["TCK-00361:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0110.yaml"]=1
-KNOWN_TICKET_ISSUES["TCK-00363:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0017.yaml"]=1
 KNOWN_TICKET_ISSUES["TCK-00364:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0018.yaml"]=1
 KNOWN_TICKET_ISSUES["TCK-00364:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0309.yaml"]=1
 KNOWN_TICKET_ISSUES["TCK-00365:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0019.yaml"]=1

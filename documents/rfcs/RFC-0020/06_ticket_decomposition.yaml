@@ -405,9 +405,10 @@ rfc_ticket_decomposition:
         scope:
           in_scope:
             - "Implement ReceiptPointerV1 with direct-signature or batch/FactRoot paths"
-            - "Implement ReceiptMultiProofV1 for compact multi-receipt membership proofs"
+            - "Implement ReceiptMultiProofV1 with independent per-receipt inclusion proofs and deterministic membership verification"
             - "Update verifier and auditor tooling to accept equivalent direct vs batched semantics"
           out_of_scope:
+            - "Compact shared-sibling multiproof wire shape per RFC-0020 §9.5.5 (`proof_nodes[]` + `proof_structure`) deferred to TCK-00370"
             - "Hierarchy root-of-roots batching (TCK-00371)"
         binds:
           requirement_ids: ["REQ-0017"]
@@ -575,6 +576,7 @@ rfc_ticket_decomposition:
             - "Implement FactRootV1 and bind batch roots into QC-certified checkpoints"
             - "Require ledger/quorum anchors for authoritative batch acceptance"
             - "Integrate FactRoot verification path in receipt pointer verifier"
+            - "Implement compact shared-sibling multiproof wire shape (`proof_nodes[]` + `proof_structure`) deferred from TCK-00363"
           out_of_scope:
             - "Hierarchical batch forests (TCK-00371)"
         binds:

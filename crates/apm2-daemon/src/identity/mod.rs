@@ -145,6 +145,7 @@ pub(crate) mod directory_proof;
 mod holon_id;
 mod keyset_id;
 mod public_key_id;
+pub(crate) mod receipt_pointer;
 mod session_delegation;
 
 pub mod conformance;
@@ -171,6 +172,11 @@ pub use directory_proof::{
 pub use holon_id::{HolonGenesisV1, HolonIdV1, HolonPurpose};
 pub use keyset_id::{KeySetDigestResolver, KeySetIdV1, ResolvedKeySetSemantics, SetTag};
 pub use public_key_id::{AlgorithmTag, PublicKeyIdV1};
+pub use receipt_pointer::{
+    BatchSealVerifier, MAX_MULTIPROOF_LEAVES, MAX_MULTIPROOF_NODES, MAX_RECEIPT_MULTIPROOF_BYTES,
+    MAX_RECEIPT_POINTER_BYTES, PointerKind, ReceiptMultiProofV1, ReceiptPointerError,
+    ReceiptPointerV1, ReceiptPointerVerifier, VerificationResult,
+};
 pub use session_delegation::{
     MAX_SESSION_DELEGATION_TICKS, SessionKeyDelegationV1, UncheckedSessionDelegation,
 };
