@@ -45,7 +45,9 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
-    HarnessEventStream, HarnessHandle, HarnessHandleInner, OutputKind, TerminationClassification,
+    HarnessEventStream, HarnessHandle, MAX_SEND_INPUT_BYTES, OutputKind, TerminationClassification,
+    create_real_handle_inner, process_pty_control_command, pty_control_channel_capacity,
+    read_proc_start_time, send_input_with_handle, terminate_with_handle,
 };
 use super::claude_parser::{ClaudeCodeParser, DEFAULT_RATE_LIMIT_PER_SEC};
 use super::pty::{PtyConfig, PtyRunner};
@@ -248,6 +250,7 @@ impl ClaudeCodeAdapter {
 
         let handle_id = Self::next_handle_id();
         let episode_id = config.episode_id.clone();
+        let terminate_grace_period = config.terminate_grace_period;
 
         // Create PTY configuration from harness config
         let (cols, rows) = config.pty_size;
@@ -262,6 +265,14 @@ impl ClaudeCodeAdapter {
         // Spawn the process via PtyRunner
         let mut runner = PtyRunner::spawn(&config.command, &args, pty_config, timestamp_ns)
             .map_err(|e| AdapterError::spawn_failed(format!("PTY spawn failed: {e}")))?;
+        let pid_raw = runner.pid().as_raw();
+        let pid = u32::try_from(pid_raw)
+            .map_err(|_| AdapterError::spawn_failed(format!("invalid PTY child pid: {pid_raw}")))?;
+        let start_time_ticks = read_proc_start_time(pid);
+
+        let (control_tx, mut control_rx) =
+            tokio::sync::mpsc::channel(pty_control_channel_capacity());
+        let handle_inner = create_real_handle_inner(pid, start_time_ticks, control_tx);
 
         // Create the event channel
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -273,65 +284,144 @@ impl ClaudeCodeAdapter {
         }
 
         // Spawn a task that reads from the PTY, parses output, and emits events
+        let task_episode_id = episode_id.clone();
         tokio::spawn(async move {
             // Hold the permit for the duration of the task
             let _permit = permit;
+            let episode_id = task_episode_id;
 
             let mut seq = 0u64;
             let mut parser = ClaudeCodeParser::with_rate_limit(tool_rate_limit);
+            let mut exit_status = None;
+            let mut control_open = true;
+            let mut output_live = true;
 
-            // Read output from PTY and emit events
-            while let Some(output) = runner.recv().await {
-                // Parse the output chunk for tool calls
-                let parse_result = parser.parse(&output.chunk);
+            // Bounded backpressure telemetry: count dropped events and only
+            // log on the first drop per category to avoid unbounded log write
+            // amplification.
+            let mut dropped_output_events: u64 = 0;
+            let mut dropped_tool_events: u64 = 0;
 
-                // Emit sanitized output event
-                let output_event = HarnessEvent::output(
-                    parse_result.sanitized_output.clone(),
-                    OutputKind::Combined,
-                    seq,
-                    output.ts_mono,
-                );
-                seq += 1;
-
-                // Update shared state with output count if provided
-                if let Some(ref state) = shared_state {
-                    let mut guard = state.lock().await;
-                    guard.output_event_count = seq;
-                }
-
-                if tx.send(output_event).await.is_err() {
-                    // Receiver dropped, stop reading
-                    break;
-                }
-
-                // Emit tool request events
-                for tool_call in parse_result.tool_calls {
-                    let tool_event = ClaudeCodeParser::to_harness_event(&tool_call);
-
-                    // Update tool request count
-                    if let Some(ref state) = shared_state {
-                        let mut guard = state.lock().await;
-                        guard.tool_request_count += 1;
+            loop {
+                tokio::select! {
+                    maybe_cmd = control_rx.recv(), if control_open => {
+                        if let Some(command) = maybe_cmd {
+                            if let Some(status) = process_pty_control_command(
+                                command,
+                                &mut runner,
+                                pid,
+                                start_time_ticks,
+                            ).await {
+                                exit_status = Some(status);
+                                break;
+                            }
+                        } else {
+                            control_open = false;
+                            // If output is also dead, nothing left to do
+                            if !output_live {
+                                break;
+                            }
+                        }
                     }
+                    maybe_output = runner.recv() => {
+                        if let Some(output) = maybe_output {
+                            if output_live {
+                                // Parse the output chunk for tool calls
+                                let parse_result = parser.parse(&output.chunk);
 
-                    if tx.send(tool_event).await.is_err() {
-                        break;
+                                // Emit sanitized output event
+                                let output_event = HarnessEvent::output(
+                                    parse_result.sanitized_output.clone(),
+                                    OutputKind::Combined,
+                                    seq,
+                                    output.ts_mono,
+                                );
+                                seq += 1;
+
+                                // Update shared state with output count if provided
+                                if let Some(ref state) = shared_state {
+                                    let mut guard = state.lock().await;
+                                    guard.output_event_count = seq;
+                                }
+
+                                match tx.try_send(output_event) {
+                                    Ok(()) => {},
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        // Receiver dropped — stop forwarding output but
+                                        // keep servicing control commands for liveness.
+                                        output_live = false;
+                                        continue;
+                                    },
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        // Channel full — drop event to avoid blocking the
+                                        // select loop (control-plane decoupling invariant).
+                                        //
+                                        // Rate-limited telemetry: log only on the first
+                                        // drop to prevent unbounded log write amplification.
+                                        // Total drops are summarised at task exit.
+                                        if dropped_output_events == 0 {
+                                            tracing::warn!(
+                                                episode_id = %episode_id,
+                                                seq = seq - 1,
+                                                "output event dropped: event channel full (backpressure); \
+                                                 further drops will be counted silently"
+                                            );
+                                        }
+                                        dropped_output_events += 1;
+                                    },
+                                }
+
+                                // Emit tool request events
+                                for tool_call in parse_result.tool_calls {
+                                    let tool_event = ClaudeCodeParser::to_harness_event(&tool_call);
+
+                                    // Update tool request count
+                                    if let Some(ref state) = shared_state {
+                                        let mut guard = state.lock().await;
+                                        guard.tool_request_count += 1;
+                                    }
+
+                                    match tx.try_send(tool_event) {
+                                        Ok(()) => {},
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            output_live = false;
+                                            break;
+                                        },
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            // Rate-limited telemetry: log only on first
+                                            // tool event drop. Total summarised at exit.
+                                            if dropped_tool_events == 0 {
+                                                tracing::warn!(
+                                                    episode_id = %episode_id,
+                                                    "tool event dropped: event channel full (backpressure); \
+                                                     further drops will be counted silently"
+                                                );
+                                            }
+                                            dropped_tool_events += 1;
+                                        },
+                                    }
+                                }
+
+                                // Log defects (but don't emit as events to avoid noise)
+                                for defect in parse_result.defects {
+                                    tracing::warn!(
+                                        description = %defect.description,
+                                        offset = defect.offset,
+                                        "Parser defect detected"
+                                    );
+                                }
+                            }
+                            // else: drain output silently to detect process termination
+                        } else {
+                            exit_status = Some(runner.wait().unwrap_or(super::pty::ExitStatus::Running));
+                            break;
+                        }
                     }
-                }
-
-                // Log defects (but don't emit as events to avoid noise)
-                for defect in parse_result.defects {
-                    tracing::warn!(
-                        description = %defect.description,
-                        offset = defect.offset,
-                        "Parser defect detected"
-                    );
                 }
             }
 
-            // Wait for process to exit and get status
-            let exit_status = runner.wait().unwrap_or(super::pty::ExitStatus::Running);
+            let exit_status = exit_status
+                .unwrap_or_else(|| runner.wait().unwrap_or(super::pty::ExitStatus::Running));
 
             let exit_code = exit_status.code();
             let classification = Self::classify_exit(exit_status);
@@ -343,13 +433,34 @@ impl ClaudeCodeAdapter {
                 guard.process_terminated = true;
             }
 
-            // Emit terminated event
-            let _ = tx
+            // Log backpressure drop summary at task exit if any events were lost.
+            if dropped_output_events > 0 || dropped_tool_events > 0 {
+                tracing::warn!(
+                    episode_id = %episode_id,
+                    dropped_output_events,
+                    dropped_tool_events,
+                    "task exiting with dropped events due to backpressure"
+                );
+            }
+
+            // Emit terminated event using blocking send. Terminated is a
+            // control-significant one-shot event (at most once per task
+            // lifetime) and must not be silently lost. Blocking here is
+            // acceptable because the task is about to exit anyway.
+            if tx
                 .send(HarnessEvent::terminated(exit_code, classification))
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    episode_id = %episode_id,
+                    "terminated event could not be delivered: receiver dropped"
+                );
+            }
         });
 
-        let handle = HarnessHandle::new(handle_id, episode_id, HarnessHandleInner::Placeholder);
+        let handle =
+            HarnessHandle::new(handle_id, episode_id, terminate_grace_period, handle_inner);
 
         Ok((handle, rx))
     }
@@ -382,25 +493,32 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
     fn send_input(
         &self,
-        _handle: &HarnessHandle,
-        _input: &[u8],
+        handle: &HarnessHandle,
+        input: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<()>> + Send + '_>> {
-        Box::pin(async move {
-            Err(AdapterError::input_failed(
-                "claude code adapter send_input requires handle-based PTY storage (not yet implemented)",
-            ))
-        })
+        let handle_id = handle.id();
+        // Validate size before cloning to avoid unnecessary allocation
+        let input_len = input.len();
+        if input_len > MAX_SEND_INPUT_BYTES {
+            return Box::pin(async move {
+                Err(AdapterError::input_failed(format!(
+                    "input payload too large: {input_len} bytes exceeds maximum {MAX_SEND_INPUT_BYTES} bytes",
+                )))
+            });
+        }
+        let runner_handle = handle.real_runner_handle();
+        let input = input.to_vec();
+        Box::pin(async move { send_input_with_handle(handle_id, runner_handle, input).await })
     }
 
     fn terminate(
         &self,
-        _handle: &HarnessHandle,
+        handle: &HarnessHandle,
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<ExitStatus>> + Send + '_>> {
-        Box::pin(async move {
-            Err(AdapterError::terminate_failed(
-                "claude code adapter terminate requires handle-based PTY storage (not yet implemented)",
-            ))
-        })
+        let handle_id = handle.id();
+        let runner_handle = handle.real_runner_handle();
+        let grace_period = handle.terminate_grace_period();
+        Box::pin(async move { terminate_with_handle(handle_id, runner_handle, grace_period).await })
     }
 }
 
@@ -801,6 +919,76 @@ mod tests {
         assert!(terminated);
     }
 
+    #[tokio::test]
+    async fn test_claude_adapter_send_input_and_terminate() {
+        let adapter = ClaudeCodeAdapter::new();
+        let config = HarnessConfig::new("cat", "episode-claude-interactive");
+
+        let (handle, mut events) = adapter.spawn(config).await.unwrap();
+        let (pid, start_time_ticks) = match &handle.inner {
+            super::super::adapter::HarnessHandleInner::Real(real) => {
+                let guard = real.lock().await;
+                (guard.pid, guard.start_time_ticks)
+            },
+        };
+        assert!(
+            start_time_ticks.is_some(),
+            "spawn should capture start-time binding for PID validation"
+        );
+
+        adapter
+            .send_input(&handle, b"hello from claude adapter\n")
+            .await
+            .unwrap();
+
+        let observed_output = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let HarnessEvent::Output { chunk, .. } = event {
+                    if String::from_utf8_lossy(&chunk).contains("hello from claude adapter") {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for output event");
+        assert!(observed_output, "expected echo output from cat");
+
+        let exit_status = adapter.terminate(&handle).await.unwrap();
+        assert!(
+            !exit_status.success(),
+            "terminate should stop the process via signal"
+        );
+
+        let terminated_event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let HarnessEvent::Terminated { .. } = event {
+                    return Some(event);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for terminated event")
+        .expect("expected terminated event after terminate()");
+
+        if let HarnessEvent::Terminated { classification, .. } = terminated_event {
+            assert!(matches!(
+                classification,
+                TerminationClassification::Killed | TerminationClassification::Terminated
+            ));
+        }
+
+        if let Some(expected_start) = start_time_ticks {
+            assert_ne!(
+                super::super::adapter::read_proc_start_time(pid),
+                Some(expected_start),
+                "original process identity must not remain alive after terminate"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_holon_full_lifecycle() {
         let adapter = ClaudeCodeAdapter::new();
@@ -833,5 +1021,41 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    // =========================================================================
+    // Control-plane decoupling regression tests (backpressure)
+    // =========================================================================
+
+    /// UT-BACKPRESSURE-CC-01: terminate must be serviced even when the output
+    /// event channel is full (Claude Code adapter variant).
+    #[tokio::test]
+    async fn test_terminate_succeeds_under_output_backpressure() {
+        let adapter = ClaudeCodeAdapter::new();
+
+        // Spawn `yes` which produces output rapidly, filling the 256-slot
+        // event channel. We do NOT consume events.
+        let config = HarnessConfig::new("yes", "episode-cc-backpressure");
+        let (handle, _events) = adapter.spawn(config).await.unwrap();
+
+        // Give the background task time to fill the event channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Terminate MUST succeed despite full output channel.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            adapter.terminate(&handle),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "terminate must not time out under output backpressure"
+        );
+        let exit_result = result.unwrap();
+        assert!(
+            exit_result.is_ok(),
+            "terminate must succeed, got: {exit_result:?}"
+        );
     }
 }

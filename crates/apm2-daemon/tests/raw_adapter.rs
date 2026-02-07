@@ -208,3 +208,50 @@ async fn it_00162_01e_raw_adapter_config_validation() {
     let result = adapter.spawn(config).await;
     assert!(result.is_err(), "arg with null byte should be rejected");
 }
+
+/// IT-00396-01: Regression test for receiver-drop + control responsiveness.
+///
+/// Verifies that when the output receiver is dropped (simulating a consumer
+/// going away), the control plane remains responsive and `terminate()` still
+/// completes within a bounded time instead of deadlocking.
+///
+/// This is a regression test for the security BLOCKER: control-plane deadlock
+/// after event-stream receiver drop.
+#[tokio::test]
+async fn it_00396_01_receiver_drop_does_not_deadlock_terminate() {
+    let adapter = RawAdapter::new();
+
+    // Spawn a long-running process (cat blocks on stdin indefinitely)
+    let config = HarnessConfig::new("cat", "it-00396-01-receiver-drop");
+    let (handle, events) = adapter.spawn(config).await.expect("spawn should succeed");
+
+    // Wait briefly for the process to start
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Drop the output receiver to simulate consumer going away
+    drop(events);
+
+    // Give the background task a moment to observe the dropped receiver
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Now call terminate — this MUST complete within a bounded time.
+    // Before the fix, this would deadlock because the control loop exited
+    // when the receiver dropped, leaving no task to service the terminate
+    // command.
+    let terminate_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        adapter.terminate(&handle),
+    )
+    .await;
+
+    assert!(
+        terminate_result.is_ok(),
+        "terminate() must not deadlock after output receiver is dropped"
+    );
+
+    let exit_status = terminate_result.unwrap();
+    assert!(
+        exit_status.is_ok(),
+        "terminate should succeed, got: {exit_status:?}"
+    );
+}
