@@ -76,6 +76,53 @@ rm -rf "${tmp_dir}"
 echo
 
 # ---------------------------------------------------------------------------
+# Test 1b: test_safety_guard multiline Rust pattern blocking
+# ---------------------------------------------------------------------------
+echo "Test 1b: test_safety_guard.sh multiline detection"
+tmp_ml="$(mktemp -d)"
+cat > "${tmp_ml}/multiline_test.rs" <<'RUSTEOF'
+fn sneaky() {
+    Command::new("sh")
+        .arg("-c")
+        .arg("whoami");
+}
+RUSTEOF
+
+touch "${tmp_ml}/allowlist.txt"
+
+if expect_fail "${REPO_ROOT}/scripts/ci/test_safety_guard.sh" \
+    --allowlist "${tmp_ml}/allowlist.txt" \
+    "${tmp_ml}"; then
+    log_pass "multiline Command::new(sh).arg(-c) correctly blocked"
+else
+    log_fail "multiline Command::new(sh).arg(-c) was not blocked"
+fi
+rm -rf "${tmp_ml}"
+
+# ---------------------------------------------------------------------------
+# Test 1c: test_safety_guard quoted-path variant blocking
+# ---------------------------------------------------------------------------
+echo "Test 1c: test_safety_guard.sh quoted path detection"
+tmp_q="$(mktemp -d)"
+cat > "${tmp_q}/quoted_test.sh" <<'QUOTEOF'
+#!/usr/bin/env bash
+rm -rf "/"
+QUOTEOF
+chmod +x "${tmp_q}/quoted_test.sh"
+
+touch "${tmp_q}/allowlist.txt"
+
+if expect_fail "${REPO_ROOT}/scripts/ci/test_safety_guard.sh" \
+    --allowlist "${tmp_q}/allowlist.txt" \
+    "${tmp_q}"; then
+    log_pass "quoted root path rm -rf correctly blocked"
+else
+    log_fail "quoted root path rm -rf was not blocked"
+fi
+rm -rf "${tmp_q}"
+echo
+
+# ---------------------------------------------------------------------------
 # Test 2: workspace_integrity_guard mutation detection
 # ---------------------------------------------------------------------------
 echo "Test 2: workspace_integrity_guard.sh"

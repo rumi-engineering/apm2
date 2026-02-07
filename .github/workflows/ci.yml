@@ -367,6 +367,8 @@ jobs:
       - uses: taiki-e/install-action@44b512a15849018e00cb9330d33250594aa2436c
         with:
           tool: cargo-nextest
+      # Workspace integrity guard wraps the same full-workspace test surface
+      # as bounded-test-runner to ensure no crate escapes integrity checks.
       - name: Verify workspace integrity around test execution
         run: |
           ./scripts/ci/workspace_integrity_guard.sh \
@@ -374,7 +376,7 @@ jobs:
             -- ./scripts/ci/run_bounded_tests.sh \
                --timeout-seconds 600 \
                --kill-after-seconds 20 \
-               -- cargo nextest run -p apm2-cli \
+               -- cargo nextest run --workspace \
                     --all-features \
                     --config-file .config/nextest.toml \
                     --profile ci

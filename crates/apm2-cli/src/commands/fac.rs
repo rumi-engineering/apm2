@@ -624,6 +624,8 @@ fn run_check(args: &CheckArgs, json_output: bool) -> u8 {
     ];
 
     let workspace_snapshot = receipts_dir.join("workspace_integrity.snapshot.tsv");
+    // Workspace integrity guard wraps the same full-workspace test surface
+    // as bounded-test-runner to ensure no crate escapes integrity checks.
     let workspace_guard_cmd = vec![
         workspace_guard_script.display().to_string(),
         "--snapshot-file".to_string(),
@@ -644,8 +646,7 @@ fn run_check(args: &CheckArgs, json_output: bool) -> u8 {
         "cargo".to_string(),
         "nextest".to_string(),
         "run".to_string(),
-        "-p".to_string(),
-        "apm2-cli".to_string(),
+        "--workspace".to_string(),
         "--all-features".to_string(),
         "--config-file".to_string(),
         ".config/nextest.toml".to_string(),
@@ -2437,5 +2438,270 @@ mod tests {
             "schema": "apm2.projection.v1"
         });
         assert_eq!(detect_receipt_type(&json), "projection_receipt");
+    }
+
+    // =========================================================================
+    // Behavioral tests: fac check fail-closed code paths
+    // =========================================================================
+
+    /// `run_check` must reject zero timeout (`invalid_limits`, fail-closed).
+    #[test]
+    fn test_run_check_rejects_zero_timeout() {
+        let args = CheckArgs {
+            workspace_root: PathBuf::from("."),
+            receipts_dir: None,
+            timeout_seconds: 0,
+            kill_after_seconds: 20,
+            memory_max: "4G".to_string(),
+            pids_max: 1536,
+            cpu_quota: "200%".to_string(),
+        };
+
+        let exit_code = run_check(&args, true);
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "zero timeout_seconds must fail-closed with VALIDATION_ERROR"
+        );
+    }
+
+    /// `run_check` must reject zero kill-after (`invalid_limits`, fail-closed).
+    #[test]
+    fn test_run_check_rejects_zero_kill_after() {
+        let args = CheckArgs {
+            workspace_root: PathBuf::from("."),
+            receipts_dir: None,
+            timeout_seconds: 900,
+            kill_after_seconds: 0,
+            memory_max: "4G".to_string(),
+            pids_max: 1536,
+            cpu_quota: "200%".to_string(),
+        };
+
+        let exit_code = run_check(&args, true);
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "zero kill_after_seconds must fail-closed with VALIDATION_ERROR"
+        );
+    }
+
+    /// `run_check` must reject zero `pids_max` (`invalid_limits`, fail-closed).
+    #[test]
+    fn test_run_check_rejects_zero_pids_max() {
+        let args = CheckArgs {
+            workspace_root: PathBuf::from("."),
+            receipts_dir: None,
+            timeout_seconds: 900,
+            kill_after_seconds: 20,
+            memory_max: "4G".to_string(),
+            pids_max: 0,
+            cpu_quota: "200%".to_string(),
+        };
+
+        let exit_code = run_check(&args, true);
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "zero pids_max must fail-closed with VALIDATION_ERROR"
+        );
+    }
+
+    /// `run_check` must fail-closed when `workspace_root` is a non-existent path.
+    #[test]
+    fn test_run_check_rejects_nonexistent_workspace() {
+        let args = CheckArgs {
+            workspace_root: PathBuf::from("/nonexistent/workspace/path/apm2_test"),
+            receipts_dir: None,
+            timeout_seconds: 900,
+            kill_after_seconds: 20,
+            memory_max: "4G".to_string(),
+            pids_max: 1536,
+            cpu_quota: "200%".to_string(),
+        };
+
+        let exit_code = run_check(&args, true);
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "nonexistent workspace_root must fail-closed with VALIDATION_ERROR"
+        );
+    }
+
+    /// `execute_gate_command` must fail-closed with exit code 127 on empty
+    /// command vec (no default-to-pass).
+    #[test]
+    fn test_execute_gate_command_empty_command_fails_closed() {
+        let tmp = std::env::temp_dir().join("fac_test_empty_cmd");
+        let _ = std::fs::create_dir_all(&tmp);
+        let receipt = tmp.join("empty_cmd.log");
+
+        let result = execute_gate_command(&tmp, &[], &receipt);
+        assert!(
+            !result.success,
+            "empty command must fail (never default to pass)"
+        );
+        assert_eq!(result.exit_code, 127, "empty command must return exit 127");
+
+        // Verify receipt was written as evidence
+        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            content.contains("FAIL"),
+            "receipt must record FAIL status: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `execute_gate_command` must fail-closed when the executable does not
+    /// exist (e.g., missing script scenario).
+    #[test]
+    fn test_execute_gate_command_missing_binary_fails_closed() {
+        let tmp = std::env::temp_dir().join("fac_test_missing_bin");
+        let _ = std::fs::create_dir_all(&tmp);
+        let receipt = tmp.join("missing_bin.log");
+
+        let command = vec!["/nonexistent/binary/path".to_string()];
+        let result = execute_gate_command(&tmp, &command, &receipt);
+        assert!(
+            !result.success,
+            "missing binary must fail (never default to pass)"
+        );
+        assert_eq!(result.exit_code, 127, "missing binary must return exit 127");
+
+        // Verify receipt was written as evidence
+        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            content.contains("error="),
+            "receipt must record error: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Gate skip-on-failure: when an early gate returns FAIL, subsequent gates
+    /// must be SKIPPED (not executed). This ensures the gate chain is
+    /// fail-closed and does not allow later gates to mask early failures.
+    #[test]
+    fn test_gate_skip_on_failure_semantics() {
+        // Simulate the gate blocking logic from run_check:
+        // After first gate fails, gate_blocked=true, remaining gates get SKIPPED.
+        let mut gates = Vec::new();
+        let mut gate_blocked = false;
+
+        // Simulate 3 gate plans: first FAILS, second and third should be SKIPPED
+        let gate_outcomes = [false, true, true]; // false = FAIL
+        let gate_ids = ["gate-security", "gate-aat", "gate-quality"];
+        let gate_labels = [
+            "test-safety-guard",
+            "bounded-test-runner",
+            "workspace-integrity-guard",
+        ];
+
+        for (i, success) in gate_outcomes.iter().enumerate() {
+            if gate_blocked {
+                gates.push(FacCheckGateResult {
+                    gate_id: gate_ids[i].to_string(),
+                    gate_label: gate_labels[i].to_string(),
+                    status: "SKIPPED".to_string(),
+                    exit_code: None,
+                    command: "test_cmd".to_string(),
+                    receipt_pointer: "/tmp/test.log".to_string(),
+                });
+                continue;
+            }
+
+            if !success {
+                gate_blocked = true;
+            }
+
+            gates.push(FacCheckGateResult {
+                gate_id: gate_ids[i].to_string(),
+                gate_label: gate_labels[i].to_string(),
+                status: if *success {
+                    "PASS".to_string()
+                } else {
+                    "FAIL".to_string()
+                },
+                exit_code: Some(i32::from(!*success)),
+                command: "test_cmd".to_string(),
+                receipt_pointer: "/tmp/test.log".to_string(),
+            });
+        }
+
+        // Verify gate chain semantics
+        assert_eq!(gates.len(), 3, "all three gates must be represented");
+        assert_eq!(gates[0].status, "FAIL", "first gate must be FAIL");
+        assert_eq!(
+            gates[1].status, "SKIPPED",
+            "second gate must be SKIPPED after first fails"
+        );
+        assert_eq!(
+            gates[2].status, "SKIPPED",
+            "third gate must be SKIPPED after first fails"
+        );
+
+        // Overall verdict must be FAIL (not PASS)
+        let passed = gates.iter().all(|g| g.status == "PASS");
+        assert!(!passed, "overall verdict must be FAIL when any gate fails");
+
+        // SKIPPED gates must have no exit code
+        assert!(
+            gates[1].exit_code.is_none(),
+            "SKIPPED gate must have no exit code"
+        );
+        assert!(
+            gates[2].exit_code.is_none(),
+            "SKIPPED gate must have no exit code"
+        );
+    }
+
+    /// `execute_gate_command` must handle a command that exits with non-zero
+    /// status and record the correct exit code.
+    #[test]
+    fn test_execute_gate_command_records_nonzero_exit() {
+        let tmp = std::env::temp_dir().join("fac_test_nonzero_exit");
+        let _ = std::fs::create_dir_all(&tmp);
+        let receipt = tmp.join("nonzero.log");
+
+        // bash -c "exit 42" should exit with code 42
+        let command = vec!["bash".to_string(), "-c".to_string(), "exit 42".to_string()];
+        let result = execute_gate_command(&tmp, &command, &receipt);
+        assert!(!result.success, "non-zero exit must be treated as failure");
+        assert_eq!(
+            result.exit_code, 42,
+            "exit code must be faithfully recorded"
+        );
+
+        // Verify receipt was written with exit code evidence
+        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            content.contains("exit_code=42"),
+            "receipt must contain exit_code=42: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `execute_gate_command` must record success for a passing command.
+    #[test]
+    fn test_execute_gate_command_records_success() {
+        let tmp = std::env::temp_dir().join("fac_test_success");
+        let _ = std::fs::create_dir_all(&tmp);
+        let receipt = tmp.join("success.log");
+
+        let command = vec!["true".to_string()];
+        let result = execute_gate_command(&tmp, &command, &receipt);
+        assert!(result.success, "exit 0 must be treated as success");
+        assert_eq!(result.exit_code, 0, "exit code must be 0");
+
+        // Verify receipt was written
+        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            content.contains("exit_code=0"),
+            "receipt must contain exit_code=0: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

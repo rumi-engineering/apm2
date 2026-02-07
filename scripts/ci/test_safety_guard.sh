@@ -103,6 +103,8 @@ declare -a RULE_IDS=(
     "TSG005"
     "TSG006"
     "TSG007"
+    "TSG008"
+    "TSG009"
 )
 
 declare -a RULE_PATTERNS=(
@@ -113,6 +115,8 @@ declare -a RULE_PATTERNS=(
     'Command::new[[:space:]]*[(][[:space:]]*"(sh|bash|zsh)"[[:space:]]*[)][[:space:]]*[.][[:space:]]*arg[[:space:]]*[(][[:space:]]*"-c"'
     'Command::new[[:space:]]*[(][[:space:]]*"rm"[[:space:]]*[)].*(-rf|-fr|-r[[:space:]]+-f|-f[[:space:]]+-r)'
     'git[[:space:]]+clean[[:space:]]+-fdx'
+    'rm[[:space:]]+-[[:alnum:]-]*r[[:alnum:]-]*f[[:space:]]+("|'"'"')[[:space:]]*/[[:space:]]*("|'"'"')'
+    'rm[[:space:]]+-[[:alnum:]-]*r[[:alnum:]-]*f[[:space:]]+("|'"'"')[[:space:]]*~[[:space:]]*("|'"'"')'
 )
 
 declare -a RULE_DESCRIPTIONS=(
@@ -123,6 +127,25 @@ declare -a RULE_DESCRIPTIONS=(
     "unbounded shell execution via Command::new(<shell>).arg(\"-c\")"
     "shelling out to recursive rm command construction"
     "destructive git clean of entire working tree"
+    "recursive delete targeting quoted root path"
+    "recursive delete targeting quoted home path"
+)
+
+# Multiline rules that require rg -U (multiline mode).
+# These detect Rust Command::new patterns split across lines.
+declare -a ML_RULE_IDS=(
+    "TSG005M"
+    "TSG006M"
+)
+
+declare -a ML_RULE_PATTERNS=(
+    'Command::new\s*\(\s*"(sh|bash|zsh)"\s*\)\s*\n\s*\.\s*arg\s*\(\s*"-c"'
+    'Command::new\s*\(\s*"rm"\s*\)\s*\n\s*\.arg\s*\(\s*"(-rf|-fr|-r)"\s*\)'
+)
+
+declare -a ML_RULE_DESCRIPTIONS=(
+    "multiline unbounded shell execution via Command::new(<shell>).arg(\"-c\")"
+    "multiline shelling out to recursive rm command construction"
 )
 
 is_allowlisted() {
@@ -188,6 +211,14 @@ collect_default_targets() {
             printf '%s\n' "${file}"
         fi
     done < <(rg --files . --glob '*.rs' --glob '*.sh' --glob '*.bash' --glob '*.zsh' --glob '*.py' | sort)
+
+    # Also scan src/ Rust files that contain #[cfg(test)] modules.
+    # Tests embedded in src/ via #[cfg(test)] are a common Rust pattern and
+    # must not escape the safety net.
+    while IFS= read -r file; do
+        file="${file#./}"
+        printf '%s\n' "${file}"
+    done < <(rg --files-with-matches '#\[cfg\(test\)\]' --glob '*/src/**/*.rs' . 2>/dev/null | sort)
 }
 
 collect_from_target() {
@@ -216,7 +247,7 @@ cd "${REPO_ROOT}"
 
 declare -a FILES=()
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-    mapfile -t FILES < <(collect_default_targets)
+    mapfile -t FILES < <(collect_default_targets | sort -u)
 else
     while IFS= read -r file; do
         FILES+=("${file}")
@@ -261,6 +292,41 @@ for i in "${!RULE_IDS[@]}"; do
         log_error "  ${text}"
     done < <(rg --with-filename --line-number --no-heading --color never -e "${rule_pattern}" "${FILES[@]}" || true)
 done
+
+# --- Multiline scan pass ---
+# Detects Rust patterns split across lines (e.g., Command::new("sh")\n  .arg("-c")).
+# Uses rg -U for multiline matching. Report the first line of each match.
+rust_files=()
+for file in "${FILES[@]}"; do
+    if [[ "${file}" == *.rs ]]; then
+        rust_files+=("${file}")
+    fi
+done
+
+if [[ ${#rust_files[@]} -gt 0 ]]; then
+    for i in "${!ML_RULE_IDS[@]}"; do
+        ml_rule_id="${ML_RULE_IDS[$i]}"
+        ml_rule_pattern="${ML_RULE_PATTERNS[$i]}"
+        ml_rule_desc="${ML_RULE_DESCRIPTIONS[$i]}"
+
+        while IFS= read -r match; do
+            [[ -z "${match}" ]] && continue
+
+            file="${match%%:*}"
+            rest="${match#*:}"
+            line="${rest%%:*}"
+            text="${rest#*:}"
+
+            if is_allowlisted "${ml_rule_id}" "${file}" "${line}" "${text}"; then
+                continue
+            fi
+
+            ((violations += 1))
+            log_error "[${ml_rule_id}] ${file}:${line} ${ml_rule_desc}"
+            log_error "  ${text}"
+        done < <(rg -U --with-filename --line-number --no-heading --color never -e "${ml_rule_pattern}" "${rust_files[@]}" || true)
+    done
+fi
 
 echo
 if [[ ${violations} -gt 0 ]]; then
