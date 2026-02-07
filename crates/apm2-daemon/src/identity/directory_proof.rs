@@ -8,6 +8,8 @@
 //! These artifacts provide bounded, deterministic, CAS-addressable identity
 //! verification inputs for boundary-crossing authority decisions.
 
+use std::collections::{HashMap, VecDeque};
+
 use apm2_core::crypto::Hash;
 use apm2_core::evidence::{CasError, ContentAddressedStore};
 use thiserror::Error;
@@ -20,6 +22,7 @@ use super::{
 const DIRECTORY_HEAD_DOMAIN_SEPARATOR: &[u8] = b"apm2:holon_directory_head:v1\0";
 const DIRECTORY_PROOF_DOMAIN_SEPARATOR: &[u8] = b"apm2:directory_proof:v1\0";
 const IDENTITY_PROOF_DOMAIN_SEPARATOR: &[u8] = b"apm2:identity_proof:v1\0";
+const IDENTITY_PROOF_PROFILE_DOMAIN_SEPARATOR: &[u8] = b"apm2:identity_proof_profile.v1\n";
 const DIRECTORY_KEY_DOMAIN_SEPARATOR: &[u8] = b"apm2:dir_key:v1\n";
 const DIRECTORY_LEAF_DOMAIN_SEPARATOR: &[u8] = b"apm2:dir_leaf:v1\0";
 const DIRECTORY_NODE_DOMAIN_SEPARATOR: &[u8] = b"apm2:dir_node:v1\0";
@@ -34,8 +37,17 @@ pub const MAX_DIRECTORY_HEAD_BYTES: usize = 4 * 1024;
 pub const MAX_DIRECTORY_PROOF_BYTES: usize = 64 * 1024;
 /// Absolute upper bound for serialized `IdentityProofV1` bytes.
 pub const MAX_IDENTITY_PROOF_BYTES: usize = 128 * 1024;
+/// Absolute upper bound for serialized `IdentityProofProfileV1` bytes.
+pub const MAX_IDENTITY_PROOF_PROFILE_BYTES: usize = 4 * 1024;
 /// Maximum allowed sibling nodes in `DirectoryProofV1`.
 pub const MAX_DIRECTORY_SIBLINGS: usize = 256;
+/// SMT verifier depth cap for 10^12 namespace target (`ceil(log2(10^12)) ~=
+/// 40`) with safety margin.
+pub const MAX_SMT_DEPTH: u32 = 48;
+/// Minimum profile depth for 10^12 namespace target.
+pub const MIN_SMT_DEPTH_10E12: u32 = 40;
+/// Maximum hash operations per membership proof for the baseline profile.
+pub const MAX_HASH_OPS_PER_MEMBERSHIP_PROOF_10E12: u32 = 96;
 
 /// Errors for directory-head/proof parsing and verification.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -134,6 +146,24 @@ pub enum IdentityProofError {
         max: usize,
     },
 
+    /// Proof depth exceeds policy/profile bound.
+    #[error("proof depth {depth} exceeds max_depth {max_depth}")]
+    DepthExceeded {
+        /// Actual sibling depth.
+        depth: usize,
+        /// Allowed maximum depth.
+        max_depth: u32,
+    },
+
+    /// Proof has too many non-default siblings for configured economics.
+    #[error("non-default sibling count {count} exceeds max {max}")]
+    NonDefaultSiblingsExceeded {
+        /// Actual non-default sibling count.
+        count: usize,
+        /// Allowed maximum count.
+        max: u32,
+    },
+
     /// SMT proof depth exceeded 256-bit key space.
     #[error("SMT proof depth {depth} exceeds 256-bit key space")]
     SmtDepthExceeded {
@@ -194,6 +224,15 @@ pub enum IdentityProofError {
     #[error("freshness policy hash mismatch")]
     FreshnessPolicyMismatch,
 
+    /// Identity proof profile kind does not match proof kind.
+    #[error("identity proof profile kind mismatch: profile {profile_kind:?}, proof {proof_kind:?}")]
+    IdentityProofProfileKindMismatch {
+        /// Profile-advertised proof kind.
+        profile_kind: DirectoryProofKindV1,
+        /// Proof-advertised kind.
+        proof_kind: DirectoryProofKindV1,
+    },
+
     /// Current tick predates proof generation tick.
     #[error("proof not yet valid at current tick {current_tick}; generated_at {generated_at_tick}")]
     ProofNotYetValid {
@@ -211,6 +250,10 @@ pub enum IdentityProofError {
         /// Maximum allowed staleness in ticks.
         max_staleness_ticks: u64,
     },
+
+    /// Requested head is not cached in verifier.
+    #[error("verified head cache miss")]
+    VerifiedHeadCacheMiss,
 }
 
 impl From<CasError> for IdentityProofError {
@@ -618,6 +661,313 @@ impl DirectoryProofKindV1 {
     }
 }
 
+/// Alias for `DirectoryProofKindV1` used by verification economics artifacts.
+pub type DirectoryProofKind = DirectoryProofKindV1;
+
+/// Verifier economics target for one identity-proof profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VerifierCostTarget {
+    /// Maximum hash operations for one membership proof verification.
+    pub max_hash_ops_per_membership_proof: u32,
+    /// Maximum signature/quorum checks required per cached head admission.
+    pub max_signature_or_quorum_checks_per_cached_head: u32,
+    /// Maximum bytes a verifier is expected to fetch for one verification path.
+    pub max_bytes_fetched_for_verification: u32,
+}
+
+impl VerifierCostTarget {
+    fn validate(self, max_depth: u32) -> Result<(), IdentityProofError> {
+        if self.max_hash_ops_per_membership_proof == 0 {
+            return Err(IdentityProofError::InvalidField {
+                field: "verifier_cost_target.max_hash_ops_per_membership_proof",
+                reason: "must be non-zero".to_string(),
+            });
+        }
+        if self.max_hash_ops_per_membership_proof > MAX_HASH_OPS_PER_MEMBERSHIP_PROOF_10E12 {
+            return Err(IdentityProofError::InvalidField {
+                field: "verifier_cost_target.max_hash_ops_per_membership_proof",
+                reason: format!(
+                    "{} exceeds 10^12 scale target cap {}",
+                    self.max_hash_ops_per_membership_proof, MAX_HASH_OPS_PER_MEMBERSHIP_PROOF_10E12
+                ),
+            });
+        }
+        if self.max_hash_ops_per_membership_proof < max_depth {
+            return Err(IdentityProofError::InvalidField {
+                field: "verifier_cost_target.max_hash_ops_per_membership_proof",
+                reason: format!(
+                    "{} must be >= max_depth {max_depth}",
+                    self.max_hash_ops_per_membership_proof
+                ),
+            });
+        }
+
+        if self.max_signature_or_quorum_checks_per_cached_head == 0 {
+            return Err(IdentityProofError::InvalidField {
+                field: "verifier_cost_target.max_signature_or_quorum_checks_per_cached_head",
+                reason: "must be non-zero".to_string(),
+            });
+        }
+
+        // O(1) check budget per cached head admission.
+        if self.max_signature_or_quorum_checks_per_cached_head > 8 {
+            return Err(IdentityProofError::InvalidField {
+                field: "verifier_cost_target.max_signature_or_quorum_checks_per_cached_head",
+                reason: "must be bounded to O(1)".to_string(),
+            });
+        }
+
+        let max_fetch_budget = u32::try_from(
+            MAX_DIRECTORY_HEAD_BYTES + MAX_DIRECTORY_PROOF_BYTES + MAX_IDENTITY_PROOF_BYTES,
+        )
+        .map_err(|_| IdentityProofError::InvalidField {
+            field: "verifier_cost_target.max_bytes_fetched_for_verification",
+            reason: "internal max fetch budget exceeds u32".to_string(),
+        })?;
+        if self.max_bytes_fetched_for_verification == 0
+            || self.max_bytes_fetched_for_verification > max_fetch_budget
+        {
+            return Err(IdentityProofError::InvalidField {
+                field: "verifier_cost_target.max_bytes_fetched_for_verification",
+                reason: format!(
+                    "must be in 1..={max_fetch_budget}, got {}",
+                    self.max_bytes_fetched_for_verification
+                ),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Verification economics contract artifact (HSI §1.7.7b).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdentityProofProfileV1 {
+    /// Directory proof kind this profile admits.
+    pub directory_kind: DirectoryProofKind,
+    /// Maximum proof depth (siblings) admitted by verifier.
+    pub max_depth: u32,
+    /// Maximum serialized proof bytes admitted by verifier.
+    pub max_proof_bytes: u32,
+    /// Maximum non-default siblings admitted by verifier.
+    pub max_non_default_siblings: u32,
+    /// Whether this profile supports membership multiproofs.
+    pub supports_membership_multiproof: bool,
+    /// Whether this profile supports explicit non-membership proofs.
+    pub supports_non_membership_proof: bool,
+    /// Verifier resource budget target.
+    pub verifier_cost_target: VerifierCostTarget,
+}
+
+impl IdentityProofProfileV1 {
+    /// Baseline 10^12 namespace profile for SMT-256 verification.
+    pub const fn baseline_smt_10e12() -> Self {
+        Self {
+            directory_kind: DirectoryProofKindV1::Smt256CompressedV1,
+            max_depth: MAX_SMT_DEPTH,
+            max_proof_bytes: 8192,
+            max_non_default_siblings: MAX_SMT_DEPTH,
+            supports_membership_multiproof: false,
+            supports_non_membership_proof: true,
+            verifier_cost_target: VerifierCostTarget {
+                max_hash_ops_per_membership_proof: MAX_HASH_OPS_PER_MEMBERSHIP_PROOF_10E12,
+                max_signature_or_quorum_checks_per_cached_head: 1,
+                max_bytes_fetched_for_verification: 16 * 1024,
+            },
+        }
+    }
+
+    /// Validates fail-closed profile invariants.
+    pub fn validate(&self) -> Result<(), IdentityProofError> {
+        if self.max_depth < MIN_SMT_DEPTH_10E12 {
+            return Err(IdentityProofError::InvalidField {
+                field: "max_depth",
+                reason: format!(
+                    "{} below 10^12 scale target floor {MIN_SMT_DEPTH_10E12}",
+                    self.max_depth
+                ),
+            });
+        }
+        if self.max_depth > MAX_SMT_DEPTH {
+            return Err(IdentityProofError::InvalidField {
+                field: "max_depth",
+                reason: format!("{} exceeds verifier cap {MAX_SMT_DEPTH}", self.max_depth),
+            });
+        }
+
+        if self.max_proof_bytes == 0 {
+            return Err(IdentityProofError::InvalidField {
+                field: "max_proof_bytes",
+                reason: "must be non-zero".to_string(),
+            });
+        }
+        if usize::try_from(self.max_proof_bytes).ok() > Some(MAX_DIRECTORY_PROOF_BYTES) {
+            return Err(IdentityProofError::InvalidField {
+                field: "max_proof_bytes",
+                reason: format!(
+                    "{} exceeds absolute verifier cap {MAX_DIRECTORY_PROOF_BYTES}",
+                    self.max_proof_bytes
+                ),
+            });
+        }
+
+        if self.max_non_default_siblings == 0 {
+            return Err(IdentityProofError::InvalidField {
+                field: "max_non_default_siblings",
+                reason: "must be non-zero".to_string(),
+            });
+        }
+        if self.max_non_default_siblings > self.max_depth {
+            return Err(IdentityProofError::InvalidField {
+                field: "max_non_default_siblings",
+                reason: format!(
+                    "{} exceeds max_depth {}",
+                    self.max_non_default_siblings, self.max_depth
+                ),
+            });
+        }
+
+        self.verifier_cost_target.validate(self.max_depth)?;
+        Ok(())
+    }
+
+    /// Deterministic canonical bytes for CAS addressing.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, IdentityProofError> {
+        self.validate()?;
+
+        let mut out = Vec::with_capacity(
+            IDENTITY_PROOF_PROFILE_DOMAIN_SEPARATOR.len() + 1 + 4 + 4 + 4 + 1 + 1 + 4 + 4 + 4,
+        );
+        out.extend_from_slice(IDENTITY_PROOF_PROFILE_DOMAIN_SEPARATOR);
+        out.push(self.directory_kind.to_byte());
+        out.extend_from_slice(&self.max_depth.to_le_bytes());
+        out.extend_from_slice(&self.max_proof_bytes.to_le_bytes());
+        out.extend_from_slice(&self.max_non_default_siblings.to_le_bytes());
+        out.push(u8::from(self.supports_membership_multiproof));
+        out.push(u8::from(self.supports_non_membership_proof));
+        out.extend_from_slice(
+            &self
+                .verifier_cost_target
+                .max_hash_ops_per_membership_proof
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(
+            &self
+                .verifier_cost_target
+                .max_signature_or_quorum_checks_per_cached_head
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(
+            &self
+                .verifier_cost_target
+                .max_bytes_fetched_for_verification
+                .to_le_bytes(),
+        );
+
+        Ok(out)
+    }
+
+    /// Parses canonical bytes with caller-provided decode bound.
+    pub fn from_canonical_bytes_bounded(
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<Self, IdentityProofError> {
+        if bytes.len() > max_bytes {
+            return Err(IdentityProofError::DecodeBoundExceeded {
+                size: bytes.len(),
+                max: max_bytes,
+            });
+        }
+        if bytes.len() > MAX_IDENTITY_PROOF_PROFILE_BYTES {
+            return Err(IdentityProofError::DecodeBoundExceeded {
+                size: bytes.len(),
+                max: MAX_IDENTITY_PROOF_PROFILE_BYTES,
+            });
+        }
+
+        let mut cursor = Cursor::new(bytes);
+        cursor.consume_prefix(
+            IDENTITY_PROOF_PROFILE_DOMAIN_SEPARATOR,
+            "IdentityProofProfileV1",
+            "IdentityProofProfileV1",
+        )?;
+
+        let directory_kind = DirectoryProofKindV1::from_byte(cursor.read_u8("directory_kind")?)?;
+        let max_depth = cursor.read_u32("max_depth")?;
+        let max_proof_bytes = cursor.read_u32("max_proof_bytes")?;
+        let max_non_default_siblings = cursor.read_u32("max_non_default_siblings")?;
+
+        let supports_membership_multiproof =
+            match cursor.read_u8("supports_membership_multiproof")? {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(IdentityProofError::InvalidField {
+                        field: "supports_membership_multiproof",
+                        reason: "must be 0 or 1".to_string(),
+                    });
+                },
+            };
+        let supports_non_membership_proof = match cursor.read_u8("supports_non_membership_proof")? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(IdentityProofError::InvalidField {
+                    field: "supports_non_membership_proof",
+                    reason: "must be 0 or 1".to_string(),
+                });
+            },
+        };
+
+        let verifier_cost_target = VerifierCostTarget {
+            max_hash_ops_per_membership_proof: cursor
+                .read_u32("verifier_cost_target.max_hash_ops_per_membership_proof")?,
+            max_signature_or_quorum_checks_per_cached_head: cursor
+                .read_u32("verifier_cost_target.max_signature_or_quorum_checks_per_cached_head")?,
+            max_bytes_fetched_for_verification: cursor
+                .read_u32("verifier_cost_target.max_bytes_fetched_for_verification")?,
+        };
+
+        cursor.ensure_exhausted("IdentityProofProfileV1")?;
+
+        let profile = Self {
+            directory_kind,
+            max_depth,
+            max_proof_bytes,
+            max_non_default_siblings,
+            supports_membership_multiproof,
+            supports_non_membership_proof,
+            verifier_cost_target,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Verifies one directory proof under this profile and the provided head.
+    pub fn verify_directory_proof(
+        &self,
+        head: &HolonDirectoryHeadV1,
+        proof: &DirectoryProofV1,
+    ) -> Result<(), IdentityProofError> {
+        self.validate()?;
+
+        if self.directory_kind != proof.kind() {
+            return Err(IdentityProofError::IdentityProofProfileKindMismatch {
+                profile_kind: self.directory_kind,
+                proof_kind: proof.kind(),
+            });
+        }
+        check_directory_kind_compatibility(head.directory_kind(), self.directory_kind)?;
+
+        proof.verify_against_root(
+            head.directory_root_hash(),
+            self.max_proof_bytes.min(head.max_proof_bytes()),
+            self.max_depth,
+            self.max_non_default_siblings,
+        )
+    }
+}
+
 /// Status of a directory entry (K-V binding semantics).
 ///
 /// A directory entry maps a holon identity key to a value (e.g., holon
@@ -751,6 +1101,13 @@ impl DirectoryProofV1 {
 
     /// Validates fail-closed structural invariants.
     pub fn validate(&self) -> Result<(), IdentityProofError> {
+        if self.siblings.is_empty() {
+            return Err(IdentityProofError::InvalidField {
+                field: "siblings",
+                reason: "must contain at least one sibling".to_string(),
+            });
+        }
+
         if self.siblings.len() > MAX_DIRECTORY_SIBLINGS {
             return Err(IdentityProofError::TooManySiblings {
                 count: self.siblings.len(),
@@ -880,6 +1237,8 @@ impl DirectoryProofV1 {
         &self,
         root_hash: &[u8; HASH_BYTES],
         max_proof_bytes: u32,
+        max_depth: u32,
+        max_non_default_siblings: u32,
     ) -> Result<(), IdentityProofError> {
         self.validate()?;
 
@@ -887,6 +1246,45 @@ impl DirectoryProofV1 {
             return Err(IdentityProofError::ProofBytesExceeded {
                 proof_bytes_len: self.proof_bytes_len,
                 max_proof_bytes,
+            });
+        }
+
+        if max_depth == 0 {
+            return Err(IdentityProofError::InvalidField {
+                field: "max_depth",
+                reason: "must be non-zero".to_string(),
+            });
+        }
+        if max_depth > MAX_SMT_DEPTH {
+            return Err(IdentityProofError::InvalidField {
+                field: "max_depth",
+                reason: format!("{max_depth} exceeds verifier cap {MAX_SMT_DEPTH}"),
+            });
+        }
+        if self.siblings.len()
+            > usize::try_from(max_depth).map_err(|_| IdentityProofError::InvalidField {
+                field: "max_depth",
+                reason: "cannot fit into usize".to_string(),
+            })?
+        {
+            return Err(IdentityProofError::DepthExceeded {
+                depth: self.siblings.len(),
+                max_depth,
+            });
+        }
+
+        let non_default_sibling_count = self.non_default_sibling_count();
+        let max_non_default_siblings_usize =
+            usize::try_from(max_non_default_siblings).map_err(|_| {
+                IdentityProofError::InvalidField {
+                    field: "max_non_default_siblings",
+                    reason: "cannot fit into usize".to_string(),
+                }
+            })?;
+        if non_default_sibling_count > max_non_default_siblings_usize {
+            return Err(IdentityProofError::NonDefaultSiblingsExceeded {
+                count: non_default_sibling_count,
+                max: max_non_default_siblings,
             });
         }
 
@@ -961,6 +1359,14 @@ impl DirectoryProofV1 {
     /// Returns siblings.
     pub fn siblings(&self) -> &[SiblingNode] {
         &self.siblings
+    }
+
+    /// Returns the number of non-default siblings (all-zero hash is default).
+    pub fn non_default_sibling_count(&self) -> usize {
+        self.siblings
+            .iter()
+            .filter(|sibling| sibling.hash() != &[0u8; HASH_BYTES])
+            .count()
     }
 
     /// Returns explicit proof byte length.
@@ -1281,9 +1687,13 @@ impl IdentityProofV1 {
             return Err(IdentityProofError::DirectoryKeyMismatch);
         }
 
+        // Proof-profile pinning is implemented in TCK-00358. Until then,
+        // verification uses the RFC-0020 10^12 baseline SMT cap.
         self.directory_proof.verify_against_root(
             directory_head.directory_root_hash(),
             directory_head.max_proof_bytes(),
+            MAX_SMT_DEPTH,
+            MAX_SMT_DEPTH,
         )?;
 
         // Step 5a: Verify K->V value semantics.
@@ -1352,6 +1762,141 @@ impl IdentityProofV1 {
     /// Proof generation tick.
     pub const fn proof_generated_at_tick(&self) -> u64 {
         self.proof_generated_at_tick
+    }
+}
+
+/// Structurally admitted directory head retained in verifier cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
+#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
+pub(crate) struct VerifiedHead {
+    /// Cached directory head commitment.
+    pub(crate) head: HolonDirectoryHeadV1,
+    /// Directory epoch tick at which this head was admitted to the cache.
+    /// Uses the same epoch unit as `HolonDirectoryHeadV1::directory_epoch`.
+    pub(crate) verified_at: u64,
+}
+
+/// Structural verification cache for directory heads.
+///
+/// **SECURITY: This cache verifies structural proof validity (root hash,
+/// kind compatibility, depth/sibling bounds) only. It does NOT verify
+/// authority seals, certificate binding, freshness policy, or holon
+/// identity binding. Callers MUST NOT use results from this cache as
+/// authorization signals without completing the full identity verification
+/// pipeline (see `IdentityProofV1::verify()`).**
+///
+/// This cache supports the O(1) head amortization contract from HSI §1.7.7c:
+/// once a head is admitted (structural + root check), proof verification
+/// against that head requires only O(log n) hashing, not repeated
+/// signature/quorum checks.
+///
+/// Full authority/freshness/binding verification will be enforced at the
+/// cache boundary in TCK-00358/TCK-00359 when the verifier cache policy
+/// is implemented.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
+#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
+pub(crate) struct VerifiedHeadCache {
+    heads: HashMap<[u8; HASH_BYTES], VerifiedHead>,
+    admission_order: VecDeque<[u8; HASH_BYTES]>,
+    max_entries: usize,
+}
+
+#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
+#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
+impl VerifiedHeadCache {
+    /// Creates a new bounded cache with at least one entry of capacity.
+    #[must_use]
+    pub(crate) fn new(max_entries: usize) -> Self {
+        Self {
+            heads: HashMap::new(),
+            admission_order: VecDeque::new(),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    /// Admits a structurally verified head into cache.
+    pub(crate) fn admit_head(
+        &mut self,
+        head_hash: [u8; HASH_BYTES],
+        head: HolonDirectoryHeadV1,
+    ) -> Result<(), IdentityProofError> {
+        head.validate()?;
+
+        let computed_hash = head.content_hash()?;
+        if computed_hash != head_hash {
+            return Err(IdentityProofError::HashMismatch {
+                field: "verified_head_cache.head_hash",
+            });
+        }
+
+        // Keep admission order unique and bounded.
+        self.admission_order
+            .retain(|cached_hash| cached_hash != &head_hash);
+        self.admission_order.push_back(head_hash);
+        self.heads.insert(
+            head_hash,
+            VerifiedHead {
+                verified_at: head.directory_epoch(),
+                head,
+            },
+        );
+
+        while self.heads.len() > self.max_entries {
+            if let Some(evicted_hash) = self.admission_order.pop_front() {
+                self.heads.remove(&evicted_hash);
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify a proof against a cached head's root. Returns the
+    /// proof-derived `DirectoryEntryStatus`.
+    ///
+    /// **SECURITY: This verifies structural proof validity only.
+    /// See struct-level documentation for authorization caveats.**
+    pub(crate) fn verify_identity(
+        &self,
+        head_hash: &[u8; HASH_BYTES],
+        proof: &IdentityProofV1,
+    ) -> Result<DirectoryEntryStatus, IdentityProofError> {
+        let cached_head = self
+            .heads
+            .get(head_hash)
+            .ok_or(IdentityProofError::VerifiedHeadCacheMiss)?;
+
+        if proof.holon_directory_head_hash() != head_hash {
+            return Err(IdentityProofError::HashMismatch {
+                field: "holon_directory_head_hash",
+            });
+        }
+
+        check_directory_kind_compatibility(
+            cached_head.head.directory_kind(),
+            proof.directory_proof().kind(),
+        )?;
+
+        proof.directory_proof().verify_against_root(
+            cached_head.head.directory_root_hash(),
+            cached_head.head.max_proof_bytes(),
+            MAX_SMT_DEPTH,
+            MAX_SMT_DEPTH,
+        )?;
+
+        let structural_status = proof.directory_proof().entry_status();
+        Ok(structural_status)
+    }
+
+    /// Evicts cached heads older than `cutoff_epoch` directory epoch ticks.
+    pub(crate) fn evict_stale(&mut self, cutoff_epoch: u64) {
+        self.heads
+            .retain(|_, verified_head| verified_head.verified_at >= cutoff_epoch);
+        self.admission_order
+            .retain(|head_hash| self.heads.contains_key(head_hash));
     }
 }
 
@@ -1625,6 +2170,45 @@ mod tests {
         current
     }
 
+    fn make_test_head(
+        cell_id: CellIdV1,
+        root: [u8; HASH_BYTES],
+        directory_kind: DirectoryKindV1,
+        max_proof_bytes: u32,
+    ) -> HolonDirectoryHeadV1 {
+        HolonDirectoryHeadV1::new(
+            cell_id,
+            12,
+            LedgerAnchorV1::ConsensusIndex { index: 99 },
+            root,
+            directory_kind,
+            1,
+            max_proof_bytes,
+            [0x61; HASH_BYTES],
+            [0x62; HASH_BYTES],
+            [0x63; HASH_BYTES],
+            None,
+        )
+        .unwrap()
+    }
+
+    fn make_test_identity_proof(
+        cell_cert: &CellCertificateV1,
+        holon_cert: &HolonCertificateV1,
+        head: &HolonDirectoryHeadV1,
+        proof: DirectoryProofV1,
+        proof_generated_at_tick: u64,
+    ) -> IdentityProofV1 {
+        IdentityProofV1::new(
+            Some(hash_bytes(&cell_cert.canonical_bytes().unwrap())),
+            hash_bytes(&holon_cert.canonical_bytes().unwrap()),
+            head.content_hash().unwrap(),
+            proof,
+            proof_generated_at_tick,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn directory_proof_smt_verifies_against_computed_root() {
         let key = [0x11; HASH_BYTES];
@@ -1647,7 +2231,7 @@ mod tests {
 
         let root = compute_root_from_proof(&proof);
         proof
-            .verify_against_root(&root, proof.proof_bytes_len())
+            .verify_against_root(&root, proof.proof_bytes_len(), MAX_SMT_DEPTH, MAX_SMT_DEPTH)
             .expect("SMT proof should verify");
     }
 
@@ -1673,7 +2257,7 @@ mod tests {
 
         let root = compute_root_from_proof(&proof);
         proof
-            .verify_against_root(&root, proof.proof_bytes_len())
+            .verify_against_root(&root, proof.proof_bytes_len(), MAX_SMT_DEPTH, MAX_SMT_DEPTH)
             .expect("active proof should verify against its root");
 
         // Adversarial tampering: mutate only `entry_status` in the proof bytes
@@ -1687,7 +2271,12 @@ mod tests {
                 .expect("tampered bytes should still decode structurally");
 
         let err = tampered
-            .verify_against_root(&root, tampered.proof_bytes_len())
+            .verify_against_root(
+                &root,
+                tampered.proof_bytes_len(),
+                MAX_SMT_DEPTH,
+                MAX_SMT_DEPTH,
+            )
             .unwrap_err();
         assert!(
             matches!(err, IdentityProofError::DirectoryRootMismatch),
@@ -1712,7 +2301,12 @@ mod tests {
         let root = compute_root_from_proof(&proof);
 
         let err = proof
-            .verify_against_root(&root, proof.proof_bytes_len() - 1)
+            .verify_against_root(
+                &root,
+                proof.proof_bytes_len() - 1,
+                MAX_SMT_DEPTH,
+                MAX_SMT_DEPTH,
+            )
             .unwrap_err();
         assert!(matches!(err, IdentityProofError::ProofBytesExceeded { .. }));
     }
@@ -1774,7 +2368,12 @@ mod tests {
         .unwrap();
 
         let err = proof
-            .verify_against_root(&[0x40; HASH_BYTES], proof.proof_bytes_len())
+            .verify_against_root(
+                &[0x40; HASH_BYTES],
+                proof.proof_bytes_len(),
+                MAX_SMT_DEPTH,
+                MAX_SMT_DEPTH,
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -2264,6 +2863,579 @@ mod tests {
             matches!(err, IdentityProofError::DirectoryKindMismatch { .. }),
             "expected DirectoryKindMismatch, got: {err:?}"
         );
+    }
+
+    // ====================================================================
+    // TCK-00357: malformed proof negatives
+    // ====================================================================
+
+    #[test]
+    fn test_forged_root_hash_rejected() {
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0x11; HASH_BYTES],
+            [0x22; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x33; HASH_BYTES]),
+                SiblingNode::new([0x44; HASH_BYTES]),
+                SiblingNode::new([0x55; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let mut forged_root = compute_root_from_proof(&proof);
+        forged_root[0] ^= 0x80;
+
+        let err = proof
+            .verify_against_root(
+                &forged_root,
+                proof.proof_bytes_len(),
+                MAX_SMT_DEPTH,
+                MAX_SMT_DEPTH,
+            )
+            .unwrap_err();
+        assert!(matches!(err, IdentityProofError::DirectoryRootMismatch));
+    }
+
+    #[test]
+    fn test_truncated_proof_bytes_rejected() {
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0x10; HASH_BYTES],
+            [0x20; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x30; HASH_BYTES]),
+                SiblingNode::new([0x40; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let bytes = proof.canonical_bytes().unwrap();
+        let truncated = &bytes[..bytes.len() - 10];
+
+        let err =
+            DirectoryProofV1::from_canonical_bytes_bounded(truncated, truncated.len()).unwrap_err();
+        assert!(matches!(err, IdentityProofError::Truncated { .. }));
+    }
+
+    #[test]
+    fn test_corrupted_sibling_hash_rejected() {
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0x01; HASH_BYTES],
+            [0x02; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x03; HASH_BYTES]),
+                SiblingNode::new([0x04; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+
+        let mut bytes = proof.canonical_bytes().unwrap();
+        let first_sibling_offset =
+            DIRECTORY_PROOF_DOMAIN_SEPARATOR.len() + 1 + HASH_BYTES + HASH_BYTES + 1 + 4 + 4;
+        bytes[first_sibling_offset] ^= 0x01;
+
+        let corrupted =
+            DirectoryProofV1::from_canonical_bytes_bounded(&bytes, bytes.len()).unwrap();
+        let err = corrupted
+            .verify_against_root(
+                &root,
+                corrupted.proof_bytes_len(),
+                MAX_SMT_DEPTH,
+                MAX_SMT_DEPTH,
+            )
+            .unwrap_err();
+        assert!(matches!(err, IdentityProofError::DirectoryRootMismatch));
+    }
+
+    #[test]
+    fn test_empty_siblings_list_rejected() {
+        let err = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0xAA; HASH_BYTES],
+            [0xBB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::InvalidField {
+                field: "siblings",
+                ..
+            }
+        ));
+    }
+
+    // ====================================================================
+    // TCK-00357: over-depth / over-size negatives
+    // ====================================================================
+
+    #[test]
+    fn test_proof_exceeds_max_depth_rejected() {
+        let siblings = (0..=MAX_SMT_DEPTH)
+            .map(|i| SiblingNode::new([u8::try_from(i).unwrap_or(0xFE); HASH_BYTES]))
+            .collect::<Vec<_>>();
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0x10; HASH_BYTES],
+            [0x20; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            siblings,
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+
+        let err = proof
+            .verify_against_root(&root, proof.proof_bytes_len(), MAX_SMT_DEPTH, MAX_SMT_DEPTH)
+            .unwrap_err();
+        assert!(matches!(err, IdentityProofError::DepthExceeded { .. }));
+    }
+
+    #[test]
+    fn test_proof_exceeds_max_proof_bytes_rejected() {
+        let oversized = vec![0u8; MAX_DIRECTORY_PROOF_BYTES + 1];
+        let err = DirectoryProofV1::from_canonical_bytes_bounded(&oversized, oversized.len())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::DecodeBoundExceeded {
+                max: MAX_DIRECTORY_PROOF_BYTES,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_proof_exceeds_max_siblings_rejected() {
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0x01; HASH_BYTES],
+            [0x02; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x03; HASH_BYTES])],
+        )
+        .unwrap();
+
+        let mut bytes = proof.canonical_bytes().unwrap();
+        let sibling_count_offset =
+            DIRECTORY_PROOF_DOMAIN_SEPARATOR.len() + 1 + HASH_BYTES + HASH_BYTES + 1 + 4;
+        let excessive_count =
+            u32::try_from(MAX_DIRECTORY_SIBLINGS).expect("MAX_DIRECTORY_SIBLINGS fits in u32") + 1;
+        bytes[sibling_count_offset..sibling_count_offset + 4]
+            .copy_from_slice(&excessive_count.to_le_bytes());
+
+        let err = DirectoryProofV1::from_canonical_bytes_bounded(&bytes, bytes.len()).unwrap_err();
+        assert!(matches!(err, IdentityProofError::TooManySiblings { .. }));
+    }
+
+    #[test]
+    fn test_proof_exceeds_profile_max_depth_rejected() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+
+        let siblings = (0..=MIN_SMT_DEPTH_10E12)
+            .map(|i| SiblingNode::new([u8::try_from(i).unwrap_or(0xEE); HASH_BYTES]))
+            .collect::<Vec<_>>();
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            siblings,
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+
+        let profile = IdentityProofProfileV1 {
+            max_depth: MIN_SMT_DEPTH_10E12,
+            max_non_default_siblings: MIN_SMT_DEPTH_10E12,
+            ..IdentityProofProfileV1::baseline_smt_10e12()
+        };
+        let err = profile.verify_directory_proof(&head, &proof).unwrap_err();
+        assert!(matches!(err, IdentityProofError::DepthExceeded { .. }));
+    }
+
+    // ====================================================================
+    // TCK-00357: forged proof negatives
+    // ====================================================================
+
+    #[test]
+    fn test_inclusion_proof_with_wrong_key_rejected() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+
+        let mut wrong_key = derive_directory_key(holon_cert.holon_id());
+        wrong_key[0] ^= 0x01;
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            wrong_key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let err = identity_proof
+            .verify(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &[0xAB; HASH_BYTES],
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, IdentityProofError::DirectoryKeyMismatch));
+    }
+
+    #[test]
+    fn test_inclusion_proof_with_wrong_value_rejected() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let err = identity_proof
+            .verify(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &[0xCD; HASH_BYTES],
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, IdentityProofError::ValueHashMismatch { .. }));
+    }
+
+    #[test]
+    fn test_non_membership_proof_forged_as_membership_rejected() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            default_empty_value_hash(),
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let err = identity_proof
+            .verify(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &[0xEF; HASH_BYTES],
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, IdentityProofError::ValueHashMismatch { .. }));
+    }
+
+    // ====================================================================
+    // TCK-00357: kind compatibility negatives
+    // ====================================================================
+
+    #[test]
+    fn test_patricia_proof_rejected_at_admission() {
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0x01; HASH_BYTES],
+            [0x02; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x03; HASH_BYTES])],
+        )
+        .unwrap();
+
+        let mut bytes = proof.canonical_bytes().unwrap();
+        let kind_offset = DIRECTORY_PROOF_DOMAIN_SEPARATOR.len();
+        bytes[kind_offset] = DirectoryProofKindV1::PatriciaCompressedV1.to_byte();
+
+        let err = DirectoryProofV1::from_canonical_bytes_bounded(&bytes, bytes.len()).unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::UnsupportedDirectoryProofKind {
+                kind: DirectoryProofKindV1::PatriciaCompressedV1
+            }
+        ));
+    }
+
+    #[test]
+    fn test_profile_kind_mismatch_rejected() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x10; HASH_BYTES])],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let patricia_head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::PatriciaTrieV1,
+            8192,
+        );
+        let identity_proof =
+            make_test_identity_proof(&cell_cert, &holon_cert, &patricia_head, proof, 100);
+
+        let err = identity_proof
+            .verify(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &patricia_head,
+                false,
+                105,
+                10,
+                patricia_head.freshness_policy_hash(),
+                &[0xAB; HASH_BYTES],
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::DirectoryKindMismatch { .. }
+        ));
+    }
+
+    // ====================================================================
+    // TCK-00357: profile/cache implementation tests
+    // ====================================================================
+
+    #[test]
+    fn identity_proof_profile_round_trip_and_bounded_decode() {
+        let profile = IdentityProofProfileV1::baseline_smt_10e12();
+        let bytes = profile.canonical_bytes().unwrap();
+        let parsed =
+            IdentityProofProfileV1::from_canonical_bytes_bounded(&bytes, bytes.len()).unwrap();
+        assert_eq!(parsed, profile);
+
+        let err = IdentityProofProfileV1::from_canonical_bytes_bounded(&bytes, bytes.len() - 1)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::DecodeBoundExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn identity_proof_profile_rejects_scale_target_violations() {
+        let bad_depth = IdentityProofProfileV1 {
+            max_depth: MIN_SMT_DEPTH_10E12 - 1,
+            ..IdentityProofProfileV1::baseline_smt_10e12()
+        };
+        let err = bad_depth.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::InvalidField {
+                field: "max_depth",
+                ..
+            }
+        ));
+
+        let mut bad_hash_ops = IdentityProofProfileV1::baseline_smt_10e12();
+        bad_hash_ops
+            .verifier_cost_target
+            .max_hash_ops_per_membership_proof = MAX_HASH_OPS_PER_MEMBERSHIP_PROOF_10E12 + 1;
+        let err = bad_hash_ops.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::InvalidField {
+                field: "verifier_cost_target.max_hash_ops_per_membership_proof",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn directory_proof_rejects_non_default_sibling_inflation() {
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            [0x01; HASH_BYTES],
+            [0x02; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+                SiblingNode::new([0x12; HASH_BYTES]),
+                SiblingNode::new([0x00; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+
+        let err = proof
+            .verify_against_root(&root, proof.proof_bytes_len(), 8, 2)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::NonDefaultSiblingsExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn verified_head_cache_amortizes_head_verification() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+        let head_hash = head.content_hash().unwrap();
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(head_hash, head).unwrap();
+        let status = cache.verify_identity(&head_hash, &identity_proof).unwrap();
+        assert_eq!(status, DirectoryEntryStatus::Active);
+    }
+
+    #[test]
+    fn verified_head_cache_evict_stale_entries() {
+        let cell_cert = make_cell_certificate();
+        let stale_head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            5,
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            [0xA1; HASH_BYTES],
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            [0xB1; HASH_BYTES],
+            [0xC1; HASH_BYTES],
+            [0xD1; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+        let boundary_head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            20,
+            LedgerAnchorV1::ConsensusIndex { index: 2 },
+            [0xA2; HASH_BYTES],
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            [0xB2; HASH_BYTES],
+            [0xC2; HASH_BYTES],
+            [0xD2; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+        let fresh_head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            25,
+            LedgerAnchorV1::ConsensusIndex { index: 3 },
+            [0xA3; HASH_BYTES],
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            [0xB3; HASH_BYTES],
+            [0xC3; HASH_BYTES],
+            [0xD3; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+        let stale_hash = stale_head.content_hash().unwrap();
+        let boundary_hash = boundary_head.content_hash().unwrap();
+        let fresh_hash = fresh_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(stale_hash, stale_head).unwrap();
+        cache.admit_head(boundary_hash, boundary_head).unwrap();
+        cache.admit_head(fresh_hash, fresh_head).unwrap();
+        cache.evict_stale(20);
+
+        assert!(!cache.heads.contains_key(&stale_hash));
+        assert!(cache.heads.contains_key(&boundary_hash));
+        assert!(cache.heads.contains_key(&fresh_hash));
     }
 
     #[test]

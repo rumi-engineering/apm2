@@ -126,7 +126,7 @@
 mod canonical_digest_id_kit;
 mod cell_id;
 mod certificate;
-mod directory_proof;
+pub(crate) mod directory_proof;
 mod holon_id;
 mod keyset_id;
 mod public_key_id;
@@ -139,11 +139,13 @@ pub use certificate::{
     CellCertificateV1, CertificateError, HolonCertificateV1, RevocationPointer, validate_key_roles,
 };
 pub use directory_proof::{
-    DirectoryEntryStatus, DirectoryKindV1, DirectoryProofKindV1, DirectoryProofV1,
-    HolonDirectoryHeadV1, IdentityProofError, IdentityProofV1, LedgerAnchorV1,
-    MAX_DIRECTORY_HEAD_BYTES, MAX_DIRECTORY_PROOF_BYTES, MAX_DIRECTORY_SIBLINGS,
-    MAX_IDENTITY_PROOF_BYTES, SiblingNode, check_directory_kind_compatibility,
-    default_empty_value_hash, derive_directory_key, validate_identity_proof_hash,
+    DirectoryEntryStatus, DirectoryKindV1, DirectoryProofKind, DirectoryProofKindV1,
+    DirectoryProofV1, HolonDirectoryHeadV1, IdentityProofError, IdentityProofProfileV1,
+    IdentityProofV1, LedgerAnchorV1, MAX_DIRECTORY_HEAD_BYTES, MAX_DIRECTORY_PROOF_BYTES,
+    MAX_DIRECTORY_SIBLINGS, MAX_HASH_OPS_PER_MEMBERSHIP_PROOF_10E12, MAX_IDENTITY_PROOF_BYTES,
+    MAX_IDENTITY_PROOF_PROFILE_BYTES, MAX_SMT_DEPTH, MIN_SMT_DEPTH_10E12, SiblingNode,
+    VerifierCostTarget, check_directory_kind_compatibility, default_empty_value_hash,
+    derive_directory_key, validate_identity_proof_hash,
 };
 pub use holon_id::{HolonGenesisV1, HolonIdV1, HolonPurpose};
 pub use keyset_id::{KeySetIdV1, SetTag};
