@@ -20,14 +20,13 @@
 
 use std::fmt;
 
+use super::canonical_digest_id_kit::CanonicalDigestIdKit;
 use super::cell_id::CellIdV1;
-use super::{
-    AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1, decode_hex_payload,
-    encode_hex_payload, validate_text_common,
-};
+use super::{AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1};
 
 /// Canonical text prefix for `HolonIdV1`.
 const PREFIX: &str = "holon:v1:blake3:";
+const CODEC: CanonicalDigestIdKit = CanonicalDigestIdKit::new(PREFIX);
 
 /// Domain separator for `HolonIdV1` derivation (HSI 1.7.4).
 const DOMAIN_SEPARATION: &[u8] = b"apm2:holon_id:v1\0";
@@ -268,46 +267,25 @@ impl HolonIdV1 {
 
     /// Parse a `HolonIdV1` from canonical text form.
     pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
-        validate_text_common(input)?;
-
-        let hex_payload = input.strip_prefix(PREFIX).ok_or_else(|| {
-            let got = input
-                .get(..PREFIX.len())
-                .map_or_else(|| input.to_string(), str::to_string);
-            KeyIdError::WrongPrefix {
-                expected: PREFIX,
-                got,
-            }
-        })?;
-
-        let hash = decode_hex_payload(hex_payload)?;
-        let mut binary = [0u8; BINARY_LEN];
-        binary[0] = VERSION_TAG_V1;
-        binary[1..].copy_from_slice(&hash);
+        let binary = CODEC.parse_text_binary_with_tag(input, VERSION_TAG_V1)?;
         Ok(Self { binary })
     }
 
     /// Construct from binary form (`version_tag + 32-byte hash`).
     pub fn from_binary(bytes: &[u8]) -> Result<Self, KeyIdError> {
-        if bytes.len() != BINARY_LEN {
-            return Err(KeyIdError::InvalidBinaryLength { got: bytes.len() });
-        }
-        if bytes[0] != VERSION_TAG_V1 {
-            return Err(KeyIdError::UnknownVersionTag { tag: bytes[0] });
-        }
-
-        let mut binary = [0u8; BINARY_LEN];
-        binary.copy_from_slice(bytes);
+        let binary = CODEC.parse_binary_exact(bytes, |tag| {
+            if tag == VERSION_TAG_V1 {
+                Ok(())
+            } else {
+                Err(KeyIdError::UnknownVersionTag { tag })
+            }
+        })?;
         Ok(Self { binary })
     }
 
     /// Return canonical text form: `holon:v1:blake3:<64-hex>`.
     pub fn to_text(&self) -> String {
-        let hash = self.holon_hash();
-        let mut out = String::with_capacity(PREFIX.len() + 64);
-        out.push_str(PREFIX);
-        out.push_str(&encode_hex_payload(hash));
-        out
+        CODEC.to_text(self.holon_hash())
     }
 
     /// Return binary form (`version_tag + hash`).

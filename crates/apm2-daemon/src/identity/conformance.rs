@@ -1588,6 +1588,93 @@ mod tests {
         }
     }
 
+    /// Regression: shared canonical digest codec paths preserve binary/text
+    /// equivalence for IDs where text carries the full tag semantics.
+    #[test]
+    fn canonical_digest_codec_equivalence_vectors() {
+        for vector in valid_public_key_id_vectors() {
+            let from_text =
+                PublicKeyIdV1::parse_text(vector.text).expect("valid vector must parse");
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            let from_binary = PublicKeyIdV1::from_binary(&binary).expect("valid vector must parse");
+            assert_eq!(from_text, from_binary, "pkid mismatch for {}", vector.name);
+            assert_eq!(
+                from_text.to_text(),
+                vector.text,
+                "pkid text mismatch for {}",
+                vector.name
+            );
+        }
+
+        for vector in valid_cell_id_vectors() {
+            let from_text = CellIdV1::parse_text(vector.text).expect("valid vector must parse");
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            let from_binary = CellIdV1::from_binary(&binary).expect("valid vector must parse");
+            assert_eq!(from_text, from_binary, "cell mismatch for {}", vector.name);
+            assert_eq!(
+                from_text.to_text(),
+                vector.text,
+                "cell text mismatch for {}",
+                vector.name
+            );
+        }
+
+        for vector in valid_holon_id_vectors() {
+            let from_text = HolonIdV1::parse_text(vector.text).expect("valid vector must parse");
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            let from_binary = HolonIdV1::from_binary(&binary).expect("valid vector must parse");
+            assert_eq!(from_text, from_binary, "holon mismatch for {}", vector.name);
+            assert_eq!(
+                from_text.to_text(),
+                vector.text,
+                "holon text mismatch for {}",
+                vector.name
+            );
+        }
+    }
+
+    /// Regression: shared codec extraction must preserve `KeySet`'s dual-origin
+    /// tag semantics (text origin: unknown tag, binary origin: known tag).
+    #[test]
+    fn canonical_digest_codec_keyset_origin_semantics() {
+        for vector in valid_keyset_id_vectors() {
+            let from_text = KeySetIdV1::parse_text(vector.text).expect("valid text must parse");
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            let from_binary = KeySetIdV1::from_binary(&binary).expect("valid binary must parse");
+
+            assert_eq!(
+                from_text.merkle_root(),
+                from_binary.merkle_root(),
+                "keyset merkle root mismatch for {}",
+                vector.name
+            );
+            assert_eq!(
+                from_text.set_tag(),
+                None,
+                "text tag must be unknown for {}",
+                vector.name
+            );
+            assert_eq!(
+                from_binary.set_tag(),
+                Some(vector.set_tag),
+                "binary tag mismatch for {}",
+                vector.name
+            );
+            assert_eq!(
+                from_text.to_text(),
+                vector.text,
+                "keyset text mismatch for {}",
+                vector.name
+            );
+            assert_eq!(
+                from_binary.to_text(),
+                vector.text,
+                "keyset binary-origin text mismatch for {}",
+                vector.name
+            );
+        }
+    }
+
     /// Verify that each invalid vector is rejected by the correct parser.
     #[test]
     fn invalid_vectors_rejected() {

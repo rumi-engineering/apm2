@@ -98,6 +98,18 @@
 //! - **Lossless round-trip**: binary-to-text-to-binary produces identical
 //!   bytes.
 //!
+//! ## Abstraction Boundary: `CanonicalDigestIdKit`
+//!
+//! `CanonicalDigestIdKit` centralizes shared fail-closed codec steps for
+//! digest-first IDs:
+//! - canonical text validation + prefix stripping + lowercase hex decode
+//! - binary length + tag-gate parsing
+//! - canonical text serialization (`prefix + 64-lowercase-hex`)
+//!
+//! The kit intentionally excludes domain-specific derivation and semantic
+//! validation (algorithm policy, set-tag semantics, descriptor invariants,
+//! genesis commitments). Those checks remain in each ID type.
+//!
 //! # Contract References
 //!
 //! - RFC-0020 section 1.7.2: `PublicKeyIdV1` canonical key identifiers
@@ -111,6 +123,7 @@
 //! - EVID-0008: Genesis artifact CAS conformance evidence
 //! - EVID-0303: Rollout phase S0.75 evidence
 
+mod canonical_digest_id_kit;
 mod cell_id;
 mod certificate;
 mod directory_proof;

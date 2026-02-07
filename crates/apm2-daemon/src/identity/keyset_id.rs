@@ -54,13 +54,12 @@
 
 use std::fmt;
 
-use super::{
-    AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1, decode_hex_payload,
-    encode_hex_payload, validate_text_common,
-};
+use super::canonical_digest_id_kit::CanonicalDigestIdKit;
+use super::{AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1};
 
 /// Prefix for `KeySetIdV1` text form (RFC-0020 canonical grammar).
 const PREFIX: &str = "kset:v1:blake3:";
+const CODEC: CanonicalDigestIdKit = CanonicalDigestIdKit::new(PREFIX);
 
 /// Domain separation string for BLAKE3 keyset hashing.
 const DOMAIN_SEPARATION: &[u8] = b"apm2:keyset_id:v1\0";
@@ -377,27 +376,8 @@ impl KeySetIdV1 {
     /// [`from_descriptor`](KeySetIdV1::from_descriptor) which do carry the
     /// tag.
     pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
-        validate_text_common(input)?;
-
-        // Check prefix
-        let hex_payload = input.strip_prefix(PREFIX).ok_or_else(|| {
-            let got = input
-                .get(..PREFIX.len())
-                .map_or_else(|| input.to_string(), str::to_string);
-            KeyIdError::WrongPrefix {
-                expected: PREFIX,
-                got,
-            }
-        })?;
-
-        // Decode hex payload (validates length = 64, lowercase only)
-        let hash = decode_hex_payload(hex_payload)?;
-
-        // The text form does not encode the set tag. Store a sentinel
-        // (not a valid SetTag) so that set_tag() returns None.
-        let mut binary = [0u8; BINARY_LEN];
-        binary[0] = UNKNOWN_SET_TAG_SENTINEL;
-        binary[1..].copy_from_slice(&hash);
+        let hash = CODEC.parse_text_hash(input)?;
+        let binary = CanonicalDigestIdKit::binary_from_tag_and_hash(UNKNOWN_SET_TAG_SENTINEL, hash);
         Ok(Self { binary })
     }
 
@@ -413,20 +393,20 @@ impl KeySetIdV1 {
     pub fn from_binary(bytes: &[u8]) -> Result<Self, KeyIdError> {
         match bytes.len() {
             HASH_LEN => {
-                let mut binary = [0u8; BINARY_LEN];
-                binary[0] = UNKNOWN_SET_TAG_SENTINEL;
-                binary[1..].copy_from_slice(bytes);
+                let mut hash = [0u8; HASH_LEN];
+                hash.copy_from_slice(bytes);
+                let binary =
+                    CanonicalDigestIdKit::binary_from_tag_and_hash(UNKNOWN_SET_TAG_SENTINEL, hash);
                 Ok(Self { binary })
             },
             BINARY_LEN => {
-                let tag = bytes[0];
-                if tag != UNKNOWN_SET_TAG_SENTINEL {
-                    // Validate known set tags (fail-closed for unknown non-sentinel values).
-                    let _set_tag = SetTag::from_byte(tag)?;
-                }
-
-                let mut binary = [0u8; BINARY_LEN];
-                binary.copy_from_slice(bytes);
+                let binary = CODEC.parse_binary_exact(bytes, |tag| {
+                    if tag == UNKNOWN_SET_TAG_SENTINEL {
+                        Ok(())
+                    } else {
+                        SetTag::from_byte(tag).map(|_| ())
+                    }
+                })?;
                 Ok(Self { binary })
             },
             _ => Err(KeyIdError::InvalidBinaryLength { got: bytes.len() }),
@@ -441,11 +421,7 @@ impl KeySetIdV1 {
     /// form is a content-addressed hash reference; mode resolution requires
     /// a CAS lookup of the full descriptor.
     pub fn to_text(&self) -> String {
-        let hash: &[u8; HASH_LEN] = self.merkle_root();
-        let mut result = String::with_capacity(PREFIX.len() + 64);
-        result.push_str(PREFIX);
-        result.push_str(&encode_hex_payload(hash));
-        result
+        CODEC.to_text(self.merkle_root())
     }
 
     /// Return the raw binary form (33 bytes).
