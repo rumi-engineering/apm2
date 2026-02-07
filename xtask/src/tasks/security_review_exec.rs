@@ -301,13 +301,35 @@ pub fn approve(ticket_id: Option<&str>, dry_run: bool, emit_internal: bool) -> R
     } else {
         println!("\n[4/4] Posting approval...");
 
-        // Post approval comment with machine-readable metadata
-        let approve_body = approval_comment(pr.pr_number, &head_sha);
-        let pr_url = &pr.pr_url;
-        cmd!(sh, "gh pr comment {pr_url} --body {approve_body}")
-            .run()
-            .context("Failed to post approval comment")?;
-        println!("  Comment posted.");
+        // TCK-00408: Check effective cutover policy. When emit-only is active,
+        // direct GitHub writes (gh pr comment) are forbidden. Emit a projection
+        // receipt instead and require durable acknowledgement.
+        let cutover = crate::util::effective_cutover_policy();
+        if cutover.is_emit_only() {
+            println!("  [TCK-00408] Emit-only cutover active — skipping direct GitHub comment.");
+            let approve_body = approval_comment(pr.pr_number, &head_sha);
+            let payload = serde_json::json!({
+                "operation": "pr_comment",
+                "pr_url": pr.pr_url,
+                "body": approve_body,
+            });
+            let correlation_id = format!("security-approve-comment-{}-{}", pr.pr_number, head_sha);
+            crate::util::emit_projection_receipt_with_ack(
+                "pr_comment",
+                &pr.owner_repo,
+                &head_sha,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+        } else {
+            // Legacy path: direct GitHub comment
+            let approve_body = approval_comment(pr.pr_number, &head_sha);
+            let pr_url = &pr.pr_url;
+            cmd!(sh, "gh pr comment {pr_url} --body {approve_body}")
+                .run()
+                .context("Failed to post approval comment")?;
+            println!("  Comment posted.");
+        }
 
         // Update status to success
         update_status(&sh, &pr.owner_repo, &head_sha, true, "Approved")?;
@@ -426,13 +448,34 @@ pub fn deny(
     } else {
         println!("\n[4/4] Posting denial...");
 
-        // Post denial comment with machine-readable metadata
-        let comment = denial_comment(&actual_reason, pr.pr_number, &head_sha);
-        let pr_url = &pr.pr_url;
-        cmd!(sh, "gh pr comment {pr_url} --body {comment}")
-            .run()
-            .context("Failed to post denial comment")?;
-        println!("  Comment posted.");
+        // TCK-00408: Check effective cutover policy. When emit-only is active,
+        // direct GitHub writes are forbidden.
+        let cutover = crate::util::effective_cutover_policy();
+        if cutover.is_emit_only() {
+            println!("  [TCK-00408] Emit-only cutover active — skipping direct GitHub comment.");
+            let comment = denial_comment(&actual_reason, pr.pr_number, &head_sha);
+            let payload = serde_json::json!({
+                "operation": "pr_comment",
+                "pr_url": pr.pr_url,
+                "body": comment,
+            });
+            let correlation_id = format!("security-deny-comment-{}-{}", pr.pr_number, head_sha);
+            crate::util::emit_projection_receipt_with_ack(
+                "pr_comment",
+                &pr.owner_repo,
+                &head_sha,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+        } else {
+            // Legacy path: direct GitHub comment
+            let comment = denial_comment(&actual_reason, pr.pr_number, &head_sha);
+            let pr_url = &pr.pr_url;
+            cmd!(sh, "gh pr comment {pr_url} --body {comment}")
+                .run()
+                .context("Failed to post denial comment")?;
+            println!("  Comment posted.");
+        }
 
         // Update status to failure
         update_status(&sh, &pr.owner_repo, &head_sha, false, "Denied")?;

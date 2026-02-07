@@ -119,45 +119,54 @@ pub fn try_emit_internal_receipt(
     // Convert payload bytes to string for the CLI --payload argument
     let payload_str = String::from_utf8_lossy(payload).to_string();
 
-    let result = cmd!(
+    // Use --json for structured output so we can reliably parse the event_id.
+    let output = cmd!(
         sh,
-        "timeout 5 apm2 event emit --event-type {event_type_arg} --payload {payload_str} --correlation-id {correlation_id_arg}"
+        "timeout 5 apm2 event emit --json --event-type {event_type_arg} --payload {payload_str} --correlation-id {correlation_id_arg}"
     )
     .ignore_status()
-    .read();
+    .output();
 
-    match result {
+    match output {
         Ok(output) => {
-            if output.contains("event_id") || output.contains("success") {
-                // Try to extract event_id from output (best effort)
-                let event_id = output
-                    .lines()
-                    .find(|line| line.contains("event_id"))
-                    .map(|line| line.trim().to_string());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !output.status.success() {
+                // Non-zero exit: CLI ran but failed
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stdout.contains("not found")
+                    || stderr.contains("not found")
+                    || stderr.contains("No such file")
+                {
+                    eprintln!("  [EMIT_INTERNAL] apm2 CLI not available for internal emission");
+                    eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
+                    return Ok(None);
+                }
                 eprintln!(
-                    "  [EMIT_INTERNAL] Internal receipt emitted: {}",
-                    event_id.as_deref().unwrap_or("OK")
+                    "  [EMIT_INTERNAL] Internal emission failed (exit {}): {}",
+                    output.status,
+                    stderr.trim()
                 );
-                Ok(event_id)
-            } else if output.contains("not found")
-                || output.contains("No such file")
-                || output.is_empty()
-            {
-                // apm2 CLI not available
-                eprintln!("  [EMIT_INTERNAL] apm2 CLI not available for internal emission");
                 eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
-                Ok(None)
-            } else {
-                // Other output - log and continue
-                eprintln!(
-                    "  [EMIT_INTERNAL] Internal emission returned: {}",
-                    output.trim()
-                );
-                Ok(None)
+                return Ok(None);
             }
+            // Parse structured JSON to extract event_id
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                if let Some(event_id) = parsed.get("event_id").and_then(|v| v.as_str()) {
+                    if !event_id.is_empty() {
+                        eprintln!("  [EMIT_INTERNAL] Internal receipt emitted: {event_id}");
+                        return Ok(Some(event_id.to_string()));
+                    }
+                }
+            }
+            // Exit success but no parseable event_id — log and continue
+            eprintln!(
+                "  [EMIT_INTERNAL] Internal emission returned unparseable output: {}",
+                stdout.trim()
+            );
+            Ok(None)
         },
         Err(e) => {
-            // Command execution failed (timeout, etc.)
+            // Command execution failed (timeout, binary not found, etc.)
             eprintln!("  [EMIT_INTERNAL] Internal emission failed: {e}");
             eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
             Ok(None)
@@ -204,6 +213,92 @@ pub const XTASK_STRICT_MODE_ENV: &str = "XTASK_STRICT_MODE";
 /// enables development workflows while maintaining fail-closed security
 /// posture.
 pub const XTASK_ALLOW_STATUS_WRITES_ENV: &str = "XTASK_ALLOW_STATUS_WRITES";
+
+// =============================================================================
+// Cutover Policy Propagation (TCK-00408)
+// =============================================================================
+
+/// Name of the environment variable propagating cutover policy to child
+/// processes.
+///
+/// Per TCK-00408, when emit-only cutover is active, ALL spawned child processes
+/// (reviewers, executors) MUST inherit the same cutover policy. This
+/// environment variable is set by the parent process and read by child
+/// processes to enforce consistent behavior.
+///
+/// Value: `"emit_only"` | `"legacy"` (default: `"legacy"`)
+pub const XTASK_CUTOVER_POLICY_ENV: &str = "XTASK_CUTOVER_POLICY";
+
+/// Returns the effective cutover policy from environment.
+///
+/// Per TCK-00408, this checks both the explicit policy env var and the
+/// emit-receipt-only flag. If either indicates emit-only mode, the policy
+/// is emit-only.
+///
+/// Note: This reads environment variables only. Prefer
+/// [`effective_cutover_policy_with_flag`] when a CLI `--emit-receipt-only`
+/// flag is available, so the CLI flag is also honoured.
+pub fn effective_cutover_policy() -> CutoverPolicy {
+    effective_cutover_policy_with_flag(false)
+}
+
+/// Returns the effective cutover policy, also considering a CLI flag.
+///
+/// Per TCK-00408, the CLI `--emit-receipt-only` flag MUST have the same
+/// effect as the `XTASK_EMIT_RECEIPT_ONLY` environment variable. This
+/// function merges both sources so that callers which have the CLI flag
+/// available can thread it through to every enforcement point.
+pub fn effective_cutover_policy_with_flag(cli_emit_receipt_only: bool) -> CutoverPolicy {
+    // Explicit policy propagation takes precedence — both "emit_only" and
+    // "legacy" are terminal decisions that override all other sources.
+    if let Ok(policy) = std::env::var(XTASK_CUTOVER_POLICY_ENV) {
+        match policy.as_str() {
+            "emit_only" => return CutoverPolicy::EmitOnly,
+            "legacy" => return CutoverPolicy::Legacy,
+            _ => {},
+        }
+    }
+    // CLI flag has the same semantics as the env var
+    if cli_emit_receipt_only {
+        return CutoverPolicy::EmitOnly;
+    }
+    // Fall back to legacy emit-receipt-only env var
+    if emit_receipt_only_from_env() {
+        return CutoverPolicy::EmitOnly;
+    }
+    CutoverPolicy::Legacy
+}
+
+/// Cutover policy governing side-effect behavior.
+///
+/// Per TCK-00408, this enum determines whether xtask commands perform direct
+/// GitHub writes or emit receipts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoverPolicy {
+    /// Legacy mode: direct writes allowed (being phased out).
+    Legacy,
+    /// Emit-only mode: no direct GitHub writes; emit receipts only.
+    /// Child processes MUST inherit this policy.
+    EmitOnly,
+}
+
+impl CutoverPolicy {
+    /// Returns true if direct GitHub writes are forbidden under this policy.
+    #[must_use]
+    pub const fn is_emit_only(self) -> bool {
+        matches!(self, Self::EmitOnly)
+    }
+
+    /// Returns the environment variable value to propagate this policy to
+    /// child processes.
+    #[must_use]
+    pub const fn env_value(self) -> &'static str {
+        match self {
+            Self::EmitOnly => "emit_only",
+            Self::Legacy => "legacy",
+        }
+    }
+}
 
 // =============================================================================
 // Cutover Stage 1 Feature Flags (TCK-00324)
@@ -479,6 +574,53 @@ pub fn emit_projection_request_receipt(
         event_payload.to_string().as_bytes(),
         correlation_id,
     )
+}
+
+// =============================================================================
+// Durable Projection Acknowledgement (TCK-00408)
+// =============================================================================
+
+/// Emits a projection request receipt and requires a durable acknowledgement.
+///
+/// Per TCK-00408, emit-only mode operations MUST NOT report success unless
+/// the projection layer returns a durable receipt/event ID. This function
+/// wraps `emit_projection_request_receipt` and fails closed when no
+/// acknowledgement is returned.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The receipt emission itself fails
+/// - No durable acknowledgement (event ID) is returned from the projection
+///   layer
+pub fn emit_projection_receipt_with_ack(
+    operation: &str,
+    owner_repo: &str,
+    target_ref: &str,
+    payload: &str,
+    correlation_id: &str,
+) -> Result<String> {
+    match emit_projection_request_receipt(
+        operation,
+        owner_repo,
+        target_ref,
+        payload,
+        correlation_id,
+    ) {
+        Ok(Some(event_id)) => {
+            eprintln!("  [TCK-00408] Durable projection acknowledgement received: {event_id}");
+            Ok(event_id)
+        },
+        Ok(None) => {
+            // TCK-00408: Fail closed — emit-only mode requires durable ack
+            bail!(
+                "TCK-00408: emit-only mode requires durable projection acknowledgement, \
+                 but the projection layer returned no event ID for operation '{operation}'. \
+                 The side-effect has NOT been confirmed."
+            )
+        },
+        Err(e) => Err(e),
+    }
 }
 
 // =============================================================================
@@ -1341,6 +1483,162 @@ mod tests {
         assert!(
             EMIT_RECEIPT_ONLY_MESSAGE.contains("allow-github-write"),
             "Message must mention allow-github-write override"
+        );
+    }
+
+    // =============================================================================
+    // Cutover Policy Tests (TCK-00408)
+    // =============================================================================
+
+    #[test]
+    fn test_cutover_policy_is_emit_only() {
+        assert!(CutoverPolicy::EmitOnly.is_emit_only());
+        assert!(!CutoverPolicy::Legacy.is_emit_only());
+    }
+
+    #[test]
+    fn test_cutover_policy_env_value() {
+        assert_eq!(CutoverPolicy::EmitOnly.env_value(), "emit_only");
+        assert_eq!(CutoverPolicy::Legacy.env_value(), "legacy");
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_effective_cutover_policy_default_is_legacy() {
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+        assert_eq!(
+            effective_cutover_policy(),
+            CutoverPolicy::Legacy,
+            "Default cutover policy should be Legacy"
+        );
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_effective_cutover_policy_explicit_emit_only() {
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, "emit_only");
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+        assert_eq!(
+            effective_cutover_policy(),
+            CutoverPolicy::EmitOnly,
+            "Explicit emit_only policy should be EmitOnly"
+        );
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_effective_cutover_policy_inherit_from_receipt_only() {
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
+        }
+        assert_eq!(
+            effective_cutover_policy(),
+            CutoverPolicy::EmitOnly,
+            "XTASK_EMIT_RECEIPT_ONLY=true should infer EmitOnly policy"
+        );
+        unsafe {
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+    }
+
+    /// TCK-00408: CLI --emit-receipt-only flag triggers `EmitOnly` cutover
+    /// policy.
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_effective_cutover_policy_with_cli_flag() {
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+        // CLI flag false, no env vars -> Legacy
+        assert_eq!(
+            effective_cutover_policy_with_flag(false),
+            CutoverPolicy::Legacy,
+            "CLI flag false with no env vars should be Legacy"
+        );
+        // CLI flag true, no env vars -> EmitOnly
+        assert_eq!(
+            effective_cutover_policy_with_flag(true),
+            CutoverPolicy::EmitOnly,
+            "CLI flag true should trigger EmitOnly even without env vars"
+        );
+        // Explicit env var takes precedence over CLI flag=false
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, "emit_only");
+        }
+        assert_eq!(
+            effective_cutover_policy_with_flag(false),
+            CutoverPolicy::EmitOnly,
+            "Explicit env var should override CLI flag=false"
+        );
+        // Cleanup
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+    }
+
+    /// TCK-00408: Explicit "legacy" policy overrides env-based
+    /// emit-receipt-only.
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_explicit_legacy_policy_overrides_env() {
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, "legacy");
+            std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
+        }
+        assert_eq!(
+            effective_cutover_policy_with_flag(false),
+            CutoverPolicy::Legacy,
+            "Explicit 'legacy' policy must be terminal and override XTASK_EMIT_RECEIPT_ONLY=true"
+        );
+        // Even with CLI flag true, explicit "legacy" policy wins
+        assert_eq!(
+            effective_cutover_policy_with_flag(true),
+            CutoverPolicy::Legacy,
+            "Explicit 'legacy' policy must override CLI --emit-receipt-only flag"
+        );
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+    }
+
+    /// TCK-00408: Durable acknowledgement fails closed when daemon unavailable.
+    #[test]
+    fn test_emit_projection_receipt_with_ack_fails_closed() {
+        let result = emit_projection_receipt_with_ack(
+            "test_op",
+            "owner/repo",
+            "abc123",
+            r#"{"test": true}"#,
+            "test-correlation",
+        );
+        assert!(
+            result.is_err(),
+            "emit_projection_receipt_with_ack must fail closed when no durable ack is returned"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("TCK-00408"),
+            "Error must reference TCK-00408"
         );
     }
 }

@@ -38,6 +38,23 @@ use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_tick
 /// - Rebase fails (conflicts need manual resolution)
 /// - Push or PR creation fails
 pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
+    // TCK-00408: If the CLI --emit-receipt-only flag is set, propagate the
+    // *resolved* cutover policy to the environment so that all downstream code
+    // (including ReviewerSpawner) picks up the same policy without requiring
+    // explicit flag threading through every function signature.
+    //
+    // We resolve through effective_cutover_policy_with_flag first so that an
+    // explicit XTASK_CUTOVER_POLICY=legacy env var is respected as terminal
+    // and not overridden by the CLI flag.
+    if emit_receipt_only {
+        let resolved = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
+        // SAFETY: single-threaded xtask entry point; no concurrent env reads.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(crate::util::XTASK_CUTOVER_POLICY_ENV, resolved.env_value());
+        }
+    }
+
     let sh = Shell::new().context("Failed to create shell")?;
 
     // Get current branch and validate it's a ticket branch
@@ -122,6 +139,11 @@ pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
     }
     println!("  Pushed to origin/{branch_name}");
 
+    // TCK-00408: Check effective cutover policy BEFORE any GitHub writes.
+    // The CLI --emit-receipt-only flag is threaded through here so it has the
+    // same effect as the XTASK_EMIT_RECEIPT_ONLY environment variable.
+    let cutover = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
+
     // Check if PR already exists
     println!("\n[4/4] Checking for existing PR...");
     let pr_exists = cmd!(sh, "gh pr view {branch_name} --json number --jq .number")
@@ -133,11 +155,47 @@ pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
         || pr_exists.contains("no pull requests")
         || pr_exists.contains("not found")
     {
-        // Create new PR
-        println!("  No existing PR found, creating one...");
-        create_pr(&sh, &branch_name, &ticket_branch.ticket_id)?
+        if cutover.is_emit_only() {
+            // TCK-00408: Emit-only mode — do NOT create a PR directly.
+            // Emit a projection event and require durable acknowledgement.
+            println!(
+                "  [TCK-00408] Emit-only cutover active — emitting PR creation projection event."
+            );
+            // Resolve canonical owner/repo from git remote for the projection payload.
+            let remote_url = cmd!(sh, "git remote get-url origin")
+                .read()
+                .unwrap_or_default();
+            let owner_repo = parse_owner_repo(&remote_url);
+            if owner_repo.is_empty() {
+                bail!(
+                    "TCK-00408: cannot emit pr_create projection — \
+                     failed to resolve owner/repo from git remote 'origin'"
+                );
+            }
+            let payload = serde_json::json!({
+                "operation": "pr_create",
+                "branch": branch_name,
+                "ticket_id": ticket_branch.ticket_id,
+                "base": "main",
+                "owner_repo": owner_repo,
+            });
+            let correlation_id = format!("push-pr-create-{}", &ticket_branch.ticket_id);
+            crate::util::emit_projection_receipt_with_ack(
+                "pr_create",
+                owner_repo,
+                &branch_name,
+                &payload.to_string(),
+                &correlation_id,
+            )?;
+            // Return a placeholder URL since the PR has not been created yet.
+            format!("(pending projection: PR for {branch_name})")
+        } else {
+            // Create new PR (legacy direct write)
+            println!("  No existing PR found, creating one...");
+            create_pr(&sh, &branch_name, &ticket_branch.ticket_id)?
+        }
     } else {
-        // PR already exists
+        // PR already exists — reading its URL is a read-only operation.
         let url = cmd!(sh, "gh pr view {branch_name} --json url --jq .url")
             .read()
             .context("Failed to get PR URL")?;
@@ -147,29 +205,41 @@ pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
 
     // Enable auto-merge if available
     println!("\nEnabling auto-merge...");
-    let auto_merge_result = cmd!(sh, "gh pr merge --auto --squash {branch_name}")
-        .ignore_status()
-        .read();
+    if cutover.is_emit_only() {
+        println!(
+            "  [TCK-00408] Emit-only cutover active — skipping auto-merge (direct GitHub write)."
+        );
+    } else {
+        let auto_merge_result = cmd!(sh, "gh pr merge --auto --squash {branch_name}")
+            .ignore_status()
+            .read();
 
-    match auto_merge_result {
-        Ok(output) => {
-            if output.contains("auto-merge")
-                || output.contains("enabled")
-                || output.trim().is_empty()
-            {
-                println!("  Auto-merge enabled (will merge when checks pass).");
-            } else {
-                println!("  Auto-merge response: {}", output.trim());
-            }
-        },
-        Err(_) => {
-            println!("  Note: Auto-merge not available (may require branch protection rules).");
-        },
+        match auto_merge_result {
+            Ok(output) => {
+                if output.contains("auto-merge")
+                    || output.contains("enabled")
+                    || output.trim().is_empty()
+                {
+                    println!("  Auto-merge enabled (will merge when checks pass).");
+                } else {
+                    println!("  Auto-merge response: {}", output.trim());
+                }
+            },
+            Err(_) => {
+                println!("  Note: Auto-merge not available (may require branch protection rules).");
+            },
+        }
     }
 
-    // Trigger AI reviews
-    println!("\nTriggering AI reviews...");
-    trigger_ai_reviews(&sh, &pr_url, emit_receipt_only, allow_github_write)?;
+    // Trigger AI reviews — but only if we have a real PR URL.
+    // In emit-only mode the PR URL is a placeholder string, so spawning
+    // reviewers with it would be meaningless.
+    if pr_url.starts_with("(pending projection") {
+        println!("\nSkipping AI reviews — PR URL is a pending projection placeholder.");
+    } else {
+        println!("\nTriggering AI reviews...");
+        trigger_ai_reviews(&sh, &pr_url, emit_receipt_only, allow_github_write)?;
+    }
 
     println!();
     println!("Push complete!");
@@ -436,6 +506,7 @@ fn extract_ticket_title(content: &str) -> Option<String> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use serial_test::serial;
     use tempfile::NamedTempFile;
 
     use super::*;
@@ -664,5 +735,49 @@ ticket_meta:
             output.contains("description=Waiting for security review"),
             "xshell should preserve spaces in interpolated value. Got: {output}"
         );
+    }
+
+    /// TCK-00408: Explicit `XTASK_CUTOVER_POLICY=legacy` must not be
+    /// overridden when `--emit-receipt-only` is passed.
+    ///
+    /// This is a regression test for the policy-precedence bug where
+    /// `push::run` force-set the env var to `emit_only` before resolution,
+    /// breaking the terminal precedence contract.
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_push_respects_explicit_legacy_policy_with_emit_receipt_flag() {
+        use crate::util::{
+            CutoverPolicy, XTASK_CUTOVER_POLICY_ENV, effective_cutover_policy_with_flag,
+        };
+
+        // Simulate: operator explicitly sets XTASK_CUTOVER_POLICY=legacy
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, "legacy");
+        }
+
+        // The push path now resolves policy through effective_cutover_policy_with_flag
+        // *before* writing back to the env var. Explicit "legacy" must win.
+        let resolved = effective_cutover_policy_with_flag(true);
+        assert_eq!(
+            resolved,
+            CutoverPolicy::Legacy,
+            "Explicit XTASK_CUTOVER_POLICY=legacy must override --emit-receipt-only CLI flag"
+        );
+
+        // After writing back (as push::run does), the env var must still be "legacy"
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, resolved.env_value());
+        }
+        assert_eq!(
+            std::env::var(XTASK_CUTOVER_POLICY_ENV).unwrap(),
+            "legacy",
+            "Env var must remain 'legacy' after push policy resolution"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+        }
     }
 }

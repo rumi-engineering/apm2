@@ -658,8 +658,14 @@ impl DispatcherState {
         let session_registry_for_runtime = Arc::clone(&session_registry);
 
         // TCK-00316: Create durable CAS
+        // Keep the concrete type so we can upcast to both executor and evidence
+        // CAS traits (TCK-00408: dispatcher needs evidence::ContentAddressedStore).
         let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
-        let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config)?);
+        let durable_cas = Arc::new(DurableCas::new(cas_config)?);
+        let cas: Arc<dyn ContentAddressedStore> =
+            Arc::clone(&durable_cas) as Arc<dyn ContentAddressedStore>;
+        let evidence_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
+            Arc::clone(&durable_cas) as Arc<dyn apm2_core::evidence::ContentAddressedStore>;
 
         // TCK-00316: Create ToolBroker with CAS
         let broker: SharedToolBroker<StubManifestLoader> =
@@ -768,6 +774,9 @@ impl DispatcherState {
             Arc::clone(&subscription_registry),
         )
         .with_credential_store(credential_store)
+        // TCK-00408: Wire CAS into privileged dispatcher for fail-closed
+        // ingest/publish validation. Uses the core evidence trait impl.
+        .with_cas(Arc::clone(&evidence_cas))
         // TCK-00352: Wire V1 manifest store into production path
         .with_v1_manifest_store(Arc::clone(&v1_manifest_store));
 

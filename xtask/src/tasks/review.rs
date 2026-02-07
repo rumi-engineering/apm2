@@ -320,11 +320,32 @@ fn run_uat_signoff(
         ---\n\
         *Signed off via `cargo xtask review uat`*";
 
-    cmd!(sh, "gh pr comment {pr_url} --body {comment_body}")
-        .run()
-        .context("Failed to post UAT comment")?;
-
-    println!("  Comment posted.");
+    // TCK-00408: Check effective cutover policy. When emit-only is active,
+    // even informational comments must go through the projection layer.
+    // Thread the CLI flag so --emit-receipt-only has the same effect as the env
+    // var.
+    let cutover = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
+    if cutover.is_emit_only() {
+        println!("  [TCK-00408] Emit-only cutover active — skipping direct GitHub comment.");
+        let payload = serde_json::json!({
+            "operation": "pr_comment",
+            "pr_url": pr_url,
+            "body": comment_body,
+        });
+        let correlation_id = format!("uat-comment-{head_sha}");
+        crate::util::emit_projection_receipt_with_ack(
+            "pr_comment",
+            owner_repo,
+            head_sha,
+            &payload.to_string(),
+            &correlation_id,
+        )?;
+    } else {
+        cmd!(sh, "gh pr comment {pr_url} --body {comment_body}")
+            .run()
+            .context("Failed to post UAT comment")?;
+        println!("  Comment posted.");
+    }
 
     println!("\nUAT review complete!");
     println!("  [TCK-00297] Direct status update removed. Comment posted only.");
@@ -344,16 +365,26 @@ fn run_ai_review(
     emit_receipt_only: bool,
     allow_github_write: bool,
 ) -> Result<()> {
-    // Note: AI reviews spawn background processes that write their own status.
-    // The cutover flags are checked in update_status when the AI reviewer
-    // completes. For now, we just log that the flags are set.
+    // TCK-00408: Export CLI emit-receipt-only flag to environment BEFORE
+    // spawning child reviewer processes, so that ReviewerSpawner (which reads
+    // the cutover policy from env) inherits the same enforcement.
+    if emit_receipt_only {
+        let policy = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
+        // SAFETY: single-threaded xtask CLI — no concurrent env mutation.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(crate::util::XTASK_CUTOVER_POLICY_ENV, policy.env_value());
+        }
+        eprintln!(
+            "  [TCK-00408] emit-receipt-only mode active — exported cutover policy \
+             to env for child processes."
+        );
+    }
     if emit_receipt_only && !allow_github_write {
         eprintln!(
             "  [TCK-00324] Note: emit-receipt-only mode active. AI reviewer will handle cutover."
         );
     }
-    // Store flags for use in manual status update hint
-    let _ = (emit_receipt_only, allow_github_write);
 
     let prompt_path = review_type
         .prompt_path()
