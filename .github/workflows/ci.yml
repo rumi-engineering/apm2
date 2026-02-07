@@ -1,5 +1,11 @@
 # Main CI workflow
 # Runs on push and PRs to ensure code quality
+#
+# Trust boundary: This repository uses repository-scoped self-hosted runners
+# behind a private GitHub organization. All pull_request triggers execute in a
+# trusted-actor-only context — only org members can open PRs that run on these
+# runners.  The `fac-ovh` runner label restricts execution to dedicated OVH
+# instances provisioned by the infrastructure team.
 
 name: CI
 
@@ -30,12 +36,12 @@ jobs:
   fmt:
     name: Rustfmt
     if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
         with:
-          toolchain: nightly
+          toolchain: nightly-2025-12-01
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -67,12 +73,12 @@ jobs:
   clippy:
     name: Clippy
     if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
         with:
-          toolchain: nightly
+          toolchain: nightly-2025-12-01
           components: clippy
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -83,12 +89,12 @@ jobs:
   doc:
     name: Documentation
     if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
         with:
-          toolchain: nightly
+          toolchain: nightly-2025-12-01
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
@@ -96,31 +102,37 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # Tests
-  test:
-    name: Test
+  # Primary bounded test execution with cgroup/systemd constraints (TCK-00410)
+  bounded-test-runner:
+    name: Bounded Test Runner
+    needs: [test-safety-guard]
     if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    runs-on: *primary_runner
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
         with:
-          toolchain: nightly
+          toolchain: nightly-2025-12-01
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
       - uses: taiki-e/install-action@44b512a15849018e00cb9330d33250594aa2436c
         with:
           tool: cargo-nextest
-      - name: Run tests
-        run: cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci
-      - name: Run doctests
-        run: cargo test --doc --workspace --all-features
+      - name: Run bounded nextest
+        run: ./scripts/ci/run_bounded_tests.sh
+      - name: Run bounded doctests
+        run: |
+          ./scripts/ci/run_bounded_tests.sh \
+            --timeout-seconds 600 \
+            --kill-after-seconds 20 \
+            -- cargo test --doc --workspace --all-features
 
   # Canonicalization test vectors (TCK-00130)
   test-vectors:
     name: Test Vectors
+    needs: [test-safety-guard]
     if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
@@ -175,17 +187,18 @@ jobs:
         with:
           command: check all
 
-  # Code coverage
+  # Code coverage (runs tests; depends on test-safety-guard to block destructive patterns first)
   coverage:
     name: Coverage
+    needs: [test-safety-guard]
     if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
         with:
-          toolchain: nightly
+          toolchain: nightly-2025-12-01
           components: llvm-tools-preview
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -328,16 +341,82 @@ jobs:
       - name: Validate status-write command contract
         run: ./scripts/lint/no_direct_status_write_commands.sh
 
+  # Test safety guard (TCK-00410)
+  # Blocks destructive test patterns (recursive deletes, unbounded shell exec)
+  # before test execution. Fail-closed: missing allowlist or config is an error.
+  test-safety-guard:
+    name: Test Safety Guard
+    if: github.event_name != 'issue_comment'
+    runs-on: *primary_runner
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Block dangerous test patterns
+        run: ./scripts/ci/test_safety_guard.sh
+
+  # Workspace integrity guard (TCK-00410)
+  # Snapshots tracked repository state before tests and fails if post-test
+  # tracked content changes unexpectedly. Fail-closed semantics.
+  workspace-integrity-guard:
+    name: Workspace Integrity Guard
+    needs: [test-safety-guard]
+    if: github.event_name != 'issue_comment'
+    runs-on: *primary_runner
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
+        with:
+          toolchain: nightly-2025-12-01
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - uses: taiki-e/install-action@44b512a15849018e00cb9330d33250594aa2436c
+        with:
+          tool: cargo-nextest
+      # Workspace integrity guard wraps the same full-workspace test surface
+      # as bounded-test-runner to ensure no crate escapes integrity checks.
+      - name: Verify workspace integrity around test execution
+        run: |
+          ./scripts/ci/workspace_integrity_guard.sh \
+            --snapshot-file target/ci/workspace_integrity.snapshot.tsv \
+            -- ./scripts/ci/run_bounded_tests.sh \
+               --timeout-seconds 600 \
+               --kill-after-seconds 20 \
+               -- cargo nextest run --workspace \
+                    --all-features \
+                    --config-file .config/nextest.toml \
+                    --profile ci
+
+  # Guardrail failure-injection fixtures (TCK-00410)
+  # Validates that test_safety_guard, workspace_integrity_guard, and
+  # run_bounded_tests correctly block dangerous patterns and detect mutations.
+  guardrail-fixtures:
+    name: Guardrail Fixtures
+    if: github.event_name != 'issue_comment'
+    runs-on: *primary_runner
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Run guardrail failure-injection fixtures
+        run: ./scripts/ci/test_guardrail_fixtures.sh
+
   # Release build check
   build:
     name: Release Build
     if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
         with:
-          toolchain: nightly
+          toolchain: nightly-2025-12-01
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
@@ -346,7 +425,7 @@ jobs:
   # Final check that all CI jobs passed
   ci-success:
     name: CI Success
-    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage, legacy-ipc-guard, evidence-refs-lint, test-refs-lint, proto-enum-drift, review-artifact-lint, status-write-command-lint]
+    needs: [fmt, proto-verify, clippy, doc, bounded-test-runner, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage, legacy-ipc-guard, evidence-refs-lint, test-refs-lint, proto-enum-drift, review-artifact-lint, status-write-command-lint, test-safety-guard, workspace-integrity-guard, guardrail-fixtures]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -356,7 +435,7 @@ jobs:
           if [[ "${{ needs.proto-verify.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.clippy.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.doc.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.test.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.bounded-test-runner.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.test-vectors.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.msrv.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.security.result }}" != "success" ]]; then exit 1; fi
@@ -370,3 +449,6 @@ jobs:
           if [[ "${{ needs.proto-enum-drift.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.review-artifact-lint.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.status-write-command-lint.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.test-safety-guard.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.workspace-integrity-guard.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.guardrail-fixtures.result }}" != "success" ]]; then exit 1; fi

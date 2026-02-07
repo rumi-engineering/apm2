@@ -37,10 +37,28 @@
         "validates": "No lint warnings or errors"
       },
       {
-        "id": "test",
-        "name": "Test",
-        "command": "cargo test --workspace",
-        "validates": "All tests pass"
+        "id": "bounded-test-runner",
+        "name": "Bounded Test Runner",
+        "command": "./scripts/ci/run_bounded_tests.sh",
+        "validates": "All workspace tests pass under cgroup/systemd resource bounds (replaces bare cargo test)"
+      },
+      {
+        "id": "test-safety-guard",
+        "name": "Test Safety Guard",
+        "command": "./scripts/ci/test_safety_guard.sh",
+        "validates": "No destructive test patterns (rm -rf, unbounded shell, git clean -fdx) present in test code without allowlist approval"
+      },
+      {
+        "id": "workspace-integrity-guard",
+        "name": "Workspace Integrity Guard",
+        "command": "./scripts/ci/workspace_integrity_guard.sh -- cargo nextest run ...",
+        "validates": "Tracked repository state is unchanged after test execution"
+      },
+      {
+        "id": "guardrail-fixtures",
+        "name": "Guardrail Fixtures",
+        "command": "./scripts/ci/test_guardrail_fixtures.sh",
+        "validates": "Safety guards correctly block dangerous patterns and detect workspace mutations"
       },
       {
         "id": "doc",
