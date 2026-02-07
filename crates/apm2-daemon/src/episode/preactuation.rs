@@ -16,9 +16,8 @@
 //!   deny (fail-closed on uncertainty).
 //! - If any budget dimension is exhausted: deny with
 //!   [`PreActuationDenial::BudgetExhausted`].
-//! - If the gate is not invoked at all: the response's `stop_checked` /
-//!   `budget_checked` fields remain `false`, which the replay harness treats as
-//!   a violation.
+//! - If the gate is not invoked at all: `stop_checked` remains `false`, which
+//!   the replay harness treats as a violation.
 //!
 //! # Replay Ordering Invariant
 //!
@@ -259,7 +258,10 @@ impl BudgetStatus {
 pub struct PreActuationReceipt {
     /// Whether stop conditions were evaluated and cleared.
     pub stop_checked: bool,
-    /// Whether budget was evaluated and sufficient.
+    /// Whether budget was enforced at pre-actuation.
+    ///
+    /// When budget enforcement is deferred to `EpisodeRuntime`, this is `false`
+    /// even when the request is allowed.
     pub budget_checked: bool,
     /// HTF timestamp (nanoseconds) when the checks completed.
     pub timestamp_ns: u64,
@@ -937,8 +939,8 @@ impl std::error::Error for ReplayViolation {}
 ///    entry.
 /// 2. The check's timestamp must be strictly less than the actuation's
 ///    timestamp.
-/// 3. The check must have both `stop_checked` and `budget_checked` set to
-///    `true`.
+/// 3. The check must have `stop_checked=true`. `budget_checked` may be `false`
+///    when budget enforcement is deferred to `EpisodeRuntime`.
 ///
 /// # `DoS` Protection
 ///
@@ -977,14 +979,11 @@ impl ReplayVerifier {
             match &entry.kind {
                 ReplayEntryKind::PreActuationCheck {
                     stop_checked,
-                    budget_checked,
+                    budget_checked: _,
                 } => {
                     // Validate completeness of the check.
                     if !stop_checked {
                         return Err(ReplayViolation::StopNotChecked { index: i });
-                    }
-                    if !budget_checked {
-                        return Err(ReplayViolation::BudgetNotChecked { index: i });
                     }
                     last_check = Some((i, entry));
                 },
@@ -1402,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_budget_not_checked_fails() {
+    fn test_replay_budget_not_checked_allowed_when_deferred() {
         let trace = vec![
             ReplayEntry {
                 timestamp_ns: 100,
@@ -1419,11 +1418,10 @@ mod tests {
                 },
             },
         ];
-        let err = ReplayVerifier::verify(&trace).unwrap_err();
-        assert!(matches!(
-            err,
-            ReplayViolation::BudgetNotChecked { index: 0 }
-        ));
+        assert!(
+            ReplayVerifier::verify(&trace).is_ok(),
+            "budget_checked=false is valid when enforcement is deferred"
+        );
     }
 
     #[test]

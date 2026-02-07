@@ -15,8 +15,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(not(test))]
-use std::time::Duration;
 
 use apm2_core::config::EcosystemConfig;
 use apm2_core::credentials::CredentialStore;
@@ -169,7 +167,7 @@ pub struct DispatcherState {
 
     /// Governance freshness monitor wired to the shared stop authority.
     ///
-    /// When present, periodic freshness checks toggle
+    /// When present, explicit governance probe paths can toggle
     /// `governance_uncertain` fail-closed behavior in pre-actuation.
     governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
 }
@@ -833,40 +831,19 @@ impl DispatcherState {
 
     /// Wires governance freshness monitoring to a shared stop authority.
     ///
-    /// Performs an immediate check and, in non-test builds, starts a periodic
-    /// background loop that keeps `governance_uncertain` current.
+    /// TCK-00351 BLOCKER-1: We intentionally do NOT run periodic stale checks
+    /// in production until a real governance probe source is wired. Running
+    /// the loop without any `record_success` call sites eventually flips
+    /// `governance_uncertain=true` for all long-lived sessions.
+    ///
+    /// TODO(TCK-XXXXX): Wire explicit governance probe success/failure signals
+    /// into `GovernanceFreshnessMonitor::{record_success,record_failure}` and
+    /// re-enable periodic freshness checks.
     fn wire_governance_freshness_monitor(
         stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
     ) -> Arc<GovernanceFreshnessMonitor> {
         let config = GovernanceFreshnessConfig::default();
-        #[cfg(not(test))]
-        let poll_interval_ms = config.poll_interval_ms;
-        let monitor = Arc::new(GovernanceFreshnessMonitor::new(stop_authority, config));
-
-        // Seed uncertainty state immediately on construction.
-        let _ = monitor.check_freshness();
-
-        #[cfg(not(test))]
-        Self::spawn_governance_freshness_loop(Arc::clone(&monitor), poll_interval_ms);
-
-        monitor
-    }
-
-    /// Spawns a detached background loop for periodic governance freshness
-    /// checks.
-    #[cfg(not(test))]
-    fn spawn_governance_freshness_loop(
-        monitor: Arc<GovernanceFreshnessMonitor>,
-        poll_interval_ms: u64,
-    ) {
-        let _ = std::thread::Builder::new()
-            .name("apm2-governance-freshness".to_string())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(Duration::from_millis(poll_interval_ms));
-                    let _ = monitor.check_freshness();
-                }
-            });
+        Arc::new(GovernanceFreshnessMonitor::new(stop_authority, config))
     }
 
     /// Sets the daemon state for process management (TCK-00342).
@@ -1275,6 +1252,15 @@ mod tests {
     use crate::episode::preactuation::{
         DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS, PreActuationDenial, PreActuationGate,
     };
+    use crate::protocol::ConnectionContext;
+    use crate::protocol::credentials::PeerCredentials;
+    use crate::protocol::dispatch::{
+        PrivilegedResponse, encode_claim_work_request, encode_spawn_episode_request,
+    };
+    use crate::protocol::messages::{
+        ClaimWorkRequest, RequestToolRequest, SpawnEpisodeRequest, WorkRole,
+    };
+    use crate::protocol::session_dispatch::{SessionResponse, encode_request_tool_request};
 
     #[test]
     fn production_wiring_stale_governance_transitions_to_deny() {
@@ -1315,5 +1301,111 @@ mod tests {
             )
             .expect_err("stale governance should deny via StopUncertain");
         assert!(matches!(denial, PreActuationDenial::StopUncertain));
+    }
+
+    #[test]
+    fn spawn_default_max_episodes_allows_first_request_tool_gate() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
+        SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
+        SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
+        let conn = Arc::new(Mutex::new(conn));
+        let cas_root = tempfile::tempdir().expect("temp CAS root should be created");
+        let cas_dir = cas_root.path().join("cas");
+        std::fs::create_dir(&cas_dir).expect("CAS dir should be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut perms = std::fs::metadata(&cas_dir)
+                .expect("CAS dir metadata should exist")
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&cas_dir, perms).expect("CAS dir permissions should be set");
+        }
+        let state = DispatcherState::with_persistence_and_cas(
+            session_registry,
+            None,
+            Arc::clone(&conn),
+            &cas_dir,
+        )
+        .expect("state with persistence+cas should be created");
+
+        let creds = PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        };
+        let privileged_ctx = ConnectionContext::privileged_session_open(Some(creds.clone()));
+
+        let claim_request = ClaimWorkRequest {
+            actor_id: "state-test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = state
+            .privileged_dispatcher()
+            .dispatch(&claim_frame, &privileged_ctx)
+            .expect("ClaimWork dispatch should succeed");
+        let (work_id, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+            other => panic!("expected ClaimWork response, got {other:?}"),
+        };
+
+        let workspace_root = std::env::current_dir()
+            .expect("cwd should exist")
+            .to_string_lossy()
+            .into_owned();
+        let spawn_request = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::Implementer.into(),
+            lease_id: Some(lease_id),
+            workspace_root,
+            max_episodes: None,
+            escalation_predicate: None,
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_request);
+        let spawn_response = state
+            .privileged_dispatcher()
+            .dispatch(&spawn_frame, &privileged_ctx)
+            .expect("SpawnEpisode dispatch should succeed");
+        let (session_id, session_token) = match spawn_response {
+            PrivilegedResponse::SpawnEpisode(resp) => (resp.session_id, resp.session_token),
+            other => panic!("expected SpawnEpisode response, got {other:?}"),
+        };
+
+        let session_ctx = ConnectionContext::session_open(Some(creds), Some(session_id));
+        let request_tool = RequestToolRequest {
+            session_token,
+            tool_id: "network".to_string(),
+            // Denied before broker dispatch by URL-userinfo guard in V1 scope
+            // enforcement. This keeps the test sync-only while still proving
+            // the pre-actuation gate admitted the first request.
+            arguments: br#"{"url":"https://user:pass@example.com/resource"}"#.to_vec(),
+            dedupe_key: "tck-00351-first-request".to_string(),
+        };
+        let request_frame = encode_request_tool_request(&request_tool);
+        let request_response = state
+            .session_dispatcher()
+            .dispatch(&request_frame, &session_ctx)
+            .expect("RequestTool dispatch should succeed");
+
+        match request_response {
+            SessionResponse::Error(err) => {
+                assert!(
+                    err.message.contains("userinfo"),
+                    "first RequestTool should pass pre-actuation gate; got: {}",
+                    err.message
+                );
+                assert!(
+                    !err.message.contains("max_episodes_reached"),
+                    "default max_episodes must not deny first RequestTool: {}",
+                    err.message
+                );
+            },
+            other => panic!("expected SessionResponse::Error, got {other:?}"),
+        }
     }
 }

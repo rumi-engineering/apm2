@@ -891,6 +891,12 @@ pub const MAX_ID_LENGTH: usize = 256;
 /// diagnostic string.
 pub const MAX_REASON_LENGTH: usize = 1024;
 
+/// Maximum allowed length for `SpawnEpisodeRequest.escalation_predicate`.
+///
+/// Per SEC-SCP-FAC-0020: caller-controlled free-form predicates must be
+/// bounded before persistence to prevent oversized payload retention.
+pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
+
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
 ///
 /// Per CTR-1303: In-memory stores must have `max_entries` limit with O(1)
@@ -5428,6 +5434,25 @@ impl PrivilegedDispatcher {
             }
         }
 
+        // SECURITY MAJOR-1: bound escalation predicate length before
+        // policy validation/persistence to prevent oversized payload DoS.
+        if let Some(ref escalation_predicate) = request.escalation_predicate {
+            if escalation_predicate.len() > MAX_ESCALATION_PREDICATE_LEN {
+                warn!(
+                    escalation_predicate_len = escalation_predicate.len(),
+                    max_len = MAX_ESCALATION_PREDICATE_LEN,
+                    "SpawnEpisode rejected: escalation_predicate exceeds maximum length"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "escalation_predicate exceeds maximum length of \
+                         {MAX_ESCALATION_PREDICATE_LEN} bytes"
+                    ),
+                ));
+            }
+        }
+
         // TCK-00319: Validate workspace_root is provided
         if request.workspace_root.is_empty() {
             return Ok(PrivilegedResponse::error(
@@ -5868,13 +5893,6 @@ impl PrivilegedDispatcher {
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     msg,
                 ));
-            }
-            // TCK-00351 MAJOR 1 FIX: Increment episode count for this session.
-            // This tracks the number of episodes spawned (semantically distinct
-            // from tool_calls). The pre-actuation gate uses episode_count to
-            // enforce max_episodes stop conditions.
-            if let Some(t) = store.get(&session_id) {
-                t.increment_episode_count();
             }
         }
 
@@ -7098,6 +7116,15 @@ impl PrivilegedDispatcher {
         // either granting or denying based on an expired session's policy.
         if let Some(ref v1_store) = self.v1_manifest_store {
             v1_store.remove(&request.session_id);
+        }
+
+        // TCK-00351 BLOCKER-2: `episode_count` is defined as completed
+        // episodes. Increment on termination (not spawn) to avoid
+        // off-by-one self-deny on the first RequestTool.
+        if let Some(ref store) = self.telemetry_store {
+            if let Some(telemetry) = store.get(&request.session_id) {
+                telemetry.increment_episode_count();
+            }
         }
 
         // TCK-00384 review fix: Clean up telemetry on EndSession to free
@@ -14977,6 +15004,67 @@ mod tests {
                     .get_session_by_work_id(&work_id)
                     .is_none(),
                 "rejected tampered spawn must not register a session"
+            );
+        }
+
+        /// SECURITY MAJOR-1: oversized escalation predicates are rejected
+        /// before persistence.
+        #[test]
+        fn test_spawn_rejects_oversized_escalation_predicate() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "tamper-escalation".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("expected ClaimWork response, got {other:?}"),
+            };
+
+            let oversized_predicate = "x".repeat(MAX_ESCALATION_PREDICATE_LEN + 1);
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: Some(oversized_predicate),
+            };
+            let frame = encode_spawn_episode_request(&spawn_request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message
+                            .contains("escalation_predicate exceeds maximum length"),
+                        "rejection should mention escalation_predicate bound: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected oversized escalation rejection, got {other:?}"),
+            }
+
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session_by_work_id(&work_id)
+                    .is_none(),
+                "rejected oversized spawn must not register a session"
             );
         }
     }

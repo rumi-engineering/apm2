@@ -2096,6 +2096,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
+                // TCK-00351 BLOCKER-2: `episode_count` tracks completed
+                // episodes. Increment on termination (not spawn) so a
+                // newly spawned session starts at 0.
+                if let Some(ref store) = self.telemetry_store {
+                    if let Some(telemetry) = store.get(session_id) {
+                        telemetry.increment_episode_count();
+                    }
+                }
+
                 // TCK-00384: Clean up telemetry on session termination to
                 // free capacity in the bounded store.
                 if let Some(ref store) = self.telemetry_store {

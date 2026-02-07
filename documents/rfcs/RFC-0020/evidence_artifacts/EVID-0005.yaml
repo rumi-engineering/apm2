@@ -1,0 +1,30 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0005"
+  title: "Pre-actuation stop and budget proof obligations evidence"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "DRAFT"
+  description: |
+    Draft evidence bundle for REQ-0005 showing pre-actuation stop/budget
+    proof behavior and regression coverage for TCK-00351. This artifact tracks
+    the production-wiring fixes from PR #456 (governance freshness liveness,
+    max_episodes admission semantics, deferred budget proof contract alignment,
+    and SpawnEpisode input hardening).
+  requirement_ids:
+    - "REQ-0005"
+  source_refs:
+    - "crates/apm2-daemon/src/state.rs"
+    - "crates/apm2-daemon/src/protocol/dispatch.rs"
+    - "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+    - "crates/apm2-daemon/src/episode/preactuation.rs"
+    - "proto/apm2d_runtime_v1.proto"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Regression and integration tests added/updated in this PR:
+        - state::tests::spawn_default_max_episodes_allows_first_request_tool_gate
+        - protocol::dispatch::tests::transactional_spawn::test_spawn_rejects_oversized_escalation_predicate
+        - episode::preactuation::tests::test_replay_budget_not_checked_allowed_when_deferred
+        Full daemon verification is captured by the mandatory ticket command:
+        cargo test -p apm2-daemon
+      ref: "cargo test -p apm2-daemon"

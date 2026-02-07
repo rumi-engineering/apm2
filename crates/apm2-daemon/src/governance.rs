@@ -295,11 +295,11 @@ fn transitional_risk_tier(role: WorkRole) -> u8 {
 
 /// Configuration for the governance freshness monitor.
 ///
-/// The monitor periodically checks whether the governance service is
-/// reachable and responsive.  When the service is unreachable or its
-/// response is stale beyond `freshness_threshold`, the monitor sets the
-/// `governance_uncertain` flag on the shared [`StopAuthority`], causing
-/// the pre-actuation gate to enter deadline-based fail-closed logic.
+/// The monitor checks whether the governance service is reachable and
+/// responsive. When the service is unreachable or its response is stale
+/// beyond `freshness_threshold`, the monitor sets the `governance_uncertain`
+/// flag on the shared [`StopAuthority`], causing the pre-actuation gate to
+/// enter deadline-based fail-closed logic.
 ///
 /// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
 ///
@@ -310,7 +310,10 @@ fn transitional_risk_tier(role: WorkRole) -> u8 {
 /// set in tests.
 #[derive(Debug, Clone)]
 pub struct GovernanceFreshnessConfig {
-    /// How often to probe the governance service (milliseconds).
+    /// Probe cadence hint (milliseconds) for external probe loops.
+    ///
+    /// The production wiring currently does not auto-spawn a polling loop
+    /// until an explicit governance probe source is wired.
     pub poll_interval_ms: u64,
     /// Maximum age of the last successful governance response before the
     /// service is considered stale (milliseconds).
@@ -331,11 +334,11 @@ impl Default for GovernanceFreshnessConfig {
 ///
 /// # Production Wiring (TCK-00351 MAJOR 1)
 ///
-/// Instantiate a monitor, call [`check_freshness`](Self::check_freshness)
-/// periodically (or from a background task), and share the same
-/// `StopAuthority` with the `PreActuationGate`.  When the governance
-/// service goes stale, the monitor sets `governance_uncertain = true`;
-/// when it recovers, the flag is cleared.
+/// Instantiate a monitor, invoke [`record_success`](Self::record_success) /
+/// [`record_failure`](Self::record_failure) from governance probe paths,
+/// and optionally run [`check_freshness`](Self::check_freshness) from an
+/// explicit scheduler. Share the same `StopAuthority` with the
+/// `PreActuationGate`.
 ///
 /// ```rust,ignore
 /// let authority = Arc::new(StopAuthority::new());
@@ -349,9 +352,9 @@ impl Default for GovernanceFreshnessConfig {
 ///
 /// # Production Wiring
 ///
-/// `state.rs` production constructors instantiate this monitor, share the
-/// same `StopAuthority` with `PreActuationGate`, and run periodic freshness
-/// checks using the configured `poll_interval_ms`.
+/// `state.rs` production constructors instantiate this monitor and share the
+/// same `StopAuthority` with `PreActuationGate`. Automatic periodic checks are
+/// intentionally disabled until explicit governance probe call sites are wired.
 ///
 /// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
 pub struct GovernanceFreshnessMonitor {

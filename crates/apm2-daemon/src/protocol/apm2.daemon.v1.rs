@@ -701,8 +701,9 @@ pub struct RequestToolResponse {
     #[prost(bool, tag = "7")]
     pub stop_checked: bool,
     /// TCK-00351: Pre-actuation budget check proof.
-    /// True indicates budget was evaluated and sufficient before actuation.
-    /// False or absent indicates budget check was not performed (fail-closed: deny).
+    /// True indicates budget was enforced at pre-actuation.
+    /// False is valid when budget enforcement is intentionally deferred to
+    /// EpisodeRuntime; in that mode stop checks still MUST pass before actuation.
     #[prost(bool, tag = "8")]
     pub budget_checked: bool,
     /// TCK-00351: HTF timestamp (nanoseconds) when pre-actuation checks completed.

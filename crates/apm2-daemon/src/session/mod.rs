@@ -336,10 +336,10 @@ pub struct SessionTelemetry {
     pub tool_calls: AtomicU64,
     /// Number of `EmitEvent` calls dispatched for this session.
     pub events_emitted: AtomicU64,
-    /// Number of episodes spawned for this session (TCK-00351 MAJOR 1 FIX).
+    /// Number of completed episodes for this session (TCK-00351 BLOCKER-2).
     ///
-    /// This counter tracks the number of `SpawnEpisode` invocations for
-    /// the session, which is semantically distinct from `tool_calls`.
+    /// This counter tracks completed/terminated episodes for the session,
+    /// which is semantically distinct from `tool_calls`.
     /// The pre-actuation gate uses this to enforce `max_episodes` stop
     /// conditions.
     pub episode_count: AtomicU64,
@@ -410,12 +410,11 @@ impl SessionTelemetry {
         self.events_emitted.load(Ordering::Relaxed)
     }
 
-    /// Increments the episode count and returns the new value (TCK-00351
-    /// MAJOR 1 FIX).
+    /// Increments the completed-episode count and returns the new value.
     ///
-    /// Called during `SpawnEpisode` to track how many episodes have been
-    /// created for this session.  The pre-actuation gate reads this counter
-    /// to enforce `max_episodes` stop conditions.
+    /// Called when an episode terminates. The pre-actuation gate reads this
+    /// counter to enforce `max_episodes` stop conditions without off-by-one
+    /// denial on a newly spawned episode.
     pub fn increment_episode_count(&self) -> u64 {
         self.episode_count.fetch_add(1, Ordering::Relaxed) + 1
     }
