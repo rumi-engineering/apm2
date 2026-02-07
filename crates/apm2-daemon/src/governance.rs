@@ -310,10 +310,7 @@ fn transitional_risk_tier(role: WorkRole) -> u8 {
 /// set in tests.
 #[derive(Debug, Clone)]
 pub struct GovernanceFreshnessConfig {
-    /// Probe cadence hint (milliseconds) for external probe loops.
-    ///
-    /// The production wiring currently does not auto-spawn a polling loop
-    /// until an explicit governance probe source is wired.
+    /// Probe cadence hint (milliseconds) for monitor polling loops.
     pub poll_interval_ms: u64,
     /// Maximum age of the last successful governance response before the
     /// service is considered stale (milliseconds).
@@ -353,8 +350,9 @@ impl Default for GovernanceFreshnessConfig {
 /// # Production Wiring
 ///
 /// `state.rs` production constructors instantiate this monitor and share the
-/// same `StopAuthority` with `PreActuationGate`. Automatic periodic checks are
-/// intentionally disabled until explicit governance probe call sites are wired.
+/// same `StopAuthority` with `PreActuationGate`, wire governance probe
+/// success/failure call sites, and run periodic `check_freshness()` in a
+/// background task.
 ///
 /// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
 pub struct GovernanceFreshnessMonitor {
@@ -411,6 +409,10 @@ impl GovernanceFreshnessMonitor {
     /// denial in the pre-actuation gate will activate once the configured
     /// threshold elapses.
     pub fn record_failure(&self) {
+        // Failure invalidates the freshness watermark until a new explicit
+        // success is recorded.
+        self.last_success_ms
+            .store(0, std::sync::atomic::Ordering::Release);
         self.stop_authority.set_governance_uncertain(true);
     }
 

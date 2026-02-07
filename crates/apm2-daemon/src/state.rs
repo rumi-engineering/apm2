@@ -67,6 +67,16 @@ use crate::session::{SessionRegistry, SessionStopConditionsStore, SessionTelemet
 /// (`apm2-github-tokens`) to avoid keyring entry collisions.
 const CREDENTIAL_STORE_SERVICE_NAME: &str = "apm2-credentials";
 
+#[cfg(not(test))]
+const GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS: u64 = 30_000;
+#[cfg(test)]
+const GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS: u64 = 25;
+
+#[cfg(not(test))]
+const GOVERNANCE_FRESHNESS_THRESHOLD_MS: u64 = 30_000;
+#[cfg(test)]
+const GOVERNANCE_FRESHNESS_THRESHOLD_MS: u64 = 120;
+
 // ============================================================================
 // TCK-00287: Fail-Closed Manifest Store (kept for potential future use)
 // ============================================================================
@@ -519,13 +529,6 @@ impl DispatcherState {
         // stop limits (max_episodes, escalation_predicate).
         let stop_conditions_store = Arc::new(SessionStopConditionsStore::new());
 
-        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
-        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
-        let privileged_dispatcher = privileged_dispatcher
-            .with_telemetry_store(Arc::clone(&telemetry_store))
-            .with_stop_conditions_store(Arc::clone(&stop_conditions_store));
-
         // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
         //
@@ -543,6 +546,14 @@ impl DispatcherState {
         );
         let governance_freshness_monitor =
             Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
+
+        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
+        // registration
+        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
+        let privileged_dispatcher = privileged_dispatcher
+            .with_telemetry_store(Arc::clone(&telemetry_store))
+            .with_stop_conditions_store(Arc::clone(&stop_conditions_store))
+            .with_governance_freshness_monitor(Arc::clone(&governance_freshness_monitor));
 
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
@@ -772,13 +783,6 @@ impl DispatcherState {
         // stop limits (max_episodes, escalation_predicate).
         let stop_conditions_store = Arc::new(SessionStopConditionsStore::new());
 
-        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
-        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
-        let privileged_dispatcher = privileged_dispatcher
-            .with_telemetry_store(Arc::clone(&telemetry_store))
-            .with_stop_conditions_store(Arc::clone(&stop_conditions_store));
-
         // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
         //
@@ -796,6 +800,14 @@ impl DispatcherState {
         );
         let governance_freshness_monitor =
             Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
+
+        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
+        // registration
+        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
+        let privileged_dispatcher = privileged_dispatcher
+            .with_telemetry_store(Arc::clone(&telemetry_store))
+            .with_stop_conditions_store(Arc::clone(&stop_conditions_store))
+            .with_governance_freshness_monitor(Arc::clone(&governance_freshness_monitor));
 
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries
@@ -830,20 +842,30 @@ impl DispatcherState {
     }
 
     /// Wires governance freshness monitoring to a shared stop authority.
-    ///
-    /// TCK-00351 BLOCKER-1: We intentionally do NOT run periodic stale checks
-    /// in production until a real governance probe source is wired. Running
-    /// the loop without any `record_success` call sites eventually flips
-    /// `governance_uncertain=true` for all long-lived sessions.
-    ///
-    /// TODO(TCK-XXXXX): Wire explicit governance probe success/failure signals
-    /// into `GovernanceFreshnessMonitor::{record_success,record_failure}` and
-    /// re-enable periodic freshness checks.
     fn wire_governance_freshness_monitor(
         stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
     ) -> Arc<GovernanceFreshnessMonitor> {
-        let config = GovernanceFreshnessConfig::default();
-        Arc::new(GovernanceFreshnessMonitor::new(stop_authority, config))
+        let config = GovernanceFreshnessConfig {
+            poll_interval_ms: GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS,
+            freshness_threshold_ms: GOVERNANCE_FRESHNESS_THRESHOLD_MS,
+        };
+        let monitor = Arc::new(GovernanceFreshnessMonitor::new(
+            stop_authority,
+            config.clone(),
+        ));
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let monitor_for_task = Arc::clone(&monitor);
+            let poll_interval_ms = config.poll_interval_ms.max(1);
+            std::mem::drop(handle.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+                    monitor_for_task.check_freshness();
+                }
+            }));
+        }
+
+        monitor
     }
 
     /// Sets the daemon state for process management (TCK-00342).
@@ -1300,6 +1322,71 @@ mod tests {
                 1_000,
             )
             .expect_err("stale governance should deny via StopUncertain");
+        assert!(matches!(denial, PreActuationDenial::StopUncertain));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_wiring_governance_health_then_failure_transitions_to_deny() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+
+        let monitor = Arc::clone(
+            state
+                .governance_freshness_monitor()
+                .expect("production constructor must wire governance freshness monitor"),
+        );
+        let authority = Arc::clone(
+            state
+                .stop_authority()
+                .expect("production constructor must wire stop authority"),
+        );
+
+        monitor.record_success();
+        tokio::time::sleep(std::time::Duration::from_millis(
+            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
+        ))
+        .await;
+        monitor.last_success_ms().store(0, Ordering::Release);
+        tokio::time::sleep(std::time::Duration::from_millis(
+            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
+        ))
+        .await;
+        assert!(
+            authority.governance_uncertain(),
+            "periodic freshness checks must mark stale governance as uncertain"
+        );
+
+        monitor.record_success();
+        tokio::time::sleep(std::time::Duration::from_millis(
+            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
+        ))
+        .await;
+        assert!(
+            !authority.governance_uncertain(),
+            "healthy governance should keep uncertainty cleared"
+        );
+
+        monitor.record_failure();
+        tokio::time::sleep(std::time::Duration::from_millis(
+            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
+        ))
+        .await;
+        assert!(
+            authority.governance_uncertain(),
+            "governance failure should transition uncertainty to deny state"
+        );
+
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+        let denial = gate
+            .check(
+                &StopConditions::default(),
+                0,
+                false,
+                false,
+                DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
+                1_000,
+            )
+            .expect_err("uncertain governance should deny after deadline");
         assert!(matches!(denial, PreActuationDenial::StopUncertain));
     }
 

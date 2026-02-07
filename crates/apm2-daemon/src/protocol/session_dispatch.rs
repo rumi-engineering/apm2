@@ -1964,9 +1964,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 // ordering invariant (check preceded actuation).
                 // No gate configured: fields remain false/0 so the replay
                 // verifier treats this as a violation.
-                let (stop_checked, budget_checked, preactuation_ts) = preactuation_receipt
-                    .map_or((false, false, 0), |r| {
-                        (r.stop_checked, r.budget_checked, r.timestamp_ns)
+                let (stop_checked, budget_checked, budget_enforcement_deferred, preactuation_ts) =
+                    preactuation_receipt.map_or((false, false, false, 0), |r| {
+                        (
+                            r.stop_checked,
+                            r.budget_checked,
+                            r.budget_enforcement_deferred,
+                            r.timestamp_ns,
+                        )
                     });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
@@ -1977,6 +1982,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     inline_result,
                     stop_checked,
                     budget_checked,
+                    budget_enforcement_deferred,
                     preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
@@ -1993,9 +1999,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     "Tool request denied by broker"
                 );
                 // TCK-00351 MAJOR 1 FIX: Derive proof fields from receipt.
-                let (stop_checked, budget_checked, preactuation_ts) = preactuation_receipt
-                    .map_or((false, false, 0), |r| {
-                        (r.stop_checked, r.budget_checked, r.timestamp_ns)
+                let (stop_checked, budget_checked, budget_enforcement_deferred, preactuation_ts) =
+                    preactuation_receipt.map_or((false, false, false, 0), |r| {
+                        (
+                            r.stop_checked,
+                            r.budget_checked,
+                            r.budget_enforcement_deferred,
+                            r.timestamp_ns,
+                        )
                     });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
@@ -2006,6 +2017,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     inline_result: None,
                     stop_checked,
                     budget_checked,
+                    budget_enforcement_deferred,
                     preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
@@ -2040,9 +2052,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 };
 
                 // TCK-00351 MAJOR 1 FIX: Derive proof fields from receipt.
-                let (stop_checked, budget_checked, preactuation_ts) = preactuation_receipt
-                    .map_or((false, false, 0), |r| {
-                        (r.stop_checked, r.budget_checked, r.timestamp_ns)
+                let (stop_checked, budget_checked, budget_enforcement_deferred, preactuation_ts) =
+                    preactuation_receipt.map_or((false, false, false, 0), |r| {
+                        (
+                            r.stop_checked,
+                            r.budget_checked,
+                            r.budget_enforcement_deferred,
+                            r.timestamp_ns,
+                        )
                     });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
@@ -2054,6 +2071,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     inline_result,
                     stop_checked,
                     budget_checked,
+                    budget_enforcement_deferred,
                     preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
@@ -3748,6 +3766,7 @@ mod tests {
             inline_result: None,
             stop_checked: false,
             budget_checked: false,
+            budget_enforcement_deferred: false,
             preactuation_timestamp_ns: 0,
         });
         let encoded = tool_resp.encode();

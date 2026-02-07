@@ -14,6 +14,7 @@ evidence_artifact:
     CAS-stored envelope.
   requirement_ids:
     - "REQ-0004"
+    - "REQ-0005"
   source_refs:
     - "crates/apm2-daemon/src/protocol/dispatch.rs"
     - "crates/apm2-daemon/src/ledger.rs"

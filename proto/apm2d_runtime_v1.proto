@@ -694,12 +694,16 @@ message RequestToolResponse {
   bool stop_checked = 7;
   // TCK-00351: Pre-actuation budget check proof.
   // True indicates budget was enforced at pre-actuation.
-  // False is valid when budget enforcement is intentionally deferred to
-  // EpisodeRuntime; in that mode stop checks still MUST pass before actuation.
+  // False is only valid when `budget_enforcement_deferred=true`.
+  // Replayers MUST reject traces where both `budget_checked=false` and
+  // `budget_enforcement_deferred=false`.
   bool budget_checked = 8;
+  // TCK-00351: Explicitly marks budget enforcement deferred beyond
+  // pre-actuation (e.g., to EpisodeRuntime).
+  bool budget_enforcement_deferred = 9;
   // TCK-00351: HTF timestamp (nanoseconds) when pre-actuation checks completed.
   // Provides replay-verifiable ordering proof that checks preceded actuation.
-  uint64 preactuation_timestamp_ns = 9;
+  uint64 preactuation_timestamp_ns = 10;
 }
 
 // IPC-SESS-002: EmitEvent

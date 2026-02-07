@@ -7,7 +7,8 @@
 //! 1. Evaluates stop conditions (emergency stop, governance stop, escalation).
 //! 2. Evaluates budget sufficiency (token, tool-call, wall-time, CPU, I/O).
 //! 3. Returns a [`PreActuationReceipt`] embedding `stop_checked`,
-//!    `budget_checked`, and an HTF timestamp proving the ordering.
+//!    `budget_checked`, `budget_enforcement_deferred`, and an HTF timestamp
+//!    proving the ordering.
 //!
 //! # Fail-Closed Semantics
 //!
@@ -252,7 +253,8 @@ impl BudgetStatus {
 /// Proof that stop and budget checks were performed before actuation.
 ///
 /// This receipt is embedded into tool-response proto fields
-/// (`stop_checked`, `budget_checked`, `preactuation_timestamp_ns`)
+/// (`stop_checked`, `budget_checked`, `budget_enforcement_deferred`,
+/// `preactuation_timestamp_ns`)
 /// and used by the replay verifier to confirm ordering invariants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreActuationReceipt {
@@ -263,6 +265,13 @@ pub struct PreActuationReceipt {
     /// When budget enforcement is deferred to `EpisodeRuntime`, this is `false`
     /// even when the request is allowed.
     pub budget_checked: bool,
+    /// Whether budget enforcement was intentionally deferred beyond
+    /// pre-actuation (e.g., to `EpisodeRuntime`).
+    ///
+    /// This field disambiguates deferred enforcement from an omitted budget
+    /// check in replay traces.
+    #[serde(default)]
+    pub budget_enforcement_deferred: bool,
     /// HTF timestamp (nanoseconds) when the checks completed.
     pub timestamp_ns: u64,
 }
@@ -706,10 +715,12 @@ impl PreActuationGate {
             },
         }
         let budget_checked = has_real_tracker;
+        let budget_enforcement_deferred = !budget_checked;
 
         Ok(PreActuationReceipt {
             stop_checked,
             budget_checked,
+            budget_enforcement_deferred,
             timestamp_ns,
         })
     }
@@ -828,6 +839,10 @@ pub enum ReplayEntryKind {
         stop_checked: bool,
         /// Whether budget was checked.
         budget_checked: bool,
+        /// Whether budget enforcement was intentionally deferred from
+        /// pre-actuation to a later runtime stage.
+        #[serde(default)]
+        budget_enforcement_deferred: bool,
     },
     /// Tool actuation occurred.
     ToolActuation {
@@ -866,7 +881,8 @@ pub enum ReplayViolation {
         /// Index of the check entry.
         index: usize,
     },
-    /// A pre-actuation check did not include budget checking.
+    /// A pre-actuation check did not include budget checking and also did
+    /// not mark budget enforcement as deferred.
     BudgetNotChecked {
         /// Index of the check entry.
         index: usize,
@@ -939,8 +955,9 @@ impl std::error::Error for ReplayViolation {}
 ///    entry.
 /// 2. The check's timestamp must be strictly less than the actuation's
 ///    timestamp.
-/// 3. The check must have `stop_checked=true`. `budget_checked` may be `false`
-///    when budget enforcement is deferred to `EpisodeRuntime`.
+/// 3. The check must have `stop_checked=true`.
+/// 4. Budget proof must be explicit: either `budget_checked=true` OR
+///    `budget_enforcement_deferred=true`.
 ///
 /// # `DoS` Protection
 ///
@@ -979,11 +996,15 @@ impl ReplayVerifier {
             match &entry.kind {
                 ReplayEntryKind::PreActuationCheck {
                     stop_checked,
-                    budget_checked: _,
+                    budget_checked,
+                    budget_enforcement_deferred,
                 } => {
                     // Validate completeness of the check.
                     if !stop_checked {
                         return Err(ReplayViolation::StopNotChecked { index: i });
+                    }
+                    if !budget_checked && !budget_enforcement_deferred {
+                        return Err(ReplayViolation::BudgetNotChecked { index: i });
                     }
                     last_check = Some((i, entry));
                 },
@@ -1251,6 +1272,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
+                    budget_enforcement_deferred: false,
                 },
             },
             ReplayEntry {
@@ -1272,6 +1294,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
+                    budget_enforcement_deferred: false,
                 },
             },
             ReplayEntry {
@@ -1286,6 +1309,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
+                    budget_enforcement_deferred: false,
                 },
             },
             ReplayEntry {
@@ -1331,6 +1355,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
+                    budget_enforcement_deferred: false,
                 },
             },
             ReplayEntry {
@@ -1364,6 +1389,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
+                    budget_enforcement_deferred: false,
                 },
             },
             ReplayEntry {
@@ -1386,6 +1412,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: false,
                     budget_checked: true,
+                    budget_enforcement_deferred: false,
                 },
             },
             ReplayEntry {
@@ -1408,6 +1435,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: false,
+                    budget_enforcement_deferred: true,
                 },
             },
             ReplayEntry {
@@ -1433,11 +1461,38 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
+                    budget_enforcement_deferred: false,
                 },
             });
         }
         let err = ReplayVerifier::verify(&trace).unwrap_err();
         assert!(matches!(err, ReplayViolation::TraceTooLarge { .. }));
+    }
+
+    #[test]
+    fn test_replay_budget_not_checked_without_deferred_fails() {
+        let trace = vec![
+            ReplayEntry {
+                timestamp_ns: 100,
+                kind: ReplayEntryKind::PreActuationCheck {
+                    stop_checked: true,
+                    budget_checked: false,
+                    budget_enforcement_deferred: false,
+                },
+            },
+            ReplayEntry {
+                timestamp_ns: 200,
+                kind: ReplayEntryKind::ToolActuation {
+                    tool_class: "file_read".to_string(),
+                    request_id: "REQ-001".to_string(),
+                },
+            },
+        ];
+        let err = ReplayVerifier::verify(&trace).unwrap_err();
+        assert!(matches!(
+            err,
+            ReplayViolation::BudgetNotChecked { index: 0 }
+        ));
     }
 
     #[test]
@@ -1449,6 +1504,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: true,
                     budget_checked: true,
+                    budget_enforcement_deferred: false,
                 },
             },
             ReplayEntry {
@@ -1520,6 +1576,7 @@ mod tests {
         let receipt = PreActuationReceipt {
             stop_checked: true,
             budget_checked: true,
+            budget_enforcement_deferred: false,
             timestamp_ns: 1000,
         };
         assert!(receipt.is_cleared());
@@ -1530,6 +1587,7 @@ mod tests {
         let receipt = PreActuationReceipt {
             stop_checked: false,
             budget_checked: true,
+            budget_enforcement_deferred: false,
             timestamp_ns: 1000,
         };
         assert!(!receipt.is_cleared());
@@ -1540,6 +1598,7 @@ mod tests {
         let receipt = PreActuationReceipt {
             stop_checked: true,
             budget_checked: false,
+            budget_enforcement_deferred: true,
             timestamp_ns: 1000,
         };
         assert!(!receipt.is_cleared());
@@ -2014,6 +2073,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: receipt1.stop_checked,
                     budget_checked: receipt1.budget_checked,
+                    budget_enforcement_deferred: receipt1.budget_enforcement_deferred,
                 },
             },
             ReplayEntry {
@@ -2028,6 +2088,7 @@ mod tests {
                 kind: ReplayEntryKind::PreActuationCheck {
                     stop_checked: receipt2.stop_checked,
                     budget_checked: receipt2.budget_checked,
+                    budget_enforcement_deferred: receipt2.budget_enforcement_deferred,
                 },
             },
             ReplayEntry {
@@ -2167,6 +2228,10 @@ mod tests {
             !receipt.budget_checked,
             "budget_checked must be false when no tracker is wired"
         );
+        assert!(
+            receipt.budget_enforcement_deferred,
+            "deferred flag must be true when pre-actuation budget check is absent"
+        );
     }
 
     /// Deferred trackers must not claim pre-actuation budget enforcement.
@@ -2187,6 +2252,10 @@ mod tests {
         assert!(
             !receipt.budget_checked,
             "budget_checked must be false when tracker enforcement is deferred"
+        );
+        assert!(
+            receipt.budget_enforcement_deferred,
+            "deferred flag must be true when tracker enforcement is deferred"
         );
     }
 
@@ -2213,6 +2282,10 @@ mod tests {
         assert!(
             receipt.budget_checked,
             "budget_checked must be true when a real tracker verified the budget"
+        );
+        assert!(
+            !receipt.budget_enforcement_deferred,
+            "deferred flag must be false when budget is enforced at pre-actuation"
         );
     }
 }

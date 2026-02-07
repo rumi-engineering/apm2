@@ -135,6 +135,7 @@ use crate::episode::{
     EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
     TerminationClass, validate_custody_domain_overlap,
 };
+use crate::governance::GovernanceFreshnessMonitor;
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
 use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
@@ -4122,6 +4123,12 @@ pub struct PrivilegedDispatcher {
     /// a clone of the same `Arc` and reads conditions in the pre-actuation
     /// gate to enforce `max_episodes` / `escalation_predicate`.
     stop_conditions_store: Option<Arc<crate::session::SessionStopConditionsStore>>,
+
+    /// Governance freshness monitor wired from production `DispatcherState`.
+    ///
+    /// Successful governance-backed operations call `record_success()`.
+    /// Governance probe/policy lookup failures call `record_failure()`.
+    governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -4261,6 +4268,7 @@ impl PrivilegedDispatcher {
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -4321,6 +4329,7 @@ impl PrivilegedDispatcher {
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -4400,6 +4409,7 @@ impl PrivilegedDispatcher {
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -4456,6 +4466,7 @@ impl PrivilegedDispatcher {
             v1_manifest_store: None,
             gate_orchestrator: None,
             stop_conditions_store: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -4549,6 +4560,16 @@ impl PrivilegedDispatcher {
         self
     }
 
+    /// Sets the governance freshness monitor for production probe wiring.
+    #[must_use]
+    pub fn with_governance_freshness_monitor(
+        mut self,
+        monitor: Arc<GovernanceFreshnessMonitor>,
+    ) -> Self {
+        self.governance_freshness_monitor = Some(monitor);
+        self
+    }
+
     /// Replaces the session registry used by this dispatcher (TEST ONLY).
     ///
     /// This allows tests to inject a concrete `InMemorySessionRegistry`
@@ -4585,6 +4606,20 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn event_emitter(&self) -> &Arc<dyn LedgerEventEmitter> {
         &self.event_emitter
+    }
+
+    /// Records a successful governance probe when monitoring is wired.
+    fn record_governance_probe_success(&self) {
+        if let Some(ref monitor) = self.governance_freshness_monitor {
+            monitor.record_success();
+        }
+    }
+
+    /// Records a governance probe failure when monitoring is wired.
+    fn record_governance_probe_failure(&self) {
+        if let Some(ref monitor) = self.governance_freshness_monitor {
+            monitor.record_failure();
+        }
     }
 
     /// Returns a reference to the episode runtime.
@@ -5022,6 +5057,7 @@ impl PrivilegedDispatcher {
         {
             Ok(resolution) => resolution,
             Err(e) => {
+                self.record_governance_probe_failure();
                 warn!(error = %e, "Policy resolution failed");
                 // Return application-level error, not protocol error
                 // Policy resolution failures are logic errors, not serialization errors
@@ -5558,6 +5594,7 @@ impl PrivilegedDispatcher {
         // Fail-closed: spawn is only allowed if a valid policy resolution exists
         // for the work_id. This is established during ClaimWork.
         let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+            self.record_governance_probe_failure();
             warn!(
                 work_id = %request.work_id,
                 "SpawnEpisode rejected: policy resolution not found for work_id"
@@ -6520,6 +6557,10 @@ impl PrivilegedDispatcher {
             "Spawn lifecycle events emitted (session_started + work_transitioned)"
         );
 
+        // Successful spawn demonstrates governance-backed policy state is
+        // accessible; record fresh governance health.
+        self.record_governance_probe_success();
+
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
             session_id,
             ephemeral_handle: ephemeral_handle.to_string(),
@@ -6601,6 +6642,7 @@ impl PrivilegedDispatcher {
                 ));
             }
         } else {
+            self.record_governance_probe_failure();
             warn!(
                 session_id = %request.session_id,
                 work_id = %session.work_id,

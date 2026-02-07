@@ -3,13 +3,13 @@ evidence_artifact:
   id: "EVID-0005"
   title: "Pre-actuation stop and budget proof obligations evidence"
   category: "INTEGRATION_TEST_RESULT"
-  status: "DRAFT"
+  status: "PASS"
   description: |
-    Draft evidence bundle for REQ-0005 showing pre-actuation stop/budget
-    proof behavior and regression coverage for TCK-00351. This artifact tracks
-    the production-wiring fixes from PR #456 (governance freshness liveness,
-    max_episodes admission semantics, deferred budget proof contract alignment,
-    and SpawnEpisode input hardening).
+    Evidence bundle for REQ-0005 showing pre-actuation stop/budget
+    proof behavior and production governance freshness wiring coverage for
+    TCK-00351 (PR #456). The covered behaviors include periodic governance
+    freshness checks, probe success/failure signaling, and replay proof
+    semantics for deferred budget enforcement.
   requirement_ids:
     - "REQ-0005"
   source_refs:
@@ -21,10 +21,14 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Regression and integration tests added/updated in this PR:
+        Regression and integration tests relevant to stop/budget/governance:
+        - state::tests::production_wiring_governance_health_then_failure_transitions_to_deny
+        - state::tests::production_wiring_stale_governance_transitions_to_deny
         - state::tests::spawn_default_max_episodes_allows_first_request_tool_gate
-        - protocol::dispatch::tests::transactional_spawn::test_spawn_rejects_oversized_escalation_predicate
         - episode::preactuation::tests::test_replay_budget_not_checked_allowed_when_deferred
-        Full daemon verification is captured by the mandatory ticket command:
+        - episode::preactuation::tests::test_replay_budget_not_checked_without_deferred_fails
+        - episode::preactuation::tests::test_budget_checked_false_with_deferred_tracker
+        - episode::preactuation::tests::test_budget_checked_true_with_real_tracker
+        Mandatory daemon verification command:
         cargo test -p apm2-daemon
       ref: "cargo test -p apm2-daemon"
