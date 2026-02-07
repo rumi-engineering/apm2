@@ -2508,6 +2508,19 @@ pub struct PolicyResolution {
     /// to validate the candidate manifest against.
     #[serde(default)]
     pub resolved_scope_baseline: Option<crate::episode::capability::ScopeBaseline>,
+
+    /// Policy-bound adapter profile hash (BLOCKER security fix).
+    ///
+    /// When present, `SpawnEpisode` MUST use this exact adapter profile hash.
+    /// Any request supplying a different hash is rejected (confused-deputy
+    /// prevention). CAS existence alone is NOT authorization -- the profile
+    /// must be policy-bound to the caller's scope.
+    ///
+    /// When `None` (rollout waiver WVR-0003), callers may supply any
+    /// CAS-present hash or fall back to the role-based default. This field
+    /// will become mandatory once governance populates it.
+    #[serde(default)]
+    pub expected_adapter_profile_hash: Option<[u8; 32]>,
 }
 
 /// Serde default for `resolved_risk_tier`: returns `4` (Tier4, most
@@ -2706,6 +2719,7 @@ impl PolicyResolver for StubPolicyResolver {
             context_pack_hash,
             resolved_risk_tier: 0, // Stub resolver: Tier0 default
             resolved_scope_baseline,
+            expected_adapter_profile_hash: None, // TODO(TCK-00399): populate from governance
         })
     }
 }
@@ -5909,6 +5923,16 @@ impl PrivilegedDispatcher {
     /// built-in default by `WorkRole` and stores it in CAS so that auditors
     /// reading the ledger can resolve the hash (MAJOR-1 security fix).
     ///
+    /// # Policy Binding (BLOCKER security fix)
+    ///
+    /// When the policy resolution carries an `expected_adapter_profile_hash`,
+    /// the resolved hash MUST match exactly. This prevents confused-deputy
+    /// attacks where an authorized caller substitutes a different CAS-present
+    /// profile to gain access to different command/env configurations.
+    ///
+    /// CAS existence is NOT authorization. The profile must be bound to the
+    /// caller's policy scope.
+    ///
     /// # Authorization Trust Chain
     ///
     /// The `requested_hash` originates from the `SpawnEpisodeRequest`, whose
@@ -5922,14 +5946,18 @@ impl PrivilegedDispatcher {
     ///    constant-time comparison (line ~6346).
     /// 3. Therefore the `adapter_profile_hash` was submitted by an authorized
     ///    caller. The CAS-existence check here ensures the hash refers to a
-    ///    well-formed, previously stored profile -- it is NOT an open-access
-    ///    lookup for arbitrary callers.
+    ///    well-formed, previously stored profile -- not that the caller is
+    ///    allowed to use it (that was established upstream).
+    /// 4. When `expected_adapter_profile_hash` is set in the policy resolution,
+    ///    the resolved hash is validated against it using constant-time
+    ///    comparison, closing the confused-deputy gap.
     fn resolve_spawn_adapter_profile_hash(
         &self,
         requested_hash: Option<&[u8]>,
         role: WorkRole,
+        claim: &WorkClaim,
     ) -> Result<[u8; 32], String> {
-        if let Some(raw_hash) = requested_hash {
+        let resolved_hash = if let Some(raw_hash) = requested_hash {
             if raw_hash.len() != 32 {
                 return Err(format!(
                     "adapter_profile_hash must be exactly 32 bytes, got {}",
@@ -5957,10 +5985,44 @@ impl PrivilegedDispatcher {
                     hex::encode(hash)
                 ));
             }
-            return Ok(hash);
+            hash
+        } else {
+            self.resolve_default_adapter_profile(role)?
+        };
+
+        // SECURITY (BLOCKER fix): Policy-binding validation.
+        //
+        // When the policy resolution carries an expected_adapter_profile_hash,
+        // the resolved hash MUST match exactly. This prevents confused-deputy
+        // attacks where an authorized caller substitutes a CAS-present profile
+        // hash that differs from the policy-bound one.
+        //
+        // Uses constant-time comparison to prevent timing side-channels that
+        // could leak information about the expected hash.
+        if let Some(expected_hash) = claim.policy_resolution.expected_adapter_profile_hash {
+            let binding_matches = bool::from(resolved_hash.ct_eq(&expected_hash));
+            if !binding_matches {
+                return Err(format!(
+                    "adapter_profile_hash policy binding mismatch: \
+                     resolved {} but policy expects {}",
+                    hex::encode(resolved_hash),
+                    hex::encode(expected_hash)
+                ));
+            }
+        } else {
+            // Rollout waiver WVR-0003: policy does not yet bind a specific
+            // adapter profile hash. CAS-existence + caller authorization
+            // (established upstream) is the current trust basis. This branch
+            // will be removed once governance populates the binding.
+            tracing::debug!(
+                work_id = %claim.work_id,
+                resolved_hash = %hex::encode(resolved_hash),
+                "adapter_profile_hash accepted under rollout waiver WVR-0003 \
+                 (no policy binding present)"
+            );
         }
 
-        self.resolve_default_adapter_profile(role)
+        Ok(resolved_hash)
     }
 
     /// Resolves the role-based default adapter profile hash.
@@ -6521,6 +6583,7 @@ impl PrivilegedDispatcher {
         let adapter_profile_hash = match self.resolve_spawn_adapter_profile_hash(
             request.adapter_profile_hash.as_deref(),
             request_role,
+            &claim,
         ) {
             Ok(hash) => hash,
             Err(e) => {
@@ -11931,6 +11994,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -12253,6 +12317,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             author_custody_domains: vec![],
             executor_custody_domains: vec![],
@@ -13661,6 +13726,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -13695,6 +13761,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
@@ -13766,6 +13833,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()],
@@ -13830,6 +13898,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
@@ -13898,6 +13967,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec![], // Empty - resolution failed
@@ -13963,6 +14033,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
@@ -14724,6 +14795,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -17407,6 +17479,7 @@ mod tests {
                             context_pack_hash: [0u8; 32],
                             resolved_risk_tier: 0,
                             resolved_scope_baseline: None,
+                            expected_adapter_profile_hash: None,
                         },
                         executor_custody_domains: vec![],
                         author_custody_domains: vec![],
@@ -17487,6 +17560,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -17532,6 +17606,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -19373,6 +19448,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: risk_tier,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -20712,6 +20788,7 @@ mod tests {
                         context_pack_hash: [0u8; 32],
                         resolved_risk_tier: 0,
                         resolved_scope_baseline: None,
+                        expected_adapter_profile_hash: None,
                     },
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
@@ -20797,6 +20874,7 @@ mod tests {
                         context_pack_hash: [0u8; 32],
                         resolved_risk_tier: 0,
                         resolved_scope_baseline: None,
+                        expected_adapter_profile_hash: None,
                     },
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
@@ -21960,6 +22038,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0, // Tier0
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -22034,6 +22113,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 2, // Tier2
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -22324,6 +22404,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0, // Tier0
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -22769,6 +22850,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             };
 
             assert!(
@@ -22797,6 +22879,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: Some(baseline),
+                expected_adapter_profile_hash: None,
             };
 
             let resolved = resolution.resolved_scope_baseline.unwrap();
@@ -22882,6 +22965,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -22944,6 +23028,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: Some(narrow_baseline),
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -23010,6 +23095,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: Some(matching_baseline),
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -23074,6 +23160,7 @@ mod tests {
                     // Invalid tier value
                     resolved_risk_tier: 255,
                     resolved_scope_baseline: Some(matching_baseline),
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],

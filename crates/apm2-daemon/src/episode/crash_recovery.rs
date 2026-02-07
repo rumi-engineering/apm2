@@ -603,6 +603,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: Vec::new(),
             author_custody_domains: Vec::new(),

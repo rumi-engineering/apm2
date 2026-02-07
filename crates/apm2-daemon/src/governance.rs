@@ -207,6 +207,7 @@ impl PolicyResolver for GovernancePolicyResolver {
             context_pack_hash,
             resolved_risk_tier,
             resolved_scope_baseline,
+            expected_adapter_profile_hash: None,
         })
     }
 }

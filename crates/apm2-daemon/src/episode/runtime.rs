@@ -554,6 +554,17 @@ pub struct EpisodeRuntime {
     /// When present, `spawn_adapter()` uses this registry to look up the
     /// appropriate `HarnessAdapter` and spawn the agent process.
     adapter_registry: Option<Arc<AdapterRegistry>>,
+
+    /// Orphaned harness handles awaiting cleanup (MAJOR security fix).
+    ///
+    /// When spawn-race cleanup fails (both `terminate()` and
+    /// `escalate_sigkill()` fail), the harness handle is retained here for
+    /// periodic retry. This prevents untracked orphaned processes surviving
+    /// outside containment.
+    ///
+    /// Invariant: process death is NEVER assumed without confirmation. Handles
+    /// remain in this vec until cleanup succeeds.
+    orphan_harness_handles: tokio::sync::Mutex<Vec<HarnessHandle>>,
 }
 
 impl EpisodeRuntime {
@@ -584,6 +595,8 @@ impl EpisodeRuntime {
             session_registry: None,
             // TCK-00399: No adapter registry by default
             adapter_registry: None,
+            // MAJOR security fix: empty orphan tracker
+            orphan_harness_handles: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -618,6 +631,8 @@ impl EpisodeRuntime {
             session_registry: None,
             // TCK-00399: No adapter registry by default
             adapter_registry: None,
+            // MAJOR security fix: empty orphan tracker
+            orphan_harness_handles: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -776,6 +791,55 @@ impl EpisodeRuntime {
     pub fn with_adapter_registry(mut self, registry: Arc<AdapterRegistry>) -> Self {
         self.adapter_registry = Some(registry);
         self
+    }
+
+    /// Returns the number of orphaned harness handles awaiting cleanup.
+    ///
+    /// A non-zero count indicates processes whose death could not be confirmed
+    /// during spawn-race cleanup. These handles are retained for periodic retry
+    /// via [`retry_orphan_cleanup`](Self::retry_orphan_cleanup).
+    pub async fn orphan_harness_count(&self) -> usize {
+        self.orphan_harness_handles.lock().await.len()
+    }
+
+    /// Retries cleanup of orphaned harness handles (MAJOR security fix).
+    ///
+    /// Iterates all retained orphan handles and attempts `escalate_sigkill`
+    /// again. Handles whose processes are confirmed dead (SIGKILL succeeds or
+    /// ESRCH) are removed. Handles that still fail are retained for the next
+    /// retry cycle.
+    ///
+    /// Returns the number of handles that were successfully cleaned up.
+    pub async fn retry_orphan_cleanup(&self) -> usize {
+        let mut orphans = self.orphan_harness_handles.lock().await;
+        let mut still_orphaned = Vec::new();
+        let mut cleaned = 0usize;
+
+        for handle in orphans.drain(..) {
+            match crate::episode::adapter::escalate_sigkill(&handle).await {
+                Ok(()) => {
+                    info!(
+                        handle_id = handle.id(),
+                        episode_id = %handle.episode_id(),
+                        "orphaned adapter process confirmed dead on retry"
+                    );
+                    cleaned += 1;
+                },
+                Err(e) => {
+                    warn!(
+                        handle_id = handle.id(),
+                        episode_id = %handle.episode_id(),
+                        error = %e,
+                        "orphaned adapter process still not confirmed dead; \
+                         retaining for next retry"
+                    );
+                    still_orphaned.push(handle);
+                },
+            }
+        }
+
+        *orphans = still_orphaned;
+        cleaned
     }
 
     /// Registers a factory for creating tool handlers (builder pattern).
@@ -1373,8 +1437,13 @@ impl EpisodeRuntime {
                             episode_id = %episode_id,
                             error = %kill_err,
                             "SIGKILL escalation failed for orphaned adapter process \
-                             on missing episode; process death NOT confirmed"
+                             on missing episode; process death NOT confirmed; \
+                             retaining handle in orphan tracker"
                         );
+                        // MAJOR security fix: Retain the handle for periodic
+                        // cleanup retry. Never claim cleanup succeeded if
+                        // process death is unconfirmed.
+                        self.orphan_harness_handles.lock().await.push(handle);
                     }
                 }
                 return Err(EpisodeError::NotFound {
@@ -1406,8 +1475,13 @@ impl EpisodeRuntime {
                             episode_id = %episode_id,
                             error = %kill_err,
                             "SIGKILL escalation failed for orphaned adapter process; \
-                             process death NOT confirmed"
+                             process death NOT confirmed; \
+                             retaining handle in orphan tracker"
                         );
+                        // MAJOR security fix: Retain the handle for periodic
+                        // cleanup retry. Never claim cleanup succeeded if
+                        // process death is unconfirmed.
+                        self.orphan_harness_handles.lock().await.push(handle);
                     }
                 }
                 return Err(EpisodeError::Internal {
