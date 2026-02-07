@@ -12,8 +12,12 @@ evidence_artifact:
 
     This artifact binds TCK-00357 hardening tests to the RFC-0020 evidence
     registry for bounded verifier economics under REQ-0011.
+
+    TCK-00359 extends verifier economics evidence with cache amortization
+    and invalidation correctness tests under REQ-0013 (see EVID-0013).
   requirement_ids:
     - "REQ-0011"
+    - "REQ-0013"
   source_refs:
     - "documents/rfcs/RFC-0020/07_test_and_evidence.yaml"
     - "crates/apm2-daemon/src/identity/directory_proof.rs"

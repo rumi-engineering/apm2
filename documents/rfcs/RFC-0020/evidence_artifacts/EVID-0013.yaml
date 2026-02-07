@@ -1,0 +1,94 @@
+evidence_artifact:
+  schema_version: "2026-02-07"
+  id: "EVID-0013"
+  title: "Verifier cache contract and invalidation correctness evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that REQ-0013 is implemented in the daemon identity verification
+    module. The VerifiedHeadCache supports O(1) head amortization (one
+    verified head admits O(log n) identity proof verifications without
+    repeated signature/quorum checks) and deterministic invalidation on
+    revocation, key rotation, and head advancement.
+
+    All invalidation paths produce deterministic VerifierCacheAuditEvent
+    entries enabling post-hoc reconstruction of invalidation decisions.
+    The cache is bounded (max_entries with FIFO eviction) and fail-closed
+    (cache miss forces full pipeline re-verification).
+
+    Key security invariants tested:
+    - Stale cache entries cannot authorize revoked identities (proof-derived
+      status is always returned; explicit invalidation removes heads entirely).
+    - Key rotation invalidates all heads for the affected cell.
+    - Head advancement invalidates older-epoch heads per cell.
+    - Emergency purge removes all cached state.
+    - Every cache mutation emits an audit event.
+  requirement_ids:
+    - "REQ-0013"
+  source_refs:
+    - "documents/rfcs/RFC-0020/requirements/REQ-0013.yaml"
+    - "crates/apm2-daemon/src/identity/directory_proof.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Cache amortization: verified head admits multiple proof checks
+        without repeated seal verification.
+        - cache_admits_and_verifies_multiple_proofs_against_same_head
+        - verified_head_cache_amortizes_head_verification
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_admits_and_verifies_multiple_proofs_against_same_head"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::verified_head_cache_amortizes_head_verification"
+    - type: "test_output"
+      description: |
+        Revocation invalidation: heads are removed on identity revocation,
+        cache returns Revoked status for revoked proofs, stale cache
+        cannot authorize revoked identities.
+        - cache_invalidate_head_removes_revoked_entry
+        - cache_invalidate_head_returns_false_for_absent_head
+        - cache_verify_returns_revoked_status_for_revoked_proof
+        - stale_cache_cannot_authorize_revoked_identity
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_invalidate_head_removes_revoked_entry"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_invalidate_head_returns_false_for_absent_head"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_verify_returns_revoked_status_for_revoked_proof"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::stale_cache_cannot_authorize_revoked_identity"
+    - type: "test_output"
+      description: |
+        Key rotation invalidation: all heads for a rotated cell are removed,
+        other cells are unaffected.
+        - cache_invalidate_for_cell_removes_all_heads_for_cell
+        - cache_invalidate_for_cell_returns_zero_for_absent_cell
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_invalidate_for_cell_removes_all_heads_for_cell"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_invalidate_for_cell_returns_zero_for_absent_cell"
+    - type: "test_output"
+      description: |
+        Head advancement invalidation: older-epoch heads for a cell are
+        removed when a newer epoch is observed, boundary epochs are retained.
+        - cache_invalidate_on_head_advance_removes_old_epochs
+        - cache_invalidate_on_head_advance_keeps_equal_epoch
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_invalidate_on_head_advance_removes_old_epochs"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_invalidate_on_head_advance_keeps_equal_epoch"
+    - type: "test_output"
+      description: |
+        Global staleness eviction and emergency purge:
+        - cache_evict_stale_returns_count_and_emits_audit
+        - verified_head_cache_evict_stale_entries
+        - cache_purge_all_removes_everything
+        - cache_purge_all_on_empty_cache_is_noop
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_evict_stale_returns_count_and_emits_audit"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::verified_head_cache_evict_stale_entries"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_purge_all_removes_everything"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_purge_all_on_empty_cache_is_noop"
+    - type: "test_output"
+      description: |
+        Audit log determinism and capacity eviction:
+        - invalidation_path_is_deterministic_and_auditable
+        - cache_capacity_eviction_emits_audit_event
+        - cache_drain_audit_log_clears_events
+      ref:
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::invalidation_path_is_deterministic_and_auditable"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_capacity_eviction_emits_audit_event"
+        - "cargo test -p apm2-daemon identity::directory_proof::tests::cache_drain_audit_log_clears_events"
