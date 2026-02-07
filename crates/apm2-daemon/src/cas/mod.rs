@@ -721,6 +721,63 @@ impl crate::episode::executor::ContentAddressedStore for DurableCas {
     }
 }
 
+/// TCK-00408: Implement the core evidence CAS trait so that `DurableCas` can
+/// be wired into `PrivilegedDispatcher` for fail-closed CAS validation in
+/// publish and ingest handlers.
+impl apm2_core::evidence::ContentAddressedStore for DurableCas {
+    fn store(
+        &self,
+        content: &[u8],
+    ) -> Result<apm2_core::evidence::StoreResult, apm2_core::evidence::CasError> {
+        Self::store(self, content)
+            .map(|r| apm2_core::evidence::StoreResult {
+                hash: r.hash,
+                size: r.size,
+                is_new: r.is_new,
+            })
+            .map_err(
+                |e: DurableCasError| apm2_core::evidence::CasError::StorageError {
+                    message: e.to_string(),
+                },
+            )
+    }
+
+    fn retrieve(
+        &self,
+        hash: &apm2_core::crypto::Hash,
+    ) -> Result<Vec<u8>, apm2_core::evidence::CasError> {
+        Self::retrieve(self, hash).map_err(|e| match e {
+            DurableCasError::NotFound { hash: h } => {
+                apm2_core::evidence::CasError::NotFound { hash: h }
+            },
+            DurableCasError::HashMismatch { expected, actual } => {
+                apm2_core::evidence::CasError::HashMismatch { expected, actual }
+            },
+            other => apm2_core::evidence::CasError::StorageError {
+                message: other.to_string(),
+            },
+        })
+    }
+
+    fn exists(
+        &self,
+        hash: &apm2_core::crypto::Hash,
+    ) -> Result<bool, apm2_core::evidence::CasError> {
+        Ok(Self::exists(self, hash))
+    }
+
+    fn size(&self, hash: &apm2_core::crypto::Hash) -> Result<usize, apm2_core::evidence::CasError> {
+        Self::size(self, hash).map_err(|e| match e {
+            DurableCasError::NotFound { hash: h } => {
+                apm2_core::evidence::CasError::NotFound { hash: h }
+            },
+            other => apm2_core::evidence::CasError::StorageError {
+                message: other.to_string(),
+            },
+        })
+    }
+}
+
 // =============================================================================
 // Core ContentAddressedStore trait implementation (apm2_core::evidence)
 // =============================================================================

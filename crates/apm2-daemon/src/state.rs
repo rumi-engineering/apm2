@@ -674,14 +674,18 @@ impl DispatcherState {
         let session_registry_for_runtime = Arc::clone(&session_registry);
 
         // TCK-00316: Create durable CAS
+        // Keep the concrete type so we can upcast to both executor and evidence
+        // CAS traits (TCK-00408: dispatcher needs evidence::ContentAddressedStore).
         let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
         let durable_cas = Arc::new(DurableCas::new(cas_config)?);
         // Coerce to executor::ContentAddressedStore (infallible, daemon-local)
-        let cas: Arc<dyn ContentAddressedStore> = Arc::clone(&durable_cas) as _;
+        let cas: Arc<dyn ContentAddressedStore> =
+            Arc::clone(&durable_cas) as Arc<dyn ContentAddressedStore>;
         // Coerce to apm2_core::evidence::ContentAddressedStore (fallible, core)
         // Used by PrivilegedDispatcher for AgentAdapterProfileV1::load_from_cas
-        let core_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
-            Arc::clone(&durable_cas) as _;
+        // and TCK-00408 fail-closed ingest/publish validation.
+        let evidence_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
+            Arc::clone(&durable_cas) as Arc<dyn apm2_core::evidence::ContentAddressedStore>;
 
         // TCK-00316: Create ToolBroker with CAS
         let broker: SharedToolBroker<StubManifestLoader> =
@@ -802,11 +806,13 @@ impl DispatcherState {
             Arc::clone(&subscription_registry),
         )
         .with_credential_store(credential_store)
+        // TCK-00408: Wire CAS into privileged dispatcher for fail-closed
+        // ingest/publish validation. Uses the core evidence trait impl.
+        .with_cas(Arc::clone(&evidence_cas))
         // TCK-00352: Wire V1 manifest store into production path
         .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
         // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
-        .with_adapter_registry(adapter_registry)
-        .with_cas(core_cas);
+        .with_adapter_registry(adapter_registry);
 
         let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(Arc::clone(metrics))

@@ -448,3 +448,106 @@ fn ecosystem_config_divergence_watchdog_defaults() {
         "default trunk branch should be 'main'"
     );
 }
+
+/// UT-00408-01: Fail-closed startup when watchdog enabled without ledger DB.
+///
+/// TCK-00408 regression test: when `divergence_watchdog.enabled=true` but no
+/// ledger database is configured, `validate_startup_prerequisites` must
+/// return an error. This ensures the daemon refuses to start in a
+/// configuration that would silently disable divergence detection.
+#[test]
+fn watchdog_enabled_without_ledger_db_fails_startup() {
+    use apm2_core::config::EcosystemConfig;
+
+    let toml = r#"
+        [daemon]
+        operator_socket = "/tmp/apm2/operator.sock"
+        session_socket = "/tmp/apm2/session.sock"
+
+        [daemon.divergence_watchdog]
+        enabled = true
+        github_owner = "rumi-engineering"
+        github_repo = "apm2"
+    "#;
+
+    let config = EcosystemConfig::from_toml(toml).expect("should parse");
+    assert!(config.daemon.divergence_watchdog.enabled);
+
+    // Simulate startup WITHOUT a ledger database (has_ledger_db = false).
+    let result = config
+        .daemon
+        .divergence_watchdog
+        .validate_startup_prerequisites(false);
+
+    assert!(
+        result.is_err(),
+        "startup should fail when watchdog is enabled without ledger DB"
+    );
+    let err_msg = result.unwrap_err();
+    assert!(
+        err_msg.contains("no --ledger-db configured"),
+        "error should mention missing ledger-db, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Divergence watchdog requires a ledger database"),
+        "error should explain the requirement, got: {err_msg}"
+    );
+}
+
+/// UT-00408-02: Startup succeeds when watchdog enabled WITH ledger DB.
+///
+/// Complementary positive test for TCK-00408: when the watchdog is enabled
+/// and a ledger database IS configured, validation passes.
+#[test]
+fn watchdog_enabled_with_ledger_db_passes_startup() {
+    use apm2_core::config::EcosystemConfig;
+
+    let toml = r#"
+        [daemon]
+        operator_socket = "/tmp/apm2/operator.sock"
+        session_socket = "/tmp/apm2/session.sock"
+
+        [daemon.divergence_watchdog]
+        enabled = true
+        github_owner = "rumi-engineering"
+        github_repo = "apm2"
+    "#;
+
+    let config = EcosystemConfig::from_toml(toml).expect("should parse");
+    let result = config
+        .daemon
+        .divergence_watchdog
+        .validate_startup_prerequisites(true);
+
+    assert!(
+        result.is_ok(),
+        "startup should succeed when watchdog is enabled with ledger DB"
+    );
+}
+
+/// UT-00408-03: Startup succeeds when watchdog is disabled without ledger DB.
+///
+/// When the watchdog is disabled, the absence of a ledger DB is irrelevant.
+#[test]
+fn watchdog_disabled_without_ledger_db_passes_startup() {
+    use apm2_core::config::EcosystemConfig;
+
+    let toml = r#"
+        [daemon]
+        operator_socket = "/tmp/apm2/operator.sock"
+        session_socket = "/tmp/apm2/session.sock"
+    "#;
+
+    let config = EcosystemConfig::from_toml(toml).expect("should parse");
+    assert!(!config.daemon.divergence_watchdog.enabled);
+
+    let result = config
+        .daemon
+        .divergence_watchdog
+        .validate_startup_prerequisites(false);
+
+    assert!(
+        result.is_ok(),
+        "startup should succeed when watchdog is disabled, regardless of ledger DB"
+    );
+}

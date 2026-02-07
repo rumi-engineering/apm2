@@ -8486,6 +8486,61 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // ---- Phase 1a (TCK-00408): CAS existence validation ----
+        // CAS is a hard requirement for review receipt ingestion (fail-closed).
+        // Without CAS, artifact_bundle_hash cannot be verified, so we reject
+        // the request rather than silently skipping validation.
+        let Some(cas) = &self.cas else {
+            warn!(
+                receipt_id = %request.receipt_id,
+                "CAS not configured — rejecting review receipt ingestion (fail-closed). \
+                 CAS is required to verify artifact_bundle_hash."
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "CAS is not configured; review receipt ingestion requires CAS \
+                 for artifact_bundle_hash verification (fail-closed)",
+            ));
+        };
+        {
+            let bundle_hash: [u8; 32] = request
+                .artifact_bundle_hash
+                .as_slice()
+                .try_into()
+                .expect("validated to be 32 bytes above");
+            match cas.exists(&bundle_hash) {
+                Ok(true) => {
+                    // Bundle exists in CAS, proceed.
+                },
+                Ok(false) => {
+                    warn!(
+                        receipt_id = %request.receipt_id,
+                        artifact_bundle_hash = %hex::encode(bundle_hash),
+                        "artifact_bundle_hash not found in CAS — rejecting review receipt (fail-closed)"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "artifact_bundle_hash {} not found in CAS; \
+                             the referenced bundle must be published before review receipt ingestion",
+                            hex::encode(bundle_hash)
+                        ),
+                    ));
+                },
+                Err(e) => {
+                    warn!(
+                        receipt_id = %request.receipt_id,
+                        error = %e,
+                        "CAS existence check failed — rejecting review receipt (fail-closed)"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("CAS existence check failed for artifact_bundle_hash: {e}"),
+                    ));
+                },
+            }
+        }
+
         // ---- Phase 1b (TCK-00340): Attestation ratchet validation ----
         //
         // SECURITY: Resolve the real risk tier from the work item's policy
@@ -9538,14 +9593,6 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // Validate work_id exists in registry (fail-closed: reject orphaned changesets)
-        let Some(_claim) = self.work_registry.get_claim(&request.work_id) else {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("work_id not found in registry: {}", request.work_id),
-            ));
-        };
-
         // Derive actor_id from peer credentials (not user input)
         let peer_creds = ctx
             .peer_credentials()
@@ -9553,6 +9600,33 @@ impl PrivilegedDispatcher {
                 reason: "peer credentials required for changeset publishing".to_string(),
             })?;
         let actor_id = derive_actor_id(peer_creds);
+
+        // Validate work_id exists in registry (fail-closed: reject orphaned changesets)
+        let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work_id not found in registry: {}", request.work_id),
+            ));
+        };
+
+        // TCK-00408: Actor ownership check — the authenticated caller must be
+        // the actor that owns the work claim. This prevents unauthorized actors
+        // from publishing changesets against work items they don't own.
+        if claim.actor_id != actor_id {
+            warn!(
+                work_id = %request.work_id,
+                claim_actor = %claim.actor_id,
+                caller_actor = %actor_id,
+                "PublishChangeSet rejected: caller does not own work claim"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "authenticated caller '{}' does not own work claim for '{}' (owned by '{}')",
+                    actor_id, request.work_id, claim.actor_id
+                ),
+            ));
+        }
 
         // Deserialize and validate the ChangeSetBundleV1
         let bundle: apm2_core::fac::ChangeSetBundleV1 =
@@ -19155,12 +19229,60 @@ mod tests {
                 "Tag 70 should map to PublishChangeSet"
             );
         }
+
+        /// TCK-00408: Verify actor ownership check rejects non-owner callers.
+        ///
+        /// A caller whose peer credentials produce a different `actor_id` than
+        /// the work claim owner must be denied.
+        #[test]
+        fn test_publish_changeset_rejects_ownership_mismatch() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let owner_ctx = privileged_ctx(); // uid=1000, gid=1000
+
+            // Claim work as the owner
+            let work_id = claim_work(&dispatcher, &owner_ctx);
+
+            // Create a different caller context (different uid -> different actor_id)
+            let non_owner_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 9999,
+                gid: 9999,
+                pid: Some(99999),
+            }));
+
+            let bundle_bytes = make_bundle_json("cs-ownership-test");
+            let request = PublishChangeSetRequest {
+                work_id,
+                bundle_bytes,
+            };
+            let frame = encode_publish_changeset_request(&request);
+            let response = dispatcher.dispatch(&frame, &non_owner_ctx).unwrap();
+
+            match &response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::PermissionDenied as i32,
+                        "Ownership mismatch should return PermissionDenied"
+                    );
+                    assert!(
+                        err.message.contains("does not own work claim"),
+                        "Error message should mention ownership: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected PermissionDenied error for ownership mismatch, got: {other:?}")
+                },
+            }
+        }
     }
 
     // ========================================================================
     // TCK-00389: IngestReviewReceipt Tests
     // ========================================================================
     mod ingest_review_receipt {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+
         use super::*;
 
         /// Standard peer credentials used by all `IngestReviewReceipt` tests.
@@ -19172,10 +19294,21 @@ mod tests {
             }
         }
 
-        /// Creates a dispatcher with a registered lease and Tier0 work claim
-        /// for testing. The work claim is registered so risk-tier
-        /// resolution can succeed (fail-closed semantics mean missing
-        /// claims -> Tier4 rejection).
+        /// Standard test artifact bundle content stored in CAS during setup.
+        const TEST_ARTIFACT_CONTENT: &[u8] = b"test-artifact-bundle-content";
+
+        /// Returns the CAS hash of `TEST_ARTIFACT_CONTENT`. Use this as
+        /// `artifact_bundle_hash` in test requests that must pass CAS
+        /// existence validation.
+        fn test_artifact_bundle_hash() -> Vec<u8> {
+            let cas = MemoryCas::default();
+            let result = cas.store(TEST_ARTIFACT_CONTENT).unwrap();
+            result.hash.to_vec()
+        }
+
+        /// Creates a dispatcher with CAS, a registered lease, and Tier0 work
+        /// claim for testing. CAS is pre-populated with the standard test
+        /// artifact bundle so that CAS existence checks pass on success paths.
         ///
         /// SECURITY (v6 Finding 1): The `executor_actor_id` is derived from the
         /// test peer credentials, ensuring the authenticated caller identity
@@ -19191,8 +19324,11 @@ mod tests {
             setup_dispatcher_with_lease_and_tier(lease_id, work_id, gate_id, "", 0)
         }
 
-        /// Creates a dispatcher with a registered lease and a work claim at the
-        /// specified risk tier. Used to test attestation ratcheting behavior.
+        /// Creates a dispatcher with CAS, a registered lease, and a work claim
+        /// at the specified risk tier. Used to test attestation ratcheting.
+        ///
+        /// TCK-00408: CAS is now mandatory for ingest (fail-closed). The
+        /// standard test artifact bundle is pre-stored in CAS.
         ///
         /// SECURITY (v6 Finding 1): Registers the lease executor as the
         /// identity derived from `test_peer_credentials()`, binding the test
@@ -19207,7 +19343,13 @@ mod tests {
         ) -> (PrivilegedDispatcher, ConnectionContext) {
             let peer_creds = test_peer_credentials();
             let executor_actor_id = derive_actor_id(&peer_creds);
-            let dispatcher = PrivilegedDispatcher::new();
+
+            // TCK-00408: CAS is mandatory for ingest (fail-closed).
+            let cas = Arc::new(MemoryCas::default());
+            cas.store(TEST_ARTIFACT_CONTENT).unwrap();
+
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
             dispatcher.lease_validator.register_lease_with_executor(
                 lease_id,
                 work_id,
@@ -19246,7 +19388,7 @@ mod tests {
                 receipt_id: "RR-001".to_string(),
                 reviewer_actor_id: "reviewer-alpha".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19278,7 +19420,7 @@ mod tests {
                 receipt_id: "RB-001".to_string(),
                 reviewer_actor_id: "reviewer-beta".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 1, // APPLY_FAILED
                 blocked_log_hash: vec![0x55; 32],
@@ -19322,7 +19464,7 @@ mod tests {
                 receipt_id: "RR-002".to_string(),
                 reviewer_actor_id: "does-not-matter".to_string(), // Ignored by handler
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19369,7 +19511,7 @@ mod tests {
                 receipt_id: "RR-NEG".to_string(),
                 reviewer_actor_id: correct_actor_id, // Correct value, but ignored
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19403,7 +19545,7 @@ mod tests {
                 receipt_id: "RR-NC".to_string(),
                 reviewer_actor_id: "any".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19438,7 +19580,7 @@ mod tests {
                 receipt_id: "RR-003".to_string(),
                 reviewer_actor_id: "reviewer-delta".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19478,7 +19620,7 @@ mod tests {
                 receipt_id: "RR-004".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19509,7 +19651,7 @@ mod tests {
                 receipt_id: String::new(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19540,7 +19682,7 @@ mod tests {
                 receipt_id: "RR-005".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: 0, // UNSPECIFIED
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19571,7 +19713,7 @@ mod tests {
                 receipt_id: "RR-006".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 16], // Wrong length
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19603,7 +19745,7 @@ mod tests {
                 receipt_id: "RR-006b".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19635,7 +19777,7 @@ mod tests {
                 receipt_id: "RR-006c".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19666,7 +19808,7 @@ mod tests {
                 receipt_id: "RB-002".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 1,
                 blocked_log_hash: vec![], // Missing log hash for BLOCKED
@@ -19698,7 +19840,7 @@ mod tests {
                 receipt_id: "RB-003".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 0, // Zero is invalid for BLOCKED
                 blocked_log_hash: vec![0x55; 32],
@@ -19737,7 +19879,7 @@ mod tests {
                 receipt_id: "RR-009".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19773,7 +19915,7 @@ mod tests {
                 receipt_id: "RR-010".to_string(),
                 reviewer_actor_id: "reviewer-zeta".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19811,7 +19953,7 @@ mod tests {
                 receipt_id: "RR-011".to_string(),
                 reviewer_actor_id: "reviewer-enc".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19868,7 +20010,7 @@ mod tests {
                 receipt_id: "RR-012".to_string(),
                 reviewer_actor_id: "reviewer".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -19918,7 +20060,7 @@ mod tests {
                 receipt_id: "RR-ATT-002".to_string(),
                 reviewer_actor_id: "reviewer-attest".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20026,7 +20168,7 @@ mod tests {
                 receipt_id: "RR-T0-001".to_string(),
                 reviewer_actor_id: "reviewer-tier0".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20074,7 +20216,7 @@ mod tests {
                 receipt_id: "RR-T2-001".to_string(),
                 reviewer_actor_id: "reviewer-tier2".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20119,7 +20261,7 @@ mod tests {
                 receipt_id: "RR-T4-001".to_string(),
                 reviewer_actor_id: "reviewer-tier4".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20164,7 +20306,7 @@ mod tests {
                 receipt_id: "RR-E2E-001".to_string(),
                 reviewer_actor_id: "reviewer-e2e".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20206,7 +20348,11 @@ mod tests {
                 pid: Some(12345),
             };
             let executor_actor_id = derive_actor_id(&peer_creds);
-            let dispatcher = PrivilegedDispatcher::new();
+            // TCK-00408: CAS is mandatory for ingest (fail-closed).
+            let cas = Arc::new(MemoryCas::default());
+            cas.store(TEST_ARTIFACT_CONTENT).unwrap();
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
             // Register lease but do NOT register a work claim
             dispatcher.lease_validator.register_lease_with_executor(
                 "lease-no-claim",
@@ -20221,7 +20367,7 @@ mod tests {
                 receipt_id: "RR-NO-CLAIM".to_string(),
                 reviewer_actor_id: "ignored-by-handler".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20264,7 +20410,7 @@ mod tests {
                 receipt_id: "RR-T1-001".to_string(),
                 reviewer_actor_id: "reviewer-tier1".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20312,7 +20458,7 @@ mod tests {
                 receipt_id: "RR-DUP-001".to_string(),
                 reviewer_actor_id: "reviewer-a".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20385,7 +20531,7 @@ mod tests {
                 receipt_id: "RR-DUP-PROOF-001".to_string(),
                 reviewer_actor_id: "reviewer-a".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20403,7 +20549,7 @@ mod tests {
                 receipt_id: "RR-DUP-PROOF-001".to_string(),
                 reviewer_actor_id: "reviewer-a".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20440,7 +20586,7 @@ mod tests {
                 receipt_id: "RR-DUP-ARTIFACT-001".to_string(),
                 reviewer_actor_id: "reviewer-a".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20495,7 +20641,7 @@ mod tests {
                 receipt_id: "RB-DUP-ARTIFACT-001".to_string(),
                 reviewer_actor_id: "reviewer-a".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 1,
                 blocked_log_hash: vec![0x55; 32],
@@ -20573,7 +20719,7 @@ mod tests {
                 receipt_id: "RR-DUP-LEASE-001".to_string(),
                 reviewer_actor_id: "reviewer-a".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20591,7 +20737,7 @@ mod tests {
                 receipt_id: "RR-DUP-LEASE-001".to_string(),
                 reviewer_actor_id: "reviewer-a".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -20610,6 +20756,75 @@ mod tests {
                 other => panic!(
                     "expected duplicate receipt_id + lease mismatch rejection, got {other:?}"
                 ),
+            }
+        }
+
+        /// TCK-00408: Verify CAS existence validation rejects review receipts
+        /// referencing artifact bundles that are not in CAS.
+        #[test]
+        fn test_ingest_review_receipt_rejects_missing_cas_artifact() {
+            // Create dispatcher WITH CAS so the validation path is exercised
+            let cas = Arc::new(MemoryCas::default());
+            let peer_creds = test_peer_credentials();
+            let executor_actor_id = derive_actor_id(&peer_creds);
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+            // Register lease and work claim
+            let lease_id = "lease-cas-check-001";
+            let work_id = "W-CAS-CHECK-001";
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                work_id,
+                "gate-cas-001",
+                &executor_actor_id,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    actor_id: executor_actor_id,
+                    role: WorkRole::Reviewer,
+                    policy_resolution: PolicyResolution {
+                        policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
+                        resolved_policy_hash: [0u8; 32],
+                        capability_manifest_hash: [0u8; 32],
+                        context_pack_hash: [0u8; 32],
+                        resolved_risk_tier: 0,
+                        resolved_scope_baseline: None,
+                    },
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                })
+                .expect("work claim registration should succeed");
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+
+            // Submit review receipt with artifact_bundle_hash NOT in CAS
+            let request = IngestReviewReceiptRequest {
+                lease_id: lease_id.to_string(),
+                receipt_id: "RR-CAS-MISSING-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0xAA; 32], // NOT stored in CAS
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("not found in CAS"),
+                        "Error should mention CAS: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected CAS existence rejection, got: {other:?}"),
             }
         }
 
@@ -21629,13 +21844,25 @@ mod tests {
     mod sqlite_integration {
         use std::sync::{Arc, Mutex};
 
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
         use rusqlite::Connection;
 
         use super::*;
         use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
 
+        /// Standard test artifact bundle content for sqlite integration tests.
+        const TEST_ARTIFACT_CONTENT: &[u8] = b"test-artifact-bundle-content";
+
+        /// Returns the CAS hash of `TEST_ARTIFACT_CONTENT`.
+        fn test_artifact_bundle_hash() -> Vec<u8> {
+            let cas = MemoryCas::default();
+            let result = cas.store(TEST_ARTIFACT_CONTENT).unwrap();
+            result.hash.to_vec()
+        }
+
         /// Creates a `PrivilegedDispatcher` backed by real `SQLite`
         /// implementations for testing the production persistence path.
+        /// TCK-00408: CAS is now mandatory for ingest (fail-closed).
         fn setup_sqlite_dispatcher() -> (
             PrivilegedDispatcher,
             ConnectionContext,
@@ -21667,7 +21894,11 @@ mod tests {
             let subscription_registry: SharedSubscriptionRegistry =
                 Arc::new(SubscriptionRegistry::with_defaults());
 
-            let dispatcher = PrivilegedDispatcher::with_dependencies(
+            // TCK-00408: CAS is mandatory for ingest (fail-closed).
+            let cas = Arc::new(MemoryCas::default());
+            cas.store(TEST_ARTIFACT_CONTENT).unwrap();
+
+            let mut dispatcher = PrivilegedDispatcher::with_dependencies(
                 DecodeConfig::default(),
                 policy_resolver,
                 work_registry,
@@ -21681,6 +21912,7 @@ mod tests {
                 manifest_loader,
                 subscription_registry,
             );
+            dispatcher = dispatcher.with_cas(cas as Arc<dyn ContentAddressedStore>);
 
             let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
@@ -21735,7 +21967,7 @@ mod tests {
                 receipt_id: "RR-SQL-001".to_string(),
                 reviewer_actor_id: "ignored-by-handler".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -21809,7 +22041,7 @@ mod tests {
                 receipt_id: "RR-SQL-T2".to_string(),
                 reviewer_actor_id: "ignored-by-handler".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -21949,6 +22181,9 @@ mod tests {
         /// privileged dispatcher.
         #[test]
         fn test_dispatcher_state_delegate_sublease_production_wiring() {
+            use std::os::unix::fs::PermissionsExt;
+
+            use crate::cas::{DurableCas, DurableCasConfig};
             use crate::state::DispatcherState;
 
             let conn = Connection::open_in_memory().unwrap();
@@ -21959,13 +22194,25 @@ mod tests {
             let session_registry: Arc<dyn SessionRegistry> =
                 Arc::new(InMemorySessionRegistry::new());
 
-            // Construct via production DispatcherState path
-            let state = DispatcherState::with_persistence(
+            // TCK-00408: Use with_persistence_and_cas so CAS is wired —
+            // IngestReviewReceipt now requires CAS (fail-closed).
+            let cas_dir = tempfile::tempdir().expect("tempdir for CAS");
+            std::fs::set_permissions(cas_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("set CAS dir permissions");
+            // Pre-populate CAS with test artifact before state construction.
+            {
+                let cas = DurableCas::new(DurableCasConfig::new(cas_dir.path().to_path_buf()))
+                    .expect("pre-populate CAS");
+                cas.store(TEST_ARTIFACT_CONTENT)
+                    .expect("store test artifact");
+            }
+            let state = DispatcherState::with_persistence_and_cas(
                 session_registry,
                 None, // no metrics
-                Some(Arc::clone(&conn)),
-                None, // generate fresh signing key
-            );
+                Arc::clone(&conn),
+                cas_dir.path(),
+            )
+            .expect("CAS initialization must succeed");
 
             // Wire gate orchestrator via production path
             let signer = Arc::new(apm2_core::crypto::Signer::generate());
@@ -22088,7 +22335,7 @@ mod tests {
                 receipt_id: "RR-PROD-001".to_string(),
                 reviewer_actor_id: "reviewer-prod".to_string(),
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
@@ -22132,6 +22379,9 @@ mod tests {
         /// regression where hardcoded Tier4 would block all production claims.
         #[test]
         fn test_governance_resolver_claim_then_ingest_review_receipt_production_path() {
+            use std::os::unix::fs::PermissionsExt;
+
+            use crate::cas::{DurableCas, DurableCasConfig};
             use crate::governance::GovernancePolicyResolver;
             use crate::state::DispatcherState;
 
@@ -22143,13 +22393,24 @@ mod tests {
             let session_registry: Arc<dyn SessionRegistry> =
                 Arc::new(InMemorySessionRegistry::new());
 
-            // Construct via production DispatcherState path
-            let state = DispatcherState::with_persistence(
+            // TCK-00408: Use with_persistence_and_cas — IngestReviewReceipt
+            // now requires CAS (fail-closed).
+            let cas_dir = tempfile::tempdir().expect("tempdir for CAS");
+            std::fs::set_permissions(cas_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("set CAS dir permissions");
+            {
+                let cas = DurableCas::new(DurableCasConfig::new(cas_dir.path().to_path_buf()))
+                    .expect("pre-populate CAS");
+                cas.store(TEST_ARTIFACT_CONTENT)
+                    .expect("store test artifact");
+            }
+            let state = DispatcherState::with_persistence_and_cas(
                 session_registry,
                 None, // no metrics
-                Some(Arc::clone(&conn)),
-                None, // generate fresh signing key
-            );
+                Arc::clone(&conn),
+                cas_dir.path(),
+            )
+            .expect("CAS initialization must succeed");
 
             // Derive caller actor from test peer credentials
             let test_creds = PeerCredentials {
@@ -22206,7 +22467,7 @@ mod tests {
                 receipt_id: "RR-GOV-001".to_string(),
                 reviewer_actor_id: caller_actor,
                 changeset_digest: vec![0x42; 32],
-                artifact_bundle_hash: vec![0x33; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
