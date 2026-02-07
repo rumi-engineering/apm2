@@ -12,6 +12,7 @@ mod finish;
 pub mod lint;
 mod push;
 mod review;
+mod review_gate;
 mod security_review_exec;
 pub mod selftest;
 mod start_ticket;
@@ -177,6 +178,29 @@ pub fn review_uat(
     allow_github_write: bool,
 ) -> Result<()> {
     review::run_uat(pr_url, emit_internal, emit_receipt_only, allow_github_write)
+}
+
+/// Evaluate authoritative PR merge gating for AI review artifacts.
+///
+/// Delegates to the `review_gate` module for the actual implementation.
+///
+/// # Arguments
+///
+/// * `repo` - Optional owner/repo override (`owner/repo`)
+/// * `pr_number` - Pull request number
+/// * `head_sha` - Optional expected PR head SHA
+/// * `trusted_reviewers_path` - Optional allowlist config path
+///
+/// # Errors
+///
+/// Returns an error if gate evaluation fails or authoritative verdict is FAIL.
+pub fn review_gate(
+    repo: Option<&str>,
+    pr_number: u64,
+    head_sha: Option<&str>,
+    trusted_reviewers_path: Option<&str>,
+) -> Result<()> {
+    review_gate::run(repo, pr_number, head_sha, trusted_reviewers_path)
 }
 
 /// Approve a PR after security review.

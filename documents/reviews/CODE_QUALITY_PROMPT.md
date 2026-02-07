@@ -12,7 +12,7 @@ protocol:
 variables:
   PR_URL: "$PR_URL"
 
-references[37]:
+references[39]:
   - path: "@documents/theory/glossary/glossary.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json"
@@ -87,6 +87,10 @@ references[37]:
     purpose: "LAW-15: Content-Addressed Evidence"
   - path: "@documents/rfcs/RFC-0019/AUTONOMOUS_FORGE_ADMISSION_CYCLE.md"
     purpose: "RFC-0019: Autonomous Forge Admission Cycle"
+  - path: "@.github/review-gate/trusted-reviewers.json"
+    purpose: "Authoritative allowlist for machine-readable reviewer_id and GitHub identity binding."
+  - path: "@documents/reviews/REVIEW_GATE_WAIVER_FLOW.md"
+    purpose: "Waiver-only operator override flow for blocked review gates."
 
 decision_tree:
   entrypoint: PHASE_1_COLLECT_PR_IDENTITY
@@ -244,14 +248,43 @@ decision_tree:
           - section: "POSITIVE OBSERVATIONS"
             format: "### **POSITIVE OBSERVATIONS (PASS)**"
             content: "What the PR does well; specific invariants correctly upheld"
+          - section: "Machine-Readable Metadata (REQUIRED)"
+            content: "Append this exact metadata block at the end of the comment for gate evaluation."
+            template: |
+              <!-- apm2-review-metadata:v1:code-quality -->
+              ```json
+              {
+                "schema": "apm2.review.metadata.v1",
+                "review_type": "code-quality",
+                "pr_number": <pr_number>,
+                "head_sha": "$reviewed_sha",
+                "verdict": "PASS|FAIL",
+                "severity_counts": {
+                  "blocker": <blocker_count>,
+                  "major": <major_count>,
+                  "minor": <minor_count>,
+                  "nit": <nit_count>
+                },
+                "reviewer_id": "<allowlisted_reviewer_id>"
+              }
+              ```
+            constraints:
+              - "head_sha MUST equal reviewed_sha exactly."
+              - "pr_number MUST equal the PR being reviewed."
+              - "reviewer_id MUST appear in `.github/review-gate/trusted-reviewers.json` under `code_quality`."
+              - "Missing/invalid metadata is gate-fatal."
           - section: "Footer"
             format: "---"
             content: "Reviewed commit: $reviewed_sha (resolved from PR_URL at review start for auditability)"
-      steps[3]:
+      steps[4]:
         - id: WRITE_FINDINGS
           action: write_file
           path: "quality_findings.md"
           content: "$FORMATTED_FINDINGS"
+        - id: APPEND_METADATA
+          action: append_file
+          path: "quality_findings.md"
+          content: "$MACHINE_READABLE_METADATA_BLOCK"
         - id: POST_AND_UPDATE
           action: command
           run: |
