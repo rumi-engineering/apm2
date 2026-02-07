@@ -1080,7 +1080,8 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
 mod tests {
     use super::*;
     use crate::identity::{
-        CellGenesisV1, HolonGenesisV1, HolonPurpose, PolicyRootId, validate_key_roles,
+        CellGenesisV1, HolonGenesisV1, HolonPurpose, IdentityParseProvenance,
+        IdentitySemanticCompleteness, PolicyRootId, validate_key_roles,
     };
 
     /// Run all conformance vectors and assert every one passes.
@@ -1671,6 +1672,112 @@ mod tests {
                 vector.text,
                 "keyset binary-origin text mismatch for {}",
                 vector.name
+            );
+        }
+    }
+
+    /// Parse-state vectors: provenance and semantic completeness must be
+    /// explicit and stable across all identity families.
+    #[test]
+    fn parse_state_vectors() {
+        for vector in valid_public_key_id_vectors() {
+            let (_, text_state) =
+                PublicKeyIdV1::parse_text_with_state(vector.text).expect("valid vector");
+            assert_eq!(text_state.provenance(), IdentityParseProvenance::FromText);
+            assert_eq!(
+                text_state.completeness(),
+                IdentitySemanticCompleteness::Resolved
+            );
+
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            let (_, binary_state) =
+                PublicKeyIdV1::from_binary_with_state(&binary).expect("valid vector");
+            assert_eq!(
+                binary_state.provenance(),
+                IdentityParseProvenance::FromTaggedBinary
+            );
+            assert_eq!(
+                binary_state.completeness(),
+                IdentitySemanticCompleteness::Resolved
+            );
+        }
+
+        for vector in valid_keyset_id_vectors() {
+            let (_, text_state) =
+                KeySetIdV1::parse_text_with_state(vector.text).expect("valid vector");
+            assert_eq!(text_state.provenance(), IdentityParseProvenance::FromText);
+            assert_eq!(
+                text_state.completeness(),
+                IdentitySemanticCompleteness::Unresolved
+            );
+
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            let (_, tagged_state) =
+                KeySetIdV1::from_binary_with_state(&binary).expect("valid vector");
+            assert_eq!(
+                tagged_state.provenance(),
+                IdentityParseProvenance::FromTaggedBinary
+            );
+            assert_eq!(
+                tagged_state.completeness(),
+                IdentitySemanticCompleteness::Resolved
+            );
+
+            let mut hash_only = [0u8; 32];
+            hash_only.copy_from_slice(&binary[1..]);
+            let (_, hash_state) =
+                KeySetIdV1::from_binary_with_state(&hash_only).expect("hash32 form is valid");
+            assert_eq!(
+                hash_state.provenance(),
+                IdentityParseProvenance::FromHashOnlyBinary
+            );
+            assert_eq!(
+                hash_state.completeness(),
+                IdentitySemanticCompleteness::Unresolved
+            );
+        }
+
+        for vector in valid_cell_id_vectors() {
+            let (_, text_state) =
+                CellIdV1::parse_text_with_state(vector.text).expect("valid vector");
+            assert_eq!(text_state.provenance(), IdentityParseProvenance::FromText);
+            assert_eq!(
+                text_state.completeness(),
+                IdentitySemanticCompleteness::Resolved
+            );
+
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            let (_, binary_state) =
+                CellIdV1::from_binary_with_state(&binary).expect("valid vector");
+            assert_eq!(
+                binary_state.provenance(),
+                IdentityParseProvenance::FromTaggedBinary
+            );
+            assert_eq!(
+                binary_state.completeness(),
+                IdentitySemanticCompleteness::Resolved
+            );
+        }
+
+        for vector in valid_holon_id_vectors() {
+            let (_, text_state) =
+                HolonIdV1::parse_text_with_state(vector.text).expect("valid vector");
+            assert_eq!(text_state.provenance(), IdentityParseProvenance::FromText);
+            assert_eq!(
+                text_state.completeness(),
+                IdentitySemanticCompleteness::Resolved
+            );
+
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            let (_, binary_state) =
+                HolonIdV1::from_binary_with_state(&binary).expect("valid vector");
+            assert_eq!(
+                binary_state.provenance(),
+                IdentityParseProvenance::FromTaggedBinary
+            );
+            assert_eq!(
+                binary_state.completeness(),
+                IdentitySemanticCompleteness::Resolved
             );
         }
     }

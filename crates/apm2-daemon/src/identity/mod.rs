@@ -98,17 +98,31 @@
 //! - **Lossless round-trip**: binary-to-text-to-binary produces identical
 //!   bytes.
 //!
-//! ## Abstraction Boundary: `CanonicalDigestIdKit`
+//! ## Abstraction Boundary: `IdentitySpec` + `IdentityWireKernel`
 //!
-//! `CanonicalDigestIdKit` centralizes shared fail-closed codec steps for
-//! digest-first IDs:
-//! - canonical text validation + prefix stripping + lowercase hex decode
-//! - binary length + tag-gate parsing
-//! - canonical text serialization (`prefix + 64-lowercase-hex`)
+//! V1 identity parsing is implemented through explicit per-type specs:
+//! - [`IdentitySpec::wire_form`]
+//! - [`IdentitySpec::tag_semantics`]
+//! - [`IdentitySpec::derivation_semantics`]
+//! - [`IdentitySpec::resolution_semantics`]
 //!
-//! The kit intentionally excludes domain-specific derivation and semantic
-//! validation (algorithm policy, set-tag semantics, descriptor invariants,
-//! genesis commitments). Those checks remain in each ID type.
+//! `IdentityWireKernel` centralizes bounded,
+//! fail-closed canonical text/binary parsing and rendering. Type modules
+//! provide per-ID tag validation and derivation/resolution policy via their
+//! `IdentitySpec` constants.
+//!
+//! This keeps wire canonicalization and semantic interpretation separated.
+//!
+//! ## New Identity Type Admission Checklist
+//!
+//! 1. Define an `IdentitySpec` with all four semantic axes.
+//! 2. Route parse/encode through `IdentityWireKernel` (or document a waiver).
+//! 3. Declare allowed wire variants (`Tagged33`, optional `Hash32`) explicitly.
+//! 4. Define fail-closed tag semantics (fixed tag / registry / optional mode).
+//! 5. Define derivation domain-separation contract.
+//! 6. Define resolution contract (`SelfContained` vs `DigestFirstResolver`).
+//! 7. Add conformance vectors + differential tests with no drift guarantees.
+//! 8. Add fuzz/property coverage for mixed wire forms and resolver failures.
 //!
 //! # Contract References
 //!
@@ -155,7 +169,7 @@ pub use directory_proof::{
     derive_directory_key, resolve_known_profile, validate_identity_proof_hash,
 };
 pub use holon_id::{HolonGenesisV1, HolonIdV1, HolonPurpose};
-pub use keyset_id::{KeySetIdV1, SetTag};
+pub use keyset_id::{KeySetDigestResolver, KeySetIdV1, ResolvedKeySetSemantics, SetTag};
 pub use public_key_id::{AlgorithmTag, PublicKeyIdV1};
 pub use session_delegation::{
     MAX_SESSION_DELEGATION_TICKS, SessionKeyDelegationV1, UncheckedSessionDelegation,
@@ -177,6 +191,174 @@ pub const HASH_LEN: usize = 32;
 
 /// Size of the full binary form: 1-byte tag + 32-byte hash.
 pub const BINARY_LEN: usize = 33;
+
+/// Canonical binary wire variant accepted at an identity boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IdentityWireVariant {
+    /// `tag (1 byte) + hash (32 bytes)` binary encoding.
+    Tagged33,
+    /// `hash (32 bytes)` encoding (digest-first, semantics unresolved).
+    Hash32,
+}
+
+/// Parse provenance for identity values constructed from external input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IdentityParseProvenance {
+    /// Parsed from canonical text (`<prefix><64-lowercase-hex>`).
+    FromText,
+    /// Parsed from tagged binary (`tag + hash`).
+    FromTaggedBinary,
+    /// Parsed from hash-only binary (`hash`).
+    FromHashOnlyBinary,
+}
+
+/// Semantic completeness of a parsed identity value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IdentitySemanticCompleteness {
+    /// All semantics required for authorization and interpretation are present.
+    Resolved,
+    /// Additional digest-first resolution is required before interpretation.
+    Unresolved,
+}
+
+/// Parse-state metadata for identity values or wrappers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IdentityParseState {
+    provenance: IdentityParseProvenance,
+    completeness: IdentitySemanticCompleteness,
+}
+
+impl IdentityParseState {
+    /// Create a new parse-state tuple.
+    pub const fn new(
+        provenance: IdentityParseProvenance,
+        completeness: IdentitySemanticCompleteness,
+    ) -> Self {
+        Self {
+            provenance,
+            completeness,
+        }
+    }
+
+    /// Return parse provenance.
+    pub const fn provenance(self) -> IdentityParseProvenance {
+        self.provenance
+    }
+
+    /// Return semantic completeness.
+    pub const fn completeness(self) -> IdentitySemanticCompleteness {
+        self.completeness
+    }
+}
+
+/// Binary wire-form contract axis for an identity type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityWireFormSemantics {
+    /// Only `Tagged33` binary input is admissible.
+    Tagged33Only,
+    /// Both `Tagged33` and `Hash32` binary inputs are admissible.
+    Tagged33AndHash32,
+}
+
+impl IdentityWireFormSemantics {
+    /// Return whether a wire variant is admissible for this identity type.
+    pub const fn allows(self, wire: IdentityWireVariant) -> bool {
+        !matches!(
+            (self, wire),
+            (Self::Tagged33Only, IdentityWireVariant::Hash32)
+        )
+    }
+}
+
+/// Tag-semantics contract axis for an identity type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityTagSemantics {
+    /// Single fixed tag byte (e.g. versioned IDs).
+    FixedVersionTag {
+        /// Fixed tag byte value.
+        tag: u8,
+    },
+    /// Algorithm-tag registry (fail-closed unknown tags).
+    AlgorithmRegistry {
+        /// Registry name for diagnostics.
+        registry: &'static str,
+    },
+    /// Set-mode semantics where text form may omit mode/tag.
+    SetMode {
+        /// Whether text form omits mode semantics and therefore requires
+        /// digest-first resolution.
+        text_omits_mode: bool,
+        /// Legacy unresolved compatibility tag for `Tagged33` storage.
+        unresolved_compat_tag: Option<u8>,
+    },
+}
+
+/// Derivation-semantics contract axis for an identity type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityDerivationSemantics {
+    /// Domain-separated digest from canonical bytes.
+    DomainSeparatedDigest {
+        /// Domain separator used in the digest preimage.
+        domain_separator: &'static str,
+    },
+    /// Domain-separated digest from a canonical descriptor object.
+    DescriptorDigest {
+        /// Domain separator used in the digest preimage.
+        domain_separator: &'static str,
+        /// Descriptor contract name used for canonicalization.
+        descriptor: &'static str,
+    },
+}
+
+/// Resolution-semantics contract axis for an identity type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityResolutionSemantics {
+    /// Text/binary forms carry complete semantics.
+    SelfContained,
+    /// Text form is digest-first and requires resolver lookup.
+    DigestFirstResolver {
+        /// Resolver contract label used for diagnostics/docs.
+        contract: &'static str,
+    },
+}
+
+/// Text-tag handling policy used by `IdentityWireKernel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityTextTagPolicy {
+    /// Canonical text form encodes a fixed tag.
+    FixedTag {
+        /// Fixed tag value implied by the canonical text form.
+        tag: u8,
+    },
+    /// Canonical text form omits tag semantics (digest-only form).
+    Omitted,
+}
+
+/// Spec contract for an identity type.
+///
+/// The first four fields are the required semantic axes:
+/// `wire_form`, `tag_semantics`, `derivation_semantics`,
+/// and `resolution_semantics`.
+#[derive(Debug, Clone, Copy)]
+pub struct IdentitySpec {
+    /// Canonical text prefix.
+    pub text_prefix: &'static str,
+    /// Wire-form contract axis.
+    pub wire_form: IdentityWireFormSemantics,
+    /// Tag-semantics contract axis.
+    pub tag_semantics: IdentityTagSemantics,
+    /// Derivation-semantics contract axis.
+    pub derivation_semantics: IdentityDerivationSemantics,
+    /// Resolution-semantics contract axis.
+    pub resolution_semantics: IdentityResolutionSemantics,
+    /// Text-tag policy for canonical text parsing.
+    pub text_tag_policy: IdentityTextTagPolicy,
+    /// Compatibility tag used when unresolved semantics need `Tagged33`
+    /// storage (for example, legacy `KeySet` hash-only forms).
+    pub unresolved_compat_tag: Option<u8>,
+    /// Fail-closed tagged-binary validation callback.
+    pub validate_tag: fn(u8) -> Result<IdentitySemanticCompleteness, KeyIdError>,
+}
 
 /// Errors produced when parsing or constructing key identifiers.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -288,6 +470,26 @@ pub enum KeyIdError {
     InvalidDescriptor {
         /// Description of the invariant violation.
         reason: String,
+    },
+
+    /// Digest-first semantics are unresolved and require a resolver.
+    #[error("identity semantics are unresolved; resolver required for {identity}")]
+    ResolutionRequired {
+        /// Identity type label requiring resolver lookup.
+        identity: &'static str,
+    },
+
+    /// Resolver returned semantics for a different digest (fail-closed).
+    #[error(
+        "resolver digest mismatch: expected {expected_hex}, got {got_hex}",
+        expected_hex = hex::encode(expected),
+        got_hex = hex::encode(got)
+    )]
+    ResolutionDigestMismatch {
+        /// Expected digest from the unresolved identity.
+        expected: [u8; HASH_LEN],
+        /// Digest returned by resolver materialization.
+        got: [u8; HASH_LEN],
     },
 }
 
