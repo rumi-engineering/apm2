@@ -63,9 +63,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
-use apm2_holon::defect::DefectRecord;
+use apm2_holon::defect::{
+    DefectContext as HolonDefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType,
+};
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, error, info, warn};
@@ -1233,6 +1236,121 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    fn emit_firewall_violation_defect(
+        &self,
+        session_id: &str,
+        defect: &FirewallViolationDefect,
+        fallback_timestamp_ns: u64,
+    ) -> Result<(), String> {
+        let Some(ref ledger) = self.ledger else {
+            return Err("ledger unavailable for firewall defect emission".to_string());
+        };
+
+        let defect_id = format!("DEF-FW-{}", uuid::Uuid::new_v4());
+        let timestamp_ns = self
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
+            .unwrap_or(fallback_timestamp_ns);
+
+        let severity = if defect.requires_termination() {
+            DefectSeverity::S1
+        } else {
+            DefectSeverity::S2
+        };
+
+        let defect_record = DefectRecord::builder(&defect_id, "CONTEXT_FIREWALL_VIOLATION")
+            .severity(severity)
+            .work_id(session_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::UnplannedContextRead,
+                format!(
+                    "rule={} type={} manifest={} path={} reason={}",
+                    defect.rule_id,
+                    defect.violation_type,
+                    defect.manifest_id,
+                    defect.path,
+                    defect.reason
+                ),
+            ))
+            .context(
+                HolonDefectContext::new()
+                    .with_session_id(session_id)
+                    .with_requested_stable_id(defect.path.clone()),
+            )
+            .build()
+            .map_err(|e| format!("failed to build firewall DefectRecord: {e}"))?;
+
+        let defect_json = serde_json::to_vec(&defect_record)
+            .map_err(|e| format!("failed to serialize firewall DefectRecord: {e}"))?;
+        let cas_hash = self.cas.as_ref().map_or_else(
+            || blake3::hash(&defect_json).as_bytes().to_vec(),
+            |cas| cas.store(&defect_json).to_vec(),
+        );
+
+        let time_envelope_uri = format!("htf:firewall:{}:{}", timestamp_ns, defect.rule_id);
+        let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+            .as_bytes()
+            .to_vec();
+
+        let defect_event = DefectRecorded {
+            defect_id,
+            defect_type: format!("CONTEXT_FIREWALL_{}", defect.violation_type),
+            cas_hash,
+            source: DefectSource::ContextMiss as i32,
+            work_id: session_id.to_string(),
+            severity: severity.as_str().to_string(),
+            detected_at: timestamp_ns,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_envelope_hash,
+            }),
+        };
+
+        ledger
+            .emit_defect_recorded(&defect_event, timestamp_ns)
+            .map_err(|e| format!("failed to emit firewall defect: {e}"))?;
+
+        Ok(())
+    }
+
+    fn emit_firewall_violation_defects(
+        &self,
+        session_id: &str,
+        defects: &[FirewallViolationDefect],
+        fallback_timestamp_ns: u64,
+    ) -> Result<(), String> {
+        for defect in defects {
+            self.emit_firewall_violation_defect(session_id, defect, fallback_timestamp_ns)
+                .map_err(|e| format!("rule={} path={} error={e}", defect.rule_id, defect.path))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_session_terminated(&self, session_id: &str, rationale: &str) -> Result<(), String> {
+        let Some(session_registry) = &self.session_registry else {
+            return Err("session registry unavailable for mandatory termination".to_string());
+        };
+
+        if session_registry.get_session(session_id).is_some() {
+            let term_info = crate::episode::decision::SessionTerminationInfo::new(
+                session_id, rationale, "FAILURE",
+            );
+            session_registry
+                .mark_terminated(session_id, term_info)
+                .map_err(|e| format!("failed to persist session termination state: {e}"))?;
+        }
+
+        if let Some(ref store) = self.telemetry_store {
+            store.remove(session_id);
+        }
+        if let Some(ref store) = self.stop_conditions_store {
+            store.remove(session_id);
+        }
+
+        Ok(())
+    }
+
     /// Dispatches a session-scoped request to the appropriate handler.
     ///
     /// # Message Format
@@ -1830,7 +1948,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // Clone arguments for execution before they are moved into BrokerToolRequest
         let request_arguments = request.arguments.clone();
 
-        let broker_request = BrokerToolRequest::new(
+        let mut broker_request = BrokerToolRequest::new(
             &request_id,
             episode_id.clone(),
             tool_class,
@@ -1840,33 +1958,73 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         )
         .with_inline_args(request.arguments);
 
+        if let Ok(args_value) = serde_json::from_slice::<serde_json::Value>(&request_arguments) {
+            match tool_class {
+                ToolClass::Read | ToolClass::Write | ToolClass::ListFiles => {
+                    if let Some(path) = args_value.get("path").and_then(serde_json::Value::as_str) {
+                        broker_request = broker_request.with_path(path);
+                    }
+                },
+                ToolClass::Search => {
+                    if let Some(scope) = args_value.get("scope").and_then(serde_json::Value::as_str)
+                    {
+                        broker_request = broker_request.with_path(scope);
+                    }
+                    if let Some(query) = args_value.get("query").and_then(serde_json::Value::as_str)
+                    {
+                        broker_request = broker_request.with_query(query);
+                    }
+                },
+                ToolClass::Execute => {
+                    if let Some(command) = args_value
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        broker_request = broker_request.with_shell_command(command);
+                    }
+                },
+                ToolClass::Network => {
+                    if let Some(url_value) =
+                        args_value.get("url").and_then(serde_json::Value::as_str)
+                    {
+                        if let Ok(parsed) = url::Url::parse(url_value) {
+                            if let Some(host) = parsed.host_str() {
+                                let port = parsed.port_or_known_default().unwrap_or(0);
+                                broker_request = broker_request.with_network(host, port);
+                            }
+                        }
+                    }
+                },
+                ToolClass::Git => {
+                    if let Some(operation) = args_value
+                        .get("operation")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        broker_request = broker_request.with_git_operation(operation);
+                    }
+                },
+                _ => {},
+            }
+
+            if let Some(limit) = args_value.get("limit").and_then(serde_json::Value::as_u64) {
+                broker_request = broker_request.with_size(limit);
+            }
+            if let Some(pattern) = args_value
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+            {
+                broker_request = broker_request.with_pattern(pattern);
+            }
+        }
+
         // Call broker.request() asynchronously using tokio runtime
         let decision = tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
         });
+        let decision_requires_termination = matches!(&decision, Ok(ToolDecision::Terminate { .. }));
 
-        // TCK-00375 BLOCKER 2 FIX: Drain and emit firewall violation defects
-        // after every broker request. Per REQ-0029, Tier3+ defects MUST be
-        // emitted into the authoritative event/ledger flow at decision time.
-        {
-            let defects = tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async { broker.drain_firewall_defects().await })
-            });
-            for defect in &defects {
-                warn!(
-                    violation_type = ?defect.violation_type,
-                    risk_tier = defect.risk_tier,
-                    rule_id = %defect.rule_id,
-                    manifest_id = %defect.manifest_id,
-                    path = %defect.path,
-                    "TCK-00375: Firewall violation defect emitted"
-                );
-            }
-        }
-
-        let response = self.handle_broker_decision(
+        let mut response = self.handle_broker_decision(
             decision,
             &token.session_id,
             tool_class,
@@ -1874,9 +2032,73 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             actuation_timestamp,
             &episode_id,
             preactuation_receipt.as_ref(),
-            &broker,
-            risk_tier,
         );
+
+        let defects = tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async { broker.drain_firewall_defects().await })
+        });
+        if !defects.is_empty() {
+            let has_mandatory_termination_defect = defects
+                .iter()
+                .any(FirewallViolationDefect::requires_termination);
+
+            for defect in &defects {
+                info!(
+                    session_id = %token.session_id,
+                    violation_type = ?defect.violation_type,
+                    risk_tier = defect.risk_tier,
+                    rule_id = %defect.rule_id,
+                    manifest_id = %defect.manifest_id,
+                    path = %defect.path,
+                    "firewall violation defect drained"
+                );
+            }
+
+            if let Err(e) =
+                self.emit_firewall_violation_defects(&token.session_id, &defects, timestamp_ns)
+            {
+                error!(
+                    session_id = %token.session_id,
+                    error = %e,
+                    "authoritative firewall defect emission failed"
+                );
+                if has_mandatory_termination_defect {
+                    if let Err(term_err) = self
+                        .ensure_session_terminated(&token.session_id, "CONTEXT_FIREWALL_VIOLATION")
+                    {
+                        error!(
+                            session_id = %token.session_id,
+                            error = %term_err,
+                            "mandatory firewall termination failed while handling defect emission error"
+                        );
+                    }
+                }
+                response = Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    format!("firewall defect emission failed: {e}"),
+                ));
+            } else if has_mandatory_termination_defect && !decision_requires_termination {
+                if let Err(e) =
+                    self.ensure_session_terminated(&token.session_id, "CONTEXT_FIREWALL_VIOLATION")
+                {
+                    error!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "mandatory firewall termination failed"
+                    );
+                    response = Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("mandatory firewall termination failed: {e}"),
+                    ));
+                } else {
+                    response = Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "session terminated: CONTEXT_FIREWALL_VIOLATION".to_string(),
+                    ));
+                }
+            }
+        }
 
         // TCK-00384: Increment tool_calls counter on successful dispatch.
         // We count Allow and DedupeCacheHit as successful tool calls.
@@ -1918,8 +2140,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         actuation_timestamp: ReplayTimestamp,
         episode_id: &EpisodeId,
         preactuation_receipt: Option<&PreActuationReceipt>,
-        broker: &SharedToolBroker<StubManifestLoader>,
-        risk_tier: RiskTier,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -2021,78 +2241,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             SessionErrorCode::SessionErrorInternal,
                             sanitize_error_message(error_msg),
                         ));
-                    }
-
-                    // TCK-00375 BLOCKER 1 FIX: Wire TOCTOU hash verification
-                    // into the read execution path.  After the tool executes
-                    // successfully but BEFORE the content is delivered to the
-                    // agent, verify that the runtime content matches the hash
-                    // recorded in the context pack manifest.  If verification
-                    // fails, the read is denied (fail-closed).
-                    //
-                    // Only applies to read-type tool classes (Read, ListFiles,
-                    // Search) since those are the operations that return file
-                    // content subject to TOCTOU attacks.
-                    if matches!(
-                        tool_class,
-                        ToolClass::Read | ToolClass::ListFiles | ToolClass::Search
-                    ) {
-                        // Extract path from tool_args for TOCTOU verification.
-                        // The path was already validated by the context firewall
-                        // in broker.request(); we need it here to look up the
-                        // manifest entry for hash comparison.
-                        let toctou_path: Option<String> =
-                            serde_json::from_slice::<serde_json::Value>(request_arguments)
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("path")
-                                        .or_else(|| v.get("scope"))
-                                        .and_then(|p| p.as_str().map(String::from))
-                                });
-
-                        if let Some(ref path_str) = toctou_path {
-                            let toctou_result = tokio::task::block_in_place(|| {
-                                let handle = tokio::runtime::Handle::current();
-                                handle.block_on(async {
-                                    broker
-                                        .verify_toctou(path_str, &result.output, risk_tier)
-                                        .await
-                                })
-                            });
-
-                            if let Err(e) = toctou_result {
-                                error!(
-                                    path = %path_str,
-                                    risk_tier = risk_tier.tier(),
-                                    error = %e,
-                                    "TCK-00375: TOCTOU verification failed; denying read (fail-closed)"
-                                );
-
-                                // Drain and emit any defects accumulated by
-                                // verify_toctou (BLOCKER 2 continuation).
-                                let defects = tokio::task::block_in_place(|| {
-                                    let handle = tokio::runtime::Handle::current();
-                                    handle.block_on(async { broker.drain_firewall_defects().await })
-                                });
-                                for defect in &defects {
-                                    warn!(
-                                        violation_type = ?defect.violation_type,
-                                        risk_tier = defect.risk_tier,
-                                        rule_id = %defect.rule_id,
-                                        manifest_id = %defect.manifest_id,
-                                        path = %defect.path,
-                                        "TCK-00375: TOCTOU defect emitted"
-                                    );
-                                }
-
-                                return Ok(SessionResponse::error(
-                                    SessionErrorCode::SessionErrorInternal,
-                                    sanitize_error_message(&format!(
-                                        "TOCTOU verification failed: {e}"
-                                    )),
-                                ));
-                            }
-                        }
                     }
 
                     // SEC-CTRL-FAC-0015 BLOCKER FIX: Enforce MAX_INLINE_RESULT_SIZE
@@ -4784,10 +4932,6 @@ mod tests {
 
             // Actuation timestamp is deliberately older than the check timestamp
             // to trigger ReplayVerifier::OrderingViolation in production wiring.
-            let test_broker: SharedToolBroker<StubManifestLoader> =
-                std::sync::Arc::new(crate::episode::broker::ToolBroker::new(
-                    crate::episode::broker::ToolBrokerConfig::default(),
-                ));
             let response = dispatcher
                 .handle_broker_decision(
                     Ok(decision),
@@ -4797,8 +4941,6 @@ mod tests {
                     ReplayTimestamp::new(100, 0),
                     &episode_id,
                     Some(&receipt),
-                    &test_broker,
-                    RiskTier::Tier0,
                 )
                 .expect("dispatch should return application-level error response");
 
@@ -4914,6 +5056,430 @@ mod tests {
                 },
                 other => panic!("Expected error for broker-without-gate, got: {other:?}"),
             }
+        }
+    }
+
+    mod tck_00375_firewall_enforcement {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+        use serde_json::Value;
+        use tempfile::tempdir;
+
+        use super::*;
+        use crate::episode::decision::Credential;
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::tool_handler::ToolArgs;
+        use crate::episode::{
+            BudgetDelta, Capability, CapabilityManifestBuilder, CapabilityScope, EpisodeRuntime,
+            EpisodeRuntimeConfig, InMemorySessionRegistry, RiskTier, StubContentAddressedStore,
+            ToolBroker, ToolBrokerConfig, ToolClass, ToolHandler, ToolHandlerError, ToolResultData,
+        };
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
+        use crate::session::SessionRegistry;
+
+        fn make_tier3_read_manifest(manifest_id: &str) -> crate::episode::CapabilityManifest {
+            let capability = Capability {
+                capability_id: "cap-read-tier3".to_string(),
+                tool_class: ToolClass::Read,
+                scope: CapabilityScope {
+                    root_paths: Vec::new(),
+                    allowed_patterns: Vec::new(),
+                    size_limits: crate::episode::scope::SizeLimits::default_limits(),
+                    network_policy: None,
+                },
+                risk_tier_required: RiskTier::Tier3,
+            };
+
+            CapabilityManifestBuilder::new(manifest_id)
+                .delegator("test-delegator")
+                .capabilities(vec![capability])
+                .tool_allowlist(vec![ToolClass::Read])
+                .build()
+                .expect("tier3 manifest build should succeed")
+        }
+
+        fn register_session(
+            registry: &Arc<InMemorySessionRegistry>,
+            session_id: &str,
+        ) -> Arc<dyn crate::session::SessionRegistry> {
+            registry
+                .register_session(crate::session::SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: "W-TCK-00375".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "L-TCK-00375".to_string(),
+                    ephemeral_handle: "handle-tck-00375".to_string(),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: Some(session_id.to_string()),
+                })
+                .expect("session registration should succeed");
+
+            Arc::clone(registry) as Arc<dyn crate::session::SessionRegistry>
+        }
+
+        #[derive(Debug)]
+        struct CountingReadHandler {
+            executions: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ToolHandler for CountingReadHandler {
+            fn tool_class(&self) -> ToolClass {
+                ToolClass::Read
+            }
+
+            async fn execute(
+                &self,
+                _args: &ToolArgs,
+                _credential: Option<&Credential>,
+            ) -> Result<ToolResultData, ToolHandlerError> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResultData::success(
+                    b"should-not-execute".to_vec(),
+                    BudgetDelta::single_call(),
+                    std::time::Duration::from_millis(1),
+                ))
+            }
+
+            fn validate(&self, _args: &ToolArgs) -> Result<(), ToolHandlerError> {
+                Ok(())
+            }
+
+            fn name(&self) -> &'static str {
+                "CountingReadHandler"
+            }
+        }
+
+        #[test]
+        fn test_tier3_toctou_mismatch_terminates_and_emits_defect_record() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async {
+                let minter = test_minter();
+                let temp_dir = tempdir().expect("temp dir");
+                let source_path = temp_dir.path().join("source.rs");
+                let source_bytes = b"fn safe() {}";
+                tokio::fs::write(&source_path, source_bytes)
+                    .await
+                    .expect("write source file");
+                let source_path_str = source_path.to_string_lossy().to_string();
+
+                let mismatched_hash = *blake3::hash(b"tampered-bytes").as_bytes();
+                let context_manifest =
+                    ContextPackManifestBuilder::new("ctx-manifest-tier3", "profile-tier3")
+                        .add_entry(
+                            ManifestEntryBuilder::new(&source_path_str, mismatched_hash)
+                                .access_level(AccessLevel::Read)
+                                .build(),
+                        )
+                        .build();
+
+                let broker = Arc::new(ToolBroker::new(
+                    ToolBrokerConfig::default().without_policy_check(),
+                ));
+                broker
+                    .initialize_with_manifest(make_tier3_read_manifest("broker-manifest-tier3"))
+                    .await
+                    .expect("broker manifest init");
+                broker
+                    .initialize_with_context_manifest(context_manifest)
+                    .await
+                    .expect("context manifest init");
+
+                let executions = Arc::new(AtomicUsize::new(0));
+                let cas: Arc<dyn crate::episode::ContentAddressedStore> =
+                    Arc::new(StubContentAddressedStore::new());
+                #[allow(deprecated)]
+                let episode_runtime = Arc::new(
+                    EpisodeRuntime::new(EpisodeRuntimeConfig::default())
+                        .with_cas(cas)
+                        .with_handler_factory({
+                            let executions = Arc::clone(&executions);
+                            move || {
+                                Box::new(CountingReadHandler {
+                                    executions: Arc::clone(&executions),
+                                }) as Box<dyn ToolHandler>
+                            }
+                        }),
+                );
+                let episode_id = episode_runtime
+                    .create(*blake3::hash(b"tck-00375-envelope").as_bytes(), 1_000_000)
+                    .await
+                    .expect("create episode");
+                #[allow(deprecated)]
+                let _handle = episode_runtime
+                    .start(&episode_id, "lease-001", 2_000_000)
+                    .await
+                    .expect("start episode");
+                let session_id = episode_id.as_str().to_string();
+
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+                manifest_store.register(
+                    &session_id,
+                    make_tier3_read_manifest("dispatch-manifest-tier3"),
+                );
+
+                let registry = Arc::new(InMemorySessionRegistry::new());
+                let registry_dyn = register_session(&registry, &session_id);
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
+                let started_at_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let ns = d.as_nanos() as u64;
+                        ns
+                    })
+                    .unwrap_or(0);
+                telemetry_store
+                    .register(&session_id, started_at_ns)
+                    .expect("telemetry registration should succeed");
+
+                let clock =
+                    Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+                let stop_authority = Arc::new(StopAuthority::new());
+                let preactuation_gate = Arc::new(PreActuationGate::production_gate(
+                    Arc::clone(&stop_authority),
+                    None,
+                ));
+
+                let ledger = Arc::new(StubLedgerEventEmitter::new());
+                let ledger_dyn: Arc<dyn LedgerEventEmitter> = ledger.clone();
+
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_clock(clock)
+                        .with_ledger(ledger_dyn)
+                        .with_episode_runtime(episode_runtime)
+                        .with_session_registry(registry_dyn)
+                        .with_telemetry_store(Arc::clone(&telemetry_store))
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority);
+
+                let spawn_time = std::time::SystemTime::now();
+                let token = minter
+                    .mint(
+                        &session_id,
+                        "lease-001",
+                        spawn_time,
+                        Duration::from_secs(3600),
+                    )
+                    .expect("mint token");
+                let ctx = ConnectionContext::session_open(
+                    Some(crate::protocol::credentials::PeerCredentials {
+                        uid: 1000,
+                        gid: 1000,
+                        pid: Some(12346),
+                    }),
+                    Some(session_id.clone()),
+                );
+
+                let request_args = serde_json::json!({
+                    "type": "read",
+                    "path": source_path_str,
+                });
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).expect("token serialization"),
+                    tool_id: "read".to_string(),
+                    arguments: serde_json::to_vec(&request_args)
+                        .expect("request args serialization"),
+                    dedupe_key: "tck-00375-tier3-toctou".to_string(),
+                };
+                let frame = encode_request_tool_request(&request);
+                let response = dispatcher
+                    .dispatch(&frame, &ctx)
+                    .expect("dispatch should succeed");
+
+                match response {
+                    SessionResponse::Error(err) => {
+                        assert_eq!(
+                            err.code,
+                            SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                            "tier3 TOCTOU mismatch must terminate/deny"
+                        );
+                        assert!(
+                            err.message.contains("session terminated"),
+                            "termination response should be returned, got: {}",
+                            err.message
+                        );
+                    },
+                    other => panic!("expected error response for TOCTOU mismatch, got: {other:?}"),
+                }
+
+                assert_eq!(
+                    executions.load(Ordering::SeqCst),
+                    0,
+                    "tool execution must not occur when pre-execution TOCTOU check fails"
+                );
+
+                let termination = registry.get_termination_info(&session_id);
+                assert!(
+                    termination.is_some(),
+                    "tier3 TOCTOU mismatch must mark the session terminated"
+                );
+
+                let defect_events: Vec<_> = ledger
+                    .get_events_by_work_id(&session_id)
+                    .into_iter()
+                    .filter(|event| event.event_type == "defect_recorded")
+                    .collect();
+                assert!(
+                    !defect_events.is_empty(),
+                    "tier3 TOCTOU mismatch must emit authoritative DefectRecorded event"
+                );
+
+                let payload: Value =
+                    serde_json::from_slice(&defect_events[0].payload).expect("defect payload json");
+                assert_eq!(
+                    payload.get("defect_type").and_then(Value::as_str),
+                    Some("CONTEXT_FIREWALL_TOCTOU_MISMATCH"),
+                    "defect payload must identify TOCTOU mismatch"
+                );
+            });
+        }
+
+        #[test]
+        fn test_tier3_toctou_without_ledger_still_terminates_fail_closed() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async {
+                let minter = test_minter();
+                let temp_dir = tempdir().expect("temp dir");
+                let source_path = temp_dir.path().join("source.rs");
+                tokio::fs::write(&source_path, b"fn safe() {}")
+                    .await
+                    .expect("write source file");
+                let source_path_str = source_path.to_string_lossy().to_string();
+
+                let mismatched_hash = *blake3::hash(b"different-bytes").as_bytes();
+                let context_manifest = ContextPackManifestBuilder::new(
+                    "ctx-manifest-tier3-no-ledger",
+                    "profile-tier3",
+                )
+                .add_entry(
+                    ManifestEntryBuilder::new(&source_path_str, mismatched_hash)
+                        .access_level(AccessLevel::Read)
+                        .build(),
+                )
+                .build();
+
+                let broker = Arc::new(ToolBroker::new(
+                    ToolBrokerConfig::default().without_policy_check(),
+                ));
+                broker
+                    .initialize_with_manifest(make_tier3_read_manifest("broker-manifest-no-ledger"))
+                    .await
+                    .expect("broker manifest init");
+                broker
+                    .initialize_with_context_manifest(context_manifest)
+                    .await
+                    .expect("context manifest init");
+
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+                let session_id = "session-tier3-no-ledger".to_string();
+                manifest_store.register(
+                    &session_id,
+                    make_tier3_read_manifest("dispatch-manifest-no-ledger"),
+                );
+
+                let registry = Arc::new(InMemorySessionRegistry::new());
+                let registry_dyn = register_session(&registry, &session_id);
+                let telemetry_store = Arc::new(crate::session::SessionTelemetryStore::new());
+                let started_at_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let ns = d.as_nanos() as u64;
+                        ns
+                    })
+                    .unwrap_or(0);
+                telemetry_store
+                    .register(&session_id, started_at_ns)
+                    .expect("telemetry registration should succeed");
+
+                let clock =
+                    Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+                let stop_authority = Arc::new(StopAuthority::new());
+                let preactuation_gate = Arc::new(PreActuationGate::production_gate(
+                    Arc::clone(&stop_authority),
+                    None,
+                ));
+
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_clock(clock)
+                        .with_session_registry(registry_dyn)
+                        .with_telemetry_store(Arc::clone(&telemetry_store))
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority);
+
+                let spawn_time = std::time::SystemTime::now();
+                let token = minter
+                    .mint(
+                        &session_id,
+                        "lease-001",
+                        spawn_time,
+                        Duration::from_secs(3600),
+                    )
+                    .expect("mint token");
+                let ctx = ConnectionContext::session_open(
+                    Some(crate::protocol::credentials::PeerCredentials {
+                        uid: 1000,
+                        gid: 1000,
+                        pid: Some(12346),
+                    }),
+                    Some(session_id.clone()),
+                );
+
+                let request_args = serde_json::json!({
+                    "type": "read",
+                    "path": source_path_str,
+                });
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).expect("token serialization"),
+                    tool_id: "read".to_string(),
+                    arguments: serde_json::to_vec(&request_args)
+                        .expect("request args serialization"),
+                    dedupe_key: "tck-00375-tier3-no-ledger".to_string(),
+                };
+                let frame = encode_request_tool_request(&request);
+                let response = dispatcher
+                    .dispatch(&frame, &ctx)
+                    .expect("dispatch should succeed");
+
+                match response {
+                    SessionResponse::Error(err) => {
+                        assert_eq!(
+                            err.code,
+                            SessionErrorCode::SessionErrorInternal as i32,
+                            "defect persistence failure must fail closed"
+                        );
+                        assert!(
+                            err.message.contains("firewall defect emission failed"),
+                            "response must report authoritative defect emission failure: {}",
+                            err.message
+                        );
+                    },
+                    other => panic!("expected fail-closed error response, got: {other:?}"),
+                }
+
+                let termination = registry.get_termination_info(&session_id);
+                assert!(
+                    termination.is_some(),
+                    "tier3 TOCTOU mismatch must terminate session even if defect persistence fails"
+                );
+            });
         }
     }
 
@@ -5528,12 +6094,15 @@ mod tests {
                 .expect("failed to build tokio runtime");
 
             rt.block_on(async {
+                use std::path::PathBuf;
+
                 use rand::rngs::OsRng;
 
                 use crate::episode::decision::Credential;
                 use crate::episode::tool_handler::ToolArgs;
                 use crate::episode::{
-                    BudgetDelta, EpisodeRuntime, EpisodeRuntimeConfig, StubContentAddressedStore,
+                    BudgetDelta, Capability, CapabilityManifestBuilder, CapabilityScope,
+                    EpisodeRuntime, EpisodeRuntimeConfig, RiskTier, StubContentAddressedStore,
                     ToolBroker, ToolBrokerConfig, ToolClass, ToolHandler, ToolHandlerError,
                     ToolResultData,
                 };
@@ -5632,8 +6201,24 @@ mod tests {
                 // and initialize with manifest so request() succeeds.
                 let broker_config = ToolBrokerConfig::default().without_policy_check();
                 let broker = Arc::new(ToolBroker::new(broker_config));
-                let broker_manifest =
-                    super::tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+                let read_scope_manifest = CapabilityManifestBuilder::new("e2e-read-manifest")
+                    .delegator("test-delegator")
+                    .capabilities(vec![Capability {
+                        capability_id: "cap-read-e2e".to_string(),
+                        tool_class: ToolClass::Read,
+                        scope: CapabilityScope {
+                            root_paths: vec![PathBuf::from("/")],
+                            allowed_patterns: Vec::new(),
+                            size_limits: crate::episode::scope::SizeLimits::default_limits(),
+                            network_policy: None,
+                        },
+                        risk_tier_required: RiskTier::Tier0,
+                    }])
+                    .tool_allowlist(vec![ToolClass::Read])
+                    .build()
+                    .expect("e2e read manifest build");
+
+                let broker_manifest = read_scope_manifest.clone();
                 broker
                     .initialize_with_manifest(broker_manifest)
                     .await
@@ -5641,8 +6226,7 @@ mod tests {
 
                 // Manifest store with Read allowed
                 let manifest_store = Arc::new(InMemoryManifestStore::new());
-                let manifest =
-                    super::tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+                let manifest = read_scope_manifest;
                 manifest_store.register(&session_id, manifest);
 
                 // Session registry

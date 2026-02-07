@@ -848,9 +848,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
     /// Verifies TOCTOU hash consistency for file content (TCK-00375).
     ///
-    /// This method should be called after a read operation succeeds but
-    /// before the content is delivered to the agent. It verifies that the
-    /// runtime content matches the hash recorded in the manifest.
+    /// This method verifies that runtime content matches the hash recorded in
+    /// the manifest. Callers should invoke this at the read boundary before
+    /// actuation output is accepted.
     ///
     /// # Arguments
     ///
@@ -904,15 +904,14 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             &normalized,
             mode,
         ) {
-            // TCK-00375: Emit mandatory defect for Tier3+ violations
-            if ctx_risk_tier.is_high_risk() {
-                let defect = FirewallViolationDefect::toctou_mismatch(
-                    risk_tier.tier(),
-                    &manifest.manifest_id,
-                    &normalized,
-                );
-                self.firewall_defects.lock().await.push(defect);
-            }
+            // Emit a structured defect for every firewall violation. Tier3+
+            // defects are marked as mandatory termination by the defect itself.
+            let defect = FirewallViolationDefect::toctou_mismatch(
+                risk_tier.tier(),
+                &manifest.manifest_id,
+                &normalized,
+            );
+            self.firewall_defects.lock().await.push(defect);
 
             // Emit metrics if available
             if let Some(ref metrics) = self.metrics {
@@ -939,6 +938,47 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
 
         Ok(())
+    }
+
+    /// Reads file bytes from disk and performs TOCTOU verification before
+    /// tool actuation.
+    ///
+    /// This enforces a pre-execution integrity check using the actual file
+    /// bytes referenced by the manifest entry when the target resolves to a
+    /// regular file.
+    async fn verify_toctou_from_disk(
+        &self,
+        path: &std::path::Path,
+        risk_tier: super::envelope::RiskTier,
+    ) -> Result<(), BrokerError> {
+        let path_str = path.to_string_lossy();
+        let normalized = apm2_core::context::normalize_path(path_str.as_ref()).map_err(|e| {
+            BrokerError::Internal {
+                message: format!("TOCTOU path normalization failed: {e}"),
+            }
+        })?;
+
+        let metadata =
+            tokio::fs::metadata(&normalized)
+                .await
+                .map_err(|e| BrokerError::Internal {
+                    message: format!("TOCTOU pre-read metadata failed for {normalized}: {e}"),
+                })?;
+        if !metadata.is_file() {
+            // Directory-oriented navigation requests (e.g., list/search scope)
+            // may target non-file paths. TOCTOU hash verification applies to
+            // concrete file bytes only.
+            return Ok(());
+        }
+
+        let file_bytes = tokio::fs::read(&normalized)
+            .await
+            .map_err(|e| BrokerError::Internal {
+                message: format!("TOCTOU pre-read failed for {normalized}: {e}"),
+            })?;
+
+        self.verify_toctou(&normalized, &file_bytes, risk_tier)
+            .await
     }
 
     /// Sets the content-addressed store for evidence artifacts (TCK-00293).
@@ -1600,15 +1640,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                             request_id = %request.request_id,
                             "context firewall violation: Read/Navigation request missing path"
                         );
-                        // TCK-00375: Emit defect for Tier3+ no-path violations
-                        if ctx_risk_tier.is_high_risk() {
-                            let defect = FirewallViolationDefect::allowlist_denied(
-                                request.risk_tier.tier(),
-                                &context_manifest.manifest_id,
-                                "<no_path>",
-                            );
-                            emit_defect(defect).await;
-                        }
+                        let defect = FirewallViolationDefect::allowlist_denied(
+                            request.risk_tier.tier(),
+                            &context_manifest.manifest_id,
+                            "<no_path>",
+                        );
+                        emit_defect(defect).await;
                         return Ok(make_terminate("CONTEXT_READ_NO_PATH"));
                     };
 
@@ -1618,8 +1655,39 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
                     match firewall.validate_read(&path_str, None) {
                         Ok(ValidationResult::Allowed) => {
-                            // Path is in the manifest and allowed; proceed to
-                            // capability checks.
+                            // Path is in the manifest and allowed. Enforce
+                            // pre-execution TOCTOU verification against raw
+                            // on-disk bytes before capability checks.
+                            if request.tool_class == super::tool_class::ToolClass::Read {
+                                if let Err(e) = self
+                                    .verify_toctou_from_disk(path.as_path(), request.risk_tier)
+                                    .await
+                                {
+                                    warn!(
+                                        path = %path_str,
+                                        risk_tier = request.risk_tier.tier(),
+                                        error = %e,
+                                        "TOCTOU pre-execution verification failed"
+                                    );
+
+                                    if ctx_risk_tier.is_high_risk()
+                                        || tier_mode
+                                            == apm2_core::context::firewall::FirewallMode::HardFail
+                                    {
+                                        return Ok(make_terminate("CONTEXT_TOCTOU_MISMATCH"));
+                                    }
+
+                                    return Ok(ToolDecision::Deny {
+                                        request_id: request.request_id.clone(),
+                                        reason: DenyReason::PolicyDenied {
+                                            rule_id: "CONTEXT_FIREWALL".to_string(),
+                                            reason: format!("TOCTOU verification failed: {e}"),
+                                        },
+                                        rule_id: Some("CONTEXT_FIREWALL".to_string()),
+                                        policy_hash: self.policy.policy_hash(),
+                                    });
+                                }
+                            }
                         },
                         Ok(ValidationResult::Warned { event }) => {
                             // TCK-00375 BLOCKER 3 FIX: Warn mode returned a
@@ -1635,15 +1703,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 "context firewall violation (Warned treated as deny per REQ-0029)"
                             );
 
-                            // Emit mandatory defect for Tier3+ violations
-                            if ctx_risk_tier.is_high_risk() {
-                                let defect = FirewallViolationDefect::allowlist_denied(
-                                    request.risk_tier.tier(),
-                                    &context_manifest.manifest_id,
-                                    &path_str,
-                                );
-                                emit_defect(defect).await;
-                            }
+                            let defect = FirewallViolationDefect::allowlist_denied(
+                                request.risk_tier.tier(),
+                                &context_manifest.manifest_id,
+                                &path_str,
+                            );
+                            emit_defect(defect).await;
 
                             // Always deny out-of-pack reads: terminate for
                             // Tier3+ or HardFail; soft-deny otherwise.
@@ -1675,14 +1740,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 rule_id = %event.rule_id,
                                 "context firewall violation (Denied)"
                             );
-                            if ctx_risk_tier.is_high_risk() {
-                                let defect = FirewallViolationDefect::allowlist_denied(
-                                    request.risk_tier.tier(),
-                                    &context_manifest.manifest_id,
-                                    &path_str,
-                                );
-                                emit_defect(defect).await;
-                            }
+                            let defect = FirewallViolationDefect::allowlist_denied(
+                                request.risk_tier.tier(),
+                                &context_manifest.manifest_id,
+                                &path_str,
+                            );
+                            emit_defect(defect).await;
                             return Ok(make_terminate("CONTEXT_MISS"));
                         },
                         Err(e) => {
@@ -1693,23 +1756,20 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 "context firewall violation"
                             );
 
-                            // TCK-00375: Emit mandatory defect for Tier3+ violations
-                            if ctx_risk_tier.is_high_risk() {
-                                let defect = if e.is_toctou_mismatch() {
-                                    FirewallViolationDefect::toctou_mismatch(
-                                        request.risk_tier.tier(),
-                                        &context_manifest.manifest_id,
-                                        &path_str,
-                                    )
-                                } else {
-                                    FirewallViolationDefect::allowlist_denied(
-                                        request.risk_tier.tier(),
-                                        &context_manifest.manifest_id,
-                                        &path_str,
-                                    )
-                                };
-                                emit_defect(defect).await;
-                            }
+                            let defect = if e.is_toctou_mismatch() {
+                                FirewallViolationDefect::toctou_mismatch(
+                                    request.risk_tier.tier(),
+                                    &context_manifest.manifest_id,
+                                    &path_str,
+                                )
+                            } else {
+                                FirewallViolationDefect::allowlist_denied(
+                                    request.risk_tier.tier(),
+                                    &context_manifest.manifest_id,
+                                    &path_str,
+                                )
+                            };
+                            emit_defect(defect).await;
 
                             // TCK-00375: Tier3+ always terminates
                             if e.should_terminate_session() || ctx_risk_tier.is_high_risk() {
@@ -1739,14 +1799,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 request_id = %request.request_id,
                                 "context firewall violation: Write request missing path"
                             );
-                            if ctx_risk_tier.is_high_risk() {
-                                let defect = FirewallViolationDefect::allowlist_denied(
-                                    request.risk_tier.tier(),
-                                    &context_manifest.manifest_id,
-                                    "<no_path>",
-                                );
-                                emit_defect(defect).await;
-                            }
+                            let defect = FirewallViolationDefect::allowlist_denied(
+                                request.risk_tier.tier(),
+                                &context_manifest.manifest_id,
+                                "<no_path>",
+                            );
+                            emit_defect(defect).await;
                             return Ok(make_terminate("CONTEXT_WRITE_NO_PATH"));
                         };
 
@@ -1755,14 +1813,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 path = %path.display(),
                                 "context firewall violation: path not in write_allowlist"
                             );
-                            if ctx_risk_tier.is_high_risk() {
-                                let defect = FirewallViolationDefect::allowlist_denied(
-                                    request.risk_tier.tier(),
-                                    &context_manifest.manifest_id,
-                                    &path.to_string_lossy(),
-                                );
-                                emit_defect(defect).await;
-                            }
+                            let defect = FirewallViolationDefect::allowlist_denied(
+                                request.risk_tier.tier(),
+                                &context_manifest.manifest_id,
+                                &path.to_string_lossy(),
+                            );
+                            emit_defect(defect).await;
                             return Ok(make_terminate("CONTEXT_WRITE_DENIED"));
                         }
                     }
@@ -1776,14 +1832,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 request_id = %request.request_id,
                                 "context firewall violation: Execute request missing shell_command"
                             );
-                            if ctx_risk_tier.is_high_risk() {
-                                let defect = FirewallViolationDefect::allowlist_denied(
-                                    request.risk_tier.tier(),
-                                    &context_manifest.manifest_id,
-                                    "<no_command>",
-                                );
-                                emit_defect(defect).await;
-                            }
+                            let defect = FirewallViolationDefect::allowlist_denied(
+                                request.risk_tier.tier(),
+                                &context_manifest.manifest_id,
+                                "<no_command>",
+                            );
+                            emit_defect(defect).await;
                             return Ok(make_terminate("CONTEXT_EXEC_NO_CMD"));
                         };
 
@@ -1792,14 +1846,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 command = %command,
                                 "context firewall violation: command not in shell_allowlist"
                             );
-                            if ctx_risk_tier.is_high_risk() {
-                                let defect = FirewallViolationDefect::allowlist_denied(
-                                    request.risk_tier.tier(),
-                                    &context_manifest.manifest_id,
-                                    command,
-                                );
-                                emit_defect(defect).await;
-                            }
+                            let defect = FirewallViolationDefect::allowlist_denied(
+                                request.risk_tier.tier(),
+                                &context_manifest.manifest_id,
+                                command,
+                            );
+                            emit_defect(defect).await;
                             return Ok(make_terminate("CONTEXT_EXEC_DENIED"));
                         }
                     }
@@ -2928,18 +2980,29 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_allows_permitted_read() {
         // TCK-00286: Read request for allowed path proceeds to capability checks
+        use tempfile::tempdir;
+
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        let temp_dir = tempdir().expect("temp dir");
+        let allowed_path = temp_dir.path().join("allowed.rs");
+        let allowed_bytes = b"fn allowed() {}";
+        tokio::fs::write(&allowed_path, allowed_bytes)
+            .await
+            .expect("write allowed file");
+        let allowed_path_str = allowed_path.to_string_lossy().to_string();
+        let allowed_hash = *blake3::hash(allowed_bytes).as_bytes();
 
         // Set up capability manifest allowing reads from /workspace
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
-            vec![PathBuf::from("/workspace")],
+            vec![temp_dir.path().to_path_buf()],
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Set up context manifest allowing /workspace/allowed.rs
+        // Set up context manifest allowing the temp file
         let context_manifest = make_context_manifest(
-            vec![("/workspace/allowed.rs", [0x42; 32])],
+            vec![(allowed_path_str.as_str(), allowed_hash)],
             Vec::new(),
             Vec::new(),
         );
@@ -2949,11 +3012,7 @@ mod tests {
             .unwrap();
 
         // Request should be allowed (both context firewall and capability check pass)
-        let request = make_request(
-            "req-allowed",
-            ToolClass::Read,
-            Some("/workspace/allowed.rs"),
-        );
+        let request = make_request("req-allowed", ToolClass::Read, Some(&allowed_path_str));
         let decision = broker
             .request(&request, timestamp_ns(0), None)
             .await
@@ -5109,6 +5168,7 @@ policy:
     async fn test_warn_mode_allows_in_pack_reads() {
         // TCK-00375: Warn mode for in-pack allowed paths should still succeed
         use apm2_core::context::firewall::FirewallMode;
+        use tempfile::tempdir;
 
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
             .with_firewall_policy(RiskTierFirewallPolicy {
@@ -5116,16 +5176,25 @@ policy:
                 medium_risk_mode: FirewallMode::Warn,
             });
 
+        let temp_dir = tempdir().expect("temp dir");
+        let allowed_path = temp_dir.path().join("allowed.rs");
+        let allowed_bytes = b"fn in_pack() {}";
+        tokio::fs::write(&allowed_path, allowed_bytes)
+            .await
+            .expect("write allowed file");
+        let allowed_path_str = allowed_path.to_string_lossy().to_string();
+        let allowed_hash = *blake3::hash(allowed_bytes).as_bytes();
+
         // Set up capability manifest allowing reads from /workspace
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
-            vec![PathBuf::from("/workspace")],
+            vec![temp_dir.path().to_path_buf()],
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Context manifest allows /workspace/allowed.rs
+        // Context manifest allows the temp file
         let context_manifest = make_context_manifest(
-            vec![("/workspace/allowed.rs", [0x42; 32])],
+            vec![(allowed_path_str.as_str(), allowed_hash)],
             Vec::new(),
             Vec::new(),
         );
@@ -5135,7 +5204,7 @@ policy:
             .unwrap();
 
         // Request for in-pack path — should be allowed
-        let request = make_request("req-inpack", ToolClass::Read, Some("/workspace/allowed.rs"));
+        let request = make_request("req-inpack", ToolClass::Read, Some(&allowed_path_str));
         let decision = broker
             .request(&request, timestamp_ns(0), None)
             .await

@@ -938,8 +938,9 @@ impl ToctouVerifier {
     /// # Errors
     ///
     /// Returns [`ContextFirewallError::ToctouMismatch`] when the runtime
-    /// content hash does not match the expected manifest hash, unless the
-    /// mode is `Warn` (in which case the mismatch is silently accepted).
+    /// content hash does not match the expected manifest hash. Per REQ-0029,
+    /// TOCTOU mismatches are always denied regardless of mode; `Warn` affects
+    /// severity/termination only, not acceptance.
     #[allow(clippy::result_large_err)]
     pub fn verify_for_firewall(
         content: &[u8],
@@ -950,27 +951,13 @@ impl ToctouVerifier {
     ) -> Result<(), ContextFirewallError> {
         if let Err(mismatch) = Self::verify_content(content, expected_hash) {
             let event = FirewallDecision::deny_toctou_mismatch(manifest_id, path);
-
-            match mode {
-                FirewallMode::Warn => {
-                    // In warn mode, log but allow (the caller should still log)
-                    Ok(())
-                },
-                FirewallMode::SoftFail => Err(ContextFirewallError::ToctouMismatch {
-                    path: path.to_string(),
-                    expected_hash: mismatch.expected,
-                    computed_hash: mismatch.computed,
-                    event,
-                    should_terminate_session: false,
-                }),
-                FirewallMode::HardFail => Err(ContextFirewallError::ToctouMismatch {
-                    path: path.to_string(),
-                    expected_hash: mismatch.expected,
-                    computed_hash: mismatch.computed,
-                    event,
-                    should_terminate_session: true,
-                }),
-            }
+            Err(ContextFirewallError::ToctouMismatch {
+                path: path.to_string(),
+                expected_hash: mismatch.expected,
+                computed_hash: mismatch.computed,
+                event,
+                should_terminate_session: matches!(mode, FirewallMode::HardFail),
+            })
         } else {
             Ok(())
         }
@@ -2166,8 +2153,13 @@ pub mod tests {
             FirewallMode::Warn,
         );
 
-        // Warn mode allows the read even on TOCTOU mismatch
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_toctou_mismatch());
+        assert!(
+            !err.should_terminate_session(),
+            "Warn TOCTOU mismatch should deny without mandatory termination"
+        );
     }
 
     #[test]
