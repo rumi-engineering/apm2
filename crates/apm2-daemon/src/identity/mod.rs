@@ -123,6 +123,7 @@
 //! - EVID-0008: Genesis artifact CAS conformance evidence
 //! - EVID-0303: Rollout phase S0.75 evidence
 
+pub(crate) mod authority_seal;
 mod canonical_digest_id_kit;
 mod cell_id;
 mod certificate;
@@ -134,6 +135,12 @@ mod session_delegation;
 
 pub mod conformance;
 
+pub use authority_seal::{
+    AuthoritySealError, AuthoritySealV1, IssuerId, MAX_AUTHORITY_SEAL_BYTES,
+    MAX_MERKLE_PROOF_DEPTH, MAX_QUORUM_SIGNATURES, MAX_SUBJECT_KIND_LEN, MerkleInclusionProof,
+    MerkleProofSibling, SealKind, SubjectKind, ZERO_TIME_ENVELOPE_REF, compute_receipt_leaf_hash,
+    reject_free_floating_batch_root,
+};
 pub use cell_id::{CellGenesisV1, CellIdV1, PolicyRootId};
 pub use certificate::{
     CellCertificateV1, CertificateError, HolonCertificateV1, RevocationPointer, validate_key_roles,

@@ -339,7 +339,11 @@ pub enum LedgerAnchorV1 {
 }
 
 impl LedgerAnchorV1 {
-    fn canonical_bytes(&self) -> Vec<u8> {
+    /// Returns the canonical byte representation of this ledger anchor.
+    ///
+    /// Used for domain-separated preimage construction in authority seals
+    /// and directory heads.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
         match self {
             Self::SeqEvent { seq_id, event_hash } => {
                 let mut out = Vec::with_capacity(1 + 8 + HASH_BYTES);
