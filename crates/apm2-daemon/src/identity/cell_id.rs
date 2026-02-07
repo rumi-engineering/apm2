@@ -16,9 +16,9 @@
 //! cell:v1:blake3:<64-lowercase-hex>
 //! ```
 
-use std::fmt;
-
-use super::canonical_digest_id_kit::CanonicalDigestIdKit;
+use super::canonical_digest_id_kit::{
+    CanonicalDigestIdKit, impl_digest_id_fmt, impl_version_tagged_digest_id,
+};
 use super::{BINARY_LEN, HASH_LEN, KeyIdError, KeySetIdV1, PublicKeyIdV1};
 
 /// Canonical text prefix for `CellIdV1`.
@@ -167,73 +167,10 @@ impl CellIdV1 {
         Self { binary }
     }
 
-    /// Parse a `CellIdV1` from canonical text form.
-    pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
-        let binary = CODEC.parse_text_binary_with_tag(input, VERSION_TAG_V1)?;
-        Ok(Self { binary })
-    }
-
-    /// Construct from binary form (`version_tag + 32-byte hash`).
-    pub fn from_binary(bytes: &[u8]) -> Result<Self, KeyIdError> {
-        let binary = CODEC.parse_binary_exact(bytes, |tag| {
-            if tag == VERSION_TAG_V1 {
-                Ok(())
-            } else {
-                Err(KeyIdError::UnknownVersionTag { tag })
-            }
-        })?;
-        Ok(Self { binary })
-    }
-
-    /// Return canonical text form: `cell:v1:blake3:<64-hex>`.
-    pub fn to_text(&self) -> String {
-        CODEC.to_text(self.cell_hash())
-    }
-
-    /// Return binary form (`version_tag + hash`).
-    pub const fn to_binary(&self) -> [u8; BINARY_LEN] {
-        self.binary
-    }
-
-    /// Return the 32-byte hash portion (without version tag).
-    pub fn cell_hash(&self) -> &[u8; HASH_LEN] {
-        self.binary[1..]
-            .try_into()
-            .expect("binary is exactly 33 bytes")
-    }
-
-    /// Return the version tag.
-    pub const fn version_tag(&self) -> u8 {
-        self.binary[0]
-    }
-
-    /// Return a reference to the full binary bytes.
-    pub const fn as_bytes(&self) -> &[u8; BINARY_LEN] {
-        &self.binary
-    }
+    impl_version_tagged_digest_id!(CODEC, VERSION_TAG_V1, cell_hash);
 }
 
-impl fmt::Debug for CellIdV1 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CellIdV1")
-            .field("text", &self.to_text())
-            .finish()
-    }
-}
-
-impl fmt::Display for CellIdV1 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_text())
-    }
-}
-
-impl std::str::FromStr for CellIdV1 {
-    type Err = KeyIdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse_text(s)
-    }
-}
+impl_digest_id_fmt!(CellIdV1, "CellIdV1");
 
 /// Validate trust-domain invariants for fail-closed genesis construction.
 fn validate_trust_domain(value: &str) -> Result<(), KeyIdError> {

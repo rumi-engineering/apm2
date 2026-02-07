@@ -54,7 +54,7 @@
 
 use std::fmt;
 
-use super::canonical_digest_id_kit::CanonicalDigestIdKit;
+use super::canonical_digest_id_kit::{CanonicalDigestIdKit, impl_digest_id_fmt};
 use super::{AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1};
 
 /// Prefix for `KeySetIdV1` text form (RFC-0020 canonical grammar).
@@ -455,27 +455,7 @@ impl KeySetIdV1 {
     }
 }
 
-impl fmt::Debug for KeySetIdV1 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KeySetIdV1")
-            .field("text", &self.to_text())
-            .finish()
-    }
-}
-
-impl fmt::Display for KeySetIdV1 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_text())
-    }
-}
-
-impl std::str::FromStr for KeySetIdV1 {
-    type Err = KeyIdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse_text(s)
-    }
-}
+impl_digest_id_fmt!(KeySetIdV1, "KeySetIdV1");
 
 #[cfg(test)]
 mod tests {
