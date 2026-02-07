@@ -1765,27 +1765,50 @@ impl IdentityProofV1 {
     }
 }
 
-/// Authority-verified directory head retained in verifier cache.
+/// Structurally admitted directory head retained in verifier cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedHead {
+#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
+#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
+pub(crate) struct VerifiedHead {
     /// Cached directory head commitment.
-    pub head: HolonDirectoryHeadV1,
-    /// HTF-like verification timestamp (directory epoch tick).
-    pub verified_at: u64,
+    pub(crate) head: HolonDirectoryHeadV1,
+    /// Directory epoch tick at which this head was admitted to the cache.
+    /// Uses the same epoch unit as `HolonDirectoryHeadV1::directory_epoch`.
+    pub(crate) verified_at: u64,
 }
 
-/// Bounded cache for amortizing head verification across many identity proofs.
+/// Structural verification cache for directory heads.
+///
+/// **SECURITY: This cache verifies structural proof validity (root hash,
+/// kind compatibility, depth/sibling bounds) only. It does NOT verify
+/// authority seals, certificate binding, freshness policy, or holon
+/// identity binding. Callers MUST NOT use results from this cache as
+/// authorization signals without completing the full identity verification
+/// pipeline (see `IdentityProofV1::verify()`).**
+///
+/// This cache supports the O(1) head amortization contract from HSI §1.7.7c:
+/// once a head is admitted (structural + root check), proof verification
+/// against that head requires only O(log n) hashing, not repeated
+/// signature/quorum checks.
+///
+/// Full authority/freshness/binding verification will be enforced at the
+/// cache boundary in TCK-00358/TCK-00359 when the verifier cache policy
+/// is implemented.
 #[derive(Debug, Clone)]
-pub struct VerifiedHeadCache {
+#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
+#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
+pub(crate) struct VerifiedHeadCache {
     heads: HashMap<[u8; HASH_BYTES], VerifiedHead>,
     admission_order: VecDeque<[u8; HASH_BYTES]>,
     max_entries: usize,
 }
 
+#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
+#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
 impl VerifiedHeadCache {
     /// Creates a new bounded cache with at least one entry of capacity.
     #[must_use]
-    pub fn new(max_entries: usize) -> Self {
+    pub(crate) fn new(max_entries: usize) -> Self {
         Self {
             heads: HashMap::new(),
             admission_order: VecDeque::new(),
@@ -1793,8 +1816,8 @@ impl VerifiedHeadCache {
         }
     }
 
-    /// Admits an authority-verified head into cache.
-    pub fn admit_head(
+    /// Admits a structurally verified head into cache.
+    pub(crate) fn admit_head(
         &mut self,
         head_hash: [u8; HASH_BYTES],
         head: HolonDirectoryHeadV1,
@@ -1831,8 +1854,12 @@ impl VerifiedHeadCache {
         Ok(())
     }
 
-    /// Verifies an identity proof against a cached head commitment.
-    pub fn verify_identity(
+    /// Verify a proof against a cached head's root. Returns the
+    /// proof-derived `DirectoryEntryStatus`.
+    ///
+    /// **SECURITY: This verifies structural proof validity only.
+    /// See struct-level documentation for authorization caveats.**
+    pub(crate) fn verify_identity(
         &self,
         head_hash: &[u8; HASH_BYTES],
         proof: &IdentityProofV1,
@@ -1860,13 +1887,14 @@ impl VerifiedHeadCache {
             MAX_SMT_DEPTH,
         )?;
 
-        Ok(proof.directory_proof().entry_status())
+        let structural_status = proof.directory_proof().entry_status();
+        Ok(structural_status)
     }
 
-    /// Evicts cached heads older than `cutoff_ns`.
-    pub fn evict_stale(&mut self, cutoff_ns: u64) {
+    /// Evicts cached heads older than `cutoff_epoch` directory epoch ticks.
+    pub(crate) fn evict_stale(&mut self, cutoff_epoch: u64) {
         self.heads
-            .retain(|_, verified_head| verified_head.verified_at >= cutoff_ns);
+            .retain(|_, verified_head| verified_head.verified_at >= cutoff_epoch);
         self.admission_order
             .retain(|head_hash| self.heads.contains_key(head_hash));
     }
@@ -3353,7 +3381,7 @@ mod tests {
     #[test]
     fn verified_head_cache_evict_stale_entries() {
         let cell_cert = make_cell_certificate();
-        let old_head = HolonDirectoryHeadV1::new(
+        let stale_head = HolonDirectoryHeadV1::new(
             cell_cert.cell_id().clone(),
             5,
             LedgerAnchorV1::ConsensusIndex { index: 1 },
@@ -3367,9 +3395,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let new_head = HolonDirectoryHeadV1::new(
+        let boundary_head = HolonDirectoryHeadV1::new(
             cell_cert.cell_id().clone(),
-            25,
+            20,
             LedgerAnchorV1::ConsensusIndex { index: 2 },
             [0xA2; HASH_BYTES],
             DirectoryKindV1::Smt256V1,
@@ -3381,16 +3409,33 @@ mod tests {
             None,
         )
         .unwrap();
-        let old_hash = old_head.content_hash().unwrap();
-        let new_hash = new_head.content_hash().unwrap();
+        let fresh_head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            25,
+            LedgerAnchorV1::ConsensusIndex { index: 3 },
+            [0xA3; HASH_BYTES],
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            [0xB3; HASH_BYTES],
+            [0xC3; HASH_BYTES],
+            [0xD3; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+        let stale_hash = stale_head.content_hash().unwrap();
+        let boundary_hash = boundary_head.content_hash().unwrap();
+        let fresh_hash = fresh_head.content_hash().unwrap();
 
         let mut cache = VerifiedHeadCache::new(8);
-        cache.admit_head(old_hash, old_head).unwrap();
-        cache.admit_head(new_hash, new_head).unwrap();
+        cache.admit_head(stale_hash, stale_head).unwrap();
+        cache.admit_head(boundary_hash, boundary_head).unwrap();
+        cache.admit_head(fresh_hash, fresh_head).unwrap();
         cache.evict_stale(20);
 
-        assert!(!cache.heads.contains_key(&old_hash));
-        assert!(cache.heads.contains_key(&new_hash));
+        assert!(!cache.heads.contains_key(&stale_hash));
+        assert!(cache.heads.contains_key(&boundary_hash));
+        assert!(cache.heads.contains_key(&fresh_hash));
     }
 
     #[test]
