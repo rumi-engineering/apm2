@@ -1,0 +1,108 @@
+# Authoritative AI review gate workflow
+# Runs gate evaluation with trusted base-branch code.
+
+name: Review Gate
+
+on:
+  pull_request_target:
+    branches: [main]
+  issue_comment:
+    types: [created, edited]
+
+concurrency:
+  group: review-gate-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  review-gate:
+    name: Review Gate
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+    runs-on: ubuntu-24.04
+    steps:
+      # pull_request_target already executes in base-branch context, so this
+      # checks out trusted evaluator code from the PR base branch.
+      - name: Checkout trusted base branch code
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # issue_comment has no PR checkout context; pin evaluator code to main.
+      - name: Checkout trusted main branch code
+        if: github.event_name == 'issue_comment'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
+        with:
+          toolchain: stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      # Resolve PR number and head SHA.
+      # For pull_request_target these come from the event payload directly.
+      # For issue_comment we resolve via the GitHub API.
+      - name: Resolve PR context
+        id: pr-ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
+            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            PR_NUMBER="${{ github.event.issue.number }}"
+            PR_DATA=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+            HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+            BASE_REF=$(echo "$PR_DATA" | jq -r '.base.ref')
+            echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "base_ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch trusted-reviewers from base branch
+        run: |
+          git fetch origin "${{ steps.pr-ctx.outputs.base_ref }}" --depth=1
+          git show "origin/${{ steps.pr-ctx.outputs.base_ref }}:.github/review-gate/trusted-reviewers.json" \
+            > /tmp/trusted-reviewers-base.json
+
+      - name: Evaluate review gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo xtask review-gate \
+            --repo "${{ github.repository }}" \
+            --pr-number "${{ steps.pr-ctx.outputs.pr_number }}" \
+            --head-sha "${{ steps.pr-ctx.outputs.head_sha }}" \
+            --trusted-reviewers "/tmp/trusted-reviewers-base.json"
+
+  review-gate-success:
+    name: Review Gate Success
+    needs: [review-gate]
+    if: >-
+      always() &&
+      (
+        github.event_name == 'pull_request_target' ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+      )
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check review gate result
+        run: |
+          if [[ "${{ needs.review-gate.result }}" != "success" ]]; then
+            exit 1
+          fi

@@ -23,6 +23,7 @@ const REVIEW_METADATA_SCHEMA: &str = "apm2.review.metadata.v1";
 const SECURITY_METADATA_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
 const QUALITY_METADATA_MARKER: &str = "<!-- apm2-review-metadata:v1:code-quality -->";
 const DEFAULT_TRUSTED_REVIEWERS_PATH: &str = ".github/review-gate/trusted-reviewers.json";
+const MAX_COMMENT_PAGES: u32 = 50;
 
 /// Runs the review gate evaluator for a PR.
 pub fn run(
@@ -167,6 +168,11 @@ fn fetch_pr_issue_comments(
         }
 
         all_comments.extend(page_comments);
+        if page >= MAX_COMMENT_PAGES {
+            bail!(
+                "Reached comment pagination cap ({MAX_COMMENT_PAGES} pages) for PR #{pr_number}; refusing to continue with potentially truncated comment history"
+            );
+        }
         page += 1;
     }
 
