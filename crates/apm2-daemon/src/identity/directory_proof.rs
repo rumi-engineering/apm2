@@ -2005,15 +2005,19 @@ pub(crate) enum VerifierCacheAuditEvent {
         cell_id: CellIdV1,
         /// Number of heads evicted.
         evicted_count: usize,
+        /// Content hashes of every evicted head (deterministic, sorted).
+        evicted_head_hashes: Vec<[u8; HASH_BYTES]>,
         /// Reason for invalidation.
         reason: InvalidationReason,
     },
-    /// Heads older than a cutoff epoch were evicted (head advancement).
+    /// Heads older than a cutoff epoch were evicted (global staleness sweep).
     StaleEvicted {
         /// Cutoff epoch used for eviction.
         cutoff_epoch: u64,
         /// Number of heads evicted.
         evicted_count: usize,
+        /// Content hashes of every evicted head (deterministic, sorted).
+        evicted_head_hashes: Vec<[u8; HASH_BYTES]>,
     },
     /// Heads for a cell older than a cutoff epoch were evicted
     /// (per-cell head advancement).
@@ -2024,11 +2028,15 @@ pub(crate) enum VerifierCacheAuditEvent {
         new_epoch: u64,
         /// Number of heads evicted.
         evicted_count: usize,
+        /// Content hashes of every evicted head (deterministic, sorted).
+        evicted_head_hashes: Vec<[u8; HASH_BYTES]>,
     },
     /// All entries were purged (emergency invalidation).
     FullPurge {
         /// Number of heads evicted.
         evicted_count: usize,
+        /// Content hashes of every evicted head (deterministic, sorted).
+        evicted_head_hashes: Vec<[u8; HASH_BYTES]>,
         /// Reason for the purge.
         reason: InvalidationReason,
     },
@@ -2036,6 +2044,15 @@ pub(crate) enum VerifierCacheAuditEvent {
     CapacityEviction {
         /// Content hash of the evicted head.
         head_hash: [u8; HASH_BYTES],
+    },
+    /// Audit log reached capacity and older events were dropped.
+    ///
+    /// This sentinel is emitted exactly once when overflow occurs.
+    /// Consumers seeing this event know that earlier audit entries
+    /// were lost and should treat the log as incomplete.
+    AuditOverflow {
+        /// Number of audit events that were dropped.
+        dropped_count: usize,
     },
 }
 
@@ -2080,6 +2097,12 @@ pub(crate) enum InvalidationReason {
 /// **Audit invariant:** Every cache mutation emits a
 /// [`VerifierCacheAuditEvent`] into the audit log, enabling deterministic
 /// post-hoc reconstruction of all invalidation decisions.
+///
+/// **Bounded audit buffer (REQ-0013 / security review R1):** The audit log
+/// is bounded to `max_audit_events` entries. When the log reaches capacity,
+/// old events are dropped and an `AuditOverflow` sentinel is emitted so
+/// that consumers know events were lost. Callers SHOULD drain the log
+/// periodically via [`drain_audit_log`] to avoid overflow.
 #[allow(dead_code)]
 #[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Clone)]
@@ -2087,27 +2110,83 @@ pub(crate) struct VerifiedHeadCache {
     heads: HashMap<[u8; HASH_BYTES], VerifiedHead>,
     admission_order: VecDeque<[u8; HASH_BYTES]>,
     max_entries: usize,
-    /// Append-only audit log of all cache mutations.
-    audit_log: Vec<VerifierCacheAuditEvent>,
+    /// Bounded audit log of cache mutations.
+    audit_log: VecDeque<VerifierCacheAuditEvent>,
+    /// Maximum number of audit events retained before overflow.
+    max_audit_events: usize,
 }
+
+/// Default maximum number of audit events retained before overflow.
+///
+/// This limit prevents unbounded memory growth in long-lived daemon
+/// processes. At 4096 events the audit log stays well under 1 MiB
+/// even with large `evicted_head_hashes` vectors.
+#[allow(dead_code)]
+const DEFAULT_MAX_AUDIT_EVENTS: usize = 4096;
 
 #[allow(dead_code)]
 impl VerifiedHeadCache {
     /// Creates a new bounded cache with at least one entry of capacity.
+    ///
+    /// The audit log is bounded to [`DEFAULT_MAX_AUDIT_EVENTS`] entries.
     #[must_use]
     pub(crate) fn new(max_entries: usize) -> Self {
         Self {
             heads: HashMap::new(),
             admission_order: VecDeque::new(),
             max_entries: max_entries.max(1),
-            audit_log: Vec::new(),
+            audit_log: VecDeque::new(),
+            max_audit_events: DEFAULT_MAX_AUDIT_EVENTS,
         }
+    }
+
+    /// Creates a new bounded cache with explicit audit log capacity.
+    ///
+    /// Use this in tests or constrained environments where the default
+    /// audit capacity is too large or too small.
+    #[must_use]
+    pub(crate) fn with_audit_capacity(max_entries: usize, max_audit_events: usize) -> Self {
+        Self {
+            heads: HashMap::new(),
+            admission_order: VecDeque::new(),
+            max_entries: max_entries.max(1),
+            audit_log: VecDeque::new(),
+            max_audit_events: max_audit_events.max(1),
+        }
+    }
+
+    /// Pushes an audit event into the bounded log.
+    ///
+    /// If the log is at capacity, older events are dropped and an
+    /// `AuditOverflow` sentinel replaces them. The sentinel itself
+    /// counts toward the capacity, so the log never exceeds
+    /// `max_audit_events`.
+    fn push_audit_event(&mut self, event: VerifierCacheAuditEvent) {
+        if self.audit_log.len() >= self.max_audit_events {
+            // Drop the oldest half to amortize overflow cost.
+            let drop_count = self.max_audit_events / 2;
+            for _ in 0..drop_count {
+                self.audit_log.pop_front();
+            }
+            self.audit_log
+                .push_back(VerifierCacheAuditEvent::AuditOverflow {
+                    dropped_count: drop_count,
+                });
+        }
+        self.audit_log.push_back(event);
     }
 
     /// Admits a structurally verified head into cache.
     ///
-    /// If the cache is at capacity, the oldest entry is evicted (FIFO)
-    /// and a `CapacityEviction` audit event is emitted.
+    /// **Atomic head-advancement (code-quality review R1):** If the cache
+    /// already contains heads for the same cell at older epochs, those
+    /// heads are atomically evicted before the new head is inserted.
+    /// This enforces the head-advancement invariant at admission time,
+    /// preventing stale same-cell heads from surviving in the cache.
+    ///
+    /// If the cache is at capacity after insertion, the oldest entry
+    /// (by FIFO admission order) is evicted and a `CapacityEviction`
+    /// audit event is emitted.
     pub(crate) fn admit_head(
         &mut self,
         head_hash: [u8; HASH_BYTES],
@@ -2122,13 +2201,39 @@ impl VerifiedHeadCache {
             });
         }
 
+        let cell_id = head.cell_id().clone();
+        let directory_epoch = head.directory_epoch();
+
+        // --- Atomic head-advancement: evict older same-cell epochs ---
+        let mut advancement_evicted: Vec<[u8; HASH_BYTES]> = self
+            .heads
+            .iter()
+            .filter(|(h, vh)| {
+                **h != head_hash
+                    && vh.head.cell_id() == &cell_id
+                    && vh.verified_at < directory_epoch
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        if !advancement_evicted.is_empty() {
+            for evicted_hash in &advancement_evicted {
+                self.heads.remove(evicted_hash);
+            }
+            self.admission_order
+                .retain(|h| self.heads.contains_key(h) || *h == head_hash);
+            advancement_evicted.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::CellHeadAdvanced {
+                cell_id: cell_id.clone(),
+                new_epoch: directory_epoch,
+                evicted_count: advancement_evicted.len(),
+                evicted_head_hashes: advancement_evicted,
+            });
+        }
+
         // Keep admission order unique and bounded.
         self.admission_order
             .retain(|cached_hash| cached_hash != &head_hash);
         self.admission_order.push_back(head_hash);
-
-        let cell_id = head.cell_id().clone();
-        let directory_epoch = head.directory_epoch();
 
         self.heads.insert(
             head_hash,
@@ -2142,17 +2247,16 @@ impl VerifiedHeadCache {
         while self.heads.len() > self.max_entries {
             if let Some(evicted_hash) = self.admission_order.pop_front() {
                 if self.heads.remove(&evicted_hash).is_some() {
-                    self.audit_log
-                        .push(VerifierCacheAuditEvent::CapacityEviction {
-                            head_hash: evicted_hash,
-                        });
+                    self.push_audit_event(VerifierCacheAuditEvent::CapacityEviction {
+                        head_hash: evicted_hash,
+                    });
                 }
             } else {
                 break;
             }
         }
 
-        self.audit_log.push(VerifierCacheAuditEvent::HeadAdmitted {
+        self.push_audit_event(VerifierCacheAuditEvent::HeadAdmitted {
             head_hash,
             directory_epoch,
             cell_id,
@@ -2221,11 +2325,10 @@ impl VerifiedHeadCache {
         if removed {
             self.admission_order
                 .retain(|cached_hash| cached_hash != head_hash);
-            self.audit_log
-                .push(VerifierCacheAuditEvent::HeadInvalidated {
-                    head_hash: *head_hash,
-                    reason,
-                });
+            self.push_audit_event(VerifierCacheAuditEvent::HeadInvalidated {
+                head_hash: *head_hash,
+                reason,
+            });
         }
         removed
     }
@@ -2243,19 +2346,26 @@ impl VerifiedHeadCache {
         cell_id: &CellIdV1,
         reason: InvalidationReason,
     ) -> usize {
-        let before = self.heads.len();
-        self.heads
-            .retain(|_, verified_head| verified_head.head.cell_id() != cell_id);
-        let evicted_count = before - self.heads.len();
+        let mut evicted_hashes: Vec<[u8; HASH_BYTES]> = self
+            .heads
+            .iter()
+            .filter(|(_, vh)| vh.head.cell_id() == cell_id)
+            .map(|(h, _)| *h)
+            .collect();
+        for evicted_hash in &evicted_hashes {
+            self.heads.remove(evicted_hash);
+        }
+        let evicted_count = evicted_hashes.len();
         self.admission_order
             .retain(|head_hash| self.heads.contains_key(head_hash));
         if evicted_count > 0 {
-            self.audit_log
-                .push(VerifierCacheAuditEvent::CellInvalidated {
-                    cell_id: cell_id.clone(),
-                    evicted_count,
-                    reason,
-                });
+            evicted_hashes.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::CellInvalidated {
+                cell_id: cell_id.clone(),
+                evicted_count,
+                evicted_head_hashes: evicted_hashes,
+                reason,
+            });
         }
         evicted_count
     }
@@ -2273,20 +2383,26 @@ impl VerifiedHeadCache {
         cell_id: &CellIdV1,
         new_epoch: u64,
     ) -> usize {
-        let before = self.heads.len();
-        self.heads.retain(|_, verified_head| {
-            verified_head.head.cell_id() != cell_id || verified_head.verified_at >= new_epoch
-        });
-        let evicted_count = before - self.heads.len();
+        let mut evicted_hashes: Vec<[u8; HASH_BYTES]> = self
+            .heads
+            .iter()
+            .filter(|(_, vh)| vh.head.cell_id() == cell_id && vh.verified_at < new_epoch)
+            .map(|(h, _)| *h)
+            .collect();
+        for evicted_hash in &evicted_hashes {
+            self.heads.remove(evicted_hash);
+        }
+        let evicted_count = evicted_hashes.len();
         self.admission_order
             .retain(|head_hash| self.heads.contains_key(head_hash));
         if evicted_count > 0 {
-            self.audit_log
-                .push(VerifierCacheAuditEvent::CellHeadAdvanced {
-                    cell_id: cell_id.clone(),
-                    new_epoch,
-                    evicted_count,
-                });
+            evicted_hashes.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::CellHeadAdvanced {
+                cell_id: cell_id.clone(),
+                new_epoch,
+                evicted_count,
+                evicted_head_hashes: evicted_hashes,
+            });
         }
         evicted_count
     }
@@ -2296,16 +2412,24 @@ impl VerifiedHeadCache {
     /// This is a global staleness sweep, independent of cell identity.
     /// Returns the number of heads evicted.
     pub(crate) fn evict_stale(&mut self, cutoff_epoch: u64) -> usize {
-        let before = self.heads.len();
-        self.heads
-            .retain(|_, verified_head| verified_head.verified_at >= cutoff_epoch);
-        let evicted_count = before - self.heads.len();
+        let mut evicted_hashes: Vec<[u8; HASH_BYTES]> = self
+            .heads
+            .iter()
+            .filter(|(_, vh)| vh.verified_at < cutoff_epoch)
+            .map(|(h, _)| *h)
+            .collect();
+        for evicted_hash in &evicted_hashes {
+            self.heads.remove(evicted_hash);
+        }
+        let evicted_count = evicted_hashes.len();
         self.admission_order
             .retain(|head_hash| self.heads.contains_key(head_hash));
         if evicted_count > 0 {
-            self.audit_log.push(VerifierCacheAuditEvent::StaleEvicted {
+            evicted_hashes.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::StaleEvicted {
                 cutoff_epoch,
                 evicted_count,
+                evicted_head_hashes: evicted_hashes,
             });
         }
         evicted_count
@@ -2317,12 +2441,15 @@ impl VerifiedHeadCache {
     /// invalidation of all cached state (e.g., key compromise detected).
     /// Returns the number of heads evicted.
     pub(crate) fn purge_all(&mut self, reason: InvalidationReason) -> usize {
-        let evicted_count = self.heads.len();
+        let mut evicted_hashes: Vec<[u8; HASH_BYTES]> = self.heads.keys().copied().collect();
+        let evicted_count = evicted_hashes.len();
         self.heads.clear();
         self.admission_order.clear();
         if evicted_count > 0 {
-            self.audit_log.push(VerifierCacheAuditEvent::FullPurge {
+            evicted_hashes.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::FullPurge {
                 evicted_count,
+                evicted_head_hashes: evicted_hashes,
                 reason,
             });
         }
@@ -2339,20 +2466,31 @@ impl VerifiedHeadCache {
         self.heads.len()
     }
 
-    /// Returns the audit log of all cache mutations since creation.
+    /// Returns the number of audit events currently retained.
+    pub(crate) fn audit_log_len(&self) -> usize {
+        self.audit_log.len()
+    }
+
+    /// Returns a snapshot of the audit log as a `Vec`.
     ///
-    /// This log is append-only and enables deterministic post-hoc
-    /// reconstruction of all invalidation decisions (REQ-0013).
-    pub(crate) fn audit_log(&self) -> &[VerifierCacheAuditEvent] {
-        &self.audit_log
+    /// The log is bounded to `max_audit_events` entries. If overflow
+    /// occurred, an `AuditOverflow` event will be present indicating
+    /// that earlier events were dropped.
+    ///
+    /// This enables deterministic post-hoc reconstruction of all
+    /// invalidation decisions (REQ-0013), subject to the bounded
+    /// retention window.
+    pub(crate) fn audit_log(&self) -> Vec<VerifierCacheAuditEvent> {
+        self.audit_log.iter().cloned().collect()
     }
 
     /// Drains the audit log, returning all events accumulated so far.
     ///
     /// This is useful for forwarding audit events to a persistent
-    /// telemetry or ledger sink without unbounded memory growth.
+    /// telemetry or ledger sink. Callers SHOULD drain periodically
+    /// to prevent audit overflow.
     pub(crate) fn drain_audit_log(&mut self) -> Vec<VerifierCacheAuditEvent> {
-        std::mem::take(&mut self.audit_log)
+        self.audit_log.drain(..).collect()
     }
 }
 
@@ -4026,49 +4164,23 @@ mod tests {
 
     #[test]
     fn verified_head_cache_evict_stale_entries() {
+        // Use distinct cells for each head to avoid triggering atomic
+        // head-advancement eviction within `admit_head`.
         let cell_cert = make_cell_certificate();
-        let stale_head = HolonDirectoryHeadV1::new(
-            cell_cert.cell_id().clone(),
-            5,
-            LedgerAnchorV1::ConsensusIndex { index: 1 },
-            [0xA1; HASH_BYTES],
-            DirectoryKindV1::Smt256V1,
-            1,
-            8192,
-            [0xB1; HASH_BYTES],
-            [0xC1; HASH_BYTES],
-            [0xD1; HASH_BYTES],
-            None,
+        let other_cert = make_other_cell_certificate();
+        // Third distinct cell via make_epoch_head with a fresh genesis.
+        let third_cell_genesis = CellGenesisV1::new(
+            [0x33; 32],
+            PolicyRootId::Single(make_public_key_id(0xEE)),
+            "third.cell.internal",
         )
         .unwrap();
-        let boundary_head = HolonDirectoryHeadV1::new(
-            cell_cert.cell_id().clone(),
-            20,
-            LedgerAnchorV1::ConsensusIndex { index: 2 },
-            [0xA2; HASH_BYTES],
-            DirectoryKindV1::Smt256V1,
-            1,
-            8192,
-            [0xB2; HASH_BYTES],
-            [0xC2; HASH_BYTES],
-            [0xD2; HASH_BYTES],
-            None,
-        )
-        .unwrap();
-        let fresh_head = HolonDirectoryHeadV1::new(
-            cell_cert.cell_id().clone(),
-            25,
-            LedgerAnchorV1::ConsensusIndex { index: 3 },
-            [0xA3; HASH_BYTES],
-            DirectoryKindV1::Smt256V1,
-            1,
-            8192,
-            [0xB3; HASH_BYTES],
-            [0xC3; HASH_BYTES],
-            [0xD3; HASH_BYTES],
-            None,
-        )
-        .unwrap();
+        let third_cell_id = CellIdV1::from_genesis(&third_cell_genesis);
+
+        let stale_head = make_epoch_head(cell_cert.cell_id().clone(), 5, 0xA1);
+        let boundary_head = make_epoch_head(other_cert.cell_id().clone(), 20, 0xA2);
+        let fresh_head = make_epoch_head(third_cell_id, 25, 0xA3);
+
         let stale_hash = stale_head.content_hash().unwrap();
         let boundary_hash = boundary_head.content_hash().unwrap();
         let fresh_hash = fresh_head.content_hash().unwrap();
@@ -4077,6 +4189,8 @@ mod tests {
         cache.admit_head(stale_hash, stale_head).unwrap();
         cache.admit_head(boundary_hash, boundary_head).unwrap();
         cache.admit_head(fresh_hash, fresh_head).unwrap();
+        assert_eq!(cache.len(), 3);
+
         cache.evict_stale(20);
 
         assert!(!cache.heads.contains_key(&stale_hash));
@@ -4311,10 +4425,16 @@ mod tests {
 
     #[test]
     fn cache_invalidate_for_cell_removes_all_heads_for_cell() {
-        // REQ-0013: Key rotation invalidation
+        // REQ-0013: Key rotation invalidation.
+        //
+        // Atomic head-advancement in `admit_head` means only the latest
+        // epoch for a given cell survives admission. We test that
+        // `invalidate_for_cell` removes even the surviving latest head,
+        // plus verify that the other cell's head is untouched.
         let cell_cert = make_cell_certificate();
         let other_cert = make_other_cell_certificate();
 
+        // head2 will auto-evict head1 on admission (same cell, higher epoch).
         let head1 = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
         let head2 = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
         let other_head = make_epoch_head(other_cert.cell_id().clone(), 12, 0xB1);
@@ -4326,14 +4446,18 @@ mod tests {
         let mut cache = VerifiedHeadCache::new(16);
         cache.admit_head(hash1, head1).unwrap();
         cache.admit_head(hash2, head2).unwrap();
+        // head1 was auto-evicted by head2's admission.
+        assert!(
+            !cache.contains_head(&hash1),
+            "head1 should be auto-evicted by head2 admission"
+        );
         cache.admit_head(other_hash, other_head).unwrap();
-        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.len(), 2, "head2 + other_head");
 
         // Simulate key rotation for the first cell.
         let evicted =
             cache.invalidate_for_cell(cell_cert.cell_id(), InvalidationReason::KeyRotation);
-        assert_eq!(evicted, 2, "both heads for cell should be evicted");
-        assert!(!cache.contains_head(&hash1));
+        assert_eq!(evicted, 1, "remaining head for cell should be evicted");
         assert!(!cache.contains_head(&hash2));
         assert!(
             cache.contains_head(&other_hash),
@@ -4363,36 +4487,35 @@ mod tests {
 
     #[test]
     fn cache_invalidate_on_head_advance_removes_old_epochs() {
-        // REQ-0013: Head advancement invalidation
+        // REQ-0013: Head advancement invalidation via explicit method.
+        //
+        // Use distinct cells to hold one head each so that the atomic
+        // advancement inside `admit_head` does not pre-evict them.
+        // Then call `invalidate_on_head_advance` to test the explicit
+        // method against a cell that has only a single head.
         let cell_cert = make_cell_certificate();
         let other_cert = make_other_cell_certificate();
 
-        let old_head = make_epoch_head(cell_cert.cell_id().clone(), 5, 0xA1);
-        let mid_head = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
-        let new_head = make_epoch_head(cell_cert.cell_id().clone(), 25, 0xA3);
+        // Admit a single head per cell (no atomic same-cell eviction).
+        let cell_head = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
         let other_head = make_epoch_head(other_cert.cell_id().clone(), 3, 0xB1);
 
-        let old_hash = old_head.content_hash().unwrap();
-        let mid_hash = mid_head.content_hash().unwrap();
-        let new_hash = new_head.content_hash().unwrap();
+        let cell_hash = cell_head.content_hash().unwrap();
         let other_hash = other_head.content_hash().unwrap();
 
         let mut cache = VerifiedHeadCache::new(16);
-        cache.admit_head(old_hash, old_head).unwrap();
-        cache.admit_head(mid_hash, mid_head).unwrap();
-        cache.admit_head(new_hash, new_head).unwrap();
+        cache.admit_head(cell_hash, cell_head).unwrap();
         cache.admit_head(other_hash, other_head).unwrap();
-        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.len(), 2);
 
-        // Advance: invalidate heads for the first cell older than epoch 20.
+        // Advance: invalidate heads for cell_cert older than epoch 20.
+        // cell_head (epoch 15 < 20) should be evicted; other_head preserved.
         let evicted = cache.invalidate_on_head_advance(cell_cert.cell_id(), 20);
-        assert_eq!(evicted, 2, "old (5) and mid (15) should be evicted");
-        assert!(!cache.contains_head(&old_hash));
-        assert!(!cache.contains_head(&mid_hash));
-        assert!(cache.contains_head(&new_hash), "new (25) head must survive");
+        assert_eq!(evicted, 1, "cell_head (15) should be evicted");
+        assert!(!cache.contains_head(&cell_hash));
         assert!(cache.contains_head(&other_hash), "other cell must survive");
 
-        // Verify audit event.
+        // Verify audit event from explicit call.
         let advance_event_count = cache
             .audit_log()
             .iter()
@@ -4416,13 +4539,181 @@ mod tests {
         assert!(cache.contains_head(&boundary_hash));
     }
 
+    // --- Atomic head-advancement on admission (regression) ---
+
+    #[test]
+    fn admit_head_atomically_evicts_older_same_cell_epochs() {
+        // Regression test (code-quality + security review R1):
+        // Admitting epoch N+1 for the same cell MUST automatically
+        // evict epoch N without requiring a separate call to
+        // `invalidate_on_head_advance`.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        let head_n = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
+        let head_n1 = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA2);
+        let other_head = make_epoch_head(other_cert.cell_id().clone(), 5, 0xB1);
+
+        let hash_n = head_n.content_hash().unwrap();
+        let hash_n1 = head_n1.content_hash().unwrap();
+        let other_hash = other_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(hash_n, head_n).unwrap();
+        cache.admit_head(other_hash, other_head).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        // Admit epoch N+1 for the same cell -- epoch N must be auto-evicted.
+        cache.admit_head(hash_n1, head_n1).unwrap();
+
+        assert!(
+            !cache.contains_head(&hash_n),
+            "epoch-N head must be evicted atomically on epoch-N+1 admission"
+        );
+        assert!(
+            cache.contains_head(&hash_n1),
+            "newly admitted epoch-N+1 head must be present"
+        );
+        assert!(
+            cache.contains_head(&other_hash),
+            "other cell's head must not be affected"
+        );
+        assert_eq!(
+            cache.len(),
+            2,
+            "only epoch-N+1 and other_head should remain"
+        );
+
+        // Verify audit log contains a CellHeadAdvanced event for the
+        // atomic eviction, proving no external invalidation was needed.
+        let all_events = cache.drain_audit_log();
+        let advancement_events: Vec<_> = all_events
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CellHeadAdvanced { .. }))
+            .collect();
+        assert_eq!(
+            advancement_events.len(),
+            1,
+            "exactly one CellHeadAdvanced event expected from atomic admission"
+        );
+        if let VerifierCacheAuditEvent::CellHeadAdvanced {
+            cell_id,
+            new_epoch,
+            evicted_count,
+            evicted_head_hashes,
+        } = advancement_events[0]
+        {
+            assert_eq!(cell_id, cell_cert.cell_id());
+            assert_eq!(*new_epoch, 20);
+            assert_eq!(*evicted_count, 1);
+            assert_eq!(evicted_head_hashes.len(), 1);
+            assert_eq!(evicted_head_hashes[0], hash_n);
+        } else {
+            panic!("expected CellHeadAdvanced event");
+        }
+    }
+
+    #[test]
+    fn admit_head_atomically_evicts_multiple_older_same_cell_epochs() {
+        // Admitting a head at epoch 30 should evict ALL remaining older
+        // same-cell heads. We use two different cells to accumulate
+        // multiple heads for the target cell without triggering
+        // intermediate advancement evictions between them.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        // Two heads for cell_cert at different epochs, admitted
+        // with an interleaving other-cell head to show selectivity.
+        let early_head = make_epoch_head(cell_cert.cell_id().clone(), 5, 0xA1);
+        let middle_head = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
+        let latest_head = make_epoch_head(cell_cert.cell_id().clone(), 30, 0xA3);
+        let other_head = make_epoch_head(other_cert.cell_id().clone(), 8, 0xB1);
+
+        let early_hash = early_head.content_hash().unwrap();
+        let middle_hash = middle_head.content_hash().unwrap();
+        let latest_hash = latest_head.content_hash().unwrap();
+        let other_hash = other_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(early_hash, early_head).unwrap();
+        // Admitting middle_head for the same cell auto-evicts early_head.
+        cache.admit_head(middle_hash, middle_head).unwrap();
+        assert!(
+            !cache.contains_head(&early_hash),
+            "epoch-5 must already be evicted by epoch-15 admission"
+        );
+
+        cache.admit_head(other_hash, other_head).unwrap();
+        assert_eq!(cache.len(), 2, "middle_head + other_head");
+
+        // Admit epoch 30 -- middle_head must be evicted, other_head preserved.
+        cache.admit_head(latest_hash, latest_head).unwrap();
+
+        assert!(!cache.contains_head(&early_hash), "epoch 5 must be evicted");
+        assert!(
+            !cache.contains_head(&middle_hash),
+            "epoch 15 must be evicted"
+        );
+        assert!(
+            cache.contains_head(&latest_hash),
+            "epoch 30 must be present"
+        );
+        assert!(
+            cache.contains_head(&other_hash),
+            "other cell must be unaffected"
+        );
+        assert_eq!(cache.len(), 2, "epoch-30 + other_head should remain");
+
+        // Two CellHeadAdvanced events total: one for middle_head evicting
+        // early_head, one for latest_head evicting middle_head.
+        let advancement_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CellHeadAdvanced { .. }))
+            .count();
+        assert_eq!(
+            advancement_count, 2,
+            "two atomic advancement evictions expected"
+        );
+    }
+
+    #[test]
+    fn admit_head_does_not_evict_equal_epoch_same_cell() {
+        // Re-admitting the same head (same hash, same epoch) should NOT
+        // trigger a head-advancement eviction event.
+        let cell_cert = make_cell_certificate();
+        let head = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
+        let head_clone = head.clone();
+        let hash = head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(hash, head).unwrap();
+        cache.admit_head(hash, head_clone).unwrap();
+
+        assert!(cache.contains_head(&hash));
+        assert_eq!(cache.len(), 1);
+
+        // No CellHeadAdvanced event should be emitted for re-admission.
+        let advancement_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CellHeadAdvanced { .. }))
+            .count();
+        assert_eq!(
+            advancement_count, 0,
+            "re-admitting same head should not trigger advancement eviction"
+        );
+    }
+
     // --- Global stale eviction ---
 
     #[test]
     fn cache_evict_stale_returns_count_and_emits_audit() {
+        // Use distinct cells to avoid atomic same-cell head advancement.
         let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
         let stale_head = make_epoch_head(cell_cert.cell_id().clone(), 5, 0xA1);
-        let fresh_head = make_epoch_head(cell_cert.cell_id().clone(), 25, 0xA3);
+        let fresh_head = make_epoch_head(other_cert.cell_id().clone(), 25, 0xA3);
 
         let stale_hash = stale_head.content_hash().unwrap();
         let fresh_hash = fresh_head.content_hash().unwrap();
@@ -4430,6 +4721,7 @@ mod tests {
         let mut cache = VerifiedHeadCache::new(8);
         cache.admit_head(stale_hash, stale_head).unwrap();
         cache.admit_head(fresh_hash, fresh_head).unwrap();
+        assert_eq!(cache.len(), 2);
 
         let evicted = cache.evict_stale(20);
         assert_eq!(evicted, 1, "only the stale head should be evicted");
@@ -4495,13 +4787,23 @@ mod tests {
 
     #[test]
     fn cache_capacity_eviction_emits_audit_event() {
+        // Use distinct cells to avoid atomic same-cell head advancement.
         let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+        let third_genesis = CellGenesisV1::new(
+            [0x44; 32],
+            PolicyRootId::Single(make_public_key_id(0xDD)),
+            "third.cap.cell.internal",
+        )
+        .unwrap();
+        let third_cell_id = CellIdV1::from_genesis(&third_genesis);
+
         // Cache with capacity 2
         let mut cache = VerifiedHeadCache::new(2);
 
         let head1 = make_epoch_head(cell_cert.cell_id().clone(), 1, 0xA1);
-        let head2 = make_epoch_head(cell_cert.cell_id().clone(), 2, 0xA2);
-        let head3 = make_epoch_head(cell_cert.cell_id().clone(), 3, 0xA3);
+        let head2 = make_epoch_head(other_cert.cell_id().clone(), 2, 0xA2);
+        let head3 = make_epoch_head(third_cell_id, 3, 0xA3);
         let hash1 = head1.content_hash().unwrap();
         let hash2 = head2.content_hash().unwrap();
         let hash3 = head3.content_hash().unwrap();
@@ -4622,15 +4924,26 @@ mod tests {
             let mut cache = VerifiedHeadCache::new(8);
             cache.admit_head(hash1, head1.clone()).unwrap();
             cache.admit_head(hash2, head2.clone()).unwrap();
-            cache.invalidate_head(&hash1, InvalidationReason::Revocation);
+            // head1 is atomically evicted by admit_head(head2) since
+            // epoch 5 < 15 for the same cell. Explicit invalidation
+            // of hash1 returns false (already evicted).
+            let already_gone = !cache.invalidate_head(&hash1, InvalidationReason::Revocation);
+            assert!(
+                already_gone,
+                "head1 should already be gone via atomic advancement"
+            );
             cache.evict_stale(20);
-            cache.audit_log().to_vec()
+            cache.drain_audit_log()
         };
 
         let log1 = run();
         let log2 = run();
         assert_eq!(log1, log2, "audit logs must be identical across runs");
-        // Expected events: Admit(1), Admit(2), Invalidate(1), StaleEvict(2)
+        // Expected events:
+        //   1. Admit(head1)
+        //   2. CellHeadAdvanced (head1 evicted atomically by head2 admission)
+        //   3. Admit(head2)
+        //   4. StaleEvicted (head2 epoch 15 < cutoff 20)
         assert_eq!(log1.len(), 4, "expected 4 audit events");
     }
 
