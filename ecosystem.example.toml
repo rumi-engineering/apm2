@@ -26,6 +26,37 @@ github_api_url = "https://api.github.com"
 github_token_env = "$GITHUB_TOKEN"
 poll_interval_secs = 30
 
+# Adapter profile rotation (TCK-00400).
+# Default rollout is operability-first: 100% claude-code-v1.
+# Additional profiles can be enabled once their adapters are production-ready.
+[daemon.adapter_rotation]
+strategy = "weighted_random"
+rate_limit_backoff_secs = 300
+
+[[daemon.adapter_rotation.profiles]]
+profile_id = "claude-code-v1"
+weight = 100
+enabled = true
+fallback_priority = 0
+
+[[daemon.adapter_rotation.profiles]]
+profile_id = "gemini-cli-v1"
+weight = 0
+enabled = false
+fallback_priority = 1
+
+[[daemon.adapter_rotation.profiles]]
+profile_id = "codex-cli-v1"
+weight = 0
+enabled = false
+fallback_priority = 2
+
+[[daemon.adapter_rotation.profiles]]
+profile_id = "local-inference-v1"
+weight = 0
+enabled = false
+fallback_priority = 3
+
 # Credential profiles (stored securely in OS keyring)
 # Use `apm2 creds add` to create profiles and store credentials
 

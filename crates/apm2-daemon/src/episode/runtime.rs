@@ -1402,13 +1402,17 @@ impl EpisodeRuntime {
             }
         }
 
-        // Spawn the agent process
+        // Spawn the agent process.
+        // TCK-00400: Use typed `AdapterSpawnFailed` variant to preserve the
+        // `AdapterError` variant so callers can classify rate-limit errors
+        // without heuristic string matching.
         let (handle, event_stream) =
             adapter
                 .spawn(config)
                 .await
-                .map_err(|e| EpisodeError::Internal {
-                    message: format!("adapter spawn failed for episode {episode_id}: {e}"),
+                .map_err(|e| EpisodeError::AdapterSpawnFailed {
+                    episode_id: episode_id.as_str().to_string(),
+                    source: e,
                 })?;
 
         info!(

@@ -44,7 +44,8 @@ async fn test_persistence_end_to_end() {
     // 2. Setup DispatcherState with persistence
     let session_registry = Arc::new(InMemorySessionRegistry::new());
     let state =
-        DispatcherState::with_persistence(session_registry, None, Some(conn_arc.clone()), None);
+        DispatcherState::with_persistence(session_registry, None, Some(conn_arc.clone()), None)
+            .expect("with_persistence should succeed in test");
     let dispatcher = state.privileged_dispatcher();
 
     // 3. ClaimWork
