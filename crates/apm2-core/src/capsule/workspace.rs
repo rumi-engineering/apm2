@@ -176,7 +176,8 @@ impl<'de> de::Deserialize<'de> for WorkspaceConfinement {
     where
         D: de::Deserializer<'de>,
     {
-        /// Helper struct matching the serialized shape of `WorkspaceConfinement`.
+        /// Helper struct matching the serialized shape of
+        /// `WorkspaceConfinement`.
         #[derive(serde::Deserialize)]
         struct Raw {
             root: PathBuf,

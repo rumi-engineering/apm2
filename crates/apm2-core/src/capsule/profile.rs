@@ -20,6 +20,8 @@
 //! in unit tests only; runtime integration is deferred to TCK-00375 and
 //! TCK-00376.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize, de};
 use thiserror::Error;
 
@@ -45,12 +47,30 @@ const MAX_EXECUTABLE_PATH_LENGTH: usize = 4096;
 /// Maximum length of host in an egress route.
 const MAX_HOST_LENGTH: usize = 253;
 
-/// The set of profile IDs admitted for Tier3+ enforcement.
+/// Computes the set of admitted profile hashes for Tier3+ enforcement.
 ///
-/// Only profiles whose `profile_id` matches one of these strings may pass
-/// `AdmissionGate::check` at Tier3 or above. This prevents a crafted profile
-/// with an arbitrary `profile_id` from disabling mandatory isolation controls.
-const ADMITTED_PROFILE_IDS: &[&str] = &["linux-ns-v1"];
+/// Only profiles whose content hash matches one of these values may pass
+/// `AdmissionGate::check` at Tier3 or above. This prevents a different
+/// policy payload with the same `profile_id` from bypassing mandatory
+/// isolation controls -- admission is pinned to the exact content hash,
+/// not just the profile ID string.
+fn default_admitted_profile_hashes() -> BTreeSet<[u8; 32]> {
+    let mut set = BTreeSet::new();
+    // linux-ns-v1 with default settings (all security controls enabled)
+    let hash = CapsuleProfile::compute_hash(&HashInput {
+        profile_id: "linux-ns-v1",
+        namespaces: &NamespaceConfig::isolated(),
+        seccomp_level: &SeccompProfileLevel::Restricted,
+        cgroup_limits: &CgroupLimits::default_restricted(),
+        egress_policy: &EgressPolicy::deny_all(),
+        allowed_executables: &[],
+        scrub_environment: true,
+        readonly_rootfs: true,
+        tmpfs_tmp: true,
+    });
+    set.insert(hash);
+    set
+}
 
 // =============================================================================
 // Error Types
@@ -150,11 +170,57 @@ pub enum CapsuleProfileError {
         value: u16,
     },
 
-    /// Profile ID is not in the admitted set for Tier3+ enforcement.
-    #[error("profile_id '{profile_id}' is not in the admitted profile set for Tier3+ enforcement")]
+    /// Profile hash is not in the admitted set for Tier3+ enforcement.
+    #[error(
+        "profile hash '{profile_hash}' (id='{profile_id}') is not in the admitted set for Tier3+ enforcement"
+    )]
     ProfileNotAdmitted {
         /// The rejected profile ID.
         profile_id: String,
+        /// The rejected profile hash (hex-encoded).
+        profile_hash: String,
+    },
+
+    /// Executable path is not absolute.
+    #[error("executable path must be absolute: {path}")]
+    ExecutablePathNotAbsolute {
+        /// The non-absolute path.
+        path: String,
+    },
+
+    /// Executable path contains traversal components.
+    #[error("executable path contains traversal component: {path}")]
+    ExecutablePathTraversal {
+        /// The path with traversal.
+        path: String,
+    },
+
+    /// Executable path contains a null byte.
+    #[error("executable path contains null byte: {path}")]
+    ExecutablePathNullByte {
+        /// The path with null byte.
+        path: String,
+    },
+
+    /// Egress route host contains whitespace.
+    #[error("egress host contains whitespace: {host}")]
+    EgressHostWhitespace {
+        /// The host with whitespace.
+        host: String,
+    },
+
+    /// Egress route host contains invalid DNS characters.
+    #[error("egress host contains invalid DNS characters: {host}")]
+    EgressHostInvalidChars {
+        /// The host with invalid characters.
+        host: String,
+    },
+
+    /// Egress route host is a wildcard abuse pattern.
+    #[error("egress host wildcard abuse: {host}")]
+    EgressHostWildcard {
+        /// The wildcard host.
+        host: String,
     },
 
     /// Read-only rootfs is mandatory for linux-ns-v1 (RFC-0020 Section 4.3).
@@ -379,6 +445,54 @@ impl EgressRoute {
                     self.host.len(),
                     MAX_HOST_LENGTH
                 ),
+            });
+        }
+        // Host must not contain whitespace
+        if self.host.chars().any(char::is_whitespace) {
+            return Err(CapsuleProfileError::EgressHostWhitespace {
+                host: self.host.clone(),
+            });
+        }
+        // Host must be lowercase (deterministic canonicalization)
+        if self.host != self.host.to_lowercase() {
+            return Err(CapsuleProfileError::InvalidEgressHost {
+                reason: format!(
+                    "host must be lowercase for deterministic canonicalization: '{}'",
+                    self.host
+                ),
+            });
+        }
+        // Host must contain only valid DNS characters: a-z, 0-9, '-', '.'
+        if !self
+            .host
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        {
+            return Err(CapsuleProfileError::EgressHostInvalidChars {
+                host: self.host.clone(),
+            });
+        }
+        // Reject wildcard abuse patterns (leading/trailing wildcards, bare *)
+        if self.host.contains('*') {
+            return Err(CapsuleProfileError::EgressHostWildcard {
+                host: self.host.clone(),
+            });
+        }
+        // Reject hosts that start or end with '.' or '-'
+        if self.host.starts_with('.') || self.host.ends_with('.') {
+            return Err(CapsuleProfileError::InvalidEgressHost {
+                reason: format!("host must not start or end with '.': '{}'", self.host),
+            });
+        }
+        if self.host.starts_with('-') || self.host.ends_with('-') {
+            return Err(CapsuleProfileError::InvalidEgressHost {
+                reason: format!("host must not start or end with '-': '{}'", self.host),
+            });
+        }
+        // Reject empty labels (consecutive dots like "host..com")
+        if self.host.contains("..") {
+            return Err(CapsuleProfileError::InvalidEgressHost {
+                reason: format!("host must not contain empty labels (..): '{}'", self.host),
             });
         }
         if self.port == 0 {
@@ -769,6 +883,26 @@ impl CapsuleProfile {
                     max: MAX_EXECUTABLE_PATH_LENGTH,
                 });
             }
+            // Path safety: must be absolute
+            if !exe.starts_with('/') {
+                return Err(CapsuleProfileError::ExecutablePathNotAbsolute { path: exe.clone() });
+            }
+            // Path safety: no null bytes
+            if exe.contains('\0') {
+                return Err(CapsuleProfileError::ExecutablePathNullByte {
+                    path: exe.replace('\0', "\\0"),
+                });
+            }
+            // Path safety: no traversal components (..)
+            let path = std::path::Path::new(exe);
+            for component in path.components() {
+                if matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                ) {
+                    return Err(CapsuleProfileError::ExecutablePathTraversal { path: exe.clone() });
+                }
+            }
         }
 
         // Profile hash
@@ -957,22 +1091,47 @@ impl CapsuleProfileBuilder {
 ///
 /// The gate enforces:
 /// 1. Presence of a capsule profile at Tier3+.
-/// 2. The profile's `profile_id` MUST be in the enumerated admitted set
-///    (`ADMITTED_PROFILE_IDS`).
+/// 2. The profile's content hash (`profile_hash`) MUST be in the admitted set.
+///    This pins admission to exact policy payloads, not just profile ID
+///    strings.
 /// 3. Structural invariants (all namespaces, seccomp, bounded cgroups) via
 ///    `CapsuleProfile::validate`.
-pub struct AdmissionGate;
+pub struct AdmissionGate {
+    /// Set of admitted profile hashes (BLAKE3, 32 bytes each).
+    admitted_hashes: BTreeSet<[u8; 32]>,
+}
 
 impl AdmissionGate {
+    /// Creates a new admission gate with the default set of admitted profile
+    /// hashes (currently only `linux-ns-v1` with default settings).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            admitted_hashes: default_admitted_profile_hashes(),
+        }
+    }
+
+    /// Creates an admission gate with a custom set of admitted profile hashes.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // BTreeSet field prevents const on stable
+    pub fn with_admitted_hashes(admitted_hashes: BTreeSet<[u8; 32]>) -> Self {
+        Self { admitted_hashes }
+    }
+
+    /// Adds a profile hash to the admitted set.
+    pub fn admit_hash(&mut self, hash: [u8; 32]) {
+        self.admitted_hashes.insert(hash);
+    }
+
     /// Checks whether actuation is permitted for the given risk tier and
     /// capsule.
     ///
     /// # Rules
     ///
     /// - **`Tier3`+ (`risk_tier` >= 3)**: MUST have an admitted (validated)
-    ///   capsule profile whose `profile_id` is in `ADMITTED_PROFILE_IDS`. The
-    ///   profile must also pass full structural validation (namespaces,
-    ///   seccomp, cgroups, egress, hash integrity).
+    ///   capsule profile whose content hash is in the admitted set. The profile
+    ///   must also pass full structural validation (namespaces, seccomp,
+    ///   cgroups, egress, hash integrity).
     /// - **`Tier0`-`Tier2` (`risk_tier` < 3)**: Capsule is optional
     ///
     /// # Runtime Wiring
@@ -986,6 +1145,7 @@ impl AdmissionGate {
     ///
     /// Returns [`AdmissionError`] if the actuation is denied.
     pub fn check(
+        &self,
         risk_tier: &RiskTier,
         capsule: Option<&CapsuleProfile>,
     ) -> Result<(), AdmissionError> {
@@ -999,26 +1159,35 @@ impl AdmissionGate {
                     });
                 },
                 Some(profile) => {
-                    // Enforce admitted profile set: only enumerated profile IDs
-                    // are accepted at Tier3+. This prevents a crafted profile
-                    // with an arbitrary profile_id from bypassing mandatory
-                    // isolation controls.
-                    if !ADMITTED_PROFILE_IDS.contains(&profile.profile_id.as_str()) {
+                    // Full structural validation first (namespaces, seccomp,
+                    // cgroups, egress, hash integrity). This ensures the
+                    // profile_hash we check below is the verified content hash.
+                    profile.validate().map_err(AdmissionError::InvalidProfile)?;
+
+                    // Enforce admitted profile hash set: only profiles whose
+                    // content hash matches an admitted value are accepted at
+                    // Tier3+. This prevents a different policy payload with
+                    // the same profile_id from bypassing mandatory isolation
+                    // controls.
+                    if !self.admitted_hashes.contains(&profile.profile_hash) {
                         return Err(AdmissionError::InvalidProfile(
                             CapsuleProfileError::ProfileNotAdmitted {
                                 profile_id: profile.profile_id.clone(),
+                                profile_hash: hex::encode(profile.profile_hash),
                             },
                         ));
                     }
-
-                    // Full structural validation (namespaces, seccomp, cgroups,
-                    // egress, hash integrity).
-                    profile.validate().map_err(AdmissionError::InvalidProfile)?;
                 },
             }
         }
 
         Ok(())
+    }
+}
+
+impl Default for AdmissionGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1269,22 +1438,22 @@ mod tests {
 
     #[test]
     fn test_admission_tier0_no_capsule_ok() {
-        assert!(AdmissionGate::check(&RiskTier::Tier0, None).is_ok());
+        assert!(AdmissionGate::new().check(&RiskTier::Tier0, None).is_ok());
     }
 
     #[test]
     fn test_admission_tier1_no_capsule_ok() {
-        assert!(AdmissionGate::check(&RiskTier::Tier1, None).is_ok());
+        assert!(AdmissionGate::new().check(&RiskTier::Tier1, None).is_ok());
     }
 
     #[test]
     fn test_admission_tier2_no_capsule_ok() {
-        assert!(AdmissionGate::check(&RiskTier::Tier2, None).is_ok());
+        assert!(AdmissionGate::new().check(&RiskTier::Tier2, None).is_ok());
     }
 
     #[test]
     fn test_admission_tier3_no_capsule_rejected() {
-        let result = AdmissionGate::check(&RiskTier::Tier3, None);
+        let result = AdmissionGate::new().check(&RiskTier::Tier3, None);
         assert!(matches!(
             result,
             Err(AdmissionError::NoCapsuleForTier { risk_tier: 3 })
@@ -1293,7 +1462,7 @@ mod tests {
 
     #[test]
     fn test_admission_tier4_no_capsule_rejected() {
-        let result = AdmissionGate::check(&RiskTier::Tier4, None);
+        let result = AdmissionGate::new().check(&RiskTier::Tier4, None);
         assert!(matches!(
             result,
             Err(AdmissionError::NoCapsuleForTier { risk_tier: 4 })
@@ -1303,13 +1472,21 @@ mod tests {
     #[test]
     fn test_admission_tier3_with_valid_capsule_ok() {
         let profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
-        assert!(AdmissionGate::check(&RiskTier::Tier3, Some(&profile)).is_ok());
+        assert!(
+            AdmissionGate::new()
+                .check(&RiskTier::Tier3, Some(&profile))
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_admission_tier4_with_valid_capsule_ok() {
         let profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
-        assert!(AdmissionGate::check(&RiskTier::Tier4, Some(&profile)).is_ok());
+        assert!(
+            AdmissionGate::new()
+                .check(&RiskTier::Tier4, Some(&profile))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1317,7 +1494,7 @@ mod tests {
         // Construct a profile with a tampered hash
         let mut profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
         profile.profile_hash = [0u8; 32]; // Tamper hash
-        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&profile));
+        let result = AdmissionGate::new().check(&RiskTier::Tier3, Some(&profile));
         assert!(matches!(result, Err(AdmissionError::InvalidProfile(_))));
     }
 
@@ -1401,7 +1578,7 @@ mod tests {
             readonly_rootfs: profile.readonly_rootfs,
             tmpfs_tmp: profile.tmpfs_tmp,
         });
-        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&profile));
+        let result = AdmissionGate::new().check(&RiskTier::Tier3, Some(&profile));
         assert!(
             matches!(result, Err(AdmissionError::InvalidProfile(_))),
             "Tier3 admission with net=false must be rejected: got {result:?}"
@@ -1535,7 +1712,7 @@ mod tests {
             tmpfs_tmp: false,
         };
 
-        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&weak_profile));
+        let result = AdmissionGate::new().check(&RiskTier::Tier3, Some(&weak_profile));
         assert!(
             matches!(
                 result,
@@ -1577,7 +1754,7 @@ mod tests {
             tmpfs_tmp: true,
         };
 
-        let result = AdmissionGate::check(&RiskTier::Tier4, Some(&profile));
+        let result = AdmissionGate::new().check(&RiskTier::Tier4, Some(&profile));
         assert!(
             matches!(
                 result,
@@ -1592,7 +1769,7 @@ mod tests {
     #[test]
     fn test_admission_tier2_allows_non_admitted_profile_id() {
         // Below Tier3, the admission gate does not enforce the admitted set.
-        assert!(AdmissionGate::check(&RiskTier::Tier2, None).is_ok());
+        assert!(AdmissionGate::new().check(&RiskTier::Tier2, None).is_ok());
     }
 
     // =========================================================================
@@ -1794,7 +1971,7 @@ mod tests {
             readonly_rootfs: profile.readonly_rootfs,
             tmpfs_tmp: profile.tmpfs_tmp,
         });
-        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&profile));
+        let result = AdmissionGate::new().check(&RiskTier::Tier3, Some(&profile));
         assert!(
             matches!(result, Err(AdmissionError::InvalidProfile(_))),
             "Tier3 admission with readonly_rootfs=false must be rejected: got {result:?}"
@@ -1817,7 +1994,7 @@ mod tests {
             readonly_rootfs: profile.readonly_rootfs,
             tmpfs_tmp: profile.tmpfs_tmp,
         });
-        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&profile));
+        let result = AdmissionGate::new().check(&RiskTier::Tier3, Some(&profile));
         assert!(
             matches!(result, Err(AdmissionError::InvalidProfile(_))),
             "Tier3 admission with scrub_environment=false must be rejected: got {result:?}"
@@ -1923,5 +2100,259 @@ mod tests {
         let deserialized: CapsuleProfile =
             serde_json::from_str(&json).expect("valid profile with routes must roundtrip");
         assert_eq!(profile, deserialized);
+    }
+
+    // =========================================================================
+    // Admission Gate: profile hash pinning tests
+    // =========================================================================
+
+    #[test]
+    fn test_admission_gate_default_admits_linux_ns_v1_default() {
+        let gate = AdmissionGate::new();
+        let profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
+        assert!(gate.check(&RiskTier::Tier3, Some(&profile)).is_ok());
+    }
+
+    #[test]
+    fn test_admission_gate_rejects_different_payload_same_profile_id() {
+        // A profile with the same profile_id but different settings (e.g.,
+        // strict seccomp instead of restricted) should be rejected because
+        // its content hash differs from the admitted default.
+        let gate = AdmissionGate::new();
+        let profile = CapsuleProfileBuilder::new("linux-ns-v1")
+            .seccomp_level(SeccompProfileLevel::Strict)
+            .build()
+            .unwrap();
+        let result = gate.check(&RiskTier::Tier3, Some(&profile));
+        assert!(
+            matches!(
+                result,
+                Err(AdmissionError::InvalidProfile(
+                    CapsuleProfileError::ProfileNotAdmitted { .. }
+                ))
+            ),
+            "different payload with same profile_id must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_admission_gate_with_custom_hashes() {
+        // Create a gate that admits a custom profile hash
+        let strict_profile = CapsuleProfileBuilder::new("linux-ns-v1")
+            .seccomp_level(SeccompProfileLevel::Strict)
+            .build()
+            .unwrap();
+        let mut gate = AdmissionGate::new();
+        gate.admit_hash(strict_profile.profile_hash);
+        assert!(
+            gate.check(&RiskTier::Tier3, Some(&strict_profile)).is_ok(),
+            "custom admitted hash should pass"
+        );
+    }
+
+    #[test]
+    fn test_admission_gate_empty_admitted_set_rejects_all() {
+        let gate = AdmissionGate::with_admitted_hashes(BTreeSet::new());
+        let profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
+        let result = gate.check(&RiskTier::Tier3, Some(&profile));
+        assert!(
+            result.is_err(),
+            "empty admitted set must reject all profiles: got {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Executable path safety tests
+    // =========================================================================
+
+    #[test]
+    fn test_build_rejects_relative_executable_path() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .add_executable("bin/tool")
+            .build();
+        assert!(
+            matches!(
+                result,
+                Err(CapsuleProfileError::ExecutablePathNotAbsolute { .. })
+            ),
+            "relative executable path must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_executable_path_traversal() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .add_executable("/usr/bin/../sbin/evil")
+            .build();
+        assert!(
+            matches!(
+                result,
+                Err(CapsuleProfileError::ExecutablePathTraversal { .. })
+            ),
+            "executable path with .. must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_executable_path_null_byte() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .add_executable("/usr/bin/tool\0evil")
+            .build();
+        assert!(
+            matches!(
+                result,
+                Err(CapsuleProfileError::ExecutablePathNullByte { .. })
+            ),
+            "executable path with null byte must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_accepts_valid_absolute_executable() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .add_executable("/usr/bin/apm2-agent")
+            .build();
+        assert!(
+            result.is_ok(),
+            "valid absolute executable must be accepted: got {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Egress host validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_egress_route_rejects_uppercase_host() {
+        let route = EgressRoute {
+            host: "Example.COM".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(route.validate().is_err(), "uppercase host must be rejected");
+    }
+
+    #[test]
+    fn test_egress_route_rejects_whitespace_host() {
+        let route = EgressRoute {
+            host: "example .com".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(
+            matches!(
+                route.validate(),
+                Err(CapsuleProfileError::EgressHostWhitespace { .. })
+            ),
+            "host with whitespace must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_egress_route_rejects_invalid_dns_chars() {
+        let route = EgressRoute {
+            host: "exam_ple.com".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(
+            matches!(
+                route.validate(),
+                Err(CapsuleProfileError::EgressHostInvalidChars { .. })
+            ),
+            "host with underscores must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_egress_route_rejects_wildcard_host() {
+        let route = EgressRoute {
+            host: "*.example.com".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(
+            matches!(
+                route.validate(),
+                Err(CapsuleProfileError::EgressHostInvalidChars { .. })
+            ),
+            "wildcard host must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_egress_route_rejects_leading_dot() {
+        let route = EgressRoute {
+            host: ".example.com".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(
+            route.validate().is_err(),
+            "host starting with . must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_egress_route_rejects_trailing_dot() {
+        let route = EgressRoute {
+            host: "example.com.".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(
+            route.validate().is_err(),
+            "host ending with . must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_egress_route_rejects_consecutive_dots() {
+        let route = EgressRoute {
+            host: "example..com".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(
+            route.validate().is_err(),
+            "host with consecutive dots must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_egress_route_rejects_leading_hyphen() {
+        let route = EgressRoute {
+            host: "-example.com".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(
+            route.validate().is_err(),
+            "host starting with - must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_egress_route_accepts_valid_dns_host() {
+        let route = EgressRoute {
+            host: "registry.npmjs.org".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(route.validate().is_ok(), "valid DNS host must be accepted");
+    }
+
+    #[test]
+    fn test_egress_route_accepts_ip_address() {
+        // IPv4 addresses are valid DNS chars (digits and dots)
+        let route = EgressRoute {
+            host: "192.168.1.1".to_string(),
+            port: 443,
+            protocol: "tcp".to_string(),
+        };
+        assert!(
+            route.validate().is_ok(),
+            "IPv4 address host must be accepted"
+        );
     }
 }

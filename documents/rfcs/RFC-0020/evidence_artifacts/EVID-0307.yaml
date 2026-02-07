@@ -20,7 +20,7 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Workspace confinement tests (36 tests):
+        Workspace confinement tests (45 tests):
         Workspace root validation (fail-closed by construction via new()):
         - test_valid_workspace_root: /home/agent/workspace accepted
         - test_empty_workspace_root: empty root rejected at construction
@@ -62,6 +62,15 @@ evidence_artifact:
         Contains() integration:
         - test_contains_valid_path: WorkspaceConfinement.contains() resolves correctly
         - test_contains_traversal_rejected: WorkspaceConfinement.contains() blocks traversal
-        Fail-closed construction (new):
+        Fail-closed construction:
         - test_new_returns_result_not_raw_struct: validates fail-closed construction pattern
+        Deserialization bypass prevention:
+        - test_deserialize_blocked_root_etc_rejected: /etc rejected on deser
+        - test_deserialize_blocked_root_var_rejected: /var rejected on deser
+        - test_deserialize_blocked_root_slash_rejected: / rejected on deser
+        - test_deserialize_relative_root_rejected: relative root rejected on deser
+        - test_deserialize_empty_root_rejected: empty root rejected on deser
+        - test_deserialize_valid_root_succeeds: valid root roundtrips via serde
+        - test_deserialize_roundtrip_preserves_validity: roundtrip preserves valid state
+        - test_deserialize_traversal_root_rejected: root with .. rejected on deser
       ref: "cargo test -p apm2-core -- capsule::workspace"

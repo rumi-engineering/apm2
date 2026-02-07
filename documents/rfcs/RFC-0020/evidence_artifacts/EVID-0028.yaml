@@ -25,11 +25,14 @@ evidence_artifact:
     - linux-ns-v1 requires user+mount+pid+net namespaces (insufficient namespaces rejected)
     - linux-ns-v1 requires at least Restricted seccomp level
     - linux-ns-v1 requires bounded non-zero cgroup controls (memory, pids, cpu_quota, io_weight)
-    - Tier3+ admission only accepts enumerated admitted profile IDs (e.g., linux-ns-v1)
+    - Tier3+ admission pinned to content hash, not just profile_id string
+    - Different policy payload with same profile_id is rejected at Tier3+
     - Content-addressed profile hash is deterministic across builds
     - Profile hash changes when any security-relevant field changes
     - Serde roundtrip preserves profile integrity
     - Builder validates all resource limits (max egress routes, max executables)
+    - Executable paths must be absolute, no traversal (..), no null bytes
+    - Egress host validation: lowercase, valid DNS chars, no wildcards, no whitespace
   requirement_ids:
     - "REQ-0028"
   source_refs:
@@ -38,7 +41,7 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Profile and admission gate tests (51 tests):
+        Profile and admission gate tests (72 tests):
         - test_build_linux_ns_v1_defaults: validates default profile meets all requirements
         - test_build_with_egress_routes: explicit route grants work correctly
         - test_build_missing_profile_id: missing field rejected
@@ -90,4 +93,30 @@ evidence_artifact:
         - test_admission_tier3_rejects_readonly_rootfs_false_profile: Tier3 rejects tampered readonly_rootfs
         - test_admission_tier3_rejects_scrub_environment_false_profile: Tier3 rejects tampered scrub_environment
         - test_non_linux_ns_v1_allows_optional_hardening: non-linux-ns-v1 profiles not enforced
+        Deserialization bypass prevention:
+        - test_capsule_profile_deserialize_valid_roundtrip: valid profile roundtrips via serde
+        - test_capsule_profile_deserialize_tampered_hash_rejected: tampered hash rejected on deser
+        - test_capsule_profile_deserialize_deny_by_default_false_rejected: deny_by_default=false rejected
+        - test_capsule_profile_deserialize_with_egress_routes_valid: valid routes roundtrip via serde
+        Admission gate hash-pinning (new):
+        - test_admission_gate_default_admits_linux_ns_v1_default: default gate admits default profile
+        - test_admission_gate_rejects_different_payload_same_profile_id: different payload same ID rejected
+        - test_admission_gate_with_custom_hashes: custom admitted hashes work
+        - test_admission_gate_empty_admitted_set_rejects_all: empty set rejects all profiles
+        Executable path safety (new):
+        - test_build_rejects_relative_executable_path: relative path rejected
+        - test_build_rejects_executable_path_traversal: path with .. rejected
+        - test_build_rejects_executable_path_null_byte: null byte in path rejected
+        - test_build_accepts_valid_absolute_executable: valid absolute path accepted
+        Egress host validation (new):
+        - test_egress_route_rejects_uppercase_host: uppercase host rejected
+        - test_egress_route_rejects_whitespace_host: whitespace in host rejected
+        - test_egress_route_rejects_invalid_dns_chars: invalid DNS chars rejected
+        - test_egress_route_rejects_wildcard_host: wildcard host rejected
+        - test_egress_route_rejects_leading_dot: leading dot rejected
+        - test_egress_route_rejects_trailing_dot: trailing dot rejected
+        - test_egress_route_rejects_consecutive_dots: consecutive dots rejected
+        - test_egress_route_rejects_leading_hyphen: leading hyphen rejected
+        - test_egress_route_accepts_valid_dns_host: valid DNS host accepted
+        - test_egress_route_accepts_ip_address: IPv4 address accepted
       ref: "cargo test -p apm2-core -- capsule::profile"
