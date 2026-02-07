@@ -5908,6 +5908,22 @@ impl PrivilegedDispatcher {
     /// exists in CAS (fail-closed). If omitted, resolves a deterministic
     /// built-in default by `WorkRole` and stores it in CAS so that auditors
     /// reading the ledger can resolve the hash (MAJOR-1 security fix).
+    ///
+    /// # Authorization Trust Chain
+    ///
+    /// The `requested_hash` originates from the `SpawnEpisodeRequest`, whose
+    /// caller has already been authenticated and authorized by the time this
+    /// method is invoked:
+    ///
+    /// 1. `ClaimWork` established a policy resolution for the `work_id`,
+    ///    binding the caller identity and lease.
+    /// 2. `handle_spawn_episode` verified the `work_id` has a valid claim (line
+    ///    ~6306), the role matches the claim, and the `lease_id` matches via
+    ///    constant-time comparison (line ~6346).
+    /// 3. Therefore the `adapter_profile_hash` was submitted by an authorized
+    ///    caller. The CAS-existence check here ensures the hash refers to a
+    ///    well-formed, previously stored profile -- it is NOT an open-access
+    ///    lookup for arbitrary callers.
     fn resolve_spawn_adapter_profile_hash(
         &self,
         requested_hash: Option<&[u8]>,
@@ -5924,6 +5940,11 @@ impl PrivilegedDispatcher {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(raw_hash);
 
+            // SECURITY: CAS-existence check. The caller was already authorized
+            // via ClaimWork + lease_id verification in handle_spawn_episode
+            // (see doc comment above). This check ensures the hash references
+            // a valid, previously stored profile -- not that the caller is
+            // allowed to use it (that was established upstream).
             let cas = self.cas.as_ref().ok_or_else(|| {
                 "adapter_profile_hash validation requires CAS configuration".to_string()
             })?;
@@ -7274,6 +7295,12 @@ impl PrivilegedDispatcher {
                     .as_ref()
                     .ok_or_else(|| "adapter spawn requires CAS configuration".to_string())?;
 
+                // SECURITY: adapter_profile_hash was resolved by
+                // resolve_spawn_adapter_profile_hash which documents the
+                // authorization trust chain: the caller was authenticated via
+                // ClaimWork + lease_id before the hash was accepted. Loading
+                // from CAS here is safe because only authorized callers can
+                // reach this point.
                 let profile = apm2_core::fac::AgentAdapterProfileV1::load_from_cas(
                     cas.as_ref(),
                     &adapter_profile_hash,
