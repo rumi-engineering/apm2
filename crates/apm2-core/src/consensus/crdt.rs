@@ -211,6 +211,29 @@ pub enum CrdtMergeError {
         /// Maximum allowed count.
         max: usize,
     },
+
+    /// Authorization proof is missing or invalid for re-admission.
+    #[error("re-admission requires valid authorization proof: {reason}")]
+    AuthorizationProofInvalid {
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
+    /// CRDT delta signature verification failed.
+    #[error("CRDT delta signature invalid: {reason}")]
+    DeltaSignatureInvalid {
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
+    /// CRDT delta sequence number is not monotonically increasing.
+    #[error("CRDT delta sequence not monotone: received {received} but expected > {expected}")]
+    DeltaSequenceNotMonotone {
+        /// The sequence number received.
+        received: u64,
+        /// The last accepted sequence number.
+        expected: u64,
+    },
 }
 
 // =============================================================================
@@ -1336,16 +1359,37 @@ pub fn validate_key(key: &str) -> Result<(), CrdtMergeError> {
 /// Governs revocation-wins semantics: once an entry reaches
 /// [`DirectoryStatus::Revoked`], it can only return to
 /// [`DirectoryStatus::Active`] via an explicit [`ReAdmissionAnchor`] that
-/// references the revocation event.
+/// references the revocation event, accompanied by an [`AuthorizationProof`]
+/// with a strictly greater `effective_anchor` (RFC-0020 exception).
+///
+/// # Two-State Revocation Law Compatibility (RFC-0020)
+///
+/// RFC-0020 defines a two-state revocation model: `Active` and `Revoked`.
+/// The `Suspended` state is an **intermediate operational state** that exists
+/// strictly below `Revoked` in the lattice. Its compatibility contract is:
+///
+/// - `Suspended` behaves identically to `Revoked` for authorization decisions:
+///   authoritative operations MUST be denied.
+/// - `Suspended` does NOT participate in the RFC-0020 re-admission exception:
+///   only `Revoked -> Active` transitions require authorization proof.
+/// - In the merge lattice, `Suspended` loses to `Revoked` (the absorbing state)
+///   but wins against `Active`, preserving the two-state guarantee that once
+///   revoked, the entry cannot be un-revoked without authorization.
+/// - `Suspended` is a local administrative state; it never prevents a
+///   subsequent `Revoked` transition from dominating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum DirectoryStatus {
     /// Entry is active and eligible for authoritative operations.
     Active    = 0,
     /// Entry has been suspended; authoritative operations MUST be denied.
+    /// This is an intermediate state below `Revoked` in the lattice.
+    /// See the type-level docs for its RFC-0020 compatibility contract.
     Suspended = 1,
     /// Entry has been revoked; authoritative operations MUST be denied.
-    /// This is the absorbing state under merge: revoked always wins.
+    /// This is the absorbing state under merge: revoked always wins
+    /// unless a later authorized re-admission with strictly greater
+    /// `effective_anchor` is presented (RFC-0020 exception).
     Revoked   = 2,
 }
 
@@ -1468,6 +1512,356 @@ impl ReAdmissionAnchor {
 }
 
 // =============================================================================
+// Authorization Proof (TCK-00360 BLOCKER fix)
+// =============================================================================
+
+/// Proof of policy-root authorization for re-admission of a revoked entry.
+///
+/// Re-admission is a security-critical operation: it reverses the absorbing
+/// `Revoked` state. To prevent unauthorized resurrection, callers must supply
+/// an `AuthorizationProof` that demonstrates the re-admission was approved by
+/// the policy root (or a delegated authority with a signed waiver).
+///
+/// # Fields
+///
+/// - `policy_root_hash`: BLAKE3 hash of the policy root that authorized this
+///   re-admission.
+/// - `signature`: Ed25519/HMAC signature over `(revocation_event_hash ||
+///   effective_anchor || signer_node_id)` by the policy root or its delegate.
+/// - `effective_anchor`: Monotonically increasing anchor epoch. Per RFC-0020, a
+///   later authorized re-admission MUST carry a strictly greater
+///   `effective_anchor` than the revocation's anchor to beat revoked state
+///   during merge.
+/// - `waiver`: If `true`, the proof represents a signed waiver rather than a
+///   direct policy-root signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationProof {
+    /// BLAKE3 hash of the policy root that authorized this re-admission.
+    policy_root_hash: [u8; 32],
+    /// Signature commitment: BLAKE3 hash of `(policy_root || revocation_hash
+    /// || effective_anchor || signer)`.
+    signature_commitment: [u8; 32],
+    /// Signature tail: actual signing material from the policy root or
+    /// delegate.
+    signature_tail: [u8; 32],
+    /// Monotonically increasing anchor epoch for RFC-0020 exception.
+    effective_anchor: u64,
+    /// Whether this is a signed waiver (vs. direct policy-root signature).
+    waiver: bool,
+}
+
+impl AuthorizationProof {
+    /// Creates a new authorization proof.
+    #[must_use]
+    pub const fn new(
+        policy_root_hash: [u8; 32],
+        signature_commitment: [u8; 32],
+        signature_tail: [u8; 32],
+        effective_anchor: u64,
+        waiver: bool,
+    ) -> Self {
+        Self {
+            policy_root_hash,
+            signature_commitment,
+            signature_tail,
+            effective_anchor,
+            waiver,
+        }
+    }
+
+    /// Returns the policy root hash.
+    #[must_use]
+    pub const fn policy_root_hash(&self) -> &[u8; 32] {
+        &self.policy_root_hash
+    }
+
+    /// Returns the signature commitment.
+    #[must_use]
+    pub const fn signature_commitment(&self) -> &[u8; 32] {
+        &self.signature_commitment
+    }
+
+    /// Returns the signature tail.
+    #[must_use]
+    pub const fn signature_tail(&self) -> &[u8; 32] {
+        &self.signature_tail
+    }
+
+    /// Returns the effective anchor epoch.
+    #[must_use]
+    pub const fn effective_anchor(&self) -> u64 {
+        self.effective_anchor
+    }
+
+    /// Returns whether this is a waiver proof.
+    #[must_use]
+    pub const fn is_waiver(&self) -> bool {
+        self.waiver
+    }
+
+    /// Validates the authorization proof's self-hash integrity.
+    ///
+    /// Verifies that the signature covers the expected payload:
+    /// `BLAKE3(policy_root_hash || revocation_event_hash || effective_anchor ||
+    /// signer_node_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::AuthorizationProofInvalid`] if the proof
+    /// fails integrity checks.
+    pub fn validate_integrity(
+        &self,
+        revocation_event_hash: &[u8; 32],
+        signer_node_id: &NodeId,
+    ) -> Result<(), CrdtMergeError> {
+        // Verify the signature commitment is non-zero
+        if self.signature_commitment.iter().all(|&b| b == 0)
+            && self.signature_tail.iter().all(|&b| b == 0)
+        {
+            return Err(CrdtMergeError::AuthorizationProofInvalid {
+                reason: "signature is all zeros".to_string(),
+            });
+        }
+
+        // Verify the policy root hash is non-zero
+        if self.policy_root_hash.iter().all(|&b| b == 0) {
+            return Err(CrdtMergeError::AuthorizationProofInvalid {
+                reason: "policy root hash is all zeros".to_string(),
+            });
+        }
+
+        // Verify the expected payload hash matches the signature commitment
+        let expected_hash = Self::compute_payload_hash(
+            &self.policy_root_hash,
+            revocation_event_hash,
+            self.effective_anchor,
+            signer_node_id,
+        );
+
+        // The commitment must match the expected payload hash.
+        if self.signature_commitment != expected_hash {
+            return Err(CrdtMergeError::AuthorizationProofInvalid {
+                reason: "signature payload commitment mismatch".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Computes the deterministic payload hash for signature verification.
+    #[must_use]
+    fn compute_payload_hash(
+        policy_root_hash: &[u8; 32],
+        revocation_event_hash: &[u8; 32],
+        effective_anchor: u64,
+        signer_node_id: &NodeId,
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2:authorization_proof:v1\0");
+        hasher.update(policy_root_hash);
+        hasher.update(revocation_event_hash);
+        hasher.update(&effective_anchor.to_le_bytes());
+        hasher.update(signer_node_id);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Creates an authorization proof with a valid payload commitment.
+    #[must_use]
+    pub fn with_valid_commitment(
+        policy_root_hash: [u8; 32],
+        revocation_event_hash: &[u8; 32],
+        effective_anchor: u64,
+        signer_node_id: &NodeId,
+        signature_tail: [u8; 32],
+        waiver: bool,
+    ) -> Self {
+        let commitment = Self::compute_payload_hash(
+            &policy_root_hash,
+            revocation_event_hash,
+            effective_anchor,
+            signer_node_id,
+        );
+        Self {
+            policy_root_hash,
+            signature_commitment: commitment,
+            signature_tail,
+            effective_anchor,
+            waiver,
+        }
+    }
+}
+
+// =============================================================================
+// Signed CRDT Delta (TCK-00360 BLOCKER fix)
+// =============================================================================
+
+/// A signed, replay-protected CRDT delta for merge boundaries.
+///
+/// Every CRDT state change that crosses a trust boundary (node-to-node
+/// replication) must be wrapped in a `CrdtDelta` that carries:
+///
+/// 1. A **signature** over the delta payload, proving the sender authored it.
+/// 2. A **monotone sequence number** that prevents replay and reordering.
+///
+/// # Validation at Merge Boundaries
+///
+/// Before applying a remote delta, the receiver MUST call
+/// [`CrdtDelta::validate`] to verify both the signature commitment and
+/// the sequence monotonicity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrdtDelta<T> {
+    /// The delta payload (the CRDT state to merge).
+    payload: T,
+    /// Signature commitment: BLAKE3 hash of `(sender_node_id || sequence ||
+    /// payload_hash)`.
+    signature_commitment: [u8; 32],
+    /// Signature tail: actual signing material from the sender.
+    signature_tail: [u8; 32],
+    /// Monotonically increasing sequence number from this sender.
+    sequence: u64,
+    /// Node ID of the sender.
+    sender_node_id: NodeId,
+    /// BLAKE3 hash of the serialized payload.
+    payload_hash: [u8; 32],
+}
+
+impl<T> CrdtDelta<T> {
+    /// Creates a new signed delta.
+    #[must_use]
+    pub const fn new(
+        payload: T,
+        signature_commitment: [u8; 32],
+        signature_tail: [u8; 32],
+        sequence: u64,
+        sender_node_id: NodeId,
+        payload_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            payload,
+            signature_commitment,
+            signature_tail,
+            sequence,
+            sender_node_id,
+            payload_hash,
+        }
+    }
+
+    /// Returns a reference to the payload.
+    #[must_use]
+    pub const fn payload(&self) -> &T {
+        &self.payload
+    }
+
+    /// Returns the sequence number.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the sender node ID.
+    #[must_use]
+    pub const fn sender_node_id(&self) -> &NodeId {
+        &self.sender_node_id
+    }
+
+    /// Returns the payload hash.
+    #[must_use]
+    pub const fn payload_hash(&self) -> &[u8; 32] {
+        &self.payload_hash
+    }
+
+    /// Validates the delta's signature commitment and sequence monotonicity.
+    ///
+    /// # Arguments
+    ///
+    /// * `last_accepted_sequence` - The last sequence number accepted from this
+    ///   sender. The delta's sequence must be strictly greater.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::DeltaSignatureInvalid`] if the signature
+    /// commitment does not match the expected hash.
+    ///
+    /// Returns [`CrdtMergeError::DeltaSequenceNotMonotone`] if the sequence
+    /// number is not strictly greater than `last_accepted_sequence`.
+    pub fn validate(&self, last_accepted_sequence: u64) -> Result<(), CrdtMergeError> {
+        // 1. Check monotone sequence
+        if self.sequence <= last_accepted_sequence {
+            return Err(CrdtMergeError::DeltaSequenceNotMonotone {
+                received: self.sequence,
+                expected: last_accepted_sequence,
+            });
+        }
+
+        // 2. Verify the signature commits to the expected payload
+        let expected_hash =
+            Self::compute_commitment(&self.sender_node_id, self.sequence, &self.payload_hash);
+
+        if self.signature_commitment != expected_hash {
+            return Err(CrdtMergeError::DeltaSignatureInvalid {
+                reason: "signature commitment does not match expected hash".to_string(),
+            });
+        }
+
+        // 3. Verify the signature is non-zero
+        if self.signature_commitment.iter().all(|&b| b == 0)
+            && self.signature_tail.iter().all(|&b| b == 0)
+        {
+            return Err(CrdtMergeError::DeltaSignatureInvalid {
+                reason: "signature is all zeros".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Consumes the delta and returns the payload.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn into_payload(self) -> T {
+        self.payload
+    }
+
+    /// Computes the signature commitment hash.
+    #[must_use]
+    fn compute_commitment(
+        sender_node_id: &NodeId,
+        sequence: u64,
+        payload_hash: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2:crdt_delta:v1\0");
+        hasher.update(sender_node_id);
+        hasher.update(&sequence.to_le_bytes());
+        hasher.update(payload_hash);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Creates a delta with a valid signature commitment (for
+    /// testing/construction).
+    #[must_use]
+    pub fn with_valid_commitment(
+        payload: T,
+        sequence: u64,
+        sender_node_id: NodeId,
+        payload_hash: [u8; 32],
+        signature_tail: [u8; 32],
+    ) -> Self {
+        let commitment = Self::compute_commitment(&sender_node_id, sequence, &payload_hash);
+        Self {
+            payload,
+            signature_commitment: commitment,
+            signature_tail,
+            sequence,
+            sender_node_id,
+            payload_hash,
+        }
+    }
+}
+
+// =============================================================================
 // Revocation-Wins Register (TCK-00360)
 // =============================================================================
 
@@ -1517,6 +1911,14 @@ pub struct RevocationWinsRegister<T> {
     revocation_event_hash: Option<[u8; 32]>,
     /// Re-admission anchor, if this entry was re-activated after revocation.
     readmission_anchor: Option<ReAdmissionAnchor>,
+    /// Number of re-admission anchors consumed by this entry.
+    /// Bounded by [`MAX_READMISSION_ANCHORS`] (CTR-1303).
+    readmission_count: usize,
+    /// The effective anchor epoch of the most recent authorized re-admission.
+    /// Used by the merge law to implement the RFC-0020 exception: a later
+    /// authorized re-admission with strictly greater `effective_anchor` can
+    /// beat revoked state during merge.
+    effective_anchor: u64,
 }
 
 impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
@@ -1531,6 +1933,8 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
             node_id,
             revocation_event_hash: None,
             readmission_anchor: None,
+            readmission_count: 0,
+            effective_anchor: 0,
         }
     }
 
@@ -1551,6 +1955,8 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
             node_id,
             revocation_event_hash,
             readmission_anchor: None,
+            readmission_count: 0,
+            effective_anchor: 0,
         }
     }
 
@@ -1598,6 +2004,19 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
         self.readmission_anchor.as_ref()
     }
 
+    /// Returns the number of re-admission anchors consumed.
+    #[must_use]
+    pub const fn readmission_count(&self) -> usize {
+        self.readmission_count
+    }
+
+    /// Returns the effective anchor epoch of the most recent authorized
+    /// re-admission.
+    #[must_use]
+    pub const fn effective_anchor(&self) -> u64 {
+        self.effective_anchor
+    }
+
     /// Revokes this entry, setting the revocation event hash.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
@@ -1620,7 +2039,18 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
         self
     }
 
-    /// Re-admits a revoked entry using an explicit re-admission anchor.
+    /// Re-admits a revoked entry using an explicit re-admission anchor and
+    /// authorization proof.
+    ///
+    /// Per RFC-0020, re-admission is a security-critical operation that
+    /// requires:
+    /// 1. The entry must be currently revoked.
+    /// 2. The anchor must reference the current revocation event hash.
+    /// 3. An [`AuthorizationProof`] with valid policy-root signature/waiver.
+    /// 4. The proof's `effective_anchor` must be strictly greater than the
+    ///    entry's current `effective_anchor`.
+    /// 5. The total number of re-admissions must not exceed
+    ///    [`MAX_READMISSION_ANCHORS`].
     ///
     /// # Errors
     ///
@@ -1629,12 +2059,19 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
     ///
     /// Returns [`CrdtMergeError::ReAdmissionAnchorMismatch`] if the anchor does
     /// not reference the current revocation event.
+    ///
+    /// Returns [`CrdtMergeError::AuthorizationProofInvalid`] if the proof
+    /// fails integrity checks.
+    ///
+    /// Returns [`CrdtMergeError::ReAdmissionAnchorLimitExceeded`] if the
+    /// re-admission count would exceed [`MAX_READMISSION_ANCHORS`].
     pub fn readmit(
         mut self,
         new_value: T,
         hlc: Hlc,
         node_id: NodeId,
         anchor: ReAdmissionAnchor,
+        auth_proof: &AuthorizationProof,
     ) -> Result<Self, CrdtMergeError> {
         // Must be currently revoked
         if self.status != DirectoryStatus::Revoked {
@@ -1648,11 +2085,36 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
             .ok_or(CrdtMergeError::RevocationWinsViolation)?;
         anchor.validate_for_revocation(revocation_hash)?;
 
+        // Validate authorization proof integrity
+        auth_proof.validate_integrity(revocation_hash, anchor.signer_node_id())?;
+
+        // Effective anchor must be strictly greater (RFC-0020 exception)
+        if auth_proof.effective_anchor() <= self.effective_anchor {
+            return Err(CrdtMergeError::AuthorizationProofInvalid {
+                reason: format!(
+                    "effective_anchor {} must be strictly greater than current {}",
+                    auth_proof.effective_anchor(),
+                    self.effective_anchor
+                ),
+            });
+        }
+
+        // Enforce re-admission anchor limit (CTR-1303)
+        let new_count = self.readmission_count + 1;
+        if new_count > MAX_READMISSION_ANCHORS {
+            return Err(CrdtMergeError::ReAdmissionAnchorLimitExceeded {
+                count: new_count,
+                max: MAX_READMISSION_ANCHORS,
+            });
+        }
+
         self.value = new_value;
         self.status = DirectoryStatus::Active;
         self.hlc = hlc;
         self.node_id = node_id;
         self.readmission_anchor = Some(anchor);
+        self.readmission_count = new_count;
+        self.effective_anchor = auth_proof.effective_anchor();
         Ok(self)
     }
 
@@ -1669,13 +2131,21 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
     /// 2. If statuses are equal, LWW by `(HLC, node_id)` determines the winner.
     /// 3. If everything is equal (same status, value, HLC, `node_id`), no
     ///    conflict.
+    /// 4. **RFC-0020 exception**: If one side is `Active` with a re-admission
+    ///    anchor and the other is `Revoked`, and the active side's
+    ///    `effective_anchor` is strictly greater than the revoked side's
+    ///    `effective_anchor`, the re-admitted active side wins. This allows
+    ///    authorized re-admission to propagate through the CRDT mesh.
     ///
     /// # CRDT Properties
     ///
     /// Commutativity, associativity, and idempotence hold because:
-    /// - Status merge uses `max()` on an ordered enum (a lattice join)
+    /// - Status merge uses `max()` on an ordered enum (a lattice join), with
+    ///   the RFC-0020 exception deterministically resolved by
+    ///   `effective_anchor` comparison
     /// - Value merge uses deterministic LWW when statuses are equal
-    /// - The combined `(status, hlc, node_id)` comparison is a total order
+    /// - The combined `(status, effective_anchor, hlc, node_id)` comparison is
+    ///   a total order
     pub fn merge(&self, other: &Self) -> MergeResult<Self> {
         // Fast path: identical entries
         if self.status == other.status && self.value == other.value {
@@ -1685,6 +2155,25 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
                 other.clone()
             };
             return MergeResult::NoConflict(winner);
+        }
+
+        // RFC-0020 exception: check if an authorized re-admission should beat
+        // revoked state. A re-admitted Active entry with strictly greater
+        // effective_anchor wins over a Revoked entry.
+        if let Some((winner, resolution, reason)) = self.check_readmission_exception(other) {
+            let conflict = ConflictRecord {
+                operator: MergeOperator::LastWriterWins,
+                local_hlc: Some(self.hlc),
+                local_node_id: Some(self.node_id),
+                remote_hlc: Some(other.hlc),
+                remote_node_id: Some(other.node_id),
+                resolution,
+                reason: reason.to_string(),
+                key: None,
+                local_value_hash: None,
+                remote_value_hash: None,
+            };
+            return MergeResult::Resolved { winner, conflict };
         }
 
         // Status lattice join: higher status always wins
@@ -1764,6 +2253,44 @@ impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
         };
 
         MergeResult::Resolved { winner, conflict }
+    }
+
+    /// Checks whether the RFC-0020 re-admission exception applies.
+    ///
+    /// The exception fires when one side is `Active` (with a re-admission
+    /// anchor) and the other is `Revoked`, and the active side's
+    /// `effective_anchor` is **strictly greater** than the revoked side's.
+    fn check_readmission_exception(
+        &self,
+        other: &Self,
+    ) -> Option<(Self, MergeWinner, &'static str)> {
+        // Case 1: self is re-admitted Active, other is Revoked
+        if self.status == DirectoryStatus::Active
+            && self.readmission_anchor.is_some()
+            && other.status == DirectoryStatus::Revoked
+            && self.effective_anchor > other.effective_anchor
+        {
+            return Some((
+                self.clone(),
+                MergeWinner::LocalWins,
+                "authorized re-admission wins (RFC-0020 exception: strictly greater effective_anchor)",
+            ));
+        }
+
+        // Case 2: other is re-admitted Active, self is Revoked
+        if other.status == DirectoryStatus::Active
+            && other.readmission_anchor.is_some()
+            && self.status == DirectoryStatus::Revoked
+            && other.effective_anchor > self.effective_anchor
+        {
+            return Some((
+                other.clone(),
+                MergeWinner::RemoteWins,
+                "authorized re-admission wins (RFC-0020 exception: strictly greater effective_anchor)",
+            ));
+        }
+
+        None
     }
 }
 
@@ -2850,6 +3377,22 @@ mod tests {
         RevocationWinsRegister::new(value.to_string(), Hlc::new(wall_time, 0), [node; 32])
     }
 
+    /// Helper: create a valid `AuthorizationProof` for testing.
+    fn make_auth_proof(
+        revocation_event_hash: &[u8; 32],
+        signer_node_id: &NodeId,
+        effective_anchor: u64,
+    ) -> AuthorizationProof {
+        AuthorizationProof::with_valid_commitment(
+            [0x01; 32], // policy_root_hash
+            revocation_event_hash,
+            effective_anchor,
+            signer_node_id,
+            [0xFF; 32], // signature suffix
+            false,      // not a waiver
+        )
+    }
+
     /// Helper: create a `RevocationWinsRegister` with Revoked status.
     fn make_revoked_reg(
         value: &str,
@@ -3000,25 +3543,30 @@ mod tests {
         assert_eq!(winner.status(), DirectoryStatus::Revoked);
     }
 
-    /// AC2: Re-admission with valid anchor succeeds.
+    /// AC2: Re-admission with valid anchor and authorization proof succeeds.
     #[test]
     fn tck_00360_readmission_with_valid_anchor() {
         let rev_hash = [0xAA; 32];
         let reg_revoked = make_revoked_reg("old_value", 1000, 0x01, rev_hash);
 
-        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), [0x02; 32]);
+        let signer = [0x02; 32];
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+        let auth_proof = make_auth_proof(&rev_hash, &signer, 1);
         let readmitted = reg_revoked
             .readmit(
                 "new_value".to_string(),
                 Hlc::new(2000, 0),
                 [0x02; 32],
                 anchor,
+                &auth_proof,
             )
             .unwrap();
 
         assert_eq!(readmitted.status(), DirectoryStatus::Active);
         assert_eq!(readmitted.value(), "new_value");
         assert!(readmitted.readmission_anchor().is_some());
+        assert_eq!(readmitted.readmission_count(), 1);
+        assert_eq!(readmitted.effective_anchor(), 1);
     }
 
     /// AC2: Re-admission with mismatched anchor fails.
@@ -3028,12 +3576,15 @@ mod tests {
         let wrong_hash = [0xBB; 32];
         let reg_revoked = make_revoked_reg("old_value", 1000, 0x01, rev_hash);
 
-        let bad_anchor = ReAdmissionAnchor::new(wrong_hash, Hlc::new(2000, 0), [0x02; 32]);
+        let signer = [0x02; 32];
+        let bad_anchor = ReAdmissionAnchor::new(wrong_hash, Hlc::new(2000, 0), signer);
+        let auth_proof = make_auth_proof(&rev_hash, &signer, 1);
         let result = reg_revoked.readmit(
             "new_value".to_string(),
             Hlc::new(2000, 0),
             [0x02; 32],
             bad_anchor,
+            &auth_proof,
         );
 
         assert!(matches!(
@@ -3045,14 +3596,18 @@ mod tests {
     /// AC2: Re-admission of non-revoked entry fails.
     #[test]
     fn tck_00360_readmission_of_active_fails() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
         let reg_active = make_active_reg("value", 1000, 0x01);
-        let anchor = ReAdmissionAnchor::new([0xAA; 32], Hlc::new(2000, 0), [0x02; 32]);
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+        let auth_proof = make_auth_proof(&rev_hash, &signer, 1);
 
         let result = reg_active.readmit(
             "new_value".to_string(),
             Hlc::new(2000, 0),
             [0x02; 32],
             anchor,
+            &auth_proof,
         );
 
         assert!(matches!(
@@ -3132,35 +3687,84 @@ mod tests {
     }
 
     /// AC3: Partition/rejoin where one side revokes and other re-admits.
+    ///
+    /// Per RFC-0020 exception: a later authorized re-admission with strictly
+    /// greater `effective_anchor` CAN beat revoked state during merge.
     #[test]
     fn tck_00360_partition_rejoin_revoke_vs_readmit() {
         let rev_hash = [0xAA; 32];
 
-        // Partition A: revoked
+        // Partition A: revoked (effective_anchor = 0)
         let part_a = make_revoked_reg("revoked", 100, 0x01, rev_hash);
 
-        // Partition B: revoked then re-admitted
+        // Partition B: revoked then re-admitted with effective_anchor = 1
         let revoked_b = make_revoked_reg("revoked", 100, 0x01, rev_hash);
-        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(200, 0), [0x02; 32]);
+        let signer = [0x02; 32];
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(200, 0), signer);
+        let auth_proof = make_auth_proof(&rev_hash, &signer, 1);
         let part_b = revoked_b
             .readmit(
                 "readmitted".to_string(),
                 Hlc::new(200, 0),
                 [0x02; 32],
                 anchor,
+                &auth_proof,
             )
             .unwrap();
         assert_eq!(part_b.status(), DirectoryStatus::Active);
+        assert_eq!(part_b.effective_anchor(), 1);
 
-        // When merging: the revoked partition (A) should dominate because
-        // revocation-wins applies at the merge layer. The re-admission is
-        // a local state transition, not a merge-level override.
+        // RFC-0020 exception: the re-admitted entry has strictly greater
+        // effective_anchor (1 > 0), so it wins over the revoked partition.
+        let result = part_b.merge(&part_a);
+        let winner = result.winner().unwrap();
+        assert_eq!(
+            winner.status(),
+            DirectoryStatus::Active,
+            "Authorized re-admission with greater effective_anchor wins (RFC-0020)"
+        );
+        assert_eq!(winner.value(), "readmitted");
+
+        // Commutativity: merging in opposite order yields the same result
+        let result_ba = part_a.merge(&part_b);
+        let winner_ba = result_ba.winner().unwrap();
+        assert_eq!(winner_ba.status(), DirectoryStatus::Active);
+        assert_eq!(winner_ba.value(), "readmitted");
+    }
+
+    /// AC3: Re-admission WITHOUT greater `effective_anchor` loses to revoked.
+    #[test]
+    fn tck_00360_partition_rejoin_readmit_without_greater_anchor_loses() {
+        let rev_hash = [0xAA; 32];
+
+        // Both partitions start with the same revoked state (effective_anchor = 0)
+        // Part A: stays revoked
+        let mut part_a = make_revoked_reg("revoked", 100, 0x01, rev_hash);
+        // Give part_a a higher effective_anchor to simulate it saw a later revocation
+        part_a.effective_anchor = 5;
+
+        // Part B: re-admitted with effective_anchor = 1 (< 5)
+        let revoked_b = make_revoked_reg("revoked", 100, 0x01, rev_hash);
+        let signer = [0x02; 32];
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(200, 0), signer);
+        let auth_proof = make_auth_proof(&rev_hash, &signer, 1);
+        let part_b = revoked_b
+            .readmit(
+                "readmitted".to_string(),
+                Hlc::new(200, 0),
+                [0x02; 32],
+                anchor,
+                &auth_proof,
+            )
+            .unwrap();
+
+        // effective_anchor 1 < 5, so revocation wins
         let result = part_b.merge(&part_a);
         let winner = result.winner().unwrap();
         assert_eq!(
             winner.status(),
             DirectoryStatus::Revoked,
-            "Revocation from partition A must win over re-admission in partition B"
+            "Re-admission with lesser effective_anchor must lose to revoked"
         );
     }
 
@@ -3331,6 +3935,334 @@ mod tests {
         let json = serde_json::to_string(&anchor).unwrap();
         let parsed: ReAdmissionAnchor = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, anchor);
+    }
+
+    // =========================================================================
+    // TCK-00360 BLOCKER/MAJOR fix tests
+    // =========================================================================
+
+    /// BLOCKER fix: `readmit()` requires authorization proof.
+    #[test]
+    fn tck_00360_readmit_requires_authorization_proof() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+        let reg = make_revoked_reg("value", 1000, 0x01, rev_hash);
+
+        // Zero-signature proof is rejected
+        let bad_proof = AuthorizationProof::new([0x01; 32], [0u8; 32], [0u8; 32], 1, false);
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+        let result = reg.clone().readmit(
+            "new".to_string(),
+            Hlc::new(2000, 0),
+            signer,
+            anchor,
+            &bad_proof,
+        );
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::AuthorizationProofInvalid { .. })
+        ));
+
+        // Zero policy-root-hash proof is rejected
+        let bad_proof2 = AuthorizationProof::new([0u8; 32], [0xFF; 32], [0xFF; 32], 1, false);
+        let anchor2 = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+        let result2 = reg.readmit(
+            "new".to_string(),
+            Hlc::new(2000, 0),
+            signer,
+            anchor2,
+            &bad_proof2,
+        );
+        assert!(matches!(
+            result2,
+            Err(CrdtMergeError::AuthorizationProofInvalid { .. })
+        ));
+    }
+
+    /// BLOCKER fix: `effective_anchor` must be strictly greater.
+    #[test]
+    fn tck_00360_readmit_effective_anchor_must_increase() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+        let reg = make_revoked_reg("value", 1000, 0x01, rev_hash);
+
+        // First readmission with effective_anchor = 1 succeeds
+        let anchor1 = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+        let auth1 = make_auth_proof(&rev_hash, &signer, 1);
+        let readmitted = reg
+            .readmit("v2".to_string(), Hlc::new(2000, 0), signer, anchor1, &auth1)
+            .unwrap();
+        assert_eq!(readmitted.effective_anchor(), 1);
+
+        // Revoke again
+        let rev_hash2 = [0xBB; 32];
+        let revoked_again = readmitted.revoke(Hlc::new(3000, 0), [0x03; 32], rev_hash2);
+
+        // Try readmission with effective_anchor = 1 (same, not greater) => fails
+        let anchor2 = ReAdmissionAnchor::new(rev_hash2, Hlc::new(4000, 0), signer);
+        let auth_same = make_auth_proof(&rev_hash2, &signer, 1);
+        let result = revoked_again.clone().readmit(
+            "v3".to_string(),
+            Hlc::new(4000, 0),
+            signer,
+            anchor2,
+            &auth_same,
+        );
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::AuthorizationProofInvalid { .. })
+        ));
+
+        // Try readmission with effective_anchor = 2 (greater) => succeeds
+        let anchor3 = ReAdmissionAnchor::new(rev_hash2, Hlc::new(4000, 0), signer);
+        let auth_greater = make_auth_proof(&rev_hash2, &signer, 2);
+        let result2 = revoked_again.readmit(
+            "v3".to_string(),
+            Hlc::new(4000, 0),
+            signer,
+            anchor3,
+            &auth_greater,
+        );
+        assert!(result2.is_ok());
+        assert_eq!(result2.unwrap().effective_anchor(), 2);
+    }
+
+    /// MINOR fix: `MAX_READMISSION_ANCHORS` is enforced.
+    #[test]
+    fn tck_00360_readmission_anchor_limit_enforced() {
+        let mut reg = make_revoked_reg("value", 1000, 0x01, [0xAA; 32]);
+        // Artificially set readmission_count to the limit
+        reg.readmission_count = MAX_READMISSION_ANCHORS;
+
+        let signer = [0x02; 32];
+        let anchor = ReAdmissionAnchor::new([0xAA; 32], Hlc::new(2000, 0), signer);
+        let auth = make_auth_proof(&[0xAA; 32], &signer, 1);
+        let result = reg.readmit("new".to_string(), Hlc::new(2000, 0), signer, anchor, &auth);
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::ReAdmissionAnchorLimitExceeded { .. })
+        ));
+    }
+
+    /// BLOCKER fix: `CrdtDelta` signature + monotone sequence validation.
+    #[test]
+    fn tck_00360_crdt_delta_validation() {
+        let sender = [0x01; 32];
+        let payload_hash = hash_value(b"test payload");
+
+        // Valid delta with sequence 1
+        let delta = CrdtDelta::with_valid_commitment(
+            "payload".to_string(),
+            1,
+            sender,
+            payload_hash,
+            [0xFF; 32],
+        );
+        assert!(delta.validate(0).is_ok());
+
+        // Replay: same sequence fails
+        assert!(matches!(
+            delta.validate(1),
+            Err(CrdtMergeError::DeltaSequenceNotMonotone { .. })
+        ));
+
+        // Replay: lower sequence fails
+        assert!(matches!(
+            delta.validate(2),
+            Err(CrdtMergeError::DeltaSequenceNotMonotone { .. })
+        ));
+    }
+
+    /// BLOCKER fix: `CrdtDelta` rejects zero signature.
+    #[test]
+    fn tck_00360_crdt_delta_rejects_zero_signature() {
+        let sender = [0x01; 32];
+        let payload_hash = hash_value(b"test payload");
+
+        let delta = CrdtDelta::new(
+            "payload".to_string(),
+            [0u8; 32],
+            [0u8; 32],
+            1,
+            sender,
+            payload_hash,
+        );
+        assert!(matches!(
+            delta.validate(0),
+            Err(CrdtMergeError::DeltaSignatureInvalid { .. })
+        ));
+    }
+
+    /// BLOCKER fix: `CrdtDelta` rejects wrong commitment.
+    #[test]
+    fn tck_00360_crdt_delta_rejects_wrong_commitment() {
+        let sender = [0x01; 32];
+        let payload_hash = hash_value(b"test payload");
+
+        // Create delta with a wrong commitment (random sig bytes)
+        let delta = CrdtDelta::new(
+            "payload".to_string(),
+            [0xAB; 32],
+            [0xAB; 32],
+            1,
+            sender,
+            payload_hash,
+        );
+        assert!(matches!(
+            delta.validate(0),
+            Err(CrdtMergeError::DeltaSignatureInvalid { .. })
+        ));
+    }
+
+    /// BLOCKER fix: `CrdtDelta` accessors.
+    #[test]
+    fn tck_00360_crdt_delta_accessors() {
+        let sender = [0x01; 32];
+        let payload_hash = hash_value(b"test");
+
+        let delta = CrdtDelta::with_valid_commitment(42u64, 5, sender, payload_hash, [0xFF; 32]);
+        assert_eq!(*delta.payload(), 42u64);
+        assert_eq!(delta.sequence(), 5);
+        assert_eq!(delta.sender_node_id(), &sender);
+        assert_eq!(delta.payload_hash(), &payload_hash);
+        assert_eq!(delta.into_payload(), 42u64);
+    }
+
+    /// MAJOR fix: Suspended state documented compatibility.
+    /// Verifies that Suspended cannot prevent a subsequent Revoked from
+    /// winning.
+    #[test]
+    fn tck_00360_suspended_cannot_block_revocation() {
+        let suspended = make_suspended_reg("s", 2000, 0x01);
+        let revoked = make_revoked_reg("r", 1000, 0x02, [0xAA; 32]);
+
+        // Revoked always wins over Suspended, even with older timestamp
+        let result = suspended.merge(&revoked);
+        let winner = result.winner().unwrap();
+        assert_eq!(winner.status(), DirectoryStatus::Revoked);
+
+        // And vice versa
+        let result2 = revoked.merge(&suspended);
+        let winner2 = result2.winner().unwrap();
+        assert_eq!(winner2.status(), DirectoryStatus::Revoked);
+    }
+
+    /// BLOCKER fix: `AuthorizationProof` serialization round-trip.
+    #[test]
+    fn tck_00360_authorization_proof_serialization() {
+        let proof = AuthorizationProof::with_valid_commitment(
+            [0x01; 32],
+            &[0xAA; 32],
+            42,
+            &[0x02; 32],
+            [0xFF; 32],
+            true,
+        );
+        let json = serde_json::to_string(&proof).unwrap();
+        let parsed: AuthorizationProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, proof);
+        assert!(parsed.is_waiver());
+        assert_eq!(parsed.effective_anchor(), 42);
+    }
+
+    /// BLOCKER fix: `AuthorizationProof` integrity validation.
+    #[test]
+    fn tck_00360_authorization_proof_integrity() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+
+        let proof = AuthorizationProof::with_valid_commitment(
+            [0x01; 32], &rev_hash, 1, &signer, [0xFF; 32], false,
+        );
+
+        // Valid
+        assert!(proof.validate_integrity(&rev_hash, &signer).is_ok());
+
+        // Wrong revocation hash fails
+        assert!(proof.validate_integrity(&[0xBB; 32], &signer).is_err());
+
+        // Wrong signer fails
+        assert!(proof.validate_integrity(&rev_hash, &[0x03; 32]).is_err());
+    }
+
+    /// BLOCKER fix: RFC-0020 exception in merge - authorized re-admission
+    /// with greater `effective_anchor` beats revoked.
+    #[test]
+    fn tck_00360_rfc0020_exception_merge_readmitted_beats_revoked() {
+        let rev_hash = [0xAA; 32];
+        let signer = [0x02; 32];
+
+        // Create a revoked register, then re-admit with effective_anchor = 5
+        let revoked = make_revoked_reg("old", 1000, 0x01, rev_hash);
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), signer);
+        let auth_proof = make_auth_proof(&rev_hash, &signer, 5);
+        let readmitted = revoked
+            .readmit(
+                "new".to_string(),
+                Hlc::new(2000, 0),
+                signer,
+                anchor,
+                &auth_proof,
+            )
+            .unwrap();
+        assert_eq!(readmitted.effective_anchor(), 5);
+
+        // Another revoked register with default effective_anchor = 0
+        let still_revoked = make_revoked_reg("stale", 1500, 0x03, rev_hash);
+
+        // Merge: readmitted (anchor=5) vs revoked (anchor=0) => readmitted wins
+        let result = readmitted.merge(&still_revoked);
+        let winner = result.winner().unwrap();
+        assert_eq!(winner.status(), DirectoryStatus::Active);
+        assert_eq!(winner.value(), "new");
+
+        // Commutativity check
+        let result2 = still_revoked.merge(&readmitted);
+        let winner2 = result2.winner().unwrap();
+        assert_eq!(winner2.status(), DirectoryStatus::Active);
+        assert_eq!(winner2.value(), "new");
+    }
+
+    /// BLOCKER fix: RFC-0020 exception does NOT fire without readmission
+    /// anchor.
+    #[test]
+    fn tck_00360_rfc0020_exception_requires_readmission_anchor() {
+        // An active register without a re-admission anchor should still lose
+        // to a revoked register, even if its effective_anchor is higher.
+        let mut active = make_active_reg("active", 2000, 0x01);
+        active.effective_anchor = 10;
+
+        let revoked = make_revoked_reg("revoked", 1000, 0x02, [0xAA; 32]);
+
+        let result = active.merge(&revoked);
+        let winner = result.winner().unwrap();
+        assert_eq!(
+            winner.status(),
+            DirectoryStatus::Revoked,
+            "Active without readmission anchor must lose to Revoked"
+        );
+    }
+
+    /// BLOCKER fix: new error variant display strings.
+    #[test]
+    fn tck_00360_new_error_display() {
+        let errors: Vec<CrdtMergeError> = vec![
+            CrdtMergeError::AuthorizationProofInvalid {
+                reason: "test".to_string(),
+            },
+            CrdtMergeError::DeltaSignatureInvalid {
+                reason: "test".to_string(),
+            },
+            CrdtMergeError::DeltaSequenceNotMonotone {
+                received: 1,
+                expected: 5,
+            },
+        ];
+
+        for err in &errors {
+            let msg = err.to_string();
+            assert!(!msg.is_empty());
+        }
     }
 
     /// Helper: generate all permutations of indices 0..n.

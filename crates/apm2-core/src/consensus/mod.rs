@@ -105,11 +105,11 @@ pub use bft_machine::{
 // HLC-based CRDT merge operators (TCK-00197)
 // Revocation-wins signed CRDT merge law (TCK-00360)
 pub use crdt::{
-    ConflictRecord, CrdtMergeError, DirectoryStatus, GCounter, Hlc, HlcWithNodeId, LwwRegister,
-    MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN, MAX_READMISSION_ANCHORS,
-    MAX_SET_ELEMENTS, MergeEngine, MergeOperator, MergeResult, MergeWinner, NodeId,
-    READMISSION_ANCHOR_DOMAIN, ReAdmissionAnchor, RevocationWinsRegister, SetUnion, hash_value,
-    validate_key, validate_node_id,
+    AuthorizationProof, ConflictRecord, CrdtDelta, CrdtMergeError, DirectoryStatus, GCounter, Hlc,
+    HlcWithNodeId, LwwRegister, MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN,
+    MAX_READMISSION_ANCHORS, MAX_SET_ELEMENTS, MergeEngine, MergeOperator, MergeResult,
+    MergeWinner, NodeId, READMISSION_ANCHOR_DOMAIN, ReAdmissionAnchor, RevocationWinsRegister,
+    SetUnion, hash_value, validate_key, validate_node_id,
 };
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
