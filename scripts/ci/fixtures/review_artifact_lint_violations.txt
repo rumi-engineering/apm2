@@ -1,0 +1,24 @@
+# Regression fixture for review_artifact_lint.sh
+# Each non-comment line below is a pattern that MUST be detected as a violation.
+# The test_review_artifact_lint_fixtures.sh script verifies these are all caught.
+
+# Pattern A: explicit POST to statuses with security context
+gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" -f state="success" -f context="ai-review/security"
+
+# Pattern B: gh pr review --approve bypass
+gh pr review --approve $PR_URL
+
+# Pattern C: check-runs with explicit POST and security context
+gh api --method POST "/repos/{owner}/{repo}/check-runs" -f name="ai-review/security" -f conclusion="success"
+
+# Pattern D: check-runs with implicit write flags (no explicit POST)
+gh api "/repos/{owner}/{repo}/check-runs/$sha" -f state="failure" -f context="ai-review/security"
+
+# Pattern E: statuses with implicit write flags (no explicit --method POST)
+gh api "/repos/{owner}/{repo}/statuses/$sha" -f state="success" -f context="ai-review/security"
+
+# Pattern F: gh api with --field flag targeting security context
+gh api "/repos/{owner}/{repo}/statuses/$sha" --field state="success" --field context="ai-review/security"
+
+# Pattern G: implicit write via -X POST to check-runs
+gh api -X POST "/repos/{owner}/{repo}/check-runs" -f name="ai-review/security"

@@ -1,0 +1,15 @@
+# Regression fixture for review_artifact_lint.sh
+# Each non-comment line below is a pattern that MUST NOT be detected as a violation.
+# The test_review_artifact_lint_fixtures.sh script verifies these are all permitted.
+
+# Permitted: code-quality context is allowed (no xtask equivalent)
+gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" -f state="success" -f context="ai-review/code-quality"
+
+# Permitted: code-quality check-runs
+gh api "/repos/{owner}/{repo}/check-runs" -f name="ai-review/code-quality" -f conclusion="success"
+
+# Permitted: plain comment (not a status write)
+gh pr comment $PR_URL --body-file findings.md
+
+# Permitted: reading (GET) a non-status, non-check-runs endpoint
+gh api "/repos/{owner}/{repo}/pulls/$pr_number"

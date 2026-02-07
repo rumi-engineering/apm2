@@ -71,14 +71,75 @@ while IFS= read -r evid_file; do
     EVID_INDEX["${rfc}/${basename_no_ext}"]=1
 done < <(find "$RFC_DIR" -path '*/evidence_artifacts/EVID-*' 2>/dev/null || true)
 
+# extract_yaml_list_block: given a file and a key name, extract only the YAML
+# list items immediately under that key, respecting indentation scope.
+# Handles both styles:
+#   requirement_ids:          evidence_ids:
+#     - "REQ-0101"            - EVID-1001     (items at same indent as key)
+# Stops at the next sibling mapping key (non-list line at same or lesser indent).
+# IMPORTANT: Only emits actual list-item lines (starting with '-'), not arbitrary
+# nested content like narrative text or multiline string continuations.  This
+# prevents false positives from tokens appearing in description/notes blocks.
+extract_yaml_list_block() {
+    local file="$1"
+    local key="$2"
+    local in_block=0
+    local key_indent=-1
+    local list_item_indent=-1
+    while IFS= read -r line; do
+        # Match the target key (e.g. "requirement_ids:")
+        if [[ $in_block -eq 0 ]] && [[ "$line" =~ ^([[:space:]]*)${key}: ]]; then
+            in_block=1
+            key_indent=${#BASH_REMATCH[1]}
+            continue
+        fi
+        if [[ $in_block -eq 1 ]]; then
+            # Skip blank lines
+            if [[ "$line" =~ ^[[:space:]]*$ ]]; then
+                continue
+            fi
+            # Measure leading whitespace of this line
+            local stripped="${line#"${line%%[![:space:]]*}"}"
+            local line_indent=$(( ${#line} - ${#stripped} ))
+            # If at or less indented than the key, we've left the block
+            if [[ $line_indent -le $key_indent ]]; then
+                # Exception: list items at the same indent as the key (compact YAML)
+                if [[ $line_indent -eq $key_indent ]] && [[ "$stripped" == -* ]]; then
+                    echo "$line"
+                    continue
+                fi
+                break  # sibling mapping key or parent scope
+            fi
+            # More indented than the key — check if this is a list item
+            if [[ "$stripped" == -* ]]; then
+                # Record the indent level of the first list item we see
+                if [[ $list_item_indent -eq -1 ]]; then
+                    list_item_indent=$line_indent
+                fi
+                echo "$line"
+                continue
+            fi
+            # Non-list-item line: if we have established the list item indent
+            # and this line is at the same or less indent as list items,
+            # it's a sibling mapping key — stop.
+            if [[ $list_item_indent -ne -1 ]] && [[ $line_indent -le $list_item_indent ]]; then
+                break
+            fi
+            # Otherwise this line is a continuation of a list item value
+            # (e.g., multiline string).  Skip it — do NOT emit non-list content
+            # to prevent narrative tokens from leaking into the extracted IDs.
+        fi
+    done < "$file"
+}
+
 # Check 1: Every requirement_id in evidence artifacts resolves to a REQ file
 log_info "Checking requirement_ids in evidence artifacts..."
 while IFS= read -r evid_file; do
     rfc=$(echo "$evid_file" | sed -n 's|.*documents/rfcs/\([^/]*\)/.*|\1|p')
     evid_basename=$(basename "$evid_file" .yaml)
 
-    # Extract all requirement_ids from the full file (not truncated by line count)
-    all_req_ids=$(sed -n '/requirement_ids:/,/^[^[:space:]-]/p' "$evid_file" 2>/dev/null | \
+    # Extract all requirement_ids scoped to the YAML block (not overshooting)
+    all_req_ids=$(extract_yaml_list_block "$evid_file" "requirement_ids" | \
         grep -oP 'REQ-[A-Z]*[0-9]+' | sort -u || true)
 
     for req_id in $all_req_ids; do
@@ -103,8 +164,8 @@ while IFS= read -r req_file; do
 
     req_status=$(grep -oP '^\s*status:\s*"?\K[A-Z_]+' "$req_file" 2>/dev/null || echo "UNKNOWN")
 
-    # Extract all evidence_ids from the full file (not truncated by line count)
-    evid_ids=$(sed -n '/evidence_ids:/,/^[^[:space:]-]/p' "$req_file" 2>/dev/null | \
+    # Extract all evidence_ids scoped to the YAML block (not overshooting)
+    evid_ids=$(extract_yaml_list_block "$req_file" "evidence_ids" | \
         grep -oP 'EVID-[A-Z]*[0-9]+' | sort -u || true)
 
     for evid_id in $evid_ids; do

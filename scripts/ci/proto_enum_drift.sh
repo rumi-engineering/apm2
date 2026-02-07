@@ -273,7 +273,7 @@ for entry in $proto_enums; do
     rs_names_csv=$(extract_rs_enum_names "$GENERATED_RS" "$enum_name")
 
     if [[ -z "$rs_names_csv" ]]; then
-        log_error "Enum ${enum_name} defined in proto but not found in generated Rust code"
+        log_error "Enum ${enum_name} defined in proto but not found in generated Rust code (rs_count=0)"
         log_error "  Proto: ${PROTO_FILE}"
         log_error "  Rust:  ${GENERATED_RS}"
         log_error "  Run 'cargo build -p apm2-daemon' to regenerate."
@@ -284,6 +284,18 @@ for entry in $proto_enums; do
     # Sort both name sets for comparison (use ${var//,/$'\n'} to avoid tr portability issues)
     proto_sorted=$(printf '%s\n' ${proto_names_csv//,/ } | sort)
     rs_sorted=$(printf '%s\n' ${rs_names_csv//,/ } | sort)
+
+    # Count actual non-empty variants (guard against empty-string false-OK)
+    rs_count=$(printf '%s\n' ${rs_names_csv//,/ } | grep -c '[A-Z]' || true)
+    proto_count=$(printf '%s\n' ${proto_names_csv//,/ } | grep -c '[A-Z]' || true)
+
+    if [[ "$rs_count" -eq 0 ]]; then
+        log_error "Enum ${enum_name}: generated Rust has 0 parseable variants (rs_count=0) — hard violation"
+        log_error "  Proto defines ${proto_count} variants but Rust has none."
+        log_error "  Run 'cargo build -p apm2-daemon' to regenerate."
+        VIOLATIONS=1
+        continue
+    fi
 
     if [[ "$proto_sorted" != "$rs_sorted" ]]; then
         # Compute set differences for a helpful error message
@@ -301,7 +313,6 @@ for entry in $proto_enums; do
         log_error "  Run 'cargo build -p apm2-daemon' to regenerate."
         VIOLATIONS=1
     else
-        proto_count=$(echo "$proto_sorted" | wc -l)
         log_info "  ${enum_name}: ${proto_count} variants (OK)"
     fi
 done
@@ -318,7 +329,12 @@ for entry in $proto_disc_enums; do
     rs_pairs_csv=$(extract_rs_enum_discriminants "$GENERATED_RS" "$enum_name")
 
     if [[ -z "$rs_pairs_csv" ]]; then
-        # Already reported in name check above
+        # Treat missing Rust discriminants as a hard violation (not just a warning).
+        # The name check above may have caught this, but we enforce here too for
+        # fail-closed semantics — never silently skip a missing enum.
+        log_error "Enum ${enum_name}: no Rust discriminants found (rs_count=0) — hard violation"
+        log_error "  Run 'cargo build -p apm2-daemon' to regenerate."
+        VIOLATIONS=1
         continue
     fi
 
@@ -342,7 +358,7 @@ for entry in $proto_disc_enums; do
         log_error "  Run 'cargo build -p apm2-daemon' to regenerate."
         VIOLATIONS=1
     else
-        disc_count=$(echo "$proto_disc_sorted" | wc -l)
+        disc_count=$(printf '%s\n' ${proto_pairs_csv//,/ } | grep -c '[A-Z]' || true)
         log_info "  ${enum_name}: ${disc_count} discriminants (OK)"
     fi
 done

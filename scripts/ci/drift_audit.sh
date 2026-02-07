@@ -68,6 +68,7 @@ run_check "Test/Source Reference Integrity" "${SCRIPT_DIR}/test_refs_lint.sh"
 run_check "Proto Enum Drift Detection" "${SCRIPT_DIR}/proto_enum_drift.sh"
 run_check "Review Artifact Integrity" "${SCRIPT_DIR}/review_artifact_lint.sh"
 run_check "Legacy IPC Guard" "${SCRIPT_DIR}/legacy_ipc_guard.sh"
+run_check "Lint Fixture Regression Tests" "${SCRIPT_DIR}/test_lint_fixtures.sh"
 
 # Summary
 log_header "============================================="

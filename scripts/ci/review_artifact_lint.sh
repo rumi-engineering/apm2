@@ -67,11 +67,14 @@ log_info "Checking for deprecated direct status-write patterns in review scripts
 # detect_direct_status_write checks whether a logical line (continuations joined)
 # contains a forbidden direct GitHub status write.  Returns 0 (true) if the line
 # is a violation.
-# Patterns:
-#   A) gh api + statuses/check-runs + POST targeting ai-review/security
-#   B) gh pr review --approve (always forbidden)
-# Lines targeting ai-review/code-quality via gh api are permitted (no xtask exists).
-# Comment lines (leading #) are ignored.
+#
+# Strategy (blocklist): any reference to the statuses API endpoint via `gh api`
+# is forbidden UNLESS it exclusively targets ai-review/code-quality (which has
+# no xtask equivalent).  `gh pr review --approve` is always forbidden.
+#
+# This is intentionally broad: review prompts should never contain raw
+# GitHub API calls to statuses — the approved path for security status is
+# `cargo xtask security-review-exec`.
 detect_direct_status_write() {
     local line="$1"
     # Skip comment lines
@@ -79,40 +82,44 @@ detect_direct_status_write() {
     if [[ "$stripped" == "#"* ]]; then
         return 1
     fi
-    # Normalise to lowercase for case-insensitive matching (bash 4+ built-in)
+    # Normalise to lowercase for case-insensitive matching
     local lc="${line,,}"
-    # Pattern C: gh pr review --approve (always forbidden)
-    if [[ "$lc" == *"gh"* ]] && [[ "$lc" == *"pr"* ]] && [[ "$lc" == *"review"* ]] && [[ "$lc" == *"--approve"* ]]; then
+
+    # Rule 1: gh pr review --approve is always forbidden
+    if [[ "$lc" == *"gh"* && "$lc" == *"pr"* && "$lc" == *"review"* && "$lc" == *"--approve"* ]]; then
         return 0
     fi
-    # Pattern A: gh api + statuses + POST (any order, case-insensitive)
-    if [[ "$lc" == *"gh"* ]] && [[ "$lc" == *"api"* ]] && [[ "$lc" == *"statuses"* ]] && [[ "$lc" == *"post"* ]]; then
-        # Permit writes targeting ai-review/code-quality (no xtask alternative)
+
+    # Rule 2: Any line containing BOTH "gh api" (as substring) AND "statuses/"
+    # is a violation — unless it targets ai-review/code-quality exclusively.
+    if [[ "$lc" == *"gh"*"api"* && "$lc" == *"statuses/"* ]]; then
+        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
+            return 1  # permitted
+        fi
+        return 0  # violation
+    fi
+
+    # Rule 3: Any line containing BOTH "gh api" AND "check-runs" is a violation
+    # unless targeting ai-review/code-quality.
+    if [[ "$lc" == *"gh"*"api"* && "$lc" == *"check-runs"* ]]; then
         if [[ "$lc" == *"ai-review/code-quality"* ]]; then
             return 1
         fi
         return 0
     fi
-    # Pattern B: gh api + check-runs + POST (any order, case-insensitive)
-    if [[ "$lc" == *"gh"* ]] && [[ "$lc" == *"api"* ]] && [[ "$lc" == *"check-runs"* ]] && [[ "$lc" == *"post"* ]]; then
-        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
-            return 1
-        fi
-        return 0
-    fi
-    # Pattern D: gh api + statuses without explicit method (gh api defaults to GET,
-    # but --method/--field/-X variants may smuggle writes; flag any gh api + statuses
-    # that is NOT targeting ai-review/code-quality as suspicious)
-    if [[ "$lc" == *"gh"* ]] && [[ "$lc" == *"api"* ]] && [[ "$lc" == *"statuses"* ]]; then
-        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
-            return 1
-        fi
-        # Flag if it contains any method-setting flag or field-setting flag
-        # that could imply a write (-X, --method, -f, --field)
-        if [[ "$lc" == *"--method"* ]] || [[ "$lc" == *"-x"* ]] || [[ "$lc" == *"-f "* ]] || [[ "$lc" == *"--field"* ]] || [[ "$lc" == *"-f\""* ]]; then
-            return 0
+
+    # Rule 4: gh api with implicit write flags (-f/--field/-X/--method) targeting
+    # ai-review/security context — catches status writes even when the endpoint
+    # path is in a variable or uses a non-literal URL.
+    # This mirrors Pattern D coverage for statuses: any `gh api` call that sets
+    # ai-review/security via field flags is a write and must use xtask.
+    if [[ "$lc" == *"gh"*"api"* && "$lc" == *"ai-review/security"* ]]; then
+        # Check for write-indicating flags: -f, --field, -X, --method
+        if [[ "$lc" == *" -f "* || "$lc" == *" --field "* || "$lc" == *" -x "* || "$lc" == *" --method "* ]]; then
+            return 0  # violation: implicit write to ai-review/security
         fi
     fi
+
     return 1
 }
 
