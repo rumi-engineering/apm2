@@ -91,28 +91,33 @@ detect_direct_status_write() {
     fi
 
     # Rule 2: Any line containing BOTH "gh api" (as substring) AND "statuses/"
-    # is a violation — unless it targets ai-review/code-quality exclusively.
+    # is a violation — unless it EXCLUSIVELY targets ai-review/code-quality
+    # (i.e., contains code-quality AND does NOT contain ai-review/security).
     if [[ "$lc" == *"gh"*"api"* && "$lc" == *"statuses/"* ]]; then
+        if [[ "$lc" == *"ai-review/security"* ]]; then
+            return 0  # violation: security context present (even if code-quality also present)
+        fi
         if [[ "$lc" == *"ai-review/code-quality"* ]]; then
-            return 1  # permitted
+            return 1  # permitted: exclusively code-quality
+        fi
+        return 0  # violation: targets unknown/unspecified context
+    fi
+
+    # Rule 3: Any line containing BOTH "gh api" AND "check-runs" is a violation
+    # unless EXCLUSIVELY targeting ai-review/code-quality (no security context).
+    if [[ "$lc" == *"gh"*"api"* && "$lc" == *"check-runs"* ]]; then
+        if [[ "$lc" == *"ai-review/security"* ]]; then
+            return 0  # violation: security context present
+        fi
+        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
+            return 1  # permitted: exclusively code-quality
         fi
         return 0  # violation
     fi
 
-    # Rule 3: Any line containing BOTH "gh api" AND "check-runs" is a violation
-    # unless targeting ai-review/code-quality.
-    if [[ "$lc" == *"gh"*"api"* && "$lc" == *"check-runs"* ]]; then
-        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
-            return 1
-        fi
-        return 0
-    fi
-
-    # Rule 4: gh api with implicit write flags (-f/--field/-X/--method) targeting
-    # ai-review/security context — catches status writes even when the endpoint
-    # path is in a variable or uses a non-literal URL.
-    # This mirrors Pattern D coverage for statuses: any `gh api` call that sets
-    # ai-review/security via field flags is a write and must use xtask.
+    # Rule 4: Any gh api call referencing ai-review/security with write-indicating
+    # flags is a violation — catches status writes even when the endpoint path is
+    # in a variable or uses a non-literal URL.
     if [[ "$lc" == *"gh"*"api"* && "$lc" == *"ai-review/security"* ]]; then
         # Check for write-indicating flags: -f, --field, -X, --method
         if [[ "$lc" == *" -f "* || "$lc" == *" --field "* || "$lc" == *" -x "* || "$lc" == *" --method "* ]]; then

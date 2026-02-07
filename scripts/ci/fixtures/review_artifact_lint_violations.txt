@@ -22,3 +22,12 @@ gh api "/repos/{owner}/{repo}/statuses/$sha" --field state="success" --field con
 
 # Pattern G: implicit write via -X POST to check-runs
 gh api -X POST "/repos/{owner}/{repo}/check-runs" -f name="ai-review/security"
+
+# Pattern H: mixed-context bypass — security + code-quality on same statuses line
+gh api "/repos/{owner}/{repo}/statuses/$sha" -f context="ai-review/security" -f context="ai-review/code-quality"
+
+# Pattern I: mixed-context bypass — dual -f context= targeting both security and code-quality
+gh api --method POST "/repos/{owner}/{repo}/statuses/$sha" -f state="success" -f context="ai-review/security" -f context="ai-review/code-quality"
+
+# Pattern J: mixed-context bypass — security in check-runs with code-quality also present
+gh api "/repos/{owner}/{repo}/check-runs" -f name="ai-review/security" -f name="ai-review/code-quality" -f conclusion="success"

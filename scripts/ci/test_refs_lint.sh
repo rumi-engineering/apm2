@@ -57,8 +57,11 @@ while IFS= read -r evid_file; do
                 in_source_refs=0
                 continue
             fi
-            # Extract path from list item (- "path" or - path)
-            ref_path=$(echo "$line" | sed -n 's/^[[:space:]]*- "\?\([^"]*\)"\?$/\1/p')
+            # Extract path from list item (- "path", - 'path', or - path)
+            # Steps: strip trailing YAML comments, then remove surrounding quotes
+            ref_path=$(echo "$line" | \
+                sed 's/ #.*$//' | \
+                sed -n "s/^[[:space:]]*- [[:space:]]*[\"']\{0,1\}\([^\"']*\)[\"']\{0,1\}[[:space:]]*$/\1/p")
             if [[ -n "$ref_path" ]]; then
                 # Extract just the file path part:
                 # - Before any space (section refs like "file.md §3.1")

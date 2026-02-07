@@ -1,0 +1,13 @@
+# Regression fixture for test_refs_lint.sh (TCK-00409)
+# Tests that the path extraction handles trailing YAML comments and quoted scalars.
+# All paths below point to real files in the repo so the lint should PASS.
+evidence_artifact:
+  id: EVID-FIXTURE-REFS-0001
+  title: "Regression test for YAML comment/quote edge cases in source_refs"
+  requirement_ids:
+    - "REQ-0101"
+  source_refs:
+    - "scripts/ci/test_refs_lint.sh" # this is a trailing comment
+    - 'scripts/ci/review_artifact_lint.sh'
+    - "scripts/ci/drift_audit.sh"
+  status: VALIDATED

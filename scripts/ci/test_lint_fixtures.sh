@@ -5,6 +5,7 @@
 # 1. review_artifact_lint detection function catches all known violation patterns
 # 2. review_artifact_lint detection function permits all known-safe patterns
 # 3. evidence_refs_lint block extraction scopes correctly to YAML keys
+# 4. test_refs_lint path extraction handles YAML comments and quoted scalars
 #
 # Exit codes:
 #   0 - All fixture tests pass
@@ -84,6 +85,63 @@ if echo "$extracted_ids" | grep -q "REQ-0101"; then
     log_pass "Real requirement REQ-0101 correctly extracted from requirement_ids block"
 else
     log_fail "Real requirement REQ-0101 not extracted from requirement_ids block"
+fi
+echo
+
+# --- Test 4: test_refs_lint path extraction handles YAML comments and quoted scalars ---
+echo "Test 4: test_refs_lint path extraction edge cases"
+
+# Helper: extract path from a YAML list line using the same logic as test_refs_lint.sh
+extract_ref_path() {
+    local line="$1"
+    echo "$line" | \
+        sed 's/ #.*$//' | \
+        sed -n "s/^[[:space:]]*- [[:space:]]*[\"']\{0,1\}\([^\"']*\)[\"']\{0,1\}[[:space:]]*$/\1/p"
+}
+
+# Test 4a: Entry with trailing comment
+test_input_comment='    - "crates/foo/src/bar.rs" # this is a test'
+result_comment=$(extract_ref_path "$test_input_comment")
+if [[ "$result_comment" == "crates/foo/src/bar.rs" ]]; then
+    log_pass "Trailing YAML comment stripped: extracted '$result_comment'"
+else
+    log_fail "Trailing YAML comment NOT stripped: expected 'crates/foo/src/bar.rs', got '$result_comment'"
+fi
+
+# Test 4b: Entry with single quotes
+test_input_squote="    - 'crates/foo/src/bar.rs'"
+result_squote=$(extract_ref_path "$test_input_squote")
+if [[ "$result_squote" == "crates/foo/src/bar.rs" ]]; then
+    log_pass "Single-quoted scalar handled: extracted '$result_squote'"
+else
+    log_fail "Single-quoted scalar NOT handled: expected 'crates/foo/src/bar.rs', got '$result_squote'"
+fi
+
+# Test 4c: Entry with double quotes (baseline)
+test_input_dquote='    - "crates/foo/src/bar.rs"'
+result_dquote=$(extract_ref_path "$test_input_dquote")
+if [[ "$result_dquote" == "crates/foo/src/bar.rs" ]]; then
+    log_pass "Double-quoted scalar handled: extracted '$result_dquote'"
+else
+    log_fail "Double-quoted scalar NOT handled: expected 'crates/foo/src/bar.rs', got '$result_dquote'"
+fi
+
+# Test 4d: Single-quoted entry with trailing comment
+test_input_squote_comment="    - 'crates/foo/src/bar.rs' # another comment"
+result_squote_comment=$(extract_ref_path "$test_input_squote_comment")
+if [[ "$result_squote_comment" == "crates/foo/src/bar.rs" ]]; then
+    log_pass "Single-quoted + comment handled: extracted '$result_squote_comment'"
+else
+    log_fail "Single-quoted + comment NOT handled: expected 'crates/foo/src/bar.rs', got '$result_squote_comment'"
+fi
+
+# Test 4e: Bare path (no quotes)
+test_input_bare='    - crates/foo/src/bar.rs'
+result_bare=$(extract_ref_path "$test_input_bare")
+if [[ "$result_bare" == "crates/foo/src/bar.rs" ]]; then
+    log_pass "Bare path handled: extracted '$result_bare'"
+else
+    log_fail "Bare path NOT handled: expected 'crates/foo/src/bar.rs', got '$result_bare'"
 fi
 echo
 
