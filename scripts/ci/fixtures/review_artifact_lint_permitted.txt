@@ -1,0 +1,22 @@
+# Regression fixture for review_artifact_lint.sh (detect_direct_status_write)
+# Each non-comment line below is a pattern that MUST NOT be detected as a violation.
+# The test_lint_fixtures.sh script verifies these are all permitted.
+#
+# NOTE: With the allowlist/prohibition approach (TCK-00409 hardening), "gh api"
+# calls are now forbidden at the per-line level.  The only permitted patterns are
+# non-API commands and the blessed xtask path.
+
+# Permitted: plain comment (not a status write, not an API call)
+gh pr comment $PR_URL --body-file findings.md
+
+# Permitted: blessed xtask path for ai-review/security
+cargo xtask security-review-exec approve --context ai-review/security
+
+# Permitted: reading a file (no API call)
+cat documents/reviews/SECURITY_REVIEW_PROMPT.md
+
+# Permitted: cargo xtask review (generic review command)
+cargo xtask review --pr 123 --type code-quality
+
+# Permitted: echo/log statements mentioning status concepts (no API call)
+echo "Review status set via xtask"

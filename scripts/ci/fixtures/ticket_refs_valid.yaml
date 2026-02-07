@@ -1,0 +1,14 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  ticket:
+    id: "TCK-FIXTURE-VALID"
+    title: "Fixture: valid ticket refs"
+  binds:
+    prd_id: "PRD-0001"
+    rfc_id: "RFC-0001"
+    requirements:
+      - requirement_id: "REQ-1001"
+        requirement_ref: "documents/rfcs/RFC-0001/requirements/REQ-1001.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-1003"
+        artifact_ref: "documents/rfcs/RFC-0001/evidence_artifacts/EVID-1003.yaml#rfc_evidence_artifact"

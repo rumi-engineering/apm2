@@ -1,0 +1,19 @@
+# Regression fixture for evidence_refs_lint.sh
+# This YAML file simulates an evidence artifact where "REQ-FAKE9999"
+# appears in narrative text OUTSIDE the requirement_ids block.
+# The lint MUST NOT treat the narrative token as a real requirement reference.
+
+evidence_artifact:
+  id: EVID-FIXTURE-0001
+  title: "Regression test for narrative token scope"
+  requirement_ids:
+    - "REQ-0101"
+  description: |
+    This evidence artifact was created for regression testing.
+    It mentions REQ-FAKE9999 in its narrative description, but that
+    reference is NOT a real requirement_id and should not be parsed
+    as one by the evidence_refs_lint.sh script.
+  status: VALIDATED
+  notes: |
+    Additional notes referencing REQ-FAKE9999 and EVID-FAKE8888
+    that should also be ignored by the lint.
