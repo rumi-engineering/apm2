@@ -1335,16 +1335,28 @@ mod tests {
         // Spawn the process
         let _ = holon.execute_episode(&ctx).unwrap();
 
-        // Wait for process to complete
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // Check that state was updated
+        // Wait for process completion with a bounded timeout. A fixed short
+        // sleep flakes under full-suite contention.
         let shared_state = holon.shared_state();
-        let guard = shared_state.lock().await;
-        assert!(guard.process_spawned);
-        assert!(guard.process_terminated);
-        assert!(guard.output_event_count > 0);
-        assert_eq!(guard.last_exit_code, Some(0));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let guard = shared_state.lock().await;
+            if guard.process_spawned && guard.process_terminated && guard.output_event_count > 0 {
+                assert_eq!(guard.last_exit_code, Some(0));
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for raw adapter state update: spawned={}, terminated={}, output_event_count={}, exit_code={:?}",
+                guard.process_spawned,
+                guard.process_terminated,
+                guard.output_event_count,
+                guard.last_exit_code
+            );
+            drop(guard);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[test]

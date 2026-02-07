@@ -12,7 +12,9 @@ use std::collections::{HashMap, VecDeque};
 
 use apm2_core::crypto::Hash;
 use apm2_core::evidence::{CasError, ContentAddressedStore};
+use apm2_core::fac::RiskTier;
 use thiserror::Error;
+use tracing::warn;
 
 use super::{
     CellCertificateV1, CellIdV1, CertificateError, HolonCertificateV1, HolonGenesisV1, HolonIdV1,
@@ -231,6 +233,24 @@ pub enum IdentityProofError {
         profile_kind: DirectoryProofKindV1,
         /// Proof-advertised kind.
         proof_kind: DirectoryProofKindV1,
+    },
+
+    /// Directory head profile hash is not recognized by this verifier.
+    #[error("unknown identity proof profile hash: {profile_hash_hex}")]
+    UnknownIdentityProofProfile {
+        /// Unknown profile hash in lowercase hex.
+        profile_hash_hex: String,
+    },
+
+    /// Directory head profile hash does not match expected profile hash.
+    #[error(
+        "identity proof profile hash mismatch: head {head_profile_hash_hex}, profile {profile_hash_hex}"
+    )]
+    IdentityProofProfileHashMismatch {
+        /// Profile hash pinned in the directory head.
+        head_profile_hash_hex: String,
+        /// Canonical hash of the provided profile.
+        profile_hash_hex: String,
     },
 
     /// Current tick predates proof generation tick.
@@ -618,6 +638,21 @@ impl HolonDirectoryHeadV1 {
         &self.identity_proof_profile_hash
     }
 
+    /// Verifies that this head is pinned to the provided proof profile.
+    pub fn verify_profile_binding(
+        &self,
+        profile: &IdentityProofProfileV1,
+    ) -> Result<(), IdentityProofError> {
+        let profile_hash = profile.content_hash()?;
+        if self.identity_proof_profile_hash != profile_hash {
+            return Err(IdentityProofError::IdentityProofProfileHashMismatch {
+                head_profile_hash_hex: hex::encode(self.identity_proof_profile_hash),
+                profile_hash_hex: hex::encode(profile_hash),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns authority seal hash.
     pub const fn authority_seal_hash(&self) -> &[u8; HASH_BYTES] {
         &self.authority_seal_hash
@@ -867,6 +902,12 @@ impl IdentityProofProfileV1 {
         Ok(out)
     }
 
+    /// Blake3 content hash over canonical bytes.
+    pub fn content_hash(&self) -> Result<Hash, IdentityProofError> {
+        let bytes = self.canonical_bytes()?;
+        Ok(hash_bytes(&bytes))
+    }
+
     /// Parses canonical bytes with caller-provided decode bound.
     pub fn from_canonical_bytes_bounded(
         bytes: &[u8],
@@ -950,6 +991,7 @@ impl IdentityProofProfileV1 {
         proof: &DirectoryProofV1,
     ) -> Result<(), IdentityProofError> {
         self.validate()?;
+        head.verify_profile_binding(self)?;
 
         if self.directory_kind != proof.kind() {
             return Err(IdentityProofError::IdentityProofProfileKindMismatch {
@@ -965,6 +1007,96 @@ impl IdentityProofProfileV1 {
             self.max_depth,
             self.max_non_default_siblings,
         )
+    }
+}
+
+/// Resolves a known/supported proof profile by its canonical hash.
+pub fn resolve_known_profile(
+    profile_hash: &[u8; HASH_BYTES],
+) -> Result<IdentityProofProfileV1, IdentityProofError> {
+    let baseline = IdentityProofProfileV1::baseline_smt_10e12();
+    if baseline.content_hash()? == *profile_hash {
+        return Ok(baseline);
+    }
+
+    Err(IdentityProofError::UnknownIdentityProofProfile {
+        profile_hash_hex: hex::encode(profile_hash),
+    })
+}
+
+const fn requires_strict_profile_enforcement(risk_tier: RiskTier) -> bool {
+    matches!(
+        risk_tier,
+        RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4
+    )
+}
+
+fn resolve_profile_for_verification(
+    directory_head: &HolonDirectoryHeadV1,
+    risk_tier: RiskTier,
+    expected_profile: Option<&IdentityProofProfileV1>,
+) -> Result<Option<IdentityProofProfileV1>, IdentityProofError> {
+    let strict = requires_strict_profile_enforcement(risk_tier);
+
+    // SECURITY (REQ-0012): In strict mode (Tier2+), the known-profile registry
+    // check is MANDATORY and cannot be bypassed by supplying an expected_profile.
+    // We must validate that the directory head's profile hash is in the known
+    // registry BEFORE accepting any profile, including a caller-supplied one.
+    if strict {
+        // Fail-closed: reject if the head's profile hash is not in the
+        // known-profile registry, regardless of whether expected_profile
+        // was supplied and hash-matches.
+        let known = resolve_known_profile(directory_head.identity_proof_profile_hash())?;
+
+        // If caller supplied an expected_profile, verify it binds to the head.
+        if let Some(profile) = expected_profile {
+            directory_head.verify_profile_binding(profile)?;
+            return Ok(Some(profile.clone()));
+        }
+
+        // No expected_profile supplied; use the registry-resolved profile.
+        directory_head.verify_profile_binding(&known)?;
+        return Ok(Some(known));
+    }
+
+    // Non-strict mode (Tier0/Tier1): tolerate unknown or mismatched profiles
+    // with warnings to preserve local/self-signed development flows.
+    if let Some(profile) = expected_profile {
+        match directory_head.verify_profile_binding(profile) {
+            Ok(()) => return Ok(Some(profile.clone())),
+            Err(err) => {
+                warn!(
+                    risk_tier = ?risk_tier,
+                    profile_hash = %hex::encode(directory_head.identity_proof_profile_hash()),
+                    error = %err,
+                    "identity proof profile mismatch allowed for Tier0/Tier1 (strict enforcement starts at Tier2)"
+                );
+            },
+        }
+    }
+
+    match resolve_known_profile(directory_head.identity_proof_profile_hash()) {
+        Ok(profile) => match directory_head.verify_profile_binding(&profile) {
+            Ok(()) => Ok(Some(profile)),
+            Err(err) => {
+                warn!(
+                    risk_tier = ?risk_tier,
+                    profile_hash = %hex::encode(directory_head.identity_proof_profile_hash()),
+                    error = %err,
+                    "identity proof profile binding check failed but was tolerated for Tier0/Tier1"
+                );
+                Ok(None)
+            },
+        },
+        Err(err) => {
+            warn!(
+                risk_tier = ?risk_tier,
+                profile_hash = %hex::encode(directory_head.identity_proof_profile_hash()),
+                error = %err,
+                "unknown identity proof profile allowed for Tier0/Tier1 (strict enforcement starts at Tier2)"
+            );
+            Ok(None)
+        },
     }
 }
 
@@ -1592,6 +1724,51 @@ impl IdentityProofV1 {
             &[u8; HASH_BYTES],
         ) -> Result<(), IdentityProofError>,
     {
+        self.verify_with_profile_policy(
+            expected_holon_id,
+            cell_certificate,
+            holon_certificate,
+            directory_head,
+            direct_trust_pinned,
+            current_tick,
+            max_staleness_ticks,
+            expected_freshness_policy_hash,
+            expected_value_hash,
+            RiskTier::Tier2,
+            None,
+            authority_seal_verifier,
+        )
+    }
+
+    /// Verifies the identity proof with explicit profile policy controls.
+    ///
+    /// Tier2+ risk tiers enforce strict profile pinning (unknown/mismatched
+    /// profile hashes are rejected fail-closed). Tier0/Tier1 tolerate unknown
+    /// or mismatched profiles with warnings to preserve local/self-signed
+    /// development flows during rollout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_with_profile_policy<F>(
+        &self,
+        expected_holon_id: &HolonIdV1,
+        cell_certificate: &CellCertificateV1,
+        holon_certificate: &HolonCertificateV1,
+        directory_head: &HolonDirectoryHeadV1,
+        direct_trust_pinned: bool,
+        current_tick: u64,
+        max_staleness_ticks: u64,
+        expected_freshness_policy_hash: &[u8; HASH_BYTES],
+        expected_value_hash: &[u8; HASH_BYTES],
+        risk_tier: RiskTier,
+        expected_profile: Option<&IdentityProofProfileV1>,
+        authority_seal_verifier: F,
+    ) -> Result<(), IdentityProofError>
+    where
+        F: FnOnce(
+            &CellCertificateV1,
+            &[u8; HASH_BYTES],
+            &[u8; HASH_BYTES],
+        ) -> Result<(), IdentityProofError>,
+    {
         self.validate()?;
 
         // Step 1a: Directory kind compatibility check (fail-closed).
@@ -1687,14 +1864,21 @@ impl IdentityProofV1 {
             return Err(IdentityProofError::DirectoryKeyMismatch);
         }
 
-        // Proof-profile pinning is implemented in TCK-00358. Until then,
-        // verification uses the RFC-0020 10^12 baseline SMT cap.
-        self.directory_proof.verify_against_root(
-            directory_head.directory_root_hash(),
-            directory_head.max_proof_bytes(),
-            MAX_SMT_DEPTH,
-            MAX_SMT_DEPTH,
-        )?;
+        let active_profile =
+            resolve_profile_for_verification(directory_head, risk_tier, expected_profile)?;
+
+        if let Some(profile) = active_profile {
+            profile.verify_directory_proof(directory_head, self.directory_proof())?;
+        } else {
+            // Tier0/Tier1 transitional fallback while session-open identity
+            // dereference wiring remains deferred (WVR-0003 / TCK-00361).
+            self.directory_proof.verify_against_root(
+                directory_head.directory_root_hash(),
+                directory_head.max_proof_bytes(),
+                MAX_SMT_DEPTH,
+                MAX_SMT_DEPTH,
+            )?;
+        }
 
         // Step 5a: Verify K->V value semantics.
         //
@@ -1880,12 +2064,9 @@ impl VerifiedHeadCache {
             proof.directory_proof().kind(),
         )?;
 
-        proof.directory_proof().verify_against_root(
-            cached_head.head.directory_root_hash(),
-            cached_head.head.max_proof_bytes(),
-            MAX_SMT_DEPTH,
-            MAX_SMT_DEPTH,
-        )?;
+        let profile = resolve_known_profile(cached_head.head.identity_proof_profile_hash())?;
+        cached_head.head.verify_profile_binding(&profile)?;
+        profile.verify_directory_proof(&cached_head.head, proof.directory_proof())?;
 
         let structural_status = proof.directory_proof().entry_status();
         Ok(structural_status)
@@ -2170,6 +2351,12 @@ mod tests {
         current
     }
 
+    fn baseline_profile_hash() -> [u8; HASH_BYTES] {
+        IdentityProofProfileV1::baseline_smt_10e12()
+            .content_hash()
+            .expect("baseline profile hash should compute")
+    }
+
     fn make_test_head(
         cell_id: CellIdV1,
         root: [u8; HASH_BYTES],
@@ -2184,7 +2371,7 @@ mod tests {
             directory_kind,
             1,
             max_proof_bytes,
-            [0x61; HASH_BYTES],
+            baseline_profile_hash(),
             [0x62; HASH_BYTES],
             [0x63; HASH_BYTES],
             None,
@@ -2411,6 +2598,68 @@ mod tests {
     }
 
     #[test]
+    fn test_directory_head_rejects_zero_profile_hash() {
+        let cert = make_cell_certificate();
+        let err = HolonDirectoryHeadV1::new(
+            cert.cell_id().clone(),
+            7,
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            [0x22; HASH_BYTES],
+            DirectoryKindV1::Smt256V1,
+            1,
+            4096,
+            [0u8; HASH_BYTES],
+            [0x33; HASH_BYTES],
+            [0x44; HASH_BYTES],
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            IdentityProofError::InvalidField {
+                field: "identity_proof_profile_hash",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_profile_binding_verified_against_head() {
+        let cert = make_cell_certificate();
+        let profile = IdentityProofProfileV1::baseline_smt_10e12();
+        let profile_hash = profile.content_hash().unwrap();
+        let head = HolonDirectoryHeadV1::new(
+            cert.cell_id().clone(),
+            7,
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            [0x22; HASH_BYTES],
+            DirectoryKindV1::Smt256V1,
+            1,
+            4096,
+            profile_hash,
+            [0x33; HASH_BYTES],
+            [0x44; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+
+        head.verify_profile_binding(&profile)
+            .expect("profile hash should match head pin");
+
+        let mut wrong_profile = IdentityProofProfileV1::baseline_smt_10e12();
+        wrong_profile.max_depth -= 1;
+        wrong_profile.max_non_default_siblings -= 1;
+        wrong_profile.validate().unwrap();
+
+        let err = head.verify_profile_binding(&wrong_profile).unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::IdentityProofProfileHashMismatch { .. }
+        ));
+    }
+
+    #[test]
     fn identity_proof_verify_success_path() {
         let cell_cert = make_cell_certificate();
         let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
@@ -2439,7 +2688,7 @@ mod tests {
             DirectoryKindV1::Smt256V1,
             1,
             8192,
-            [0x61; HASH_BYTES],
+            baseline_profile_hash(),
             [0x62; HASH_BYTES],
             [0x63; HASH_BYTES],
             None,
@@ -2480,6 +2729,117 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_profile_hash_rejected_for_tier2() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x10; HASH_BYTES])],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+
+        let unknown_profile_hash = [0xEE; HASH_BYTES];
+        assert_ne!(
+            unknown_profile_hash,
+            baseline_profile_hash(),
+            "test requires an unknown profile hash"
+        );
+
+        let head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            12,
+            LedgerAnchorV1::ConsensusIndex { index: 99 },
+            root,
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            unknown_profile_hash,
+            [0x62; HASH_BYTES],
+            [0x63; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let err = identity_proof
+            .verify_with_profile_policy(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &[0xAB; HASH_BYTES],
+                RiskTier::Tier2,
+                None,
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::UnknownIdentityProofProfile { .. }
+        ));
+    }
+
+    #[test]
+    fn test_profile_mismatch_rejected_during_verification() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x10; HASH_BYTES])],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let mut profile_b = IdentityProofProfileV1::baseline_smt_10e12();
+        profile_b.max_depth -= 1;
+        profile_b.max_non_default_siblings -= 1;
+        profile_b.validate().unwrap();
+
+        let err = identity_proof
+            .verify_with_profile_policy(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &[0xAB; HASH_BYTES],
+                RiskTier::Tier2,
+                Some(&profile_b),
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IdentityProofError::IdentityProofProfileHashMismatch { .. }
+        ));
+    }
+
+    #[test]
     fn identity_proof_rejects_missing_cell_hash_without_direct_trust_pin() {
         let cell_cert = make_cell_certificate();
         let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
@@ -2503,7 +2863,7 @@ mod tests {
             DirectoryKindV1::Smt256V1,
             1,
             4096,
-            [0xC1; HASH_BYTES],
+            baseline_profile_hash(),
             [0xC2; HASH_BYTES],
             [0xC3; HASH_BYTES],
             None,
@@ -2561,7 +2921,7 @@ mod tests {
             DirectoryKindV1::Smt256V1,
             1,
             4096,
-            [0x03; HASH_BYTES],
+            baseline_profile_hash(),
             [0x04; HASH_BYTES],
             [0x05; HASH_BYTES],
             None,
@@ -2700,7 +3060,7 @@ mod tests {
             DirectoryKindV1::Smt256V1,
             1,
             8192,
-            [0x61; HASH_BYTES],
+            baseline_profile_hash(),
             [0x62; HASH_BYTES],
             [0x63; HASH_BYTES],
             None,
@@ -2769,7 +3129,7 @@ mod tests {
             DirectoryKindV1::Smt256V1,
             1,
             8192,
-            [0x61; HASH_BYTES],
+            baseline_profile_hash(),
             [0x62; HASH_BYTES],
             [0x63; HASH_BYTES],
             None,
@@ -3037,6 +3397,14 @@ mod tests {
         let cell_cert = make_cell_certificate();
         let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
         let key = derive_directory_key(holon_cert.holon_id());
+        let profile = IdentityProofProfileV1 {
+            max_depth: MIN_SMT_DEPTH_10E12,
+            max_non_default_siblings: MIN_SMT_DEPTH_10E12,
+            ..IdentityProofProfileV1::baseline_smt_10e12()
+        };
+        let profile_hash = profile
+            .content_hash()
+            .expect("test profile hash should compute");
 
         let siblings = (0..=MIN_SMT_DEPTH_10E12)
             .map(|i| SiblingNode::new([u8::try_from(i).unwrap_or(0xEE); HASH_BYTES]))
@@ -3050,18 +3418,20 @@ mod tests {
         )
         .unwrap();
         let root = compute_root_from_proof(&proof);
-        let head = make_test_head(
+        let head = HolonDirectoryHeadV1::new(
             cell_cert.cell_id().clone(),
+            12,
+            LedgerAnchorV1::ConsensusIndex { index: 99 },
             root,
             DirectoryKindV1::Smt256V1,
+            1,
             8192,
-        );
-
-        let profile = IdentityProofProfileV1 {
-            max_depth: MIN_SMT_DEPTH_10E12,
-            max_non_default_siblings: MIN_SMT_DEPTH_10E12,
-            ..IdentityProofProfileV1::baseline_smt_10e12()
-        };
+            profile_hash,
+            [0x62; HASH_BYTES],
+            [0x63; HASH_BYTES],
+            None,
+        )
+        .expect("test head should be valid");
         let err = profile.verify_directory_proof(&head, &proof).unwrap_err();
         assert!(matches!(err, IdentityProofError::DepthExceeded { .. }));
     }
@@ -3462,6 +3832,103 @@ mod tests {
                 }
             ),
             "expected InvalidEnumTag for 0xFF, got: {err:?}"
+        );
+    }
+
+    /// Regression test (Round 3): Tier2+ strict mode MUST reject an
+    /// `expected_profile` whose hash matches the directory head but is NOT in
+    /// the known-profile registry. Before the fix, supplying `expected_profile`
+    /// bypassed `resolve_known_profile()`, violating REQ-0012.
+    #[test]
+    fn test_tier2_rejects_unknown_but_hash_matching_expected_profile() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x10; HASH_BYTES])],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+
+        // Construct a custom profile that is NOT in the known-profile registry.
+        // It differs from baseline_smt_10e12 by using a different max_proof_bytes.
+        let custom_profile = IdentityProofProfileV1 {
+            directory_kind: DirectoryProofKindV1::Smt256CompressedV1,
+            max_depth: MAX_SMT_DEPTH,
+            max_proof_bytes: 4096, // different from baseline's 8192
+            max_non_default_siblings: MAX_SMT_DEPTH,
+            supports_membership_multiproof: false,
+            supports_non_membership_proof: true,
+            verifier_cost_target: VerifierCostTarget {
+                max_hash_ops_per_membership_proof: MAX_HASH_OPS_PER_MEMBERSHIP_PROOF_10E12,
+                max_signature_or_quorum_checks_per_cached_head: 1,
+                max_bytes_fetched_for_verification: 16 * 1024,
+            },
+        };
+
+        // Confirm the custom profile is NOT the baseline (different hash).
+        let custom_hash = custom_profile
+            .content_hash()
+            .expect("custom profile hash should compute");
+        assert_ne!(
+            custom_hash,
+            baseline_profile_hash(),
+            "test requires a profile hash that differs from the baseline"
+        );
+
+        // Confirm resolve_known_profile rejects it.
+        assert!(
+            resolve_known_profile(&custom_hash).is_err(),
+            "custom profile must not be in the known-profile registry"
+        );
+
+        // Build a directory head whose identity_proof_profile_hash matches
+        // the custom (unknown) profile hash.
+        let head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            12,
+            LedgerAnchorV1::ConsensusIndex { index: 99 },
+            root,
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            custom_hash,
+            [0x62; HASH_BYTES],
+            [0x63; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        // Supply expected_profile = custom_profile (hash matches the head).
+        // In Tier2+ strict mode, this MUST be rejected because the profile
+        // hash is not in the known-profile registry.
+        let err = identity_proof
+            .verify_with_profile_policy(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &[0xAB; HASH_BYTES],
+                RiskTier::Tier2,
+                Some(&custom_profile),
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, IdentityProofError::UnknownIdentityProofProfile { .. }),
+            "Tier2+ must reject unknown-but-hash-matching expected_profile; got: {err:?}"
         );
     }
 }
