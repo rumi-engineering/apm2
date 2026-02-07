@@ -164,6 +164,72 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')",
             [],
         )?;
+        // SECURITY (TCK-00412 Follow-up — Changeset Published Uniqueness):
+        //
+        // Enforce at-most-once semantics for `changeset_published` events at
+        // the database level. The semantic idempotency check in
+        // `handle_publish_changeset` (dispatch.rs) uses a check-then-act
+        // pattern: `find_changeset_published_replay` queries for an existing
+        // event before emitting. Under concurrent requests with the same
+        // `(work_id, changeset_digest)`, both threads can pass the check,
+        // both proceed to emit, and create duplicate ledger entries.
+        //
+        // This partial unique index converts the pattern into defense-in-depth:
+        // the application-level check provides the idempotent fast-path, while
+        // the database constraint provides the authoritative uniqueness
+        // guarantee. The existing race-safe fallback in
+        // `handle_publish_changeset` (dispatch.rs lines 10062-10076) already
+        // catches the UNIQUE violation gracefully by replaying persisted
+        // bindings.
+        //
+        // MIGRATION: Quarantine historical duplicate `changeset_published`
+        // events that may exist if the daemon ran with TCK-00412's code
+        // (before this fix) under concurrent PublishChangeSet requests.
+        // Duplicate `(work_id, changeset_digest)` rows would cause
+        // `CREATE UNIQUE INDEX` to fail, resulting in a daemon startup DoS.
+        //
+        // The migration is idempotent:
+        // - quarantine table already exists from receipt migration
+        // - `INSERT OR IGNORE` skips already-quarantined rows
+        // - `MIN(rowid)` keeps the earliest row, quarantines the rest
+        // - after quarantine, the unique index creation is safe
+        conn.execute(
+            "INSERT OR IGNORE INTO ledger_events_quarantine \
+                 (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, quarantine_reason) \
+             SELECT le.event_id, le.event_type, le.work_id, le.actor_id, \
+                    le.payload, le.signature, le.timestamp_ns, \
+                    'changeset_digest_dedupe_migration' \
+             FROM ledger_events le \
+             INNER JOIN ( \
+                 SELECT work_id, \
+                        json_extract(CAST(payload AS TEXT), '$.changeset_digest') AS cs_digest, \
+                        MIN(rowid) AS keep_rowid \
+                 FROM ledger_events \
+                 WHERE event_type = 'changeset_published' \
+                 AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') IS NOT NULL \
+                 GROUP BY work_id, json_extract(CAST(payload AS TEXT), '$.changeset_digest') \
+                 HAVING COUNT(*) > 1 \
+             ) dups ON le.work_id = dups.work_id \
+                 AND json_extract(CAST(le.payload AS TEXT), '$.changeset_digest') = dups.cs_digest \
+             WHERE le.event_type = 'changeset_published' \
+             AND json_extract(CAST(le.payload AS TEXT), '$.changeset_digest') IS NOT NULL \
+             AND le.rowid != dups.keep_rowid \
+             ",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM ledger_events WHERE event_id IN ( \
+                 SELECT event_id FROM ledger_events_quarantine \
+                 WHERE quarantine_reason = 'changeset_digest_dedupe_migration' \
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_changeset_published \
+             ON ledger_events(work_id, json_extract(CAST(payload AS TEXT), '$.changeset_digest')) \
+             WHERE event_type = 'changeset_published'",
+            [],
+        )?;
         Ok(())
     }
 
