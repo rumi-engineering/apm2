@@ -157,16 +157,15 @@ fn fetch_pr_issue_comments(
         // page was full we probe page MAX_COMMENT_PAGES + 1 to check for
         // truncation, and only fail if it returns non-empty content.
         if page > MAX_COMMENT_PAGES {
-            let probe_endpoint = format!(
-                "/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}"
-            );
+            let probe_endpoint =
+                format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
             let probe_output = cmd!(sh, "gh api {probe_endpoint}")
                 .read()
                 .with_context(|| {
                     format!("Failed to fetch overflow probe page {page} for PR #{pr_number}")
                 })?;
-            let probe_comments: Vec<IssueComment> =
-                serde_json::from_str(&probe_output).with_context(|| {
+            let probe_comments: Vec<IssueComment> = serde_json::from_str(&probe_output)
+                .with_context(|| {
                     format!("Failed to parse overflow probe page {page} for PR #{pr_number}")
                 })?;
             if probe_comments.is_empty() {
