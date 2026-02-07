@@ -476,8 +476,12 @@ impl DurableCas {
             // write-then-rename cycle.  If the final file exists with the
             // correct content, this is a benign duplicate — roll back quota
             // and return success.
-            if self.concurrent_winner_exists(&file_path, &hash)? {
+            if self
+                .concurrent_winner_exists(&file_path, &hash)
+                .unwrap_or(false)
+            {
                 self.current_total_size.fetch_sub(size, Ordering::AcqRel);
+                let _ = self.persist_total_size();
                 return Ok(StoreResult {
                     hash,
                     size,
@@ -494,8 +498,12 @@ impl DurableCas {
             let _ = fs::remove_file(&temp_path);
             // Same concurrent-winner check: the rename may have failed because
             // another thread already placed the file via its own rename.
-            if self.concurrent_winner_exists(&file_path, &hash)? {
+            if self
+                .concurrent_winner_exists(&file_path, &hash)
+                .unwrap_or(false)
+            {
                 self.current_total_size.fetch_sub(size, Ordering::AcqRel);
+                let _ = self.persist_total_size();
                 return Ok(StoreResult {
                     hash,
                     size,
