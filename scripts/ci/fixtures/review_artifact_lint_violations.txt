@@ -1,0 +1,64 @@
+# Regression fixture for review_artifact_lint.sh (detect_direct_status_write)
+# Each non-comment line below is a pattern that MUST be detected as a violation.
+# The test_lint_fixtures.sh script verifies these are all caught.
+#
+# With the allowlist/prohibition approach (TCK-00409 hardening), ALL gh api and
+# curl-to-GitHub calls are forbidden.  The patterns below test both old-style
+# specific violations AND the new blanket prohibition.
+
+# Pattern A: explicit POST to statuses with security context
+gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" -f state="success" -f context="ai-review/security"
+
+# Pattern B: gh pr review --approve bypass
+gh pr review --approve $PR_URL
+
+# Pattern C: check-runs with explicit POST and security context
+gh api --method POST "/repos/{owner}/{repo}/check-runs" -f name="ai-review/security" -f conclusion="success"
+
+# Pattern D: check-runs with implicit write flags (no explicit POST)
+gh api "/repos/{owner}/{repo}/check-runs/$sha" -f state="failure" -f context="ai-review/security"
+
+# Pattern E: statuses with implicit write flags (no explicit --method POST)
+gh api "/repos/{owner}/{repo}/statuses/$sha" -f state="success" -f context="ai-review/security"
+
+# Pattern F: gh api with --field flag targeting security context
+gh api "/repos/{owner}/{repo}/statuses/$sha" --field state="success" --field context="ai-review/security"
+
+# Pattern G: implicit write via -X POST to check-runs
+gh api -X POST "/repos/{owner}/{repo}/check-runs" -f name="ai-review/security"
+
+# Pattern H: mixed-context bypass — security + code-quality on same statuses line
+gh api "/repos/{owner}/{repo}/statuses/$sha" -f context="ai-review/security" -f context="ai-review/code-quality"
+
+# Pattern I: mixed-context bypass — dual -f context= targeting both security and code-quality
+gh api --method POST "/repos/{owner}/{repo}/statuses/$sha" -f state="success" -f context="ai-review/security" -f context="ai-review/code-quality"
+
+# Pattern J: mixed-context bypass — security in check-runs with code-quality also present
+gh api "/repos/{owner}/{repo}/check-runs" -f name="ai-review/security" -f name="ai-review/code-quality" -f conclusion="success"
+
+# Pattern K: curl bypass — direct POST to statuses endpoint with security context
+curl -X POST "https://api.github.com/repos/{owner}/{repo}/statuses/$sha" -d '{"context":"ai-review/security","state":"success"}'
+
+# Pattern L: variable indirection bypass — endpoint and context in variables (gh api present = violation)
+endpoint="/repos/{owner}/{repo}/statuses/$sha"; ctx="ai-review/security"; gh api "$endpoint" -f context="$ctx"
+
+# Pattern M: curl with check-runs endpoint and security context
+curl -H "Authorization: token $TOKEN" -X POST "https://api.github.com/repos/{owner}/{repo}/check-runs" -d '{"name":"ai-review/security","conclusion":"success"}'
+
+# Pattern N: variable indirection with check-runs (gh api present = violation)
+statuses_url="/repos/{owner}/{repo}/check-runs"; gh api "$statuses_url" -f name="ai-review/security" -f conclusion="success"
+
+# Pattern O: split-line endpoint+variable (gh api present = violation)
+endpoint="/repos/{owner}/{repo}/statuses/$sha"; ctx="ai-review/security"; gh api "$endpoint" -f context="$ctx"
+
+# Pattern P: NEW — gh api GET read of non-status endpoint (now also forbidden by prohibition)
+gh api "/repos/{owner}/{repo}/pulls/$pr_number"
+
+# Pattern Q: NEW — code-quality gh api call (now forbidden at per-line level; only CODE_QUALITY_PROMPT.md is exempt at file level)
+gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" -f state="success" -f context="ai-review/code-quality"
+
+# Pattern R: NEW — split-token context construction with gh api
+ctx_a="ai-review"; ctx_b="security"; ctx="${ctx_a}/${ctx_b}"; gh api "$endpoint" -f context="$ctx"
+
+# Pattern S: NEW — variable-indirected endpoint with gh api (no security context needed — gh api itself is forbidden)
+endpoint="/repos/{owner}/{repo}/statuses/$sha"; gh api "$endpoint" -f state="success"

@@ -265,6 +265,57 @@ jobs:
       - name: Check for legacy IPC patterns
         run: ./scripts/ci/legacy_ipc_guard.sh
 
+  # Evidence/requirement reference integrity (TCK-00409)
+  # Validates that evidence artifacts reference existing requirements and vice versa
+  evidence-refs-lint:
+    name: Evidence Refs Lint
+    if: github.event_name != 'issue_comment'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate evidence/requirement cross-references
+        run: ./scripts/ci/evidence_refs_lint.sh
+
+  # Test/source reference integrity (TCK-00409)
+  # Validates that source_refs in evidence artifacts point to existing files
+  test-refs-lint:
+    name: Test Refs Lint
+    if: github.event_name != 'issue_comment'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate evidence source references
+        run: ./scripts/ci/test_refs_lint.sh
+
+  # Proto enum drift detection (TCK-00409)
+  # Validates proto enum variant counts match generated Rust code
+  proto-enum-drift:
+    name: Proto Enum Drift
+    if: github.event_name != 'issue_comment'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Detect proto/Rust enum drift
+        run: ./scripts/ci/proto_enum_drift.sh
+
+  # Review artifact integrity (TCK-00409)
+  # Validates review prompts enforce SHA pinning and don't bypass review gates
+  review-artifact-lint:
+    name: Review Artifact Lint
+    if: github.event_name != 'issue_comment'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Validate review artifact integrity
+        run: ./scripts/ci/review_artifact_lint.sh
+
   # Release build check
   build:
     name: Release Build
@@ -283,7 +334,7 @@ jobs:
   # Final check that all CI jobs passed
   ci-success:
     name: CI Success
-    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage, legacy-ipc-guard]
+    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage, legacy-ipc-guard, evidence-refs-lint, test-refs-lint, proto-enum-drift, review-artifact-lint]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -302,3 +353,7 @@ jobs:
           if [[ "${{ needs.build.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.safety-proof-coverage.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.legacy-ipc-guard.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.evidence-refs-lint.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.test-refs-lint.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.proto-enum-drift.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.review-artifact-lint.result }}" != "success" ]]; then exit 1; fi

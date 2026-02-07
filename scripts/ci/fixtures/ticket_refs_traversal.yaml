@@ -1,0 +1,14 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  ticket:
+    id: "TCK-FIXTURE-TRAVERSAL"
+    title: "Fixture: path traversal ticket refs"
+  binds:
+    prd_id: "PRD-0001"
+    rfc_id: "RFC-0001"
+    requirements:
+      - requirement_id: "REQ-0001"
+        requirement_ref: "../../etc/passwd#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0001"
+        artifact_ref: "../../../etc/hosts#rfc_evidence_artifact"
