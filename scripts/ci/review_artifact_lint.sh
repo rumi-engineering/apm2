@@ -60,17 +60,18 @@ check_dependencies
 # ALLOWLIST/PROHIBITION APPROACH (TCK-00409 hardening):
 # Instead of trying to enumerate all bad patterns (denylist — impossible to
 # be exhaustive against token-splitting, variable indirection, etc.), we
-# PROHIBIT all direct GitHub API calls in review artifacts, with a strict
-# file-level exemption list.
+# PROHIBIT all direct GitHub API calls in review artifacts.
 #
 # The approved paths are:
 #   - cargo xtask security-review-exec (approve|deny) — for ai-review/security
 #   - cargo xtask review — for other review types
 #
-# Exemptions (files that legitimately need direct API calls):
-#   - CODE_QUALITY_PROMPT.md — uses gh api for ai-review/code-quality status
-#     (no xtask equivalent exists yet; protected by the primary security-literal
-#     gate which ensures it never references ai-review/security)
+# KNOWN-GOOD LINE ALLOWLIST (replaces blanket file exemption):
+#   CODE_QUALITY_PROMPT.md has a single legitimate gh api call that writes
+#   the ai-review/code-quality status.  Instead of exempting the entire file,
+#   we strip lines matching the known-good pattern (containing both "gh api"
+#   or "statuses" AND "ai-review/code-quality") before running checks.  All
+#   remaining content is checked by every gate.
 #
 # Similarly, `gh pr review --approve` bypasses the review gate and is always
 # forbidden in all review artifacts (no exemptions).
@@ -112,17 +113,32 @@ detect_forbidden_api_usage() {
     local file="$1"
     local file_basename="$2"
 
-    # Exemption: CODE_QUALITY_PROMPT.md legitimately uses gh api for
-    # code-quality status (protected by separate security-literal gate).
-    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]]; then
-        return 1
-    fi
-
-    # Read file, strip comments, flatten to stream, lowercase
+    # Read file, strip comments
     local content
     content="$(cat "$file")"
     local stripped
     stripped="$(strip_comments "$content")"
+
+    # KNOWN-GOOD LINE ALLOWLIST for CODE_QUALITY_PROMPT.md:
+    # Instead of exempting the entire file, strip only LOGICAL lines that
+    # match the one legitimate gh api usage pattern (writes ai-review/code-quality
+    # status).  We join backslash-continuation lines first so that multi-line
+    # gh api commands (where "gh api" and "ai-review/code-quality" are on
+    # separate continuation lines) are treated as a single logical line.
+    # Only logical lines containing BOTH the marker are stripped; all remaining
+    # content is then checked by every gate below.
+    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]]; then
+        # Join continuation lines (\ at EOL), then strip logical lines matching
+        # the known-good pattern, then output the rest.
+        stripped=$(echo "$stripped" | awk '
+            /\\$/ { buf = buf substr($0, 1, length($0)-1) " "; next }
+            { line = buf $0; buf = ""
+              if (line !~ /ai-review\/code-quality/) print line }
+            END { if (buf != "" && buf !~ /ai-review\/code-quality/) print buf }
+        ')
+    fi
+
+    # Flatten to stream, lowercase
     local stream
     stream="$(flatten_stream "$stripped")"
     local lc="${stream,,}"
@@ -350,11 +366,15 @@ while IFS= read -r review_file; do
     file_basename="$(basename "$review_file")"
     # Process with continuation-joining so multiline commands are caught
     while IFS=$'\t' read -r line_num logical_line; do
-        # CODE_QUALITY_PROMPT.md is exempt from the per-line API prohibition
-        # (detect_direct_status_write) because it legitimately uses gh api for
-        # code-quality status writes.  However, it MUST still be checked for
-        # cross-category exec misuse (e.g. invoking security-review-exec).
-        if [[ "$file_basename" != "CODE_QUALITY_PROMPT.md" ]]; then
+        # KNOWN-GOOD LINE ALLOWLIST: For CODE_QUALITY_PROMPT.md, skip only
+        # lines that match the one legitimate gh api pattern (writes
+        # ai-review/code-quality status).  All other lines are checked.
+        skip_api_check=0
+        if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]] \
+           && [[ "$logical_line" == *"ai-review/code-quality"* ]]; then
+            skip_api_check=1
+        fi
+        if [[ $skip_api_check -eq 0 ]]; then
             if detect_direct_status_write "$logical_line"; then
                 log_error "Forbidden direct GitHub API call in review artifact:"
                 log_error "  ${review_file}:${line_num}: ${logical_line}"

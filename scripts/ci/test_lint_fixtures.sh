@@ -131,11 +131,31 @@ else
     log_pass "API prohibition correctly permits file without API calls"
 fi
 
-# Test 2c-iii: CODE_QUALITY_PROMPT.md is exempt -> MUST PASS
-if detect_forbidden_api_usage "$violation_fixture" "CODE_QUALITY_PROMPT.md"; then
-    log_fail "API prohibition not exempting CODE_QUALITY_PROMPT.md"
+# Test 2c-iii: CODE_QUALITY_PROMPT.md with ONLY known-good lines -> MUST PASS
+# (known-good lines containing ai-review/code-quality are stripped before analysis)
+cq_known_good="${FIXTURE_DIR}/review_cq_known_good_permitted.md"
+if detect_forbidden_api_usage "$cq_known_good" "CODE_QUALITY_PROMPT.md"; then
+    log_fail "API prohibition false positive on CODE_QUALITY_PROMPT.md with only known-good gh api"
 else
-    log_pass "API prohibition correctly exempts CODE_QUALITY_PROMPT.md"
+    log_pass "API prohibition correctly permits CODE_QUALITY_PROMPT.md known-good gh api lines"
+fi
+
+# Test 2c-iv: CODE_QUALITY_PROMPT.md with EXTRA gh api call beyond allowlist -> MUST FAIL
+# (the extra gh api targeting ai-review/security is NOT in the allowlist)
+cq_extra_api="${FIXTURE_DIR}/review_cq_extra_api_violation.md"
+if detect_forbidden_api_usage "$cq_extra_api" "CODE_QUALITY_PROMPT.md"; then
+    log_pass "API prohibition caught extra gh api in CODE_QUALITY_PROMPT.md beyond allowlist"
+else
+    log_fail "API prohibition missed extra gh api in CODE_QUALITY_PROMPT.md beyond allowlist"
+fi
+
+# Test 2c-v: CODE_QUALITY_PROMPT.md with split-token ai-review/security -> MUST FAIL
+# (the split-token construction includes "gh api" which remains after stripping known-good lines)
+cq_split_token="${FIXTURE_DIR}/review_cq_split_token_violation.md"
+if detect_forbidden_api_usage "$cq_split_token" "CODE_QUALITY_PROMPT.md"; then
+    log_pass "API prohibition caught split-token bypass in CODE_QUALITY_PROMPT.md"
+else
+    log_fail "API prohibition missed split-token bypass in CODE_QUALITY_PROMPT.md"
 fi
 
 # Remove stub log_error

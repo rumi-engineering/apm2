@@ -288,9 +288,10 @@ decision_tree:
         - id: POST_AND_UPDATE
           action: command
           note: |
-            code-quality sets its own category status via gh api because
-            the xtask review-exec command is security-category only
-            (it hardcodes the security review context, not code-quality).
+            code-quality sets its own category status via the GitHub
+            statuses API because the xtask review-exec command is
+            security-category only (it hardcodes the security review
+            context, not code-quality).
           run: |
             gh pr comment $PR_URL --body-file quality_findings.md
             if [ "$VERDICT_STATE" == "success" ]; then
