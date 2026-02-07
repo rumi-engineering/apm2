@@ -24,6 +24,7 @@
 //! - `review security <PR_URL>` - Run security review for a PR
 //! - `review quality <PR_URL>` - Run code quality review for a PR
 //! - `review uat <PR_URL>` - Run UAT sign-off for a PR
+//! - `review-gate --pr-number <N>` - Evaluate authoritative AI review gate
 //! - `security-review-exec approve [TCK-XXXXX]` - Approve PR after security
 //!   review
 //! - `security-review-exec deny [TCK-XXXXX] --reason <reason>` - Deny PR with
@@ -138,6 +139,31 @@ enum Commands {
         /// Continuously poll status every 10 seconds
         #[arg(short, long)]
         watch: bool,
+    },
+
+    /// Evaluate authoritative AI review gate for a pull request.
+    ///
+    /// This command reads:
+    /// - Commit statuses for `ai-review/security` and `ai-review/code-quality`
+    /// - Machine-readable review metadata from PR comments
+    /// - Trusted reviewer allowlist from repo configuration
+    ///
+    /// It fails closed on missing/invalid artifacts and exits non-zero if the
+    /// authoritative verdict blocks merge.
+    #[command(name = "review-gate")]
+    ReviewGate {
+        /// Pull request number to evaluate
+        #[arg(long)]
+        pr_number: u64,
+        /// Optional owner/repo override (defaults to origin remote)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional expected PR head SHA override
+        #[arg(long)]
+        head_sha: Option<String>,
+        /// Optional trusted reviewer allowlist path
+        #[arg(long)]
+        trusted_reviewers: Option<String>,
     },
 
     /// Clean up after PR merge.
@@ -395,6 +421,17 @@ fn main() -> Result<()> {
             allow_github_write,
         } => tasks::push(emit_receipt_only, allow_github_write),
         Commands::Check { watch } => tasks::check(watch),
+        Commands::ReviewGate {
+            pr_number,
+            repo,
+            head_sha,
+            trusted_reviewers,
+        } => tasks::review_gate(
+            repo.as_deref(),
+            pr_number,
+            head_sha.as_deref(),
+            trusted_reviewers.as_deref(),
+        ),
         Commands::Finish => tasks::finish(),
         Commands::Review { review_type } => match review_type {
             ReviewCommands::Security {
