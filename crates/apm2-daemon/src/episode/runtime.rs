@@ -45,8 +45,10 @@ use super::decision::{Credential, SessionTerminationInfo, ToolResult};
 use super::error::{EpisodeError, EpisodeId};
 use super::executor::{ContentAddressedStore, ExecutionContext, SharedToolExecutor, ToolExecutor};
 use super::handle::{SessionHandle, StopSignal};
+use super::registry::AdapterRegistry;
 use super::state::{EpisodeState, QuarantineReason, TerminationClass};
 use super::tool_handler::{ToolArgs, ToolHandler};
+use crate::episode::adapter::{HarnessEvent, HarnessHandle};
 use crate::htf::HolonicClock;
 use crate::protocol::dispatch::LedgerEventEmitter;
 use crate::session::SessionRegistry;
@@ -443,6 +445,12 @@ struct EpisodeEntry {
     /// `ToolResultData` in deterministic tool sequence order. Used for
     /// downstream indexing (TCK-00327: `ToolLogIndexV1`).
     result_hashes: Vec<Hash>,
+    /// TCK-00399: Harness handle for the spawned agent CLI process.
+    ///
+    /// Stored for lifecycle management: `stop()` calls
+    /// `adapter.terminate()` via this handle. Set after a successful
+    /// `AdapterRegistry::spawn()` and cleared on termination.
+    harness_handle: Option<HarnessHandle>,
 }
 
 /// Episode runtime for managing daemon-hosted episodes.
@@ -541,6 +549,22 @@ pub struct EpisodeRuntime {
     /// (normal, crash, timeout, quarantined, budget-exhausted) produce a
     /// `TERMINATED + reason/exit_code` status in the session registry.
     session_registry: Option<Arc<dyn SessionRegistry>>,
+    /// TCK-00399: Adapter registry for spawning agent CLI processes.
+    ///
+    /// When present, `spawn_adapter()` uses this registry to look up the
+    /// appropriate `HarnessAdapter` and spawn the agent process.
+    adapter_registry: Option<Arc<AdapterRegistry>>,
+
+    /// Orphaned harness handles awaiting cleanup (MAJOR security fix).
+    ///
+    /// When spawn-race cleanup fails (both `terminate()` and
+    /// `escalate_sigkill()` fail), the harness handle is retained here for
+    /// periodic retry. This prevents untracked orphaned processes surviving
+    /// outside containment.
+    ///
+    /// Invariant: process death is NEVER assumed without confirmation. Handles
+    /// remain in this vec until cleanup succeeds.
+    orphan_harness_handles: tokio::sync::Mutex<Vec<HarnessHandle>>,
 }
 
 impl EpisodeRuntime {
@@ -569,6 +593,10 @@ impl EpisodeRuntime {
             ledger_emitter: None,
             // TCK-00385: No session registry by default (tests don't need it)
             session_registry: None,
+            // TCK-00399: No adapter registry by default
+            adapter_registry: None,
+            // MAJOR security fix: empty orphan tracker
+            orphan_harness_handles: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -601,6 +629,10 @@ impl EpisodeRuntime {
             ledger_emitter: None,
             // TCK-00385: No session registry by default
             session_registry: None,
+            // TCK-00399: No adapter registry by default
+            adapter_registry: None,
+            // MAJOR security fix: empty orphan tracker
+            orphan_harness_handles: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -752,6 +784,62 @@ impl EpisodeRuntime {
     pub fn with_session_registry(mut self, registry: Arc<dyn SessionRegistry>) -> Self {
         self.session_registry = Some(registry);
         self
+    }
+
+    /// Sets the adapter registry for spawning agent CLI processes (TCK-00399).
+    #[must_use]
+    pub fn with_adapter_registry(mut self, registry: Arc<AdapterRegistry>) -> Self {
+        self.adapter_registry = Some(registry);
+        self
+    }
+
+    /// Returns the number of orphaned harness handles awaiting cleanup.
+    ///
+    /// A non-zero count indicates processes whose death could not be confirmed
+    /// during spawn-race cleanup. These handles are retained for periodic retry
+    /// via [`retry_orphan_cleanup`](Self::retry_orphan_cleanup).
+    pub async fn orphan_harness_count(&self) -> usize {
+        self.orphan_harness_handles.lock().await.len()
+    }
+
+    /// Retries cleanup of orphaned harness handles (MAJOR security fix).
+    ///
+    /// Iterates all retained orphan handles and attempts `escalate_sigkill`
+    /// again. Handles whose processes are confirmed dead (SIGKILL succeeds or
+    /// ESRCH) are removed. Handles that still fail are retained for the next
+    /// retry cycle.
+    ///
+    /// Returns the number of handles that were successfully cleaned up.
+    pub async fn retry_orphan_cleanup(&self) -> usize {
+        let mut orphans = self.orphan_harness_handles.lock().await;
+        let mut still_orphaned = Vec::new();
+        let mut cleaned = 0usize;
+
+        for handle in orphans.drain(..) {
+            match crate::episode::adapter::escalate_sigkill(&handle).await {
+                Ok(()) => {
+                    info!(
+                        handle_id = handle.id(),
+                        episode_id = %handle.episode_id(),
+                        "orphaned adapter process confirmed dead on retry"
+                    );
+                    cleaned += 1;
+                },
+                Err(e) => {
+                    warn!(
+                        handle_id = handle.id(),
+                        episode_id = %handle.episode_id(),
+                        error = %e,
+                        "orphaned adapter process still not confirmed dead; \
+                         retaining for next retry"
+                    );
+                    still_orphaned.push(handle);
+                },
+            }
+        }
+
+        *orphans = still_orphaned;
+        cleaned
     }
 
     /// Registers a factory for creating tool handlers (builder pattern).
@@ -958,6 +1046,7 @@ impl EpisodeRuntime {
                     handle: None,
                     executor: None,
                     result_hashes: Vec::new(), // TCK-00320: Accumulate result hashes
+                    harness_handle: None,      // TCK-00399: Set after spawn_adapter()
                 },
             );
         }
@@ -1265,6 +1354,275 @@ impl EpisodeRuntime {
         Ok(handle)
     }
 
+    /// Spawns an agent CLI process for the given episode (TCK-00399).
+    ///
+    /// Validates the episode is in RUNNING state, calls
+    /// `HarnessAdapter::spawn()`, stores the `HarnessHandle` in the episode
+    /// entry, and launches a background bridge task to consume the
+    /// `HarnessEventStream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EpisodeError` if the episode is not in RUNNING state or
+    /// if adapter spawning fails.
+    pub async fn spawn_adapter(
+        &self,
+        episode_id: &EpisodeId,
+        config: crate::episode::adapter::HarnessConfig,
+        adapter: &dyn crate::episode::adapter::HarnessAdapter,
+    ) -> Result<(), EpisodeError> {
+        // Validate episode is in Running state and has no active harness handle.
+        // Transactional: check admission BEFORE mutating state (CTR-2601).
+        {
+            let episodes = self.episodes.read().await;
+            let entry =
+                episodes
+                    .get(episode_id.as_str())
+                    .ok_or_else(|| EpisodeError::NotFound {
+                        id: episode_id.as_str().to_string(),
+                    })?;
+            if !matches!(entry.state, EpisodeState::Running { .. }) {
+                return Err(EpisodeError::Internal {
+                    message: format!(
+                        "cannot spawn adapter for episode {} in state {}; expected Running",
+                        episode_id,
+                        entry.state.state_name()
+                    ),
+                });
+            }
+            // Guard: reject re-spawn if an active harness handle already exists.
+            // Overwriting a live handle would orphan the previous process (MAJOR 1).
+            if entry.harness_handle.is_some() {
+                return Err(EpisodeError::Internal {
+                    message: format!(
+                        "episode {episode_id} already has an active harness handle; \
+                         terminate before re-spawn"
+                    ),
+                });
+            }
+        }
+
+        // Spawn the agent process
+        let (handle, event_stream) =
+            adapter
+                .spawn(config)
+                .await
+                .map_err(|e| EpisodeError::Internal {
+                    message: format!("adapter spawn failed for episode {episode_id}: {e}"),
+                })?;
+
+        info!(
+            episode_id = %episode_id,
+            handle_id = handle.id(),
+            "agent process spawned via adapter"
+        );
+
+        // BLOCKER fix: Re-validate episode state after the spawn await.
+        // If stop()/quarantine() won the race during spawn, the episode is
+        // already terminal.  Terminate the just-spawned process immediately
+        // to prevent orphaned processes surviving past terminal transition.
+        {
+            let mut episodes = self.episodes.write().await;
+            // SECURITY: If the episode was removed while we were spawning,
+            // terminate the just-spawned process to prevent an orphan.
+            #[allow(clippy::option_if_let_else)]
+            let Some(entry) = episodes.get_mut(episode_id.as_str()) else {
+                drop(episodes);
+                warn!(
+                    episode_id = %episode_id,
+                    "episode entry missing after spawn; \
+                     terminating orphaned adapter process"
+                );
+                if let Err(e) = adapter.terminate(&handle).await {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "failed to terminate orphaned adapter process \
+                         on missing episode; escalating to SIGKILL"
+                    );
+                    // SECURITY: Escalate to SIGKILL to prevent orphaned
+                    // processes when control-channel terminate fails.
+                    if let Err(kill_err) = crate::episode::adapter::escalate_sigkill(&handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed for orphaned adapter process \
+                             on missing episode; process death NOT confirmed; \
+                             retaining handle in orphan tracker"
+                        );
+                        // MAJOR security fix: Retain the handle for periodic
+                        // cleanup retry. Never claim cleanup succeeded if
+                        // process death is unconfirmed.
+                        self.orphan_harness_handles.lock().await.push(handle);
+                    }
+                }
+                return Err(EpisodeError::NotFound {
+                    id: episode_id.as_str().to_string(),
+                });
+            };
+            if !matches!(entry.state, EpisodeState::Running { .. }) {
+                warn!(
+                    episode_id = %episode_id,
+                    state = entry.state.state_name(),
+                    "episode transitioned to non-Running during spawn; \
+                     terminating orphaned adapter process"
+                );
+                // Drop the write lock before async terminate to avoid
+                // holding it across await.
+                drop(episodes);
+                if let Err(e) = adapter.terminate(&handle).await {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "failed to terminate orphaned adapter process; \
+                         escalating to SIGKILL"
+                    );
+                    // SECURITY: Escalate to SIGKILL to prevent orphaned
+                    // processes when control-channel terminate fails.
+                    if let Err(kill_err) = crate::episode::adapter::escalate_sigkill(&handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed for orphaned adapter process; \
+                             process death NOT confirmed; \
+                             retaining handle in orphan tracker"
+                        );
+                        // MAJOR security fix: Retain the handle for periodic
+                        // cleanup retry. Never claim cleanup succeeded if
+                        // process death is unconfirmed.
+                        self.orphan_harness_handles.lock().await.push(handle);
+                    }
+                }
+                return Err(EpisodeError::Internal {
+                    message: format!(
+                        "episode {episode_id} transitioned away from Running \
+                         during adapter spawn"
+                    ),
+                });
+            }
+            // SECURITY: Atomic check-and-set under write lock. A concurrent
+            // spawn_adapter caller may have won the race between our read-lock
+            // admission check and this write-lock commit. Re-check under the
+            // write lock to prevent overwriting a live handle, which would
+            // orphan the first caller's process.
+            if entry.harness_handle.is_some() {
+                warn!(
+                    episode_id = %episode_id,
+                    "concurrent spawn_adapter won the race; \
+                     terminating duplicate adapter process"
+                );
+                drop(episodes);
+                if let Err(e) = adapter.terminate(&handle).await {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "failed to terminate duplicate adapter process; \
+                         escalating to SIGKILL"
+                    );
+                    if let Err(kill_err) = crate::episode::adapter::escalate_sigkill(&handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed for duplicate adapter process; \
+                             retaining handle in orphan tracker"
+                        );
+                        self.orphan_harness_handles.lock().await.push(handle);
+                    }
+                }
+                return Err(EpisodeError::Internal {
+                    message: format!(
+                        "episode {episode_id} already has an active harness handle; \
+                         concurrent spawn_adapter won the race"
+                    ),
+                });
+            }
+            entry.harness_handle = Some(handle);
+        }
+
+        // Spawn background bridge task to consume the event stream.
+        // Tool-request intents are captured with explicit stub markers
+        // (tool execution is deferred to TCK-00401).
+        let bridge_episode_id = episode_id.clone();
+        tokio::spawn(async move {
+            Self::event_stream_bridge(bridge_episode_id, event_stream).await;
+        });
+
+        Ok(())
+    }
+
+    /// Background bridge task that consumes a `HarnessEventStream`.
+    ///
+    /// Tool-request intents are logged with stub markers. Actual tool
+    /// execution is deferred to TCK-00401.
+    async fn event_stream_bridge(
+        episode_id: EpisodeId,
+        mut event_stream: crate::episode::adapter::HarnessEventStream,
+    ) {
+        let mut tool_request_count: u64 = 0;
+
+        while let Some(event) = event_stream.recv().await {
+            match &event {
+                HarnessEvent::ToolRequest {
+                    request_id, tool, ..
+                } => {
+                    tool_request_count += 1;
+                    debug!(
+                        episode_id = %episode_id,
+                        request_id = %request_id,
+                        tool = %tool,
+                        "[STUB] tool-request intent captured (execution deferred to TCK-00401)"
+                    );
+                },
+                HarnessEvent::Terminated {
+                    exit_code,
+                    classification,
+                } => {
+                    info!(
+                        episode_id = %episode_id,
+                        exit_code = ?exit_code,
+                        classification = %classification,
+                        tool_requests_captured = tool_request_count,
+                        "agent process terminated"
+                    );
+                    break;
+                },
+                HarnessEvent::Output { seq, .. } => {
+                    if *seq == 0 {
+                        debug!(
+                            episode_id = %episode_id,
+                            "first output event received from agent process"
+                        );
+                    }
+                },
+                HarnessEvent::Error { code, message } => {
+                    warn!(
+                        episode_id = %episode_id,
+                        code = %code,
+                        message = %message,
+                        "error event from agent process"
+                    );
+                },
+                HarnessEvent::Progress { message, percent } => {
+                    debug!(
+                        episode_id = %episode_id,
+                        message = %message,
+                        percent = ?percent,
+                        "progress event from agent process"
+                    );
+                },
+            }
+        }
+
+        debug!(
+            episode_id = %episode_id,
+            tool_request_count,
+            "event stream bridge task completed"
+        );
+    }
+
     /// Stops an episode, transitioning it from RUNNING to TERMINATED.
     ///
     /// # Arguments
@@ -1295,7 +1653,26 @@ impl EpisodeRuntime {
         // success. On mark_terminated failure the runtime state stays
         // Running so callers can retry.
 
-        {
+        // SECURITY: Fail-closed terminal transition. Process death MUST be
+        // confirmed before committing terminal state. The sequence is:
+        // 1. Validate transition + extract fields (inside lock)
+        // 2. Mark session terminated (inside lock)
+        // 3. Take harness handle (inside lock, state stays Running)
+        // 4. Drop lock
+        // 5. Kill subprocess (outside lock)
+        // 6. On kill success: re-acquire lock, commit Terminated state
+        // 7. On kill failure: re-acquire lock, restore handle, return error
+        //
+        // NOTE (WVR-0005): Concurrent stop/quarantine callers can both pass
+        // the phase-1 admission check before either commits the terminal
+        // state in phase-3. This is a known limitation of the current
+        // lock-release-reacquire pattern. A future ticket should introduce a
+        // per-episode transition mutex or compare-and-swap guard. The current
+        // behavior is safe (both callers attempt kill, only one state
+        // transition commits) but may produce duplicate kill attempts.
+
+        // Phase 1: Validate and prepare (inside lock).
+        let (created_at_ns, started_at_ns, envelope_hash, harness_handle_opt) = {
             let mut episodes = self.episodes.write().await;
 
             let entry =
@@ -1374,16 +1751,86 @@ impl EpisodeRuntime {
                 });
             }
 
-            // Session persisted successfully (or no registry) -- now commit
-            // the runtime terminal transition.
-            entry.state = EpisodeState::Terminated {
-                created_at_ns,
-                started_at_ns,
-                terminated_at_ns: timestamp_ns,
-                envelope_hash,
-                termination_class,
-            };
-            entry.handle = None;
+            // TCK-00399: Take the harness handle. State stays Running until
+            // process death is confirmed (fail-closed). The terminal
+            // transition is committed in Phase 3 below.
+            let harness_handle = entry.harness_handle.take();
+
+            (created_at_ns, started_at_ns, envelope_hash, harness_handle)
+        };
+
+        // Phase 2: Kill subprocess outside the lock.
+        if let Some(ref harness_handle) = harness_handle_opt {
+            let runner_handle = harness_handle.real_runner_handle();
+            let grace_period = harness_handle.terminate_grace_period();
+            match crate::episode::adapter::terminate_with_handle(
+                harness_handle.id(),
+                runner_handle,
+                grace_period,
+            )
+            .await
+            {
+                Ok(status) => {
+                    info!(
+                        episode_id = %episode_id,
+                        exit_status = ?status,
+                        "agent process terminated during episode stop"
+                    );
+                },
+                Err(e) => {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "agent process termination error during episode stop; \
+                         escalating to SIGKILL"
+                    );
+                    // SECURITY: Escalate to direct SIGKILL to prevent
+                    // orphaned processes when the control channel fails.
+                    // Fail-closed: if SIGKILL also fails, restore the
+                    // harness handle and abort the terminal transition.
+                    if let Err(kill_err) =
+                        crate::episode::adapter::escalate_sigkill(harness_handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed during episode stop; \
+                             process death NOT confirmed -- restoring handle \
+                             and aborting terminal transition"
+                        );
+                        // Restore the harness handle so a future retry can
+                        // attempt termination again.
+                        {
+                            let mut episodes = self.episodes.write().await;
+                            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                                entry.harness_handle = harness_handle_opt;
+                            }
+                        }
+                        return Err(EpisodeError::Internal {
+                            message: format!(
+                                "episode {episode_id} stop failed: subprocess kill \
+                                 unconfirmed after SIGKILL escalation: {kill_err}"
+                            ),
+                        });
+                    }
+                },
+            }
+        }
+        drop(harness_handle_opt);
+
+        // Phase 3: Commit terminal state transition (process death confirmed).
+        {
+            let mut episodes = self.episodes.write().await;
+            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                entry.state = EpisodeState::Terminated {
+                    created_at_ns,
+                    started_at_ns,
+                    terminated_at_ns: timestamp_ns,
+                    envelope_hash,
+                    termination_class,
+                };
+                entry.handle = None;
+            }
         }
 
         // Emit event (INV-ER002)
@@ -1618,11 +2065,13 @@ impl EpisodeRuntime {
         reason: QuarantineReason,
         timestamp_ns: u64,
     ) -> Result<(), EpisodeError> {
-        // BLOCKER 1 fix: Make lifecycle transition and mark_terminated
-        // effectively atomic. Mark session terminated FIRST, then commit
-        // the runtime terminal transition only on success.
+        // SECURITY: Fail-closed terminal transition (same pattern as stop).
+        // Process death MUST be confirmed before committing terminal state.
+        // See WVR-0005 note on stop() regarding concurrent terminal
+        // transition callers and the lock-release-reacquire pattern.
 
-        {
+        // Phase 1: Validate and prepare (inside lock).
+        let (created_at_ns, started_at_ns, envelope_hash, quarantine_harness_handle) = {
             let mut episodes = self.episodes.write().await;
 
             let entry =
@@ -1686,16 +2135,81 @@ impl EpisodeRuntime {
                 });
             }
 
-            // Session persisted successfully (or no registry) -- now commit
-            // the runtime terminal transition.
-            entry.state = EpisodeState::Quarantined {
-                created_at_ns,
-                started_at_ns,
-                quarantined_at_ns: timestamp_ns,
-                envelope_hash,
-                reason: reason.clone(),
-            };
-            entry.handle = None;
+            // Take harness handle; state stays Running until process
+            // death is confirmed.
+            let harness_handle = entry.harness_handle.take();
+
+            (created_at_ns, started_at_ns, envelope_hash, harness_handle)
+        };
+
+        // Phase 2: Kill subprocess outside the lock.
+        if let Some(ref harness_handle) = quarantine_harness_handle {
+            let runner_handle = harness_handle.real_runner_handle();
+            let grace_period = harness_handle.terminate_grace_period();
+            match crate::episode::adapter::terminate_with_handle(
+                harness_handle.id(),
+                runner_handle,
+                grace_period,
+            )
+            .await
+            {
+                Ok(status) => {
+                    info!(
+                        episode_id = %episode_id,
+                        exit_status = ?status,
+                        "agent process terminated during episode quarantine"
+                    );
+                },
+                Err(e) => {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "agent process termination error during episode quarantine; \
+                         escalating to SIGKILL"
+                    );
+                    // SECURITY: Escalate to direct SIGKILL. If this also
+                    // fails, restore the handle and abort the transition.
+                    if let Err(kill_err) =
+                        crate::episode::adapter::escalate_sigkill(harness_handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed during episode quarantine; \
+                             process death NOT confirmed -- restoring handle \
+                             and aborting terminal transition"
+                        );
+                        {
+                            let mut episodes = self.episodes.write().await;
+                            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                                entry.harness_handle = quarantine_harness_handle;
+                            }
+                        }
+                        return Err(EpisodeError::Internal {
+                            message: format!(
+                                "episode {episode_id} quarantine failed: subprocess kill \
+                                 unconfirmed after SIGKILL escalation: {kill_err}"
+                            ),
+                        });
+                    }
+                },
+            }
+        }
+        drop(quarantine_harness_handle);
+
+        // Phase 3: Commit terminal state transition (process death confirmed).
+        {
+            let mut episodes = self.episodes.write().await;
+            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                entry.state = EpisodeState::Quarantined {
+                    created_at_ns,
+                    started_at_ns,
+                    quarantined_at_ns: timestamp_ns,
+                    envelope_hash,
+                    reason: reason.clone(),
+                };
+                entry.handle = None;
+            }
         }
 
         // Emit event (INV-ER002)
@@ -2656,6 +3170,280 @@ mod tests {
             result,
             Err(EpisodeError::InvalidTransition { .. })
         ));
+    }
+
+    // =========================================================================
+    // TCK-00399: Adapter spawning tests
+    // =========================================================================
+
+    /// Mock adapter for testing `spawn_adapter` without real PTY processes.
+    struct MockAdapter;
+
+    impl crate::episode::adapter::HarnessAdapter for MockAdapter {
+        fn adapter_type(&self) -> crate::episode::adapter::AdapterType {
+            crate::episode::adapter::AdapterType::Raw
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn spawn(
+            &self,
+            config: crate::episode::adapter::HarnessConfig,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::episode::adapter::AdapterResult<(
+                            crate::episode::adapter::HarnessHandle,
+                            crate::episode::adapter::HarnessEventStream,
+                        )>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+                // Create a dummy control channel (never consumed)
+                let (control_tx, _control_rx) =
+                    tokio::sync::mpsc::channel::<crate::episode::adapter::PtyControlCommand>(1);
+                let inner = crate::episode::adapter::create_real_handle_inner(
+                    99999, // fake PID
+                    None, control_tx,
+                );
+                let handle = crate::episode::adapter::HarnessHandle::new(
+                    1,
+                    config.episode_id.clone(),
+                    config.terminate_grace_period,
+                    inner,
+                );
+
+                // Send a terminated event after a short delay to complete the bridge
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let _ = event_tx
+                        .send(crate::episode::adapter::HarnessEvent::Terminated {
+                            exit_code: Some(0),
+                            classification:
+                                crate::episode::adapter::TerminationClassification::Success,
+                        })
+                        .await;
+                });
+
+                Ok((handle, event_rx))
+            })
+        }
+
+        fn send_input(
+            &self,
+            _handle: &crate::episode::adapter::HarnessHandle,
+            _input: &[u8],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = crate::episode::adapter::AdapterResult<()>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn terminate(
+            &self,
+            _handle: &crate::episode::adapter::HarnessHandle,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::episode::adapter::AdapterResult<std::process::ExitStatus>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                // Cannot construct ExitStatus directly, so this is best-effort.
+                // In practice, terminate is called via terminate_with_handle which
+                // uses the real handle; mock tests avoid this path.
+                Err(crate::episode::adapter::AdapterError::TerminateFailed {
+                    reason: "mock terminate not implemented".to_string(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_adapter_requires_running_state() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        // Episode is in Created state, not Running. spawn_adapter should fail.
+        let config = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        let result = runtime.spawn_adapter(&episode_id, config, &adapter).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("expected Running"),
+            "Error should mention expected Running, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_adapter_success() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let config = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        let result = runtime.spawn_adapter(&episode_id, config, &adapter).await;
+        assert!(result.is_ok(), "spawn_adapter should succeed: {result:?}");
+
+        // Verify harness_handle is stored
+        let episodes = runtime.episodes.read().await;
+        let entry = episodes.get(episode_id.as_str()).unwrap();
+        assert!(
+            entry.harness_handle.is_some(),
+            "harness_handle should be stored after spawn"
+        );
+    }
+
+    /// Verifies that `spawn_adapter` rejects a second spawn when an active
+    /// harness handle already exists (MAJOR 1: prevent orphaned processes).
+    #[tokio::test]
+    async fn test_spawn_adapter_rejects_respawn_with_active_handle() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        // First spawn succeeds
+        let config1 = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        let result1 = runtime.spawn_adapter(&episode_id, config1, &adapter).await;
+        assert!(result1.is_ok(), "first spawn should succeed: {result1:?}");
+
+        // Second spawn must be rejected because the first handle is still active
+        let config2 = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let result2 = runtime.spawn_adapter(&episode_id, config2, &adapter).await;
+        assert!(result2.is_err(), "second spawn should be rejected");
+        let err = result2.unwrap_err();
+        assert!(
+            format!("{err}").contains("already has an active harness handle"),
+            "Error should mention active harness handle, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_clears_harness_handle() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let config = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        runtime
+            .spawn_adapter(&episode_id, config, &adapter)
+            .await
+            .unwrap();
+
+        // Pre-mark the mock handle as terminated (the mock uses a fake
+        // PID 99999 with no start-time binding).  With fail-closed
+        // semantics, stop() refuses to commit terminal state unless the
+        // process is confirmed dead.  Marking terminated simulates the
+        // child process already having exited.
+        {
+            let episodes = runtime.episodes.read().await;
+            let entry = episodes.get(episode_id.as_str()).unwrap();
+            if let Some(ref handle) = entry.harness_handle {
+                let runner = handle.real_runner_handle();
+                runner.lock().await.mark_terminated();
+            }
+        }
+
+        // Stop the episode -- this should extract and drop the harness handle
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        // Verify episode is terminated
+        let state = runtime.observe(&episode_id).await.unwrap();
+        assert!(
+            state.is_terminal(),
+            "episode should be terminated after stop"
+        );
+    }
+
+    /// Verifies fail-closed semantics: `stop()` succeeds when the mock
+    /// process (PID 99999) does not exist -- ESRCH confirms the process
+    /// is dead even when PID binding validation fails (no /proc entry).
+    /// The terminal transition should proceed because process death is
+    /// confirmed.
+    #[tokio::test]
+    async fn test_stop_confirms_death_via_esrch_for_nonexistent_pid() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let config = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        runtime
+            .spawn_adapter(&episode_id, config, &adapter)
+            .await
+            .unwrap();
+
+        // Do NOT mark handle as terminated. The mock uses fake PID 99999
+        // which does not exist. escalate_sigkill should detect ESRCH
+        // (process does not exist) and confirm death.
+        let result = runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "stop should succeed when ESRCH confirms process death: {result:?}"
+        );
+
+        // Verify episode is terminated
+        let state = runtime.observe(&episode_id).await.unwrap();
+        assert!(
+            state.is_terminal(),
+            "episode should be terminated after stop"
+        );
     }
 
     #[tokio::test]

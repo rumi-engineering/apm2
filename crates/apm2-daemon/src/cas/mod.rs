@@ -721,9 +721,15 @@ impl crate::episode::executor::ContentAddressedStore for DurableCas {
     }
 }
 
-/// TCK-00408: Implement the core evidence CAS trait so that `DurableCas` can
-/// be wired into `PrivilegedDispatcher` for fail-closed CAS validation in
-/// publish and ingest handlers.
+// =============================================================================
+// Core ContentAddressedStore trait implementation (apm2_core::evidence)
+// =============================================================================
+
+/// Bridges `DurableCas` to the core CAS trait used by `apm2_core` types
+/// (e.g., `AgentAdapterProfileV1::load_from_cas`).
+///
+/// This allows the same `DurableCas` instance to be shared with components
+/// that require `apm2_core::evidence::ContentAddressedStore` (fallible API).
 impl apm2_core::evidence::ContentAddressedStore for DurableCas {
     fn store(
         &self,
@@ -735,46 +741,52 @@ impl apm2_core::evidence::ContentAddressedStore for DurableCas {
                 size: r.size,
                 is_new: r.is_new,
             })
-            .map_err(
-                |e: DurableCasError| apm2_core::evidence::CasError::StorageError {
-                    message: e.to_string(),
-                },
-            )
+            .map_err(durable_to_core_error)
     }
 
-    fn retrieve(
-        &self,
-        hash: &apm2_core::crypto::Hash,
-    ) -> Result<Vec<u8>, apm2_core::evidence::CasError> {
-        Self::retrieve(self, hash).map_err(|e| match e {
-            DurableCasError::NotFound { hash: h } => {
-                apm2_core::evidence::CasError::NotFound { hash: h }
-            },
-            DurableCasError::HashMismatch { expected, actual } => {
-                apm2_core::evidence::CasError::HashMismatch { expected, actual }
-            },
-            other => apm2_core::evidence::CasError::StorageError {
-                message: other.to_string(),
-            },
-        })
+    fn retrieve(&self, hash: &Hash) -> Result<Vec<u8>, apm2_core::evidence::CasError> {
+        Self::retrieve(self, hash).map_err(durable_to_core_error)
     }
 
-    fn exists(
-        &self,
-        hash: &apm2_core::crypto::Hash,
-    ) -> Result<bool, apm2_core::evidence::CasError> {
+    fn exists(&self, hash: &Hash) -> Result<bool, apm2_core::evidence::CasError> {
         Ok(Self::exists(self, hash))
     }
 
-    fn size(&self, hash: &apm2_core::crypto::Hash) -> Result<usize, apm2_core::evidence::CasError> {
-        Self::size(self, hash).map_err(|e| match e {
-            DurableCasError::NotFound { hash: h } => {
-                apm2_core::evidence::CasError::NotFound { hash: h }
-            },
-            other => apm2_core::evidence::CasError::StorageError {
-                message: other.to_string(),
-            },
-        })
+    fn size(&self, hash: &Hash) -> Result<usize, apm2_core::evidence::CasError> {
+        Self::size(self, hash).map_err(durable_to_core_error)
+    }
+}
+
+/// Maps `DurableCasError` to `apm2_core::evidence::CasError`.
+fn durable_to_core_error(e: DurableCasError) -> apm2_core::evidence::CasError {
+    match e {
+        DurableCasError::NotFound { hash } => apm2_core::evidence::CasError::NotFound { hash },
+        DurableCasError::HashMismatch { expected, actual } => {
+            apm2_core::evidence::CasError::HashMismatch { expected, actual }
+        },
+        DurableCasError::Collision { hash } => apm2_core::evidence::CasError::Collision { hash },
+        DurableCasError::ContentTooLarge { size, max_size } => {
+            apm2_core::evidence::CasError::ContentTooLarge { size, max_size }
+        },
+        DurableCasError::EmptyContent => apm2_core::evidence::CasError::EmptyContent,
+        DurableCasError::InvalidHash { expected, actual } => {
+            apm2_core::evidence::CasError::InvalidHash { expected, actual }
+        },
+        DurableCasError::StorageFull {
+            current_size,
+            new_size,
+            max_size,
+        } => apm2_core::evidence::CasError::StorageFull {
+            current_size,
+            new_size,
+            max_size,
+        },
+        DurableCasError::Io { context, source } => apm2_core::evidence::CasError::StorageError {
+            message: format!("{context}: {source}"),
+        },
+        DurableCasError::InitializationFailed { message } => {
+            apm2_core::evidence::CasError::StorageError { message }
+        },
     }
 }
 

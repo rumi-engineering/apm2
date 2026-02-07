@@ -483,6 +483,19 @@ impl DispatcherState {
             let clock =
                 Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
+            // TCK-00399: Create adapter registry so SpawnEpisode can spawn
+            // adapter processes (fail-closed: registry is required).
+            let mut adapter_registry = crate::episode::AdapterRegistry::new();
+            adapter_registry.register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
+            adapter_registry.register(Box::new(
+                crate::episode::claude_code::ClaudeCodeAdapter::new(),
+            ));
+            let adapter_registry = Arc::new(adapter_registry);
+
+            // TCK-00399: CAS for adapter profile resolution during spawn.
+            let cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
+                Arc::new(apm2_core::evidence::MemoryCas::new());
+
             PrivilegedDispatcher::with_dependencies(
                 DecodeConfig::default(),
                 policy_resolver,
@@ -500,6 +513,9 @@ impl DispatcherState {
             )
             // TCK-00352: Wire V1 manifest store into production path
             .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
+            // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
+            .with_adapter_registry(adapter_registry)
+            .with_cas(cas)
         } else {
             // Use stubs
             let clock = Arc::new(
@@ -662,8 +678,12 @@ impl DispatcherState {
         // CAS traits (TCK-00408: dispatcher needs evidence::ContentAddressedStore).
         let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
         let durable_cas = Arc::new(DurableCas::new(cas_config)?);
+        // Coerce to executor::ContentAddressedStore (infallible, daemon-local)
         let cas: Arc<dyn ContentAddressedStore> =
             Arc::clone(&durable_cas) as Arc<dyn ContentAddressedStore>;
+        // Coerce to apm2_core::evidence::ContentAddressedStore (fallible, core)
+        // Used by PrivilegedDispatcher for AgentAdapterProfileV1::load_from_cas
+        // and TCK-00408 fail-closed ingest/publish validation.
         let evidence_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
             Arc::clone(&durable_cas) as Arc<dyn apm2_core::evidence::ContentAddressedStore>;
 
@@ -750,6 +770,18 @@ impl DispatcherState {
             // call mark_terminated() in production.
             .with_session_registry(session_registry_for_runtime);
 
+        // TCK-00399: Create adapter registry with explicit adapter registrations.
+        // MAJOR fix: Use explicit new() + register() instead of deprecated
+        // with_defaults() to avoid ambient defaults (DoD requires
+        // profile-explicit production path).
+        let mut adapter_registry = crate::episode::AdapterRegistry::new();
+        adapter_registry.register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
+        adapter_registry.register(Box::new(
+            crate::episode::claude_code::ClaudeCodeAdapter::new(),
+        ));
+        let adapter_registry = Arc::new(adapter_registry);
+        let episode_runtime = episode_runtime.with_adapter_registry(Arc::clone(&adapter_registry));
+
         let episode_runtime = Arc::new(episode_runtime);
 
         // TCK-00343: Create credential store for credential management
@@ -778,7 +810,9 @@ impl DispatcherState {
         // ingest/publish validation. Uses the core evidence trait impl.
         .with_cas(Arc::clone(&evidence_cas))
         // TCK-00352: Wire V1 manifest store into production path
-        .with_v1_manifest_store(Arc::clone(&v1_manifest_store));
+        .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
+        // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
+        .with_adapter_registry(adapter_registry);
 
         let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(Arc::clone(metrics))

@@ -221,6 +221,21 @@ impl ClaudeCodeAdapter {
             .unwrap_or(0)
     }
 
+    /// Converts `HarnessConfig` env map to the `(CString, CString)` pairs
+    /// expected by `PtyConfig`.
+    fn harness_env_to_pty_env(
+        env: &std::collections::HashMap<String, secrecy::SecretString>,
+    ) -> Vec<(std::ffi::CString, std::ffi::CString)> {
+        use secrecy::ExposeSecret;
+        env.iter()
+            .filter_map(|(k, v)| {
+                let key = std::ffi::CString::new(k.as_bytes()).ok()?;
+                let val = std::ffi::CString::new(v.expose_secret().as_bytes()).ok()?;
+                Some((key, val))
+            })
+            .collect()
+    }
+
     /// Classify the exit status into a termination classification.
     const fn classify_exit(exit_status: super::pty::ExitStatus) -> TerminationClassification {
         match exit_status {
@@ -252,9 +267,16 @@ impl ClaudeCodeAdapter {
         let episode_id = config.episode_id.clone();
         let terminate_grace_period = config.terminate_grace_period;
 
-        // Create PTY configuration from harness config
+        // Create PTY configuration from harness config.
+        // SECURITY: Pass cwd and env from HarnessConfig to PtyConfig so
+        // the child process uses the guarded values instead of inheriting
+        // the daemon's ambient cwd/env (BLOCKER: exec boundary enforcement).
         let (cols, rows) = config.pty_size;
-        let pty_config = PtyConfig::default().with_window_size(cols, rows);
+        let mut pty_config = PtyConfig::default().with_window_size(cols, rows);
+        if let Some(ref cwd) = config.cwd {
+            pty_config = pty_config.with_cwd(cwd);
+        }
+        pty_config = pty_config.with_env(Self::harness_env_to_pty_env(&config.env));
 
         // Get timestamp for spawn
         let timestamp_ns = Self::now_ns();

@@ -68,7 +68,7 @@ use nix::libc;
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, close, execvp, fork, setsid};
+use nix::unistd::{ForkResult, Pid, close, fork, setsid};
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -210,6 +210,19 @@ pub enum PtyError {
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
+    /// Command not found in PATH during pre-fork resolution.
+    ///
+    /// This occurs when the command is a non-absolute path (e.g. `claude`)
+    /// and cannot be found in any directory listed in the configured PATH
+    /// environment variable.
+    #[error("command not found: '{command}' not found in PATH '{path}'")]
+    CommandNotFound {
+        /// The command that was not found.
+        command: String,
+        /// The PATH that was searched.
+        path: String,
+    },
+
     /// PTY write timed out due to sustained backpressure.
     ///
     /// This occurs when the PTY write loop cannot complete within the
@@ -259,7 +272,7 @@ impl ExitStatus {
 /// - `read_buffer_size`: max 64KB
 /// - `ring_buffer_capacity`: max 4096
 /// - `channel_capacity`: max 8192
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PtyConfig {
     /// Initial window size (cols, rows).
     window_size: (u16, u16),
@@ -269,6 +282,13 @@ pub struct PtyConfig {
     channel_capacity: usize,
     /// Read buffer size.
     read_buffer_size: usize,
+    /// Working directory for the child process (security-critical: prevents
+    /// inheriting the daemon's cwd).
+    cwd: Option<std::path::PathBuf>,
+    /// Environment variables for the child process.  When non-empty the child
+    /// environment is set **exactly** to these entries (no ambient
+    /// inheritance).
+    env: Vec<(CString, CString)>,
 }
 
 impl Default for PtyConfig {
@@ -278,6 +298,8 @@ impl Default for PtyConfig {
             ring_buffer_capacity: 1024,
             channel_capacity: OUTPUT_CHANNEL_CAPACITY,
             read_buffer_size: READ_BUFFER_SIZE,
+            cwd: None,
+            env: Vec::new(),
         }
     }
 }
@@ -335,6 +357,8 @@ impl PtyConfig {
             ring_buffer_capacity,
             channel_capacity,
             read_buffer_size,
+            cwd: None,
+            env: Vec::new(),
         })
     }
 
@@ -413,6 +437,42 @@ impl PtyConfig {
         };
         self
     }
+
+    /// Sets the working directory for the child process.
+    ///
+    /// # Security
+    ///
+    /// When set, the child process uses `chdir` before `execvp` instead of
+    /// inheriting the daemon's working directory.
+    #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Sets the environment for the child process (replaces ambient env).
+    ///
+    /// # Security
+    ///
+    /// When non-empty, the child environment is set to exactly these entries
+    /// via `clearenv` + `setenv`, preventing daemon env leakage.
+    #[must_use]
+    pub fn with_env(mut self, env: Vec<(CString, CString)>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Returns the configured working directory, if any.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
+    }
+
+    /// Returns the configured environment entries.
+    #[must_use]
+    pub fn env_entries(&self) -> &[(CString, CString)] {
+        &self.env
+    }
 }
 
 /// PTY runner for managing a child process with PTY I/O.
@@ -466,6 +526,7 @@ impl PtyRunner {
     ///
     /// This function uses `unsafe` for the fork/exec sequence. The child
     /// process performs minimal operations before exec to minimize risk.
+    #[allow(clippy::needless_pass_by_value)] // config is consumed across fork
     pub fn spawn<P, S>(
         program: P,
         args: &[S],
@@ -478,7 +539,9 @@ impl PtyRunner {
     {
         let program_path = program.as_ref();
 
-        // Validate program path
+        // Validate program path — this is the original command (may be
+        // relative like "claude").  We use it for argv[0] per POSIX
+        // convention.
         let program_cstr = path_to_cstring(program_path)?;
 
         // Build args as CStrings (program name should be argv[0])
@@ -494,6 +557,97 @@ impl PtyRunner {
                 .map_err(|_| PtyError::InvalidCommand("argument contains null byte".to_string()))?;
             arg_cstrings.push(cstr);
         }
+
+        // SECURITY: Pre-fork preparation of all exec inputs to avoid
+        // async-signal-unsafe operations (heap allocation, CString::new,
+        // clearenv, setenv) in the post-fork child. After fork() in a
+        // multi-threaded process, only async-signal-safe functions may be
+        // called before exec.
+
+        // Pre-fork: prepare cwd CString if configured.
+        let cwd_cstr: Option<CString> = match &config.cwd {
+            Some(cwd) => Some(CString::new(cwd.as_os_str().as_bytes()).map_err(|_| {
+                PtyError::InvalidCommand("cwd path contains null byte".to_string())
+            })?),
+            None => None,
+        };
+
+        // Pre-fork: build envp array for execve. Each entry is
+        // "KEY=VALUE\0" as a CString. The array is terminated by a null
+        // pointer. We keep the owning Vec<CString> alive across the fork
+        // so the pointers remain valid in the child.
+        let env_cstrings: Vec<CString> = config
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let mut entry = Vec::with_capacity(k.as_bytes().len() + 1 + v.as_bytes().len());
+                entry.extend_from_slice(k.as_bytes());
+                entry.push(b'=');
+                entry.extend_from_slice(v.as_bytes());
+                // SAFETY: k and v are CStrings (no interior NUL); the only
+                // added byte is '=' which is not NUL.
+                CString::new(entry).expect("env key=value should not contain NUL")
+            })
+            .collect();
+        let use_custom_env = !config.env.is_empty();
+
+        // Pre-fork: resolve non-absolute commands via PATH from the custom
+        // environment.  `execve` does NOT perform PATH search, so built-in
+        // adapter profiles that use bare command names (claude, gemini,
+        // codex, ollama) would fail with ENOENT.  We resolve the absolute
+        // path here (pre-fork) so the child can use `execve` with the
+        // resolved path, preserving async-signal-safety.
+        //
+        // Standard Unix exec semantics: PATH search only applies to bare
+        // command names (no `/`).  Commands containing `/` (absolute like
+        // `/usr/bin/foo` or relative like `./agent.sh`, `bin/agent`) are
+        // passed directly to execve — the kernel resolves them relative to
+        // cwd without consulting PATH.
+        //
+        // The resolved CString is kept separate from program_cstr because
+        // argv[0] should remain the original command name per POSIX
+        // convention.
+        let command_bytes = program_path.as_os_str().as_bytes();
+        let needs_path_resolution = use_custom_env && !command_bytes.contains(&b'/');
+        let exec_program_cstr: CString = if needs_path_resolution {
+            // Extract PATH value from the custom env entries.
+            let env_path = config
+                .env
+                .iter()
+                .find_map(|(k, v)| {
+                    if k.as_bytes() == b"PATH" {
+                        v.to_str().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("");
+
+            let command_str = program_path.to_str().unwrap_or("");
+            let resolved = resolve_executable_in_path(command_str, env_path)?;
+            path_to_cstring(&resolved)?
+        } else {
+            // Absolute path, relative path with `/`, or no custom env
+            // — use as-is (kernel resolves relative to cwd).
+            program_cstr.clone()
+        };
+
+        // Pre-fork: build the raw pointer array for execve envp parameter.
+        // Must be null-terminated.
+        let envp_ptrs: Vec<*const libc::c_char> = {
+            let mut ptrs: Vec<*const libc::c_char> =
+                env_cstrings.iter().map(|c| c.as_ptr()).collect();
+            ptrs.push(std::ptr::null());
+            ptrs
+        };
+
+        // Pre-fork: build the raw pointer array for execvp/execve argv.
+        let argv_ptrs: Vec<*const libc::c_char> = {
+            let mut ptrs: Vec<*const libc::c_char> =
+                arg_cstrings.iter().map(|c| c.as_ptr()).collect();
+            ptrs.push(std::ptr::null());
+            ptrs
+        };
 
         // Create PTY pair
         let (cols, rows) = config.window_size();
@@ -511,7 +665,8 @@ impl PtyRunner {
 
         // Fork child process
         // SAFETY: We perform minimal operations in the child before exec.
-        // The child sets up the session/terminal and execs immediately.
+        // All CStrings, argv, envp, and cwd are prepared above (pre-fork).
+        // The child only calls async-signal-safe functions before exec.
         let fork_result = unsafe { fork() }.map_err(PtyError::Fork)?;
 
         match fork_result {
@@ -572,16 +727,44 @@ impl PtyRunner {
                     let _ = close(slave_fd);
                 }
 
-                // Execute the program
-                // This replaces the current process image
-                // SAFETY: _exit is safe to call from the child process
-                if execvp(&program_cstr, &arg_cstrings).is_err() {
-                    unsafe { libc::_exit(127) }; // 127 = command not found convention
+                // SECURITY: Apply HarnessConfig cwd before exec to prevent
+                // child from inheriting daemon's working directory.
+                // SAFETY: chdir is async-signal-safe. The CString was
+                // prepared pre-fork so no allocation occurs here.
+                if let Some(ref cwd) = cwd_cstr {
+                    unsafe {
+                        if libc::chdir(cwd.as_ptr()) != 0 {
+                            libc::_exit(1);
+                        }
+                    }
                 }
 
-                // execvp never returns on success, but if it somehow does, exit
-                // SAFETY: _exit is safe to call from the child process
-                unsafe { libc::_exit(1) };
+                // SECURITY: Apply HarnessConfig env via execve envp instead
+                // of clearenv/setenv (which are NOT async-signal-safe).
+                // The envp array was fully constructed pre-fork.
+                //
+                // When custom env is configured, use execve with the
+                // precomputed envp to atomically replace the environment.
+                // When no custom env, use execvp for PATH resolution with
+                // inherited environment.
+                unsafe {
+                    if use_custom_env {
+                        // execve: no PATH search, uses precomputed envp.
+                        // exec_program_cstr was resolved pre-fork to an
+                        // absolute path via resolve_executable_in_path when
+                        // the original command was non-absolute.
+                        libc::execve(
+                            exec_program_cstr.as_ptr(),
+                            argv_ptrs.as_ptr(),
+                            envp_ptrs.as_ptr(),
+                        );
+                    } else {
+                        // execvp: PATH search, inherits parent environment.
+                        libc::execvp(program_cstr.as_ptr(), argv_ptrs.as_ptr());
+                    }
+                    // exec only returns on failure
+                    libc::_exit(127);
+                }
             },
             ForkResult::Parent { child } => {
                 // Parent process
@@ -985,6 +1168,58 @@ impl Drop for PtyRunner {
             }
         }
     }
+}
+
+/// Resolves a non-absolute command to an absolute path by searching the
+/// given PATH string (colon-separated directory list).
+///
+/// This is the pre-fork equivalent of the PATH resolution that `execvp`
+/// does internally.  By performing resolution before `fork()`, we:
+///
+/// 1. Return a clear error to the caller instead of getting ENOENT from the
+///    child (which would just `_exit(127)` with no diagnostics).
+/// 2. Allow use of `execve` (which requires an absolute path) in the post-fork
+///    child, preserving async-signal-safety.
+///
+/// # Arguments
+///
+/// * `command` - The command name to resolve (must not be absolute).
+/// * `path_value` - The PATH string to search (colon-separated directories).
+///
+/// # Returns
+///
+/// The absolute path to the executable, or `PtyError::CommandNotFound` if
+/// the command cannot be found or is not executable in any PATH directory.
+fn resolve_executable_in_path(
+    command: &str,
+    path_value: &str,
+) -> Result<std::path::PathBuf, PtyError> {
+    for dir in path_value.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = std::path::PathBuf::from(dir).join(command);
+        // Check that the candidate exists and is executable.
+        // We use access(2) with X_OK which is the same check the kernel
+        // does during execve, minus race conditions that are inherent
+        // to any pre-check.
+        if candidate.is_file() {
+            // Use libc::access to check X_OK (executable permission).
+            if let Ok(c) = CString::new(candidate.as_os_str().as_bytes()) {
+                // SAFETY: c is a valid null-terminated C string pointing to a
+                // valid filesystem path.  access(2) is a standard POSIX call
+                // that only reads the path and does not modify any state.
+                let ret = unsafe { libc::access(c.as_ptr(), libc::X_OK) };
+                if ret == 0 {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err(PtyError::CommandNotFound {
+        command: command.to_string(),
+        path: path_value.to_string(),
+    })
 }
 
 /// Converts a path to a `CString`.

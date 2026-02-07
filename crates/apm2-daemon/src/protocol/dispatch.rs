@@ -45,7 +45,7 @@ use bytes::Bytes;
 use prost::Message;
 use secrecy::SecretString;
 use subtle::ConstantTimeEq;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::credentials::PeerCredentials;
 use super::error::{ProtocolError, ProtocolResult};
@@ -2508,6 +2508,19 @@ pub struct PolicyResolution {
     /// to validate the candidate manifest against.
     #[serde(default)]
     pub resolved_scope_baseline: Option<crate::episode::capability::ScopeBaseline>,
+
+    /// Policy-bound adapter profile hash (BLOCKER security fix).
+    ///
+    /// When present, `SpawnEpisode` MUST use this exact adapter profile hash.
+    /// Any request supplying a different hash is rejected (confused-deputy
+    /// prevention). CAS existence alone is NOT authorization -- the profile
+    /// must be policy-bound to the caller's scope.
+    ///
+    /// When `None` (rollout waiver WVR-0003), callers may supply any
+    /// CAS-present hash or fall back to the role-based default. This field
+    /// will become mandatory once governance populates it.
+    #[serde(default)]
+    pub expected_adapter_profile_hash: Option<[u8; 32]>,
 }
 
 /// Serde default for `resolved_risk_tier`: returns `4` (Tier4, most
@@ -2706,6 +2719,7 @@ impl PolicyResolver for StubPolicyResolver {
             context_pack_hash,
             resolved_risk_tier: 0, // Stub resolver: Tier0 default
             resolved_scope_baseline,
+            expected_adapter_profile_hash: None, // TODO(TCK-00399): populate from governance
         })
     }
 }
@@ -4603,6 +4617,13 @@ pub struct PrivilegedDispatcher {
     /// Only governance transport/communication failures call
     /// `record_failure()`.
     governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
+
+    /// TCK-00399: Adapter registry for spawning agent CLI processes.
+    ///
+    /// When present, `handle_spawn_episode` loads the adapter profile from
+    /// CAS, builds a `HarnessConfig`, and spawns the agent process via the
+    /// appropriate `HarnessAdapter`.
+    adapter_registry: Option<Arc<crate::episode::AdapterRegistry>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -4616,11 +4637,11 @@ impl Default for PrivilegedDispatcher {
     }
 }
 
-/// Default session token TTL (1 hour).
+/// Default session token TTL (5 minutes).
 ///
-/// Per RFC-0017, session tokens should have a reasonable TTL that matches
-/// lease expiration. 1 hour is a sensible default for development.
-pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 3600;
+/// Per WVR-0002, env-only bootstrap tokens MUST have a TTL <= 300 seconds.
+/// This was previously 3600s (1 hour) which violated the waiver constraint.
+pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 300;
 
 /// Stop-condition policy floor for untrusted `SpawnEpisode` inputs.
 ///
@@ -4744,6 +4765,7 @@ impl PrivilegedDispatcher {
             stop_conditions_store: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            adapter_registry: None,
         }
     }
 
@@ -4806,6 +4828,7 @@ impl PrivilegedDispatcher {
             stop_conditions_store: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            adapter_registry: None,
         }
     }
 
@@ -4887,6 +4910,7 @@ impl PrivilegedDispatcher {
             stop_conditions_store: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            adapter_registry: None,
         }
     }
 
@@ -4945,6 +4969,7 @@ impl PrivilegedDispatcher {
             stop_conditions_store: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            adapter_registry: None,
         }
     }
 
@@ -5055,6 +5080,13 @@ impl PrivilegedDispatcher {
         monitor: Arc<GovernanceFreshnessMonitor>,
     ) -> Self {
         self.governance_freshness_monitor = Some(monitor);
+        self
+    }
+
+    /// Sets the adapter registry for spawning agent CLI processes (TCK-00399).
+    #[must_use]
+    pub fn with_adapter_registry(mut self, registry: Arc<crate::episode::AdapterRegistry>) -> Self {
+        self.adapter_registry = Some(registry);
         self
     }
 
@@ -5890,12 +5922,42 @@ impl PrivilegedDispatcher {
     /// exists in CAS (fail-closed). If omitted, resolves a deterministic
     /// built-in default by `WorkRole` and stores it in CAS so that auditors
     /// reading the ledger can resolve the hash (MAJOR-1 security fix).
+    ///
+    /// # Policy Binding (BLOCKER security fix)
+    ///
+    /// When the policy resolution carries an `expected_adapter_profile_hash`,
+    /// the resolved hash MUST match exactly. This prevents confused-deputy
+    /// attacks where an authorized caller substitutes a different CAS-present
+    /// profile to gain access to different command/env configurations.
+    ///
+    /// CAS existence is NOT authorization. The profile must be bound to the
+    /// caller's policy scope.
+    ///
+    /// # Authorization Trust Chain
+    ///
+    /// The `requested_hash` originates from the `SpawnEpisodeRequest`, whose
+    /// caller has already been authenticated and authorized by the time this
+    /// method is invoked:
+    ///
+    /// 1. `ClaimWork` established a policy resolution for the `work_id`,
+    ///    binding the caller identity and lease.
+    /// 2. `handle_spawn_episode` verified the `work_id` has a valid claim (line
+    ///    ~6306), the role matches the claim, and the `lease_id` matches via
+    ///    constant-time comparison (line ~6346).
+    /// 3. Therefore the `adapter_profile_hash` was submitted by an authorized
+    ///    caller. The CAS-existence check here ensures the hash refers to a
+    ///    well-formed, previously stored profile -- not that the caller is
+    ///    allowed to use it (that was established upstream).
+    /// 4. When `expected_adapter_profile_hash` is set in the policy resolution,
+    ///    the resolved hash is validated against it using constant-time
+    ///    comparison, closing the confused-deputy gap.
     fn resolve_spawn_adapter_profile_hash(
         &self,
         requested_hash: Option<&[u8]>,
         role: WorkRole,
+        claim: &WorkClaim,
     ) -> Result<[u8; 32], String> {
-        if let Some(raw_hash) = requested_hash {
+        let resolved_hash = if let Some(raw_hash) = requested_hash {
             if raw_hash.len() != 32 {
                 return Err(format!(
                     "adapter_profile_hash must be exactly 32 bytes, got {}",
@@ -5906,6 +5968,11 @@ impl PrivilegedDispatcher {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(raw_hash);
 
+            // SECURITY: CAS-existence check. The caller was already authorized
+            // via ClaimWork + lease_id verification in handle_spawn_episode
+            // (see doc comment above). This check ensures the hash references
+            // a valid, previously stored profile -- not that the caller is
+            // allowed to use it (that was established upstream).
             let cas = self.cas.as_ref().ok_or_else(|| {
                 "adapter_profile_hash validation requires CAS configuration".to_string()
             })?;
@@ -5918,10 +5985,46 @@ impl PrivilegedDispatcher {
                     hex::encode(hash)
                 ));
             }
-            return Ok(hash);
+            hash
+        } else {
+            self.resolve_default_adapter_profile(role)?
+        };
+
+        // SECURITY (BLOCKER fix): Policy-binding validation.
+        //
+        // When the policy resolution carries an expected_adapter_profile_hash,
+        // the resolved hash MUST match exactly. This prevents confused-deputy
+        // attacks where an authorized caller substitutes a CAS-present profile
+        // hash that differs from the policy-bound one.
+        //
+        // Uses constant-time comparison to prevent timing side-channels that
+        // could leak information about the expected hash.
+        if let Some(expected_hash) = claim.policy_resolution.expected_adapter_profile_hash {
+            let binding_matches = bool::from(resolved_hash.ct_eq(&expected_hash));
+            if !binding_matches {
+                return Err(format!(
+                    "adapter_profile_hash policy binding mismatch: \
+                     resolved {} but policy expects {}",
+                    hex::encode(resolved_hash),
+                    hex::encode(expected_hash)
+                ));
+            }
+        } else {
+            // WVR-0003: Policy-level adapter profile binding is not yet
+            // populated by governance resolution. Once governance populates
+            // expected_adapter_profile_hash in PolicyResolution, this branch
+            // will be removed and mismatches will be hard-rejected.
+            // Accepted risk: CAS-existence serves as the authorization check
+            // until governance wiring is complete.
+            tracing::debug!(
+                work_id = %claim.work_id,
+                resolved_hash = %hex::encode(resolved_hash),
+                "adapter_profile_hash accepted under rollout waiver WVR-0003 \
+                 (no policy binding present)"
+            );
         }
 
-        self.resolve_default_adapter_profile(role)
+        Ok(resolved_hash)
     }
 
     /// Resolves the role-based default adapter profile hash.
@@ -5959,6 +6062,122 @@ impl PrivilegedDispatcher {
     /// authoritative role spec binding yet, so this may return `None`.
     const fn derive_role_spec_hash(_claim: &WorkClaim) -> Option<[u8; 32]> {
         None
+    }
+
+    /// Builds a `HarnessConfig` from an adapter profile and spawn parameters
+    /// (TCK-00399).
+    ///
+    /// # Security
+    ///
+    /// - Session token is passed via env only (WVR-0002), NEVER in argv
+    /// - Security-critical env vars cannot be overridden by the profile
+    /// - `workspace_root` path traversal is prevented by
+    ///   `HarnessConfig::validate()`
+    fn build_harness_config(
+        profile: &apm2_core::fac::AgentAdapterProfileV1,
+        episode_id: &str,
+        workspace_root: &str,
+        prompt: &str,
+        model: &str,
+        session_token: &secrecy::SecretString,
+    ) -> Result<crate::episode::HarnessConfig, String> {
+        use secrecy::ExposeSecret;
+
+        /// Environment variable names that MUST NOT be overridden by
+        /// adapter profiles (privilege escalation / library injection).
+        const FORBIDDEN_ENV_KEYS: &[&str] = &[
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ];
+
+        /// Known template placeholder tokens. Only these are flagged as
+        /// unresolved after expansion; arbitrary `{...}` strings (e.g.,
+        /// JSON literals) are accepted.
+        const KNOWN_PLACEHOLDERS: &[&str] = &["{workspace}", "{prompt}", "{model}", "{episode_id}"];
+
+        // Expand args_template placeholders.
+        // SECURITY: session_token MUST NEVER appear in argv (WVR-0002).
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let expanded_args: Vec<String> = profile
+            .args_template
+            .iter()
+            .map(|arg| {
+                arg.replace("{workspace}", workspace_root)
+                    .replace("{prompt}", prompt)
+                    .replace("{model}", model)
+            })
+            .collect();
+
+        // Defense-in-depth: verify session_token is not in any arg.
+        let token_str = session_token.expose_secret();
+        for (i, arg) in expanded_args.iter().enumerate() {
+            if arg.contains(token_str) {
+                return Err(format!(
+                    "security violation: session_token found in argv[{i}] \
+                     after template expansion"
+                ));
+            }
+        }
+
+        // Fail-closed: reject any unresolved KNOWN template placeholders in args.
+        // Only flag known placeholder tokens to avoid rejecting legitimate
+        // literal braces (e.g., JSON arguments like `{"key": "value"}`).
+        for (i, arg) in expanded_args.iter().enumerate() {
+            for placeholder in KNOWN_PLACEHOLDERS {
+                if arg.contains(placeholder) {
+                    return Err(format!(
+                        "unresolved template placeholder {placeholder} in argv[{i}]"
+                    ));
+                }
+            }
+        }
+
+        let mut config = crate::episode::HarnessConfig::new(&profile.command, episode_id)
+            .with_args(expanded_args)
+            .with_cwd(workspace_root);
+
+        // Expand and set env vars from profile template.
+        for (key, value_template) in &profile.env_template {
+            if FORBIDDEN_ENV_KEYS
+                .iter()
+                .any(|&k| k.eq_ignore_ascii_case(key))
+            {
+                return Err(format!(
+                    "security violation: adapter profile overrides \
+                     forbidden env var '{key}'"
+                ));
+            }
+            #[allow(clippy::literal_string_with_formatting_args)]
+            let expanded_value = value_template
+                .replace("{workspace}", workspace_root)
+                .replace("{prompt}", prompt)
+                .replace("{model}", model);
+            config = config.with_env(key, expanded_value);
+        }
+
+        // WVR-0002: Pass session token via environment only.
+        config = config.with_secret_env("APM2_SESSION_TOKEN", session_token.clone());
+
+        // SECURITY: After clearenv() the child has no PATH, so non-absolute
+        // commands (claude, gemini, codex, ollama) would fail at exec.
+        // Inject a daemon-controlled safe default PATH.  This is NOT
+        // profile-controlled (FORBIDDEN_ENV_KEYS still blocks profile
+        // overrides) -- it is set by the daemon after all profile env
+        // expansion.
+        config = config.with_env("PATH", "/usr/local/bin:/usr/bin:/bin");
+
+        if profile.requires_pty {
+            config = config.with_pty_size(120, 40);
+        }
+
+        config
+            .validate()
+            .map_err(|e| format!("harness config validation failed: {e}"))?;
+
+        Ok(config)
     }
 
     /// Handles `SpawnEpisode` requests (IPC-PRIV-002).
@@ -6372,6 +6591,7 @@ impl PrivilegedDispatcher {
         let adapter_profile_hash = match self.resolve_spawn_adapter_profile_hash(
             request.adapter_profile_hash.as_deref(),
             request_role,
+            &claim,
         ) {
             Ok(hash) => hash,
             Err(e) => {
@@ -7108,6 +7328,10 @@ impl PrivilegedDispatcher {
         // ledger events (SessionStarted + WorkTransitioned), and recording
         // "unknown" as the actor identity would break the accountability chain.
         //
+        // SECURITY: Validate peer credentials BEFORE any side-effectful
+        // operations (adapter process spawn). Unauthorized requests must be
+        // rejected before triggering subprocess spawn.
+        //
         // TCK-00384 review fix: Stop the running episode before returning on
         // this failure path.  The original `?` operator would exit without
         // stopping the episode, leaking a running runtime episode.
@@ -7134,6 +7358,137 @@ impl PrivilegedDispatcher {
             ));
         };
         let actor_id = derive_actor_id(peer_creds);
+
+        // TCK-00399: Spawn agent CLI process via adapter registry.
+        //
+        // After the episode is created and Running, load the adapter profile
+        // from CAS, build a HarnessConfig with template expansion, and spawn
+        // the agent process. Fail-closed: if the adapter registry is not
+        // configured, SpawnEpisode must return an error -- a "successful"
+        // response without a spawned agent process is a silent failure.
+        if let Some(episode_id) = &episode_id_opt {
+            let Some(registry) = &self.adapter_registry else {
+                error!(
+                    episode_id = %episode_id,
+                    "adapter registry not configured; cannot spawn adapter process"
+                );
+                let rollback_warn = self.rollback_spawn_with_episode_stop(
+                    episode_id_opt.as_ref(),
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    &evicted_stop_conditions,
+                    timestamp_ns,
+                    "missing adapter registry",
+                );
+                let msg = rollback_warn.map_or_else(
+                    || "adapter registry not configured: cannot spawn adapter process".to_string(),
+                    |rw| {
+                        format!(
+                            "adapter registry not configured: cannot spawn adapter process \
+                         (rollback partial failure: {rw})"
+                        )
+                    },
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            };
+            let spawn_result: Result<(), String> = (|| {
+                let cas = self
+                    .cas
+                    .as_ref()
+                    .ok_or_else(|| "adapter spawn requires CAS configuration".to_string())?;
+
+                // SECURITY: adapter_profile_hash was resolved by
+                // resolve_spawn_adapter_profile_hash which documents the
+                // authorization trust chain: the caller was authenticated via
+                // ClaimWork + lease_id before the hash was accepted. Loading
+                // from CAS here is safe because only authorized callers can
+                // reach this point.
+                let profile = apm2_core::fac::AgentAdapterProfileV1::load_from_cas(
+                    cas.as_ref(),
+                    &adapter_profile_hash,
+                )
+                .map_err(|e| format!("adapter profile load failed: {e}"))?;
+
+                // SECURITY: Fail-closed adapter mode mapping.  Unknown or
+                // unsupported modes MUST be denied, not silently downgraded
+                // to Raw (MAJOR: fail-open fix).
+                let adapter_type = match profile.adapter_mode {
+                    apm2_core::fac::AdapterMode::StructuredOutput => {
+                        crate::episode::AdapterType::ClaudeCode
+                    },
+                    apm2_core::fac::AdapterMode::BlackBox => crate::episode::AdapterType::Raw,
+                    unsupported => {
+                        return Err(format!(
+                            "unsupported adapter mode '{unsupported}': \
+                             only BlackBox and StructuredOutput are supported"
+                        ));
+                    },
+                };
+
+                let adapter = registry.get(adapter_type).ok_or_else(|| {
+                    format!("adapter type {adapter_type} not registered in registry")
+                })?;
+
+                // Build HarnessConfig. Prompt is empty -- actual prompt
+                // delivery is via stdin/PTY, not in argv.
+                let session_token_secret = secrecy::SecretString::from(session_token_json.clone());
+                let config = Self::build_harness_config(
+                    &profile,
+                    episode_id.as_str(),
+                    &request.workspace_root,
+                    "",
+                    &profile.profile_id,
+                    &session_token_secret,
+                )?;
+
+                let rt_handle = tokio::runtime::Handle::try_current()
+                    .map_err(|_| "adapter spawn requires async runtime".to_string())?;
+                tokio::task::block_in_place(|| {
+                    rt_handle.block_on(async {
+                        self.episode_runtime
+                            .spawn_adapter(episode_id, config, adapter)
+                            .await
+                            .map_err(|e| format!("adapter spawn failed: {e}"))
+                    })
+                })?;
+
+                Ok(())
+            })();
+
+            if let Err(e) = spawn_result {
+                // MAJOR fix: Fail-closed on spawn errors.  A successful
+                // SpawnEpisode response with no agent process is a silent
+                // failure.  Roll back the episode and return an error.
+                error!(
+                    episode_id = %episode_id,
+                    error = %e,
+                    "adapter process spawn failed; rolling back episode"
+                );
+                let rollback_warn = self.rollback_spawn_with_episode_stop(
+                    Some(episode_id),
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    &evicted_stop_conditions,
+                    timestamp_ns,
+                    "adapter spawn failure",
+                );
+                let msg = rollback_warn.map_or_else(
+                    || format!("adapter spawn failed: {e}"),
+                    |rw| format!("adapter spawn failed: {e} (rollback partial failure: {rw})"),
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            }
+        }
 
         // TCK-00358: Resolve identity proof profile hash for SessionStarted.
         // Primary path: the session-open handler in main.rs sets the profile
@@ -11647,6 +12002,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -11969,6 +12325,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             author_custody_domains: vec![],
             executor_custody_domains: vec![],
@@ -13377,6 +13734,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -13411,6 +13769,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
@@ -13482,6 +13841,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()],
@@ -13546,6 +13906,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
@@ -13614,6 +13975,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec![], // Empty - resolution failed
@@ -13679,6 +14041,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
@@ -14440,6 +14803,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -17123,6 +17487,7 @@ mod tests {
                             context_pack_hash: [0u8; 32],
                             resolved_risk_tier: 0,
                             resolved_scope_baseline: None,
+                            expected_adapter_profile_hash: None,
                         },
                         executor_custody_domains: vec![],
                         author_custody_domains: vec![],
@@ -17203,6 +17568,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -17248,6 +17614,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -19089,6 +19456,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: risk_tier,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -20428,6 +20796,7 @@ mod tests {
                         context_pack_hash: [0u8; 32],
                         resolved_risk_tier: 0,
                         resolved_scope_baseline: None,
+                        expected_adapter_profile_hash: None,
                     },
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
@@ -20513,6 +20882,7 @@ mod tests {
                         context_pack_hash: [0u8; 32],
                         resolved_risk_tier: 0,
                         resolved_scope_baseline: None,
+                        expected_adapter_profile_hash: None,
                     },
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
@@ -21676,6 +22046,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0, // Tier0
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -21750,6 +22121,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 2, // Tier2
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -22040,6 +22412,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0, // Tier0
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -22485,6 +22858,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
+                expected_adapter_profile_hash: None,
             };
 
             assert!(
@@ -22513,6 +22887,7 @@ mod tests {
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: Some(baseline),
+                expected_adapter_profile_hash: None,
             };
 
             let resolved = resolution.resolved_scope_baseline.unwrap();
@@ -22598,6 +22973,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -22660,6 +23036,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: Some(narrow_baseline),
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -22726,6 +23103,7 @@ mod tests {
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: Some(matching_baseline),
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -22790,6 +23168,7 @@ mod tests {
                     // Invalid tier value
                     resolved_risk_tier: 255,
                     resolved_scope_baseline: Some(matching_baseline),
+                    expected_adapter_profile_hash: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -22829,6 +23208,261 @@ mod tests {
                 },
                 other => panic!("Expected SpawnEpisode or Error, got: {other:?}"),
             }
+        }
+    }
+
+    // =========================================================================
+    // TCK-00399: build_harness_config tests
+    // =========================================================================
+
+    mod build_harness_config_tests {
+        use apm2_core::fac::AgentAdapterProfileV1;
+        use secrecy::ExposeSecret;
+
+        use super::*;
+
+        /// Creates a test profile by mutating the builtin `claude_code_profile`
+        /// (which already passes all validation). We just override templates.
+        fn test_profile_with_templates() -> AgentAdapterProfileV1 {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec![
+                "--workspace".to_string(),
+                "{workspace}".to_string(),
+                "--prompt".to_string(),
+                "{prompt}".to_string(),
+            ];
+            profile.env_template = vec![
+                ("MY_WORKSPACE".to_string(), "{workspace}".to_string()),
+                ("MY_PROMPT".to_string(), "{prompt}".to_string()),
+            ];
+            profile
+        }
+
+        #[test]
+        fn test_template_expansion() {
+            let profile = test_profile_with_templates();
+            let token = secrecy::SecretString::from("test-token-123".to_string());
+
+            let config = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/home/user/workspace",
+                "do something",
+                "claude-code-v1",
+                &token,
+            )
+            .expect("build_harness_config should succeed");
+
+            // Check args were expanded
+            assert_eq!(config.args[0], "--workspace");
+            assert_eq!(config.args[1], "/home/user/workspace");
+            assert_eq!(config.args[2], "--prompt");
+            assert_eq!(config.args[3], "do something");
+
+            // Check env was expanded
+            assert_eq!(
+                config.env.get("MY_WORKSPACE").unwrap().expose_secret(),
+                "/home/user/workspace"
+            );
+            assert_eq!(
+                config.env.get("MY_PROMPT").unwrap().expose_secret(),
+                "do something"
+            );
+
+            // Check session token is in env (WVR-0002)
+            assert_eq!(
+                config
+                    .env
+                    .get("APM2_SESSION_TOKEN")
+                    .unwrap()
+                    .expose_secret(),
+                "test-token-123"
+            );
+        }
+
+        #[test]
+        fn test_forbidden_env_rejected() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.env_template = vec![("PATH".to_string(), "/malicious/path".to_string())];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "claude-code-v1",
+                &token,
+            );
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("forbidden env var"),
+                "Error should mention forbidden env var"
+            );
+        }
+
+        #[test]
+        fn test_ld_preload_rejected() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.env_template = vec![("LD_PRELOAD".to_string(), "/evil.so".to_string())];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "claude-code-v1",
+                &token,
+            );
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("LD_PRELOAD"));
+        }
+
+        #[test]
+        fn test_session_token_in_argv_rejected() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["--token".to_string(), "secret-token".to_string()];
+            // Token value matches an argv value
+            let token = secrecy::SecretString::from("secret-token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "claude-code-v1",
+                &token,
+            );
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("session_token found in argv"),
+                "Error should mention session_token in argv"
+            );
+        }
+
+        #[test]
+        fn test_model_template_expansion() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["run".to_string(), "{model}".to_string()];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let config = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            )
+            .expect("build_harness_config should succeed");
+
+            assert_eq!(config.args[0], "run");
+            assert_eq!(config.args[1], "llama3");
+        }
+
+        /// Known placeholder `{episode_id}` is NOT expanded by
+        /// `build_harness_config` (only `{workspace}`, `{prompt}`, `{model}`
+        /// are), so it must be rejected as unresolved.
+        #[test]
+        fn test_unresolved_known_placeholder_rejected() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["run".to_string(), "{episode_id}".to_string()];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            );
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("unresolved template placeholder"),
+                "Error should mention unresolved template placeholder"
+            );
+        }
+
+        /// `{{workspace}}` IS expanded during template processing, so the
+        /// result should succeed (no unresolved placeholder remains).
+        #[test]
+        fn test_expanded_known_placeholder_accepted() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["run".to_string(), "prefix-{workspace}".to_string()];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            );
+            assert!(
+                result.is_ok(),
+                "expanded known placeholder should be accepted, got error: {result:?}"
+            );
+        }
+
+        /// Literal braces in args (e.g., JSON) must NOT be rejected.
+        /// Only known placeholder tokens (`{workspace}`, `{prompt}`, etc.)
+        /// should trigger the unresolved-placeholder guard.
+        #[test]
+        fn test_literal_braces_in_args_accepted() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec![
+                "--config".to_string(),
+                r#"{"key": "value", "nested": {"a": 1}}"#.to_string(),
+            ];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            );
+
+            assert!(
+                result.is_ok(),
+                "literal braces in JSON args should be accepted, got error: {result:?}"
+            );
+        }
+
+        /// Unknown placeholders (not in the known set) must be accepted.
+        /// Only `{workspace}`, `{prompt}`, `{model}`, and `{episode_id}`
+        /// are flagged.
+        #[test]
+        fn test_unknown_placeholder_not_in_known_set_accepted() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["run".to_string(), "{custom_flag}".to_string()];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            );
+
+            assert!(
+                result.is_ok(),
+                "unknown placeholder not in known set should be accepted, got error: {result:?}"
+            );
         }
     }
 }
