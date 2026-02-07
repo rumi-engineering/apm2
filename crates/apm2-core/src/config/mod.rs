@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::credentials::CredentialConfig;
+use crate::fac::{
+    CLAUDE_CODE_PROFILE_ID, CODEX_CLI_PROFILE_ID, GEMINI_CLI_PROFILE_ID, LOCAL_INFERENCE_PROFILE_ID,
+};
 use crate::health::HealthCheckConfig;
 use crate::log::LogConfig;
 use crate::restart::RestartConfig;
@@ -70,7 +73,13 @@ impl EcosystemConfig {
         }
         // Parse the config - operator_socket and session_socket are now required fields
         // and serde will fail if they are missing when [daemon] section is present
-        toml::from_str(content).map_err(ConfigError::Parse)
+        let config: Self = toml::from_str(content).map_err(ConfigError::Parse)?;
+        config
+            .daemon
+            .adapter_rotation
+            .validate()
+            .map_err(ConfigError::Validation)?;
+        Ok(config)
     }
 
     /// Serialize configuration to TOML.
@@ -141,6 +150,150 @@ pub struct DaemonConfig {
     /// `InterventionFreeze` are emitted to halt admissions.
     #[serde(default)]
     pub divergence_watchdog: DivergenceWatchdogSection,
+
+    /// Adapter profile rotation policy (TCK-00400).
+    ///
+    /// Defines weighted profile selection and rate-limit backoff behavior for
+    /// `SpawnEpisode` when no explicit `adapter_profile_hash` is provided.
+    #[serde(default)]
+    pub adapter_rotation: AdapterRotationConfig,
+}
+
+/// Adapter profile rotation configuration (TCK-00400).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterRotationConfig {
+    /// Selection strategy.
+    #[serde(default)]
+    pub strategy: AdapterRotationStrategyConfig,
+
+    /// Rate-limit backoff window in seconds.
+    #[serde(default = "default_adapter_rotation_backoff_secs")]
+    pub rate_limit_backoff_secs: u64,
+
+    /// Profile entries with weights and enable flags.
+    #[serde(default = "default_adapter_rotation_profiles")]
+    pub profiles: Vec<AdapterRotationProfileConfig>,
+}
+
+impl AdapterRotationConfig {
+    /// Validate weight configuration invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when the profile list is empty, contains
+    /// duplicates, or has no enabled profile with positive weight.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.profiles.is_empty() {
+            return Err("daemon.adapter_rotation.profiles cannot be empty".to_string());
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut enabled_count: usize = 0;
+        let mut enabled_positive_weight_count: usize = 0;
+
+        for profile in &self.profiles {
+            if profile.profile_id.trim().is_empty() {
+                return Err("daemon.adapter_rotation profile_id cannot be empty".to_string());
+            }
+            if !seen.insert(profile.profile_id.clone()) {
+                return Err(format!(
+                    "daemon.adapter_rotation has duplicate profile_id '{}'",
+                    profile.profile_id
+                ));
+            }
+            if profile.enabled {
+                enabled_count += 1;
+                if profile.weight > 0 {
+                    enabled_positive_weight_count += 1;
+                }
+            }
+        }
+
+        if enabled_count == 0 {
+            return Err(
+                "daemon.adapter_rotation must have at least one enabled profile".to_string(),
+            );
+        }
+        if enabled_positive_weight_count == 0 {
+            return Err(
+                "daemon.adapter_rotation must have at least one enabled profile with weight > 0"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for AdapterRotationConfig {
+    fn default() -> Self {
+        Self {
+            strategy: AdapterRotationStrategyConfig::default(),
+            rate_limit_backoff_secs: default_adapter_rotation_backoff_secs(),
+            profiles: default_adapter_rotation_profiles(),
+        }
+    }
+}
+
+const fn default_adapter_rotation_backoff_secs() -> u64 {
+    300
+}
+
+fn default_adapter_rotation_profiles() -> Vec<AdapterRotationProfileConfig> {
+    vec![
+        AdapterRotationProfileConfig {
+            profile_id: CLAUDE_CODE_PROFILE_ID.to_string(),
+            weight: 100,
+            enabled: true,
+            fallback_priority: 0,
+        },
+        AdapterRotationProfileConfig {
+            profile_id: GEMINI_CLI_PROFILE_ID.to_string(),
+            weight: 0,
+            enabled: false,
+            fallback_priority: 1,
+        },
+        AdapterRotationProfileConfig {
+            profile_id: CODEX_CLI_PROFILE_ID.to_string(),
+            weight: 0,
+            enabled: false,
+            fallback_priority: 2,
+        },
+        AdapterRotationProfileConfig {
+            profile_id: LOCAL_INFERENCE_PROFILE_ID.to_string(),
+            weight: 0,
+            enabled: false,
+            fallback_priority: 3,
+        },
+    ]
+}
+
+/// Adapter rotation selection strategy (TCK-00400).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterRotationStrategyConfig {
+    /// Deterministic weighted random.
+    #[default]
+    WeightedRandom,
+    /// Deterministic round-robin.
+    RoundRobin,
+}
+
+/// Configured weight for one adapter profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterRotationProfileConfig {
+    /// Builtin profile ID.
+    pub profile_id: String,
+    /// Selection weight.
+    pub weight: u32,
+    /// Whether this profile is eligible.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Lower number has higher fallback priority.
+    #[serde(default)]
+    pub fallback_priority: u32,
 }
 
 /// Projection worker configuration (TCK-00322).
@@ -222,6 +375,7 @@ impl Default for DaemonConfig {
             projection: ProjectionConfig::default(),
             cas_path: None,
             divergence_watchdog: DivergenceWatchdogSection::default(),
+            adapter_rotation: AdapterRotationConfig::default(),
         }
     }
 }
@@ -647,5 +801,85 @@ mod tests {
             result.is_err(),
             "Should require both sockets when daemon section present"
         );
+    }
+
+    #[test]
+    fn test_default_adapter_rotation_config() {
+        let config = EcosystemConfig::default();
+        let rotation = &config.daemon.adapter_rotation;
+
+        assert_eq!(
+            rotation.strategy,
+            AdapterRotationStrategyConfig::WeightedRandom
+        );
+        assert_eq!(rotation.rate_limit_backoff_secs, 300);
+        assert_eq!(rotation.profiles.len(), 4);
+        assert_eq!(rotation.profiles[0].profile_id, CLAUDE_CODE_PROFILE_ID);
+        assert_eq!(rotation.profiles[0].weight, 100);
+        assert!(rotation.profiles[0].enabled);
+        assert!(rotation.validate().is_ok());
+    }
+
+    #[test]
+    fn test_parse_adapter_rotation_section() {
+        let toml = r#"
+            [daemon]
+            operator_socket = "/tmp/apm2/operator.sock"
+            session_socket = "/tmp/apm2/session.sock"
+
+            [daemon.adapter_rotation]
+            strategy = "weighted_random"
+            rate_limit_backoff_secs = 900
+
+            [[daemon.adapter_rotation.profiles]]
+            profile_id = "claude-code-v1"
+            weight = 70
+            enabled = true
+            fallback_priority = 0
+
+            [[daemon.adapter_rotation.profiles]]
+            profile_id = "gemini-cli-v1"
+            weight = 30
+            enabled = true
+            fallback_priority = 1
+
+            [[processes]]
+            name = "test"
+            command = "echo"
+        "#;
+
+        let config = EcosystemConfig::from_toml(toml).expect("config should parse");
+        assert_eq!(config.daemon.adapter_rotation.rate_limit_backoff_secs, 900);
+        assert_eq!(
+            config.daemon.adapter_rotation.strategy,
+            AdapterRotationStrategyConfig::WeightedRandom
+        );
+        assert_eq!(config.daemon.adapter_rotation.profiles.len(), 2);
+    }
+
+    #[test]
+    fn test_adapter_rotation_requires_enabled_profiles() {
+        let toml = r#"
+            [daemon]
+            operator_socket = "/tmp/apm2/operator.sock"
+            session_socket = "/tmp/apm2/session.sock"
+
+            [daemon.adapter_rotation]
+            strategy = "weighted_random"
+            rate_limit_backoff_secs = 300
+
+            [[daemon.adapter_rotation.profiles]]
+            profile_id = "claude-code-v1"
+            weight = 100
+            enabled = false
+            fallback_priority = 0
+
+            [[processes]]
+            name = "test"
+            command = "echo"
+        "#;
+
+        let err = EcosystemConfig::from_toml(toml).expect_err("config should fail validation");
+        assert!(matches!(err, ConfigError::Validation(_)));
     }
 }
