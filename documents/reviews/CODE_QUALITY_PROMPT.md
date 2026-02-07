@@ -210,7 +210,7 @@ decision_tree:
       next: PHASE_6_PUBLISH_RESULTS
 
     - id: PHASE_6_PUBLISH_RESULTS
-      purpose: "Post PR comment and update status checks."
+      purpose: "Post PR comment and publish review-gate metadata for projection-only status handling."
       comment_content:
         structure:
           - section: "Verdict Banner"
@@ -288,23 +288,13 @@ decision_tree:
         - id: POST_AND_UPDATE
           action: command
           note: |
-            code-quality sets its own category status via the GitHub
-            statuses API because the xtask review-exec command is
-            security-category only (it hardcodes the security review
-            context, not code-quality).
+            Post findings as a PR comment only.
+            Do NOT call GitHub statuses/check-runs APIs directly.
+            The authoritative ai-review/code-quality status is produced by
+            the review-gate workflow from the machine-readable metadata
+            block above.
           run: |
             gh pr comment $PR_URL --body-file quality_findings.md
-            if [ "$VERDICT_STATE" == "success" ]; then
-              gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" \
-                -f state="success" \
-                -f context="ai-review/code-quality" \
-                -f description="Code quality review passed"
-            else
-              gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" \
-                -f state="failure" \
-                -f context="ai-review/code-quality" \
-                -f description="Code quality review found issues - see PR comments"
-            fi
             rm quality_findings.md
         - id: TERMINATE
           action: output

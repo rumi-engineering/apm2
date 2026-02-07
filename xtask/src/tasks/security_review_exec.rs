@@ -35,6 +35,8 @@ pub const REQUIRED_READING: &[&str] = &[
 ];
 
 const STATUS_CONTEXT: &str = "ai-review/security";
+const SECURITY_STATUS_PROJECTION_NOTICE: &str =
+    "  [TCK-00411] Projection-only: xtask does not write security status checks directly.";
 
 /// Default reviewer identity for security-review-exec verdicts.
 const DEFAULT_REVIEWER_ID: &str = "apm2-codex-security";
@@ -296,7 +298,9 @@ pub fn approve(ticket_id: Option<&str>, dry_run: bool, emit_internal: bool) -> R
     if dry_run {
         println!("\n[4/4] DRY RUN - Would perform:");
         println!("  - Post approval comment to PR #{}", pr.pr_number);
-        println!("  - Update status {STATUS_CONTEXT} to 'success' on {head_sha}");
+        println!(
+            "  - Record projection-only status intent: {STATUS_CONTEXT} = success on {head_sha}"
+        );
         println!("\nDry run complete. No changes were made.");
     } else {
         println!("\n[4/4] Posting approval...");
@@ -331,11 +335,11 @@ pub fn approve(ticket_id: Option<&str>, dry_run: bool, emit_internal: bool) -> R
             println!("  Comment posted.");
         }
 
-        // Update status to success
-        update_status(&sh, &pr.owner_repo, &head_sha, true, "Approved")?;
+        // Record projection-only status intent (no direct status write).
+        update_status(&sh, &pr.owner_repo, &head_sha, true, "Approved");
 
         println!("\nSecurity review approval complete!");
-        println!("  Status: {STATUS_CONTEXT} = success");
+        println!("  Projected status intent: {STATUS_CONTEXT} = success");
 
         // TCK-00295: Optionally emit internal receipt (non-blocking)
         if should_emit_internal {
@@ -443,7 +447,9 @@ pub fn deny(
     if dry_run {
         println!("\n[4/4] DRY RUN - Would perform:");
         println!("  - Post denial comment to PR #{}", pr.pr_number);
-        println!("  - Update status {STATUS_CONTEXT} to 'failure' on {head_sha}");
+        println!(
+            "  - Record projection-only status intent: {STATUS_CONTEXT} = failure on {head_sha}"
+        );
         println!("\nDry run complete. No changes were made.");
     } else {
         println!("\n[4/4] Posting denial...");
@@ -477,11 +483,11 @@ pub fn deny(
             println!("  Comment posted.");
         }
 
-        // Update status to failure
-        update_status(&sh, &pr.owner_repo, &head_sha, false, "Denied")?;
+        // Record projection-only status intent (no direct status write).
+        update_status(&sh, &pr.owner_repo, &head_sha, false, "Denied");
 
         println!("\nSecurity review denial complete!");
-        println!("  Status: {STATUS_CONTEXT} = failure");
+        println!("  Projected status intent: {STATUS_CONTEXT} = failure");
 
         // TCK-00295: Optionally emit internal receipt (non-blocking)
         if should_emit_internal {
@@ -559,7 +565,7 @@ fn validate_pr_is_open(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<(
     let state = output.trim();
     match state {
         "open" => Ok(()),
-        "closed" => bail!("PR #{pr_number} is closed. Cannot update status on closed PRs."),
+        "closed" => bail!("PR #{pr_number} is closed. Cannot record review outcome on closed PRs."),
         _ => bail!("PR #{pr_number} has unexpected state: {state}"),
     }
 }
@@ -579,79 +585,35 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
     Ok(sha)
 }
 
-/// Log that the security review status check would have been updated (writes
-/// are removed).
+/// Log security review status intent (direct status writes are removed).
 ///
 /// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
 /// Per RFC-0018, direct GitHub status writes from xtask have been removed.
-/// This function logs what the status would have been for diagnostic purposes
-/// and returns `Ok(())`. The `_sh` parameter is retained for call-site
-/// compatibility.
-fn update_status(
-    _sh: &Shell,
-    owner_repo: &str,
-    head_sha: &str,
-    success: bool,
-    description: &str,
-) -> Result<()> {
-    use crate::util::{
-        StatusWriteDecision, check_status_write_allowed, emit_projection_request_receipt,
-    };
+/// This function logs projection-only status intent for diagnostic purposes.
+/// The `_sh` parameter is retained for call-site compatibility.
+fn update_status(_sh: &Shell, owner_repo: &str, head_sha: &str, success: bool, description: &str) {
+    use crate::util::{StatusWriteDecision, check_status_write_allowed};
 
     let state = if success { "success" } else { "failure" };
 
     // TCK-00297 (Stage X3): Status writes are permanently removed.
     match check_status_write_allowed() {
         StatusWriteDecision::Removed => {
-            println!(
-                "  [TCK-00297] GitHub status write removed. Would have set on {owner_repo}@{head_sha}:"
-            );
+            println!("{SECURITY_STATUS_PROJECTION_NOTICE}");
+            println!("  Target commit: {owner_repo}@{head_sha}");
             println!("    context: {STATUS_CONTEXT}");
             println!("    state:   {state}");
             println!("    desc:    {description}");
             crate::util::print_status_writes_removed_notice();
-            Ok(())
         },
-        // Legacy variants preserved for backwards compatibility but never returned.
-        StatusWriteDecision::SkipHefProjection => {
-            println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
-            println!("  [HEF] Status would be: {STATUS_CONTEXT} = {success} - {description}");
-            Ok(())
-        },
-        StatusWriteDecision::EmitReceiptOnly => {
-            // TCK-00324: Emit receipt only, no direct GitHub write
-            let state = if success { "success" } else { "failure" };
-            let payload = serde_json::json!({
-                "context": STATUS_CONTEXT,
-                "state": state,
-                "description": description
-            });
-            let correlation_id = format!("security-exec-{head_sha}");
-            emit_projection_request_receipt(
-                "status_write",
-                owner_repo,
-                head_sha,
-                &payload.to_string(),
-                &correlation_id,
-            )?;
+        // Legacy variants are inert after TCK-00297; keep projection-only output.
+        legacy_decision => {
+            println!("{SECURITY_STATUS_PROJECTION_NOTICE}");
             println!(
-                "  [CUTOVER] Security review status receipt emitted: {STATUS_CONTEXT} = {state}"
+                "  [TCK-00297] Ignoring legacy status decision: {legacy_decision:?}. \
+                 No status write performed. Intended status: {STATUS_CONTEXT} = {state} - {description}"
             );
-            Ok(())
-        },
-        StatusWriteDecision::BlockStrictMode => {
-            bail!(
-                "Status writes blocked in strict mode.\n\
-                 Status would be: {STATUS_CONTEXT} = {success} - {description}"
-            );
-        },
-        StatusWriteDecision::Proceed => {
-            // TCK-00297: Even if somehow reached, do not write.
-            println!(
-                "  [TCK-00297] GitHub status writes removed. Status would be: {STATUS_CONTEXT} = {state} - {description}"
-            );
-            Ok(())
         },
     }
 }

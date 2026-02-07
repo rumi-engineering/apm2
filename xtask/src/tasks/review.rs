@@ -9,7 +9,7 @@
 //! 1. Reads the appropriate review prompt
 //! 2. Runs the review (via AI tool or manual)
 //! 3. Posts a PR comment with findings
-//! 4. Logs status check intent (GitHub status writes removed per TCK-00297)
+//! 4. Logs projection-only status intent (direct status writes are removed)
 
 use std::path::Path;
 
@@ -17,6 +17,9 @@ use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{ReviewerSpawner, select_review_model};
+
+const REVIEW_STATUS_PROJECTION_NOTICE: &str =
+    "  [TCK-00411] Projection-only: xtask does not write review status checks directly.";
 
 /// Review type determines which prompt and status check to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +77,7 @@ impl ReviewType {
 /// 2. Gets the HEAD SHA of the PR
 /// 3. Reads the security review prompt
 /// 4. Spawns Codex to run the review (if available)
-/// 5. The AI reviewer will post comments and update the status
+/// 5. The AI reviewer posts findings; status authority remains projection-only
 ///
 /// # Arguments
 ///
@@ -111,7 +114,7 @@ pub fn run_security(
 /// 2. Gets the HEAD SHA of the PR
 /// 3. Reads the code quality review prompt
 /// 4. Spawns Codex to run the review (if available)
-/// 5. The AI reviewer will post comments and update the status
+/// 5. The AI reviewer posts findings; status authority remains projection-only
 ///
 /// # Arguments
 ///
@@ -146,7 +149,7 @@ pub fn run_quality(
 /// This is a manual sign-off that:
 /// 1. Parses the PR URL
 /// 2. Posts a UAT approval comment
-/// 3. Updates the ai-review/uat status to success
+/// 3. Logs projection-only ai-review/uat status intent
 ///
 /// # Arguments
 ///
@@ -159,7 +162,7 @@ pub fn run_quality(
 ///
 /// Returns an error if:
 /// - The PR URL is invalid
-/// - The status update fails
+/// - The sign-off workflow fails
 pub fn run_uat(
     pr_url: &str,
     emit_internal: bool,
@@ -293,21 +296,20 @@ fn run_uat_signoff(
     // check_status_write_with_flags always returns Removed as of TCK-00297.
     match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
         StatusWriteDecision::Removed => {
-            println!(
-                "  [TCK-00297] GitHub status writes removed. UAT signoff on {owner_repo}@{head_sha}:"
-            );
+            println!("{REVIEW_STATUS_PROJECTION_NOTICE}");
+            println!("  Target commit: {owner_repo}@{head_sha}");
             println!("    context: ai-review/uat");
             println!("    state:   success");
             println!("    desc:    UAT approved");
             crate::util::print_status_writes_removed_notice();
         },
-        // Legacy variants preserved for backwards compatibility but never returned.
-        StatusWriteDecision::EmitReceiptOnly
-        | StatusWriteDecision::SkipHefProjection
-        | StatusWriteDecision::BlockStrictMode
-        | StatusWriteDecision::Proceed => {
-            // TCK-00297: Even if somehow reached, do not write.
-            println!("  [TCK-00297] GitHub status writes removed. UAT signoff not performed.");
+        // Legacy variants are inert after TCK-00297; keep projection-only output.
+        legacy_decision => {
+            println!("{REVIEW_STATUS_PROJECTION_NOTICE}");
+            println!(
+                "  [TCK-00297] Ignoring legacy status decision: {legacy_decision:?}. \
+                 No status write performed."
+            );
         },
     }
 
@@ -348,7 +350,7 @@ fn run_uat_signoff(
     }
 
     println!("\nUAT review complete!");
-    println!("  [TCK-00297] Direct status update removed. Comment posted only.");
+    println!("  [TCK-00297] Projection-only status intent logged. Comment posted only.");
 
     Ok(())
 }
@@ -458,8 +460,8 @@ fn run_ai_review(
                 review_type.display_name().to_lowercase()
             );
             println!("\n  Note: Codex should have posted a comment with its findings.");
-            println!("  [TCK-00297] Direct GitHub status writes have been removed from xtask.");
-            println!("  Status updates are now handled by the daemon's projection system.");
+            println!("  {REVIEW_STATUS_PROJECTION_NOTICE}");
+            println!("  Status authority is handled by projection/review-gate systems.");
         },
         Ok(result) => {
             println!("  Warning: Codex exited with status: {}", result.status);
@@ -527,16 +529,15 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
     Ok(sha)
 }
 
-/// Log that a review status check would have been updated (writes are removed).
+/// Log review status intent (direct status writes are removed).
 ///
 /// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
 /// Per RFC-0018, direct GitHub status writes from xtask have been removed.
-/// This function logs what the status would have been for diagnostic purposes
-/// and returns `Ok(())`. The `_sh` parameter is retained for call-site
-/// compatibility. The `emit_receipt_only` and `allow_github_write` parameters
-/// are retained for call-site compatibility with TCK-00324 callers but are
-/// ignored.
+/// This function logs projection-only status intent for diagnostic purposes.
+/// The `_sh` parameter is retained for call-site compatibility. The
+/// `emit_receipt_only` and `allow_github_write` parameters are retained for
+/// call-site compatibility with TCK-00324 callers but are ignored.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn update_status(
@@ -548,10 +549,8 @@ fn update_status(
     description: &str,
     emit_receipt_only: bool,
     allow_github_write: bool,
-) -> Result<()> {
-    use crate::util::{
-        StatusWriteDecision, check_status_write_with_flags, emit_projection_request_receipt,
-    };
+) {
+    use crate::util::{StatusWriteDecision, check_status_write_with_flags};
 
     let context = review_type.status_context();
     let state = if success { "success" } else { "failure" };
@@ -560,52 +559,20 @@ fn update_status(
     // check_status_write_with_flags always returns Removed as of TCK-00297.
     match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
         StatusWriteDecision::Removed => {
-            println!(
-                "  [TCK-00297] GitHub status write removed. Would have set on {owner_repo}@{head_sha}:"
-            );
+            println!("{REVIEW_STATUS_PROJECTION_NOTICE}");
+            println!("  Target commit: {owner_repo}@{head_sha}");
             println!("    context: {context}");
             println!("    state:   {state}");
             println!("    desc:    {description}");
             crate::util::print_status_writes_removed_notice();
-            Ok(())
         },
-        // Legacy variants preserved for backwards compatibility but never returned.
-        StatusWriteDecision::SkipHefProjection => {
-            println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
-            println!("  [HEF] Status would be: {context} = {success} - {description}");
-            Ok(())
-        },
-        StatusWriteDecision::EmitReceiptOnly => {
-            // TCK-00324: Emit receipt only, no direct GitHub write
-            let state = if success { "success" } else { "failure" };
-            let payload = serde_json::json!({
-                "context": context,
-                "state": state,
-                "description": description
-            });
-            let correlation_id = format!("status-{context}-{head_sha}");
-            emit_projection_request_receipt(
-                "status_write",
-                owner_repo,
-                head_sha,
-                &payload.to_string(),
-                &correlation_id,
-            )?;
-            println!("  [CUTOVER] Status update receipt emitted: {context} = {state}");
-            Ok(())
-        },
-        StatusWriteDecision::BlockStrictMode => {
-            bail!(
-                "Status writes blocked in strict mode.\n\
-                 Status would be: {context} = {success} - {description}"
-            );
-        },
-        StatusWriteDecision::Proceed => {
-            // TCK-00297: Even if somehow reached, do not write.
+        // Legacy variants are inert after TCK-00297; keep projection-only output.
+        legacy_decision => {
+            println!("{REVIEW_STATUS_PROJECTION_NOTICE}");
             println!(
-                "  [TCK-00297] GitHub status writes removed. Status would be: {context} = {state} - {description}"
+                "  [TCK-00297] Ignoring legacy status decision: {legacy_decision:?}. \
+                 No status write performed. Intended status: {context} = {state} - {description}"
             );
-            Ok(())
         },
     }
 }
@@ -833,5 +800,18 @@ mod tests {
                 "Prompt {prompt_path} missing reviewed_sha reference"
             );
         }
+    }
+
+    #[test]
+    fn test_review_status_projection_notice_mentions_projection_only() {
+        assert!(
+            REVIEW_STATUS_PROJECTION_NOTICE.contains("Projection-only"),
+            "Review status notice must explicitly state projection-only semantics"
+        );
+        assert!(
+            REVIEW_STATUS_PROJECTION_NOTICE
+                .contains("does not write review status checks directly"),
+            "Review status notice must state direct status writes are disabled"
+        );
     }
 }
