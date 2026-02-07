@@ -390,10 +390,10 @@ impl AdapterSelectionPolicy {
     /// Compute eligibility snapshots, eligible entries, and fallback
     /// candidates.
     ///
-    /// Fallback candidates are profiles that are enabled and adapter-available,
-    /// regardless of backoff state. This ensures the fallback path can always
-    /// select a profile even when all weighted profiles are in backoff
-    /// (selecting the one with the highest fallback priority).
+    /// Fallback candidates are profiles that are enabled, adapter-available,
+    /// and NOT in backoff. When all profiles are rate-limited, fallback
+    /// candidates will be empty and selection returns `NoEligibleProfile`,
+    /// maintaining anti-abuse throttling invariants.
     fn compute_eligibility(
         &self,
         now_secs: u64,
@@ -416,11 +416,10 @@ impl AdapterSelectionPolicy {
                 eligible.push((index, effective_weight));
             }
 
-            // Fallback candidates include ALL enabled+available profiles,
-            // even those in backoff. When every profile is rate-limited,
-            // fallback picks the highest-priority one rather than returning
-            // NoEligibleProfile.
-            if entry.enabled && is_available {
+            // Fallback candidates include enabled+available profiles that are NOT
+            // in backoff. This ensures rate-limited profiles are not selected via
+            // fallback, maintaining anti-abuse throttling invariants.
+            if entry.enabled && is_available && !is_rate_limited {
                 fallback_candidates.push(index);
             }
 
@@ -797,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_selects_profile_when_all_in_backoff() {
+    fn all_in_backoff_returns_no_eligible_profile() {
         let mut policy = sample_policy();
         let available = BTreeSet::from([hash(0x11), hash(0x22)]);
 
@@ -809,21 +808,14 @@ mod tests {
             .record_failure(&hash(0x22), 60_000, true)
             .expect("profile should exist");
 
-        // Selection must still succeed via fallback, choosing the
-        // highest-priority profile even though it is rate-limited.
-        let decision = policy
+        // Selection must fail with NoEligibleProfile when all are in backoff.
+        let err = policy
             .select_profile_at("W-ALL-BACKOFF-001", 0, 60_001, &available)
-            .expect("fallback must succeed when all profiles are in backoff");
+            .expect_err("should fail when all profiles are in backoff");
 
         assert!(
-            decision.used_fallback,
-            "must use fallback when all weighted profiles are in backoff"
-        );
-        // Primary has fallback_priority 0 (highest).
-        assert_eq!(
-            decision.selected_profile_hash,
-            hash(0x11),
-            "fallback must pick the profile with highest priority"
+            matches!(err, AdapterSelectionError::NoEligibleProfile),
+            "expected NoEligibleProfile, got: {err:?}"
         );
     }
 
