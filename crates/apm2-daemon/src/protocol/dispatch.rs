@@ -38,7 +38,7 @@ use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
     AttestationLevel, AttestationRequirements, REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation,
-    ReceiptKind, RiskTier, validate_receipt_attestation,
+    ReceiptKind, RiskTier, builtin_profiles, validate_receipt_attestation,
 };
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
@@ -335,6 +335,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `work_id` - The work ID this session is associated with
     /// * `lease_id` - The lease ID authorizing this session
     /// * `actor_id` - The actor starting the session
+    /// * `adapter_profile_hash` - CAS hash of the adapter profile used
+    /// * `role_spec_hash` - CAS hash of the role spec (if available)
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
     /// * `contract_binding` - Contract binding from handshake (if available)
     ///
@@ -345,12 +347,15 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// # Errors
     ///
     /// Returns `LedgerEventError` if signing or persistence fails.
+    #[allow(clippy::too_many_arguments)]
     fn emit_session_started(
         &self,
         session_id: &str,
         work_id: &str,
         lease_id: &str,
         actor_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
@@ -708,12 +713,15 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// Returns `LedgerEventError` if signing or persistence of either
     /// event fails.
+    #[allow(clippy::too_many_arguments)]
     fn emit_spawn_lifecycle(
         &self,
         session_id: &str,
         work_id: &str,
         lease_id: &str,
         actor_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
@@ -723,6 +731,8 @@ pub trait LedgerEventEmitter: Send + Sync {
             work_id,
             lease_id,
             actor_id,
+            adapter_profile_hash,
+            role_spec_hash,
             timestamp_ns,
             contract_binding,
         )?;
@@ -1144,6 +1154,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         work_id: &str,
         lease_id: &str,
         actor_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
@@ -1163,7 +1175,23 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "work_id": work_id,
             "lease_id": lease_id,
             "actor_id": actor_id,
+            "adapter_profile_hash": hex::encode(adapter_profile_hash),
         });
+        if let Some(hash) = role_spec_hash {
+            payload.as_object_mut().expect("payload is object").insert(
+                "role_spec_hash".to_string(),
+                serde_json::Value::String(hex::encode(hash)),
+            );
+        } else {
+            payload.as_object_mut().expect("payload is object").insert(
+                "waiver_id".to_string(),
+                serde_json::Value::String("WVR-0002".to_string()),
+            );
+            payload.as_object_mut().expect("payload is object").insert(
+                "role_spec_hash_absent".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         if let Some(binding) = contract_binding {
             let obj = payload.as_object_mut().expect("payload is object");
             obj.insert(
@@ -5775,6 +5803,67 @@ impl PrivilegedDispatcher {
         rollback_warn
     }
 
+    /// Resolves the adapter profile hash for `SpawnEpisode`.
+    ///
+    /// If `requested_hash` is provided, validates it is exactly 32 bytes and
+    /// exists in CAS (fail-closed). If omitted, resolves a deterministic
+    /// built-in default by `WorkRole`.
+    fn resolve_spawn_adapter_profile_hash(
+        &self,
+        requested_hash: Option<&[u8]>,
+        role: WorkRole,
+    ) -> Result<[u8; 32], String> {
+        if let Some(raw_hash) = requested_hash {
+            if raw_hash.len() != 32 {
+                return Err(format!(
+                    "adapter_profile_hash must be exactly 32 bytes, got {}",
+                    raw_hash.len()
+                ));
+            }
+
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(raw_hash);
+
+            let cas = self.cas.as_ref().ok_or_else(|| {
+                "adapter_profile_hash validation requires CAS configuration".to_string()
+            })?;
+            let exists = cas
+                .exists(&hash)
+                .map_err(|e| format!("adapter_profile_hash CAS validation failed: {e}"))?;
+            if !exists {
+                return Err(format!(
+                    "adapter_profile_hash not found in CAS: {}",
+                    hex::encode(hash)
+                ));
+            }
+            return Ok(hash);
+        }
+
+        Self::resolve_default_adapter_profile(role)
+    }
+
+    /// Resolves the role-based default adapter profile hash.
+    fn resolve_default_adapter_profile(role: WorkRole) -> Result<[u8; 32], String> {
+        let profile = match role {
+            WorkRole::Implementer
+            | WorkRole::GateExecutor
+            | WorkRole::Reviewer
+            | WorkRole::Coordinator
+            | WorkRole::Unspecified => builtin_profiles::claude_code_profile(),
+        };
+        profile
+            .compute_cas_hash()
+            .map_err(|e| format!("default adapter profile hash computation failed: {e}"))
+    }
+
+    /// Derives role spec attribution from daemon-controlled claim context.
+    ///
+    /// During rollout waiver WVR-0002, policy claims do not always carry an
+    /// authoritative role spec binding yet, so this may return `None`.
+    const fn derive_role_spec_hash(_claim: &WorkClaim) -> Option<[u8; 32]> {
+        None
+    }
+
     /// Handles `SpawnEpisode` requests (IPC-PRIV-002).
     ///
     /// # Security Contract (TCK-00257)
@@ -6183,9 +6272,31 @@ impl PrivilegedDispatcher {
             }
         }
 
+        let adapter_profile_hash = match self.resolve_spawn_adapter_profile_hash(
+            request.adapter_profile_hash.as_deref(),
+            request_role,
+        ) {
+            Ok(hash) => hash,
+            Err(e) => {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: adapter profile hash resolution failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    e,
+                ));
+            },
+        };
+
+        let role_spec_hash = Self::derive_role_spec_hash(&claim);
+
         info!(
             work_id = %request.work_id,
             policy_resolved_ref = %claim.policy_resolution.policy_resolved_ref,
+            adapter_profile_hash = %hex::encode(adapter_profile_hash),
+            role_spec_hash_present = role_spec_hash.is_some(),
             "SpawnEpisode authorized with policy resolution"
         );
 
@@ -6729,7 +6840,16 @@ impl PrivilegedDispatcher {
         // to the client so that tool handlers are properly initialized.
         //
         // Generate envelope hash from session_id + work_id + lease_id for uniqueness
-        let envelope_data = format!("{}{}{}", session_id, request.work_id, claim.lease_id);
+        let role_spec_hash_component =
+            role_spec_hash.map_or_else(|| "WVR-0002".to_string(), hex::encode);
+        let envelope_data = format!(
+            "{}{}{}{}{}",
+            session_id,
+            request.work_id,
+            claim.lease_id,
+            hex::encode(adapter_profile_hash),
+            role_spec_hash_component
+        );
         let envelope_hash: [u8; 32] = blake3::hash(envelope_data.as_bytes()).into();
 
         // Try to create and start the episode. This requires a Tokio runtime.
@@ -6922,6 +7042,8 @@ impl PrivilegedDispatcher {
             &request.work_id,
             &claim.lease_id,
             &actor_id,
+            &adapter_profile_hash,
+            role_spec_hash.as_ref(),
             timestamp_ns,
             ctx.contract_binding(),
         ) {
@@ -11079,6 +11201,7 @@ mod tests {
                 work_id: "W-NO-CLAIM".to_string(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some("L-NO-CLAIM".to_string()),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -11286,6 +11409,7 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -11404,6 +11528,7 @@ mod tests {
                     work_id: "W-001".to_string(),
                     role: WorkRole::Implementer.into(),
                     lease_id: None,
+                    adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
                 }),
@@ -11487,6 +11612,7 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: None,
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -11599,6 +11725,7 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12271,6 +12398,7 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: None, // Missing required lease_id
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12318,6 +12446,7 @@ mod tests {
             work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some(lease_id), // Use the correct lease_id from ClaimWork
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12370,6 +12499,7 @@ mod tests {
             work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-WRONG-LEASE-ID".to_string()), // Wrong!
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12426,6 +12556,7 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: None, // Missing! Should fail because claim has a lease_id
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12477,6 +12608,7 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id), // Correct lease_id
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12522,6 +12654,7 @@ mod tests {
             work_id: work_id.clone(),
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12576,6 +12709,7 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-UNKNOWN".to_string()), // Not registered
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12620,6 +12754,7 @@ mod tests {
             work_id: "W-002".to_string(), // Mismatched work_id
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-001".to_string()),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12665,6 +12800,7 @@ mod tests {
             work_id: "W-VALID".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-VALID".to_string()),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12804,6 +12940,7 @@ mod tests {
             work_id: "W-NONEXISTENT".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: None,
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12861,6 +12998,7 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12929,6 +13067,7 @@ mod tests {
             work_id,
             role: WorkRole::Reviewer.into(), // Different from claimed role
             lease_id: None,
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -12988,6 +13127,7 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -13162,6 +13302,7 @@ mod tests {
             work_id: "W-team-alpha-test123".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some(lease_id),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -13227,6 +13368,7 @@ mod tests {
             work_id: "W-team-dev-test456".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-non-overlap-123".to_string()),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -13294,6 +13436,7 @@ mod tests {
             work_id: "W-unknown-work-789".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-empty-authors-456".to_string()),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -13351,6 +13494,7 @@ mod tests {
             work_id: "W-team-alpha-impl123".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: Some("L-implementer-789".to_string()),
+            adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
         };
@@ -14275,6 +14419,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -14377,6 +14522,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -15094,6 +15240,7 @@ mod tests {
                     work_id: work_id.clone(),
                     role: WorkRole::Implementer.into(),
                     lease_id: Some(lease_id),
+                    adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
                 };
@@ -15528,6 +15675,7 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -15931,6 +16079,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: Some(0),
                 escalation_predicate: None,
             };
@@ -15991,6 +16140,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: Some(oversized_predicate),
             };
@@ -16114,6 +16264,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -16153,6 +16304,31 @@ mod tests {
             assert_eq!(second_payload["to_state"], "InProgress");
             assert_eq!(second_payload["rationale_code"], "episode_spawned_via_ipc");
             assert_eq!(second_payload["previous_transition_count"], 1);
+
+            let session_started_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "session_started")
+                .collect();
+            assert_eq!(
+                session_started_events.len(),
+                1,
+                "Expected exactly 1 SessionStarted event"
+            );
+            let session_payload: serde_json::Value =
+                serde_json::from_slice(&session_started_events[0].payload).expect("valid JSON");
+            let expected_adapter_hash = apm2_core::fac::builtin_profiles::claude_code_profile()
+                .compute_cas_hash()
+                .expect("builtin adapter hash should compute");
+            assert_eq!(
+                session_payload["adapter_profile_hash"],
+                hex::encode(expected_adapter_hash)
+            );
+            assert_eq!(session_payload["waiver_id"], "WVR-0002");
+            assert_eq!(session_payload["role_spec_hash_absent"], true);
+            assert!(
+                session_payload.get("role_spec_hash").is_none(),
+                "role_spec_hash should be absent during WVR-0002 rollout path"
+            );
         }
 
         /// TCK-00395: `WorkTransitioned` events use domain-separated
@@ -16255,6 +16431,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -16452,6 +16629,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -16535,6 +16713,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -16766,7 +16945,16 @@ mod tests {
                 .unwrap();
 
             emitter
-                .emit_session_started("SESS-001", "W-ORDER-001", "L-001", "uid:1000", ts, None)
+                .emit_session_started(
+                    "SESS-001",
+                    "W-ORDER-001",
+                    "L-001",
+                    "uid:1000",
+                    &[0xAA; 32],
+                    None,
+                    ts,
+                    None,
+                )
                 .unwrap();
 
             // Query events - must maintain insertion order
@@ -16874,6 +17062,8 @@ mod tests {
                 "W-ATOMIC-002",
                 "L-001",
                 "uid:1000",
+                &[0xAA; 32],
+                None,
                 2_000_000_000,
                 None,
             );
@@ -16927,6 +17117,7 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -17016,6 +17207,7 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -17085,6 +17277,7 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -17147,6 +17340,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -17229,6 +17423,7 @@ mod tests {
                     work_id: work_id.clone(),
                     role: WorkRole::Implementer.into(),
                     lease_id: Some(lease_id),
+                    adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
                 };
@@ -17419,6 +17614,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -17523,6 +17719,7 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -17617,6 +17814,7 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -17816,6 +18014,131 @@ mod tests {
                 .collect();
             let p1: serde_json::Value = serde_json::from_slice(&t1[0].payload).unwrap();
             assert_eq!(p1["actor_id"], "daemon:shutdown");
+        }
+    }
+
+    // ========================================================================
+    // TCK-00397: Spawn adapter profile hash binding tests
+    // ========================================================================
+    mod tck_00397_adapter_profile_binding {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+        use apm2_core::fac::builtin_profiles;
+
+        use super::*;
+
+        fn dispatcher_with_cas() -> (PrivilegedDispatcher, Arc<MemoryCas>, ConnectionContext) {
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            (dispatcher, cas, ctx)
+        }
+
+        fn claim_work(
+            dispatcher: &PrivilegedDispatcher,
+            ctx: &ConnectionContext,
+        ) -> (String, String) {
+            let claim_request = ClaimWorkRequest {
+                actor_id: "adapter-profile-test".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, ctx).unwrap();
+            match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn spawn_episode_rejects_missing_adapter_profile_hash_in_cas() {
+            let (dispatcher, _cas, ctx) = dispatcher_with_cas();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: Some(vec![0x55; 32]),
+                max_episodes: None,
+                escalation_predicate: None,
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message
+                            .contains("adapter_profile_hash not found in CAS"),
+                        "error should fail-closed on CAS miss: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected spawn rejection on CAS miss, got {other:?}"),
+            }
+
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session_by_work_id(&work_id)
+                    .is_none(),
+                "CAS-miss rejection must not persist a session"
+            );
+        }
+
+        #[test]
+        fn spawn_episode_accepts_present_adapter_profile_hash_and_records_attribution() {
+            let (dispatcher, cas, ctx) = dispatcher_with_cas();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let adapter_hash = builtin_profiles::claude_code_profile()
+                .store_in_cas(cas.as_ref())
+                .expect("builtin profile should store in CAS");
+
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: Some(adapter_hash.to_vec()),
+                max_episodes: None,
+                escalation_predicate: None,
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+            assert!(
+                matches!(response, PrivilegedResponse::SpawnEpisode(_)),
+                "expected spawn success with CAS-present adapter hash"
+            );
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let session_started: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "session_started")
+                .collect();
+            assert_eq!(
+                session_started.len(),
+                1,
+                "expected one SessionStarted event"
+            );
+
+            let payload: serde_json::Value =
+                serde_json::from_slice(&session_started[0].payload).expect("valid JSON payload");
+            assert_eq!(payload["adapter_profile_hash"], hex::encode(adapter_hash));
+            assert_eq!(payload["waiver_id"], "WVR-0002");
+            assert_eq!(payload["role_spec_hash_absent"], true);
         }
     }
 
@@ -21697,6 +22020,7 @@ mod tests {
                 work_id: "W-V3-SCOPE-NONE".to_string(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some("L-V3-001".to_string()),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -21758,6 +22082,7 @@ mod tests {
                 work_id: "W-V3-SCOPE-NARROW".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-002".to_string()),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -21823,6 +22148,7 @@ mod tests {
                 work_id: "W-V3-RISK-CEIL".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-003".to_string()),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };
@@ -21886,6 +22212,7 @@ mod tests {
                 work_id: "W-V3-RISK-INV".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-004".to_string()),
+                adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
             };

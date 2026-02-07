@@ -401,6 +401,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         work_id: &str,
         lease_id: &str,
         actor_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
@@ -418,7 +420,23 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "work_id": work_id,
             "lease_id": lease_id,
             "actor_id": actor_id,
+            "adapter_profile_hash": hex::encode(adapter_profile_hash),
         });
+        if let Some(hash) = role_spec_hash {
+            payload.as_object_mut().expect("payload is object").insert(
+                "role_spec_hash".to_string(),
+                serde_json::Value::String(hex::encode(hash)),
+            );
+        } else {
+            payload.as_object_mut().expect("payload is object").insert(
+                "waiver_id".to_string(),
+                serde_json::Value::String("WVR-0002".to_string()),
+            );
+            payload.as_object_mut().expect("payload is object").insert(
+                "role_spec_hash_absent".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         if let Some(binding) = contract_binding {
             let obj = payload.as_object_mut().expect("payload is object");
             obj.insert(
@@ -1549,6 +1567,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         work_id: &str,
         lease_id: &str,
         actor_id: &str,
+        adapter_profile_hash: &[u8; 32],
+        role_spec_hash: Option<&[u8; 32]>,
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
@@ -1576,7 +1596,32 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "work_id": work_id,
             "lease_id": lease_id,
             "actor_id": actor_id,
+            "adapter_profile_hash": hex::encode(adapter_profile_hash),
         });
+        if let Some(hash) = role_spec_hash {
+            session_payload
+                .as_object_mut()
+                .expect("payload is object")
+                .insert(
+                    "role_spec_hash".to_string(),
+                    serde_json::Value::String(hex::encode(hash)),
+                );
+        } else {
+            session_payload
+                .as_object_mut()
+                .expect("payload is object")
+                .insert(
+                    "waiver_id".to_string(),
+                    serde_json::Value::String("WVR-0002".to_string()),
+                );
+            session_payload
+                .as_object_mut()
+                .expect("payload is object")
+                .insert(
+                    "role_spec_hash_absent".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+        }
         if let Some(binding) = contract_binding {
             let obj = session_payload.as_object_mut().expect("payload is object");
             obj.insert(
@@ -2409,6 +2454,8 @@ mod tests {
                 "W-ORDER-SQL-001",
                 "L-001",
                 "uid:1000",
+                &[0xAA; 32],
+                None,
                 ts,
                 None,
             )
@@ -2588,6 +2635,8 @@ mod tests {
             "W-ATOMIC-SQL-002",
             "L-001",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             2_000_000_000,
             None,
         );
@@ -2684,6 +2733,8 @@ mod tests {
             "W-ROLLBACK-003",
             "L-001",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             1_000,
             None,
         );
@@ -2705,6 +2756,8 @@ mod tests {
             "W-ROLLBACK-004",
             "L-002",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             2_000,
             None,
         );
@@ -2850,6 +2903,8 @@ mod tests {
             "W-CANON-001",
             "L-001",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             1_000_000_000,
             Some(&binding),
         );
@@ -2862,6 +2917,9 @@ mod tests {
         assert_eq!(payload["cli_contract_hash"], "blake3:client_abc");
         assert_eq!(payload["server_contract_hash"], "blake3:server_xyz");
         assert_eq!(payload["mismatch_waived"], true);
+        assert_eq!(payload["adapter_profile_hash"], hex::encode([0xAA; 32]));
+        assert_eq!(payload["waiver_id"], "WVR-0002");
+        assert_eq!(payload["role_spec_hash_absent"], true);
 
         // Verify canonicalizer metadata is present
         let canonicalizers = payload["client_canonicalizers"]
@@ -2917,6 +2975,8 @@ mod tests {
             "W-CANON-002",
             "L-002",
             "uid:1000",
+            &[0xAA; 32],
+            None,
             2_000_000_000,
             Some(&binding),
         );
@@ -2929,6 +2989,9 @@ mod tests {
         assert_eq!(payload["cli_contract_hash"], "blake3:client_def");
         assert_eq!(payload["server_contract_hash"], "blake3:server_ghi");
         assert_eq!(payload["mismatch_waived"], false);
+        assert_eq!(payload["adapter_profile_hash"], hex::encode([0xAA; 32]));
+        assert_eq!(payload["waiver_id"], "WVR-0002");
+        assert_eq!(payload["role_spec_hash_absent"], true);
 
         // Verify canonicalizer metadata is present with both entries
         let canonicalizers = payload["client_canonicalizers"]

@@ -832,7 +832,7 @@ async fn run_coordination_loop(
         // Spawn episode via daemon (TCK-00346 fix: use Implementer role, not
         // Coordinator)
         let spawn_response = client
-            .spawn_episode(&work_id, WorkRole::Implementer, None, workspace_root)
+            .spawn_episode(&work_id, WorkRole::Implementer, None, workspace_root, None)
             .await;
 
         // Determine outcome by observing the spawned session

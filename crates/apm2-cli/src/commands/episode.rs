@@ -290,6 +290,10 @@ pub struct SpawnArgs {
     /// Must be an absolute path to an existing directory.
     #[arg(long, required = true)]
     pub workspace_root: String,
+
+    /// Optional adapter profile hash to bind explicitly (64 hex chars).
+    #[arg(long, value_name = "HEX")]
+    pub adapter_profile_hash: Option<String>,
 }
 
 /// Arguments for `apm2 episode session-status` (TCK-00288).
@@ -713,6 +717,35 @@ fn run_spawn(args: &SpawnArgs, socket_path: &std::path::Path, json_output: bool)
         );
     }
 
+    let adapter_profile_hash = match args.adapter_profile_hash.as_deref() {
+        Some(hex_hash) => {
+            let decoded = match hex::decode(hex_hash) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return output_error(
+                        json_output,
+                        "invalid_adapter_profile_hash",
+                        &format!("--adapter-profile-hash is not valid hex: {e}"),
+                        hef_exit_codes::VALIDATION_ERROR,
+                    );
+                },
+            };
+            if decoded.len() != 32 {
+                return output_error(
+                    json_output,
+                    "invalid_adapter_profile_hash",
+                    &format!(
+                        "--adapter-profile-hash must decode to exactly 32 bytes, got {} bytes",
+                        decoded.len()
+                    ),
+                    hef_exit_codes::VALIDATION_ERROR,
+                );
+            }
+            Some(decoded)
+        },
+        None => None,
+    };
+
     // Build async runtime
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -738,6 +771,7 @@ fn run_spawn(args: &SpawnArgs, socket_path: &std::path::Path, json_output: bool)
                 args.role.into(),
                 args.lease_id.as_deref(),
                 &args.workspace_root,
+                adapter_profile_hash.as_deref(),
             )
             .await
     });

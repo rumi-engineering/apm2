@@ -16,6 +16,8 @@
 //!     +-- stop_conditions: StopConditions
 //!     +-- pinned_snapshot: PinnedSnapshot
 //!     +-- capability_manifest_hash
+//!     +-- adapter_profile_hash (optional)
+//!     +-- role_spec_hash (optional)
 //!     +-- risk_tier, determinism_class
 //!     +-- context_refs (optional)
 //!           |
@@ -405,6 +407,10 @@ struct EpisodeEnvelopeProto {
     determinism_class: Option<u32>,
     #[prost(message, optional, tag = "11")]
     context_refs: Option<ContextRefsProto>,
+    #[prost(bytes = "vec", optional, tag = "12")]
+    adapter_profile_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "13")]
+    role_spec_hash: Option<Vec<u8>>,
 }
 
 /// Immutable episode envelope.
@@ -429,6 +435,8 @@ struct EpisodeEnvelopeProto {
 ///
 /// - `work_id`: Recommended but optional link to work item
 /// - `context_refs`: Context pack and DCP references
+/// - `adapter_profile_hash`: Optional adapter profile CAS hash attribution
+/// - `role_spec_hash`: Optional role spec CAS hash attribution
 ///
 /// # Invariants
 ///
@@ -491,6 +499,12 @@ pub struct EpisodeEnvelope {
 
     /// Hash of the capability manifest (OCAP handles).
     capability_manifest_hash: Vec<u8>,
+
+    /// Optional hash of the adapter profile used for this episode.
+    adapter_profile_hash: Option<[u8; 32]>,
+
+    /// Optional hash of the role specification used for this episode.
+    role_spec_hash: Option<[u8; 32]>,
 
     /// Risk tier for this episode.
     risk_tier: RiskTier,
@@ -584,6 +598,18 @@ impl EpisodeEnvelope {
     #[must_use]
     pub fn capability_manifest_hash(&self) -> &[u8] {
         &self.capability_manifest_hash
+    }
+
+    /// Returns the adapter profile hash, if set.
+    #[must_use]
+    pub const fn adapter_profile_hash(&self) -> Option<&[u8; 32]> {
+        self.adapter_profile_hash.as_ref()
+    }
+
+    /// Returns the role spec hash, if set.
+    #[must_use]
+    pub const fn role_spec_hash(&self) -> Option<&[u8; 32]> {
+        self.role_spec_hash.as_ref()
     }
 
     /// Returns the risk tier.
@@ -706,6 +732,8 @@ impl EpisodeEnvelope {
             risk_tier: Some(u32::from(self.risk_tier.tier())),
             determinism_class: Some(u32::from(self.determinism_class.value())),
             context_refs,
+            adapter_profile_hash: self.adapter_profile_hash.map(|hash| hash.to_vec()),
+            role_spec_hash: self.role_spec_hash.map(|hash| hash.to_vec()),
         }
     }
 
@@ -934,6 +962,38 @@ impl EpisodeEnvelope {
             dcp_refs: c.dcp_refs,
         });
 
+        let adapter_profile_hash = match proto.adapter_profile_hash {
+            Some(hash) => {
+                if hash.len() != 32 {
+                    return Err(EnvelopeError::InvalidHashLength {
+                        field: "adapter_profile_hash",
+                        expected: 32,
+                        actual: hash.len(),
+                    });
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&hash);
+                Some(arr)
+            },
+            None => None,
+        };
+
+        let role_spec_hash = match proto.role_spec_hash {
+            Some(hash) => {
+                if hash.len() != 32 {
+                    return Err(EnvelopeError::InvalidHashLength {
+                        field: "role_spec_hash",
+                        expected: 32,
+                        actual: hash.len(),
+                    });
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&hash);
+                Some(arr)
+            },
+            None => None,
+        };
+
         Ok(Self {
             episode_id: proto.episode_id,
             actor_id: proto.actor_id,
@@ -943,6 +1003,8 @@ impl EpisodeEnvelope {
             stop_conditions,
             pinned_snapshot,
             capability_manifest_hash: proto.capability_manifest_hash,
+            adapter_profile_hash,
+            role_spec_hash,
             risk_tier,
             determinism_class,
             context_refs,
@@ -1062,6 +1124,8 @@ pub struct EpisodeEnvelopeBuilder {
     stop_conditions: Option<StopConditions>,
     pinned_snapshot: Option<PinnedSnapshot>,
     capability_manifest_hash: Vec<u8>,
+    adapter_profile_hash: Option<[u8; 32]>,
+    role_spec_hash: Option<[u8; 32]>,
     risk_tier: RiskTier,
     determinism_class: DeterminismClass,
     context_refs: Option<ContextRefs>,
@@ -1080,6 +1144,8 @@ impl EpisodeEnvelopeBuilder {
             stop_conditions: None,
             pinned_snapshot: None,
             capability_manifest_hash: Vec::new(),
+            adapter_profile_hash: None,
+            role_spec_hash: None,
             risk_tier: RiskTier::Tier0,
             determinism_class: DeterminismClass::NonDeterministic,
             context_refs: None,
@@ -1146,6 +1212,20 @@ impl EpisodeEnvelopeBuilder {
     #[must_use]
     pub fn capability_manifest_hash_from_slice(mut self, hash: &[u8]) -> Self {
         self.capability_manifest_hash = hash.to_vec();
+        self
+    }
+
+    /// Sets the adapter profile hash attribution.
+    #[must_use]
+    pub const fn adapter_profile_hash(mut self, hash: [u8; 32]) -> Self {
+        self.adapter_profile_hash = Some(hash);
+        self
+    }
+
+    /// Sets the role spec hash attribution.
+    #[must_use]
+    pub const fn role_spec_hash(mut self, hash: [u8; 32]) -> Self {
+        self.role_spec_hash = Some(hash);
         self
     }
 
@@ -1293,6 +1373,8 @@ impl EpisodeEnvelopeBuilder {
             stop_conditions: self.stop_conditions,
             pinned_snapshot: self.pinned_snapshot,
             capability_manifest_hash: self.capability_manifest_hash,
+            adapter_profile_hash: self.adapter_profile_hash,
+            role_spec_hash: self.role_spec_hash,
             risk_tier: self.risk_tier,
             determinism_class: self.determinism_class,
             context_refs: self.context_refs,
@@ -1872,6 +1954,27 @@ mod tests {
             DeterminismClass::SoftDeterministic
         );
         assert!(envelope.context_refs().is_some());
+    }
+
+    #[test]
+    fn test_envelope_builder_adapter_and_role_spec_hash_roundtrip() {
+        let envelope = EpisodeEnvelope::builder()
+            .episode_id("ep-attr-001")
+            .actor_id("agent-attr")
+            .lease_id("lease-attr")
+            .capability_manifest_hash([0xab; 32])
+            .adapter_profile_hash([0x11; 32])
+            .role_spec_hash([0x22; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .build()
+            .expect("valid envelope with attribution hashes");
+
+        let decoded =
+            EpisodeEnvelope::decode(&envelope.canonical_bytes()).expect("decode should succeed");
+        assert_eq!(decoded.adapter_profile_hash(), Some(&[0x11; 32]));
+        assert_eq!(decoded.role_spec_hash(), Some(&[0x22; 32]));
     }
 
     #[test]

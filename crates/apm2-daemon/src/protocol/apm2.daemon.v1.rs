@@ -331,16 +331,20 @@ pub struct SpawnEpisodeRequest {
     /// REQUIRED: Episodes cannot be spawned without a workspace root.
     #[prost(string, tag = "4")]
     pub workspace_root: ::prost::alloc::string::String,
+    /// TCK-00397: Optional adapter profile hash for explicit adapter binding.
+    /// Must be a 32-byte BLAKE3 digest and must resolve in CAS (fail-closed).
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub adapter_profile_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     /// TCK-00351 BLOCKER 1: Authoritative stop conditions from the episode
     /// envelope.  When present, these override StopConditions::default() so
     /// that max_episodes and escalation_predicate are actually enforced.
     /// When absent, the handler falls back to fail-closed defaults
     /// (max_episodes=1, empty predicates).
-    #[prost(uint64, optional, tag = "5")]
+    #[prost(uint64, optional, tag = "6")]
     pub max_episodes: ::core::option::Option<u64>,
     /// Escalation predicate from the episode envelope (free-form v1).
     /// Non-empty string triggers EscalationTriggered stop denial.
-    #[prost(string, optional, tag = "6")]
+    #[prost(string, optional, tag = "7")]
     pub escalation_predicate: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
