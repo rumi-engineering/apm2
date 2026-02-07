@@ -710,10 +710,9 @@ impl SiblingNode {
 
 /// Bounded authenticated-directory proof for identity membership checks.
 ///
-/// The `entry_status` field is part of the value commitment: the directory
-/// authority hashes `(certificate_hash, entry_status)` into the leaf
-/// `value_hash`. This ensures the entry status is proof-derived and cannot
-/// be caller-asserted (TCK-00356 Fix 4).
+/// The `entry_status` field is cryptographically bound by the ADS leaf
+/// commitment (`key || value_hash || entry_status`). This ensures the entry
+/// status is proof-derived and cannot be caller-asserted (TCK-00356 Fix 4).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DirectoryProofV1 {
     kind: DirectoryProofKindV1,
@@ -900,7 +899,7 @@ impl DirectoryProofV1 {
             });
         }
 
-        let mut current = hash_directory_leaf(&self.key, &self.value_hash);
+        let mut current = hash_directory_leaf(&self.key, &self.value_hash, self.entry_status);
 
         for (depth, sibling) in self.siblings.iter().enumerate() {
             let bit = key_bit_at_depth(&self.key, depth)?;
@@ -1367,11 +1366,16 @@ pub fn default_empty_value_hash() -> [u8; HASH_BYTES] {
     *hasher.finalize().as_bytes()
 }
 
-fn hash_directory_leaf(key: &[u8; HASH_BYTES], value_hash: &[u8; HASH_BYTES]) -> [u8; HASH_BYTES] {
+fn hash_directory_leaf(
+    key: &[u8; HASH_BYTES],
+    value_hash: &[u8; HASH_BYTES],
+    entry_status: DirectoryEntryStatus,
+) -> [u8; HASH_BYTES] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DIRECTORY_LEAF_DOMAIN_SEPARATOR);
     hasher.update(key);
     hasher.update(value_hash);
+    hasher.update(&[entry_status.to_byte()]);
     *hasher.finalize().as_bytes()
 }
 
@@ -1602,7 +1606,8 @@ mod tests {
     }
 
     fn compute_root_from_proof(proof: &DirectoryProofV1) -> [u8; HASH_BYTES] {
-        let mut current = hash_directory_leaf(proof.key(), proof.value_hash());
+        let mut current =
+            hash_directory_leaf(proof.key(), proof.value_hash(), proof.entry_status());
         for (depth, sibling) in proof.siblings().iter().enumerate() {
             let bit = key_bit_at_depth(proof.key(), depth).unwrap();
             current = if bit == 0 {
@@ -1638,6 +1643,50 @@ mod tests {
         proof
             .verify_against_root(&root, proof.proof_bytes_len())
             .expect("SMT proof should verify");
+    }
+
+    #[test]
+    fn directory_proof_smt_rejects_status_tampering_without_root_update() {
+        let key = [0x11; HASH_BYTES];
+        let value_hash = [0x22; HASH_BYTES];
+        let siblings = vec![
+            SiblingNode::new([0x33; HASH_BYTES]),
+            SiblingNode::new([0x44; HASH_BYTES]),
+            SiblingNode::new([0x55; HASH_BYTES]),
+            SiblingNode::new([0x66; HASH_BYTES]),
+        ];
+
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            value_hash,
+            DirectoryEntryStatus::Active,
+            siblings,
+        )
+        .unwrap();
+
+        let root = compute_root_from_proof(&proof);
+        proof
+            .verify_against_root(&root, proof.proof_bytes_len())
+            .expect("active proof should verify against its root");
+
+        // Adversarial tampering: mutate only `entry_status` in the proof bytes
+        // while keeping key/value/siblings/root unchanged.
+        let mut tampered_bytes = proof.canonical_bytes().unwrap();
+        let status_offset = DIRECTORY_PROOF_DOMAIN_SEPARATOR.len() + 1 + HASH_BYTES + HASH_BYTES;
+        tampered_bytes[status_offset] = DirectoryEntryStatus::Revoked.to_byte();
+
+        let tampered =
+            DirectoryProofV1::from_canonical_bytes_bounded(&tampered_bytes, tampered_bytes.len())
+                .expect("tampered bytes should still decode structurally");
+
+        let err = tampered
+            .verify_against_root(&root, tampered.proof_bytes_len())
+            .unwrap_err();
+        assert!(
+            matches!(err, IdentityProofError::DirectoryRootMismatch),
+            "status tampering must invalidate root reconstruction, got: {err:?}"
+        );
     }
 
     #[test]

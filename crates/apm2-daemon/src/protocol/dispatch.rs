@@ -2886,6 +2886,46 @@ pub fn generate_lease_id() -> String {
     format!("L-{uuid}")
 }
 
+/// Extracts replay-critical fields from a persisted `SubleaseIssued` payload.
+///
+/// Supports both payload shapes used by emitters:
+/// - wrapper JSON with hex-encoded inner payload in `"payload"` (stub emitter)
+/// - direct top-level fields (`SQLite` emitter)
+fn extract_sublease_replay_bindings(event_payload: &[u8]) -> Result<(String, [u8; 32]), String> {
+    let wrapper = serde_json::from_slice::<serde_json::Value>(event_payload)
+        .map_err(|e| format!("cannot parse SubleaseIssued payload wrapper: {e}"))?;
+
+    let inner_payload = wrapper
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|hex_payload| hex::decode(hex_payload).ok())
+        .and_then(|inner_bytes| serde_json::from_slice::<serde_json::Value>(&inner_bytes).ok());
+
+    let lookup_field = |field: &str| {
+        inner_payload
+            .as_ref()
+            .and_then(|inner| inner.get(field).and_then(serde_json::Value::as_str))
+            .or_else(|| wrapper.get(field).and_then(serde_json::Value::as_str))
+    };
+
+    let parent_lease_id = lookup_field("parent_lease_id")
+        .map(str::to_owned)
+        .ok_or_else(|| "missing parent_lease_id".to_string())?;
+
+    let identity_proof_hash_hex = lookup_field("identity_proof_hash")
+        .ok_or_else(|| "missing identity_proof_hash".to_string())?;
+    let identity_proof_hash_vec = hex::decode(identity_proof_hash_hex)
+        .map_err(|e| format!("identity_proof_hash is not valid hex: {e}"))?;
+    crate::identity::validate_identity_proof_hash(&identity_proof_hash_vec)
+        .map_err(|e| format!("identity_proof_hash validation failed: {e}"))?;
+    let identity_proof_hash: [u8; 32] = identity_proof_hash_vec
+        .as_slice()
+        .try_into()
+        .expect("validated to 32 bytes by validate_identity_proof_hash");
+
+    Ok((parent_lease_id, identity_proof_hash))
+}
+
 // ============================================================================
 // Connection Context
 // ============================================================================
@@ -8898,6 +8938,11 @@ impl PrivilegedDispatcher {
                 format!("identity_proof_hash validation failed: {e}"),
             ));
         }
+        let request_identity_proof_hash: [u8; 32] = request
+            .identity_proof_hash
+            .as_slice()
+            .try_into()
+            .expect("validated to be 32 bytes by validate_identity_proof_hash above");
 
         // WVR-0003: Log once that identity proof hash is validated as
         // shape-only commitment (Phase 1 / pre-CAS transport).
@@ -9112,91 +9157,28 @@ impl PrivilegedDispatcher {
                     ));
                 };
 
-                // SECURITY (v9 Finding 2 — Fail-Closed Parent Lineage Binding):
-                //
-                // Verify that the original `SubleaseIssued` event was bound to
-                // the same `parent_lease_id` as the current request. Even though
-                // the `changeset_digest`/`policy_hash` comparison above provides
-                // indirect lineage verification, we MUST also check the
-                // explicit `parent_lease_id` from the event payload to prevent
-                // lineage ambiguity when two different parent leases happen
-                // to share inherited cryptographic fields.
-                //
-                // SECURITY: This extraction MUST be fail-closed. If the event
-                // payload cannot be parsed, or if `parent_lease_id` cannot be
-                // extracted from either the hex-encoded inner payload or the
-                // top-level wrapper, the idempotent replay MUST be rejected.
-                // Silently bypassing this check on parse failure would allow
-                // corrupted or legacy payloads to return success without
-                // verifying lineage, weakening confused-deputy resistance.
-                //
-                // NOTE: The event payload is a wrapper JSON containing the
-                // original payload as a hex-encoded string in the "payload"
-                // field. We must decode that inner payload to extract the
-                // `parent_lease_id` field.
-                let wrapper =
-                    match serde_json::from_slice::<serde_json::Value>(&original_event.payload) {
-                        Ok(w) => w,
+                // SECURITY (v12): Idempotent replay must verify both lineage
+                // (`parent_lease_id`) and proof pointer (`identity_proof_hash`)
+                // extracted from the persisted `SubleaseIssued` payload.
+                let (original_parent_id, original_identity_proof_hash) =
+                    match extract_sublease_replay_bindings(&original_event.payload) {
+                        Ok(values) => values,
                         Err(e) => {
                             warn!(
                                 sublease_id = %request.sublease_id,
                                 error = %e,
-                                "Idempotent sublease replay rejected: cannot parse event payload \
-                                 for lineage verification"
+                                "Idempotent sublease replay rejected: cannot extract replay bindings"
                             );
                             return Ok(PrivilegedResponse::error(
                                 PrivilegedErrorCode::CapabilityRequestRejected,
                                 format!(
-                                    "sublease '{}' exists but its event payload cannot be parsed \
-                                 for lineage verification: {e}",
+                                    "sublease '{}' exists but replay bindings could not be extracted \
+                                     from its event payload: {e}",
                                     request.sublease_id
                                 ),
                             ));
                         },
                     };
-
-                // Extract the inner payload: it may be hex-encoded (stub
-                // emitter) or directly embedded depending on the emitter.
-                // Try hex-decoding the "payload" field first, then fall
-                // back to checking `parent_lease_id` at the top level.
-                let original_parent_id = wrapper
-                    .get("payload")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|hex_str| hex::decode(hex_str).ok())
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|inner| {
-                        inner
-                            .get("parent_lease_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(String::from)
-                    })
-                    .or_else(|| {
-                        // Fallback: `parent_lease_id` at top level (e.g.,
-                        // production SQLite emitter stores raw payload).
-                        wrapper
-                            .get("parent_lease_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(String::from)
-                    });
-
-                // SECURITY: Fail-closed -- if parent_lease_id cannot be
-                // extracted from the event payload, reject the idempotent
-                // replay rather than silently bypassing lineage verification.
-                let Some(original_parent_id) = original_parent_id else {
-                    warn!(
-                        sublease_id = %request.sublease_id,
-                        "Idempotent sublease replay rejected: cannot extract parent_lease_id \
-                         from event payload for lineage verification"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "sublease '{}' exists but parent_lease_id cannot be extracted \
-                             from its event payload for lineage verification",
-                            request.sublease_id
-                        ),
-                    ));
-                };
 
                 if original_parent_id != request.parent_lease_id {
                     warn!(
@@ -9211,6 +9193,25 @@ impl PrivilegedDispatcher {
                             "sublease '{}' was originally delegated from parent '{}', \
                              not '{}'",
                             request.sublease_id, original_parent_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
+                if original_identity_proof_hash != request_identity_proof_hash {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        original_identity_proof_hash = %hex::encode(original_identity_proof_hash),
+                        requested_identity_proof_hash = %hex::encode(request_identity_proof_hash),
+                        "Idempotent sublease replay rejected: identity_proof_hash mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' was originally delegated with identity_proof_hash '{}', \
+                             not '{}'",
+                            request.sublease_id,
+                            hex::encode(original_identity_proof_hash),
+                            hex::encode(request_identity_proof_hash)
                         ),
                     ));
                 }
@@ -9399,54 +9400,28 @@ impl PrivilegedDispatcher {
                     ));
                 };
 
-                // Extract parent_lease_id from the event payload using the
-                // same logic as Phase 2b: try hex-decoded inner payload first,
-                // then fall back to top-level field.
-                let parent_id_from_event =
-                    serde_json::from_slice::<serde_json::Value>(&original_event.payload)
-                        .ok()
-                        .and_then(|wrapper| {
-                            // Try hex-encoded inner payload first (stub emitter format)
-                            wrapper
-                                .get("payload")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|hex_str| hex::decode(hex_str).ok())
-                                .and_then(|bytes| {
-                                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                                })
-                                .and_then(|inner| {
-                                    inner
-                                        .get("parent_lease_id")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(String::from)
-                                })
-                                .or_else(|| {
-                                    // Fallback: parent_lease_id at top level
-                                    // (production SQLite emitter stores raw payload).
-                                    wrapper
-                                        .get("parent_lease_id")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(String::from)
-                                })
-                        });
-
-                // SECURITY: Fail-closed -- if parent_lease_id cannot be
-                // extracted, reject the idempotent replay.
-                let Some(original_parent_id) = parent_id_from_event else {
-                    warn!(
-                        sublease_id = %sublease.lease_id,
-                        "Concurrent duplicate sublease: cannot extract \
-                         parent_lease_id from event payload -- failing closed"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "sublease '{}' exists but parent_lease_id cannot be \
-                             extracted from its event payload for lineage verification",
-                            sublease.lease_id
-                        ),
-                    ));
-                };
+                // SECURITY (v12): Re-check persisted replay bindings
+                // (`parent_lease_id` + `identity_proof_hash`) for the
+                // duplicate detected at persistence time.
+                let (original_parent_id, original_identity_proof_hash) =
+                    match extract_sublease_replay_bindings(&original_event.payload) {
+                        Ok(values) => values,
+                        Err(extract_err) => {
+                            warn!(
+                                sublease_id = %sublease.lease_id,
+                                error = %extract_err,
+                                "Concurrent duplicate sublease: cannot extract replay bindings -- failing closed"
+                            );
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::CapabilityRequestRejected,
+                                format!(
+                                    "sublease '{}' exists but replay bindings could not be \
+                                     extracted from its event payload: {extract_err}",
+                                    sublease.lease_id
+                                ),
+                            ));
+                        },
+                    };
 
                 if original_parent_id != request.parent_lease_id {
                     warn!(
@@ -9461,6 +9436,25 @@ impl PrivilegedDispatcher {
                             "sublease '{}' was originally delegated from parent \
                              '{}', not '{}'",
                             sublease.lease_id, original_parent_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
+                if original_identity_proof_hash != request_identity_proof_hash {
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        original_identity_proof_hash = %hex::encode(original_identity_proof_hash),
+                        requested_identity_proof_hash = %hex::encode(request_identity_proof_hash),
+                        "Concurrent duplicate sublease: identity_proof_hash mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' was originally delegated with identity_proof_hash \
+                             '{}', not '{}'",
+                            sublease.lease_id,
+                            hex::encode(original_identity_proof_hash),
+                            hex::encode(request_identity_proof_hash)
                         ),
                     ));
                 }
@@ -19774,6 +19768,52 @@ mod tests {
                     );
                 },
                 other => panic!("Expected idempotent DelegateSublease, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_duplicate_id_different_identity_proof_hash_rejected() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-dup-proof",
+                "W-DS-DUP-PROOF",
+                "gate-quality",
+                "executor-dup-proof",
+            );
+
+            let req1 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-dup-proof".to_string(),
+                delegatee_actor_id: "child-executor-dup-proof".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-dup-proof-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame1 = encode_delegate_sublease_request(&req1);
+            let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(resp1, PrivilegedResponse::DelegateSublease(_)),
+                "first sublease should succeed"
+            );
+
+            // Same sublease_id, same logical parameters, but different proof pointer.
+            // This is not idempotent and must be rejected.
+            let req2 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-dup-proof".to_string(),
+                delegatee_actor_id: "child-executor-dup-proof".to_string(),
+                requested_expiry_ns: req1.requested_expiry_ns,
+                sublease_id: "sublease-dup-proof-001".to_string(),
+                identity_proof_hash: vec![0x98; 32],
+            };
+            let frame2 = encode_delegate_sublease_request(&req2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match resp2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("identity_proof_hash"),
+                        "expected identity_proof_hash mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected identity_proof_hash mismatch rejection, got {other:?}"),
             }
         }
 
