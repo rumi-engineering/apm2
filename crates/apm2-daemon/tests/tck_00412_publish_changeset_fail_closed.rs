@@ -492,21 +492,11 @@ fn tck_00412_publish_changeset_concurrent_publish_exactly_once() {
 
                     match response {
                         PrivilegedResponse::PublishChangeSet(resp) => {
-                            Some((resp.changeset_digest, resp.cas_hash, resp.event_id))
+                            (resp.changeset_digest, resp.cas_hash, resp.event_id)
                         },
-                        // CAS-level races (concurrent temp-file rename for the
-                        // same content hash) may produce transient storage errors.
-                        // These are expected under contention and do not indicate
-                        // a ledger idempotency failure.
-                        PrivilegedResponse::Error(err) => {
-                            assert!(
-                                err.message.contains("CAS storage failed"),
-                                "unexpected error: {}",
-                                err.message
-                            );
-                            None
+                        other => {
+                            panic!("Expected PublishChangeSet (success or replay), got {other:?}")
                         },
-                        other => panic!("Expected PublishChangeSet or CAS error, got {other:?}"),
                     }
                 })
             })
@@ -518,16 +508,17 @@ fn tck_00412_publish_changeset_concurrent_publish_exactly_once() {
             .collect()
     });
 
-    // Collect only successful publish responses.
-    let successes: Vec<_> = results.into_iter().flatten().collect();
-    assert!(
-        !successes.is_empty(),
-        "at least one thread must succeed with PublishChangeSet"
+    // Every thread must succeed — no CAS failures are acceptable now that
+    // the CAS store handles concurrent same-hash writes idempotently.
+    assert_eq!(
+        results.len(),
+        NUM_THREADS,
+        "all threads must return PublishChangeSet (success or replay)"
     );
 
-    // All successful threads must observe the same canonical bindings.
-    let (ref expected_digest, ref expected_cas_hash, ref expected_event_id) = successes[0];
-    for (i, (digest, cas_hash, event_id)) in successes.iter().enumerate() {
+    // All threads must observe the same canonical bindings.
+    let (ref expected_digest, ref expected_cas_hash, ref expected_event_id) = results[0];
+    for (i, (digest, cas_hash, event_id)) in results.iter().enumerate() {
         assert_eq!(
             digest, expected_digest,
             "thread {i} returned different changeset_digest"

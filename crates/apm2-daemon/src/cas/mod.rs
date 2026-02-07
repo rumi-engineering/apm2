@@ -465,9 +465,25 @@ impl DurableCas {
             return Err(e);
         }
 
-        // Write atomically via temp file + rename
+        // Write atomically via temp file + rename.
+        // The temp path is deterministic (hash + ".tmp"), so concurrent stores
+        // of the same content hash will collide.  When write or rename fails we
+        // check whether a concurrent winner already placed the final file; if
+        // its content matches, we treat this as a successful dedup.
         let temp_path = file_path.with_extension("tmp");
         if let Err(e) = self.write_file(&temp_path, content) {
+            // A concurrent writer may have already completed the full
+            // write-then-rename cycle.  If the final file exists with the
+            // correct content, this is a benign duplicate — roll back quota
+            // and return success.
+            if self.concurrent_winner_exists(&file_path, &hash)? {
+                self.current_total_size.fetch_sub(size, Ordering::AcqRel);
+                return Ok(StoreResult {
+                    hash,
+                    size,
+                    is_new: false,
+                });
+            }
             self.current_total_size.fetch_sub(size, Ordering::AcqRel);
             return Err(e);
         }
@@ -476,6 +492,16 @@ impl DurableCas {
         if let Err(e) = fs::rename(&temp_path, &file_path) {
             // Clean up temp file on failure
             let _ = fs::remove_file(&temp_path);
+            // Same concurrent-winner check: the rename may have failed because
+            // another thread already placed the file via its own rename.
+            if self.concurrent_winner_exists(&file_path, &hash)? {
+                self.current_total_size.fetch_sub(size, Ordering::AcqRel);
+                return Ok(StoreResult {
+                    hash,
+                    size,
+                    is_new: false,
+                });
+            }
             self.current_total_size.fetch_sub(size, Ordering::AcqRel);
             return Err(DurableCasError::io(
                 format!("rename {} to {}", temp_path.display(), file_path.display()),
@@ -582,6 +608,24 @@ impl DurableCas {
         let dir_path = self.objects_path.join(prefix);
         let file_path = dir_path.join(suffix);
         (dir_path, file_path)
+    }
+
+    /// Checks whether a concurrent writer already placed the final CAS file
+    /// at `file_path` with content matching `expected_hash`.
+    ///
+    /// This is used after a write or rename failure to distinguish a genuine
+    /// I/O error from a benign concurrent-duplicate race.
+    fn concurrent_winner_exists(
+        &self,
+        file_path: &Path,
+        expected_hash: &Hash,
+    ) -> Result<bool, DurableCasError> {
+        if !file_path.exists() {
+            return Ok(false);
+        }
+        let existing = self.read_file(file_path)?;
+        let actual_hash = EventHasher::hash_content(&existing);
+        Ok(actual_hash == *expected_hash)
     }
 
     /// Reads a file's contents.
