@@ -38,7 +38,7 @@ use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use apm2_holon::{Artifact, EpisodeContext, EpisodeResult, Holon, HolonError, StopCondition};
 use tokio::sync::{Mutex, Semaphore};
@@ -443,19 +443,29 @@ impl ClaudeCodeAdapter {
                 );
             }
 
-            // Emit terminated event using blocking send. Terminated is a
-            // control-significant one-shot event (at most once per task
-            // lifetime) and must not be silently lost. Blocking here is
-            // acceptable because the task is about to exit anyway.
-            if tx
-                .send(HarnessEvent::terminated(exit_code, classification))
-                .await
-                .is_err()
-            {
-                tracing::error!(
-                    episode_id = %episode_id,
-                    "terminated event could not be delivered: receiver dropped"
-                );
+            // Emit terminated event with a bounded timeout to prevent permit
+            // leak under backpressure. If the receiver is alive but not
+            // consuming events (channel full), an unbounded `.await` would
+            // stall this task indefinitely while holding its semaphore permit,
+            // eventually exhausting MAX_CONCURRENT_ADAPTERS and denying all
+            // future spawns.
+            let terminated_event = HarnessEvent::terminated(exit_code, classification);
+            match tokio::time::timeout(Duration::from_secs(5), tx.send(terminated_event)).await {
+                Ok(Ok(())) => {},
+                Ok(Err(_)) => {
+                    // Receiver dropped — event lost but task cleanup proceeds
+                    tracing::error!(
+                        episode_id = %episode_id,
+                        "terminated event could not be delivered: receiver dropped"
+                    );
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        episode_id = %episode_id,
+                        "terminated event delivery timed out (channel full); \
+                         proceeding with task cleanup"
+                    );
+                },
             }
         });
 
@@ -1057,5 +1067,52 @@ mod tests {
             exit_result.is_ok(),
             "terminate must succeed, got: {exit_result:?}"
         );
+    }
+
+    /// UT-PERMIT-RELEASE-CC-01: The adapter task must exit in bounded time
+    /// and release its semaphore permit even when the event channel is full
+    /// and the receiver is alive (Claude Code adapter variant).
+    #[tokio::test]
+    async fn test_permit_released_when_channel_full_and_receiver_alive() {
+        let adapter = ClaudeCodeAdapter::new();
+        let initial_available = adapter.available_slots();
+
+        // Spawn `yes` which fills the 256-slot channel rapidly. Hold the
+        // receiver alive without consuming events.
+        let config = HarnessConfig::new("yes", "episode-cc-permit-release");
+        let (handle, events) = adapter.spawn(config).await.unwrap();
+
+        assert_eq!(adapter.available_slots(), initial_available - 1);
+
+        // Let the channel fill.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Terminate the process.
+        let _ = adapter.terminate(&handle).await;
+
+        // Wait for the background task to release the permit. Before the
+        // fix this would hang because the unbounded terminal-event send
+        // blocked indefinitely on the full channel.
+        let permit_restored = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if adapter.available_slots() == initial_available {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            permit_restored.is_ok(),
+            "semaphore permit must be released after bounded terminal event delivery; \
+             available_slots={}, expected={}",
+            adapter.available_slots(),
+            initial_available
+        );
+
+        // Drop receiver AFTER assertion to prove the timeout (not
+        // receiver-drop) unblocked the task.
+        drop(events);
     }
 }
