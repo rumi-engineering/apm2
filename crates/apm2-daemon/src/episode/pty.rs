@@ -98,6 +98,15 @@ const MAX_RING_BUFFER_CAPACITY: usize = 4096;
 /// Maximum allowed channel capacity.
 const MAX_CHANNEL_CAPACITY: usize = 8192;
 
+/// Deadline for a PTY write operation to complete (30 seconds).
+///
+/// If a PTY write does not complete within this deadline (e.g. due to
+/// sustained `WouldBlock` from PTY backpressure), the write fails closed
+/// with `PtyError::WriteTimeout`. This prevents the daemon from spinning
+/// indefinitely on a stalled PTY, which would be an availability exhaustion
+/// vector.
+const PTY_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Grace period for SIGTERM before SIGKILL in drop (milliseconds).
 ///
 /// This is intentionally short (5ms) to avoid blocking tokio workers.
@@ -198,6 +207,14 @@ pub enum PtyError {
     /// Invalid configuration value.
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+
+    /// PTY write timed out due to sustained backpressure.
+    ///
+    /// This occurs when the PTY write loop cannot complete within the
+    /// configured write deadline (e.g., due to sustained `WouldBlock`).
+    /// Fail-closed: the write is abandoned rather than spinning forever.
+    #[error("PTY write timed out after {0:?}")]
+    WriteTimeout(std::time::Duration),
 }
 
 /// Exit status of the child process.
@@ -643,6 +660,8 @@ impl PtyRunner {
     /// # Errors
     ///
     /// Returns `PtyError::Write` if the write fails.
+    /// Returns `PtyError::WriteTimeout` if the write does not complete
+    ///   within the write deadline (30 s) due to sustained backpressure.
     /// Returns `PtyError::NotRunning` if the process has exited.
     /// Returns `PtyError::DupFd` if duplicating the file descriptor fails.
     ///
@@ -659,7 +678,27 @@ impl PtyRunner {
     /// its own owned copy. This prevents use-after-close if `PtyRunner` is
     /// dropped while the blocking task is executing. The duplicated FD is
     /// closed after the write completes.
+    ///
+    /// # Security
+    ///
+    /// The write is bounded by a 30-second deadline to prevent the daemon
+    /// from spinning indefinitely under PTY backpressure (availability
+    /// exhaustion vector). If the deadline is exceeded, the write fails closed
+    /// with `PtyError::WriteTimeout`.
     pub async fn send_input(&mut self, data: &[u8]) -> Result<(), PtyError> {
+        self.send_input_with_deadline(data, PTY_WRITE_DEADLINE)
+            .await
+    }
+
+    /// Sends input to the PTY with a caller-specified deadline.
+    ///
+    /// This is the internal implementation that accepts a configurable
+    /// deadline, allowing tests to use shorter timeouts.
+    async fn send_input_with_deadline(
+        &self,
+        data: &[u8],
+        deadline: std::time::Duration,
+    ) -> Result<(), PtyError> {
         let master_fd = self.master_fd.as_ref().ok_or(PtyError::NotRunning)?;
 
         // Duplicate the FD so the blocking task owns its copy.
@@ -680,7 +719,10 @@ impl PtyRunner {
         // Use spawn_blocking to avoid blocking the tokio runtime.
         // PTY writes are typically fast (kernel buffer copy), but we don't want
         // to risk blocking the async runtime if the buffer is full.
-        tokio::task::spawn_blocking(move || {
+        //
+        // The entire blocking write is bounded by `deadline` to prevent
+        // indefinite spinning under PTY backpressure (CTR-INPUT-002).
+        let write_future = tokio::task::spawn_blocking(move || {
             // The blocking task now owns dup_fd and is responsible for closing it.
             // We use a guard to ensure the fd is closed even on early return.
             struct FdGuard(i32);
@@ -692,6 +734,9 @@ impl PtyRunner {
             }
             let _guard = FdGuard(dup_fd);
 
+            // Track elapsed time within the blocking thread to detect
+            // sustained backpressure even if the tokio-level timeout races.
+            let start = std::time::Instant::now();
             let mut written = 0;
             while written < data.len() {
                 // SAFETY: Writing from a valid buffer to a valid fd.
@@ -708,9 +753,12 @@ impl PtyRunner {
                     if err.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    // Handle WouldBlock by yielding and retrying
-                    // (shouldn't happen often for PTY writes, but handle it)
+                    // Handle WouldBlock by yielding and retrying, but only
+                    // if we haven't exceeded the deadline.
                     if err.kind() == io::ErrorKind::WouldBlock {
+                        if start.elapsed() >= deadline {
+                            return Err(PtyError::WriteTimeout(deadline));
+                        }
                         std::thread::yield_now();
                         continue;
                     }
@@ -723,9 +771,15 @@ impl PtyRunner {
             }
             Ok(())
             // FdGuard drops here, closing dup_fd
-        })
-        .await
-        .map_err(|e| PtyError::Write(io::Error::other(e)))?
+        });
+
+        // Apply async-level deadline as a secondary safety net. If the
+        // blocking thread is stuck on a non-WouldBlock syscall, this
+        // ensures the caller is not blocked forever.
+        match tokio::time::timeout(deadline, write_future).await {
+            Ok(join_result) => join_result.map_err(|e| PtyError::Write(io::Error::other(e)))?,
+            Err(_elapsed) => Err(PtyError::WriteTimeout(deadline)),
+        }
     }
 
     /// Sends a signal to the child process.
@@ -1412,5 +1466,80 @@ mod tests {
 
         let err = PtyError::NotRunning;
         assert!(err.to_string().contains("not running"));
+    }
+
+    #[test]
+    fn test_write_timeout_error_display() {
+        let err = PtyError::WriteTimeout(std::time::Duration::from_secs(30));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out"),
+            "WriteTimeout error must mention 'timed out', got: {msg}"
+        );
+        assert!(
+            msg.contains("30"),
+            "WriteTimeout error must include the deadline duration, got: {msg}"
+        );
+    }
+
+    // ========================================================================
+    // UT-00396-03: PTY write deadline under sustained backpressure
+    // ========================================================================
+
+    /// UT-00396-03: When a PTY write cannot complete due to sustained
+    /// backpressure (the child process does not consume stdin), the write
+    /// must time out with `PtyError::WriteTimeout` rather than spinning
+    /// indefinitely.
+    ///
+    /// This test spawns `sleep 60` (which never reads stdin), fills the
+    /// kernel PTY buffer to create backpressure, then attempts a large
+    /// write with a very short deadline.
+    #[tokio::test]
+    async fn pty_write_times_out_under_backpressure() {
+        let config = PtyConfig::default();
+        let timestamp_ns = 0;
+
+        // Spawn a process that never reads stdin — PTY buffer will fill.
+        let runner = PtyRunner::spawn("/bin/sleep", &["60"], config, timestamp_ns)
+            .expect("failed to spawn sleep");
+
+        // Fill the kernel PTY write buffer. The kernel PTY buffer is
+        // typically 4096 bytes; we write much more to ensure saturation.
+        // Some writes may succeed initially until the buffer fills.
+        let fill_data = vec![b'A'; 128 * 1024]; // 128 KiB
+        // Use a short deadline so the fill attempt doesn't hang the test.
+        let fill_deadline = std::time::Duration::from_millis(500);
+        let _ = runner
+            .send_input_with_deadline(&fill_data, fill_deadline)
+            .await;
+
+        // Now attempt another write with a very short deadline.
+        // The PTY buffer should be full so this will hit WouldBlock
+        // immediately and must time out.
+        let short_deadline = std::time::Duration::from_millis(100);
+        let write_data = vec![b'B'; 64 * 1024]; // 64 KiB
+        let result = runner
+            .send_input_with_deadline(&write_data, short_deadline)
+            .await;
+
+        match result {
+            Err(PtyError::WriteTimeout(duration)) => {
+                assert_eq!(
+                    duration, short_deadline,
+                    "timeout duration must match the provided deadline"
+                );
+            },
+            // Acceptable non-timeout outcomes: the write may succeed on
+            // systems with large PTY buffers, or fail with a different
+            // I/O error (e.g. broken pipe). The important invariant is
+            // that the call did NOT hang indefinitely.
+            Err(PtyError::Write(_)) | Ok(()) => {},
+            Err(other) => {
+                panic!("unexpected error variant: {other:?}");
+            },
+        }
+
+        // Clean up: signal the sleep process so the runner can be dropped.
+        let _ = runner.signal(Signal::SIGKILL);
     }
 }

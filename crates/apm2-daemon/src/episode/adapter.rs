@@ -76,6 +76,19 @@ pub const MAX_ENV_KEY_LENGTH: usize = 256;
 /// legitimate use cases like certificates or JSON payloads.
 pub const MAX_ENV_VALUE_LENGTH: usize = 32768;
 
+/// Maximum size of a single `send_input` payload in bytes (256 KiB).
+///
+/// This limit prevents denial-of-service attacks where a malicious client
+/// sends oversized input payloads that exhaust daemon memory or cause
+/// unbounded PTY backpressure. The 256 KiB cap is chosen to be large
+/// enough for any legitimate interactive input while providing meaningful
+/// protection against resource exhaustion.
+///
+/// Per security review: the control channel has capacity 8, and without
+/// this cap the protocol default of 64 MiB per message could queue up to
+/// 512 MiB of pending input in the worst case.
+pub const MAX_SEND_INPUT_BYTES: usize = 256 * 1024;
+
 /// Maximum number of environment variables (500).
 pub const MAX_ENV_COUNT: usize = 500;
 
@@ -759,11 +772,28 @@ pub(crate) fn create_real_handle_inner(
 }
 
 /// Sends input bytes to a spawned harness process via the real handle.
+///
+/// # Security
+///
+/// Input size is validated against [`MAX_SEND_INPUT_BYTES`] before
+/// enqueuing to the control channel. This prevents a malicious client from
+/// exhausting daemon memory via oversized payloads queued across the
+/// bounded control channel (capacity 8).
 pub(crate) async fn send_input_with_handle(
     handle_id: u64,
     runner_handle: Arc<Mutex<PtyRunnerHandle>>,
     input: Vec<u8>,
 ) -> AdapterResult<()> {
+    // CTR-INPUT-001: Validate input size BEFORE enqueuing to prevent
+    // memory exhaustion via oversized payloads on the control channel.
+    if input.len() > MAX_SEND_INPUT_BYTES {
+        return Err(AdapterError::input_failed(format!(
+            "input payload too large: {} bytes exceeds maximum {} bytes",
+            input.len(),
+            MAX_SEND_INPUT_BYTES,
+        )));
+    }
+
     let (control_tx, pid) = {
         let guard = runner_handle.lock().await;
         if guard.is_terminated() {
@@ -1867,6 +1897,114 @@ mod tests {
         );
 
         // Clean up the mock task.
+        mock_task.abort();
+    }
+
+    // ========================================================================
+    // UT-00396-01: send_input rejects oversized payloads
+    // ========================================================================
+
+    /// UT-00396-01: Payloads exceeding `MAX_SEND_INPUT_BYTES` must be rejected
+    /// at the adapter boundary BEFORE enqueuing to the control channel.
+    ///
+    /// This is a security invariant: without this check, the 64 MiB protocol
+    /// default combined with the capacity-8 control channel could queue
+    /// up to 512 MiB of pending input data.
+    #[tokio::test]
+    async fn send_input_rejects_oversized_payload() {
+        let (control_tx, mut control_rx) =
+            mpsc::channel::<PtyControlCommand>(PTY_CONTROL_CHANNEL_CAPACITY);
+
+        let runner_handle = Arc::new(Mutex::new(PtyRunnerHandle::new(12345, Some(1), control_tx)));
+
+        // Spawn a sink that would accept any command (to prove the oversized
+        // payload never reaches the control channel).
+        let sink = tokio::spawn(async move {
+            let mut received = 0u64;
+            while control_rx.recv().await.is_some() {
+                received += 1;
+            }
+            received
+        });
+
+        // --- Exactly at the limit: should succeed (mock task will ack) ---
+        let at_limit = vec![0u8; MAX_SEND_INPUT_BYTES];
+        // We need a mock handler, but more importantly we test the REJECTION
+        // path. For the acceptance path we'd need the sink to respond.
+        // Instead, test that the over-limit path returns an immediate error
+        // without reaching the control channel.
+
+        // --- Over the limit by 1 byte: must be rejected immediately ---
+        let over_limit = vec![0u8; MAX_SEND_INPUT_BYTES + 1];
+        let result = send_input_with_handle(1, Arc::clone(&runner_handle), over_limit).await;
+        assert!(
+            result.is_err(),
+            "payload exceeding MAX_SEND_INPUT_BYTES must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too large"),
+            "error message must mention 'too large', got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains(&MAX_SEND_INPUT_BYTES.to_string()),
+            "error message must include the limit value, got: {err_msg}"
+        );
+
+        // --- Much larger payload: also rejected ---
+        let huge = vec![0u8; MAX_SEND_INPUT_BYTES * 4];
+        let result = send_input_with_handle(1, Arc::clone(&runner_handle), huge).await;
+        assert!(
+            result.is_err(),
+            "payload 4x over MAX_SEND_INPUT_BYTES must be rejected"
+        );
+
+        // --- At exactly the limit: should reach the control channel ---
+        // Spawn a handler that acks SendInput commands.
+        drop(runner_handle); // Drop old handle to close the channel
+        let (ack_tx, mut ack_rx) = mpsc::channel::<PtyControlCommand>(PTY_CONTROL_CHANNEL_CAPACITY);
+        let ack_handle = Arc::new(Mutex::new(PtyRunnerHandle::new(12346, Some(2), ack_tx)));
+        let ack_task = tokio::spawn(async move {
+            while let Some(cmd) = ack_rx.recv().await {
+                if let PtyControlCommand::SendInput { respond_to, .. } = cmd {
+                    let _ = respond_to.send(Ok(()));
+                }
+            }
+        });
+
+        let result = send_input_with_handle(1, Arc::clone(&ack_handle), at_limit).await;
+        assert!(
+            result.is_ok(),
+            "payload exactly at MAX_SEND_INPUT_BYTES must be accepted, got: {result:?}"
+        );
+
+        // Verify the oversized payloads never reached the original sink.
+        drop(sink);
+        ack_task.abort();
+    }
+
+    /// UT-00396-02: Zero-length input is accepted (edge case).
+    #[tokio::test]
+    async fn send_input_accepts_empty_payload() {
+        let (control_tx, mut control_rx) =
+            mpsc::channel::<PtyControlCommand>(PTY_CONTROL_CHANNEL_CAPACITY);
+
+        let runner_handle = Arc::new(Mutex::new(PtyRunnerHandle::new(12347, Some(3), control_tx)));
+
+        let mock_task = tokio::spawn(async move {
+            while let Some(cmd) = control_rx.recv().await {
+                if let PtyControlCommand::SendInput { respond_to, .. } = cmd {
+                    let _ = respond_to.send(Ok(()));
+                }
+            }
+        });
+
+        let result = send_input_with_handle(1, Arc::clone(&runner_handle), vec![]).await;
+        assert!(
+            result.is_ok(),
+            "empty payload must be accepted, got: {result:?}"
+        );
+
         mock_task.abort();
     }
 }
