@@ -26,6 +26,18 @@
 //! - Constant-time signature comparison via `subtle::ConstantTimeEq`.
 //! - Domain separation tags are required and validated before verification.
 //! - Quorum seals require issuer quorum identifier.
+//! - `MERKLE_BATCH` seals with quorum issuers enforce quorum verification:
+//!   multisig requires all signatures valid (n-of-n), threshold requires
+//!   k-of-n. The single-key `verify_merkle_batch` method rejects quorum issuers
+//!   to prevent single-signature bypass.
+//!
+//! # Issuer-Key Binding Contract
+//!
+//! All verification methods accept caller-provided verifying keys. The caller
+//! is responsible for resolving the `issuer_id` in the seal to the authentic
+//! verifying keys via an authenticated directory or equivalent trusted
+//! mechanism. The verification methods validate cryptographic signatures but
+//! do NOT perform issuer identity resolution.
 //!
 //! # Contract References
 //!
@@ -655,19 +667,26 @@ impl AuthoritySealV1 {
         }
     }
 
-    /// Verify a `MERKLE_BATCH` seal: verify the signature over the batch root
-    /// hash, then verify the inclusion proof that the artifact is a member.
+    /// Verify a `MERKLE_BATCH` seal with a single-key issuer: verify the
+    /// signature over the batch root hash, then verify the inclusion proof
+    /// that the artifact is a member.
     ///
-    /// # Arguments
+    /// # Issuer-Key Binding Contract
     ///
-    /// - `verifying_key`: The key that signed the batch root.
-    /// - `artifact_hash`: The hash of the specific artifact to verify
-    ///   membership for.
-    /// - `inclusion_proof`: Merkle proof proving the artifact is in the batch.
+    /// The caller is responsible for ensuring that `verifying_key` is the
+    /// authentic public key corresponding to the `issuer_id` stored in this
+    /// seal. This method validates the cryptographic signature against the
+    /// provided key but does NOT perform issuer identity resolution. Callers
+    /// MUST resolve `issuer_id` to a trusted key via an authenticated
+    /// directory or equivalent mechanism before calling this method.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The seal kind is not `MerkleBatch`
+    /// - The issuer is a quorum (use
+    ///   [`Self::verify_merkle_batch_quorum_multisig`] or
+    ///   [`Self::verify_merkle_batch_quorum_threshold`] instead)
     /// - The batch root signature is invalid
     /// - The inclusion proof does not reconstruct to the batch root
     pub fn verify_merkle_batch(
@@ -682,7 +701,17 @@ impl AuthoritySealV1 {
             });
         }
 
-        // Step 1: Verify the signature over the batch root (subject_hash).
+        // Fail-closed: reject quorum issuers in the single-key path.
+        // Callers MUST use the quorum-aware verification methods for
+        // quorum-issued MERKLE_BATCH seals.
+        if matches!(self.issuer_id, IssuerId::Quorum(_)) {
+            return Err(AuthoritySealError::SignatureVerificationFailed {
+                seal_kind: self.seal_kind,
+            });
+        }
+
+        // Step 1: Verify the single signature over the batch root
+        // (subject_hash).
         let preimage = self.domain_separated_preimage();
         let sig_bytes = &self.signatures[0];
         let signature = ed25519_dalek::Signature::from_slice(sig_bytes).map_err(|_| {
@@ -699,6 +728,168 @@ impl AuthoritySealV1 {
 
         // Step 2: Verify the leaf hash is derived from the artifact hash
         // with domain separation.
+        Self::verify_merkle_inclusion(artifact_hash, inclusion_proof, &self.subject_hash)
+    }
+
+    /// Verify a `MERKLE_BATCH` seal with a quorum multisig issuer (n-of-n):
+    /// verify ALL signatures over the batch root hash, then verify the
+    /// inclusion proof that the artifact is a member.
+    ///
+    /// # Issuer-Key Binding Contract
+    ///
+    /// The caller is responsible for ensuring that `verifying_keys` are the
+    /// authentic public keys corresponding to the quorum `issuer_id` stored
+    /// in this seal. This method validates cryptographic signatures against
+    /// the provided keys but does NOT perform issuer identity resolution.
+    /// Callers MUST resolve the quorum `issuer_id` to a trusted keyset via
+    /// an authenticated directory or equivalent mechanism before calling
+    /// this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The seal kind is not `MerkleBatch`
+    /// - The issuer is not a quorum
+    /// - The number of verifying keys does not match the number of signatures
+    /// - Any signature fails verification (n-of-n required)
+    /// - The inclusion proof does not reconstruct to the batch root
+    pub fn verify_merkle_batch_quorum_multisig(
+        &self,
+        verifying_keys: &[ed25519_dalek::VerifyingKey],
+        artifact_hash: &Hash,
+        inclusion_proof: &MerkleInclusionProof,
+    ) -> Result<(), AuthoritySealError> {
+        if self.seal_kind != SealKind::MerkleBatch {
+            return Err(AuthoritySealError::SignatureVerificationFailed {
+                seal_kind: self.seal_kind,
+            });
+        }
+
+        // Fail-closed: require quorum issuer for quorum verification path.
+        if !matches!(self.issuer_id, IssuerId::Quorum(_)) {
+            return Err(AuthoritySealError::SignatureVerificationFailed {
+                seal_kind: self.seal_kind,
+            });
+        }
+
+        // Enforce n-of-n: key count must equal signature count.
+        if verifying_keys.len() != self.signatures.len() {
+            return Err(AuthoritySealError::InvalidQuorumSignatureCount {
+                count: self.signatures.len(),
+                min: verifying_keys.len(),
+                max: verifying_keys.len(),
+            });
+        }
+
+        let preimage = self.domain_separated_preimage();
+
+        // Verify ALL signatures (n-of-n multisig).
+        for (i, (sig_bytes, key)) in self
+            .signatures
+            .iter()
+            .zip(verifying_keys.iter())
+            .enumerate()
+        {
+            let signature = ed25519_dalek::Signature::from_slice(sig_bytes).map_err(|_| {
+                AuthoritySealError::SignatureVerificationFailed {
+                    seal_kind: self.seal_kind,
+                }
+            })?;
+
+            key.verify(&preimage, &signature).map_err(|_| {
+                tracing::warn!(
+                    index = i,
+                    "merkle batch quorum multisig: signature verification failed"
+                );
+                AuthoritySealError::SignatureVerificationFailed {
+                    seal_kind: self.seal_kind,
+                }
+            })?;
+        }
+
+        Self::verify_merkle_inclusion(artifact_hash, inclusion_proof, &self.subject_hash)
+    }
+
+    /// Verify a `MERKLE_BATCH` seal with a quorum threshold issuer (k-of-n):
+    /// verify at least `threshold` signatures over the batch root hash, then
+    /// verify the inclusion proof that the artifact is a member.
+    ///
+    /// # Issuer-Key Binding Contract
+    ///
+    /// The caller is responsible for ensuring that `verifying_keys` are the
+    /// authentic public keys corresponding to the quorum `issuer_id` stored
+    /// in this seal, and that `threshold` matches the quorum policy. This
+    /// method validates cryptographic signatures against the provided keys
+    /// but does NOT perform issuer identity resolution. Callers MUST resolve
+    /// the quorum `issuer_id` to a trusted keyset and threshold via an
+    /// authenticated directory or equivalent mechanism before calling this
+    /// method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The seal kind is not `MerkleBatch`
+    /// - The issuer is not a quorum
+    /// - The threshold is zero or exceeds the number of verifying keys
+    /// - Fewer than `threshold` signatures are valid
+    /// - The inclusion proof does not reconstruct to the batch root
+    pub fn verify_merkle_batch_quorum_threshold(
+        &self,
+        verifying_keys: &[ed25519_dalek::VerifyingKey],
+        threshold: usize,
+        artifact_hash: &Hash,
+        inclusion_proof: &MerkleInclusionProof,
+    ) -> Result<(), AuthoritySealError> {
+        if self.seal_kind != SealKind::MerkleBatch {
+            return Err(AuthoritySealError::SignatureVerificationFailed {
+                seal_kind: self.seal_kind,
+            });
+        }
+
+        // Fail-closed: require quorum issuer for quorum verification path.
+        if !matches!(self.issuer_id, IssuerId::Quorum(_)) {
+            return Err(AuthoritySealError::SignatureVerificationFailed {
+                seal_kind: self.seal_kind,
+            });
+        }
+
+        if threshold == 0 || threshold > verifying_keys.len() {
+            return Err(AuthoritySealError::ThresholdNotMet {
+                valid_sigs: 0,
+                threshold,
+            });
+        }
+
+        let preimage = self.domain_separated_preimage();
+        let mut valid_count = 0usize;
+
+        for (sig_bytes, key) in self.signatures.iter().zip(verifying_keys.iter()) {
+            if let Ok(signature) = ed25519_dalek::Signature::from_slice(sig_bytes) {
+                if key.verify(&preimage, &signature).is_ok() {
+                    valid_count = valid_count.saturating_add(1);
+                }
+            }
+        }
+
+        if valid_count < threshold {
+            return Err(AuthoritySealError::ThresholdNotMet {
+                valid_sigs: valid_count,
+                threshold,
+            });
+        }
+
+        Self::verify_merkle_inclusion(artifact_hash, inclusion_proof, &self.subject_hash)
+    }
+
+    /// Shared helper: verify Merkle inclusion proof for batch membership.
+    ///
+    /// Validates that the artifact hash, after domain-separated leaf hashing,
+    /// is included in the batch root via the provided inclusion proof.
+    fn verify_merkle_inclusion(
+        artifact_hash: &Hash,
+        inclusion_proof: &MerkleInclusionProof,
+        batch_root: &Hash,
+    ) -> Result<(), AuthoritySealError> {
         let expected_leaf = compute_receipt_leaf_hash(artifact_hash);
         if inclusion_proof.leaf_hash != expected_leaf {
             return Err(AuthoritySealError::MerkleProofFailed {
@@ -706,11 +897,7 @@ impl AuthoritySealV1 {
             });
         }
 
-        // Step 3: Verify the Merkle inclusion proof reconstructs to
-        // subject_hash (the batch root).
-        inclusion_proof.verify(&self.subject_hash)?;
-
-        Ok(())
+        inclusion_proof.verify(batch_root)
     }
 }
 
@@ -722,6 +909,15 @@ impl AuthoritySealV1 {
 ///
 /// For non-batch seals, this is a no-op (they already require anchors
 /// via construction).
+///
+/// # Design Note
+///
+/// `AuthoritySealV1::new()` already enforces that a `ledger_anchor` is
+/// present for all seal kinds at construction time. This function exists
+/// as an explicit semantic assertion at call sites where the §0.1(11b)
+/// invariant is safety-critical, providing defense-in-depth and
+/// self-documenting intent. It is intentionally a lightweight check
+/// because the heavy validation occurs at construction.
 pub const fn reject_free_floating_batch_root(
     seal: &AuthoritySealV1,
 ) -> Result<(), AuthoritySealError> {
@@ -1568,5 +1764,379 @@ mod tests {
             proof.verify(&wrong_root),
             Err(AuthoritySealError::MerkleProofFailed { .. })
         ));
+    }
+
+    // ────────── MERKLE_BATCH quorum verification tests (security regression)
+    // ──────────
+
+    /// Helper: build a quorum-issued `MERKLE_BATCH` seal with 2 signers.
+    /// Returns (seal, keys, receipt hash, inclusion proof).
+    fn make_quorum_merkle_batch_seal(
+        signer_a: &Signer,
+        signer_b: &Signer,
+        sign_both: bool,
+    ) -> (
+        AuthoritySealV1,
+        [ed25519_dalek::VerifyingKey; 2],
+        Hash,
+        MerkleInclusionProof,
+    ) {
+        let cell_id = test_cell_id();
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            None,
+        )
+        .unwrap();
+
+        let receipt_hash = [0x42; HASH_SIZE];
+        let other_receipt_hash = [0x43; HASH_SIZE];
+        let leaf0 = compute_receipt_leaf_hash(&receipt_hash);
+        let leaf1 = compute_receipt_leaf_hash(&other_receipt_hash);
+        let (batch_root, inclusion_proof) = build_merkle_tree_2(leaf0, leaf1);
+
+        let subject_kind = SubjectKind::new("apm2.receipt_batch.v1").unwrap();
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        // Build unsigned to get preimage.
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            batch_root,
+            ledger_anchor.clone(),
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = if sign_both {
+            signer_b.sign(&preimage).to_bytes().to_vec()
+        } else {
+            vec![0u8; 64] // invalid placeholder
+        };
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            batch_root,
+            ledger_anchor,
+            SealKind::MerkleBatch,
+            vec![sig_a.to_bytes().to_vec(), sig_b],
+        )
+        .unwrap();
+
+        let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
+        (seal, keys, receipt_hash, inclusion_proof)
+    }
+
+    /// SECURITY REGRESSION: quorum-issued `MERKLE_BATCH` with only 1 valid
+    /// signature MUST be rejected by `verify_merkle_batch` (single-key path).
+    #[test]
+    fn merkle_batch_quorum_issuer_rejected_by_single_key_verify() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let (seal, _keys, receipt_hash, inclusion_proof) =
+            make_quorum_merkle_batch_seal(&signer_a, &signer_b, true);
+
+        // Attempting to use the single-key verification method on a
+        // quorum-issued MERKLE_BATCH seal must fail.
+        let result =
+            seal.verify_merkle_batch(&signer_a.verifying_key(), &receipt_hash, &inclusion_proof);
+        assert!(
+            result.is_err(),
+            "verify_merkle_batch must reject quorum-issued MERKLE_BATCH seals"
+        );
+    }
+
+    /// SECURITY REGRESSION: quorum multisig `MERKLE_BATCH` with only 1 valid
+    /// sig out of 2 required MUST be rejected.
+    #[test]
+    fn merkle_batch_quorum_multisig_rejects_single_valid_sig() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        // sign_both=false: only signer_a signs, signer_b's sig is invalid.
+        let (seal, keys, receipt_hash, inclusion_proof) =
+            make_quorum_merkle_batch_seal(&signer_a, &signer_b, false);
+
+        let result =
+            seal.verify_merkle_batch_quorum_multisig(&keys, &receipt_hash, &inclusion_proof);
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::SignatureVerificationFailed { .. })
+            ),
+            "Quorum multisig MERKLE_BATCH must reject when not all sigs are valid"
+        );
+    }
+
+    /// Quorum multisig `MERKLE_BATCH` with all valid sigs MUST be accepted.
+    #[test]
+    fn merkle_batch_quorum_multisig_accepts_all_valid_sigs() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let (seal, keys, receipt_hash, inclusion_proof) =
+            make_quorum_merkle_batch_seal(&signer_a, &signer_b, true);
+
+        let result =
+            seal.verify_merkle_batch_quorum_multisig(&keys, &receipt_hash, &inclusion_proof);
+        assert!(
+            result.is_ok(),
+            "Quorum multisig MERKLE_BATCH must accept when all sigs are valid"
+        );
+    }
+
+    /// SECURITY REGRESSION: quorum threshold `MERKLE_BATCH` with insufficient
+    /// valid sigs MUST be rejected.
+    #[test]
+    fn merkle_batch_quorum_threshold_rejects_insufficient_sigs() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let member_c =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_c.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            2,
+            &[member_a, member_b, member_c],
+            None,
+        )
+        .unwrap();
+
+        let receipt_hash = [0x42; HASH_SIZE];
+        let other_receipt_hash = [0x43; HASH_SIZE];
+        let leaf0 = compute_receipt_leaf_hash(&receipt_hash);
+        let leaf1 = compute_receipt_leaf_hash(&other_receipt_hash);
+        let (batch_root, inclusion_proof) = build_merkle_tree_2(leaf0, leaf1);
+
+        let subject_kind = SubjectKind::new("apm2.receipt_batch.v1").unwrap();
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            batch_root,
+            ledger_anchor.clone(),
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        // Only 1 valid sig; threshold is 2-of-3.
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            batch_root,
+            ledger_anchor,
+            SealKind::MerkleBatch,
+            vec![sig_a.to_bytes().to_vec(), vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let keys = [
+            signer_a.verifying_key(),
+            signer_b.verifying_key(),
+            signer_c.verifying_key(),
+        ];
+
+        let result =
+            seal.verify_merkle_batch_quorum_threshold(&keys, 2, &receipt_hash, &inclusion_proof);
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::ThresholdNotMet {
+                    valid_sigs: 1,
+                    threshold: 2,
+                })
+            ),
+            "Quorum threshold MERKLE_BATCH must reject when threshold not met"
+        );
+    }
+
+    /// Quorum threshold `MERKLE_BATCH` with sufficient valid sigs MUST be
+    /// accepted.
+    #[test]
+    fn merkle_batch_quorum_threshold_accepts_sufficient_sigs() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let member_c =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_c.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            2,
+            &[member_a, member_b, member_c],
+            None,
+        )
+        .unwrap();
+
+        let receipt_hash = [0x42; HASH_SIZE];
+        let other_receipt_hash = [0x43; HASH_SIZE];
+        let leaf0 = compute_receipt_leaf_hash(&receipt_hash);
+        let leaf1 = compute_receipt_leaf_hash(&other_receipt_hash);
+        let (batch_root, inclusion_proof) = build_merkle_tree_2(leaf0, leaf1);
+
+        let subject_kind = SubjectKind::new("apm2.receipt_batch.v1").unwrap();
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            batch_root,
+            ledger_anchor.clone(),
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+        // 2-of-3 threshold: a and b sign, c doesn't.
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            batch_root,
+            ledger_anchor,
+            SealKind::MerkleBatch,
+            vec![
+                sig_a.to_bytes().to_vec(),
+                sig_b.to_bytes().to_vec(),
+                vec![0u8; 64],
+            ],
+        )
+        .unwrap();
+
+        let keys = [
+            signer_a.verifying_key(),
+            signer_b.verifying_key(),
+            signer_c.verifying_key(),
+        ];
+
+        let result =
+            seal.verify_merkle_batch_quorum_threshold(&keys, 2, &receipt_hash, &inclusion_proof);
+        assert!(
+            result.is_ok(),
+            "Quorum threshold MERKLE_BATCH must accept when threshold is met"
+        );
+    }
+
+    /// Quorum multisig `MERKLE_BATCH`: mismatched key count must fail.
+    #[test]
+    fn merkle_batch_quorum_multisig_rejects_key_count_mismatch() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let (seal, _keys, receipt_hash, inclusion_proof) =
+            make_quorum_merkle_batch_seal(&signer_a, &signer_b, true);
+
+        // Provide only 1 key for a 2-sig seal.
+        let result = seal.verify_merkle_batch_quorum_multisig(
+            &[signer_a.verifying_key()],
+            &receipt_hash,
+            &inclusion_proof,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::InvalidQuorumSignatureCount { .. })
+            ),
+            "Key count mismatch must be rejected"
+        );
+    }
+
+    /// Single-key issuer `MERKLE_BATCH` must be rejected by quorum methods.
+    #[test]
+    fn merkle_batch_single_key_issuer_rejected_by_quorum_verify() {
+        let signer = Signer::generate();
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer.public_key_bytes());
+
+        let receipt_hash = [0x42; HASH_SIZE];
+        let other_receipt_hash = [0x43; HASH_SIZE];
+        let leaf0 = compute_receipt_leaf_hash(&receipt_hash);
+        let leaf1 = compute_receipt_leaf_hash(&other_receipt_hash);
+        let (batch_root, inclusion_proof) = build_merkle_tree_2(leaf0, leaf1);
+
+        let subject_kind = SubjectKind::new("apm2.receipt_batch.v1").unwrap();
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::PublicKey(pkid.clone()),
+            subject_kind.clone(),
+            batch_root,
+            ledger_anchor.clone(),
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let signature = signer.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            batch_root,
+            ledger_anchor,
+            SealKind::MerkleBatch,
+            vec![signature.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        // Using quorum multisig on a single-key issuer must fail.
+        let result = seal.verify_merkle_batch_quorum_multisig(
+            &[signer.verifying_key()],
+            &receipt_hash,
+            &inclusion_proof,
+        );
+        assert!(
+            result.is_err(),
+            "verify_merkle_batch_quorum_multisig must reject single-key issuers"
+        );
+
+        // Using quorum threshold on a single-key issuer must fail.
+        let result = seal.verify_merkle_batch_quorum_threshold(
+            &[signer.verifying_key()],
+            1,
+            &receipt_hash,
+            &inclusion_proof,
+        );
+        assert!(
+            result.is_err(),
+            "verify_merkle_batch_quorum_threshold must reject single-key issuers"
+        );
     }
 }
