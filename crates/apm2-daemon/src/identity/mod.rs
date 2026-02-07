@@ -9,6 +9,9 @@
 //! - [`CellCertificateV1`]
 //! - [`HolonCertificateV1`]
 //! - [`SessionKeyDelegationV1`]
+//! - [`HolonDirectoryHeadV1`]
+//! - [`DirectoryProofV1`]
+//! - [`IdentityProofV1`]
 //!
 //! # V1 Canonical Text Form Grammar (RFC-0020 section 1.7.5b)
 //!
@@ -123,6 +126,7 @@
 mod canonical_digest_id_kit;
 mod cell_id;
 mod certificate;
+mod directory_proof;
 mod holon_id;
 mod keyset_id;
 mod public_key_id;
@@ -133,6 +137,13 @@ pub mod conformance;
 pub use cell_id::{CellGenesisV1, CellIdV1, PolicyRootId};
 pub use certificate::{
     CellCertificateV1, CertificateError, HolonCertificateV1, RevocationPointer, validate_key_roles,
+};
+pub use directory_proof::{
+    DirectoryEntryStatus, DirectoryKindV1, DirectoryProofKindV1, DirectoryProofV1,
+    HolonDirectoryHeadV1, IdentityProofError, IdentityProofV1, LedgerAnchorV1,
+    MAX_DIRECTORY_HEAD_BYTES, MAX_DIRECTORY_PROOF_BYTES, MAX_DIRECTORY_SIBLINGS,
+    MAX_IDENTITY_PROOF_BYTES, SiblingNode, check_directory_kind_compatibility,
+    default_empty_value_hash, derive_directory_key, validate_identity_proof_hash,
 };
 pub use holon_id::{HolonGenesisV1, HolonIdV1, HolonPurpose};
 pub use keyset_id::{KeySetIdV1, SetTag};

@@ -502,6 +502,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
     /// * `reviewer_actor_id` - Actor ID of the reviewer
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
     ///
     /// # Returns
     ///
@@ -511,6 +512,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// Returns `LedgerEventError` if signing, CAS validation, or persistence
     /// fails.
+    #[allow(clippy::too_many_arguments)]
     fn emit_review_receipt(
         &self,
         episode_id: &str,
@@ -519,6 +521,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         artifact_bundle_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a `ReviewBlockedRecorded` ledger event (TCK-00389).
@@ -529,11 +532,15 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `lease_id` - Gate lease identifier associated with this review
     /// * `receipt_id` - Unique receipt identifier (used as `blocked_id`)
+    /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
+    /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
     /// * `reason_code` - Numeric reason code for the blocked review
     /// * `blocked_log_hash` - CAS hash of blocked logs
     /// * `reviewer_actor_id` - Actor ID of the reviewer
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
     ///
     /// # Returns
     ///
@@ -542,13 +549,18 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// # Errors
     ///
     /// Returns `LedgerEventError` if signing or persistence fails.
+    #[allow(clippy::too_many_arguments)]
     fn emit_review_blocked_receipt(
         &self,
+        lease_id: &str,
         receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Returns the number of `work_transitioned` events for a given work ID.
@@ -821,6 +833,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `reviewer_actor_id` - Actor ID of the reviewer
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds
     /// * `bindings` - Envelope bindings to include in the receipt
+    /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
     ///
     /// # Errors
     ///
@@ -836,6 +849,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         bindings: &crate::episode::EnvelopeBindings,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Fail-closed: validate bindings before emission
         bindings
@@ -853,6 +867,7 @@ pub trait LedgerEventEmitter: Send + Sync {
             artifact_bundle_hash,
             reviewer_actor_id,
             timestamp_ns,
+            identity_proof_hash,
         )
     }
 }
@@ -1688,6 +1703,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         artifact_bundle_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -1698,14 +1714,21 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
+        //
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed payload so it is audit-bound and cannot be stripped
+        // post-signing.
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,
+            "lease_id": episode_id,
             "receipt_id": receipt_id,
             "changeset_digest": hex::encode(changeset_digest),
             "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "verdict": "APPROVE",
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         // Use JCS (RFC 8785) canonicalization for deterministic signing
@@ -1779,25 +1802,40 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         Ok(signed_event)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_review_blocked_receipt(
         &self,
+        lease_id: &str,
         receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
+        // SECURITY (TCK-00356 Fix 2): identity_proof_hash is included in
+        // the signed payload so it is audit-bound and cannot be stripped
+        // post-signing, matching the APPROVE path's payload binding.
         let payload_json = serde_json::json!({
             "event_type": "review_blocked_recorded",
+            "lease_id": lease_id,
             "receipt_id": receipt_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "verdict": "BLOCKED",
+            "blocked_reason_code": reason_code,
+            // Preserve legacy field for backward compatibility with old readers.
             "reason_code": reason_code,
             "blocked_log_hash": hex::encode(blocked_log_hash),
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         let payload_string = payload_json.to_string();
@@ -2264,6 +2302,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         bindings: &crate::episode::EnvelopeBindings,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -2277,6 +2316,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Include bindings in the signed payload
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed payload so it is audit-bound.
         let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
@@ -2289,6 +2330,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "envelope_hash": env_hex,
             "capability_manifest_hash": cap_hex,
             "view_commitment_hash": view_hex,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         let payload_bytes =
@@ -2861,6 +2903,170 @@ pub fn generate_lease_id() -> String {
     // RFC-0016 HTF compliance: Use UUID v4 instead of SystemTime::now()
     let uuid = uuid::Uuid::new_v4();
     format!("L-{uuid}")
+}
+
+/// Extracts replay-critical fields from a persisted `SubleaseIssued` payload.
+///
+/// Supports both payload shapes used by emitters:
+/// - wrapper JSON with hex-encoded inner payload in `"payload"` (stub emitter)
+/// - direct top-level fields (`SQLite` emitter)
+fn extract_sublease_replay_bindings(event_payload: &[u8]) -> Result<(String, [u8; 32]), String> {
+    let wrapper = serde_json::from_slice::<serde_json::Value>(event_payload)
+        .map_err(|e| format!("cannot parse SubleaseIssued payload wrapper: {e}"))?;
+
+    let inner_payload = wrapper
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|hex_payload| hex::decode(hex_payload).ok())
+        .and_then(|inner_bytes| serde_json::from_slice::<serde_json::Value>(&inner_bytes).ok());
+
+    let lookup_field = |field: &str| {
+        inner_payload
+            .as_ref()
+            .and_then(|inner| inner.get(field).and_then(serde_json::Value::as_str))
+            .or_else(|| wrapper.get(field).and_then(serde_json::Value::as_str))
+    };
+
+    let parent_lease_id = lookup_field("parent_lease_id")
+        .map(str::to_owned)
+        .ok_or_else(|| "missing parent_lease_id".to_string())?;
+
+    let identity_proof_hash_hex = lookup_field("identity_proof_hash")
+        .ok_or_else(|| "missing identity_proof_hash".to_string())?;
+    let identity_proof_hash_vec = hex::decode(identity_proof_hash_hex)
+        .map_err(|e| format!("identity_proof_hash is not valid hex: {e}"))?;
+    crate::identity::validate_identity_proof_hash(&identity_proof_hash_vec)
+        .map_err(|e| format!("identity_proof_hash validation failed: {e}"))?;
+    let identity_proof_hash: [u8; 32] = identity_proof_hash_vec
+        .as_slice()
+        .try_into()
+        .expect("validated to 32 bytes by validate_identity_proof_hash");
+
+    Ok((parent_lease_id, identity_proof_hash))
+}
+
+/// Replay-critical fields persisted for `IngestReviewReceipt` idempotency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceiptReplayBindings {
+    lease_id: String,
+    changeset_digest: [u8; 32],
+    verdict: String,
+    identity_proof_hash: [u8; 32],
+    artifact_bundle_hash: [u8; 32],
+    blocked_reason_code: Option<u32>,
+    blocked_log_hash: Option<[u8; 32]>,
+}
+
+fn normalize_receipt_replay_verdict(verdict: &str) -> Result<String, String> {
+    let canonical = verdict.trim().to_ascii_uppercase();
+    match canonical.as_str() {
+        "APPROVE" | "APPROVED" => Ok("APPROVE".to_string()),
+        "BLOCKED" => Ok("BLOCKED".to_string()),
+        _ => Err(format!("unsupported verdict value: {verdict}")),
+    }
+}
+
+/// Extracts replay-critical fields from a persisted review receipt payload.
+///
+/// Supports both payload shapes used by emitters:
+/// - wrapper JSON with hex-encoded inner payload in `"payload"` (stub emitter)
+/// - direct top-level fields (`SQLite` emitter)
+fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplayBindings, String> {
+    let wrapper = serde_json::from_slice::<serde_json::Value>(event_payload)
+        .map_err(|e| format!("cannot parse receipt payload wrapper: {e}"))?;
+
+    let inner_payload = wrapper
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|hex_payload| hex::decode(hex_payload).ok())
+        .and_then(|inner_bytes| serde_json::from_slice::<serde_json::Value>(&inner_bytes).ok());
+
+    let lookup_value = |field: &str| {
+        inner_payload
+            .as_ref()
+            .and_then(|inner| inner.get(field))
+            .or_else(|| wrapper.get(field))
+    };
+    let lookup_field = |field: &str| lookup_value(field).and_then(serde_json::Value::as_str);
+    let decode_hash32 = |field: &str, value: &str| -> Result<[u8; 32], String> {
+        let decoded = hex::decode(value).map_err(|e| format!("{field} is not valid hex: {e}"))?;
+        decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("{field} must decode to 32 bytes, got {}", decoded.len()))
+    };
+
+    let lease_id = lookup_field("lease_id")
+        .or_else(|| lookup_field("episode_id"))
+        .map(str::to_owned)
+        .ok_or_else(|| "missing lease_id".to_string())?;
+    if lease_id.is_empty() {
+        return Err("lease_id is empty".to_string());
+    }
+
+    let changeset_digest_hex =
+        lookup_field("changeset_digest").ok_or_else(|| "missing changeset_digest".to_string())?;
+    let changeset_digest = decode_hash32("changeset_digest", changeset_digest_hex)?;
+
+    let verdict_value = lookup_field("verdict")
+        .map(str::to_owned)
+        .or_else(|| {
+            lookup_field("event_type").and_then(|event_type| match event_type {
+                "review_receipt_recorded" | "ReviewReceiptRecorded" => Some("APPROVE".to_string()),
+                "review_blocked_recorded" | "ReviewBlockedRecorded" => Some("BLOCKED".to_string()),
+                _ => None,
+            })
+        })
+        .ok_or_else(|| "missing verdict".to_string())?;
+    let verdict = normalize_receipt_replay_verdict(&verdict_value)?;
+
+    let identity_proof_hash_hex = lookup_field("identity_proof_hash")
+        .ok_or_else(|| "missing identity_proof_hash".to_string())?;
+    let identity_proof_hash_vec = hex::decode(identity_proof_hash_hex)
+        .map_err(|e| format!("identity_proof_hash is not valid hex: {e}"))?;
+    crate::identity::validate_identity_proof_hash(&identity_proof_hash_vec)
+        .map_err(|e| format!("identity_proof_hash validation failed: {e}"))?;
+    let identity_proof_hash: [u8; 32] = identity_proof_hash_vec
+        .as_slice()
+        .try_into()
+        .expect("validated to 32 bytes by validate_identity_proof_hash");
+
+    let artifact_bundle_hash_hex = lookup_field("artifact_bundle_hash")
+        .ok_or_else(|| "missing artifact_bundle_hash".to_string())?;
+    let artifact_bundle_hash = decode_hash32("artifact_bundle_hash", artifact_bundle_hash_hex)?;
+
+    let blocked_reason_code = lookup_value("blocked_reason_code")
+        .or_else(|| lookup_value("reason_code"))
+        .map(|value| match value {
+            serde_json::Value::Number(num) => {
+                let reason_u64 = num.as_u64().ok_or_else(|| {
+                    "blocked_reason_code must be a non-negative integer".to_string()
+                })?;
+                u32::try_from(reason_u64)
+                    .map_err(|_| format!("blocked_reason_code must fit in u32, got {reason_u64}"))
+            },
+            serde_json::Value::String(text) => text
+                .parse::<u32>()
+                .map_err(|e| format!("blocked_reason_code is not a valid u32: {e}")),
+            other => Err(format!(
+                "blocked_reason_code has unsupported JSON type: {other}"
+            )),
+        })
+        .transpose()?;
+
+    let blocked_log_hash = lookup_field("blocked_log_hash")
+        .map(|value| decode_hash32("blocked_log_hash", value))
+        .transpose()?;
+
+    Ok(ReceiptReplayBindings {
+        lease_id,
+        changeset_digest,
+        verdict,
+        identity_proof_hash,
+        artifact_bundle_hash,
+        blocked_reason_code,
+        blocked_log_hash,
+    })
 }
 
 // ============================================================================
@@ -7630,6 +7836,35 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // REQ-0010: Identity-bearing authoritative requests MUST carry
+        // proof-carrying pointers.
+        //
+        // SECURITY (TCK-00356 Fix 1): Validate the identity proof hash using
+        // the centralized validator which enforces non-zero commitment and
+        // correct length. Phase 1 (pre-CAS transport) validates the hash as
+        // a binding commitment; full proof dereference requires CAS
+        // integration (TCK-00359).
+        if let Err(e) = crate::identity::validate_identity_proof_hash(&request.identity_proof_hash)
+        {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("identity_proof_hash validation failed: {e}"),
+            ));
+        }
+
+        // WVR-0003: Log once that identity proof hash is validated as
+        // shape-only commitment (Phase 1 / pre-CAS transport).
+        {
+            static PROOF_WAIVER_WARN: std::sync::Once = std::sync::Once::new();
+            PROOF_WAIVER_WARN.call_once(|| {
+                warn!(
+                    waiver = "WVR-0003",
+                    "identity proof hash validated as shape-only commitment; \
+                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0003)"
+                );
+            });
+        }
+
         // Validate changeset_digest is exactly 32 bytes
         if request.changeset_digest.len() != 32 {
             return Ok(PrivilegedResponse::error(
@@ -7832,44 +8067,207 @@ impl PrivilegedDispatcher {
             }
         }
 
+        let request_changeset_digest_arr: [u8; 32] = request
+            .changeset_digest
+            .as_slice()
+            .try_into()
+            .expect("validated to be 32 bytes above");
+        let request_identity_proof_hash_arr: [u8; 32] = request
+            .identity_proof_hash
+            .as_slice()
+            .try_into()
+            .expect("validated to be 32 bytes by validate_identity_proof_hash above");
+        let request_artifact_bundle_hash_arr: [u8; 32] = request
+            .artifact_bundle_hash
+            .as_slice()
+            .try_into()
+            .expect("validated to be 32 bytes above");
+        let request_verdict = match verdict {
+            ReviewReceiptVerdict::Approve => "APPROVE",
+            ReviewReceiptVerdict::Blocked => "BLOCKED",
+            ReviewReceiptVerdict::Unspecified => {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "verdict must be APPROVE or BLOCKED",
+                ));
+            },
+        };
+        let request_blocked_reason_code = if verdict == ReviewReceiptVerdict::Blocked {
+            Some(request.blocked_reason_code)
+        } else {
+            None
+        };
+        let request_blocked_log_hash_arr = if verdict == ReviewReceiptVerdict::Blocked {
+            Some(
+                request
+                    .blocked_log_hash
+                    .as_slice()
+                    .try_into()
+                    .expect("validated to be 32 bytes above"),
+            )
+        } else {
+            None
+        };
+
+        let to_response_event_type = |event_type: &str| -> String {
+            match event_type {
+                "review_receipt_recorded" => "ReviewReceiptRecorded".to_string(),
+                "review_blocked_recorded" => "ReviewBlockedRecorded".to_string(),
+                other => other.to_string(),
+            }
+        };
+
+        let validate_receipt_replay = |existing: &SignedLedgerEvent| -> Result<(), String> {
+            let original = extract_receipt_replay_bindings(&existing.payload).map_err(|e| {
+                format!("receipt exists but replay bindings could not be extracted: {e}")
+            })?;
+
+            if original.lease_id != request.lease_id {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    original_lease_id = %original.lease_id,
+                    requested_lease_id = %request.lease_id,
+                    "Idempotent review receipt replay rejected: lease_id mismatch"
+                );
+                return Err(format!(
+                    "receipt_id '{}' was originally submitted for lease '{}', not '{}'",
+                    request.receipt_id, original.lease_id, request.lease_id
+                ));
+            }
+
+            if original.identity_proof_hash != request_identity_proof_hash_arr {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    original_identity_proof_hash = %hex::encode(original.identity_proof_hash),
+                    requested_identity_proof_hash = %hex::encode(request_identity_proof_hash_arr),
+                    "Idempotent review receipt replay rejected: identity_proof_hash mismatch"
+                );
+                return Err(format!(
+                    "receipt_id '{}' was originally submitted with identity_proof_hash '{}', not '{}'",
+                    request.receipt_id,
+                    hex::encode(original.identity_proof_hash),
+                    hex::encode(request_identity_proof_hash_arr),
+                ));
+            }
+
+            if original.changeset_digest != request_changeset_digest_arr {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    original_changeset_digest = %hex::encode(original.changeset_digest),
+                    requested_changeset_digest = %hex::encode(request_changeset_digest_arr),
+                    "Idempotent review receipt replay rejected: changeset_digest mismatch"
+                );
+                return Err(format!(
+                    "receipt_id '{}' was originally submitted with changeset_digest '{}', not '{}'",
+                    request.receipt_id,
+                    hex::encode(original.changeset_digest),
+                    hex::encode(request_changeset_digest_arr),
+                ));
+            }
+
+            if original.verdict != request_verdict {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    original_verdict = %original.verdict,
+                    requested_verdict = %request_verdict,
+                    "Idempotent review receipt replay rejected: verdict mismatch"
+                );
+                return Err(format!(
+                    "receipt_id '{}' was originally submitted with verdict '{}', not '{}'",
+                    request.receipt_id, original.verdict, request_verdict
+                ));
+            }
+
+            if original.artifact_bundle_hash != request_artifact_bundle_hash_arr {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    original_artifact_bundle_hash = %hex::encode(original.artifact_bundle_hash),
+                    requested_artifact_bundle_hash = %hex::encode(request_artifact_bundle_hash_arr),
+                    "Idempotent review receipt replay rejected: artifact_bundle_hash mismatch"
+                );
+                return Err(format!(
+                    "receipt_id '{}' was originally submitted with artifact_bundle_hash '{}', not '{}'",
+                    request.receipt_id,
+                    hex::encode(original.artifact_bundle_hash),
+                    hex::encode(request_artifact_bundle_hash_arr),
+                ));
+            }
+
+            if let Some(original_blocked_reason_code) = original.blocked_reason_code {
+                let requested_blocked_reason_code = request_blocked_reason_code
+                    .map_or_else(|| "<missing>".to_string(), |code| code.to_string());
+                if Some(original_blocked_reason_code) != request_blocked_reason_code {
+                    warn!(
+                        receipt_id = %request.receipt_id,
+                        existing_event_id = %existing.event_id,
+                        original_blocked_reason_code = original_blocked_reason_code,
+                        requested_blocked_reason_code = %requested_blocked_reason_code,
+                        "Idempotent review receipt replay rejected: blocked_reason_code mismatch"
+                    );
+                    return Err(format!(
+                        "receipt_id '{}' was originally submitted with blocked_reason_code '{}', not '{}'",
+                        request.receipt_id,
+                        original_blocked_reason_code,
+                        requested_blocked_reason_code,
+                    ));
+                }
+            }
+
+            if let Some(original_blocked_log_hash) = original.blocked_log_hash {
+                let requested_blocked_log_hash = request_blocked_log_hash_arr
+                    .map_or_else(|| "<missing>".to_string(), hex::encode);
+                if Some(original_blocked_log_hash) != request_blocked_log_hash_arr {
+                    warn!(
+                        receipt_id = %request.receipt_id,
+                        existing_event_id = %existing.event_id,
+                        original_blocked_log_hash = %hex::encode(original_blocked_log_hash),
+                        requested_blocked_log_hash = %requested_blocked_log_hash,
+                        "Idempotent review receipt replay rejected: blocked_log_hash mismatch"
+                    );
+                    return Err(format!(
+                        "receipt_id '{}' was originally submitted with blocked_log_hash '{}', not '{}'",
+                        request.receipt_id,
+                        hex::encode(original_blocked_log_hash),
+                        requested_blocked_log_hash,
+                    ));
+                }
+            }
+
+            Ok(())
+        };
+
         // ---- Phase 2: Idempotency check ----
         //
         // SECURITY (v10 MAJOR 1 -- receipt_id idempotency fix):
         //
         // Use `get_event_by_receipt_id` to look up existing events by the
-        // caller-supplied `receipt_id` embedded in the event payload. The
-        // previous approach using `get_event(&receipt_id)` was broken because
-        // `get_event` looks up by `event_id` (auto-generated `EVT-<uuid>`),
-        // not by `receipt_id`. The intermediate `get_events_by_work_id` approach
-        // also had a gap: `emit_review_blocked_receipt` stores `work_id` as
-        // `receipt_id` (not `lease_id`), so blocked receipts would not be found
-        // when querying by `lease_id`.
-        //
-        // `get_event_by_receipt_id` searches the payload JSON directly for the
-        // matching `receipt_id` field across both `review_receipt_recorded` and
-        // `review_blocked_recorded` event types, regardless of `work_id`.
+        // caller-supplied `receipt_id` embedded in the event payload.
         if let Some(existing) = self
             .event_emitter
             .get_event_by_receipt_id(&request.receipt_id)
         {
+            if let Err(message) = validate_receipt_replay(&existing) {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    message,
+                ));
+            }
+
             info!(
                 receipt_id = %request.receipt_id,
                 existing_event_id = %existing.event_id,
-                "Duplicate receipt_id detected - returning existing event (idempotent)"
+                "Duplicate receipt_id detected with matching replay bindings - returning existing event"
             );
-            // Map the internal event_type to the response-level event type.
-            // The ledger stores snake_case event types ("review_receipt_recorded",
-            // "review_blocked_recorded"), but the response contract uses
-            // PascalCase ("ReviewReceiptRecorded", "ReviewBlockedRecorded").
-            let response_event_type = match existing.event_type.as_str() {
-                "review_receipt_recorded" => "ReviewReceiptRecorded".to_string(),
-                "review_blocked_recorded" => "ReviewBlockedRecorded".to_string(),
-                other => other.to_string(),
-            };
+
             return Ok(PrivilegedResponse::IngestReviewReceipt(
                 IngestReviewReceiptResponse {
-                    receipt_id: request.receipt_id,
-                    event_type: response_event_type,
+                    receipt_id: request.receipt_id.clone(),
+                    event_type: to_response_event_type(&existing.event_type),
                     event_id: existing.event_id,
                 },
             ));
@@ -7888,67 +8286,91 @@ impl PrivilegedDispatcher {
         };
 
         // ---- Phase 4: Emit event based on verdict ----
-        let (event_type, signed_event) = match verdict {
-            ReviewReceiptVerdict::Approve => {
-                let changeset_digest: [u8; 32] = request
-                    .changeset_digest
-                    .as_slice()
-                    .try_into()
-                    .expect("validated to be 32 bytes above");
-                let artifact_bundle_hash: [u8; 32] = request
-                    .artifact_bundle_hash
-                    .as_slice()
-                    .try_into()
-                    .expect("validated to be 32 bytes above");
-
-                // SECURITY (v6 Finding 1): Use authenticated reviewer identity
-                // for event actor attribution, not the caller-supplied value.
-                let event = self
-                    .event_emitter
-                    .emit_review_receipt(
+        let (event_type, emit_result, emit_error_prefix) = match verdict {
+            ReviewReceiptVerdict::Approve => (
+                "ReviewReceiptRecorded".to_string(),
+                self.event_emitter.emit_review_receipt(
+                    &request.lease_id,
+                    &request.receipt_id,
+                    &request_changeset_digest_arr,
+                    &request_artifact_bundle_hash_arr,
+                    &authenticated_reviewer_id,
+                    timestamp_ns,
+                    &request_identity_proof_hash_arr,
+                ),
+                "review receipt emission failed",
+            ),
+            ReviewReceiptVerdict::Blocked => {
+                let blocked_log_hash_arr = request_blocked_log_hash_arr
+                    .expect("validated to be present for BLOCKED verdict");
+                (
+                    "ReviewBlockedRecorded".to_string(),
+                    self.event_emitter.emit_review_blocked_receipt(
                         &request.lease_id,
                         &request.receipt_id,
-                        &changeset_digest,
-                        &artifact_bundle_hash,
-                        &authenticated_reviewer_id,
-                        timestamp_ns,
-                    )
-                    .map_err(|e| ProtocolError::Serialization {
-                        reason: format!("review receipt emission failed: {e}"),
-                    })?;
-
-                ("ReviewReceiptRecorded".to_string(), event)
-            },
-            ReviewReceiptVerdict::Blocked => {
-                let blocked_log_hash: [u8; 32] = request
-                    .blocked_log_hash
-                    .as_slice()
-                    .try_into()
-                    .expect("validated to be 32 bytes above");
-
-                // SECURITY (v6 Finding 1): Use authenticated reviewer identity
-                // for event actor attribution, not the caller-supplied value.
-                let event = self
-                    .event_emitter
-                    .emit_review_blocked_receipt(
-                        &request.receipt_id,
+                        &request_changeset_digest_arr,
+                        &request_artifact_bundle_hash_arr,
                         request.blocked_reason_code,
-                        &blocked_log_hash,
+                        &blocked_log_hash_arr,
                         &authenticated_reviewer_id,
                         timestamp_ns,
-                    )
-                    .map_err(|e| ProtocolError::Serialization {
-                        reason: format!("review blocked emission failed: {e}"),
-                    })?;
-
-                ("ReviewBlockedRecorded".to_string(), event)
+                        &request_identity_proof_hash_arr,
+                    ),
+                    "review blocked emission failed",
+                )
             },
-            ReviewReceiptVerdict::Unspecified => {
-                // Already handled above, but fail-closed for safety
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    "verdict must be APPROVE or BLOCKED",
+            ReviewReceiptVerdict::Unspecified => unreachable!("validated above"),
+        };
+
+        let signed_event = match emit_result {
+            Ok(event) => event,
+            Err(e) if e.to_string().contains("UNIQUE constraint") => {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    verdict = %request_verdict,
+                    error = %e,
+                    "Concurrent duplicate receipt_id detected by UNIQUE constraint"
+                );
+
+                let Some(existing) = self
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                else {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "receipt_id '{}' hit a uniqueness race, but the existing event \
+                             could not be resolved",
+                            request.receipt_id
+                        ),
+                    ));
+                };
+
+                if let Err(message) = validate_receipt_replay(&existing) {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        message,
+                    ));
+                }
+
+                info!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    "Concurrent duplicate receipt_id resolved as idempotent replay"
+                );
+
+                return Ok(PrivilegedResponse::IngestReviewReceipt(
+                    IngestReviewReceiptResponse {
+                        receipt_id: request.receipt_id.clone(),
+                        event_type: to_response_event_type(&existing.event_type),
+                        event_id: existing.event_id,
+                    },
                 ));
+            },
+            Err(e) => {
+                return Err(ProtocolError::Serialization {
+                    reason: format!("{emit_error_prefix}: {e}"),
+                });
             },
         };
 
@@ -8813,6 +9235,40 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // REQ-0010: Identity-bearing authoritative requests MUST carry
+        // proof-carrying pointers.
+        //
+        // SECURITY (TCK-00356 Fix 1): Validate the identity proof hash using
+        // the centralized validator which enforces non-zero commitment and
+        // correct length. Phase 1 (pre-CAS transport) validates the hash as
+        // a binding commitment; full proof dereference requires CAS
+        // integration (TCK-00359).
+        if let Err(e) = crate::identity::validate_identity_proof_hash(&request.identity_proof_hash)
+        {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("identity_proof_hash validation failed: {e}"),
+            ));
+        }
+        let request_identity_proof_hash: [u8; 32] = request
+            .identity_proof_hash
+            .as_slice()
+            .try_into()
+            .expect("validated to be 32 bytes by validate_identity_proof_hash above");
+
+        // WVR-0003: Log once that identity proof hash is validated as
+        // shape-only commitment (Phase 1 / pre-CAS transport).
+        {
+            static SUBLEASE_PROOF_WAIVER_WARN: std::sync::Once = std::sync::Once::new();
+            SUBLEASE_PROOF_WAIVER_WARN.call_once(|| {
+                warn!(
+                    waiver = "WVR-0003",
+                    "identity proof hash validated as shape-only commitment; \
+                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0003)"
+                );
+            });
+        }
+
         if request.sublease_id.is_empty() {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -9013,91 +9469,28 @@ impl PrivilegedDispatcher {
                     ));
                 };
 
-                // SECURITY (v9 Finding 2 — Fail-Closed Parent Lineage Binding):
-                //
-                // Verify that the original `SubleaseIssued` event was bound to
-                // the same `parent_lease_id` as the current request. Even though
-                // the `changeset_digest`/`policy_hash` comparison above provides
-                // indirect lineage verification, we MUST also check the
-                // explicit `parent_lease_id` from the event payload to prevent
-                // lineage ambiguity when two different parent leases happen
-                // to share inherited cryptographic fields.
-                //
-                // SECURITY: This extraction MUST be fail-closed. If the event
-                // payload cannot be parsed, or if `parent_lease_id` cannot be
-                // extracted from either the hex-encoded inner payload or the
-                // top-level wrapper, the idempotent replay MUST be rejected.
-                // Silently bypassing this check on parse failure would allow
-                // corrupted or legacy payloads to return success without
-                // verifying lineage, weakening confused-deputy resistance.
-                //
-                // NOTE: The event payload is a wrapper JSON containing the
-                // original payload as a hex-encoded string in the "payload"
-                // field. We must decode that inner payload to extract the
-                // `parent_lease_id` field.
-                let wrapper =
-                    match serde_json::from_slice::<serde_json::Value>(&original_event.payload) {
-                        Ok(w) => w,
+                // SECURITY (v12): Idempotent replay must verify both lineage
+                // (`parent_lease_id`) and proof pointer (`identity_proof_hash`)
+                // extracted from the persisted `SubleaseIssued` payload.
+                let (original_parent_id, original_identity_proof_hash) =
+                    match extract_sublease_replay_bindings(&original_event.payload) {
+                        Ok(values) => values,
                         Err(e) => {
                             warn!(
                                 sublease_id = %request.sublease_id,
                                 error = %e,
-                                "Idempotent sublease replay rejected: cannot parse event payload \
-                                 for lineage verification"
+                                "Idempotent sublease replay rejected: cannot extract replay bindings"
                             );
                             return Ok(PrivilegedResponse::error(
                                 PrivilegedErrorCode::CapabilityRequestRejected,
                                 format!(
-                                    "sublease '{}' exists but its event payload cannot be parsed \
-                                 for lineage verification: {e}",
+                                    "sublease '{}' exists but replay bindings could not be extracted \
+                                     from its event payload: {e}",
                                     request.sublease_id
                                 ),
                             ));
                         },
                     };
-
-                // Extract the inner payload: it may be hex-encoded (stub
-                // emitter) or directly embedded depending on the emitter.
-                // Try hex-decoding the "payload" field first, then fall
-                // back to checking `parent_lease_id` at the top level.
-                let original_parent_id = wrapper
-                    .get("payload")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|hex_str| hex::decode(hex_str).ok())
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|inner| {
-                        inner
-                            .get("parent_lease_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(String::from)
-                    })
-                    .or_else(|| {
-                        // Fallback: `parent_lease_id` at top level (e.g.,
-                        // production SQLite emitter stores raw payload).
-                        wrapper
-                            .get("parent_lease_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(String::from)
-                    });
-
-                // SECURITY: Fail-closed -- if parent_lease_id cannot be
-                // extracted from the event payload, reject the idempotent
-                // replay rather than silently bypassing lineage verification.
-                let Some(original_parent_id) = original_parent_id else {
-                    warn!(
-                        sublease_id = %request.sublease_id,
-                        "Idempotent sublease replay rejected: cannot extract parent_lease_id \
-                         from event payload for lineage verification"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "sublease '{}' exists but parent_lease_id cannot be extracted \
-                             from its event payload for lineage verification",
-                            request.sublease_id
-                        ),
-                    ));
-                };
 
                 if original_parent_id != request.parent_lease_id {
                     warn!(
@@ -9112,6 +9505,25 @@ impl PrivilegedDispatcher {
                             "sublease '{}' was originally delegated from parent '{}', \
                              not '{}'",
                             request.sublease_id, original_parent_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
+                if original_identity_proof_hash != request_identity_proof_hash {
+                    warn!(
+                        sublease_id = %request.sublease_id,
+                        original_identity_proof_hash = %hex::encode(original_identity_proof_hash),
+                        requested_identity_proof_hash = %hex::encode(request_identity_proof_hash),
+                        "Idempotent sublease replay rejected: identity_proof_hash mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' was originally delegated with identity_proof_hash '{}', \
+                             not '{}'",
+                            request.sublease_id,
+                            hex::encode(original_identity_proof_hash),
+                            hex::encode(request_identity_proof_hash)
                         ),
                     ));
                 }
@@ -9300,54 +9712,28 @@ impl PrivilegedDispatcher {
                     ));
                 };
 
-                // Extract parent_lease_id from the event payload using the
-                // same logic as Phase 2b: try hex-decoded inner payload first,
-                // then fall back to top-level field.
-                let parent_id_from_event =
-                    serde_json::from_slice::<serde_json::Value>(&original_event.payload)
-                        .ok()
-                        .and_then(|wrapper| {
-                            // Try hex-encoded inner payload first (stub emitter format)
-                            wrapper
-                                .get("payload")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|hex_str| hex::decode(hex_str).ok())
-                                .and_then(|bytes| {
-                                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                                })
-                                .and_then(|inner| {
-                                    inner
-                                        .get("parent_lease_id")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(String::from)
-                                })
-                                .or_else(|| {
-                                    // Fallback: parent_lease_id at top level
-                                    // (production SQLite emitter stores raw payload).
-                                    wrapper
-                                        .get("parent_lease_id")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(String::from)
-                                })
-                        });
-
-                // SECURITY: Fail-closed -- if parent_lease_id cannot be
-                // extracted, reject the idempotent replay.
-                let Some(original_parent_id) = parent_id_from_event else {
-                    warn!(
-                        sublease_id = %sublease.lease_id,
-                        "Concurrent duplicate sublease: cannot extract \
-                         parent_lease_id from event payload -- failing closed"
-                    );
-                    return Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::CapabilityRequestRejected,
-                        format!(
-                            "sublease '{}' exists but parent_lease_id cannot be \
-                             extracted from its event payload for lineage verification",
-                            sublease.lease_id
-                        ),
-                    ));
-                };
+                // SECURITY (v12): Re-check persisted replay bindings
+                // (`parent_lease_id` + `identity_proof_hash`) for the
+                // duplicate detected at persistence time.
+                let (original_parent_id, original_identity_proof_hash) =
+                    match extract_sublease_replay_bindings(&original_event.payload) {
+                        Ok(values) => values,
+                        Err(extract_err) => {
+                            warn!(
+                                sublease_id = %sublease.lease_id,
+                                error = %extract_err,
+                                "Concurrent duplicate sublease: cannot extract replay bindings -- failing closed"
+                            );
+                            return Ok(PrivilegedResponse::error(
+                                PrivilegedErrorCode::CapabilityRequestRejected,
+                                format!(
+                                    "sublease '{}' exists but replay bindings could not be \
+                                     extracted from its event payload: {extract_err}",
+                                    sublease.lease_id
+                                ),
+                            ));
+                        },
+                    };
 
                 if original_parent_id != request.parent_lease_id {
                     warn!(
@@ -9362,6 +9748,25 @@ impl PrivilegedDispatcher {
                             "sublease '{}' was originally delegated from parent \
                              '{}', not '{}'",
                             sublease.lease_id, original_parent_id, request.parent_lease_id
+                        ),
+                    ));
+                }
+
+                if original_identity_proof_hash != request_identity_proof_hash {
+                    warn!(
+                        sublease_id = %sublease.lease_id,
+                        original_identity_proof_hash = %hex::encode(original_identity_proof_hash),
+                        requested_identity_proof_hash = %hex::encode(request_identity_proof_hash),
+                        "Concurrent duplicate sublease: identity_proof_hash mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "sublease '{}' was originally delegated with identity_proof_hash \
+                             '{}', not '{}'",
+                            sublease.lease_id,
+                            hex::encode(original_identity_proof_hash),
+                            hex::encode(request_identity_proof_hash)
                         ),
                     ));
                 }
@@ -9404,6 +9809,10 @@ impl PrivilegedDispatcher {
         // caller-controlled `delegatee_actor_id`. The delegatee is included
         // as a separate field in the event payload so the audit trail records
         // BOTH who performed the delegation and who received the sublease.
+        //
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed event payload so it is audit-bound and cannot be
+        // stripped post-signing.
         let event_payload = serde_json::json!({
             "parent_lease_id": request.parent_lease_id,
             "sublease_id": sublease.lease_id,
@@ -9413,6 +9822,7 @@ impl PrivilegedDispatcher {
             "work_id": sublease.work_id,
             "expires_at": sublease.expires_at,
             "issued_at": sublease.issued_at,
+            "identity_proof_hash": hex::encode(&request.identity_proof_hash),
         });
         // SECURITY (v10 MAJOR — Fail-closed serialization):
         //
@@ -17909,6 +18319,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -17940,6 +18351,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 1, // APPLY_FAILED
                 blocked_log_hash: vec![0x55; 32],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -17983,6 +18395,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18029,6 +18442,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18062,6 +18476,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18096,6 +18511,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18135,6 +18551,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18165,6 +18582,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18195,6 +18613,7 @@ mod tests {
                 verdict: 0, // UNSPECIFIED
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18225,6 +18644,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18243,6 +18663,69 @@ mod tests {
         }
 
         #[test]
+        fn test_ingest_review_receipt_missing_identity_proof_hash_rejected() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-006b", "W-006b", "gate-006b", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-006b".to_string(),
+                receipt_id: "RR-006b".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("identity_proof_hash validation failed"),
+                        "Expected identity_proof_hash validation error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_zero_identity_proof_hash_rejected() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-006c", "W-006c", "gate-006c", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-006c".to_string(),
+                receipt_id: "RR-006c".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x00; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("null commitment rejected"),
+                        "Expected null commitment rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for zero identity proof hash, got {other:?}"),
+            }
+        }
+
+        #[test]
         fn test_ingest_review_receipt_blocked_missing_log_hash() {
             let (dispatcher, ctx) =
                 setup_dispatcher_with_lease("lease-007", "W-007", "gate-007", "reviewer");
@@ -18256,6 +18739,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 1,
                 blocked_log_hash: vec![], // Missing log hash for BLOCKED
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18287,6 +18771,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 0, // Zero is invalid for BLOCKED
                 blocked_log_hash: vec![0x55; 32],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18325,6 +18810,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18360,6 +18846,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18397,6 +18884,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18453,6 +18941,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18502,6 +18991,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18609,6 +19099,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18656,6 +19147,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18700,6 +19192,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18744,6 +19237,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18800,6 +19294,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18842,6 +19337,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18889,6 +19385,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
 
             // First submission should succeed
@@ -18940,6 +19437,249 @@ mod tests {
                 receipt_event_count, 1,
                 "Duplicate receipt_id submission must NOT create a second event"
             );
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_duplicate_receipt_id_different_identity_proof_hash_rejected()
+        {
+            let (dispatcher, ctx) = setup_dispatcher_with_lease(
+                "lease-dup-proof-001",
+                "W-DUP-PROOF-001",
+                "gate-001",
+                "reviewer-a",
+            );
+
+            let request1 = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-proof-001".to_string(),
+                receipt_id: "RR-DUP-PROOF-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame1 = encode_ingest_review_receipt_request(&request1);
+            let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(response1, PrivilegedResponse::IngestReviewReceipt(_)),
+                "first receipt submission should succeed"
+            );
+
+            let request2 = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-proof-001".to_string(),
+                receipt_id: "RR-DUP-PROOF-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x98; 32],
+            };
+            let frame2 = encode_ingest_review_receipt_request(&request2);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("identity_proof_hash"),
+                        "expected identity_proof_hash mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "expected duplicate receipt_id + identity_proof_hash mismatch rejection, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_duplicate_receipt_id_different_artifact_bundle_hash_rejected()
+        {
+            let (dispatcher, ctx) = setup_dispatcher_with_lease(
+                "lease-dup-artifact-001",
+                "W-DUP-ARTIFACT-001",
+                "gate-001",
+                "reviewer-a",
+            );
+
+            let request1 = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-artifact-001".to_string(),
+                receipt_id: "RR-DUP-ARTIFACT-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame1 = encode_ingest_review_receipt_request(&request1);
+            let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(response1, PrivilegedResponse::IngestReviewReceipt(_)),
+                "first receipt submission should succeed"
+            );
+
+            let request2 = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-artifact-001".to_string(),
+                receipt_id: "RR-DUP-ARTIFACT-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x44; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame2 = encode_ingest_review_receipt_request(&request2);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("artifact_bundle_hash"),
+                        "expected artifact_bundle_hash mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "expected duplicate receipt_id + artifact_bundle_hash mismatch rejection, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_duplicate_blocked_receipt_different_artifact_bundle_hash_rejected()
+         {
+            let (dispatcher, ctx) = setup_dispatcher_with_lease(
+                "lease-dup-blocked-artifact-001",
+                "W-DUP-BLOCKED-ARTIFACT-001",
+                "gate-001",
+                "reviewer-a",
+            );
+
+            let request1 = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-blocked-artifact-001".to_string(),
+                receipt_id: "RB-DUP-ARTIFACT-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Blocked.into(),
+                blocked_reason_code: 1,
+                blocked_log_hash: vec![0x55; 32],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame1 = encode_ingest_review_receipt_request(&request1);
+            let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(response1, PrivilegedResponse::IngestReviewReceipt(_)),
+                "first blocked receipt submission should succeed"
+            );
+
+            let request2 = IngestReviewReceiptRequest {
+                lease_id: "lease-dup-blocked-artifact-001".to_string(),
+                receipt_id: "RB-DUP-ARTIFACT-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x44; 32],
+                verdict: ReviewReceiptVerdict::Blocked.into(),
+                blocked_reason_code: 1,
+                blocked_log_hash: vec![0x55; 32],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame2 = encode_ingest_review_receipt_request(&request2);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("artifact_bundle_hash"),
+                        "expected artifact_bundle_hash mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "expected duplicate BLOCKED receipt_id + artifact_bundle_hash mismatch rejection, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_duplicate_receipt_id_different_lease_id_rejected() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-A", "W-DUP-LEASE-A", "gate-001", "reviewer-a");
+
+            let peer_creds = test_peer_credentials();
+            let executor_actor_id = derive_actor_id(&peer_creds);
+            dispatcher.lease_validator.register_lease_with_executor(
+                "lease-B",
+                "W-DUP-LEASE-B",
+                "gate-002",
+                &executor_actor_id,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-DUP-LEASE-B".to_string(),
+                    lease_id: "lease-B".to_string(),
+                    actor_id: executor_actor_id,
+                    role: WorkRole::Reviewer,
+                    policy_resolution: PolicyResolution {
+                        policy_resolved_ref: "PolicyResolvedForChangeSet:W-DUP-LEASE-B".to_string(),
+                        resolved_policy_hash: [0u8; 32],
+                        capability_manifest_hash: [0u8; 32],
+                        context_pack_hash: [0u8; 32],
+                        resolved_risk_tier: 0,
+                        resolved_scope_baseline: None,
+                    },
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                })
+                .expect("second work claim registration should succeed");
+
+            let request1 = IngestReviewReceiptRequest {
+                lease_id: "lease-A".to_string(),
+                receipt_id: "RR-DUP-LEASE-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame1 = encode_ingest_review_receipt_request(&request1);
+            let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(response1, PrivilegedResponse::IngestReviewReceipt(_)),
+                "first receipt submission should succeed"
+            );
+
+            let request2 = IngestReviewReceiptRequest {
+                lease_id: "lease-B".to_string(),
+                receipt_id: "RR-DUP-LEASE-001".to_string(),
+                reviewer_actor_id: "reviewer-a".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame2 = encode_ingest_review_receipt_request(&request2);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("lease"),
+                        "expected lease mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "expected duplicate receipt_id + lease mismatch rejection, got {other:?}"
+                ),
+            }
         }
 
         // ====================================================================
@@ -19022,6 +19762,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19067,6 +19808,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-002".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19105,6 +19847,7 @@ mod tests {
                 requested_expiry_ns: 3_000_000_000_000, /* Exceeds parent's expires_at (3_000_000
                                                          * ms) */
                 sublease_id: "sublease-overflow".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19140,6 +19883,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-003".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19175,6 +19919,7 @@ mod tests {
                 delegatee_actor_id: String::new(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-004".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19188,6 +19933,81 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error for empty delegatee_actor_id, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_missing_identity_proof_hash_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-001".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-no-proof".to_string(),
+                identity_proof_hash: vec![],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("identity_proof_hash validation failed"),
+                        "Expected identity_proof_hash validation error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for missing identity proof hash, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_zero_identity_proof_hash_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-002".to_string(),
+                delegatee_actor_id: "child-executor-002".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-zero-proof".to_string(),
+                identity_proof_hash: vec![0x00; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("null commitment rejected"),
+                        "Expected null commitment rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected error for zero identity proof hash, got {other:?}")
+                },
             }
         }
 
@@ -19206,6 +20026,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-005".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19245,6 +20066,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-006".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19308,6 +20130,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-authz".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19348,6 +20171,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-no-creds".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19417,6 +20241,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-evt".to_string(),
                 requested_expiry_ns: 1_900_000_000_000, // ns
                 sublease_id: "sublease-evt-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19461,6 +20286,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-dup".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-dup-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19497,6 +20323,52 @@ mod tests {
                     );
                 },
                 other => panic!("Expected idempotent DelegateSublease, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_duplicate_id_different_identity_proof_hash_rejected() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-dup-proof",
+                "W-DS-DUP-PROOF",
+                "gate-quality",
+                "executor-dup-proof",
+            );
+
+            let req1 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-dup-proof".to_string(),
+                delegatee_actor_id: "child-executor-dup-proof".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-dup-proof-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame1 = encode_delegate_sublease_request(&req1);
+            let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(resp1, PrivilegedResponse::DelegateSublease(_)),
+                "first sublease should succeed"
+            );
+
+            // Same sublease_id, same logical parameters, but different proof pointer.
+            // This is not idempotent and must be rejected.
+            let req2 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-dup-proof".to_string(),
+                delegatee_actor_id: "child-executor-dup-proof".to_string(),
+                requested_expiry_ns: req1.requested_expiry_ns,
+                sublease_id: "sublease-dup-proof-001".to_string(),
+                identity_proof_hash: vec![0x98; 32],
+            };
+            let frame2 = encode_delegate_sublease_request(&req2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match resp2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("identity_proof_hash"),
+                        "expected identity_proof_hash mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected identity_proof_hash mismatch rejection, got {other:?}"),
             }
         }
 
@@ -19573,6 +20445,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "shared-sublease-id".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame1 = encode_delegate_sublease_request(&req1);
             let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
@@ -19588,6 +20461,7 @@ mod tests {
                 delegatee_actor_id: "child-002".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "shared-sublease-id".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame2 = encode_delegate_sublease_request(&req2);
             let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
@@ -19623,6 +20497,7 @@ mod tests {
                 delegatee_actor_id: "child-exp".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-exp-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame1 = encode_delegate_sublease_request(&req1);
             let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
@@ -19637,6 +20512,7 @@ mod tests {
                 delegatee_actor_id: "child-exp".to_string(),
                 requested_expiry_ns: 1_800_000_000_000, // Different expiry
                 sublease_id: "sublease-exp-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame2 = encode_delegate_sublease_request(&req2);
             let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
@@ -19732,6 +20608,7 @@ mod tests {
                 delegatee_actor_id: "child-lin".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-lineage-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame1 = encode_delegate_sublease_request(&req1);
             let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
@@ -19750,6 +20627,7 @@ mod tests {
                 delegatee_actor_id: "child-lin".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-lineage-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame2 = encode_delegate_sublease_request(&req2);
             let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
@@ -19930,6 +20808,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -20003,6 +20882,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -20072,6 +20952,7 @@ mod tests {
                 delegatee_actor_id: "child-sql-exec".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-sql-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -20113,6 +20994,7 @@ mod tests {
                 delegatee_actor_id: "child-sql".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-sql-invalid".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -20205,6 +21087,7 @@ mod tests {
                 delegatee_actor_id: "child-prod-exec".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-prod-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -20278,6 +21161,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let review_frame = encode_ingest_review_receipt_request(&review_request);
 
@@ -20395,6 +21279,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let review_frame = encode_ingest_review_receipt_request(&review_request);
 

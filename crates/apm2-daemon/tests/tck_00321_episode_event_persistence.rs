@@ -143,6 +143,7 @@ async fn test_atomic_receipt_emission() {
     let reviewer_actor_id = "reviewer-agent";
     let timestamp_ns = test_timestamp();
 
+    let identity_proof_hash = [0x99u8; 32];
     let signed_event = emitter
         .emit_review_receipt(
             episode_id,
@@ -151,6 +152,7 @@ async fn test_atomic_receipt_emission() {
             &artifact_bundle_hash,
             reviewer_actor_id,
             timestamp_ns,
+            &identity_proof_hash,
         )
         .unwrap();
 

@@ -14,10 +14,14 @@ evidence_artifact:
     (TCK-00354). Certificate hierarchy and session-key delegation are enforced
     via CellCertificateV1, HolonCertificateV1, and SessionKeyDelegationV1 with
     explicit root/operational/session role separation (TCK-00355, REQ-0009).
+    Directory-head and identity-proof artifacts are implemented with bounded
+    verification and authoritative boundary proof-pointer enforcement
+    (TCK-00356, REQ-0010).
   requirement_ids:
     - "REQ-0007"
     - "REQ-0008"
     - "REQ-0009"
+    - "REQ-0010"
   source_refs:
     - "crates/apm2-daemon/src/identity/mod.rs"
     - "crates/apm2-daemon/src/identity/public_key_id.rs"
@@ -26,9 +30,13 @@ evidence_artifact:
     - "crates/apm2-daemon/src/identity/holon_id.rs"
     - "crates/apm2-daemon/src/identity/certificate.rs"
     - "crates/apm2-daemon/src/identity/session_delegation.rs"
+    - "crates/apm2-daemon/src/identity/directory_proof.rs"
+    - "proto/apm2d_runtime_v1.proto"
+    - "crates/apm2-daemon/src/protocol/dispatch.rs"
     - "crates/apm2-daemon/src/cas/mod.rs"
     - "crates/apm2-daemon/src/identity/conformance.rs"
     - "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0009.yaml"
+    - "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0010.yaml"
   artifacts:
     - type: "test_output"
       description: |
@@ -69,3 +77,10 @@ evidence_artifact:
         - deterministic length-prefixed canonical bytes and CAS round-trip
         - key-role conformance vectors in identity::conformance
       ref: "cargo test -p apm2-daemon identity::certificate identity::session_delegation identity::conformance::tests::key_role_conformance_vectors_pass"
+    - type: "test_output"
+      description: |
+        Directory-head and identity-proof artifact tests (TCK-00356) covering:
+        - HolonDirectoryHeadV1 / DirectoryProofV1 / IdentityProofV1 canonicalization and CAS round-trip
+        - SMT proof verification and proof-byte bound enforcement
+        - fail-closed rejection for missing identity_proof_hash in authoritative boundary handlers
+      ref: "cargo test -p apm2-daemon identity::directory_proof test_ingest_review_receipt_missing_identity_proof_hash_rejected test_delegate_sublease_missing_identity_proof_hash_rejected"

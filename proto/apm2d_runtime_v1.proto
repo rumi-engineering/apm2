@@ -1642,6 +1642,8 @@ message IngestReviewReceiptRequest {
   uint32 blocked_reason_code = 7;
   // BLAKE3 hash of blocked logs stored in CAS (only for BLOCKED verdict).
   bytes blocked_log_hash = 8;
+  // CAS hash pointer to IdentityProofV1 for reviewer identity verification.
+  bytes identity_proof_hash = 9;
 }
 
 // Response confirming review receipt ingestion.
@@ -1667,6 +1669,8 @@ message DelegateSubleaseRequest {
   uint64 requested_expiry_ns = 3;
   // Sublease ID to assign (must be unique).
   string sublease_id = 4;
+  // CAS hash pointer to IdentityProofV1 for delegatee identity verification.
+  bytes identity_proof_hash = 5;
 }
 
 // Response confirming sublease delegation.
