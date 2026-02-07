@@ -1,0 +1,31 @@
+waiver:
+  id: WVR-0003
+  title: "Deferred identity proof CAS dereference at admission"
+  description: |
+    Permits authoritative handlers (IngestReviewReceipt, DelegateSublease)
+    to validate identity_proof_hash as a shape-only commitment (32-byte
+    non-zero) without dereferencing from CAS or executing
+    IdentityProofV1::verify() at admission time.
+
+    Full CAS dereference + cryptographic verification requires CAS
+    transport integration, which is delivered by TCK-00359 (verifier
+    cache contract and invalidation correctness). Until then, the hash
+    acts as a binding commitment — callers attest they hold a valid
+    proof by providing its hash, and the hash is bound into signed
+    ledger events for audit.
+
+    This waiver expires automatically and MUST be renewed or replaced
+    by CAS-backed proof verification.
+  status: ACTIVE
+  issued: "2026-02-07"
+  expires: "2026-04-07"
+  scope: "Authoritative handler identity_proof_hash admission checks"
+  binding_tickets:
+    - TCK-00356
+    - TCK-00359
+  conditions:
+    - "Only applies to identity_proof_hash validation in privileged handlers"
+    - "Hash must be exactly 32 bytes and non-zero (shape validation)"
+    - "Hash must be bound into ALL signed ledger event payloads"
+    - "Must be renewed or replaced before expiry"
+    - "IdentityProofV1::verify() exists and is tested but not wired to handlers"

@@ -191,6 +191,7 @@ fn emit_receipt_rejects_zero_bindings() {
         "reviewer-001",
         1_000_000,
         &zero_bindings,
+        &[0x99; 32],
     );
 
     assert!(result.is_err(), "emit must reject zero bindings");
@@ -218,6 +219,7 @@ fn emit_receipt_succeeds_with_valid_bindings_stub() {
         "reviewer-001",
         1_000_000,
         &bindings,
+        &[0x99; 32],
     );
 
     assert!(result.is_ok(), "emit must succeed with valid bindings");
@@ -278,6 +280,7 @@ fn emit_receipt_succeeds_with_valid_bindings_sqlite() {
         "reviewer-sqlite",
         2_000_000,
         &bindings,
+        &[0x99; 32],
     );
 
     assert!(
@@ -345,6 +348,7 @@ fn emit_receipt_rejects_zero_bindings_sqlite() {
         "reviewer-fail",
         3_000_000,
         &zero_bindings,
+        &[0x99; 32],
     );
 
     assert!(
@@ -496,6 +500,7 @@ fn e2e_envelope_bindings_receipt_verify() {
             "reviewer-e2e",
             5_000_000,
             &bindings,
+            &[0x99; 32],
         )
         .expect("receipt emission must succeed");
 

@@ -1564,6 +1564,9 @@ pub struct IngestReviewReceiptRequest {
     /// BLAKE3 hash of blocked logs stored in CAS (only for BLOCKED verdict).
     #[prost(bytes = "vec", tag = "8")]
     pub blocked_log_hash: ::prost::alloc::vec::Vec<u8>,
+    /// CAS hash pointer to IdentityProofV1 for reviewer identity verification.
+    #[prost(bytes = "vec", tag = "9")]
+    pub identity_proof_hash: ::prost::alloc::vec::Vec<u8>,
 }
 /// Response confirming review receipt ingestion.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1596,6 +1599,9 @@ pub struct DelegateSubleaseRequest {
     /// Sublease ID to assign (must be unique).
     #[prost(string, tag = "4")]
     pub sublease_id: ::prost::alloc::string::String,
+    /// CAS hash pointer to IdentityProofV1 for delegatee identity verification.
+    #[prost(bytes = "vec", tag = "5")]
+    pub identity_proof_hash: ::prost::alloc::vec::Vec<u8>,
 }
 /// Response confirming sublease delegation.
 #[derive(Clone, PartialEq, ::prost::Message)]

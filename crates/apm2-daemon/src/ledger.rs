@@ -107,6 +107,138 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type = 'SubleaseIssued'",
             [],
         )?;
+        // SECURITY (v13 Finding 2 — Receipt Uniqueness Constraint):
+        //
+        // Enforce at-most-once semantics for review receipt events at the
+        // database level. The `receipt_id` is stored as a field in the JSON
+        // payload. A partial unique index on `json_extract(payload, '$.receipt_id')`
+        // for review receipt event types prevents concurrent duplicate
+        // `IngestReviewReceipt` calls from creating multiple receipt events.
+        // This converts the check-then-act pattern into defense-in-depth:
+        // application-level `get_event_by_receipt_id` provides the fast-path,
+        // while the database constraint provides the authoritative uniqueness
+        // guarantee.
+        //
+        // MIGRATION: Quarantine historical duplicate `receipt_id` rows before
+        // creating the unique index. Quarantine entries are keyed by stable
+        // `event_id` (never persistent `rowid`) so startup replays are safe
+        // even if SQLite rowids are recycled over time.
+        //
+        // The migration is idempotent:
+        // - quarantine table is created with `IF NOT EXISTS`
+        // - legacy rowid-based tables are upgraded once to event_id-keyed schema
+        // - rows already quarantined are skipped with `INSERT OR IGNORE`
+        Self::ensure_receipt_quarantine_table(conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO ledger_events_quarantine \
+                 (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+             SELECT le.event_id, le.event_type, le.work_id, le.actor_id, \
+                    le.payload, le.signature, le.timestamp_ns \
+             FROM ledger_events le \
+             INNER JOIN ( \
+                 SELECT json_extract(CAST(payload AS TEXT), '$.receipt_id') AS receipt_id, \
+                        MIN(rowid) AS keep_rowid \
+                 FROM ledger_events \
+                 WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+                 AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL \
+                 GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id') \
+                 HAVING COUNT(*) > 1 \
+             ) dups ON json_extract(CAST(le.payload AS TEXT), '$.receipt_id') = dups.receipt_id \
+             WHERE le.event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND json_extract(CAST(le.payload AS TEXT), '$.receipt_id') IS NOT NULL \
+             AND le.rowid != dups.keep_rowid \
+             ",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM ledger_events WHERE event_id IN ( \
+                 SELECT event_id FROM ledger_events_quarantine \
+                 WHERE quarantine_reason = 'receipt_id_dedupe_migration' \
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_receipt_quarantine_table(conn: &Connection) -> rusqlite::Result<()> {
+        let table_exists: bool = conn.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'ledger_events_quarantine' \
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if !table_exists {
+            return Self::create_receipt_quarantine_table(conn);
+        }
+
+        let mut has_rowid_orig = false;
+        let mut has_event_id_primary_key = false;
+        let mut stmt = conn.prepare("PRAGMA table_info('ledger_events_quarantine')")?;
+        let columns = stmt.query_map([], |row| {
+            let name: String = row.get(1)?;
+            let pk: i64 = row.get(5)?;
+            Ok((name, pk))
+        })?;
+
+        for column in columns {
+            let (name, pk) = column?;
+            if name == "rowid_orig" {
+                has_rowid_orig = true;
+            }
+            if name == "event_id" && pk == 1 {
+                has_event_id_primary_key = true;
+            }
+        }
+
+        if has_rowid_orig || !has_event_id_primary_key {
+            conn.execute(
+                "DROP TABLE IF EXISTS ledger_events_quarantine_rowid_backup",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE ledger_events_quarantine \
+                 RENAME TO ledger_events_quarantine_rowid_backup",
+                [],
+            )?;
+            Self::create_receipt_quarantine_table(conn)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO ledger_events_quarantine \
+                     (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, quarantine_reason) \
+                 SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, \
+                        COALESCE(quarantine_reason, 'receipt_id_dedupe_migration') \
+                 FROM ledger_events_quarantine_rowid_backup \
+                 WHERE event_id IS NOT NULL",
+                [],
+            )?;
+            conn.execute("DROP TABLE ledger_events_quarantine_rowid_backup", [])?;
+        }
+
+        Ok(())
+    }
+
+    fn create_receipt_quarantine_table(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger_events_quarantine ( \
+                 event_id TEXT NOT NULL PRIMARY KEY, \
+                 event_type TEXT NOT NULL, \
+                 work_id TEXT NOT NULL, \
+                 actor_id TEXT NOT NULL, \
+                 payload BLOB NOT NULL, \
+                 signature BLOB NOT NULL, \
+                 timestamp_ns INTEGER NOT NULL, \
+                 quarantine_reason TEXT NOT NULL DEFAULT 'receipt_id_dedupe_migration' \
+             )",
+            [],
+        )?;
         Ok(())
     }
 
@@ -797,6 +929,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         artifact_bundle_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
         // protocol compatibility across daemon/core boundary.
@@ -809,14 +942,21 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
+        //
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed payload so it is audit-bound and cannot be stripped
+        // post-signing.
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,
+            "lease_id": episode_id,
             "receipt_id": receipt_id,
             "changeset_digest": hex::encode(changeset_digest),
             "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "verdict": "APPROVE",
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
@@ -880,25 +1020,40 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(signed_event)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_review_blocked_receipt(
         &self,
+        lease_id: &str,
         receipt_id: &str,
+        changeset_digest: &[u8; 32],
+        artifact_bundle_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use crate::protocol::dispatch::REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX;
 
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
+        // SECURITY (TCK-00356 Fix 2): identity_proof_hash is included in
+        // the signed payload so it is audit-bound and cannot be stripped
+        // post-signing, matching the APPROVE path's payload binding.
         let payload_json = serde_json::json!({
             "event_type": "review_blocked_recorded",
+            "lease_id": lease_id,
             "receipt_id": receipt_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "verdict": "BLOCKED",
+            "blocked_reason_code": reason_code,
+            // Preserve legacy field for backward compatibility with old readers.
             "reason_code": reason_code,
             "blocked_log_hash": hex::encode(blocked_log_hash),
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         let payload_string = payload_json.to_string();
@@ -1674,6 +1829,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         bindings: &crate::episode::EnvelopeBindings,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Fail-closed: validate bindings before emission
         bindings
@@ -1687,6 +1843,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // TCK-00350: Include envelope bindings in signed payload.
         // This ensures receipts carry immutable proof of the envelope,
         // capability manifest, and view commitment that were active.
+        //
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed payload so it is audit-bound.
         let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
@@ -1699,6 +1858,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "envelope_hash": env_hex,
             "capability_manifest_hash": cap_hex,
             "view_commitment_hash": view_hex,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         let payload_string = payload_json.to_string();
@@ -2792,6 +2952,7 @@ mod tests {
         let artifact = [0xCDu8; 32];
 
         // Emit a review receipt with a specific receipt_id
+        let identity_proof = [0x99u8; 32];
         let event1 = emitter
             .emit_review_receipt(
                 "episode-001",
@@ -2800,6 +2961,7 @@ mod tests {
                 &artifact,
                 "reviewer-actor-x",
                 1_000_000_000,
+                &identity_proof,
             )
             .expect("first emit should succeed");
 
@@ -2830,15 +2992,22 @@ mod tests {
     fn test_get_event_by_receipt_id_finds_blocked_receipts() {
         let emitter = test_emitter();
 
+        let changeset_digest = [0x42u8; 32];
+        let artifact_bundle_hash = [0xA5u8; 32];
         let blocked_log_hash = [0xEEu8; 32];
 
+        let identity_proof_hash = [0xDDu8; 32];
         let blocked_event = emitter
             .emit_review_blocked_receipt(
+                "lease-blocked-001",
                 "RR-BLOCKED-001",
+                &changeset_digest,
+                &artifact_bundle_hash,
                 42,
                 &blocked_log_hash,
                 "reviewer-actor-y",
                 2_000_000_000,
+                &identity_proof_hash,
             )
             .expect("blocked receipt emit should succeed");
 
@@ -2853,5 +3022,296 @@ mod tests {
             "Must return the same event_id as the original blocked emission"
         );
         assert_eq!(found.event_type, "review_blocked_recorded");
+    }
+
+    /// Regression: startup migration upgrades rowid-based quarantine tables
+    /// and never deletes by unstable `rowid`.
+    #[test]
+    fn init_schema_migrates_rowid_quarantine_table_without_rowid_deletes() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "legit-event-id",
+                "unrelated_event",
+                "work-001",
+                "actor-001",
+                br#"{"ok":true}"#.as_slice(),
+                b"sig".as_slice(),
+                1_i64
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "CREATE TABLE ledger_events_quarantine (
+                rowid_orig INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                quarantine_reason TEXT NOT NULL DEFAULT 'receipt_id_dedupe_migration'
+            )",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO ledger_events_quarantine
+                (rowid_orig, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                1_i64,
+                "legacy-quarantined-event-id",
+                "review_receipt_recorded",
+                "work-legacy",
+                "actor-legacy",
+                br#"{"receipt_id":"RR-LEGACY-001"}"#.as_slice(),
+                b"legacy-sig".as_slice(),
+                2_i64
+            ],
+        )
+        .unwrap();
+
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+
+        let legit_event_still_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ledger_events WHERE event_id = 'legit-event-id'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            legit_event_still_exists,
+            "event_id-based cleanup must not delete unrelated rows that share historic rowids"
+        );
+
+        let has_rowid_orig_column: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('ledger_events_quarantine')
+                    WHERE name = 'rowid_orig'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_rowid_orig_column,
+            "quarantine table must no longer persist rowid_orig"
+        );
+
+        let has_event_id_primary_key: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('ledger_events_quarantine')
+                    WHERE name = 'event_id' AND pk = 1
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_event_id_primary_key,
+            "quarantine table must be keyed by event_id"
+        );
+    }
+
+    /// Regression: duplicate receipt migration quarantines by `event_id`,
+    /// preserves the canonical first event, and remains idempotent.
+    #[test]
+    fn init_schema_quarantines_duplicate_receipts_by_event_id_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let duplicate_payload = br#"{"receipt_id":"RR-DUPE-001"}"#;
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "receipt-event-keep",
+                "review_receipt_recorded",
+                "work-a",
+                "actor-a",
+                duplicate_payload.as_slice(),
+                b"sig-a".as_slice(),
+                10_i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "receipt-event-duplicate",
+                "review_receipt_recorded",
+                "work-b",
+                "actor-b",
+                duplicate_payload.as_slice(),
+                b"sig-b".as_slice(),
+                11_i64
+            ],
+        )
+        .unwrap();
+
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+
+        let keep_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ledger_events WHERE event_id = 'receipt-event-keep'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(keep_exists, "canonical first receipt event must remain");
+
+        let duplicate_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ledger_events WHERE event_id = 'receipt-event-duplicate'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !duplicate_exists,
+            "duplicate receipt event must be removed from ledger_events"
+        );
+
+        let duplicate_quarantined_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_quarantine
+                 WHERE event_id = 'receipt-event-duplicate'
+                 AND quarantine_reason = 'receipt_id_dedupe_migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate_quarantined_count, 1,
+            "duplicate receipt event must be quarantined exactly once"
+        );
+
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+
+        let duplicate_quarantined_count_after_rerun: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_quarantine
+                 WHERE event_id = 'receipt-event-duplicate'
+                 AND quarantine_reason = 'receipt_id_dedupe_migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate_quarantined_count_after_rerun, 1,
+            "idempotent reruns must not duplicate quarantine entries"
+        );
+    }
+
+    /// Verifies that `emit_review_blocked_receipt` includes replay-critical
+    /// blocked fields and identity binding in the signed payload.
+    #[test]
+    fn test_blocked_receipt_payload_contains_replay_bindings() {
+        let emitter = test_emitter();
+        let changeset_digest = [0x42u8; 32];
+        let artifact_bundle_hash = [0xC3u8; 32];
+        let blocked_log_hash = [0xAAu8; 32];
+        let identity_proof_hash = [0xBBu8; 32];
+
+        let event = emitter
+            .emit_review_blocked_receipt(
+                "lease-blocked-iph",
+                "RR-BLOCKED-IPH",
+                &changeset_digest,
+                &artifact_bundle_hash,
+                99,
+                &blocked_log_hash,
+                "reviewer-actor-z",
+                3_000_000_000,
+                &identity_proof_hash,
+            )
+            .expect("blocked receipt emit should succeed");
+
+        // Parse the payload and verify replay bindings are present.
+        let payload: serde_json::Value =
+            serde_json::from_slice(&event.payload).expect("payload should be valid JSON");
+
+        let artifact_hash = payload
+            .get("artifact_bundle_hash")
+            .expect("payload must contain artifact_bundle_hash field");
+        assert_eq!(
+            artifact_hash.as_str().unwrap(),
+            hex::encode(artifact_bundle_hash),
+            "artifact_bundle_hash in blocked event payload must match the input"
+        );
+
+        let blocked_reason_code = payload
+            .get("blocked_reason_code")
+            .expect("payload must contain blocked_reason_code field");
+        assert_eq!(
+            blocked_reason_code.as_u64().unwrap(),
+            99,
+            "blocked_reason_code in blocked event payload must match the input"
+        );
+
+        let blocked_log = payload
+            .get("blocked_log_hash")
+            .expect("payload must contain blocked_log_hash field");
+        assert_eq!(
+            blocked_log.as_str().unwrap(),
+            hex::encode(blocked_log_hash),
+            "blocked_log_hash in blocked event payload must match the input"
+        );
+
+        let iph = payload
+            .get("identity_proof_hash")
+            .expect("payload must contain identity_proof_hash field");
+        assert_eq!(
+            iph.as_str().unwrap(),
+            hex::encode(identity_proof_hash),
+            "identity_proof_hash in blocked event payload must match the input"
+        );
     }
 }
