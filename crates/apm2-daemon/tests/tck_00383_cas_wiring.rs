@@ -470,12 +470,22 @@ fn spawn_session_and_get_token(dispatcher_state: &DispatcherState) -> Option<Str
     match spawn_response {
         PrivilegedResponse::SpawnEpisode(resp) => Some(resp.session_token),
         PrivilegedResponse::Error(err) => {
-            // Accept command-not-found / ENOENT as expected when `claude`
-            // is not installed.  Other spawn failures are real regressions
-            // and must not be silently skipped.
+            // Accept command-not-found as expected when `claude` is not
+            // installed.  Assert the precise error code
+            // (CapabilityRequestRejected wraps adapter spawn failures)
+            // and that the message specifically mentions the adapter spawn
+            // path, not an unrelated failure.
+            assert_eq!(
+                err.code,
+                apm2_daemon::protocol::messages::PrivilegedErrorCode::CapabilityRequestRejected
+                    as i32,
+                "spawn failure should use CapabilityRequestRejected error code, got code={}, msg={}",
+                err.code,
+                err.message
+            );
             assert!(
-                err.message.contains("command not found") || err.message.contains("No such file"),
-                "unexpected spawn error: code={}, msg={}",
+                err.message.contains("adapter spawn failed"),
+                "spawn error should originate from adapter spawn path: code={}, msg={}",
                 err.code,
                 err.message
             );

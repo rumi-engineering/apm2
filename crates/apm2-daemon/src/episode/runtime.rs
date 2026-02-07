@@ -1371,7 +1371,8 @@ impl EpisodeRuntime {
         config: crate::episode::adapter::HarnessConfig,
         adapter: &dyn crate::episode::adapter::HarnessAdapter,
     ) -> Result<(), EpisodeError> {
-        // Validate episode is in Running state
+        // Validate episode is in Running state and has no active harness handle.
+        // Transactional: check admission BEFORE mutating state (CTR-2601).
         {
             let episodes = self.episodes.read().await;
             let entry =
@@ -1386,6 +1387,16 @@ impl EpisodeRuntime {
                         "cannot spawn adapter for episode {} in state {}; expected Running",
                         episode_id,
                         entry.state.state_name()
+                    ),
+                });
+            }
+            // Guard: reject re-spawn if an active harness handle already exists.
+            // Overwriting a live handle would orphan the previous process (MAJOR 1).
+            if entry.harness_handle.is_some() {
+                return Err(EpisodeError::Internal {
+                    message: format!(
+                        "episode {episode_id} already has an active harness handle; \
+                         terminate before re-spawn"
                     ),
                 });
             }
@@ -3255,6 +3266,37 @@ mod tests {
         assert!(
             entry.harness_handle.is_some(),
             "harness_handle should be stored after spawn"
+        );
+    }
+
+    /// Verifies that `spawn_adapter` rejects a second spawn when an active
+    /// harness handle already exists (MAJOR 1: prevent orphaned processes).
+    #[tokio::test]
+    async fn test_spawn_adapter_rejects_respawn_with_active_handle() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        // First spawn succeeds
+        let config1 = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        let result1 = runtime.spawn_adapter(&episode_id, config1, &adapter).await;
+        assert!(result1.is_ok(), "first spawn should succeed: {result1:?}");
+
+        // Second spawn must be rejected because the first handle is still active
+        let config2 = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let result2 = runtime.spawn_adapter(&episode_id, config2, &adapter).await;
+        assert!(result2.is_err(), "second spawn should be rejected");
+        let err = result2.unwrap_err();
+        assert!(
+            format!("{err}").contains("already has an active harness handle"),
+            "Error should mention active harness handle, got: {err}"
         );
     }
 

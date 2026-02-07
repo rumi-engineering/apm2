@@ -6091,6 +6091,11 @@ impl PrivilegedDispatcher {
             "DYLD_LIBRARY_PATH",
         ];
 
+        /// Known template placeholder tokens. Only these are flagged as
+        /// unresolved after expansion; arbitrary `{...}` strings (e.g.,
+        /// JSON literals) are accepted.
+        const KNOWN_PLACEHOLDERS: &[&str] = &["{workspace}", "{prompt}", "{model}", "{episode_id}"];
+
         // Expand args_template placeholders.
         // SECURITY: session_token MUST NEVER appear in argv (WVR-0002).
         #[allow(clippy::literal_string_with_formatting_args)]
@@ -6115,13 +6120,14 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // Fail-closed: reject any unresolved template placeholders in args.
+        // Fail-closed: reject any unresolved KNOWN template placeholders in args.
+        // Only flag known placeholder tokens to avoid rejecting legitimate
+        // literal braces (e.g., JSON arguments like `{"key": "value"}`).
         for (i, arg) in expanded_args.iter().enumerate() {
-            if let (Some(open), Some(close)) = (arg.find('{'), arg.find('}')) {
-                if open < close {
-                    let token = &arg[open..=close];
+            for placeholder in KNOWN_PLACEHOLDERS {
+                if arg.contains(placeholder) {
                     return Err(format!(
-                        "unresolved template placeholder {token} in argv[{i}]"
+                        "unresolved template placeholder {placeholder} in argv[{i}]"
                     ));
                 }
             }
@@ -23354,10 +23360,13 @@ mod tests {
             assert_eq!(config.args[1], "llama3");
         }
 
+        /// Known placeholder `{episode_id}` is NOT expanded by
+        /// `build_harness_config` (only `{workspace}`, `{prompt}`, `{model}`
+        /// are), so it must be rejected as unresolved.
         #[test]
-        fn test_unresolved_placeholder_rejected() {
+        fn test_unresolved_known_placeholder_rejected() {
             let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
-            profile.args_template = vec!["run".to_string(), "{unknown}".to_string()];
+            profile.args_template = vec!["run".to_string(), "{episode_id}".to_string()];
             profile.env_template = vec![];
             let token = secrecy::SecretString::from("token".to_string());
 
@@ -23375,6 +23384,82 @@ mod tests {
                     .unwrap_err()
                     .contains("unresolved template placeholder"),
                 "Error should mention unresolved template placeholder"
+            );
+        }
+
+        /// `{{workspace}}` IS expanded during template processing, so the
+        /// result should succeed (no unresolved placeholder remains).
+        #[test]
+        fn test_expanded_known_placeholder_accepted() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["run".to_string(), "prefix-{workspace}".to_string()];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            );
+            assert!(
+                result.is_ok(),
+                "expanded known placeholder should be accepted, got error: {result:?}"
+            );
+        }
+
+        /// Literal braces in args (e.g., JSON) must NOT be rejected.
+        /// Only known placeholder tokens (`{workspace}`, `{prompt}`, etc.)
+        /// should trigger the unresolved-placeholder guard.
+        #[test]
+        fn test_literal_braces_in_args_accepted() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec![
+                "--config".to_string(),
+                r#"{"key": "value", "nested": {"a": 1}}"#.to_string(),
+            ];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            );
+
+            assert!(
+                result.is_ok(),
+                "literal braces in JSON args should be accepted, got error: {result:?}"
+            );
+        }
+
+        /// Unknown placeholders (not in the known set) must be accepted.
+        /// Only `{workspace}`, `{prompt}`, `{model}`, and `{episode_id}`
+        /// are flagged.
+        #[test]
+        fn test_unknown_placeholder_not_in_known_set_accepted() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["run".to_string(), "{custom_flag}".to_string()];
+            profile.env_template = vec![];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                "llama3",
+                &token,
+            );
+
+            assert!(
+                result.is_ok(),
+                "unknown placeholder not in known set should be accepted, got error: {result:?}"
             );
         }
     }
