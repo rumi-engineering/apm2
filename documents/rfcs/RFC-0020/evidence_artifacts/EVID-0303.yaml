@@ -11,18 +11,24 @@ evidence_artifact:
     conformance vectors (TCK-00353). Stable genesis-derived identity types
     (CellIdV1 and HolonIdV1) derive deterministically from CellGenesisV1 and
     HolonGenesisV1 commitments with CAS hash-addressing round-trip evidence
-    (TCK-00354).
+    (TCK-00354). Certificate hierarchy and session-key delegation are enforced
+    via CellCertificateV1, HolonCertificateV1, and SessionKeyDelegationV1 with
+    explicit root/operational/session role separation (TCK-00355, REQ-0009).
   requirement_ids:
     - "REQ-0007"
     - "REQ-0008"
+    - "REQ-0009"
   source_refs:
     - "crates/apm2-daemon/src/identity/mod.rs"
     - "crates/apm2-daemon/src/identity/public_key_id.rs"
     - "crates/apm2-daemon/src/identity/keyset_id.rs"
     - "crates/apm2-daemon/src/identity/cell_id.rs"
     - "crates/apm2-daemon/src/identity/holon_id.rs"
+    - "crates/apm2-daemon/src/identity/certificate.rs"
+    - "crates/apm2-daemon/src/identity/session_delegation.rs"
     - "crates/apm2-daemon/src/cas/mod.rs"
     - "crates/apm2-daemon/src/identity/conformance.rs"
+    - "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0009.yaml"
   artifacts:
     - type: "test_output"
       description: |
@@ -53,3 +59,13 @@ evidence_artifact:
           public key and anchor validation, HolonPurpose parsing, and genesis
           artifact CAS round-trip + deduplication via DurableCas
       ref: "cargo test -p apm2-daemon identity::"
+    - type: "test_output"
+      description: |
+        Certificate hierarchy and session delegation tests (TCK-00355) covering:
+        - CellCertificateV1 / HolonCertificateV1 binding verification
+        - fail-closed trust-domain, purpose-tag, revocation-pointer, and key-length validation
+        - root/operational/session key role overlap rejection
+        - SessionKeyDelegationV1 HTF validity windows and operational-key signature verification
+        - deterministic length-prefixed canonical bytes and CAS round-trip
+        - key-role conformance vectors in identity::conformance
+      ref: "cargo test -p apm2-daemon identity::certificate identity::session_delegation identity::conformance::tests::key_role_conformance_vectors_pass"

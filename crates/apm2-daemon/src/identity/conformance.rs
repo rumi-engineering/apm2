@@ -618,6 +618,59 @@ pub fn invalid_text_vectors() -> Vec<InvalidTextVector> {
 }
 
 // ============================================================================
+// Key Role Separation Vectors (REQ-0009)
+// ============================================================================
+
+/// Key-role separation conformance vector.
+#[derive(Debug)]
+pub struct KeyRoleConformanceVector {
+    /// Human-readable vector name.
+    pub name: &'static str,
+    /// Root/genesis key material fill byte.
+    pub root_key_fill: u8,
+    /// Operational key material fill byte.
+    pub operational_key_fill: u8,
+    /// Optional session key material fill byte.
+    pub session_key_fill: Option<u8>,
+    /// Expected pass/fail result.
+    pub should_pass: bool,
+}
+
+/// Return key-role separation vectors for REQ-0009.
+pub fn key_role_conformance_vectors() -> Vec<KeyRoleConformanceVector> {
+    vec![
+        KeyRoleConformanceVector {
+            name: "distinct_root_operational_session",
+            root_key_fill: 0xA1,
+            operational_key_fill: 0xB2,
+            session_key_fill: Some(0xC3),
+            should_pass: true,
+        },
+        KeyRoleConformanceVector {
+            name: "reject_root_equals_operational",
+            root_key_fill: 0xA1,
+            operational_key_fill: 0xA1,
+            session_key_fill: Some(0xC3),
+            should_pass: false,
+        },
+        KeyRoleConformanceVector {
+            name: "reject_operational_equals_session",
+            root_key_fill: 0xA1,
+            operational_key_fill: 0xB2,
+            session_key_fill: Some(0xB2),
+            should_pass: false,
+        },
+        KeyRoleConformanceVector {
+            name: "reject_root_equals_session",
+            root_key_fill: 0xA1,
+            operational_key_fill: 0xB2,
+            session_key_fill: Some(0xA1),
+            should_pass: false,
+        },
+    ]
+}
+
+// ============================================================================
 // Conformance Test Runner
 // ============================================================================
 
@@ -1026,7 +1079,9 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{CellGenesisV1, HolonGenesisV1, HolonPurpose, PolicyRootId};
+    use crate::identity::{
+        CellGenesisV1, HolonGenesisV1, HolonPurpose, PolicyRootId, validate_key_roles,
+    };
 
     /// Run all conformance vectors and assert every one passes.
     ///
@@ -1153,6 +1208,39 @@ mod tests {
             46,
             "expected exactly 46 invalid text vectors"
         );
+    }
+
+    /// Verify REQ-0009 key role separation vectors.
+    #[test]
+    fn key_role_conformance_vectors_pass() {
+        let vectors = key_role_conformance_vectors();
+        assert_eq!(
+            vectors.len(),
+            4,
+            "expected exactly 4 key-role conformance vectors"
+        );
+
+        for vector in vectors {
+            let root_key_id =
+                PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[vector.root_key_fill; 32]);
+            let operational_key_id = PublicKeyIdV1::from_key_bytes(
+                AlgorithmTag::Ed25519,
+                &[vector.operational_key_fill; 32],
+            );
+            let session_key_id = vector
+                .session_key_fill
+                .map(|fill| PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[fill; 32]));
+
+            let result =
+                validate_key_roles(&root_key_id, &operational_key_id, session_key_id.as_ref());
+            assert_eq!(
+                result.is_ok(),
+                vector.should_pass,
+                "key-role conformance vector {} failed unexpectedly: {:?}",
+                vector.name,
+                result
+            );
+        }
     }
 
     /// Parser differential: runtime-derived `PublicKeyIdV1` values must match

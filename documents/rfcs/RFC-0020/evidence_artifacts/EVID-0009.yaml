@@ -1,0 +1,47 @@
+evidence_artifact:
+  schema_version: "2026-02-05"
+  id: "EVID-0009"
+  title: "Certificate hierarchy and session-key delegation evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that REQ-0009 is implemented in the daemon identity module:
+    CellCertificateV1 and HolonCertificateV1 enforce identity bindings and
+    role-separated key hierarchy, while SessionKeyDelegationV1 enforces
+    short-lived session delegation signed by the holon operational key.
+
+    Validation is fail-closed and rejects malformed key lengths, control
+    characters in string fields, key-role overlap, invalid HTF validity
+    windows, and signature mismatches.
+  requirement_ids:
+    - "REQ-0009"
+  source_refs:
+    - "crates/apm2-daemon/src/identity/mod.rs"
+    - "crates/apm2-daemon/src/identity/certificate.rs"
+    - "crates/apm2-daemon/src/identity/session_delegation.rs"
+    - "crates/apm2-daemon/src/identity/conformance.rs"
+    - "documents/rfcs/RFC-0020/requirements/REQ-0009.yaml"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Cell/Holon certificate conformance tests verify:
+        - binding checks (`cell_id` and `holon_id` derivation invariants)
+        - root vs operational key separation
+        - previous operational key overlap rejection
+        - trust-domain and string field control-character rejection
+        - purpose-tag fail-closed behavior (unknown tags rejected)
+        - deterministic length-prefixed canonical bytes and CAS round-trip
+      ref: "cargo test -p apm2-daemon identity::certificate"
+    - type: "test_output"
+      description: |
+        Session delegation tests verify:
+        - session key binding to holon/issuer operational key
+        - HTF validity window enforcement (`expires_at_tick > issued_at_envelope_ref`)
+        - Ed25519 signature verification by operational key authority
+        - role overlap rejection (root==operational, operational==session, root==session)
+      ref: "cargo test -p apm2-daemon identity::session_delegation"
+    - type: "test_output"
+      description: |
+        Key-role conformance vectors in `identity/conformance.rs` execute
+        pass/fail fixtures for REQ-0009 role separation invariants.
+      ref: "cargo test -p apm2-daemon identity::conformance::tests::key_role_conformance_vectors_pass"
