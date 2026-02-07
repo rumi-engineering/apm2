@@ -117,6 +117,8 @@ use super::messages::{
     TerminationOutcome,
     UnsubscribePulseRequest,
     UnsubscribePulseResponse,
+    UpdateStopFlagsRequest,
+    UpdateStopFlagsResponse,
     WorkRole,
     WorkStatusRequest,
     WorkStatusResponse,
@@ -135,6 +137,7 @@ use crate::episode::{
     EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
     TerminationClass, validate_custody_domain_overlap,
 };
+use crate::governance::GovernanceFreshnessMonitor;
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
 use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
@@ -263,6 +266,29 @@ pub struct WorkTransition<'a> {
     pub timestamp_ns: u64,
 }
 
+/// Parameters for a stop-flag mutation audit event (TCK-00351).
+///
+/// This captures the immutable evidence payload for `UpdateStopFlags` so
+/// emergency/governance stop mutations are queryable from the ledger.
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // Captures explicit before/after stop-flag state for audit evidence.
+pub struct StopFlagsMutation<'a> {
+    /// Actor identity derived from peer credentials.
+    pub actor_id: &'a str,
+    /// Emergency stop flag value before mutation.
+    pub emergency_stop_previous: bool,
+    /// Emergency stop flag value after mutation.
+    pub emergency_stop_current: bool,
+    /// Governance stop flag value before mutation.
+    pub governance_stop_previous: bool,
+    /// Governance stop flag value after mutation.
+    pub governance_stop_current: bool,
+    /// HTF-compliant timestamp in nanoseconds since epoch.
+    pub timestamp_ns: u64,
+    /// Request-scoped context (connection identity + requested fields).
+    pub request_context: &'a serde_json::Value,
+}
+
 /// Trait for emitting signed events to the ledger.
 ///
 /// Per TCK-00253 acceptance criteria:
@@ -357,6 +383,23 @@ pub trait LedgerEventEmitter: Send + Sync {
         payload: &[u8],
         actor_id: &str,
         timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Returns whether emitted events are durably persisted.
+    ///
+    /// `false` indicates in-memory/test-only emitters where audit evidence
+    /// does not survive process restart.
+    fn has_durable_storage(&self) -> bool {
+        true
+    }
+
+    /// Emits a signed `StopFlagsMutated` event to the ledger (TCK-00351).
+    ///
+    /// This records runtime stop-flag mutations performed by the privileged
+    /// `UpdateStopFlags` endpoint.
+    fn emit_stop_flags_mutated(
+        &self,
+        mutation: &StopFlagsMutation<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a signed `DefectRecorded` event to the ledger (TCK-00307).
@@ -856,6 +899,12 @@ pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitione
 /// This prefix is for ledger-level JCS-canonicalized JSON events.
 pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_terminated_ledger:";
 
+/// Domain separation prefix for `StopFlagsMutated` ledger events (TCK-00351).
+pub const STOP_FLAGS_MUTATED_DOMAIN_PREFIX: &[u8] = b"apm2.event.stop_flags_mutated:";
+
+/// Ledger indexing key for daemon stop-flag mutation events.
+pub const STOP_FLAGS_MUTATED_WORK_ID: &str = "daemon.stop_flags";
+
 /// Domain separation prefix for `ChangeSetPublished` ledger events (TCK-00394).
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
@@ -890,6 +939,12 @@ pub const MAX_ID_LENGTH: usize = 256;
 /// bloated ledger entries. This limit constrains the reason to a reasonable
 /// diagnostic string.
 pub const MAX_REASON_LENGTH: usize = 1024;
+
+/// Maximum allowed length for `SpawnEpisodeRequest.escalation_predicate`.
+///
+/// Per SEC-SCP-FAC-0020: caller-controlled free-form predicates must be
+/// bounded before persistence to prevent oversized payload retention.
+pub const MAX_ESCALATION_PREDICATE_LEN: usize = 1024;
 
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
 ///
@@ -1278,6 +1333,96 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             event_type = %event_type,
             actor_id = %actor_id,
             "SessionEvent signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn has_durable_storage(&self) -> bool {
+        false
+    }
+
+    fn emit_stop_flags_mutated(
+        &self,
+        mutation: &StopFlagsMutation<'_>,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        let payload_json = serde_json::json!({
+            "event_type": "stop_flags_mutated",
+            "actor_id": mutation.actor_id,
+            "emergency_stop_previous": mutation.emergency_stop_previous,
+            "emergency_stop_current": mutation.emergency_stop_current,
+            "governance_stop_previous": mutation.governance_stop_previous,
+            "governance_stop_current": mutation.governance_stop_current,
+            "request_context": mutation.request_context,
+            "timestamp_ns": mutation.timestamp_ns,
+        });
+
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes =
+            Vec::with_capacity(STOP_FLAGS_MUTATED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(STOP_FLAGS_MUTATED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "stop_flags_mutated".to_string(),
+            work_id: STOP_FLAGS_MUTATED_WORK_ID.to_string(),
+            actor_id: mutation.actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns: mutation.timestamp_ns,
+        };
+
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(STOP_FLAGS_MUTATED_WORK_ID.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            actor_id = %mutation.actor_id,
+            emergency_stop_previous = mutation.emergency_stop_previous,
+            emergency_stop_current = mutation.emergency_stop_current,
+            governance_stop_previous = mutation.governance_stop_previous,
+            governance_stop_current = mutation.governance_stop_current,
+            "StopFlagsMutated event signed and persisted"
         );
 
         Ok(signed_event)
@@ -3022,6 +3167,8 @@ pub enum PrivilegedMessageType {
     EndSession          = 16,
     /// `IngestReviewReceipt` request (IPC-PRIV-017, TCK-00389)
     IngestReviewReceipt = 17,
+    /// `UpdateStopFlags` request (IPC-PRIV-018, TCK-00351)
+    UpdateStopFlags     = 18,
     // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
     /// `ListCredentials` request (IPC-PRIV-021)
     ListCredentials     = 21,
@@ -3077,6 +3224,8 @@ impl PrivilegedMessageType {
             16 => Some(Self::EndSession),
             // TCK-00389: IngestReviewReceipt for external reviewer results
             17 => Some(Self::IngestReviewReceipt),
+            // TCK-00351: stop flags update
+            18 => Some(Self::UpdateStopFlags),
             // Credential management tags (21-26, TCK-00343)
             21 => Some(Self::ListCredentials),
             22 => Some(Self::AddCredential),
@@ -3128,6 +3277,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus,
             Self::EndSession,
             Self::IngestReviewReceipt,
+            Self::UpdateStopFlags,
             Self::ListCredentials,
             Self::AddCredential,
             Self::RemoveCredential,
@@ -3172,6 +3322,7 @@ impl PrivilegedMessageType {
             | Self::WorkStatus
             | Self::EndSession
             | Self::IngestReviewReceipt
+            | Self::UpdateStopFlags
             | Self::ListCredentials
             | Self::AddCredential
             | Self::RemoveCredential
@@ -3212,6 +3363,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus => "hsi.work.status",
             Self::EndSession => "hsi.session.end",
             Self::IngestReviewReceipt => "hsi.review.ingest_receipt",
+            Self::UpdateStopFlags => "hsi.stop.update_flags",
             Self::ListCredentials => "hsi.credential.list",
             Self::AddCredential => "hsi.credential.add",
             Self::RemoveCredential => "hsi.credential.remove",
@@ -3247,6 +3399,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus => "WORK_STATUS",
             Self::EndSession => "END_SESSION",
             Self::IngestReviewReceipt => "INGEST_REVIEW_RECEIPT",
+            Self::UpdateStopFlags => "UPDATE_STOP_FLAGS",
             Self::ListCredentials => "LIST_CREDENTIALS",
             Self::AddCredential => "ADD_CREDENTIAL",
             Self::RemoveCredential => "REMOVE_CREDENTIAL",
@@ -3282,6 +3435,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus => "apm2.work_status_request.v1",
             Self::EndSession => "apm2.end_session_request.v1",
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_request.v1",
+            Self::UpdateStopFlags => "apm2.update_stop_flags_request.v1",
             Self::ListCredentials => "apm2.list_credentials_request.v1",
             Self::AddCredential => "apm2.add_credential_request.v1",
             Self::RemoveCredential => "apm2.remove_credential_request.v1",
@@ -3317,6 +3471,7 @@ impl PrivilegedMessageType {
             Self::WorkStatus => "apm2.work_status_response.v1",
             Self::EndSession => "apm2.end_session_response.v1",
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_response.v1",
+            Self::UpdateStopFlags => "apm2.update_stop_flags_response.v1",
             Self::ListCredentials => "apm2.list_credentials_response.v1",
             Self::AddCredential => "apm2.add_credential_response.v1",
             Self::RemoveCredential => "apm2.remove_credential_response.v1",
@@ -3368,6 +3523,8 @@ pub enum PrivilegedResponse {
     EndSession(EndSessionResponse),
     /// Successful `IngestReviewReceipt` response (TCK-00389).
     IngestReviewReceipt(IngestReviewReceiptResponse),
+    /// Successful `UpdateStopFlags` response (TCK-00351).
+    UpdateStopFlags(UpdateStopFlagsResponse),
     // --- Credential Management (CTR-PROTO-012, TCK-00343) ---
     /// Successful `ListCredentials` response.
     ListCredentials(ListCredentialsResponse),
@@ -3484,6 +3641,10 @@ impl PrivilegedResponse {
             // TCK-00389: IngestReviewReceipt
             Self::IngestReviewReceipt(resp) => {
                 buf.push(PrivilegedMessageType::IngestReviewReceipt.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::UpdateStopFlags(resp) => {
+                buf.push(PrivilegedMessageType::UpdateStopFlags.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             // Credential Management (CTR-PROTO-012, TCK-00343)
@@ -4107,6 +4268,26 @@ pub struct PrivilegedDispatcher {
     /// the handler returns an error indicating the orchestrator is not
     /// configured.
     gate_orchestrator: Option<Arc<crate::gate::GateOrchestrator>>,
+
+    /// Per-session stop conditions store for pre-actuation gate enforcement
+    /// (TCK-00351 v4).
+    ///
+    /// When present, `SpawnEpisode` registers stop conditions (from the
+    /// episode envelope) for the new session. The `SessionDispatcher` holds
+    /// a clone of the same `Arc` and reads conditions in the pre-actuation
+    /// gate to enforce `max_episodes` / `escalation_predicate`.
+    stop_conditions_store: Option<Arc<crate::session::SessionStopConditionsStore>>,
+
+    /// Shared stop authority used by privileged control-plane handlers to
+    /// mutate emergency/governance stop flags at runtime.
+    stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
+
+    /// Governance freshness monitor wired from production `DispatcherState`.
+    ///
+    /// Successful governance-backed operations call `record_success()`.
+    /// Only governance transport/communication failures call
+    /// `record_failure()`.
+    governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -4125,6 +4306,68 @@ impl Default for PrivilegedDispatcher {
 /// Per RFC-0017, session tokens should have a reasonable TTL that matches
 /// lease expiration. 1 hour is a sensible default for development.
 pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 3600;
+
+/// Stop-condition policy floor for untrusted `SpawnEpisode` inputs.
+///
+/// This enforces authoritative minimum constraints before requester-supplied
+/// stop conditions are persisted.
+#[derive(Debug, Clone, Copy)]
+struct StopConditionPolicy {
+    /// Maximum allowed value for `max_episodes`.
+    ///
+    /// Values above this policy floor are rejected. A value of `0` means no
+    /// floor is configured for this dimension.
+    max_episodes_floor: u64,
+}
+
+impl StopConditionPolicy {
+    /// Fail-closed policy floor used when no governance-provided floor is
+    /// available.
+    const fn fail_closed_default() -> Self {
+        Self {
+            // Transitional policy ceiling: requester cannot bypass with
+            // unlimited `max_episodes=0` and cannot exceed this floor.
+            max_episodes_floor: 10,
+        }
+    }
+
+    /// Validates request stop conditions against the policy floor and returns
+    /// canonicalized conditions to persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when request values violate the floor.
+    fn validate_against_floor(
+        self,
+        request_max_episodes: Option<u64>,
+        request_escalation_predicate: Option<&str>,
+    ) -> Result<crate::episode::envelope::StopConditions, String> {
+        // Fail-closed request default: missing max_episodes is constrained.
+        let resolved_max_episodes = request_max_episodes.unwrap_or(1);
+
+        if self.max_episodes_floor > 0 {
+            if resolved_max_episodes == 0 {
+                return Err(format!(
+                    "max_episodes=0 is not allowed by policy floor; expected 1..={}",
+                    self.max_episodes_floor
+                ));
+            }
+            if resolved_max_episodes > self.max_episodes_floor {
+                return Err(format!(
+                    "max_episodes={} exceeds policy floor max={}",
+                    resolved_max_episodes, self.max_episodes_floor
+                ));
+            }
+        }
+
+        Ok(crate::episode::envelope::StopConditions {
+            max_episodes: resolved_max_episodes,
+            escalation_predicate: request_escalation_predicate.unwrap_or("").to_string(),
+            goal_predicate: String::new(),
+            failure_predicate: String::new(),
+        })
+    }
+}
 
 impl PrivilegedDispatcher {
     /// Creates a new dispatcher with default decode configuration (TEST ONLY).
@@ -4183,6 +4426,9 @@ impl PrivilegedDispatcher {
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
+            stop_conditions_store: None,
+            stop_authority: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -4242,6 +4488,9 @@ impl PrivilegedDispatcher {
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
+            stop_conditions_store: None,
+            stop_authority: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -4320,6 +4569,9 @@ impl PrivilegedDispatcher {
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
+            stop_conditions_store: None,
+            stop_authority: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -4375,6 +4627,9 @@ impl PrivilegedDispatcher {
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
+            stop_conditions_store: None,
+            stop_authority: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -4454,6 +4709,40 @@ impl PrivilegedDispatcher {
         self
     }
 
+    /// Sets the per-session stop conditions store (TCK-00351 v4).
+    ///
+    /// When set, `SpawnEpisode` registers stop conditions from the episode
+    /// envelope for each new session. The `SessionDispatcher` holds a clone
+    /// of the same `Arc` and reads conditions in the pre-actuation gate.
+    #[must_use]
+    pub fn with_stop_conditions_store(
+        mut self,
+        store: Arc<crate::session::SessionStopConditionsStore>,
+    ) -> Self {
+        self.stop_conditions_store = Some(store);
+        self
+    }
+
+    /// Sets the shared stop authority for runtime stop-flag mutation.
+    #[must_use]
+    pub fn with_stop_authority(
+        mut self,
+        authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Self {
+        self.stop_authority = Some(authority);
+        self
+    }
+
+    /// Sets the governance freshness monitor for production probe wiring.
+    #[must_use]
+    pub fn with_governance_freshness_monitor(
+        mut self,
+        monitor: Arc<GovernanceFreshnessMonitor>,
+    ) -> Self {
+        self.governance_freshness_monitor = Some(monitor);
+        self
+    }
+
     /// Replaces the session registry used by this dispatcher (TEST ONLY).
     ///
     /// This allows tests to inject a concrete `InMemorySessionRegistry`
@@ -4490,6 +4779,24 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn event_emitter(&self) -> &Arc<dyn LedgerEventEmitter> {
         &self.event_emitter
+    }
+
+    /// Records a successful governance probe when monitoring is wired.
+    fn record_governance_probe_success(&self) {
+        if let Some(ref monitor) = self.governance_freshness_monitor {
+            monitor.record_success();
+        }
+    }
+
+    /// Records a governance probe failure when monitoring is wired.
+    ///
+    /// IMPORTANT: Callers must use this only for real governance service
+    /// transport/communication failures, never for local validation/state
+    /// precondition errors.
+    fn record_governance_probe_failure(&self) {
+        if let Some(ref monitor) = self.governance_freshness_monitor {
+            monitor.record_failure();
+        }
     }
 
     /// Returns a reference to the episode runtime.
@@ -4775,6 +5082,8 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::IngestReviewReceipt => {
                 self.handle_ingest_review_receipt(payload, ctx)
             },
+            // TCK-00351: Runtime stop-flag mutation
+            PrivilegedMessageType::UpdateStopFlags => self.handle_update_stop_flags(payload, ctx),
             // Credential Management (CTR-PROTO-012, TCK-00343)
             PrivilegedMessageType::ListCredentials => self.handle_list_credentials(payload, ctx),
             PrivilegedMessageType::AddCredential => self.handle_add_credential(payload, ctx),
@@ -4823,6 +5132,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::EndSession => "EndSession",
                 // TCK-00389
                 PrivilegedMessageType::IngestReviewReceipt => "IngestReviewReceipt",
+                // TCK-00351
+                PrivilegedMessageType::UpdateStopFlags => "UpdateStopFlags",
                 // Credential Management (CTR-PROTO-012, TCK-00343)
                 PrivilegedMessageType::ListCredentials => "ListCredentials",
                 PrivilegedMessageType::AddCredential => "AddCredential",
@@ -4927,6 +5238,12 @@ impl PrivilegedDispatcher {
         {
             Ok(resolution) => resolution,
             Err(e) => {
+                if matches!(&e, PolicyResolutionError::GovernanceFailed { .. }) {
+                    // Governance resolver reported a governance-side failure
+                    // (transport/communication/service error), so this
+                    // qualifies as a governance probe failure signal.
+                    self.record_governance_probe_failure();
+                }
                 warn!(error = %e, "Policy resolution failed");
                 // Return application-level error, not protocol error
                 // Policy resolution failures are logic errors, not serialization errors
@@ -4936,6 +5253,10 @@ impl PrivilegedDispatcher {
                 ));
             },
         };
+
+        // Successful policy resolution is a direct governance-path health
+        // signal, so refresh the governance probe watermark.
+        self.record_governance_probe_success();
 
         // SEC-SCP-FAC-0020: lease_id is redacted from logs to prevent capability
         // leakage
@@ -5058,9 +5379,10 @@ impl PrivilegedDispatcher {
 
     /// Rolls back a partially-completed spawn registration.
     ///
-    /// Removes the newly-registered session, cleans up its telemetry, and
-    /// restores any sessions/telemetry that were evicted during the
-    /// registration.  Optionally removes the manifest if it was registered.
+    /// Removes the newly-registered session, cleans up its telemetry/stop
+    /// conditions, and restores evicted session/telemetry/manifest/stop
+    /// entries captured before failure. Optionally removes the manifest if it
+    /// was registered.
     ///
     /// Returns `Some(warning)` if any rollback step failed (indicating
     /// partial failure), or `None` if rollback was clean.
@@ -5075,6 +5397,7 @@ impl PrivilegedDispatcher {
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
         evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        evicted_stop_conditions: &[(String, crate::episode::envelope::StopConditions)],
         remove_manifest: bool,
     ) -> Option<String> {
         let mut warnings: Vec<String> = Vec::new();
@@ -5117,6 +5440,13 @@ impl PrivilegedDispatcher {
             v1_store.remove(session_id);
         }
 
+        // 3a-ii. TCK-00351 v4: Remove stop conditions on rollback.
+        // Prevents a stale stop conditions entry from persisting for a
+        // session that was never fully spawned.
+        if let Some(ref store) = self.stop_conditions_store {
+            store.remove(session_id);
+        }
+
         // 3b. Restore evicted manifests so capacity is not permanently lost.
         for (sid, manifest) in evicted_manifests {
             self.manifest_store
@@ -5132,6 +5462,21 @@ impl PrivilegedDispatcher {
                     "Rollback: failed to re-register evicted session"
                 );
                 warnings.push(format!("re-register({}): {e}", evicted.session_id));
+            }
+        }
+
+        // 5. Restore evicted stop conditions captured before eviction cleanup.
+        // This keeps rollback atomic across session/telemetry/manifest/stop stores.
+        if let Some(ref store) = self.stop_conditions_store {
+            for (sid, conditions) in evicted_stop_conditions {
+                if let Err(e) = store.restore(sid, conditions.clone()) {
+                    warn!(
+                        session_id = %sid,
+                        error = %e,
+                        "Rollback: failed to restore evicted stop conditions"
+                    );
+                    warnings.push(format!("restore_stop_conditions({sid}): {e}"));
+                }
             }
         }
 
@@ -5166,6 +5511,8 @@ impl PrivilegedDispatcher {
     ///   restored.
     /// * `evicted_manifests` — Manifests captured from evicted sessions, to be
     ///   restored.
+    /// * `evicted_stop_conditions` — Stop conditions captured from evicted
+    ///   sessions, to be restored.
     /// * `timestamp_ns` — HTF timestamp for the episode stop event.
     /// * `context` — Human-readable label for log messages identifying the
     ///   failure site (e.g. "peer credentials failure").
@@ -5177,6 +5524,7 @@ impl PrivilegedDispatcher {
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
         evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        evicted_stop_conditions: &[(String, crate::episode::envelope::StopConditions)],
         timestamp_ns: u64,
         context: &str,
     ) -> Option<String> {
@@ -5208,6 +5556,7 @@ impl PrivilegedDispatcher {
             evicted_sessions,
             evicted_telemetry,
             evicted_manifests,
+            evicted_stop_conditions,
             true,
         );
         if let Some(ref rw) = rollback_warn {
@@ -5307,6 +5656,25 @@ impl PrivilegedDispatcher {
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+                ));
+            }
+        }
+
+        // SECURITY MAJOR-1: bound escalation predicate length before
+        // policy validation/persistence to prevent oversized payload DoS.
+        if let Some(ref escalation_predicate) = request.escalation_predicate {
+            if escalation_predicate.len() > MAX_ESCALATION_PREDICATE_LEN {
+                warn!(
+                    escalation_predicate_len = escalation_predicate.len(),
+                    max_len = MAX_ESCALATION_PREDICATE_LEN,
+                    "SpawnEpisode rejected: escalation_predicate exceeds maximum length"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "escalation_predicate exceeds maximum length of \
+                         {MAX_ESCALATION_PREDICATE_LEN} bytes"
+                    ),
                 ));
             }
         }
@@ -5416,6 +5784,8 @@ impl PrivilegedDispatcher {
         // Fail-closed: spawn is only allowed if a valid policy resolution exists
         // for the work_id. This is established during ClaimWork.
         let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+            // Local precondition failure (no prior ClaimWork / missing local
+            // claim state); this is NOT a governance transport failure.
             warn!(
                 work_id = %request.work_id,
                 "SpawnEpisode rejected: policy resolution not found for work_id"
@@ -5490,6 +5860,27 @@ impl PrivilegedDispatcher {
                 }
             }
         }
+
+        // TCK-00351 BLOCKER 2: Validate caller-supplied stop conditions
+        // against an authoritative policy floor before persisting.
+        let stop_policy = StopConditionPolicy::fail_closed_default();
+        let resolved_stop_conditions = match stop_policy.validate_against_floor(
+            request.max_episodes,
+            request.escalation_predicate.as_deref(),
+        ) {
+            Ok(conditions) => conditions,
+            Err(e) => {
+                warn!(
+                    work_id = %request.work_id,
+                    max_episodes = ?request.max_episodes,
+                    "SpawnEpisode rejected: stop-condition policy floor violation"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("invalid stop conditions: {e}"),
+                ));
+            },
+        };
 
         // =====================================================================
         // TCK-00258: SoD Custody Domain Validation
@@ -5676,6 +6067,22 @@ impl PrivilegedDispatcher {
                 })
                 .collect();
 
+        // Step 2c: Capture and remove stop conditions for evicted sessions.
+        // These are restored if a later spawn step fails (atomic rollback).
+        let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> = self
+            .stop_conditions_store
+            .as_ref()
+            .map_or_else(Vec::new, |store| {
+                evicted_sessions
+                    .iter()
+                    .filter_map(|s| {
+                        store
+                            .remove_and_return(&s.session_id)
+                            .map(|c| (s.session_id.clone(), c))
+                    })
+                    .collect()
+            });
+
         // Step 3: Register telemetry with started_at_ns.
         // The wall-clock timestamp is stored as audit metadata only;
         // elapsed duration is computed from a monotonic Instant inside the
@@ -5697,6 +6104,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     false,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5707,6 +6115,40 @@ impl PrivilegedDispatcher {
                     || format!("telemetry store at capacity: {e}"),
                     |rw| {
                         format!("telemetry store at capacity: {e} (rollback partial failure: {rw})")
+                    },
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            }
+        }
+
+        // Step 3b: Register stop conditions for the session (TCK-00351 v4).
+        // The pre-actuation gate reads from this store to enforce
+        // max_episodes / escalation_predicate limits.
+        //
+        // TCK-00351 BLOCKER 1+2 FIX: Persist policy-validated stop
+        // conditions derived from authoritative request fields.
+        if let Some(ref store) = self.stop_conditions_store {
+            if let Err(e) = store.register(&session_id, resolved_stop_conditions) {
+                // Rollback session, telemetry, and restore evicted entries.
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    &evicted_stop_conditions,
+                    false,
+                );
+                if let Some(ref rw) = rollback_warn {
+                    warn!(rollback_errors = %rw, "Partial rollback failure during stop conditions error recovery");
+                }
+                warn!(error = %e, "Stop conditions registration rejected (store at capacity)");
+                let msg = rollback_warn.map_or_else(
+                    || format!("stop conditions store at capacity: {e}"),
+                    |rw| {
+                        format!("stop conditions store at capacity: {e} (rollback partial failure: {rw})")
                     },
                 );
                 return Ok(PrivilegedResponse::error(
@@ -5746,6 +6188,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     false,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5778,6 +6221,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     false,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5827,6 +6271,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_stop_conditions,
                         false,
                     );
                     if let Some(ref rw) = rollback_warn {
@@ -5885,6 +6330,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     true,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5915,6 +6361,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     true,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5988,6 +6435,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_stop_conditions,
                         true,
                     );
                     if let Some(ref rw) = rollback_warn {
@@ -6050,6 +6498,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     true,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -6113,6 +6562,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_stop_conditions,
                         true,
                     );
                     if let Some(ref rw) = rollback_warn {
@@ -6158,6 +6608,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     true,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -6199,6 +6650,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     timestamp_ns,
                     "update_episode_id failure",
                 );
@@ -6240,6 +6692,7 @@ impl PrivilegedDispatcher {
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_stop_conditions,
                 timestamp_ns,
                 "peer credentials failure",
             );
@@ -6274,6 +6727,7 @@ impl PrivilegedDispatcher {
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_stop_conditions,
                 timestamp_ns,
                 "event emission failure",
             );
@@ -6293,6 +6747,10 @@ impl PrivilegedDispatcher {
             work_id = %request.work_id,
             "Spawn lifecycle events emitted (session_started + work_transitioned)"
         );
+
+        // Successful spawn demonstrates governance-backed policy state is
+        // accessible; record fresh governance health.
+        self.record_governance_probe_success();
 
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
             session_id,
@@ -6375,6 +6833,8 @@ impl PrivilegedDispatcher {
                 ));
             }
         } else {
+            // Local state-precondition failure (missing in-process work claim),
+            // not a governance transport/communication failure.
             warn!(
                 session_id = %request.session_id,
                 work_id = %session.work_id,
@@ -6512,6 +6972,132 @@ impl PrivilegedDispatcher {
                 message: "Shutdown acknowledged (stub — daemon state not configured)".to_string(),
             }))
         }
+    }
+
+    /// Handles `UpdateStopFlags` requests (IPC-PRIV-018, TCK-00351).
+    ///
+    /// Mutates the shared runtime stop flags used by pre-actuation gating.
+    ///
+    /// # Audit Trail
+    ///
+    /// After mutation, this emits a `stop_flags_mutated` ledger event on a
+    /// best-effort basis. Emission failures are logged but do NOT roll back
+    /// the stop mutation. The stop mutation is the safety-critical path and
+    /// must take effect even when ledger infrastructure is unavailable.
+    fn handle_update_stop_flags(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = UpdateStopFlagsRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid UpdateStopFlagsRequest: {e}"),
+            })?;
+
+        if request.emergency_stop_active.is_none() && request.governance_stop_active.is_none() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "at least one stop flag must be provided",
+            ));
+        }
+
+        let peer = ctx
+            .peer_credentials()
+            .ok_or_else(|| ProtocolError::Serialization {
+                reason: "peer credentials required for UpdateStopFlags".to_string(),
+            })?;
+        let actor_id = derive_actor_id(peer);
+
+        let Some(authority) = self.stop_authority.as_ref() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "stop authority is not configured",
+            ));
+        };
+
+        let prev_emergency = authority.emergency_stop_active();
+        let prev_governance = authority.governance_stop_active();
+
+        if let Some(active) = request.emergency_stop_active {
+            authority.set_emergency_stop(active);
+        }
+        if let Some(active) = request.governance_stop_active {
+            authority.set_governance_stop(active);
+        }
+
+        let emergency_stop_active = authority.emergency_stop_active();
+        let governance_stop_active = authority.governance_stop_active();
+
+        info!(
+            actor_id = %actor_id,
+            emergency_stop_previous = prev_emergency,
+            emergency_stop_current = emergency_stop_active,
+            governance_stop_previous = prev_governance,
+            governance_stop_current = governance_stop_active,
+            "UpdateStopFlags applied"
+        );
+
+        // Best-effort audit evidence emission. Never roll back the stop
+        // mutation based on ledger availability.
+        if !self.event_emitter.has_durable_storage() {
+            warn!(
+                actor_id = %actor_id,
+                "UpdateStopFlags audit trail is in-memory only; event durability unavailable"
+            );
+        }
+
+        match self.get_htf_timestamp_ns() {
+            Ok(timestamp_ns) => {
+                let request_context = serde_json::json!({
+                    "endpoint": "UpdateStopFlags",
+                    "connection_id": ctx.connection_id(),
+                    "connection_phase": format!("{:?}", ctx.phase()),
+                    "peer_uid": peer.uid,
+                    "peer_gid": peer.gid,
+                    "peer_pid": peer.pid,
+                    "requested_updates": {
+                        "emergency_stop_active": request.emergency_stop_active,
+                        "governance_stop_active": request.governance_stop_active,
+                    },
+                });
+
+                let mutation = StopFlagsMutation {
+                    actor_id: actor_id.as_str(),
+                    emergency_stop_previous: prev_emergency,
+                    emergency_stop_current: emergency_stop_active,
+                    governance_stop_previous: prev_governance,
+                    governance_stop_current: governance_stop_active,
+                    timestamp_ns,
+                    request_context: &request_context,
+                };
+
+                if let Err(error) = self.event_emitter.emit_stop_flags_mutated(&mutation) {
+                    warn!(
+                        actor_id = %actor_id,
+                        error = %error,
+                        emergency_stop_current = emergency_stop_active,
+                        governance_stop_current = governance_stop_active,
+                        "UpdateStopFlags mutation applied but ledger audit emission failed"
+                    );
+                }
+            },
+            Err(error) => {
+                warn!(
+                    actor_id = %actor_id,
+                    error = %error,
+                    emergency_stop_current = emergency_stop_active,
+                    governance_stop_current = governance_stop_active,
+                    "UpdateStopFlags mutation applied but audit timestamp acquisition failed"
+                );
+            },
+        }
+
+        Ok(PrivilegedResponse::UpdateStopFlags(
+            UpdateStopFlagsResponse {
+                emergency_stop_active,
+                governance_stop_active,
+            },
+        ))
     }
 
     /// Handles `WorkStatus` requests (IPC-PRIV-005, TCK-00344).
@@ -6892,11 +7478,30 @@ impl PrivilegedDispatcher {
             v1_store.remove(&request.session_id);
         }
 
+        // TCK-00351 BLOCKER-2: `episode_count` is defined as completed
+        // episodes. Increment on termination (not spawn) to avoid
+        // off-by-one self-deny on the first RequestTool.
+        if let Some(ref store) = self.telemetry_store {
+            if let Some(telemetry) = store.get(&request.session_id) {
+                telemetry.increment_episode_count();
+            }
+        }
+
         // TCK-00384 review fix: Clean up telemetry on EndSession to free
         // capacity in the bounded store. Without this, repeated
         // spawn/end cycles exhaust MAX_TELEMETRY_SESSIONS and block new
         // spawns (DoS). Mirrors the cleanup in session_dispatch.rs:1421.
         if let Some(ref store) = self.telemetry_store {
+            store.remove(&request.session_id);
+        }
+
+        // TCK-00351 BLOCKER 3 FIX: Clean up stop conditions on EndSession
+        // to free capacity in the bounded store.  Without this, stop
+        // conditions entries accumulate on every spawn/end cycle and are
+        // never reclaimed, causing the store to reach capacity and reject
+        // new registrations (DoS).  Same lifecycle as telemetry cleanup
+        // above.
+        if let Some(ref store) = self.stop_conditions_store {
             store.remove(&request.session_id);
         }
 
@@ -9804,6 +10409,14 @@ pub fn encode_shutdown_request(request: &ShutdownRequest) -> Bytes {
     Bytes::from(buf)
 }
 
+/// Encodes an `UpdateStopFlags` request to bytes for sending (TCK-00351).
+#[must_use]
+pub fn encode_update_stop_flags_request(request: &UpdateStopFlagsRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::UpdateStopFlags.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
 /// Encodes an `EndSession` request to bytes for sending (TCK-00395).
 #[must_use]
 pub fn encode_end_session_request(request: &EndSessionRequest) -> Bytes {
@@ -10028,6 +10641,117 @@ mod tests {
         "/tmp".to_string()
     }
 
+    mod governance_probe_failure_classification {
+        use super::*;
+        use crate::episode::preactuation::StopAuthority;
+        use crate::governance::GovernanceFreshnessConfig;
+
+        #[test]
+        fn spawn_missing_claim_does_not_record_governance_failure() {
+            let authority = Arc::new(StopAuthority::new());
+            let monitor = Arc::new(GovernanceFreshnessMonitor::new(
+                Arc::clone(&authority),
+                GovernanceFreshnessConfig::default(),
+                false,
+            ));
+            monitor.record_success();
+
+            let dispatcher =
+                PrivilegedDispatcher::new().with_governance_freshness_monitor(Arc::clone(&monitor));
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-NO-CLAIM".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-NO-CLAIM".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
+            };
+            let frame = encode_spawn_episode_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::PolicyResolutionMissing as i32
+                    );
+                },
+                other => panic!("expected PolicyResolutionMissing error, got: {other:?}"),
+            }
+
+            assert!(
+                !authority.governance_uncertain(),
+                "local missing-claim path must not set governance uncertainty"
+            );
+        }
+
+        #[test]
+        fn issue_capability_missing_claim_does_not_record_governance_failure() {
+            let authority = Arc::new(StopAuthority::new());
+            let monitor = Arc::new(GovernanceFreshnessMonitor::new(
+                Arc::clone(&authority),
+                GovernanceFreshnessConfig::default(),
+                false,
+            ));
+            monitor.record_success();
+
+            let dispatcher =
+                PrivilegedDispatcher::new().with_governance_freshness_monitor(Arc::clone(&monitor));
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            dispatcher
+                .session_registry
+                .register_session(crate::session::SessionState {
+                    session_id: "S-NO-CLAIM".to_string(),
+                    work_id: "W-NO-CLAIM".to_string(),
+                    role: WorkRole::Implementer.into(),
+                    lease_id: "L-NO-CLAIM".to_string(),
+                    ephemeral_handle: "EH-NO-CLAIM".to_string(),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                })
+                .expect("session registration should succeed");
+
+            let request = IssueCapabilityRequest {
+                session_id: "S-NO-CLAIM".to_string(),
+                capability_request: Some(super::super::super::messages::CapabilityRequest {
+                    tool_class: "read".to_string(),
+                    read_patterns: vec!["**/*".to_string()],
+                    write_patterns: vec![],
+                    duration_secs: 60,
+                }),
+            };
+            let frame = encode_issue_capability_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                },
+                other => panic!("expected CapabilityRequestRejected error, got: {other:?}"),
+            }
+
+            assert!(
+                !authority.governance_uncertain(),
+                "local missing-claim path must not set governance uncertainty"
+            );
+        }
+    }
+
     // ========================================================================
     // INT-001: Privileged endpoint routing (TCK-00251)
     // Test name matches verification command: cargo test -p apm2-daemon
@@ -10035,6 +10759,7 @@ mod tests {
     // ========================================================================
     mod privileged_routing {
         use super::*;
+        use crate::episode::preactuation::StopAuthority;
 
         #[test]
         fn test_claim_work_routing() {
@@ -10055,6 +10780,70 @@ mod tests {
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
             assert!(matches!(response, PrivilegedResponse::ClaimWork(_)));
+        }
+
+        #[test]
+        fn test_update_stop_flags_tag_and_routing() {
+            let authority = Arc::new(StopAuthority::new());
+            let dispatcher =
+                PrivilegedDispatcher::new().with_stop_authority(Arc::clone(&authority));
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            assert_eq!(PrivilegedMessageType::UpdateStopFlags.tag(), 18);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(18),
+                Some(PrivilegedMessageType::UpdateStopFlags)
+            );
+
+            let request = UpdateStopFlagsRequest {
+                emergency_stop_active: Some(true),
+                governance_stop_active: None,
+            };
+            let frame = encode_update_stop_flags_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::UpdateStopFlags(resp) => {
+                    assert!(resp.emergency_stop_active);
+                    assert!(!resp.governance_stop_active);
+                },
+                other => panic!("expected UpdateStopFlags response, got {other:?}"),
+            }
+            assert!(authority.emergency_stop_active());
+
+            let events = dispatcher
+                .event_emitter()
+                .get_events_by_work_id(STOP_FLAGS_MUTATED_WORK_ID);
+            assert_eq!(events.len(), 1, "expected one stop-flags audit event");
+            let event = &events[0];
+            assert_eq!(event.event_type, "stop_flags_mutated");
+
+            let payload: serde_json::Value =
+                serde_json::from_slice(&event.payload).expect("payload should be valid JSON");
+            assert_eq!(
+                payload["actor_id"],
+                derive_actor_id(&PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                })
+            );
+            assert_eq!(payload["emergency_stop_previous"], false);
+            assert_eq!(payload["emergency_stop_current"], true);
+            assert_eq!(payload["governance_stop_previous"], false);
+            assert_eq!(payload["governance_stop_current"], false);
+            assert_eq!(
+                payload["request_context"]["endpoint"], "UpdateStopFlags",
+                "request context must include endpoint"
+            );
+            assert_eq!(
+                payload["request_context"]["requested_updates"]["emergency_stop_active"],
+                true
+            );
         }
 
         #[test]
@@ -10087,6 +10876,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
 
@@ -10203,6 +10994,8 @@ mod tests {
                     work_id: "W-001".to_string(),
                     role: WorkRole::Implementer.into(),
                     lease_id: None,
+                    max_episodes: None,
+                    escalation_predicate: None,
                 }),
                 encode_issue_capability_request(&IssueCapabilityRequest {
                     session_id: "S-001".to_string(),
@@ -10284,6 +11077,8 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: None,
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -10394,6 +11189,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11064,6 +11861,8 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: None, // Missing required lease_id
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11109,6 +11908,8 @@ mod tests {
             work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some(lease_id), // Use the correct lease_id from ClaimWork
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11159,6 +11960,8 @@ mod tests {
             work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-WRONG-LEASE-ID".to_string()), // Wrong!
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11213,6 +12016,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: None, // Missing! Should fail because claim has a lease_id
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11262,6 +12067,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id), // Correct lease_id
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11305,6 +12112,8 @@ mod tests {
             work_id: work_id.clone(),
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -11357,6 +12166,8 @@ mod tests {
             work_id: "W-001".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-UNKNOWN".to_string()), // Not registered
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11399,6 +12210,8 @@ mod tests {
             work_id: "W-002".to_string(), // Mismatched work_id
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-001".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11442,6 +12255,8 @@ mod tests {
             work_id: "W-VALID".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-VALID".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11579,6 +12394,8 @@ mod tests {
             work_id: "W-NONEXISTENT".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: None,
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -11634,6 +12451,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -11700,6 +12519,8 @@ mod tests {
             work_id,
             role: WorkRole::Reviewer.into(), // Different from claimed role
             lease_id: None,
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -11757,6 +12578,8 @@ mod tests {
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -11929,6 +12752,8 @@ mod tests {
             work_id: "W-team-alpha-test123".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some(lease_id),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -11992,6 +12817,8 @@ mod tests {
             work_id: "W-team-dev-test456".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-non-overlap-123".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -12057,6 +12884,8 @@ mod tests {
             work_id: "W-unknown-work-789".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-empty-authors-456".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -12112,6 +12941,8 @@ mod tests {
             work_id: "W-team-alpha-impl123".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: Some("L-implementer-789".to_string()),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -13034,6 +13865,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -13134,6 +13967,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -13849,6 +14684,8 @@ mod tests {
                     work_id: work_id.clone(),
                     role: WorkRole::Implementer.into(),
                     lease_id: Some(lease_id),
+                    max_episodes: None,
+                    escalation_predicate: None,
                 };
                 let spawn_frame = encode_spawn_episode_request(&spawn_request);
                 let spawn_resp = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -13944,11 +14781,16 @@ mod tests {
                 Vec::new();
             let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let no_evicted_stop_conditions: Vec<(
+                String,
+                crate::episode::envelope::StopConditions,
+            )> = Vec::new();
             let result = dispatcher.rollback_spawn(
                 "S-EPID-FAIL",
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
                 &no_evicted_manifests,
+                &no_evicted_stop_conditions,
                 true,
             );
             assert!(result.is_none(), "Rollback should succeed without warnings");
@@ -14208,12 +15050,15 @@ mod tests {
             let evicted_sessions = vec![evicted_session_state];
             let evicted_telem: Vec<(String, Arc<crate::session::SessionTelemetry>)> = Vec::new();
             let evicted_manifests = vec![("S-ROLLBACK-M".to_string(), evicted_manifest)];
+            let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> =
+                Vec::new();
 
             let result = dispatcher.rollback_spawn(
                 "S-NEW-M",
                 &evicted_sessions,
                 &evicted_telem,
                 &evicted_manifests,
+                &evicted_stop_conditions,
                 true,
             );
             assert!(result.is_none(), "Rollback should succeed: {result:?}");
@@ -14273,6 +15118,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
@@ -14353,6 +15200,10 @@ mod tests {
                 Vec::new();
             let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let no_evicted_stop_conditions: Vec<(
+                String,
+                crate::episode::envelope::StopConditions,
+            )> = Vec::new();
 
             let result = dispatcher.rollback_spawn_with_episode_stop(
                 None,
@@ -14360,6 +15211,7 @@ mod tests {
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
                 &no_evicted_manifests,
+                &no_evicted_stop_conditions,
                 999_000,
                 "test context",
             );
@@ -14461,6 +15313,8 @@ mod tests {
                 .collect();
             assert_eq!(evicted_telemetry.len(), 1);
             assert_eq!(evicted_manifests.len(), 1);
+            let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> =
+                Vec::new();
 
             // Register telemetry and manifest for the new session
             store.register("S-NEW", 999).unwrap();
@@ -14474,6 +15328,7 @@ mod tests {
                 &evicted,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_stop_conditions,
                 999_000,
                 "test eviction restore",
             );
@@ -14508,6 +15363,252 @@ mod tests {
             assert!(
                 manifest_store.get_manifest("S-0").is_some(),
                 "Evicted manifest must be restored by unified rollback"
+            );
+        }
+
+        /// TCK-00351 BLOCKER 1: Regression for non-atomic stop-condition
+        /// rollback.
+        ///
+        /// Simulates: spawn -> eviction -> post-eviction failure -> rollback,
+        /// and verifies the evicted session's original stop conditions are
+        /// restored.
+        #[test]
+        fn test_failed_spawn_restores_evicted_stop_conditions() {
+            use crate::episode::envelope::StopConditions;
+            use crate::episode::registry::{InMemorySessionRegistry, MAX_SESSIONS};
+            use crate::session::{
+                SessionRegistry, SessionState, SessionStopConditionsStore, SessionTelemetryStore,
+            };
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let stop_store = Arc::new(SessionStopConditionsStore::new());
+
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_session_registry(
+                    Arc::clone(&registry) as Arc<dyn SessionRegistry + Send + Sync>
+                )
+                .with_telemetry_store(Arc::clone(&telemetry))
+                .with_stop_conditions_store(Arc::clone(&stop_store));
+
+            let original_conditions = StopConditions {
+                max_episodes: 3,
+                escalation_predicate: "severity>=high".to_string(),
+                goal_predicate: String::new(),
+                failure_predicate: String::new(),
+            };
+
+            // Fill to capacity with sessions, telemetry, and stop conditions.
+            for i in 0..MAX_SESSIONS {
+                let sid = format!("S-{i}");
+                let session = SessionState {
+                    session_id: sid.clone(),
+                    work_id: format!("W-{i}"),
+                    role: 1,
+                    ephemeral_handle: format!("H-{i}"),
+                    lease_id: format!("L-{i}"),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![0u8; 32],
+                    episode_id: None,
+                };
+                registry.register_session(session).unwrap();
+                telemetry.register(&sid, i as u64).unwrap();
+                let conditions = if i == 0 {
+                    original_conditions.clone()
+                } else {
+                    StopConditions::max_episodes(1)
+                };
+                stop_store.register(&sid, conditions).unwrap();
+            }
+
+            // Register one more session to evict S-0.
+            let new_session = SessionState {
+                session_id: "S-NEW-STOP".to_string(),
+                work_id: "W-NEW-STOP".to_string(),
+                role: 1,
+                ephemeral_handle: "H-NEW-STOP".to_string(),
+                lease_id: "L-NEW-STOP".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+            };
+            let evicted = registry.register_session(new_session).unwrap();
+            assert_eq!(evicted.len(), 1);
+            assert_eq!(evicted[0].session_id, "S-0");
+
+            // Capture evicted telemetry and stop conditions as spawn path does.
+            let evicted_telemetry: Vec<_> = evicted
+                .iter()
+                .filter_map(|s| {
+                    telemetry
+                        .remove_and_return(&s.session_id)
+                        .map(|t| (s.session_id.clone(), t))
+                })
+                .collect();
+            let evicted_stop_conditions: Vec<_> = evicted
+                .iter()
+                .filter_map(|s| {
+                    stop_store
+                        .remove_and_return(&s.session_id)
+                        .map(|c| (s.session_id.clone(), c))
+                })
+                .collect();
+            assert_eq!(evicted_telemetry.len(), 1);
+            assert_eq!(evicted_stop_conditions.len(), 1);
+
+            // Register resources for the newly spawned session.
+            telemetry.register("S-NEW-STOP", 999).unwrap();
+            stop_store
+                .register("S-NEW-STOP", StopConditions::max_episodes(1))
+                .unwrap();
+
+            // Simulate spawn failure rollback.
+            let evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
+                Vec::new();
+            let result = dispatcher.rollback_spawn(
+                "S-NEW-STOP",
+                &evicted,
+                &evicted_telemetry,
+                &evicted_manifests,
+                &evicted_stop_conditions,
+                false,
+            );
+            assert!(result.is_none(), "Rollback should succeed: {result:?}");
+
+            // New session should be fully removed.
+            assert!(registry.get_session("S-NEW-STOP").is_none());
+            assert!(telemetry.get("S-NEW-STOP").is_none());
+            assert!(stop_store.get("S-NEW-STOP").is_none());
+
+            // Evicted session and its original stop conditions should be restored.
+            assert!(registry.get_session("S-0").is_some());
+            let restored = stop_store
+                .get("S-0")
+                .expect("evicted stop conditions must be restored");
+            assert_eq!(restored.max_episodes, original_conditions.max_episodes);
+            assert_eq!(
+                restored.escalation_predicate,
+                original_conditions.escalation_predicate
+            );
+        }
+
+        /// TCK-00351 BLOCKER 2: caller tampering with permissive stop values
+        /// (`max_episodes=0`) is rejected by policy-floor validation.
+        #[test]
+        fn test_spawn_rejects_untrusted_max_episodes_zero() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "tamper-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("expected ClaimWork response, got {other:?}"),
+            };
+
+            let tampered_spawn = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                max_episodes: Some(0),
+                escalation_predicate: None,
+            };
+            let frame = encode_spawn_episode_request(&tampered_spawn);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("max_episodes=0"),
+                        "tamper rejection should mention max_episodes floor: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected tamper rejection, got {other:?}"),
+            }
+
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session_by_work_id(&work_id)
+                    .is_none(),
+                "rejected tampered spawn must not register a session"
+            );
+        }
+
+        /// SECURITY MAJOR-1: oversized escalation predicates are rejected
+        /// before persistence.
+        #[test]
+        fn test_spawn_rejects_oversized_escalation_predicate() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "tamper-escalation".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("expected ClaimWork response, got {other:?}"),
+            };
+
+            let oversized_predicate = "x".repeat(MAX_ESCALATION_PREDICATE_LEN + 1);
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: Some(oversized_predicate),
+            };
+            let frame = encode_spawn_episode_request(&spawn_request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message
+                            .contains("escalation_predicate exceeds maximum length"),
+                        "rejection should mention escalation_predicate bound: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected oversized escalation rejection, got {other:?}"),
+            }
+
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session_by_work_id(&work_id)
+                    .is_none(),
+                "rejected oversized spawn must not register a session"
             );
         }
     }
@@ -14603,6 +15704,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -14742,6 +15845,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -14937,6 +16042,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15018,6 +16125,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15408,6 +16517,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15495,6 +16606,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15562,6 +16675,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15622,6 +16737,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15702,6 +16819,8 @@ mod tests {
                     work_id: work_id.clone(),
                     role: WorkRole::Implementer.into(),
                     lease_id: Some(lease_id),
+                    max_episodes: None,
+                    escalation_predicate: None,
                 };
                 let spawn_frame = encode_spawn_episode_request(&spawn_request);
                 let spawn_response = d.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15890,6 +17009,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15992,6 +17113,8 @@ mod tests {
                 work_id: work_id.clone(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &valid_ctx).unwrap();
@@ -16084,6 +17207,8 @@ mod tests {
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
@@ -19687,6 +20812,8 @@ mod tests {
                 work_id: "W-V3-SCOPE-NONE".to_string(),
                 role: WorkRole::Implementer.into(),
                 lease_id: Some("L-V3-001".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -19746,6 +20873,8 @@ mod tests {
                 work_id: "W-V3-SCOPE-NARROW".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-002".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -19809,6 +20938,8 @@ mod tests {
                 work_id: "W-V3-RISK-CEIL".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-003".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -19870,6 +21001,8 @@ mod tests {
                 work_id: "W-V3-RISK-INV".to_string(),
                 role: WorkRole::Reviewer.into(),
                 lease_id: Some("L-V3-004".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();

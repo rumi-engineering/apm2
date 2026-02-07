@@ -336,6 +336,13 @@ pub struct SessionTelemetry {
     pub tool_calls: AtomicU64,
     /// Number of `EmitEvent` calls dispatched for this session.
     pub events_emitted: AtomicU64,
+    /// Number of completed episodes for this session (TCK-00351 BLOCKER-2).
+    ///
+    /// This counter tracks completed/terminated episodes for the session,
+    /// which is semantically distinct from `tool_calls`.
+    /// The pre-actuation gate uses this to enforce `max_episodes` stop
+    /// conditions.
+    pub episode_count: AtomicU64,
     /// Timestamp (nanoseconds since epoch) when the session was spawned.
     /// Used for display/audit metadata only; NOT for elapsed time computation.
     pub started_at_ns: u64,
@@ -352,6 +359,7 @@ impl SessionTelemetry {
         Self {
             tool_calls: AtomicU64::new(0),
             events_emitted: AtomicU64::new(0),
+            episode_count: AtomicU64::new(0),
             started_at_ns,
             started_at: Instant::now(),
         }
@@ -366,6 +374,7 @@ impl SessionTelemetry {
         Self {
             tool_calls: AtomicU64::new(0),
             events_emitted: AtomicU64::new(0),
+            episode_count: AtomicU64::new(0),
             started_at_ns,
             started_at,
         }
@@ -400,6 +409,24 @@ impl SessionTelemetry {
     pub fn get_events_emitted(&self) -> u64 {
         self.events_emitted.load(Ordering::Relaxed)
     }
+
+    /// Increments the completed-episode count and returns the new value.
+    ///
+    /// Called when an episode terminates. The pre-actuation gate reads this
+    /// counter to enforce `max_episodes` stop conditions without off-by-one
+    /// denial on a newly spawned episode.
+    pub fn increment_episode_count(&self) -> u64 {
+        self.episode_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Returns the current episode count (TCK-00351 MAJOR 1 FIX).
+    ///
+    /// Semantically distinct from `get_tool_calls()`: episodes are
+    /// lifecycle units (one per `SpawnEpisode`), while tool calls count
+    /// individual `RequestTool` invocations within an episode.
+    pub fn get_episode_count(&self) -> u64 {
+        self.episode_count.load(Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for SessionTelemetry {
@@ -410,6 +437,7 @@ impl std::fmt::Debug for SessionTelemetry {
                 "events_emitted",
                 &self.events_emitted.load(Ordering::Relaxed),
             )
+            .field("episode_count", &self.episode_count.load(Ordering::Relaxed))
             .field("started_at_ns", &self.started_at_ns)
             .field("started_at", &self.started_at)
             .field("elapsed_ms", &self.elapsed_ms())
@@ -427,6 +455,8 @@ pub struct TelemetrySnapshot {
     pub tool_calls: u64,
     /// Number of events emitted.
     pub events_emitted: u64,
+    /// Number of episodes spawned (TCK-00351 MAJOR 1 FIX).
+    pub episode_count: u64,
     /// Session start timestamp (nanoseconds since epoch).
     /// Wall-clock metadata for display/audit only.
     pub started_at_ns: u64,
@@ -539,6 +569,7 @@ impl SessionTelemetryStore {
         entries.get(session_id).map(|t| TelemetrySnapshot {
             tool_calls: t.get_tool_calls(),
             events_emitted: t.get_events_emitted(),
+            episode_count: t.get_episode_count(),
             started_at_ns: t.started_at_ns,
             duration_ms: t.elapsed_ms(),
         })
@@ -627,6 +658,138 @@ impl SessionTelemetryStore {
 }
 
 // =============================================================================
+// TCK-00351 v3: Per-Session Stop Conditions Store
+// =============================================================================
+
+/// Per-session stop conditions store for pre-actuation gate enforcement.
+///
+/// TCK-00351 v3 FIX: The pre-actuation gate was called with
+/// `StopConditions::default()` and `current_episode_count=0`, meaning
+/// `max_episodes` and `escalation_predicate` were never checked.  This
+/// store associates real stop conditions with each session so the gate can
+/// enforce them.
+///
+/// # Capacity Bounds (CTR-1303)
+///
+/// Shares the same capacity limit as [`SessionTelemetryStore`].
+///
+/// # Thread Safety
+///
+/// Uses `RwLock<HashMap>` for concurrent access.  Stop conditions are
+/// immutable once registered (set at session spawn time).
+#[derive(Debug, Default)]
+pub struct SessionStopConditionsStore {
+    entries: RwLock<HashMap<String, crate::episode::envelope::StopConditions>>,
+}
+
+impl SessionStopConditionsStore {
+    /// Creates a new empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers stop conditions for a session.
+    ///
+    /// If the session already has conditions registered, the existing entry
+    /// is preserved (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the store is at capacity and the session is not
+    /// already registered.
+    pub fn register(
+        &self,
+        session_id: &str,
+        conditions: crate::episode::envelope::StopConditions,
+    ) -> Result<(), TelemetryStoreError> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        if entries.contains_key(session_id) {
+            return Ok(());
+        }
+        if entries.len() >= MAX_TELEMETRY_SESSIONS {
+            return Err(TelemetryStoreError::AtCapacity {
+                session_id: session_id.to_string(),
+                max: MAX_TELEMETRY_SESSIONS,
+            });
+        }
+        entries.insert(session_id.to_string(), conditions);
+        Ok(())
+    }
+
+    /// Returns the stop conditions for a session, if registered.
+    #[must_use]
+    pub fn get(&self, session_id: &str) -> Option<crate::episode::envelope::StopConditions> {
+        let entries = self.entries.read().expect("lock poisoned");
+        entries.get(session_id).cloned()
+    }
+
+    /// Removes and returns stop conditions for a session, if present.
+    ///
+    /// Used by spawn rollback paths to capture evicted stop conditions
+    /// before removal and restore them if a later spawn step fails.
+    #[must_use]
+    pub fn remove_and_return(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::episode::envelope::StopConditions> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.remove(session_id)
+    }
+
+    /// Restores stop conditions for a session.
+    ///
+    /// If the session already has an entry, this is a no-op (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the store is at capacity and the session is not
+    /// already present.
+    pub fn restore(
+        &self,
+        session_id: &str,
+        conditions: crate::episode::envelope::StopConditions,
+    ) -> Result<(), TelemetryStoreError> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        if entries.contains_key(session_id) {
+            return Ok(());
+        }
+        if entries.len() >= MAX_TELEMETRY_SESSIONS {
+            return Err(TelemetryStoreError::AtCapacity {
+                session_id: session_id.to_string(),
+                max: MAX_TELEMETRY_SESSIONS,
+            });
+        }
+        entries.insert(session_id.to_string(), conditions);
+        Ok(())
+    }
+
+    /// Removes stop conditions for a session.
+    ///
+    /// TCK-00351 BLOCKER 3 FIX: Must be called from the same termination
+    /// and eviction paths that clean up telemetry entries.  Without this,
+    /// stop condition entries accumulate on every spawn/end cycle, causing
+    /// the store to reach capacity and reject new registrations (`DoS`).
+    pub fn remove(&self, session_id: &str) {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.remove(session_id);
+    }
+
+    /// Returns the number of stored entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let entries = self.entries.read().expect("lock poisoned");
+        entries.len()
+    }
+
+    /// Returns `true` if no entries are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// =============================================================================
 // TCK-00384: Session Telemetry Tests
 // =============================================================================
 
@@ -709,11 +872,13 @@ mod telemetry_tests {
         let snap = TelemetrySnapshot {
             tool_calls: 5,
             events_emitted: 3,
+            episode_count: 1,
             started_at_ns: 1_000_000_000,
             duration_ms: 42,
         };
         assert_eq!(snap.tool_calls, 5);
         assert_eq!(snap.events_emitted, 3);
+        assert_eq!(snap.episode_count, 1);
         assert_eq!(snap.started_at_ns, 1_000_000_000);
         assert_eq!(snap.duration_ms, 42);
     }
@@ -723,6 +888,7 @@ mod telemetry_tests {
         let snap1 = TelemetrySnapshot {
             tool_calls: 5,
             events_emitted: 3,
+            episode_count: 0,
             started_at_ns: 1_000_000_000,
             duration_ms: 0,
         };
@@ -987,5 +1153,148 @@ mod telemetry_tests {
             "duration_ms should be small, got {}",
             snap.duration_ms,
         );
+    }
+
+    // =========================================================================
+    // TCK-00351 BLOCKER 3: SessionStopConditionsStore lifecycle tests
+    // =========================================================================
+
+    #[test]
+    fn test_stop_conditions_store_new_is_empty() {
+        let store = SessionStopConditionsStore::new();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_stop_conditions_store_register_and_get() {
+        let store = SessionStopConditionsStore::new();
+        let conditions = crate::episode::envelope::StopConditions::max_episodes(5);
+        store.register("sess-1", conditions).unwrap();
+
+        assert_eq!(store.len(), 1);
+        let got = store.get("sess-1").expect("should have conditions");
+        assert_eq!(got.max_episodes, 5);
+    }
+
+    #[test]
+    fn test_stop_conditions_store_remove() {
+        let store = SessionStopConditionsStore::new();
+        let conditions = crate::episode::envelope::StopConditions::max_episodes(10);
+        store.register("sess-1", conditions).unwrap();
+        assert_eq!(store.len(), 1);
+
+        store.remove("sess-1");
+        assert!(store.is_empty());
+        assert!(store.get("sess-1").is_none());
+    }
+
+    #[test]
+    fn test_stop_conditions_store_remove_and_restore() {
+        let store = SessionStopConditionsStore::new();
+        let original = crate::episode::envelope::StopConditions {
+            max_episodes: 7,
+            escalation_predicate: "severity>=high".to_string(),
+            goal_predicate: String::new(),
+            failure_predicate: String::new(),
+        };
+        store.register("sess-1", original.clone()).unwrap();
+
+        let removed = store
+            .remove_and_return("sess-1")
+            .expect("entry should be removed");
+        assert_eq!(removed.max_episodes, 7);
+        assert_eq!(removed.escalation_predicate, "severity>=high");
+        assert!(store.get("sess-1").is_none());
+
+        store
+            .restore("sess-1", removed)
+            .expect("restore should succeed");
+        let restored = store.get("sess-1").expect("entry should be restored");
+        assert_eq!(restored.max_episodes, original.max_episodes);
+        assert_eq!(restored.escalation_predicate, original.escalation_predicate);
+    }
+
+    #[test]
+    fn test_stop_conditions_store_remove_nonexistent() {
+        let store = SessionStopConditionsStore::new();
+        store.remove("nonexistent"); // Should not panic
+        assert!(store.is_empty());
+    }
+
+    /// TCK-00351 BLOCKER 3: Churn regression test.
+    ///
+    /// Simulates repeated spawn/terminate cycles and verifies that
+    /// `remove()` keeps the store size stable.  Without the fix,
+    /// entries accumulate and eventually hit the capacity limit.
+    #[test]
+    fn test_stop_conditions_store_churn_regression() {
+        let store = SessionStopConditionsStore::new();
+        let cycles = 100;
+
+        for cycle in 0..cycles {
+            let session_id = format!("sess-churn-{cycle}");
+            let conditions = crate::episode::envelope::StopConditions::max_episodes(10);
+
+            // Spawn: register conditions
+            store.register(&session_id, conditions).unwrap();
+            assert_eq!(
+                store.len(),
+                1,
+                "cycle {cycle}: store should have exactly 1 entry during active session"
+            );
+
+            // Terminate: remove conditions
+            store.remove(&session_id);
+            assert!(
+                store.is_empty(),
+                "cycle {cycle}: store should be empty after termination"
+            );
+        }
+
+        // After all cycles, store must be empty (no leaked entries)
+        assert_eq!(
+            store.len(),
+            0,
+            "store must be empty after {cycles} churn cycles"
+        );
+    }
+
+    /// TCK-00351 BLOCKER 3: Capacity regression test.
+    ///
+    /// Fills the store to capacity, removes entries, and verifies that
+    /// new registrations succeed after removal.  Proves that `remove()`
+    /// actually frees capacity slots.
+    #[test]
+    fn test_stop_conditions_store_capacity_reclaim() {
+        let store = SessionStopConditionsStore::new();
+
+        // Fill to capacity
+        for i in 0..MAX_TELEMETRY_SESSIONS {
+            let conditions = crate::episode::envelope::StopConditions::max_episodes(1);
+            store
+                .register(&format!("sess-cap-{i}"), conditions)
+                .unwrap();
+        }
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS);
+
+        // Next registration should fail (at capacity)
+        let result = store.register(
+            "one-too-many",
+            crate::episode::envelope::StopConditions::default(),
+        );
+        assert!(result.is_err(), "should reject at capacity");
+
+        // Remove one entry to free a slot
+        store.remove("sess-cap-0");
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS - 1);
+
+        // Now registration should succeed
+        let result = store.register(
+            "reclaimed",
+            crate::episode::envelope::StopConditions::max_episodes(42),
+        );
+        assert!(result.is_ok(), "should succeed after capacity reclaim");
+        assert_eq!(store.len(), MAX_TELEMETRY_SESSIONS);
     }
 }

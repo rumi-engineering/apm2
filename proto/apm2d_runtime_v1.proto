@@ -303,6 +303,15 @@ message SpawnEpisodeRequest {
   // All file operations will be confined to this directory.
   // REQUIRED: Episodes cannot be spawned without a workspace root.
   string workspace_root = 4;
+  // TCK-00351 BLOCKER 1: Authoritative stop conditions from the episode
+  // envelope.  When present, these override StopConditions::default() so
+  // that max_episodes and escalation_predicate are actually enforced.
+  // When absent, the handler falls back to fail-closed defaults
+  // (max_episodes=1, empty predicates).
+  optional uint64 max_episodes = 5;
+  // Escalation predicate from the episode envelope (free-form v1).
+  // Non-empty string triggers EscalationTriggered stop denial.
+  optional string escalation_predicate = 6;
 }
 
 message SpawnEpisodeResponse {
@@ -358,6 +367,22 @@ message ShutdownRequest {
 message ShutdownResponse {
   // Acknowledgment message.
   string message = 1;
+}
+
+// IPC-PRIV-018: UpdateStopFlags
+// Mutate runtime emergency/governance stop flags used by pre-actuation gating.
+message UpdateStopFlagsRequest {
+  // Optional emergency stop state update.
+  optional bool emergency_stop_active = 1;
+  // Optional governance stop state update.
+  optional bool governance_stop_active = 2;
+}
+
+message UpdateStopFlagsResponse {
+  // Effective emergency stop state after applying updates.
+  bool emergency_stop_active = 1;
+  // Effective governance stop state after applying updates.
+  bool governance_stop_active = 2;
 }
 
 // IPC-PRIV-005: WorkStatus (TCK-00344)
@@ -679,6 +704,22 @@ message RequestToolResponse {
   // Inline result for small outputs (bounded by MAX_INLINE_RESULT_SIZE = 64KB).
   // TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
   optional bytes inline_result = 6;
+  // TCK-00351: Pre-actuation stop check proof.
+  // True indicates stop conditions were evaluated and cleared before actuation.
+  // False or absent indicates stop check was not performed (fail-closed: deny).
+  bool stop_checked = 7;
+  // TCK-00351: Pre-actuation budget check proof.
+  // True indicates budget was enforced at pre-actuation.
+  // False is only valid when `budget_enforcement_deferred=true`.
+  // Replayers MUST reject traces where both `budget_checked=false` and
+  // `budget_enforcement_deferred=false`.
+  bool budget_checked = 8;
+  // TCK-00351: Explicitly marks budget enforcement deferred beyond
+  // pre-actuation (e.g., to EpisodeRuntime).
+  bool budget_enforcement_deferred = 9;
+  // TCK-00351: HTF timestamp (nanoseconds) when pre-actuation checks completed.
+  // Provides replay-verifiable ordering proof that checks preceded actuation.
+  uint64 preactuation_timestamp_ns = 10;
 }
 
 // IPC-SESS-002: EmitEvent

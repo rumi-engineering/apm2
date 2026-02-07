@@ -188,6 +188,9 @@ pub struct BudgetTracker {
     /// Original budget limits (immutable).
     limits: EpisodeBudget,
 
+    /// Whether enforcement is deferred to `EpisodeRuntime`.
+    deferred_enforcement: bool,
+
     /// Tokens consumed.
     tokens_consumed: AtomicU64,
 
@@ -218,6 +221,7 @@ impl BudgetTracker {
     pub fn from_envelope(budget: EpisodeBudget) -> Self {
         Self {
             limits: budget,
+            deferred_enforcement: false,
             tokens_consumed: AtomicU64::new(0),
             tool_calls_consumed: AtomicU32::new(0),
             wall_ms_consumed: AtomicU64::new(0),
@@ -233,6 +237,44 @@ impl BudgetTracker {
     #[must_use]
     pub fn unlimited() -> Self {
         Self::from_envelope(EpisodeBudget::unlimited())
+    }
+
+    /// Creates a deferred budget tracker sentinel.
+    ///
+    /// WVR-0002 Phase-1 sentinel: this tracker uses unlimited limits and marks
+    /// enforcement as deferred, so pre-actuation receipts report
+    /// `budget_checked=false` with `budget_enforcement_deferred=true` while
+    /// actual per-episode budget enforcement occurs in [`EpisodeRuntime`].
+    /// Replay verification accepts this receipt shape only when the deferred
+    /// flag is present.
+    ///
+    /// # Architecture
+    ///
+    /// The pre-actuation gate operates at the session level (one gate
+    /// per session).  Per-episode budgets are tracked by `EpisodeRuntime`
+    /// which receives the budget from the episode envelope.  This
+    /// sentinel bridges the gap: it allows the gate to run and defer
+    /// enforcement to the runtime without overstating pre-actuation proof.
+    ///
+    /// # When to Use
+    ///
+    /// Wire this into production constructors where per-session budget
+    /// enforcement is not yet implemented but the gate still needs a tracker
+    /// instance for availability checks.
+    ///
+    /// [`EpisodeRuntime`]: crate::episode::EpisodeRuntime
+    #[must_use]
+    pub fn deferred() -> Self {
+        let mut tracker = Self::from_envelope(EpisodeBudget::unlimited());
+        tracker.deferred_enforcement = true;
+        tracker
+    }
+
+    /// Returns `true` when budget enforcement is deferred to
+    /// [`crate::episode::EpisodeRuntime`].
+    #[must_use]
+    pub const fn is_deferred(&self) -> bool {
+        self.deferred_enforcement
     }
 
     /// Charges the given budget delta, consuming resources.
@@ -897,6 +939,12 @@ mod tests {
         let remaining = tracker.remaining();
         assert_eq!(remaining.tokens(), 0);
         assert!(remaining.is_unlimited());
+    }
+
+    #[test]
+    fn test_budget_tracker_deferred_marks_deferred_enforcement() {
+        let tracker = BudgetTracker::deferred();
+        assert!(tracker.is_deferred());
     }
 
     #[test]

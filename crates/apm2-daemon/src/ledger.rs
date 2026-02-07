@@ -25,9 +25,9 @@ use tracing::{info, warn};
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
-    LedgerEventError, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, SignedLedgerEvent,
-    WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry,
-    WorkRegistryError, WorkTransition,
+    LedgerEventError, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
+    STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
+    WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry, WorkRegistryError, WorkTransition,
 };
 
 /// Durable ledger event emitter backed by `SQLite`.
@@ -448,6 +448,83 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             event_type = %event_type,
             actor_id = %actor_id,
             "Persisted SessionEvent"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_stop_flags_mutated(
+        &self,
+        mutation: &StopFlagsMutation<'_>,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        let payload = serde_json::json!({
+            "event_type": "stop_flags_mutated",
+            "actor_id": mutation.actor_id,
+            "emergency_stop_previous": mutation.emergency_stop_previous,
+            "emergency_stop_current": mutation.emergency_stop_current,
+            "governance_stop_previous": mutation.governance_stop_previous,
+            "governance_stop_current": mutation.governance_stop_current,
+            "request_context": mutation.request_context,
+            "timestamp_ns": mutation.timestamp_ns,
+        });
+
+        let payload_json = payload.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes =
+            Vec::with_capacity(STOP_FLAGS_MUTATED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(STOP_FLAGS_MUTATED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "stop_flags_mutated".to_string(),
+            work_id: STOP_FLAGS_MUTATED_WORK_ID.to_string(),
+            actor_id: mutation.actor_id.to_string(),
+            payload: payload_bytes.clone(),
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns: mutation.timestamp_ns,
+        };
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns
+            ],
+        ).map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+
+        info!(
+            event_id = %event_id,
+            actor_id = %mutation.actor_id,
+            emergency_stop_previous = mutation.emergency_stop_previous,
+            emergency_stop_current = mutation.emergency_stop_current,
+            governance_stop_previous = mutation.governance_stop_previous,
+            governance_stop_current = mutation.governance_stop_current,
+            "Persisted StopFlagsMutated event"
         );
 
         Ok(signed_event)

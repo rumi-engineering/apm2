@@ -143,7 +143,7 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         // Credential add is idempotent by key but still mutates the
         // credential store, requiring receipts for accountability.
         // =================================================================
-        "hsi.credential.add" => Some(AUTH_IDEMPOTENT_RECEIPT_LOCAL),
+        "hsi.credential.add" | "hsi.stop.update_flags" => Some(AUTH_IDEMPOTENT_RECEIPT_LOCAL),
 
         // =================================================================
         // Advisory (read-only) endpoints
@@ -183,6 +183,7 @@ mod tests {
             "hsi.tool.request",
             "hsi.event.emit",
             "hsi.evidence.publish",
+            "hsi.stop.update_flags",
             "hsi.session.status",
             "hsi.changeset.publish",
         ];
@@ -225,6 +226,7 @@ mod tests {
             "hsi.credential.switch",
             "hsi.credential.login",
             "hsi.credential.add",
+            "hsi.stop.update_flags",
             "hsi.process.list",
             "hsi.process.status",
             "hsi.consensus.status",
@@ -282,6 +284,7 @@ mod tests {
             "hsi.credential.refresh",
             "hsi.credential.switch",
             "hsi.credential.login",
+            "hsi.stop.update_flags",
         ];
         for route in &side_effectful_routes {
             let sem = annotate_route(route).unwrap();
@@ -326,6 +329,7 @@ mod tests {
             "hsi.credential.refresh",
             "hsi.credential.switch",
             "hsi.credential.login",
+            "hsi.stop.update_flags",
         ];
         for route in &side_effectful_routes {
             let sem = annotate_route(route)

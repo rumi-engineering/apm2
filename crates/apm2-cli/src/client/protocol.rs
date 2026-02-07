@@ -501,6 +501,8 @@ impl OperatorClient {
             role: role.into(),
             lease_id: lease_id.map(String::from),
             workspace_root: workspace_root.to_string(),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let request_bytes = encode_spawn_episode_request(&request);
 
@@ -2691,6 +2693,8 @@ mod tests {
             role: WorkRole::Implementer.into(),
             lease_id: Some("lease-456".to_string()),
             workspace_root: "/tmp".to_string(),
+            max_episodes: None,
+            escalation_predicate: None,
         };
         let encoded = encode_spawn_episode_request(&request);
 

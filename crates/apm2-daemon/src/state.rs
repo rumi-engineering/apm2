@@ -39,18 +39,20 @@ use crate::episode::{
     new_shared_broker_with_cas,
 };
 use crate::gate::{GateOrchestrator, GateOrchestratorEvent, MergeExecutor, SessionTerminatedInfo};
-use crate::governance::GovernancePolicyResolver;
+use crate::governance::{
+    GovernanceFreshnessConfig, GovernanceFreshnessMonitor, GovernancePolicyResolver,
+};
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use crate::metrics::SharedMetricsRegistry;
-use crate::protocol::dispatch::PrivilegedDispatcher;
-use crate::protocol::messages::DecodeConfig;
+use crate::protocol::dispatch::{PolicyResolutionError, PolicyResolver, PrivilegedDispatcher};
+use crate::protocol::messages::{DecodeConfig, WorkRole};
 use crate::protocol::resource_governance::{SharedSubscriptionRegistry, SubscriptionRegistry};
 use crate::protocol::session_dispatch::{
     InMemoryManifestStore, ManifestStore, SessionDispatcher, V1ManifestStore,
 };
 use crate::protocol::session_token::TokenMinter;
-use crate::session::{SessionRegistry, SessionTelemetryStore};
+use crate::session::{SessionRegistry, SessionStopConditionsStore, SessionTelemetryStore};
 
 // ============================================================================
 // TCK-00343: Credential Store Service Name
@@ -64,6 +66,16 @@ use crate::session::{SessionRegistry, SessionTelemetryStore};
 /// (`apm2-receipt-signing`) and GitHub token service name
 /// (`apm2-github-tokens`) to avoid keyring entry collisions.
 const CREDENTIAL_STORE_SERVICE_NAME: &str = "apm2-credentials";
+
+#[cfg(not(test))]
+const GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS: u64 = 30_000;
+#[cfg(test)]
+const GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS: u64 = 25;
+
+#[cfg(not(test))]
+const GOVERNANCE_FRESHNESS_THRESHOLD_MS: u64 = 30_000;
+#[cfg(test)]
+const GOVERNANCE_FRESHNESS_THRESHOLD_MS: u64 = 120;
 
 // ============================================================================
 // TCK-00287: Fail-Closed Manifest Store (kept for potential future use)
@@ -155,6 +167,19 @@ pub struct DispatcherState {
     /// It verifies policy hash, executes squash merge via GitHub API,
     /// creates a signed `MergeReceipt`, and transitions work to Completed.
     merge_executor: Option<Arc<MergeExecutor>>,
+
+    /// Shared stop authority for runtime mutation (TCK-00351 MAJOR 2 FIX).
+    ///
+    /// Stored as `Arc` so operator/governance control-plane paths can
+    /// mutate stop flags at runtime (e.g., set emergency stop) and the
+    /// pre-actuation gate immediately sees the change.
+    stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
+
+    /// Governance freshness monitor wired to the shared stop authority.
+    ///
+    /// When present, explicit governance probe paths can toggle
+    /// `governance_uncertain` fail-closed behavior in pre-actuation.
+    governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
 }
 
 impl DispatcherState {
@@ -261,6 +286,8 @@ impl DispatcherState {
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
+            stop_authority: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -345,6 +372,8 @@ impl DispatcherState {
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
+            stop_authority: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -496,20 +525,50 @@ impl DispatcherState {
         // TCK-00384: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
+        // TCK-00351 v4: Create shared stop conditions store for per-session
+        // stop limits (max_episodes, escalation_predicate).
+        let stop_conditions_store = Arc::new(SessionStopConditionsStore::new());
+
+        // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
+        // with real StopAuthority and fail-closed budget enforcement.
+        //
+        // TCK-00351 MAJOR 2 FIX: Wire a deferred budget tracker sentinel.
+        // The gate evaluates budget availability but records
+        // `budget_checked=false` because enforcement is deferred to
+        // EpisodeRuntime.
+        let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+        let deferred_budget = Arc::new(crate::episode::budget_tracker::BudgetTracker::deferred());
+        let preactuation_gate = Arc::new(
+            crate::episode::preactuation::PreActuationGate::production_gate(
+                Arc::clone(&stop_authority),
+                Some(deferred_budget),
+            ),
+        );
+        let governance_freshness_monitor =
+            Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
+
         // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
         // registration
-        let privileged_dispatcher =
-            privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
+        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
+        let privileged_dispatcher = privileged_dispatcher
+            .with_telemetry_store(Arc::clone(&telemetry_store))
+            .with_stop_conditions_store(Arc::clone(&stop_conditions_store))
+            .with_stop_authority(Arc::clone(&stop_authority))
+            .with_governance_freshness_monitor(Arc::clone(&governance_freshness_monitor));
 
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
+        // TCK-00351: Wire pre-actuation gate, stop authority, and stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
                 .with_telemetry_store(telemetry_store)
+                .with_preactuation_gate(preactuation_gate)
+                .with_stop_authority(Arc::clone(&stop_authority))
+                .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store);
 
         Self {
@@ -517,6 +576,10 @@ impl DispatcherState {
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
+            // TCK-00351 MAJOR 2 FIX: Store shared stop authority for
+            // runtime mutation by operator/governance control plane.
+            stop_authority: Some(stop_authority),
+            governance_freshness_monitor: Some(governance_freshness_monitor),
         }
     }
 
@@ -717,14 +780,41 @@ impl DispatcherState {
         // TCK-00384: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
+        // TCK-00351 v4: Create shared stop conditions store for per-session
+        // stop limits (max_episodes, escalation_predicate).
+        let stop_conditions_store = Arc::new(SessionStopConditionsStore::new());
+
+        // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
+        // with real StopAuthority and fail-closed budget enforcement.
+        //
+        // TCK-00351 MAJOR 2 FIX: Wire a deferred budget tracker sentinel.
+        // The gate evaluates budget availability but records
+        // `budget_checked=false` because enforcement is deferred to
+        // EpisodeRuntime.
+        let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+        let deferred_budget = Arc::new(crate::episode::budget_tracker::BudgetTracker::deferred());
+        let preactuation_gate = Arc::new(
+            crate::episode::preactuation::PreActuationGate::production_gate(
+                Arc::clone(&stop_authority),
+                Some(deferred_budget),
+            ),
+        );
+        let governance_freshness_monitor =
+            Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
+
         // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
         // registration
-        let privileged_dispatcher =
-            privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
+        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
+        let privileged_dispatcher = privileged_dispatcher
+            .with_telemetry_store(Arc::clone(&telemetry_store))
+            .with_stop_conditions_store(Arc::clone(&stop_conditions_store))
+            .with_stop_authority(Arc::clone(&stop_authority))
+            .with_governance_freshness_monitor(Arc::clone(&governance_freshness_monitor));
 
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
+        // TCK-00351: Wire pre-actuation gate, stop authority, stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
@@ -736,6 +826,9 @@ impl DispatcherState {
                 .with_broker(broker)
                 .with_episode_runtime(episode_runtime)
                 .with_telemetry_store(telemetry_store)
+                .with_preactuation_gate(preactuation_gate)
+                .with_stop_authority(Arc::clone(&stop_authority))
+                .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store);
 
         Ok(Self {
@@ -743,7 +836,98 @@ impl DispatcherState {
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
+            // TCK-00351 MAJOR 2 FIX: Store shared stop authority for
+            // runtime mutation by operator/governance control plane.
+            stop_authority: Some(stop_authority),
+            governance_freshness_monitor: Some(governance_freshness_monitor),
         })
+    }
+
+    /// Wires governance freshness monitoring to a shared stop authority.
+    fn wire_governance_freshness_monitor(
+        stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Arc<GovernanceFreshnessMonitor> {
+        // Phase-1 resolver is transitional-local until authenticated governance
+        // transport is implemented (TCK-00364).
+        let transitional_resolver = true;
+        let config = GovernanceFreshnessConfig {
+            poll_interval_ms: GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS,
+            freshness_threshold_ms: GOVERNANCE_FRESHNESS_THRESHOLD_MS,
+        };
+        let monitor = Arc::new(GovernanceFreshnessMonitor::new(
+            stop_authority,
+            config.clone(),
+            transitional_resolver,
+        ));
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let monitor_for_task = Arc::clone(&monitor);
+            let poll_interval_ms = config.poll_interval_ms.max(1);
+            let transitional_resolver_for_task = transitional_resolver;
+            std::mem::drop(handle.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+                    // Active governance health probe:
+                    // resolve policy through the governance resolver on each
+                    // poll cycle, then evaluate freshness using the updated
+                    // watermark.
+                    Self::run_governance_health_probe(
+                        &monitor_for_task,
+                        transitional_resolver_for_task,
+                    );
+                    monitor_for_task.check_freshness();
+                }
+            }));
+        }
+
+        monitor
+    }
+
+    /// Executes a lightweight active governance health probe.
+    ///
+    /// This probe records monitor state using strict classification:
+    /// - `record_success()` on successful governance transport responses
+    /// - `record_failure()` only for governance transport/service failures
+    /// - local resolver contract errors are ignored here (freshness falls back
+    ///   to elapsed-time checks and existing watermark state)
+    fn run_governance_health_probe(
+        monitor: &GovernanceFreshnessMonitor,
+        transitional_resolver: bool,
+    ) {
+        if transitional_resolver {
+            static TRANSITIONAL_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            TRANSITIONAL_WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "Governance freshness probe running in transitional local resolver mode; \
+                     resolver success is not authoritative freshness evidence (WVR-0001 path)."
+                );
+            });
+            monitor.record_failure();
+            return;
+        }
+
+        let resolver = GovernancePolicyResolver::new();
+        let probe_result = resolver.resolve_for_claim(
+            "governance-health-probe",
+            WorkRole::Coordinator,
+            "governance-freshness-monitor",
+        );
+
+        match probe_result {
+            Ok(_) => monitor.record_success(),
+            Err(PolicyResolutionError::GovernanceFailed { .. }) => {
+                // This qualifies as a governance probe failure because the
+                // resolver reported a governance-side service failure.
+                monitor.record_failure();
+            },
+            Err(
+                PolicyResolutionError::NotFound { .. }
+                | PolicyResolutionError::InvalidCredential { .. },
+            ) => {
+                // Local resolver contract/input errors are not governance
+                // transport failures and must not force a failure sample.
+            },
+        }
     }
 
     /// Sets the daemon state for process management (TCK-00342).
@@ -857,6 +1041,52 @@ impl DispatcherState {
     #[must_use]
     pub fn event_emitter(&self) -> &Arc<dyn crate::protocol::dispatch::LedgerEventEmitter> {
         self.privileged_dispatcher.event_emitter()
+    }
+
+    /// Returns the shared stop authority for runtime mutation (TCK-00351
+    /// MAJOR 2 FIX).
+    ///
+    /// Operator/governance control-plane paths use this to flip stop flags
+    /// at runtime.  Changes are immediately visible to the pre-actuation
+    /// gate because the `Arc` is shared.
+    ///
+    /// Returns `None` for non-production dispatchers that were created
+    /// without a pre-actuation gate.
+    #[must_use]
+    pub const fn stop_authority(
+        &self,
+    ) -> Option<&Arc<crate::episode::preactuation::StopAuthority>> {
+        self.stop_authority.as_ref()
+    }
+
+    /// Mutates runtime stop flags on the shared
+    /// [`StopAuthority`](crate::episode::preactuation::StopAuthority).
+    ///
+    /// Returns `true` when stop authority is wired and the update was applied,
+    /// `false` when no shared stop authority exists on this dispatcher state.
+    pub fn set_stop_flags(
+        &self,
+        emergency_stop_active: Option<bool>,
+        governance_stop_active: Option<bool>,
+    ) -> bool {
+        let Some(authority) = self.stop_authority.as_ref() else {
+            return false;
+        };
+
+        if let Some(active) = emergency_stop_active {
+            authority.set_emergency_stop(active);
+        }
+        if let Some(active) = governance_stop_active {
+            authority.set_governance_stop(active);
+        }
+        true
+    }
+
+    /// Returns the governance freshness monitor when wired in production
+    /// constructors.
+    #[must_use]
+    pub const fn governance_freshness_monitor(&self) -> Option<&Arc<GovernanceFreshnessMonitor>> {
+        self.governance_freshness_monitor.as_ref()
     }
 }
 
@@ -1117,5 +1347,434 @@ impl DaemonState {
     /// Iterate over all runners mutably.
     pub fn runners_mut(&mut self) -> impl Iterator<Item = (&RunnerKey, &mut ProcessRunner)> {
         self.runners.iter_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::episode::envelope::StopConditions;
+    use crate::episode::preactuation::{
+        DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS, PreActuationDenial, PreActuationGate,
+    };
+    use crate::protocol::ConnectionContext;
+    use crate::protocol::credentials::PeerCredentials;
+    use crate::protocol::dispatch::{
+        PrivilegedResponse, encode_claim_work_request, encode_spawn_episode_request,
+        encode_update_stop_flags_request,
+    };
+    use crate::protocol::messages::{
+        ClaimWorkRequest, RequestToolRequest, SpawnEpisodeRequest, UpdateStopFlagsRequest, WorkRole,
+    };
+    use crate::protocol::session_dispatch::{SessionResponse, encode_request_tool_request};
+
+    #[test]
+    fn production_wiring_transitional_governance_uncertain_allows_gate() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+
+        let monitor = state
+            .governance_freshness_monitor()
+            .expect("production constructor must wire governance freshness monitor");
+        let authority = Arc::clone(
+            state
+                .stop_authority()
+                .expect("production constructor must wire stop authority"),
+        );
+
+        assert!(
+            monitor.transitional_resolver(),
+            "production monitor should run in transitional resolver mode"
+        );
+        assert!(
+            !monitor.has_last_success_for_test(),
+            "transitional production monitor should start with no success watermark"
+        );
+        assert!(
+            authority.governance_uncertain(),
+            "transitional production monitor should remain uncertain"
+        );
+
+        // Transitional uncertainty uses the WVR-0001 carve-out and remains
+        // gate-allowing while the waiver is active.
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+        let receipt = gate
+            .check(
+                &StopConditions::default(),
+                0,
+                false,
+                false,
+                DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
+                1_000,
+            )
+            .expect("transitional uncertainty should allow under active waiver");
+        assert!(receipt.stop_checked);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_wiring_periodic_probe_keeps_governance_uncertainty_in_transitional_mode() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+
+        let monitor = Arc::clone(
+            state
+                .governance_freshness_monitor()
+                .expect("production constructor must wire governance freshness monitor"),
+        );
+        let authority = Arc::clone(
+            state
+                .stop_authority()
+                .expect("production constructor must wire stop authority"),
+        );
+
+        monitor.record_failure();
+        assert!(
+            authority.governance_uncertain(),
+            "explicit governance failure should set uncertainty"
+        );
+
+        // Periodic transitional probes must not establish freshness evidence.
+        let wait_for = std::time::Duration::from_millis(
+            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(3),
+        );
+        tokio::time::sleep(wait_for).await;
+
+        assert!(
+            authority.governance_uncertain(),
+            "periodic transitional probe must keep governance uncertainty"
+        );
+        assert!(
+            !monitor.has_last_success_for_test(),
+            "periodic transitional probe must not produce a success watermark"
+        );
+    }
+
+    #[test]
+    fn production_wiring_claim_work_success_does_not_clear_transitional_uncertainty() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+
+        let monitor = Arc::clone(
+            state
+                .governance_freshness_monitor()
+                .expect("production constructor must wire governance freshness monitor"),
+        );
+        let authority = Arc::clone(
+            state
+                .stop_authority()
+                .expect("production constructor must wire stop authority"),
+        );
+
+        // Force uncertain state, then prove ClaimWork success refreshes health.
+        monitor.record_failure();
+        assert!(
+            authority.governance_uncertain(),
+            "failure sample should set governance uncertainty"
+        );
+
+        let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        }));
+        let claim_request = ClaimWorkRequest {
+            actor_id: "monitor-refresh-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = state
+            .privileged_dispatcher()
+            .dispatch(&claim_frame, &ctx)
+            .expect("ClaimWork dispatch should succeed");
+        assert!(
+            matches!(claim_response, PrivilegedResponse::ClaimWork(_)),
+            "ClaimWork should complete successfully to refresh governance health"
+        );
+
+        assert!(
+            authority.governance_uncertain(),
+            "transitional ClaimWork success must not clear governance uncertainty"
+        );
+        assert!(
+            !monitor.has_last_success_for_test(),
+            "transitional ClaimWork success must not produce freshness evidence"
+        );
+    }
+
+    #[test]
+    fn non_transitional_governance_failure_denies_after_deadline() {
+        let authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+        let monitor = GovernanceFreshnessMonitor::new(
+            Arc::clone(&authority),
+            GovernanceFreshnessConfig {
+                poll_interval_ms: 1,
+                freshness_threshold_ms: 1,
+            },
+            false,
+        );
+        monitor.record_failure();
+
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+        let denial = gate
+            .check(
+                &StopConditions::default(),
+                0,
+                false,
+                false,
+                DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
+                1_000,
+            )
+            .expect_err("non-transitional governance failure should deny");
+        assert!(matches!(denial, PreActuationDenial::StopUncertain));
+    }
+
+    #[test]
+    fn spawn_default_max_episodes_allows_first_request_tool_gate() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
+        SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
+        SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
+        let conn = Arc::new(Mutex::new(conn));
+        let cas_root = tempfile::tempdir().expect("temp CAS root should be created");
+        let cas_dir = cas_root.path().join("cas");
+        std::fs::create_dir(&cas_dir).expect("CAS dir should be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut perms = std::fs::metadata(&cas_dir)
+                .expect("CAS dir metadata should exist")
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&cas_dir, perms).expect("CAS dir permissions should be set");
+        }
+        let state = DispatcherState::with_persistence_and_cas(
+            session_registry,
+            None,
+            Arc::clone(&conn),
+            &cas_dir,
+        )
+        .expect("state with persistence+cas should be created");
+
+        let creds = PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        };
+        let privileged_ctx = ConnectionContext::privileged_session_open(Some(creds.clone()));
+
+        let claim_request = ClaimWorkRequest {
+            actor_id: "state-test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = state
+            .privileged_dispatcher()
+            .dispatch(&claim_frame, &privileged_ctx)
+            .expect("ClaimWork dispatch should succeed");
+        let (work_id, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+            other => panic!("expected ClaimWork response, got {other:?}"),
+        };
+
+        let workspace_root = std::env::current_dir()
+            .expect("cwd should exist")
+            .to_string_lossy()
+            .into_owned();
+        let spawn_request = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::Implementer.into(),
+            lease_id: Some(lease_id),
+            workspace_root,
+            max_episodes: None,
+            escalation_predicate: None,
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_request);
+        let spawn_response = state
+            .privileged_dispatcher()
+            .dispatch(&spawn_frame, &privileged_ctx)
+            .expect("SpawnEpisode dispatch should succeed");
+        let (session_id, session_token) = match spawn_response {
+            PrivilegedResponse::SpawnEpisode(resp) => (resp.session_id, resp.session_token),
+            other => panic!("expected SpawnEpisode response, got {other:?}"),
+        };
+
+        let session_ctx = ConnectionContext::session_open(Some(creds), Some(session_id));
+        let request_tool = RequestToolRequest {
+            session_token,
+            tool_id: "network".to_string(),
+            // Denied before broker dispatch by URL-userinfo guard in V1 scope
+            // enforcement. This keeps the test sync-only while still proving
+            // the pre-actuation gate admitted the first request.
+            arguments: br#"{"url":"https://user:pass@example.com/resource"}"#.to_vec(),
+            dedupe_key: "tck-00351-first-request".to_string(),
+        };
+        let request_frame = encode_request_tool_request(&request_tool);
+        let request_response = state
+            .session_dispatcher()
+            .dispatch(&request_frame, &session_ctx)
+            .expect("RequestTool dispatch should succeed");
+
+        match request_response {
+            SessionResponse::Error(err) => {
+                assert!(
+                    err.message.contains("userinfo"),
+                    "first RequestTool should pass pre-actuation gate; got: {}",
+                    err.message
+                );
+                assert!(
+                    !err.message.contains("max_episodes_reached"),
+                    "default max_episodes must not deny first RequestTool: {}",
+                    err.message
+                );
+            },
+            other => panic!("expected SessionResponse::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn production_constructor_binds_deferred_budget_receipt_fields() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+        let gate = state
+            .session_dispatcher()
+            .preactuation_gate_for_test()
+            .expect("production constructor must wire pre-actuation gate");
+
+        let receipt = gate
+            .check(&StopConditions::default(), 0, false, false, 0, 1_000)
+            .expect("production pre-actuation gate should produce receipt");
+
+        assert!(receipt.stop_checked, "stop proof must be bound in receipt");
+        assert!(
+            !receipt.budget_checked,
+            "production constructor wires deferred pre-actuation budget enforcement"
+        );
+        assert!(
+            receipt.budget_enforcement_deferred,
+            "deferred budget enforcement marker must be bound in receipt"
+        );
+    }
+
+    #[test]
+    fn update_stop_flags_emergency_stop_denies_subsequent_request_tool() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
+        SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
+        SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
+        let conn = Arc::new(Mutex::new(conn));
+        let cas_root = tempfile::tempdir().expect("temp CAS root should be created");
+        let cas_dir = cas_root.path().join("cas");
+        std::fs::create_dir(&cas_dir).expect("CAS dir should be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut perms = std::fs::metadata(&cas_dir)
+                .expect("CAS dir metadata should exist")
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&cas_dir, perms).expect("CAS dir permissions should be set");
+        }
+
+        let state = DispatcherState::with_persistence_and_cas(
+            session_registry,
+            None,
+            Arc::clone(&conn),
+            &cas_dir,
+        )
+        .expect("state with persistence+cas should be created");
+
+        let creds = PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        };
+        let privileged_ctx = ConnectionContext::privileged_session_open(Some(creds.clone()));
+
+        let claim_request = ClaimWorkRequest {
+            actor_id: "state-stop-flags-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = state
+            .privileged_dispatcher()
+            .dispatch(&claim_frame, &privileged_ctx)
+            .expect("ClaimWork dispatch should succeed");
+        let (work_id, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+            other => panic!("expected ClaimWork response, got {other:?}"),
+        };
+
+        let workspace_root = std::env::current_dir()
+            .expect("cwd should exist")
+            .to_string_lossy()
+            .into_owned();
+        let spawn_request = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::Implementer.into(),
+            lease_id: Some(lease_id),
+            workspace_root,
+            max_episodes: None,
+            escalation_predicate: None,
+        };
+        let spawn_frame = encode_spawn_episode_request(&spawn_request);
+        let spawn_response = state
+            .privileged_dispatcher()
+            .dispatch(&spawn_frame, &privileged_ctx)
+            .expect("SpawnEpisode dispatch should succeed");
+        let (session_id, session_token) = match spawn_response {
+            PrivilegedResponse::SpawnEpisode(resp) => (resp.session_id, resp.session_token),
+            other => panic!("expected SpawnEpisode response, got {other:?}"),
+        };
+
+        let update_flags_request = UpdateStopFlagsRequest {
+            emergency_stop_active: Some(true),
+            governance_stop_active: None,
+        };
+        let update_frame = encode_update_stop_flags_request(&update_flags_request);
+        let update_response = state
+            .privileged_dispatcher()
+            .dispatch(&update_frame, &privileged_ctx)
+            .expect("UpdateStopFlags dispatch should succeed");
+        match update_response {
+            PrivilegedResponse::UpdateStopFlags(resp) => {
+                assert!(
+                    resp.emergency_stop_active,
+                    "emergency stop should be active after update"
+                );
+            },
+            other => panic!("expected UpdateStopFlags response, got {other:?}"),
+        }
+
+        let session_ctx = ConnectionContext::session_open(Some(creds), Some(session_id));
+        let request_tool = RequestToolRequest {
+            session_token,
+            tool_id: "network".to_string(),
+            arguments: br#"{"url":"https://example.com/resource"}"#.to_vec(),
+            dedupe_key: "tck-00351-stop-active".to_string(),
+        };
+        let request_frame = encode_request_tool_request(&request_tool);
+        let request_response = state
+            .session_dispatcher()
+            .dispatch(&request_frame, &session_ctx)
+            .expect("RequestTool dispatch should succeed");
+
+        match request_response {
+            SessionResponse::Error(err) => {
+                assert!(
+                    err.message.contains("emergency_stop"),
+                    "expected emergency stop denial, got: {}",
+                    err.message
+                );
+            },
+            other => panic!("expected SessionResponse::Error, got {other:?}"),
+        }
     }
 }

@@ -324,6 +324,8 @@ impl_bounded_decode_simple!(
     IssueCapabilityResponse,
     ShutdownRequest,
     ShutdownResponse,
+    UpdateStopFlagsRequest,
+    UpdateStopFlagsResponse,
     PrivilegedError,
     // CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, TCK-00252)
     RequestToolRequest,

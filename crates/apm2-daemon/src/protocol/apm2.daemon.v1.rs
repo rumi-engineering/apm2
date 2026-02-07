@@ -331,6 +331,17 @@ pub struct SpawnEpisodeRequest {
     /// REQUIRED: Episodes cannot be spawned without a workspace root.
     #[prost(string, tag = "4")]
     pub workspace_root: ::prost::alloc::string::String,
+    /// TCK-00351 BLOCKER 1: Authoritative stop conditions from the episode
+    /// envelope.  When present, these override StopConditions::default() so
+    /// that max_episodes and escalation_predicate are actually enforced.
+    /// When absent, the handler falls back to fail-closed defaults
+    /// (max_episodes=1, empty predicates).
+    #[prost(uint64, optional, tag = "5")]
+    pub max_episodes: ::core::option::Option<u64>,
+    /// Escalation predicate from the episode envelope (free-form v1).
+    /// Non-empty string triggers EscalationTriggered stop denial.
+    #[prost(string, optional, tag = "6")]
+    pub escalation_predicate: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SpawnEpisodeResponse {
@@ -402,6 +413,26 @@ pub struct ShutdownResponse {
     /// Acknowledgment message.
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
+}
+/// IPC-PRIV-018: UpdateStopFlags
+/// Mutate runtime emergency/governance stop flags used by pre-actuation gating.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct UpdateStopFlagsRequest {
+    /// Optional emergency stop state update.
+    #[prost(bool, optional, tag = "1")]
+    pub emergency_stop_active: ::core::option::Option<bool>,
+    /// Optional governance stop state update.
+    #[prost(bool, optional, tag = "2")]
+    pub governance_stop_active: ::core::option::Option<bool>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct UpdateStopFlagsResponse {
+    /// Effective emergency stop state after applying updates.
+    #[prost(bool, tag = "1")]
+    pub emergency_stop_active: bool,
+    /// Effective governance stop state after applying updates.
+    #[prost(bool, tag = "2")]
+    pub governance_stop_active: bool,
 }
 /// IPC-PRIV-005: WorkStatus (TCK-00344)
 /// Query the status of a work item from the work queue.
@@ -684,6 +715,26 @@ pub struct RequestToolResponse {
     /// TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
     #[prost(bytes = "vec", optional, tag = "6")]
     pub inline_result: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// TCK-00351: Pre-actuation stop check proof.
+    /// True indicates stop conditions were evaluated and cleared before actuation.
+    /// False or absent indicates stop check was not performed (fail-closed: deny).
+    #[prost(bool, tag = "7")]
+    pub stop_checked: bool,
+    /// TCK-00351: Pre-actuation budget check proof.
+    /// True indicates budget was enforced at pre-actuation.
+    /// False is only valid when `budget_enforcement_deferred=true`.
+    /// Replayers MUST reject traces where both `budget_checked=false` and
+    /// `budget_enforcement_deferred=false`.
+    #[prost(bool, tag = "8")]
+    pub budget_checked: bool,
+    /// TCK-00351: Explicitly marks budget enforcement deferred beyond
+    /// pre-actuation (e.g., to EpisodeRuntime).
+    #[prost(bool, tag = "9")]
+    pub budget_enforcement_deferred: bool,
+    /// TCK-00351: HTF timestamp (nanoseconds) when pre-actuation checks completed.
+    /// Provides replay-verifiable ordering proof that checks preceded actuation.
+    #[prost(uint64, tag = "10")]
+    pub preactuation_timestamp_ns: u64,
 }
 /// IPC-SESS-002: EmitEvent
 /// Emit a signed event to the ledger.

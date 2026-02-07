@@ -289,6 +289,225 @@ fn transitional_risk_tier(role: WorkRole) -> u8 {
     tier
 }
 
+// =============================================================================
+// Governance Freshness Monitor (TCK-00351 MAJOR 1)
+// =============================================================================
+
+/// Configuration for the governance freshness monitor.
+///
+/// The monitor checks whether the governance service is reachable and
+/// responsive. When the service is unreachable or its response is stale
+/// beyond `freshness_threshold`, the monitor sets the `governance_uncertain`
+/// flag on the shared [`StopAuthority`], causing the pre-actuation gate to
+/// enter deadline-based fail-closed logic.
+///
+/// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
+///
+/// # TCK-00351 MAJOR 1
+///
+/// This struct wires the `set_governance_uncertain(...)` control surface
+/// into the production path.  Prior to this fix, the flag was only ever
+/// set in tests.
+#[derive(Debug, Clone)]
+pub struct GovernanceFreshnessConfig {
+    /// Probe cadence hint (milliseconds) for monitor polling loops.
+    pub poll_interval_ms: u64,
+    /// Maximum age of the last successful governance response before the
+    /// service is considered stale (milliseconds).
+    pub freshness_threshold_ms: u64,
+}
+
+impl Default for GovernanceFreshnessConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: 5_000,
+            freshness_threshold_ms: 30_000,
+        }
+    }
+}
+
+/// Governance freshness monitor that probes governance service health and
+/// updates the [`StopAuthority`] uncertainty flag.
+///
+/// # Production Wiring (TCK-00351 MAJOR 1)
+///
+/// Instantiate a monitor, invoke [`record_success`](Self::record_success) /
+/// [`record_failure`](Self::record_failure) from governance probe paths,
+/// and optionally run [`check_freshness`](Self::check_freshness) from an
+/// explicit scheduler. Share the same `StopAuthority` with the
+/// `PreActuationGate`.
+///
+/// ```rust,ignore
+/// let authority = Arc::new(StopAuthority::new());
+/// let monitor = GovernanceFreshnessMonitor::new(
+///     Arc::clone(&authority),
+///     GovernanceFreshnessConfig::default(),
+///     false, // authenticated governance transport present
+/// );
+/// // In a background loop:
+/// monitor.check_freshness();
+/// ```
+///
+/// # Production Wiring
+///
+/// `state.rs` production constructors instantiate this monitor and share the
+/// same `StopAuthority` with `PreActuationGate`, wire governance probe
+/// success/failure call sites, and run periodic `check_freshness()` in a
+/// background task.
+///
+/// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
+pub struct GovernanceFreshnessMonitor {
+    /// Shared stop authority whose `governance_uncertain` flag is mutated.
+    stop_authority: std::sync::Arc<crate::episode::preactuation::StopAuthority>,
+    /// Monitor configuration.
+    config: GovernanceFreshnessConfig,
+    /// Most recent successful governance probe timestamp.
+    ///
+    /// `Instant` is monotonic and not affected by wall-clock rollback.
+    last_success: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Whether the active resolver path is transitional-local.
+    transitional_resolver: bool,
+}
+
+impl GovernanceFreshnessMonitor {
+    /// Creates a new monitor with the given configuration.
+    #[must_use]
+    pub fn new(
+        stop_authority: std::sync::Arc<crate::episode::preactuation::StopAuthority>,
+        config: GovernanceFreshnessConfig,
+        transitional_resolver: bool,
+    ) -> Self {
+        stop_authority.set_governance_transitional_resolver(transitional_resolver);
+        if transitional_resolver {
+            stop_authority.set_governance_uncertain(true);
+        }
+        Self {
+            stop_authority,
+            config,
+            last_success: std::sync::Arc::new(std::sync::Mutex::new(if transitional_resolver {
+                None
+            } else {
+                Some(std::time::Instant::now())
+            })),
+            transitional_resolver,
+        }
+    }
+
+    /// Records a successful governance probe.
+    ///
+    /// Call this from any path that confirms the governance service is
+    /// healthy (e.g., after a successful policy resolution response).
+    pub fn record_success(&self) {
+        if self.transitional_resolver {
+            warn!(
+                "Governance freshness success observed under transitional local resolver; \
+                 not treated as freshness evidence"
+            );
+            self.stop_authority.set_governance_uncertain(true);
+            return;
+        }
+
+        *self
+            .last_success
+            .lock()
+            .expect("governance monitor lock poisoned") = Some(std::time::Instant::now());
+        self.stop_authority.set_governance_uncertain(false);
+    }
+
+    /// Records a governance probe failure.
+    ///
+    /// Call this when the governance service is unreachable or returns an
+    /// error.  The uncertainty flag is set immediately; the deadline-based
+    /// denial in the pre-actuation gate will activate once the configured
+    /// threshold elapses.
+    pub fn record_failure(&self) {
+        // Failure invalidates the freshness watermark until a new explicit
+        // success is recorded.
+        *self
+            .last_success
+            .lock()
+            .expect("governance monitor lock poisoned") = None;
+        self.stop_authority.set_governance_uncertain(true);
+    }
+
+    /// Checks freshness based on the last success timestamp and updates
+    /// the `governance_uncertain` flag accordingly.
+    ///
+    /// Returns `true` if governance is considered fresh, `false` if stale.
+    pub fn check_freshness(&self) -> bool {
+        if self.transitional_resolver {
+            self.stop_authority.set_governance_uncertain(true);
+            return false;
+        }
+
+        let last_success = *self
+            .last_success
+            .lock()
+            .expect("governance monitor lock poisoned");
+        let Some(last_success) = last_success else {
+            self.stop_authority.set_governance_uncertain(true);
+            return false;
+        };
+
+        if last_success.elapsed().as_millis() > u128::from(self.config.freshness_threshold_ms) {
+            self.stop_authority.set_governance_uncertain(true);
+            return false;
+        }
+
+        self.stop_authority.set_governance_uncertain(false);
+        true
+    }
+
+    /// Returns the configured freshness threshold in milliseconds.
+    #[must_use]
+    pub const fn freshness_threshold_ms(&self) -> u64 {
+        self.config.freshness_threshold_ms
+    }
+
+    /// Returns whether monitor freshness evidence is currently transitional.
+    #[must_use]
+    pub const fn transitional_resolver(&self) -> bool {
+        self.transitional_resolver
+    }
+
+    /// Clears the last-success sample (test helper).
+    #[cfg(test)]
+    pub fn clear_last_success_for_test(&self) {
+        *self
+            .last_success
+            .lock()
+            .expect("governance monitor lock poisoned") = None;
+    }
+
+    /// Returns whether a last-success sample is present (test helper).
+    #[cfg(test)]
+    #[must_use]
+    pub fn has_last_success_for_test(&self) -> bool {
+        self.last_success
+            .lock()
+            .expect("governance monitor lock poisoned")
+            .is_some()
+    }
+}
+
+impl std::fmt::Debug for GovernanceFreshnessMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GovernanceFreshnessMonitor")
+            .field("config", &self.config)
+            .field("stop_authority", &"<StopAuthority>")
+            .field(
+                "last_success_is_some",
+                &self
+                    .last_success
+                    .lock()
+                    .expect("governance monitor lock poisoned")
+                    .is_some(),
+            )
+            .field("transitional_resolver", &self.transitional_resolver)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

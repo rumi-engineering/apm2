@@ -89,6 +89,9 @@ use crate::episode::capability::StubManifestLoader;
 use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
+use crate::episode::preactuation::{
+    PreActuationReceipt, ReplayEntry, ReplayEntryKind, ReplayTimestamp, ReplayVerifier,
+};
 use crate::episode::registry::TerminationReason;
 use crate::episode::{CapabilityManifest, EpisodeId, EpisodeRuntime, SharedToolBroker, ToolClass};
 use crate::gate::{GateOrchestrator, SessionTerminatedInfo};
@@ -687,6 +690,30 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// are persisted to the ledger through the session dispatcher's
     /// `ledger` emitter.
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
+    /// Pre-actuation gate for stop/budget checks (TCK-00351).
+    ///
+    /// When set, every `RequestTool` invocation must pass through this gate
+    /// before reaching the broker. The gate checks stop conditions and
+    /// budget availability, returning a receipt that is embedded in the
+    /// tool response.
+    preactuation_gate: Option<Arc<crate::episode::preactuation::PreActuationGate>>,
+    /// Authoritative stop state for the daemon runtime (TCK-00351).
+    ///
+    /// TCK-00351 BLOCKER 1 FIX: This provides the runtime stop flags
+    /// (emergency stop, governance stop) that the pre-actuation gate reads.
+    /// When set, the gate ignores hardcoded false values and reads from
+    /// this authority.
+    stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
+    /// Per-session stop conditions store (TCK-00351 v3).
+    ///
+    /// TCK-00351 BLOCKER 1 v3 FIX: The pre-actuation gate was called with
+    /// `StopConditions::default()` and `current_episode_count=0`, meaning
+    /// `max_episodes` and `escalation_predicate` were never actually
+    /// checked.  This store holds real stop conditions per session, loaded
+    /// from the episode envelope at session spawn time.  The gate reads
+    /// from this store and passes real `current_episode_count` from the
+    /// session telemetry.
+    stop_conditions_store: Option<Arc<crate::session::SessionStopConditionsStore>>,
     /// Shared V1 manifest store for broker scope enforcement
     /// (TCK-00352 Security Review MAJOR 2).
     ///
@@ -727,6 +754,9 @@ impl SessionDispatcher<InMemoryManifestStore> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            preactuation_gate: None,
+            stop_authority: None,
+            stop_conditions_store: None,
             v1_manifest_store: None,
         }
     }
@@ -748,6 +778,9 @@ impl SessionDispatcher<InMemoryManifestStore> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            preactuation_gate: None,
+            stop_authority: None,
+            stop_conditions_store: None,
             v1_manifest_store: None,
         }
     }
@@ -774,6 +807,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            preactuation_gate: None,
+            stop_authority: None,
+            stop_conditions_store: None,
             v1_manifest_store: None,
         }
     }
@@ -800,6 +836,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            preactuation_gate: None,
+            stop_authority: None,
+            stop_conditions_store: None,
             v1_manifest_store: None,
         }
     }
@@ -842,6 +881,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            preactuation_gate: None,
+            stop_authority: None,
+            stop_conditions_store: None,
             v1_manifest_store: None,
         }
     }
@@ -942,6 +984,60 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// the orchestrator after the session dispatcher has been built.
     pub fn set_gate_orchestrator(&mut self, orchestrator: Arc<GateOrchestrator>) {
         self.gate_orchestrator = Some(orchestrator);
+    }
+
+    /// Sets the pre-actuation gate for stop/budget checks (TCK-00351).
+    ///
+    /// When set, every `RequestTool` invocation must pass through this gate
+    /// before reaching the broker.  The gate enforces fail-closed semantics:
+    /// - Active stop condition -> deny
+    /// - Budget exhausted -> deny
+    /// - Stop uncertainty past deadline -> deny
+    #[must_use]
+    pub fn with_preactuation_gate(
+        mut self,
+        gate: Arc<crate::episode::preactuation::PreActuationGate>,
+    ) -> Self {
+        self.preactuation_gate = Some(gate);
+        self
+    }
+
+    /// Returns the configured pre-actuation gate (tests only).
+    #[cfg(test)]
+    pub const fn preactuation_gate_for_test(
+        &self,
+    ) -> Option<&Arc<crate::episode::preactuation::PreActuationGate>> {
+        self.preactuation_gate.as_ref()
+    }
+
+    /// Sets the stop authority for authoritative stop-state reads
+    /// (TCK-00351).
+    ///
+    /// TCK-00351 BLOCKER 1 FIX: When set, the pre-actuation gate reads
+    /// emergency and governance stop flags from this authority instead
+    /// of using hardcoded `false`.
+    #[must_use]
+    pub fn with_stop_authority(
+        mut self,
+        authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Self {
+        self.stop_authority = Some(authority);
+        self
+    }
+
+    /// Sets the per-session stop conditions store (TCK-00351 v3).
+    ///
+    /// TCK-00351 BLOCKER 1 v3 FIX: When set, the pre-actuation gate
+    /// reads real stop conditions from this store instead of using
+    /// `StopConditions::default()`.  Conditions are registered at
+    /// session spawn time from the episode envelope.
+    #[must_use]
+    pub fn with_stop_conditions_store(
+        mut self,
+        store: Arc<crate::session::SessionStopConditionsStore>,
+    ) -> Self {
+        self.stop_conditions_store = Some(store);
+        self
     }
 
     /// Sets the shared V1 manifest store for TCK-00352 scope enforcement.
@@ -1332,6 +1428,131 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         };
 
+        let broker = self.broker.as_ref();
+
+        // TCK-00351: Pre-actuation stop/budget gate.
+        // This check MUST precede broker dispatch.  If the gate denies,
+        // we return immediately without reaching the broker (fail-closed).
+        //
+        // TCK-00351 BLOCKER 2 v2 FIX: When broker/runtime are configured
+        // the pre-actuation gate is MANDATORY.  If absent, hard-deny the
+        // request instead of silently setting proof fields to false and
+        // allowing execution to proceed.
+        //
+        // TCK-00351 BLOCKER 1 FIX: Read real stop state from stop_authority
+        // instead of hardcoded false.
+        // TCK-00351 MAJOR 1 FIX: Store the receipt and propagate its fields
+        // into the response (stop_checked, budget_checked, timestamp_ns).
+        let preactuation_receipt = if broker.is_some() {
+            if let Some(ref gate) = self.preactuation_gate {
+                // Get monotonic timestamp for the receipt.
+                let precheck_ts = self.get_htf_timestamp()?;
+
+                // TCK-00351 BLOCKER 1 FIX: Use real stop conditions.
+                // Read stop flags from the authoritative StopAuthority (set by
+                // operator/governance) instead of hardcoded false.
+                // No stop authority configured; defaults to no stops.
+                // The gate itself may also have a StopAuthority wired in
+                // via with_stop_authority(), providing defense in depth.
+                let (emergency_stop, governance_stop) =
+                    self.stop_authority
+                        .as_ref()
+                        .map_or((false, false), |authority| {
+                            (
+                                authority.emergency_stop_active(),
+                                authority.governance_stop_active(),
+                            )
+                        });
+
+                // TCK-00351 BLOCKER 1 v3 FIX: Load real stop conditions from the
+                // per-session store.  If no store is wired or the session has no
+                // conditions registered, fall back to fail-closed defaults
+                // (max_episodes=1) rather than StopConditions::default() which
+                // is permissive (max_episodes=0 = unlimited).  This ensures
+                // sessions without explicit limits are constrained rather than
+                // unbounded.
+                let conditions = self
+                    .stop_conditions_store
+                    .as_ref()
+                    .and_then(|store| store.get(&token.session_id))
+                    .unwrap_or_else(|| crate::episode::envelope::StopConditions::max_episodes(1));
+
+                // TCK-00351 MAJOR v3 FIX: Hard-deny when telemetry is missing for
+                // an active session.  An active session MUST have telemetry
+                // registered; missing telemetry indicates a configuration bug and
+                // continuing with elapsed_ms=0 would mask the stop-uncertainty
+                // deadline (fail-closed on uncertainty).
+                let telemetry = self
+                    .telemetry_store
+                    .as_ref()
+                    .and_then(|store| store.get(&token.session_id));
+                let (elapsed_ms, current_episode_count) = if let Some(t) = telemetry {
+                    (t.elapsed_ms(), t.get_episode_count())
+                } else {
+                    // Fail-closed: no telemetry for this session means we
+                    // cannot verify elapsed time or episode count.
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_id = %request.tool_id,
+                        "Pre-actuation gate denied: no telemetry registered for session (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "pre-actuation check failed: session telemetry unavailable (fail-closed)"
+                            .to_string(),
+                    ));
+                };
+
+                match gate.check_with_timestamp(
+                    &conditions,
+                    current_episode_count,
+                    emergency_stop,
+                    governance_stop,
+                    elapsed_ms,
+                    precheck_ts,
+                ) {
+                    Ok(receipt) => {
+                        // Gate cleared; proceed to broker dispatch.
+                        debug!(
+                            session_id = %token.session_id,
+                            tool_id = %request.tool_id,
+                            stop_checked = receipt.stop_checked,
+                            budget_checked = receipt.budget_checked,
+                            timestamp_ns = receipt.timestamp_ns,
+                            "Pre-actuation gate cleared"
+                        );
+                        Some(receipt)
+                    },
+                    Err(denial) => {
+                        warn!(
+                            session_id = %token.session_id,
+                            tool_id = %request.tool_id,
+                            denial = %denial,
+                            "Pre-actuation gate denied tool request"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("pre-actuation check failed: {denial}"),
+                        ));
+                    },
+                }
+            } else {
+                // TCK-00351 BLOCKER 2 v2 FIX: Broker is configured but gate
+                // is missing.  This is a configuration error; hard-deny rather
+                // than allowing execution without pre-actuation proof.
+                error!(
+                    session_id = %token.session_id,
+                    tool_id = %request.tool_id,
+                    "Pre-actuation gate missing but broker configured (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "pre-actuation gate not configured (fail-closed)".to_string(),
+                ));
+            }
+        } else {
+            None
+        };
         // TCK-00352 Security Review BLOCKER 1 fix: V1 scope enforcement gate.
         // If the session has a V1 manifest registered, enforce V1 checks
         // (risk tier ceiling, host restrictions, expiry) BEFORE dispatching
@@ -1522,117 +1743,134 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
-        if let Some(ref broker) = self.broker {
-            // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
-            let timestamp_ns = self.get_htf_timestamp()?;
-
-            // Build BrokerToolRequest
-            let request_id = format!("REQ-{}", uuid::Uuid::new_v4());
-
-            // BLOCKER 1 FIX (TCK-00290): Fail-closed if session ID is not valid for
-            // EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
-            // fallback that could cause cross-session ID collision. Return
-            // SESSION_ERROR_INVALID instead.
-            let episode_id = match EpisodeId::new(&token.session_id) {
-                Ok(id) => id,
-                Err(e) => {
-                    error!(
-                        session_id = %token.session_id,
-                        error = %e,
-                        "Session ID not valid for EpisodeId (fail-closed)"
-                    );
-                    return Ok(SessionResponse::error(
-                        SessionErrorCode::SessionErrorInvalid,
-                        format!("session ID not valid for episode: {e}"),
-                    ));
-                },
-            };
-
-            let dedupe_key = DedupeKey::new(&request.dedupe_key);
-            let args_hash = *blake3::hash(&request.arguments).as_bytes();
-
-            // BLOCKER 2 FIX (TCK-00290): Derive risk tier from capability manifest.
-            // Per the security review, we must not hardcode Tier0. Get the risk tier
-            // from the manifest's capability for this tool class, or default to Tier0
-            // if no specific tier is configured (fail-open for tier, fail-closed for
-            // access).
-            let risk_tier = self
-                .manifest_store
-                .as_ref()
-                .and_then(|store| store.get_manifest(&token.session_id))
-                .and_then(|manifest| {
-                    manifest
-                        .find_by_tool_class(tool_class)
-                        .next()
-                        .map(|cap| cap.risk_tier_required)
-                })
-                .unwrap_or(RiskTier::Tier0);
-
-            // Clone arguments for execution before they are moved into BrokerToolRequest
-            let request_arguments = request.arguments.clone();
-
-            let broker_request = BrokerToolRequest::new(
-                &request_id,
-                episode_id.clone(),
-                tool_class,
-                dedupe_key,
-                args_hash,
-                risk_tier,
-            )
-            .with_inline_args(request.arguments);
-
-            // Call broker.request() asynchronously using tokio runtime
-            let decision = tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
-            });
-
-            let response = self.handle_broker_decision(
-                decision,
-                &token.session_id,
-                tool_class,
-                &request_arguments,
-                timestamp_ns,
-                &episode_id,
+        let Some(broker) = broker else {
+            warn!(
+                session_id = %token.session_id,
+                "RequestTool denied: tool broker unavailable (fail-closed)"
             );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                "tool broker unavailable (fail-closed)",
+            ));
+        };
 
-            // TCK-00384: Increment tool_calls counter on successful dispatch.
-            // We count Allow and DedupeCacheHit as successful tool calls.
-            if let Ok(SessionResponse::RequestTool(ref resp)) = response {
-                if resp.decision == i32::from(DecisionType::Allow) {
-                    if let Some(ref store) = self.telemetry_store {
-                        if let Some(telemetry) = store.get(&token.session_id) {
-                            telemetry.increment_tool_calls();
-                        }
+        // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
+        let actuation_timestamp = self.get_htf_timestamp()?;
+        let timestamp_ns = actuation_timestamp.wall_ns;
+
+        // Build BrokerToolRequest
+        let request_id = format!("REQ-{}", uuid::Uuid::new_v4());
+
+        // BLOCKER 1 FIX (TCK-00290): Fail-closed if session ID is not valid for
+        // EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
+        // fallback that could cause cross-session ID collision. Return
+        // SESSION_ERROR_INVALID instead.
+        let episode_id = match EpisodeId::new(&token.session_id) {
+            Ok(id) => id,
+            Err(e) => {
+                error!(
+                    session_id = %token.session_id,
+                    error = %e,
+                    "Session ID not valid for EpisodeId (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInvalid,
+                    format!("session ID not valid for episode: {e}"),
+                ));
+            },
+        };
+
+        let dedupe_key = DedupeKey::new(&request.dedupe_key);
+        let args_hash = *blake3::hash(&request.arguments).as_bytes();
+
+        // BLOCKER 2 FIX (TCK-00290): Derive risk tier from capability manifest.
+        // Per the security review, we must not hardcode Tier0. Get the risk tier
+        // from the manifest's capability for this tool class, or default to Tier0
+        // if no specific tier is configured (fail-open for tier, fail-closed for
+        // access).
+        let risk_tier = self
+            .manifest_store
+            .as_ref()
+            .and_then(|store| store.get_manifest(&token.session_id))
+            .and_then(|manifest| {
+                manifest
+                    .find_by_tool_class(tool_class)
+                    .next()
+                    .map(|cap| cap.risk_tier_required)
+            })
+            .unwrap_or(RiskTier::Tier0);
+
+        // Clone arguments for execution before they are moved into BrokerToolRequest
+        let request_arguments = request.arguments.clone();
+
+        let broker_request = BrokerToolRequest::new(
+            &request_id,
+            episode_id.clone(),
+            tool_class,
+            dedupe_key,
+            args_hash,
+            risk_tier,
+        )
+        .with_inline_args(request.arguments);
+
+        // Call broker.request() asynchronously using tokio runtime
+        let decision = tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
+        });
+
+        let response = self.handle_broker_decision(
+            decision,
+            &token.session_id,
+            tool_class,
+            &request_arguments,
+            actuation_timestamp,
+            &episode_id,
+            preactuation_receipt.as_ref(),
+        );
+
+        // TCK-00384: Increment tool_calls counter on successful dispatch.
+        // We count Allow and DedupeCacheHit as successful tool calls.
+        if let Ok(SessionResponse::RequestTool(ref resp)) = response {
+            if resp.decision == i32::from(DecisionType::Allow) {
+                if let Some(ref store) = self.telemetry_store {
+                    if let Some(telemetry) = store.get(&token.session_id) {
+                        telemetry.increment_tool_calls();
                     }
                 }
             }
-
-            return response;
         }
 
-        // INV-TCK-00290-001: Neither broker nor manifest store configured - fail closed
-        warn!(
-            session_id = %token.session_id,
-            "RequestTool denied: neither broker nor manifest store configured (fail-closed)"
-        );
-        Ok(SessionResponse::error(
-            SessionErrorCode::SessionErrorToolNotAllowed,
-            "tool broker unavailable (fail-closed)",
-        ))
+        response
     }
 
     /// Handles the broker decision and converts it to a `SessionResponse`.
-    #[allow(clippy::unnecessary_wraps, clippy::items_after_statements)]
+    ///
+    /// # TCK-00351 MAJOR 1 FIX
+    ///
+    /// The `preactuation_receipt` parameter carries the gate receipt from
+    /// the pre-actuation check. Its fields (`stop_checked`, `budget_checked`,
+    /// `timestamp_ns`) are propagated into the `RequestToolResponse` instead
+    /// of hardcoded `true` / later clock sample.
+    ///
+    /// Production replay ordering verification runs on `Allow` decisions before
+    /// actuation output is accepted.
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::items_after_statements,
+        clippy::too_many_arguments
+    )]
     fn handle_broker_decision(
         &self,
         decision: Result<ToolDecision, crate::episode::BrokerError>,
         session_id: &str,
         tool_class: ToolClass,
         request_arguments: &[u8],
-        timestamp_ns: u64,
+        actuation_timestamp: ReplayTimestamp,
         episode_id: &EpisodeId,
+        preactuation_receipt: Option<&PreActuationReceipt>,
     ) -> ProtocolResult<SessionResponse> {
+        let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
             Ok(ToolDecision::Allow {
                 request_id,
@@ -1647,6 +1885,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     request_id = %request_id,
                     "Tool request allowed by broker"
                 );
+
+                if let Err(violation) = Self::verify_preactuation_replay_ordering(
+                    preactuation_receipt,
+                    actuation_timestamp,
+                    tool_class,
+                    &request_id,
+                ) {
+                    error!(
+                        session_id = %session_id,
+                        tool_class = %tool_class,
+                        request_id = %request_id,
+                        violation = %violation,
+                        "RequestTool denied: replay ordering verification failed (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("replay ordering verification failed: {violation}"),
+                    ));
+                }
 
                 // TCK-00316: Execute tool via EpisodeRuntime
                 let (result_hash, inline_result) = if let Some(ref runtime) = self.episode_runtime {
@@ -1739,6 +1996,21 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 };
 
+                // TCK-00351 MAJOR 1 FIX: Populate proof fields from the
+                // gate receipt, not from hardcoded values or a later
+                // clock sample.  The receipt's timestamp proves the
+                // ordering invariant (check preceded actuation).
+                // No gate configured: fields remain false/0 so the replay
+                // verifier treats this as a violation.
+                let (stop_checked, budget_checked, budget_enforcement_deferred, preactuation_ts) =
+                    preactuation_receipt.map_or((false, false, false, 0), |r| {
+                        (
+                            r.stop_checked,
+                            r.budget_checked,
+                            r.budget_enforcement_deferred,
+                            r.timestamp_ns,
+                        )
+                    });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
@@ -1746,6 +2018,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: policy_hash.to_vec(),
                     result_hash,
                     inline_result,
+                    stop_checked,
+                    budget_checked,
+                    budget_enforcement_deferred,
+                    preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
             Ok(ToolDecision::Deny {
@@ -1760,6 +2036,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     reason = %reason,
                     "Tool request denied by broker"
                 );
+                // TCK-00351 MAJOR 1 FIX: Derive proof fields from receipt.
+                let (stop_checked, budget_checked, budget_enforcement_deferred, preactuation_ts) =
+                    preactuation_receipt.map_or((false, false, false, 0), |r| {
+                        (
+                            r.stop_checked,
+                            r.budget_checked,
+                            r.budget_enforcement_deferred,
+                            r.timestamp_ns,
+                        )
+                    });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Deny.into(),
@@ -1767,6 +2053,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: policy_hash.to_vec(),
                     result_hash: None,
                     inline_result: None,
+                    stop_checked,
+                    budget_checked,
+                    budget_enforcement_deferred,
+                    preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
             Ok(ToolDecision::DedupeCacheHit { request_id, result }) => {
@@ -1799,6 +2089,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     None
                 };
 
+                // TCK-00351 MAJOR 1 FIX: Derive proof fields from receipt.
+                let (stop_checked, budget_checked, budget_enforcement_deferred, preactuation_ts) =
+                    preactuation_receipt.map_or((false, false, false, 0), |r| {
+                        (
+                            r.stop_checked,
+                            r.budget_checked,
+                            r.budget_enforcement_deferred,
+                            r.timestamp_ns,
+                        )
+                    });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
@@ -1807,6 +2107,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: Vec::new(),
                     result_hash,
                     inline_result,
+                    stop_checked,
+                    budget_checked,
+                    budget_enforcement_deferred,
+                    preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
             Ok(ToolDecision::Terminate {
@@ -1848,9 +2152,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
+                // TCK-00351 BLOCKER-2: `episode_count` tracks completed
+                // episodes. Increment on termination (not spawn) so a
+                // newly spawned session starts at 0.
+                if let Some(ref store) = self.telemetry_store {
+                    if let Some(telemetry) = store.get(session_id) {
+                        telemetry.increment_episode_count();
+                    }
+                }
+
                 // TCK-00384: Clean up telemetry on session termination to
                 // free capacity in the bounded store.
                 if let Some(ref store) = self.telemetry_store {
+                    store.remove(session_id);
+                }
+
+                // TCK-00351 BLOCKER 3 FIX: Clean up stop conditions on
+                // session termination to free capacity in the bounded
+                // store.  Same lifecycle as telemetry cleanup above.
+                if let Some(ref store) = self.stop_conditions_store {
                     store.remove(session_id);
                 }
 
@@ -1998,6 +2318,39 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
     }
 
+    /// Builds a per-request replay trace and verifies pre-actuation ordering.
+    ///
+    /// This is the production call site for `ReplayVerifier::verify`.
+    fn verify_preactuation_replay_ordering(
+        preactuation_receipt: Option<&PreActuationReceipt>,
+        actuation_timestamp: ReplayTimestamp,
+        tool_class: ToolClass,
+        request_id: &str,
+    ) -> Result<(), crate::episode::preactuation::ReplayViolation> {
+        let Some(receipt) = preactuation_receipt else {
+            return Ok(());
+        };
+
+        let trace = [
+            ReplayEntry {
+                timestamp: receipt.replay_timestamp,
+                kind: ReplayEntryKind::PreActuationCheck {
+                    stop_checked: receipt.stop_checked,
+                    budget_checked: receipt.budget_checked,
+                    budget_enforcement_deferred: receipt.budget_enforcement_deferred,
+                },
+            },
+            ReplayEntry {
+                timestamp: actuation_timestamp,
+                kind: ReplayEntryKind::ToolActuation {
+                    tool_class: tool_class.to_string(),
+                    request_id: request_id.to_string(),
+                },
+            },
+        ];
+        ReplayVerifier::verify(&trace)
+    }
+
     /// Gets an HTF-compliant monotonic timestamp.
     ///
     /// # TCK-00290 MAJOR 2 FIX: Time Monotonicity
@@ -2013,19 +2366,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// Per SEC-CTRL-FAC-0015, we must fail-closed when the clock is required
     /// rather than falling back to an insecure `SystemTime::now()`.
     #[allow(clippy::option_if_let_else, clippy::single_match_else)]
-    fn get_htf_timestamp(&self) -> ProtocolResult<u64> {
+    fn get_htf_timestamp(&self) -> ProtocolResult<ReplayTimestamp> {
         // Using match here for clarity - the error paths have important security
         // comments that would be less readable with map_or_else or if let/else.
         match &self.clock {
-            Some(clock) => clock.now_hlc().map(|hlc| hlc.wall_ns).map_err(|e| {
-                if let ClockError::ClockRegression { current, previous } = e {
-                    self.emit_htf_regression_defect(current, previous);
-                }
-                error!("HolonicClock failed: {}", e);
-                ProtocolError::Serialization {
-                    reason: format!("clock failure: {e}"),
-                }
-            }),
+            Some(clock) => clock
+                .now_hlc()
+                .map(|hlc| ReplayTimestamp::new(hlc.wall_ns, hlc.logical))
+                .map_err(|e| {
+                    if let ClockError::ClockRegression { current, previous } = e {
+                        self.emit_htf_regression_defect(current, previous);
+                    }
+                    error!("HolonicClock failed: {}", e);
+                    ProtocolError::Serialization {
+                        reason: format!("clock failure: {e}"),
+                    }
+                }),
             None => {
                 // MAJOR 2 FIX (TCK-00290): Fail-closed when clock is not configured.
                 // Per SEC-CTRL-FAC-0015, we must not fall back to SystemTime::now()
@@ -2116,7 +2472,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
-        let now_ns = self.get_htf_timestamp()?;
+        let now_ns = self.get_htf_timestamp()?.wall_ns;
 
         // Increment sequence counter atomically
         let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3482,6 +3838,10 @@ mod tests {
             policy_hash: vec![],
             result_hash: None,
             inline_result: None,
+            stop_checked: false,
+            budget_checked: false,
+            budget_enforcement_deferred: false,
+            preactuation_timestamp_ns: 0,
         });
         let encoded = tool_resp.encode();
         assert!(!encoded.is_empty());
@@ -4168,6 +4528,7 @@ mod tests {
     mod tool_execution {
         use super::*;
         use crate::episode::{ToolBroker, ToolBrokerConfig, ToolClass};
+        use crate::htf::ClockConfig;
 
         /// TCK-00316: Verify fail-closed behavior when broker is configured but
         /// holonic clock is missing.
@@ -4175,8 +4536,13 @@ mod tests {
         /// Per SEC-CTRL-FAC-0015, the dispatcher must fail-closed when required
         /// infrastructure (clock, runtime) is missing. This test verifies the
         /// clock check happens before broker request.
+        ///
+        /// TCK-00351 BLOCKER 2 v2 FIX: Broker now requires a gate; this test
+        /// wires a default gate so the clock check is the first failure point.
         #[test]
         fn test_request_tool_fails_closed_without_clock() {
+            use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+
             let minter = test_minter();
             let store = Arc::new(InMemoryManifestStore::new());
 
@@ -4187,9 +4553,14 @@ mod tests {
             // Create broker with default config
             let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
 
-            // Create dispatcher WITH broker but WITHOUT clock
-            let dispatcher =
-                SessionDispatcher::with_manifest_store(minter.clone(), store).with_broker(broker);
+            // Wire a gate (required since BLOCKER 2 fix) but no clock
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(authority, None));
+
+            // Create dispatcher WITH broker and gate but WITHOUT clock
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+                .with_broker(broker)
+                .with_preactuation_gate(gate);
 
             let token = test_token(&minter);
             let ctx = make_session_ctx();
@@ -4204,6 +4575,8 @@ mod tests {
             let frame = encode_request_tool_request(&request);
 
             // Should return protocol error for missing clock (fail-closed)
+            // The gate check calls get_htf_timestamp() which fails
+            // because no clock is configured.
             let result = dispatcher.dispatch(&frame, &ctx);
             match result {
                 Err(ProtocolError::Serialization { reason }) => {
@@ -4213,6 +4586,103 @@ mod tests {
                     );
                 },
                 other => panic!("Expected protocol error for missing clock, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_request_tool_without_broker_skips_gate_clock_path() {
+            use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            let manifest = tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            // Gate is wired but broker and clock are intentionally absent.
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(authority, None));
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+                .with_preactuation_gate(gate);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "test-no-broker-skip-gate".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("broker unavailable"),
+                        "expected broker-unavailable denial, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        !err.message.contains("holonic clock not configured"),
+                        "must not fail through gate clock path when broker is absent"
+                    );
+                },
+                other => panic!("Expected application-level denial, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_replay_verifier_rejects_ordering_violation_in_production_path() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter);
+            let episode_id = EpisodeId::new("session-001").expect("valid episode id");
+
+            let decision = ToolDecision::Allow {
+                request_id: "REQ-ORDER-001".to_string(),
+                capability_id: "cap-read-001".to_string(),
+                rule_id: Some("rule-read".to_string()),
+                policy_hash: [0u8; 32],
+                budget_delta: crate::episode::decision::BudgetDelta::single_call(),
+                credential: None,
+            };
+
+            let receipt = crate::episode::preactuation::PreActuationReceipt {
+                stop_checked: true,
+                budget_checked: true,
+                budget_enforcement_deferred: false,
+                replay_timestamp: ReplayTimestamp::new(200, 0),
+                timestamp_ns: 200,
+            };
+
+            // Actuation timestamp is deliberately older than the check timestamp
+            // to trigger ReplayVerifier::OrderingViolation in production wiring.
+            let response = dispatcher
+                .handle_broker_decision(
+                    Ok(decision),
+                    "session-001",
+                    ToolClass::Read,
+                    b"{}",
+                    ReplayTimestamp::new(100, 0),
+                    &episode_id,
+                    Some(&receipt),
+                )
+                .expect("dispatch should return application-level error response");
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(err.code, SessionErrorCode::SessionErrorInternal as i32);
+                    assert!(
+                        err.message.contains("replay ordering verification failed"),
+                        "expected replay verifier failure message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected replay-verifier error response, got: {other:?}"),
             }
         }
 
@@ -4260,6 +4730,60 @@ mod tests {
                     );
                 },
                 other => panic!("Expected Error response, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00351 BLOCKER 2 v2 FIX: Broker configured without
+        /// pre-actuation gate must be denied (fail-closed).
+        ///
+        /// This regression test verifies that when a broker is configured
+        /// but the pre-actuation gate is missing, `RequestTool` is
+        /// hard-denied instead of proceeding without proof fields.
+        #[test]
+        fn test_request_tool_denied_broker_without_gate() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            let manifest = tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default ClockConfig should succeed"),
+            );
+
+            // Create dispatcher WITH broker and clock but WITHOUT gate
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+                .with_broker(broker)
+                .with_clock(clock);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "test-dedupe-no-gate".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for missing gate"
+                    );
+                    assert!(
+                        err.message.contains("pre-actuation gate not configured"),
+                        "Error should mention missing gate: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for broker-without-gate, got: {other:?}"),
             }
         }
     }
@@ -5024,6 +5548,15 @@ mod tests {
                     .expect("telemetry registration should succeed");
 
                 // --- Build dispatcher with all production dependencies ---
+                // TCK-00351 BLOCKER 2 v2 FIX: Gate is mandatory when broker
+                // is configured.
+                let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+                let preactuation_gate = Arc::new(
+                    crate::episode::preactuation::PreActuationGate::production_gate(
+                        Arc::clone(&stop_authority),
+                        None,
+                    ),
+                );
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -5031,7 +5564,9 @@ mod tests {
                         .with_ledger(ledger)
                         .with_episode_runtime(episode_runtime)
                         .with_session_registry(Arc::clone(&registry))
-                        .with_telemetry_store(Arc::clone(&telemetry_store));
+                        .with_telemetry_store(Arc::clone(&telemetry_store))
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority);
 
                 // Mint token with the episode-derived session_id
                 let spawn_time = std::time::SystemTime::now();
