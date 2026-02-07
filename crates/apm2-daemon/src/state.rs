@@ -492,10 +492,6 @@ impl DispatcherState {
             ));
             let adapter_registry = Arc::new(adapter_registry);
 
-            // TCK-00399: CAS for adapter profile resolution during spawn.
-            let cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
-                Arc::new(apm2_core::evidence::MemoryCas::new());
-
             PrivilegedDispatcher::with_dependencies(
                 DecodeConfig::default(),
                 policy_resolver,
@@ -513,9 +509,11 @@ impl DispatcherState {
             )
             // TCK-00352: Wire V1 manifest store into production path
             .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
-            // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
+            // TCK-00399: Wire adapter registry for agent CLI process spawning.
+            // CAS is intentionally not wired in this constructor: fail-closed
+            // publish/ingest handlers require explicit CAS configuration via
+            // with_persistence_and_cas().
             .with_adapter_registry(adapter_registry)
-            .with_cas(cas)
         } else {
             // Use stubs
             let clock = Arc::new(

@@ -46,6 +46,7 @@
 //! ```
 
 use crate::crypto::{Signature, SignerError, VerifyingKey, verify_signature};
+use crate::events::CHANGESET_PUBLISHED_DOMAIN_PREFIX;
 
 // =============================================================================
 // Domain Separator Constants
@@ -122,7 +123,10 @@ pub const LEDGER_EVENT_PREFIX: &[u8] = b"LEDGER_EVENT:";
 ///
 /// Used when signing/verifying changeset publication events.
 /// This anchors the changeset digest and CAS hash before any review begins.
-pub const CHANGESET_PUBLISHED_PREFIX: &[u8] = b"CHANGESET_PUBLISHED:";
+///
+/// This prefix is intentionally sourced from the canonical kernel-event
+/// namespace to keep FAC and ledger contracts aligned.
+pub const CHANGESET_PUBLISHED_PREFIX: &[u8] = CHANGESET_PUBLISHED_DOMAIN_PREFIX;
 
 /// Domain prefix for `ReviewBlockedRecorded` events.
 ///

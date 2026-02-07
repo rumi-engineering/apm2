@@ -19,7 +19,8 @@
 //!   same inputs always produce the same digest.
 //!
 //! - **Domain Separation**: The `ChangeSetPublished` event signature uses the
-//!   `CHANGESET_PUBLISHED:` domain prefix to prevent replay attacks.
+//!   canonical `CHANGESET_PUBLISHED_PREFIX` domain separator to prevent replay
+//!   attacks.
 //!
 //! - **Anchor Before Review**: The `ChangeSetPublished` event MUST be emitted
 //!   before any review activities begin for a work item.
@@ -212,6 +213,26 @@ impl GitObjectRef {
     ///
     /// Returns error if `object_id` length doesn't match the algorithm.
     pub fn validate(&self) -> Result<(), ChangeSetBundleError> {
+        if self.object_kind.is_empty() {
+            return Err(ChangeSetBundleError::MissingField("object_kind"));
+        }
+        if self.object_kind.len() > MAX_STRING_LENGTH {
+            return Err(ChangeSetBundleError::StringTooLong {
+                field: "object_kind",
+                len: self.object_kind.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if !matches!(
+            self.object_kind.as_str(),
+            "commit" | "tree" | "blob" | "tag"
+        ) {
+            return Err(ChangeSetBundleError::InvalidData(format!(
+                "object_kind must be one of commit/tree/blob/tag, got '{}'",
+                self.object_kind
+            )));
+        }
+
         let expected_len = self.algo.hex_length();
         if self.object_id.len() != expected_len {
             return Err(ChangeSetBundleError::InvalidData(format!(
@@ -505,6 +526,12 @@ impl ChangeSetBundleV1 {
                 self.schema
             )));
         }
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(ChangeSetBundleError::InvalidData(format!(
+                "invalid schema_version: expected {SCHEMA_VERSION}, got {}",
+                self.schema_version
+            )));
+        }
 
         // Validate changeset_id
         if self.changeset_id.is_empty() {
@@ -521,7 +548,17 @@ impl ChangeSetBundleV1 {
         // Validate base
         self.base.validate()?;
 
+        if self.diff_format != "git_unified_diff" {
+            return Err(ChangeSetBundleError::InvalidData(format!(
+                "invalid diff_format: expected git_unified_diff, got {}",
+                self.diff_format
+            )));
+        }
+
         // Validate file_manifest size
+        if self.file_manifest.is_empty() {
+            return Err(ChangeSetBundleError::MissingField("file_manifest"));
+        }
         if self.file_manifest.len() > MAX_FILE_MANIFEST_SIZE {
             return Err(ChangeSetBundleError::CollectionTooLarge {
                 field: "file_manifest",
@@ -693,8 +730,8 @@ pub struct ChangeSetPublished {
     pub published_at: u64,
     /// Actor who published the changeset.
     pub publisher_actor_id: String,
-    /// Ed25519 signature over canonical bytes with `CHANGESET_PUBLISHED:`
-    /// domain.
+    /// Ed25519 signature over canonical bytes with
+    /// `CHANGESET_PUBLISHED_PREFIX` domain separation.
     #[serde(with = "serde_bytes")]
     pub publisher_signature: [u8; 64],
     /// HTF time envelope reference for temporal authority (RFC-0016).
@@ -1060,6 +1097,62 @@ mod tests {
     }
 
     #[test]
+    fn test_bundle_validation_fails_empty_manifest() {
+        let bundle = ChangeSetBundleV1::builder()
+            .changeset_id("cs-empty")
+            .base(test_base())
+            .diff_hash([0x42; 32])
+            .file_manifest(vec![])
+            .build()
+            .expect("valid bundle construction");
+
+        let err = bundle.validate().expect_err("validation should fail");
+        assert_eq!(err, ChangeSetBundleError::MissingField("file_manifest"));
+    }
+
+    #[test]
+    fn test_bundle_validation_fails_bad_schema_version() {
+        let mut bundle = ChangeSetBundleV1::builder()
+            .changeset_id("cs-schema-version")
+            .base(test_base())
+            .diff_hash([0x42; 32])
+            .file_manifest(vec![FileChange {
+                path: "src/lib.rs".to_string(),
+                change_kind: ChangeKind::Modify,
+                old_path: None,
+            }])
+            .build()
+            .expect("valid bundle construction");
+        bundle.schema_version = "2.0.0".to_string();
+
+        let err = bundle.validate().expect_err("validation should fail");
+        assert!(
+            matches!(err, ChangeSetBundleError::InvalidData(message) if message.contains("invalid schema_version"))
+        );
+    }
+
+    #[test]
+    fn test_bundle_validation_fails_bad_diff_format() {
+        let mut bundle = ChangeSetBundleV1::builder()
+            .changeset_id("cs-diff-format")
+            .base(test_base())
+            .diff_hash([0x42; 32])
+            .file_manifest(vec![FileChange {
+                path: "src/lib.rs".to_string(),
+                change_kind: ChangeKind::Modify,
+                old_path: None,
+            }])
+            .build()
+            .expect("valid bundle construction");
+        bundle.diff_format = "custom_diff".to_string();
+
+        let err = bundle.validate().expect_err("validation should fail");
+        assert!(
+            matches!(err, ChangeSetBundleError::InvalidData(message) if message.contains("invalid diff_format"))
+        );
+    }
+
+    #[test]
     fn test_file_manifest_sorting() {
         // Create bundle with unsorted manifest
         let bundle = ChangeSetBundleV1::builder()
@@ -1232,5 +1325,13 @@ mod tests {
             object_id: "A".repeat(40),
         };
         assert!(uppercase.validate().is_err());
+
+        // Invalid object kind
+        let invalid_kind = GitObjectRef {
+            algo: HashAlgo::Sha1,
+            object_kind: "branch".to_string(),
+            object_id: "a".repeat(40),
+        };
+        assert!(invalid_kind.validate().is_err());
     }
 }
