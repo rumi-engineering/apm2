@@ -78,6 +78,7 @@ mod engine;
 mod error;
 mod event;
 mod parser;
+pub mod permeability;
 mod schema;
 mod validator;
 
