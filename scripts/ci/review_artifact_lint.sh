@@ -14,6 +14,29 @@
 # Usage:
 #   ./scripts/ci/review_artifact_lint.sh
 
+# WVR-0004: Defense-in-depth scope limitation
+#
+# This lint catches common/accidental direct GitHub status writes in review
+# artifacts. It is NOT designed to resist adversarial bypass via string
+# construction techniques (variable indirection, token splitting, eval,
+# process substitution, base64 encoding, etc.).
+#
+# The hard security gate for review status integrity is the Review Gate
+# GitHub Actions workflow (.github/workflows/review-gate.yml), which
+# validates that status checks are posted by authorized CI processes
+# regardless of how they are constructed.
+#
+# Threat model: Review artifacts are authored by trusted CI processes
+# (codex reviewers, xtask commands) running in controlled environments.
+# An adversary who can modify review artifacts already has CI write access
+# and can bypass any shell-level lint. The lint's value is catching
+# copy-paste mistakes and accidental regressions, not adversarial bypass.
+#
+# Waiver: Remaining bypass vectors in pattern matching (split-token
+# construction, variable indirection in exempt files) are accepted as
+# out-of-scope for this defense-in-depth control.
+# See: TCK-00409, review rounds 1-13
+
 set -euo pipefail
 
 if [[ -t 1 ]]; then
