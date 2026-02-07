@@ -93,7 +93,10 @@ use crate::episode::preactuation::{
     PreActuationReceipt, ReplayEntry, ReplayEntryKind, ReplayTimestamp, ReplayVerifier,
 };
 use crate::episode::registry::TerminationReason;
-use crate::episode::{CapabilityManifest, EpisodeId, EpisodeRuntime, SharedToolBroker, ToolClass};
+use crate::episode::{
+    CapabilityManifest, EpisodeId, EpisodeRuntime, SharedSessionBrokerRegistry, SharedToolBroker,
+    ToolClass,
+};
 use crate::gate::{GateOrchestrator, SessionTerminatedInfo};
 use crate::htf::{ClockError, HolonicClock};
 
@@ -652,6 +655,11 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Per DOD: "`RequestTool` executes via `ToolBroker` and returns
     /// `ToolResult` or Deny"
     broker: Option<SharedToolBroker<StubManifestLoader>>,
+    /// Per-session broker registry for capability/policy isolation (TCK-00401).
+    ///
+    /// When configured, `RequestTool` resolves the broker by `session_id`.
+    /// Missing session brokers are denied fail-closed.
+    session_brokers: Option<SharedSessionBrokerRegistry<StubManifestLoader>>,
     /// Holonic clock for monotonic timestamps (TCK-00290).
     ///
     /// Per RFC-0016, timestamps must be monotonic. Using `SystemTime` directly
@@ -747,6 +755,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             ledger: None,
             cas: None,
             broker: None,
+            session_brokers: None,
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
@@ -771,6 +780,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             ledger: None,
             cas: None,
             broker: None,
+            session_brokers: None,
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
@@ -800,6 +810,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ledger: None,
             cas: None,
             broker: None,
+            session_brokers: None,
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
@@ -829,6 +840,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ledger: None,
             cas: None,
             broker: None,
+            session_brokers: None,
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
@@ -874,6 +886,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ledger: Some(ledger),
             cas: Some(cas),
             broker: None,
+            session_brokers: None,
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
@@ -909,6 +922,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_broker(mut self, broker: SharedToolBroker<StubManifestLoader>) -> Self {
         self.broker = Some(broker);
+        self
+    }
+
+    /// Sets the per-session broker registry for `RequestTool` execution.
+    #[must_use]
+    pub fn with_session_brokers(
+        mut self,
+        brokers: SharedSessionBrokerRegistry<StubManifestLoader>,
+    ) -> Self {
+        self.session_brokers = Some(brokers);
         self
     }
 
@@ -1428,7 +1451,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         };
 
-        let broker = self.broker.as_ref();
+        let broker = if let Some(ref brokers) = self.session_brokers {
+            brokers.get(&token.session_id)
+        } else {
+            self.broker.clone()
+        };
 
         // TCK-00351: Pre-actuation stop/budget gate.
         // This check MUST precede broker dispatch.  If the gate denies,

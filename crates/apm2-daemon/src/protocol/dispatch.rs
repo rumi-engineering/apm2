@@ -136,8 +136,10 @@ use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
     EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
-    TerminationClass, validate_custody_domain_overlap,
+    SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass, ToolBroker, ToolBrokerConfig,
+    validate_custody_domain_overlap,
 };
+use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 use crate::governance::GovernanceFreshnessMonitor;
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
@@ -4575,6 +4577,24 @@ pub struct PrivilegedDispatcher {
     /// shared with `SessionDispatcher` for counter updates and queries.
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
 
+    /// Per-session tool broker registry (TCK-00401).
+    ///
+    /// When configured, `SpawnEpisode` initializes a broker scoped to the
+    /// session capability manifest and registers it here. `RequestTool`
+    /// resolves brokers by session ID.
+    session_broker_registry:
+        Option<SharedSessionBrokerRegistry<crate::episode::capability::StubManifestLoader>>,
+
+    /// Configuration template for per-session broker construction.
+    broker_config: ToolBrokerConfig,
+
+    /// CAS backend for broker context artifact retrieval and firewall init.
+    broker_cas: Option<Arc<dyn crate::episode::executor::ContentAddressedStore>>,
+
+    /// Optional credential stores wired into per-session brokers.
+    broker_github_store: Option<Arc<dyn GitHubCredentialStore>>,
+    broker_ssh_store: Option<Arc<dyn SshCredentialStore>>,
+
     /// Content-addressed store for `ChangeSet` bundle persistence (TCK-00394).
     ///
     /// When present, `PublishChangeSet` stores the canonical bundle bytes in
@@ -4759,6 +4779,11 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            session_broker_registry: None,
+            broker_config: ToolBrokerConfig::default(),
+            broker_cas: None,
+            broker_github_store: None,
+            broker_ssh_store: None,
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -4822,6 +4847,11 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            session_broker_registry: None,
+            broker_config: ToolBrokerConfig::default(),
+            broker_cas: None,
+            broker_github_store: None,
+            broker_ssh_store: None,
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -4904,6 +4934,11 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            session_broker_registry: None,
+            broker_config: ToolBrokerConfig::default(),
+            broker_cas: None,
+            broker_github_store: None,
+            broker_ssh_store: None,
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -4963,6 +4998,11 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            session_broker_registry: None,
+            broker_config: ToolBrokerConfig::default(),
+            broker_cas: None,
+            broker_github_store: None,
+            broker_ssh_store: None,
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -5010,6 +5050,47 @@ impl PrivilegedDispatcher {
         store: Arc<crate::session::SessionTelemetryStore>,
     ) -> Self {
         self.telemetry_store = Some(store);
+        self
+    }
+
+    /// Sets the per-session broker registry (TCK-00401).
+    #[must_use]
+    pub fn with_session_broker_registry(
+        mut self,
+        registry: SharedSessionBrokerRegistry<crate::episode::capability::StubManifestLoader>,
+    ) -> Self {
+        self.session_broker_registry = Some(registry);
+        self
+    }
+
+    /// Sets the per-session broker configuration template.
+    #[must_use]
+    pub const fn with_broker_config(mut self, config: ToolBrokerConfig) -> Self {
+        self.broker_config = config;
+        self
+    }
+
+    /// Sets the CAS backend used by per-session brokers.
+    #[must_use]
+    pub fn with_broker_cas(
+        mut self,
+        cas: Arc<dyn crate::episode::executor::ContentAddressedStore>,
+    ) -> Self {
+        self.broker_cas = Some(cas);
+        self
+    }
+
+    /// Sets the GitHub credential store used by per-session brokers.
+    #[must_use]
+    pub fn with_broker_github_store(mut self, store: Arc<dyn GitHubCredentialStore>) -> Self {
+        self.broker_github_store = Some(store);
+        self
+    }
+
+    /// Sets the SSH credential store used by per-session brokers.
+    #[must_use]
+    pub fn with_broker_ssh_store(mut self, store: Arc<dyn SshCredentialStore>) -> Self {
+        self.broker_ssh_store = Some(store);
         self
     }
 
@@ -5724,6 +5805,78 @@ impl PrivilegedDispatcher {
         }))
     }
 
+    /// Builds and initializes a per-session tool broker from manifest and
+    /// role-scoped allowlist policy (TCK-00401).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when broker policy or manifest initialization
+    /// fails, or when async runtime is unavailable in production.
+    fn build_session_broker(
+        &self,
+        session_id: &str,
+        manifest: &CapabilityManifest,
+    ) -> Result<SharedToolBroker<crate::episode::capability::StubManifestLoader>, String> {
+        let mut broker = match (&self.broker_github_store, &self.broker_ssh_store) {
+            (Some(github), Some(ssh)) => ToolBroker::with_credential_stores(
+                self.broker_config.clone(),
+                Arc::clone(github),
+                Arc::clone(ssh),
+            ),
+            (Some(github), None) => {
+                ToolBroker::with_github_store(self.broker_config.clone(), Arc::clone(github))
+            },
+            (None, Some(ssh)) => {
+                ToolBroker::with_ssh_store(self.broker_config.clone(), Arc::clone(ssh))
+            },
+            (None, None) => ToolBroker::new(self.broker_config.clone()),
+        };
+
+        if let Some(ref cas) = self.broker_cas {
+            broker = broker.with_cas(Arc::clone(cas));
+        }
+
+        broker
+            .set_policy_from_tool_allowlist(
+                &format!("session-role-allowlist-{session_id}"),
+                manifest.tool_allowlist(),
+            )
+            .map_err(|e| format!("policy initialization failed: {e}"))?;
+
+        let broker = Arc::new(broker);
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    broker
+                        .initialize_with_manifest(manifest.clone())
+                        .await
+                        .map_err(|e| format!("broker initialization failed: {e}"))
+                })
+            })?;
+        } else {
+            #[cfg(test)]
+            {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("failed to build test runtime for broker init: {e}"))?;
+                rt.block_on(async {
+                    broker
+                        .initialize_with_manifest(manifest.clone())
+                        .await
+                        .map_err(|e| format!("broker initialization failed: {e}"))
+                })?;
+            }
+            #[cfg(not(test))]
+            {
+                return Err("broker initialization failed: no async runtime available".to_string());
+            }
+        }
+
+        Ok(broker)
+    }
+
     /// Rolls back a partially-completed spawn registration.
     ///
     /// Removes the newly-registered session, cleans up its telemetry/stop
@@ -5738,12 +5891,17 @@ impl PrivilegedDispatcher {
     ///
     /// All rollback operations are explicitly error-checked; none are
     /// silently discarded via `let _ = ...`.
+    #[allow(clippy::too_many_arguments)]
     fn rollback_spawn(
         &self,
         session_id: &str,
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
         evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        evicted_brokers: &[(
+            String,
+            SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+        )],
         evicted_stop_conditions: &[(String, crate::episode::envelope::StopConditions)],
         remove_manifest: bool,
     ) -> Option<String> {
@@ -5794,10 +5952,22 @@ impl PrivilegedDispatcher {
             store.remove(session_id);
         }
 
+        // 3a-iii. TCK-00401: Remove per-session broker on rollback.
+        if let Some(ref store) = self.session_broker_registry {
+            store.remove(session_id);
+        }
+
         // 3b. Restore evicted manifests so capacity is not permanently lost.
         for (sid, manifest) in evicted_manifests {
             self.manifest_store
                 .restore(sid, std::sync::Arc::clone(manifest));
+        }
+
+        // 3c. Restore evicted per-session brokers.
+        if let Some(ref store) = self.session_broker_registry {
+            for (sid, broker) in evicted_brokers {
+                store.restore(sid, Arc::clone(broker));
+            }
         }
 
         // 4. Re-register evicted sessions to restore capacity.
@@ -5864,6 +6034,7 @@ impl PrivilegedDispatcher {
     /// * `context` — Human-readable label for log messages identifying the
     ///   failure site (e.g. "peer credentials failure").
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn rollback_spawn_with_episode_stop(
         &self,
         episode_id_opt: Option<&EpisodeId>,
@@ -5871,6 +6042,10 @@ impl PrivilegedDispatcher {
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
         evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        evicted_brokers: &[(
+            String,
+            SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+        )],
         evicted_stop_conditions: &[(String, crate::episode::envelope::StopConditions)],
         timestamp_ns: u64,
         context: &str,
@@ -5903,6 +6078,7 @@ impl PrivilegedDispatcher {
             evicted_sessions,
             evicted_telemetry,
             evicted_manifests,
+            evicted_brokers,
             evicted_stop_conditions,
             true,
         );
@@ -6701,7 +6877,26 @@ impl PrivilegedDispatcher {
                 })
                 .collect();
 
-        // Step 2c: Capture and remove stop conditions for evicted sessions.
+        // Step 2c: Capture and remove per-session brokers for evicted sessions.
+        // Restored during rollback to keep broker/session stores converged.
+        let evicted_brokers: Vec<(
+            String,
+            SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+        )> = self
+            .session_broker_registry
+            .as_ref()
+            .map_or_else(Vec::new, |store| {
+                evicted_sessions
+                    .iter()
+                    .filter_map(|s| {
+                        store
+                            .remove_and_return(&s.session_id)
+                            .map(|b| (s.session_id.clone(), b))
+                    })
+                    .collect()
+            });
+
+        // Step 2d: Capture and remove stop conditions for evicted sessions.
         // These are restored if a later spawn step fails (atomic rollback).
         let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> = self
             .stop_conditions_store
@@ -6738,6 +6933,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     false,
                 );
@@ -6772,6 +6968,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     false,
                 );
@@ -6822,6 +7019,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     false,
                 );
@@ -6855,6 +7053,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     false,
                 );
@@ -6905,6 +7104,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_brokers,
                         &evicted_stop_conditions,
                         false,
                     );
@@ -6942,6 +7142,45 @@ impl PrivilegedDispatcher {
 
         self.manifest_store.register(&session_id, manifest.clone());
 
+        // TCK-00401: Build and register per-session broker in production path.
+        //
+        // This enforces session-scoped capability/policy isolation and ensures
+        // broker validator/policy are initialized before session spawn commits.
+        if let Some(ref broker_store) = self.session_broker_registry {
+            match self.build_session_broker(&session_id, &manifest) {
+                Ok(broker) => broker_store.register(&session_id, broker),
+                Err(e) => {
+                    let rollback_warn = self.rollback_spawn(
+                        &session_id,
+                        &evicted_sessions,
+                        &evicted_telemetry,
+                        &evicted_manifests,
+                        &evicted_brokers,
+                        &evicted_stop_conditions,
+                        true,
+                    );
+                    if let Some(ref rw) = rollback_warn {
+                        warn!(rollback_errors = %rw, "Partial rollback failure during broker initialization");
+                    }
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "SpawnEpisode rejected: per-session broker initialization failed"
+                    );
+                    let msg = rollback_warn.map_or_else(
+                        || format!("per-session broker initialization failed: {e}"),
+                        |rw| format!(
+                            "per-session broker initialization failed: {e} (rollback partial failure: {rw})"
+                        ),
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        msg,
+                    ));
+                },
+            }
+        }
+
         // TCK-00352 Security Review MAJOR 2: Mint and register V1 manifest
         // in the shared store so that SessionDispatcher can enforce V1 scope
         // checks (risk tier ceiling, host restrictions, envelope binding)
@@ -6964,6 +7203,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     true,
                 );
@@ -6995,6 +7235,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     true,
                 );
@@ -7069,6 +7310,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_brokers,
                         &evicted_stop_conditions,
                         true,
                     );
@@ -7132,6 +7374,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     true,
                 );
@@ -7210,6 +7453,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_brokers,
                         &evicted_stop_conditions,
                         true,
                     );
@@ -7256,6 +7500,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     true,
                 );
@@ -7298,6 +7543,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     timestamp_ns,
                     "update_episode_id failure",
@@ -7344,6 +7590,7 @@ impl PrivilegedDispatcher {
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 timestamp_ns,
                 "peer credentials failure",
@@ -7378,6 +7625,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     timestamp_ns,
                     "missing adapter registry",
@@ -7475,6 +7723,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     timestamp_ns,
                     "adapter spawn failure",
@@ -7535,6 +7784,7 @@ impl PrivilegedDispatcher {
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 timestamp_ns,
                 "event emission failure",
@@ -8284,6 +8534,12 @@ impl PrivilegedDispatcher {
         // either granting or denying based on an expired session's policy.
         if let Some(ref v1_store) = self.v1_manifest_store {
             v1_store.remove(&request.session_id);
+        }
+
+        // TCK-00401: Remove per-session broker on EndSession to prevent stale
+        // capability/policy state from being reused by retained tokens.
+        if let Some(ref broker_store) = self.session_broker_registry {
+            broker_store.remove(&request.session_id);
         }
 
         // TCK-00351 BLOCKER-2: `episode_count` is defined as completed
@@ -15935,6 +16191,10 @@ mod tests {
                 Vec::new();
             let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let no_evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             let no_evicted_stop_conditions: Vec<(
                 String,
                 crate::episode::envelope::StopConditions,
@@ -15944,6 +16204,7 @@ mod tests {
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
                 &no_evicted_manifests,
+                &no_evicted_brokers,
                 &no_evicted_stop_conditions,
                 true,
             );
@@ -16204,6 +16465,10 @@ mod tests {
             let evicted_sessions = vec![evicted_session_state];
             let evicted_telem: Vec<(String, Arc<crate::session::SessionTelemetry>)> = Vec::new();
             let evicted_manifests = vec![("S-ROLLBACK-M".to_string(), evicted_manifest)];
+            let evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> =
                 Vec::new();
 
@@ -16212,6 +16477,7 @@ mod tests {
                 &evicted_sessions,
                 &evicted_telem,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 true,
             );
@@ -16355,6 +16621,10 @@ mod tests {
                 Vec::new();
             let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let no_evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             let no_evicted_stop_conditions: Vec<(
                 String,
                 crate::episode::envelope::StopConditions,
@@ -16366,6 +16636,7 @@ mod tests {
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
                 &no_evicted_manifests,
+                &no_evicted_brokers,
                 &no_evicted_stop_conditions,
                 999_000,
                 "test context",
@@ -16466,6 +16737,10 @@ mod tests {
                         .map(|m| (s.session_id.clone(), m))
                 })
                 .collect();
+            let evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             assert_eq!(evicted_telemetry.len(), 1);
             assert_eq!(evicted_manifests.len(), 1);
             let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> =
@@ -16483,6 +16758,7 @@ mod tests {
                 &evicted,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 999_000,
                 "test eviction restore",
@@ -16620,11 +16896,16 @@ mod tests {
             // Simulate spawn failure rollback.
             let evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             let result = dispatcher.rollback_spawn(
                 "S-NEW-STOP",
                 &evicted,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 false,
             );
