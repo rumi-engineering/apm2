@@ -1,0 +1,76 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0307"
+  title: "Workspace confinement path traversal adversarial test evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that workspace confinement prevents lexical path traversal and
+    unsafe workspace root configuration. Tests verify defense against known
+    attack patterns per RFC-0020 Section 4.3 and CTR-1504.
+
+    This evidence covers lexical path validation only. Symlink-safe runtime
+    path resolution (filesystem-level TOCTOU checks via symlink_metadata)
+    is deferred to TCK-00375 which implements the context firewall.
+  requirement_ids:
+    - "REQ-0028"
+  source_refs:
+    - "crates/apm2-core/src/capsule/workspace.rs"
+    - "crates/apm2-core/src/capsule/mod.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Workspace confinement tests (45 tests):
+        Workspace root validation (fail-closed by construction via new()):
+        - test_valid_workspace_root: /home/agent/workspace accepted
+        - test_empty_workspace_root: empty root rejected at construction
+        - test_relative_workspace_root: relative root rejected at construction
+        - test_blocked_root_exact: /etc rejected at construction
+        - test_blocked_root_child: /var/log rejected at construction (child of blocked /var)
+        - test_blocked_root_slash: / rejected at construction
+        Path traversal prevention:
+        - test_valid_relative_path: src/main.rs resolved correctly
+        - test_path_with_dot: ./src/main.rs handled (dot is harmless)
+        - test_path_traversal_dotdot: ../../../etc/passwd rejected
+        - test_path_traversal_embedded_dotdot: src/../../etc/passwd rejected
+        - test_absolute_path_rejected: /etc/passwd rejected (must be relative)
+        - test_path_too_deep: depth exceeding MAX_WORKSPACE_PATH_DEPTH rejected
+        - test_path_exactly_at_max_depth: path at exact depth limit accepted
+        Adversarial escape attempts:
+        - test_adversarial_dotdot_at_start: bare .. rejected
+        - test_adversarial_multiple_dotdots: ../../.. rejected
+        - test_adversarial_dotdot_after_normal: a/b/../../.. rejected
+        - test_adversarial_dotdot_to_etc: ../../../etc/shadow rejected
+        - test_adversarial_encoded_traversal_components: mixed traversal rejected
+        - test_adversarial_null_byte_in_path: safe file with no traversal accepted
+        Post-resolution containment:
+        - test_absolute_within_root_ok: /workspace/src/main.rs within /workspace
+        - test_absolute_outside_root_rejected: /etc/passwd outside /workspace
+        - test_absolute_sibling_rejected: /workspace/project-b outside /workspace/project-a
+        - test_absolute_escape_via_parent_dir: /workspace/../etc/passwd rejected
+        - test_absolute_escape_via_double_parent_dir: /workspace/./../../etc/passwd rejected
+        - test_absolute_escape_via_nested_parent_dir: /workspace/subdir/../../etc/shadow rejected
+        - test_absolute_curdir_stripped_by_components: CurDir stripped by Rust for absolute paths
+        - test_absolute_clean_path_within_root_ok: normalized absolute path passes
+        - test_absolute_root_exact_ok: workspace root path itself passes
+        Workspace root ParentDir bypass regression (caught at construction time):
+        - test_workspace_root_rejects_parent_dir_bypass_to_etc: /tmp/../etc rejected
+        - test_workspace_root_rejects_deep_parent_dir_bypass: /workspace/../../var rejected
+        - test_workspace_root_rejects_triple_parent_dir_bypass: /home/./user/../../../etc rejected
+        - test_workspace_root_rejects_curdir_component: path with . and .. rejected
+        - test_workspace_root_clean_path_still_works: clean path still accepted
+        Contains() integration:
+        - test_contains_valid_path: WorkspaceConfinement.contains() resolves correctly
+        - test_contains_traversal_rejected: WorkspaceConfinement.contains() blocks traversal
+        Fail-closed construction:
+        - test_new_returns_result_not_raw_struct: validates fail-closed construction pattern
+        Deserialization bypass prevention:
+        - test_deserialize_blocked_root_etc_rejected: /etc rejected on deser
+        - test_deserialize_blocked_root_var_rejected: /var rejected on deser
+        - test_deserialize_blocked_root_slash_rejected: / rejected on deser
+        - test_deserialize_relative_root_rejected: relative root rejected on deser
+        - test_deserialize_empty_root_rejected: empty root rejected on deser
+        - test_deserialize_valid_root_succeeds: valid root roundtrips via serde
+        - test_deserialize_roundtrip_preserves_validity: roundtrip preserves valid state
+        - test_deserialize_traversal_root_rejected: root with .. rejected on deser
+      ref: "cargo test -p apm2-core -- capsule::workspace"

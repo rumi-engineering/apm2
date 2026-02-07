@@ -8,7 +8,9 @@ requirement:
   statement: |
     Tier3+ actuation MUST execute within admitted capsule profiles with namespace, seccomp, cgroup, and deny-by-default egress controls and no ambient OS authority.
 
-    Primary delivery ticket: TCK-00374
+    Multi-ticket delivery: TCK-00374 delivers policy types, validation logic,
+    and unit tests. TCK-00375 wires AdmissionGate::check into the daemon
+    actuation path. TCK-00376 ensures no-bypass path ratchet.
   rationale: |
     Containment boundaries are mandatory for safe autonomous actuation.
   acceptance_criteria:
