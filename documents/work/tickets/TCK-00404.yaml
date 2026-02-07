@@ -1,0 +1,93 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00404"
+    title: "Adopt Nix flake dev shell and worktree-safe global skills sync for agent runtime readiness"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0010"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0012"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0012.yaml#rfc_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_INFRA"
+      - "DOMAIN_BUILD_RELEASE"
+      - "DOMAIN_RUNTIME"
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Add a repository flake (`flake.nix`) with a default devShell that provides the required local developer toolchain for apm2 CLI + daemon work (Rust toolchain compatibility, protoc, cargo helper tools, git/rsync/ripgrep)."
+      - "Add lockfile management for deterministic Nix inputs (`flake.lock`) and document update procedure."
+      - "Create a path-agnostic skills runtime sync command (for example `scripts/dev/skills_runtime_sync.sh`) that treats `documents/skills` as the single source of truth."
+      - "Implement global runtime materialization under `${XDG_STATE_HOME:-$HOME/.local/state}/apm2/skills/<repo_id>/<worktree_id>` so multiple worktrees do not clobber each other."
+      - "Replace copy-based `.claude/skills` behavior with symlink-based behavior (`.claude/skills -> global runtime materialization path`)."
+      - "Update `xtask start-ticket` worktree bootstrap flow to stop recursively copying `.claude` into each worktree and instead invoke link/sync setup for the target worktree."
+      - "Add a deterministic `--check` mode that fails when runtime skills are stale relative to `documents/skills`."
+      - "Document local workflow for developers and agents: initial setup, sync, verify, and worktree behavior."
+      - "Add migration guidance for existing worktrees that currently contain copied `.claude/skills` trees."
+    out_of_scope:
+      - "Migrating CI runners to Nix for all jobs."
+      - "Rewriting all historical RFC/ticket references that mention `.claude/skills` in archival documents."
+      - "Home-manager/system-wide Nix installation policy."
+      - "Provider-specific adapter behavior changes (Codex/Claude/Gemini runtime semantics)."
+  plan:
+    steps:
+      - "Author `flake.nix` with `devShells.default`; include required tools and environment defaults needed by existing commands in CI expectations and local agent workflows."
+      - "Generate and commit `flake.lock`."
+      - "Create `scripts/dev/skills_runtime_sync.sh` with subcommands or flags: `sync` (default), `--check`, and optional `--verbose`."
+      - "In sync mode: resolve repo root dynamically, compute stable `repo_id` and `worktree_id`, rsync `documents/skills/` into the per-worktree global path, and atomically update `.claude/skills` symlink."
+      - "In check mode: compare `documents/skills` and runtime path; exit non-zero on drift."
+      - "Retire hard-coded path behavior from `.claude/sync-skills.sh` by replacing it with a thin wrapper to the new script or deleting it with migration notes."
+      - "Refactor `xtask/src/tasks/start_ticket.rs`: replace recursive `copy_claude_directory` behavior with deterministic link/sync setup for the new worktree."
+      - "Add tests for the path derivation/link setup logic in xtask where feasible (unit tests around target path computation and idempotent setup)."
+      - "Update developer docs (README and/or docs file) with concrete commands: `nix develop`, sync command, check command, and expected worktree layout."
+      - "Run validation: `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo doc --workspace --no-deps`, `cargo test --workspace`."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0012"
+    criteria:
+      - "`flake.nix` exists and `nix develop` yields a usable environment for apm2 CLI + daemon development."
+      - "No script contains machine-specific hard-coded repository paths."
+      - "Skills runtime sync uses `documents/skills` as source of truth and materializes to per-worktree global path."
+      - "`.claude/skills` is symlink-based after setup; copy-based duplication is removed from the normal path."
+      - "Running setup in two different worktrees produces isolated global runtime skill directories and no cross-worktree overwrite."
+      - "`--check` mode detects drift and exits non-zero when runtime skills are stale."
+      - "`xtask start-ticket` no longer recursively copies `.claude` as the primary mechanism."
+      - "Developer documentation includes migration and verification commands."
+      - "Workspace CI-quality commands pass after the change."
+  notes:
+    context: |
+      The current workflow uses copy-based propagation of skills:
+      - `.claude/sync-skills.sh` contains hard-coded absolute paths and manual rsync fanout.
+      - `xtask start-ticket` recursively copies `.claude` into each worktree.
+
+      This creates drift and weak reproducibility for agent workflows in multi-worktree development.
+      A local audit showed divergence between `.claude/skills` and `documents/skills`, meaning
+      the runtime skill set can become stale relative to the documented source of truth.
+
+      For RFC-0018 FAC v0 readiness, reviewers/implementers need deterministic and consistent
+      local agent behavior so end-to-end evidence (`EVID-HEF-0012`) is not invalidated by
+      environment drift.
+    files: |
+      - flake.nix
+      - flake.lock
+      - scripts/dev/skills_runtime_sync.sh
+      - .claude/sync-skills.sh
+      - xtask/src/tasks/start_ticket.rs
+      - README.md
+      - documents/work/tickets/TCK-00404.yaml
+    security: |
+      - Global runtime path must be persistent and non-temporary (avoid `/tmp` roots).
+      - Symlink target resolution must be canonicalized and constrained to the expected global root.
+      - Sync must be fail-closed: on partial failure, do not leave dangling or half-populated runtime trees.
+      - Delete operations (`rsync --delete`) must only target the computed runtime directory for the active worktree.
+      - Skills materialization must not copy credential-bearing files from local private directories.

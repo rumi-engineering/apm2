@@ -976,11 +976,9 @@ impl SqliteLedgerBackend {
     /// // Sign the domain-prefixed payload (as DomainSeparatedCanonical does)
     /// let mut signing_bytes = TOOL_DECIDED_DOMAIN_PREFIX.to_vec();
     /// signing_bytes.extend_from_slice(&payload);
-    /// let signature =
-    ///     sign_with_domain(&signer, TOOL_DECIDED_DOMAIN_PREFIX, &payload);
+    /// let signature = sign_with_domain(&signer, TOOL_DECIDED_DOMAIN_PREFIX, &payload);
     ///
-    /// let mut event =
-    ///     EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    /// let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
     /// event.signature = Some(signature.to_bytes().to_vec());
     ///
     /// // Append with signature verification

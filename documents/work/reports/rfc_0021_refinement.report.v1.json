@@ -7,7 +7,7 @@
     "created_at": "2026-02-05T00:00:00Z",
     "stable_id": "dcp://apm2.local/reports/rfc_0021/refinement@v1",
     "instruction_ref": "dcp://apm2.local/instructions/rfc_0021/refinement@v1",
-    "report_path": "work/reports/rfc_0021_refinement.report.v1.md"
+    "report_path": "documents/work/reports/rfc_0021_refinement.report.v1.md"
   },
   "payload": {
     "status": "completed_with_minor_residual",
@@ -61,7 +61,7 @@
       "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0008.yaml",
       "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0009.yaml",
       "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0010.yaml",
-      "work/prompts/instruction.rfc_0021_refinement.alien_engineering_protocol.v1.json"
+      "documents/work/prompts/instruction.rfc_0021_refinement.alien_engineering_protocol.v1.json"
     ]
   }
 }

@@ -787,9 +787,7 @@ pub const CONTEXT_PACK_SPEC_VERSION: &str = "v1";
 /// # Example
 ///
 /// ```rust
-/// use apm2_core::cac::pack_spec::{
-///     BudgetConstraint, ContextPackSpec, TypedQuantity,
-/// };
+/// use apm2_core::cac::pack_spec::{BudgetConstraint, ContextPackSpec, TypedQuantity};
 ///
 /// let spec = ContextPackSpec::builder()
 ///     .spec_id("my-pack-001")

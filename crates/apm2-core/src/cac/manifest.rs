@@ -24,8 +24,7 @@
 //!
 //! ```rust
 //! use apm2_core::cac::manifest::{
-//!     Capability, CapabilityManifest, Command, ManifestConfig,
-//!     VerificationMethod,
+//!     Capability, CapabilityManifest, Command, ManifestConfig, VerificationMethod,
 //! };
 //!
 //! // Create a manifest configuration

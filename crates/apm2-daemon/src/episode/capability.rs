@@ -4289,9 +4289,7 @@ impl std::error::Error for CustodyDomainError {}
 /// # Example
 ///
 /// ```rust
-/// use apm2_daemon::episode::capability::{
-///     CustodyDomainId, validate_custody_domain_overlap,
-/// };
+/// use apm2_daemon::episode::capability::{CustodyDomainId, validate_custody_domain_overlap};
 ///
 /// let executor = vec![CustodyDomainId::new("team-review").unwrap()];
 /// let authors = vec![CustodyDomainId::new("team-dev").unwrap()];
@@ -4366,9 +4364,7 @@ pub fn validate_custody_domain_overlap(
 /// ```rust
 /// use std::collections::HashMap;
 ///
-/// use apm2_daemon::episode::capability::{
-///     CustodyDomainId, extract_custody_domains,
-/// };
+/// use apm2_daemon::episode::capability::{CustodyDomainId, extract_custody_domains};
 ///
 /// // Mock resolver: maps actor_id -> domains
 /// let domain_map: HashMap<&str, Vec<&str>> =

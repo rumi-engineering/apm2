@@ -44,17 +44,16 @@
 //!
 //! // Create a gate receipt
 //! let signer = Signer::generate();
-//! let receipt =
-//!     GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")
-//!         .changeset_digest([0x42; 32])
-//!         .executor_actor_id("executor-001")
-//!         .receipt_version(1)
-//!         .payload_kind("aat")
-//!         .payload_schema_version(1)
-//!         .payload_hash([0xAB; 32])
-//!         .evidence_bundle_hash([0xCD; 32])
-//!         .passed(true)
-//!         .build_and_sign(&signer);
+//! let receipt = GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")
+//!     .changeset_digest([0x42; 32])
+//!     .executor_actor_id("executor-001")
+//!     .receipt_version(1)
+//!     .payload_kind("aat")
+//!     .payload_schema_version(1)
+//!     .payload_hash([0xAB; 32])
+//!     .evidence_bundle_hash([0xCD; 32])
+//!     .passed(true)
+//!     .build_and_sign(&signer);
 //!
 //! // Validate version in enforce mode
 //! assert!(receipt.validate_version(true).is_ok());
@@ -360,17 +359,16 @@ impl GateReceipt {
     /// use apm2_core::fac::GateReceiptBuilder;
     ///
     /// let signer = Signer::generate();
-    /// let receipt =
-    ///     GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")
-    ///         .changeset_digest([0x42; 32])
-    ///         .executor_actor_id("executor-001")
-    ///         .receipt_version(1)
-    ///         .payload_kind("aat")
-    ///         .payload_schema_version(1)
-    ///         .payload_hash([0xAB; 32])
-    ///         .evidence_bundle_hash([0xCD; 32])
-    ///         .passed(true)
-    ///         .build_and_sign(&signer);
+    /// let receipt = GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")
+    ///     .changeset_digest([0x42; 32])
+    ///     .executor_actor_id("executor-001")
+    ///     .receipt_version(1)
+    ///     .payload_kind("aat")
+    ///     .payload_schema_version(1)
+    ///     .payload_hash([0xAB; 32])
+    ///     .evidence_bundle_hash([0xCD; 32])
+    ///     .passed(true)
+    ///     .build_and_sign(&signer);
     ///
     /// // Enforce mode: errors on unknown versions
     /// assert!(receipt.validate_version(true).is_ok());

@@ -419,9 +419,9 @@ impl GateLease {
     /// ```rust
     /// use apm2_core::crypto::Signer;
     /// use apm2_core::fac::{
-    ///     AatAttestation, AatGateReceipt, AatGateReceiptBuilder,
-    ///     AatLeaseExtension, AatVerdict, DeterminismClass, DeterminismStatus,
-    ///     FlakeClass, GateLeaseBuilder, RiskTier, TerminalVerifierOutput,
+    ///     AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatLeaseExtension, AatVerdict,
+    ///     DeterminismClass, DeterminismStatus, FlakeClass, GateLeaseBuilder, RiskTier,
+    ///     TerminalVerifierOutput,
     /// };
     ///
     /// let signer = Signer::generate();
@@ -580,8 +580,7 @@ impl GateLease {
 ///
 /// ```rust
 /// use apm2_core::fac::{
-///     CustodyDomain, KeyBinding, KeyPolicy, KeyPolicyBuilder,
-///     validate_custody_for_aat_lease,
+///     CustodyDomain, KeyBinding, KeyPolicy, KeyPolicyBuilder, validate_custody_for_aat_lease,
 /// };
 ///
 /// let policy = KeyPolicyBuilder::new("policy-001")
@@ -605,14 +604,10 @@ impl GateLease {
 ///     .build();
 ///
 /// // Bob can review Alice's code (different custody domains)
-/// assert!(
-///     validate_custody_for_aat_lease(&policy, "key-bob", "alice").is_ok()
-/// );
+/// assert!(validate_custody_for_aat_lease(&policy, "key-bob", "alice").is_ok());
 ///
 /// // Alice cannot review her own code (same custody domain)
-/// assert!(
-///     validate_custody_for_aat_lease(&policy, "key-alice", "alice").is_err()
-/// );
+/// assert!(validate_custody_for_aat_lease(&policy, "key-alice", "alice").is_err());
 /// ```
 pub fn validate_custody_for_aat_lease(
     key_policy: &KeyPolicy,
@@ -693,16 +688,10 @@ pub fn validate_custody_for_aat_lease(
 ///     .build();
 ///
 /// // Bob can review Alice's code (different custody domains)
-/// assert!(
-///     validate_custody_for_aat_lease_by_actor(&policy, "bob", "alice")
-///         .is_ok()
-/// );
+/// assert!(validate_custody_for_aat_lease_by_actor(&policy, "bob", "alice").is_ok());
 ///
 /// // Alice cannot review her own code (same person)
-/// assert!(
-///     validate_custody_for_aat_lease_by_actor(&policy, "alice", "alice")
-///         .is_err()
-/// );
+/// assert!(validate_custody_for_aat_lease_by_actor(&policy, "alice", "alice").is_err());
 /// ```
 pub fn validate_custody_for_aat_lease_by_actor(
     key_policy: &KeyPolicy,

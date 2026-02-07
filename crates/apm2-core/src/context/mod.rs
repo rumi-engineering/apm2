@@ -51,23 +51,20 @@
 //!     ContextAwareValidator, DefaultContextFirewall, FirewallMode,
 //! };
 //! use apm2_core::context::{
-//!     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
-//!     ManifestEntryBuilder,
+//!     AccessLevel, ContextPackManifest, ContextPackManifestBuilder, ManifestEntryBuilder,
 //! };
 //!
-//! let manifest =
-//!     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-//!         .add_entry(
-//!             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
-//!                 .stable_id("main")
-//!                 .access_level(AccessLevel::Read)
-//!                 .build(),
-//!         )
-//!         .build();
+//! let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+//!     .add_entry(
+//!         ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+//!             .stable_id("main")
+//!             .access_level(AccessLevel::Read)
+//!             .build(),
+//!     )
+//!     .build();
 //!
 //! // Create firewall with SoftFail mode
-//! let firewall =
-//!     DefaultContextFirewall::new(&manifest, FirewallMode::SoftFail);
+//! let firewall = DefaultContextFirewall::new(&manifest, FirewallMode::SoftFail);
 //!
 //! // Validate reads through the firewall
 //! let result = firewall.validate_read("/project/src/main.rs", None);

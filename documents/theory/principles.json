@@ -7,11 +7,11 @@
     "classification": "PUBLIC",
     "created_at": "2026-02-04T22:30:00Z",
     "description": "Operational principles for holonic design, providing guidance and best practices for agent-native systems.",
-    "source_of_truth_ref": "HOLONIC_SUBSTRATE_INTERFACE.md"
+    "source_of_truth_ref": "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
   },
   "payload": {
     "version": "1.0.0",
-    "principle_count": 102,
+    "principle_count": 124,
     "principles": [
       {
         "id": "PRIN-001",
@@ -68,9 +68,25 @@
         "id": "PRIN-004",
         "name": "GEMM Tiling/blocking",
         "title": "Locality engineering is *the* performance lever",
-        "formal": "",
-        "apm2_mapping": "",
-        "connections": []
+        "formal": "Blocking transforms data movement from bandwidth-bound to cache-local regimes. By partitioning work into tiles that fit near compute, total runtime shifts from repeated full-surface transfers to bounded local reuse.",
+        "apm2_mapping": "Theory thread: locality is a cognition law, not a hardware trick. Any multi-step reasoning system benefits when relevant state is partitioned into stable, reusable tiles; unbounded global context scans are an anti-pattern that increases noise and cost.",
+        "connections": [
+          "PRIN-002",
+          "PRIN-003",
+          "PRIN-013",
+          "PRIN-021",
+          "PRIN-097"
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-CONTEXTPACK"
+        ],
+        "defect_refs": [
+          "CONTEXT_OVERBUDGET"
+        ]
       },
       {
         "id": "PRIN-005",
@@ -98,7 +114,7 @@
         "name": "Amdahl + Gustafson",
         "title": "Small serial paths dominate at scale",
         "formal": "Amdahl:\n[\nS(N)=\\frac{1}{(1-p)+p/N}\n]\nGustafson: scaled speedup grows with problem size:\n[\nS(N)=N-(1-p)(N-1)\n]",
-        "apm2_mapping": "APM2’s serial fraction is the **control plane**: policy decisions, lease issuance, ledger append, gate adjudication. If those are slow or flaky, the whole holarchy stalls. Hence: keep control-plane state minimal (PRIN-049), deterministic (PRIN-059), and always-on. Anything expensive must move to the data plane with receipts.",
+        "apm2_mapping": "APM2’s serial fraction is the **control plane**: policy decisions, lease issuance, ledger append, gate resolution. If those are slow or flaky, the whole holarchy stalls. Hence: keep control-plane state minimal (PRIN-049), deterministic (PRIN-059), and always-on. Anything expensive must move to the data plane with receipts.",
         "connections": [
           "PRIN-049",
           "PRIN-059",
@@ -411,6 +427,12 @@
         "connections": [
           "PRIN-050",
           "PRIN-065"
+        ],
+        "law_refs": [
+          "LAW-09"
+        ],
+        "mechanism_refs": [
+          "MECH-LEDGER"
         ]
       },
       {
@@ -482,7 +504,7 @@
         "name": "Secure Boot + Measured Boot",
         "title": "Bind software state to hardware roots of trust",
         "formal": "a chain of trust extends from hardware (TPM) through bootloader to OS.",
-        "apm2_mapping": "to scale beyond one developer machine, APM2 needs executor attestation. Otherwise your “kernel” can be replaced and still claim compliance.",
+        "apm2_mapping": "to scale beyond one developer machine, APM2 needs executor integrity proofs bound to signed runtime measurements. Otherwise your “kernel” can be replaced and still claim compliance.",
         "connections": [
           "PRIN-037",
           "PRIN-044"
@@ -490,10 +512,10 @@
       },
       {
         "id": "PRIN-037",
-        "name": "Remote Attestation",
-        "title": "Trust becomes a verifiable claim",
-        "formal": "prove to a verifier that the prover is running approved code/config, typically using TPM quotes or enclave attestation.",
-        "apm2_mapping": "any node receiving authority (capabilities, keys, deployment power) must present attestation *before* delegation. This aligns with APM2’s “fail-closed” posture: if attestation missing/unverifiable, deny.",
+        "name": "Execution Integrity Proofs",
+        "title": "Trust becomes a machine-checkable claim",
+        "formal": "prove to a verifier that the prover is running approved code/config via signed measurement proofs (e.g., TPM quotes, reproducible runner digests, sealed policy/toolchain bindings).",
+        "apm2_mapping": "any node receiving authority (capabilities, keys, deployment power) must present execution integrity proof *before* delegation. This aligns with APM2’s fail-closed posture: if integrity proof is missing or unverifiable, deny.",
         "connections": [
           "PRIN-038",
           "PRIN-093",
@@ -505,12 +527,14 @@
         "name": "Capability-based Security",
         "title": "Prevent ambient authority via attenuable tokens",
         "formal": "authority is represented explicitly as a capability object; delegation is attenuation:\n[\ncap' \\preceq cap\n]\nin a partial order of privilege.",
-        "apm2_mapping": "APM2 already implements OCAP in the lease/capability system: scope hashes, budgets, expiry, delegation depth, signatures. This is the primary defense against confused-deputy prompt injection. Treat capability attenuation as a *lattice* (PRIN-071): operations should be monotone (only reduce privileges).",
+        "apm2_mapping": "APM2 already implements OCAP in the lease/capability system: scope hashes, budgets, expiry, delegation depth, signatures. This is the primary defense against confused-deputy prompt injection. Treat capability attenuation as a *lattice* (PRIN-071): operations should be monotone (only reduce privileges). This is cross-scale: on one host with 10 agents and in federated operation, authority is granted by capabilities, never by location, branch access, or narrative trust.",
         "connections": [
           "PRIN-071",
           "PRIN-089",
           "PRIN-090",
-          "PRIN-091"
+          "PRIN-091",
+          "PRIN-094",
+          "PRIN-124"
         ]
       },
       {
@@ -570,8 +594,8 @@
         "id": "PRIN-044",
         "name": "Supply-chain Provenance",
         "title": "Promotion is graph verification, not a trust leap",
-        "formal": "verify build graph integrity: source → build → artifact → deploy, with signed attestations.",
-        "apm2_mapping": "APM2 already wants evidence bundles; extend to full supply chain: deterministic builds (PRIN-058), provenance attestations, and content-addressed artifact manifests. Promotion should require verifying the graph, not “someone said it passed.”",
+        "formal": "verify build graph integrity: source → build → artifact → deploy, with signed provenance receipts and integrity proofs.",
+        "apm2_mapping": "APM2 already wants evidence bundles; extend to full supply chain: deterministic builds (PRIN-058), provenance receipts, execution integrity proofs, and content-addressed artifact manifests. Promotion should require verifying the graph, not “someone said it passed.”",
         "connections": [
           "PRIN-058",
           "PRIN-092"
@@ -605,10 +629,20 @@
         "name": "Event Sourcing",
         "title": "Model system as sequence of decisions, not hidden state mutation",
         "formal": "state is a fold over events:\n[\nstate_t = fold(apply, state_0, events_{0:t})\n]",
-        "apm2_mapping": "this is literally APM2’s kernel: ledger events + deterministic reducers. Operationally: “the truth” is the event stream + CAS. Everything else is a projection.",
+        "apm2_mapping": "this is literally APM2’s kernel: ledger events + deterministic reducers. Operationally: “the truth” is the event stream + CAS. Everything else is a projection. Scale does not change this semantic split: one box and global federation both treat projections as disposable caches over authoritative facts.",
         "connections": [
           "PRIN-059",
-          "PRIN-095"
+          "PRIN-095",
+          "PRIN-123"
+        ],
+        "law_refs": [
+          "LAW-03"
+        ],
+        "mechanism_refs": [
+          "MECH-LEDGER"
+        ],
+        "defect_refs": [
+          "SILENT_MEMORY_MUTATION"
         ]
       },
       {
@@ -680,11 +714,21 @@
         "name": "Backpressure",
         "title": "The only honest overload strategy",
         "formal": "when downstream cannot process, upstream must slow/stop; otherwise queues explode.",
-        "apm2_mapping": "APM2 already implements backpressure in resource governance for pulse subscriptions and in budgets for sessions. Push it everywhere: tool execution pools, replication streams, CI import, gate evaluation. Also: treat “cannot accept work” as a normal outcome, not an error.",
+        "apm2_mapping": "APM2 already implements backpressure in resource governance for pulse subscriptions and in budgets for sessions. Push it everywhere: tool execution pools, replication streams, CI import, gate evaluation. Also: treat “cannot accept work” as a normal outcome, not an error. This is scale invariant: local worker pools and inter-cell planes use the same admission-control law with different capacity vectors.",
         "connections": [
           "PRIN-009",
           "PRIN-025",
-          "PRIN-027"
+          "PRIN-027",
+          "PRIN-094"
+        ],
+        "law_refs": [
+          "LAW-12"
+        ],
+        "mechanism_refs": [
+          "MECH-LEASES-BUDGETS"
+        ],
+        "defect_refs": [
+          "UNBOUNDED_SEARCH"
         ]
       },
       {
@@ -1109,6 +1153,15 @@
         "connections": [
           "PRIN-031",
           "PRIN-092"
+        ],
+        "law_refs": [
+          "LAW-13"
+        ],
+        "mechanism_refs": [
+          "MECH-SCHEMAS"
+        ],
+        "defect_refs": [
+          "SCHEMA_VIOLATION"
         ]
       },
       {
@@ -1128,13 +1181,24 @@
         "name": "Evidence-carrying Actions",
         "title": "Every merge/deploy requires machine-checkable receipts",
         "formal": "action validity predicate:\n[\nValid(Output,Receipt,Evidence)=VerifyReceipt \\wedge EvidenceSatisfies(contract) \\wedge DigestBindingsHold\n]\n(Exactly the direction APM2’s unified theory pushes.)",
-        "apm2_mapping": "AAT bundles, merge receipts, CI attestations—these are not “docs,” they are the core security boundary. Anything not bound to evidence is not real.",
+        "apm2_mapping": "AAT bundles, merge receipts, CI integrity receipts—these are not “docs,” they are the core security boundary. Anything not bound to evidence is not real. This predicate is unchanged by scale: local PR merges and federated promotions both require the same receipt/evidence/digest validity, with only proof economics and batching changing.",
         "connections": [
           "PRIN-044",
           "PRIN-045",
           "PRIN-046",
           "PRIN-047",
-          "PRIN-085"
+          "PRIN-085",
+          "PRIN-121"
+        ],
+        "law_refs": [
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-CAS",
+          "MECH-LEDGER"
+        ],
+        "defect_refs": [
+          "MEASUREMENT_INTEGRITY"
         ]
       },
       {
@@ -1153,13 +1217,22 @@
         "name": "Risk Classes + Autonomy Levels",
         "title": "Gate authority by evidence and risk",
         "formal": "define an authority lattice and a promotion function:\n[\nauthority = f(risk, evidence, budget_headroom)\n]",
-        "apm2_mapping": "APM2 already encodes risk tiers in factory logic; make it universal with explicit four-tier Unified Theory semantics (T0..T3) and lossless mapping to daemon tiers (Tier0..Tier4): suggest → patch → merge → deploy are different effect classes requiring escalating receipts and isolation.",
+        "apm2_mapping": "APM2 already encodes risk tiers in factory logic; make it universal with explicit four-tier Unified Theory semantics (T0..T3) and lossless mapping to daemon tiers (Tier0..Tier4): suggest → patch → merge → deploy are different effect classes requiring escalating receipts and isolation. The same risk vocabulary applies on one host and at federated scale; only thresholds and capacity envelopes vary.",
         "connections": [
           "PRIN-063",
           "PRIN-089",
           "PRIN-090",
           "PRIN-091",
           "PRIN-092"
+        ],
+        "law_refs": [
+          "LAW-14"
+        ],
+        "mechanism_refs": [
+          "MECH-LEASES-BUDGETS"
+        ],
+        "defect_refs": [
+          "CAPABILITY_OVERGRANT"
         ]
       },
       {
@@ -1212,15 +1285,17 @@
       },
       {
         "id": "PRIN-099",
-        "name": "Sociotechnical Incident Response",
-        "title": "Convert failure into stronger contracts and rollback triggers",
-        "formal": "postmortems produce actionable countermeasures; automate rollback based on SLO/budget triggers.",
-        "apm2_mapping": "incidents should mint new defects and new gates. If a failure mode happens twice, governance failed. Tie rollback triggers to burn-rate and to explicit receipts, not human panic. This is how Phase‑1 recursion becomes monotonic improvement.",
+        "name": "Incident Response and Countermeasure Compilation",
+        "title": "Convert failure into stronger contracts, gates, and rollback triggers",
+        "formal": "incident closure produces actionable countermeasures and automated rollback/recovery triggers linked to measurable SLO and budget conditions.",
+        "apm2_mapping": "incidents should mint new defects and new gates. If a failure mode happens twice, governance failed. Tie rollback triggers to burn-rate and explicit receipts. This is cross-scale: same loop on one node or federation, with different blast-radius envelopes.",
         "connections": [
           "PRIN-063",
           "PRIN-064",
           "PRIN-067",
-          "PRIN-092"
+          "PRIN-092",
+          "PRIN-121",
+          "PRIN-124"
         ]
       },
       {
@@ -1275,8 +1350,595 @@
           "LAW-04"
         ],
         "mechanism_refs": [
-          "LOOP-RECURRENCE",
+          "MECH-REPETITION-DETECTION",
           "MECH-WORK-DECOMPOSITION"
+        ]
+      },
+      {
+        "id": "PRIN-103",
+        "name": "Privacy as Information Boundary Geometry",
+        "title": "Identifiability, utility, and disclosure form a constrained manifold",
+        "formal": "Any disclosure channel changes posterior inference power. Privacy analysis requires bounding composition effects, linkage risk, and adversarial re-identification under repeated observations.",
+        "apm2_mapping": "Theory thread: privacy is a structural property of information flows, not a UI preference. The relevant abstraction is boundary geometry: what can cross, at what granularity, for how long, and under what inferential assumptions.",
+        "connections": [
+          "PRIN-042",
+          "PRIN-043",
+          "PRIN-066",
+          "PRIN-092"
+        ],
+        "law_refs": [
+          "LAW-15",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-CAS",
+          "MECH-SCHEMAS"
+        ],
+        "defect_refs": [
+          "MEASUREMENT_INTEGRITY",
+          "CONTEXT_BLEED"
+        ]
+      },
+      {
+        "id": "PRIN-104",
+        "name": "Jurisdictional Pluralism and Legal Realism",
+        "title": "Normative validity is multi-jurisdictional and time-varying",
+        "formal": "A rule set valid in one jurisdiction may be invalid in another; legal admissibility is context-indexed by authority domain, temporal scope, and conflict-of-law hierarchy.",
+        "apm2_mapping": "Theory thread: governance must model legal reality as plural, not singular. Knowledge claims should carry jurisdictional context, conflict predicates, and explicit uncertainty where legal interpretation is non-unique.",
+        "connections": [
+          "PRIN-084",
+          "PRIN-085",
+          "PRIN-099"
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-14",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-WORK-DECOMPOSITION"
+        ],
+        "defect_refs": [
+          "POLICY_VIOLATION"
+        ]
+      },
+      {
+        "id": "PRIN-105",
+        "name": "Deterministic Re-verification and Reversal",
+        "title": "Correctness requires auditable re-check and bounded reversal paths",
+        "formal": "For high-impact decisions, correctness requires deterministic machine re-verification channels, evidence visibility, and bounded reversal semantics with provenance.",
+        "apm2_mapping": "Theory thread: closed-loop governance is incomplete without re-verification loops. A knowledge system is stronger when disagreement is resolved by independent machine reruns that can repair upstream assumptions.",
+        "connections": [
+          "PRIN-057",
+          "PRIN-085",
+          "PRIN-099"
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-07",
+          "LAW-12",
+          "LAW-14",
+          "LAW-16",
+          "LAW-20"
+        ],
+        "mechanism_refs": [
+          "MECH-LEDGER",
+          "MECH-WORK-DECOMPOSITION"
+        ],
+        "defect_refs": [
+          "EVALUATOR_DRIFT",
+          "MEASUREMENT_INTEGRITY"
+        ]
+      },
+      {
+        "id": "PRIN-106",
+        "name": "Epistemic Hygiene and Uncertainty Calibration",
+        "title": "Belief quality depends on calibration, provenance, and contradiction handling",
+        "formal": "Reliable epistemic state requires calibrated uncertainty, source-weighted updates, and explicit contradiction management; confidence prose without update semantics is not evidence.",
+        "apm2_mapping": "Theory thread: reasoning quality is a control problem over beliefs, not outputs. A robust theory stack preserves uncertainty metadata and differentiates unknown, conflicting, and falsified states.",
+        "connections": [
+          "PRIN-076",
+          "PRIN-079",
+          "PRIN-087",
+          "PRIN-101"
+        ],
+        "law_refs": [
+          "LAW-07",
+          "LAW-08",
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-MONITOR-ISOLATION",
+          "MECH-EVALUATOR-AUDIT"
+        ],
+        "defect_refs": [
+          "EVALUATOR_DRIFT",
+          "MONITOR_GAMING"
+        ]
+      },
+      {
+        "id": "PRIN-107",
+        "name": "Ontology Governance and Semantic Drift",
+        "title": "Shared meaning requires explicit concept evolution rules",
+        "formal": "Distributed cognition collapses when symbol grounding drifts. Stable ontology requires canonical terms, versioned synonym maps, and drift detection under composition.",
+        "apm2_mapping": "Theory thread: semantics must be governed as infrastructure. Concept drift, alias sprawl, and implicit renaming are epistemic failure modes that degrade model signal-to-noise over time. This is scale invariant: semantic drift destroys correctness in a single repository and in a 100B-agent federation alike.",
+        "connections": [
+          "PRIN-013",
+          "PRIN-071",
+          "PRIN-097",
+          "PRIN-111"
+        ],
+        "law_refs": [
+          "LAW-03",
+          "LAW-13",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-SCHEMAS",
+          "MECH-CONTEXTPACK"
+        ],
+        "defect_refs": [
+          "SCHEMA_VIOLATION",
+          "SCHEMA_DRIFT",
+          "INTERFACE_PROLIFERATION"
+        ]
+      },
+      {
+        "id": "PRIN-108",
+        "name": "Epochal Schema Evolution",
+        "title": "Forward evolution with explicit discontinuities",
+        "formal": "Schema/protocol evolution should assume explicit epoch boundaries and deliberate breaking changes when needed. Compatibility is an explicit contract, not a default promise.",
+        "apm2_mapping": "Theory thread: evolution speed comes from explicit epoch cuts, typed migration receipts, and clear validity windows. Backward compatibility can be offered selectively, but the default is forward movement with auditable transition semantics.",
+        "connections": [
+          "PRIN-009",
+          "PRIN-050",
+          "PRIN-093",
+          "PRIN-097",
+          "PRIN-112"
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-13",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-SCHEMAS",
+          "MECH-ANTI-ENTROPY"
+        ],
+        "defect_refs": [
+          "SCHEMA_DRIFT",
+          "ABSTRACTION_BREAK"
+        ]
+      },
+      {
+        "id": "PRIN-109",
+        "name": "Adversarial Economics and Collusion Resistance",
+        "title": "Incentive systems must assume coalitions and strategic manipulation",
+        "formal": "Mechanisms robust to single-agent honesty assumptions can fail under coalition formation, sybil amplification, and side-channel coordination. Incentive compatibility must be stress-tested under adversarial game dynamics.",
+        "apm2_mapping": "Theory thread: economics is a security surface. Claims about efficiency or truthfulness are incomplete unless they model collusion, manipulation costs, and detectable exploit signatures.",
+        "connections": [
+          "PRIN-083",
+          "PRIN-084",
+          "PRIN-085",
+          "PRIN-098"
+        ],
+        "law_refs": [
+          "LAW-08",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-MONITOR-ISOLATION",
+          "MECH-EVALUATOR-AUDIT"
+        ],
+        "defect_refs": [
+          "MONITOR_GAMING",
+          "POLICY_VIOLATION"
+        ]
+      },
+      {
+        "id": "PRIN-110",
+        "name": "Externality Accounting and Thermodynamic Governance",
+        "title": "Optimization must include hidden physical and social externalities",
+        "formal": "Objective functions that ignore externalized cost terms produce locally optimal but globally degrading dynamics. Sustainable optimization requires explicit externality terms and uncertainty bounds.",
+        "apm2_mapping": "Theory thread: energy, latency, storage, and social risk are coupled budget dimensions. Theory quality improves when optimization narratives include what was previously omitted from cost accounting.",
+        "connections": [
+          "PRIN-001",
+          "PRIN-006",
+          "PRIN-063"
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-14"
+        ],
+        "mechanism_refs": [
+          "MECH-LEASES-BUDGETS"
+        ],
+        "defect_refs": [
+          "REDUNDANT_COMPUTE",
+          "CONTEXT_OVERBUDGET"
+        ]
+      },
+      {
+        "id": "PRIN-111",
+        "name": "Civilizational Agent Ecology",
+        "title": "Design with one invariant architecture from small cells to 100B-agent holarchies",
+        "formal": "Architecture should preserve the same boundary primitives across cardinalities; increasing scale changes topology, budgets, and proof economics, not semantic contracts. At 10^11-agent cardinality, locality, hierarchy depth, and summary quality dominate.",
+        "apm2_mapping": "Theory thread: treat single-host 10-20 agent deployments as small cells of the same holonic system. Do not fork semantics by scale; vary placement, capacity, and verifier economics while keeping authority, evidence, and composition primitives identical.",
+        "connections": [
+          "PRIN-038",
+          "PRIN-047",
+          "PRIN-053",
+          "PRIN-092",
+          "PRIN-024",
+          "PRIN-049",
+          "PRIN-057",
+          "PRIN-083",
+          "PRIN-100",
+          "PRIN-121",
+          "PRIN-124"
+        ],
+        "law_refs": [
+          "LAW-10",
+          "LAW-14",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-FEDERATION",
+          "MECH-HOLON-DIRECTORY",
+          "MECH-ANTI-ENTROPY"
+        ],
+        "defect_refs": [
+          "INTERFACE_PROLIFERATION",
+          "UNBOUNDED_SEARCH"
+        ]
+      },
+      {
+        "id": "PRIN-112",
+        "name": "Forward-Only Evolution",
+        "title": "Prefer explicit epoch cuts over perpetual compatibility drag",
+        "formal": "Systems optimized for endless backward compatibility accumulate semantic debt and observational ambiguity. Explicit epoch transitions with migration proofs improve long-horizon coherence.",
+        "apm2_mapping": "Theory thread: deliberate discontinuity can raise signal-to-noise when transition boundaries are explicit, signed, and testable. The objective is not compatibility theater; it is semantic clarity across time.",
+        "connections": [
+          "PRIN-060",
+          "PRIN-093",
+          "PRIN-108"
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-13",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-SCHEMAS",
+          "MECH-ANTI-ENTROPY"
+        ],
+        "defect_refs": [
+          "SCHEMA_DRIFT",
+          "ABSTRACTION_BREAK"
+        ]
+      },
+      {
+        "id": "PRIN-113",
+        "name": "Sampling Theorem and Aliasing",
+        "title": "Telemetry cadence shapes perceived reality",
+        "formal": "Any sampled signal with cadence below its effective variation bandwidth aliases higher-frequency dynamics into misleading low-frequency patterns.",
+        "apm2_mapping": "Theory thread: false stability and fake incidents can both be sampling artifacts. Observability design must treat cadence selection as a governance decision, not a logging default.",
+        "connections": [
+          "PRIN-029",
+          "PRIN-063",
+          "PRIN-066",
+          "PRIN-087"
+        ],
+        "law_refs": [
+          "LAW-08",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-SIGNAL-SAMPLING-GOVERNANCE",
+          "MECH-EVALUATOR-AUDIT"
+        ],
+        "defect_refs": [
+          "MEASUREMENT_INTEGRITY",
+          "EVALUATOR_DRIFT"
+        ]
+      },
+      {
+        "id": "PRIN-114",
+        "name": "Anti-Alias Filtering and Robust Smoothing",
+        "title": "Suppress noise before governance reacts",
+        "formal": "Low-pass/robust filtering prior to downsampling reduces alias-induced instability and limits outlier-driven controller overreaction.",
+        "apm2_mapping": "Theory thread: raw spikes are not decisions. Systems improve when they separate measurement preprocessing from policy actuation and preserve filter provenance.",
+        "connections": [
+          "PRIN-029",
+          "PRIN-064",
+          "PRIN-087",
+          "PRIN-113"
+        ],
+        "law_refs": [
+          "LAW-08",
+          "LAW-12",
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-ANTI-ALIAS-FILTERING",
+          "MECH-EPISTEMIC-CALIBRATION"
+        ],
+        "defect_refs": [
+          "MEASUREMENT_INTEGRITY",
+          "EVALUATOR_DRIFT"
+        ]
+      },
+      {
+        "id": "PRIN-115",
+        "name": "State Estimation under Partial Observability",
+        "title": "Observed signals are projections of hidden state",
+        "formal": "Control and planning should operate over estimated latent state with uncertainty bounds, not over raw observables alone.",
+        "apm2_mapping": "Theory thread: the factory never observes full truth in real time. Belief-state estimation (Kalman-like/Bayesian style) improves decision quality and reduces oscillatory overfitting to noisy signals.",
+        "connections": [
+          "PRIN-076",
+          "PRIN-079",
+          "PRIN-106",
+          "PRIN-113"
+        ],
+        "law_refs": [
+          "LAW-04",
+          "LAW-07",
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-STATE-ESTIMATION",
+          "MECH-EPISTEMIC-CALIBRATION"
+        ],
+        "defect_refs": [
+          "MEASUREMENT_INTEGRITY",
+          "EVALUATOR_DRIFT"
+        ]
+      },
+      {
+        "id": "PRIN-116",
+        "name": "Change-Point Detection vs Outliers",
+        "title": "Detect regime shifts, not just anomalies",
+        "formal": "A robust controller distinguishes structural distribution shift from transient outliers to avoid inappropriate policy transitions.",
+        "apm2_mapping": "Theory thread: adaptation should trigger on validated regime change, not single excursions. This preserves stability while still allowing rapid response to real shifts.",
+        "connections": [
+          "PRIN-077",
+          "PRIN-087",
+          "PRIN-114"
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-CHANGEPOINT-DETECTION",
+          "MECH-FRESHNESS-POLICY"
+        ],
+        "defect_refs": [
+          "EVALUATOR_DRIFT",
+          "MEASUREMENT_INTEGRITY"
+        ]
+      },
+      {
+        "id": "PRIN-117",
+        "name": "Delay-Aware Feedback Stability",
+        "title": "Actuation delay can destabilize otherwise good control",
+        "formal": "Feedback control with delayed observations or delayed actuation requires explicit delay margins to avoid oscillation and limit cycles.",
+        "apm2_mapping": "Theory thread: governance loops that ignore CI/network/human delay frequently thrash. Delay-aware gain/threshold selection preserves progress under realistic latency.",
+        "connections": [
+          "PRIN-028",
+          "PRIN-029",
+          "PRIN-118"
+        ],
+        "law_refs": [
+          "LAW-12",
+          "LAW-14"
+        ],
+        "mechanism_refs": [
+          "MECH-DELAY-AWARE-CONTROL",
+          "MECH-MULTIRATE-CONTROL"
+        ],
+        "defect_refs": [
+          "REASONING_DEGENERATION",
+          "UNBOUNDED_SEARCH"
+        ]
+      },
+      {
+        "id": "PRIN-118",
+        "name": "Hysteresis, Deadbands, and Hold-Down Timers",
+        "title": "Avoid flip-flop policy behavior",
+        "formal": "State transitions in noisy environments are stabilized by asymmetric thresholds, neutral zones, and minimum dwell intervals.",
+        "apm2_mapping": "Theory thread: policy churn is often an avoidable control artifact. Hysteresis constructs reduce needless mode switching and improve explainability of governance actions.",
+        "connections": [
+          "PRIN-029",
+          "PRIN-057",
+          "PRIN-117"
+        ],
+        "law_refs": [
+          "LAW-12",
+          "LAW-14",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-DEADBAND-HYSTERESIS",
+          "MECH-BACKPRESSURE"
+        ],
+        "defect_refs": [
+          "UNBOUNDED_SEARCH",
+          "POLICY_VIOLATION"
+        ]
+      },
+      {
+        "id": "PRIN-119",
+        "name": "Multi-Rate Hierarchical Control",
+        "title": "Fast local loops, slower global loops",
+        "formal": "Large systems remain stable when inner loops operate at higher frequency on local state and outer loops operate at lower frequency on aggregated summaries.",
+        "apm2_mapping": "Theory thread: the holarchy is a control stack. Local repair/containment loops should be fast; cross-cell governance and strategy loops should be slower and evidence-rich.",
+        "connections": [
+          "PRIN-052",
+          "PRIN-057",
+          "PRIN-111",
+          "PRIN-117"
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-10",
+          "LAW-16"
+        ],
+        "mechanism_refs": [
+          "MECH-MULTIRATE-CONTROL",
+          "MECH-HOLON-MESH-PROTOCOL"
+        ],
+        "defect_refs": [
+          "INTERFACE_PROLIFERATION",
+          "UNBOUNDED_SEARCH"
+        ]
+      },
+      {
+        "id": "PRIN-120",
+        "name": "Signal Provenance and Trust Weighting",
+        "title": "Signals carry confidence as well as value",
+        "formal": "Decision quality improves when each signal is weighted by source integrity, freshness, calibration quality, and attack surface rather than treated uniformly.",
+        "apm2_mapping": "Theory thread: not all telemetry deserves equal control authority. Trust-weighted fusion is essential when combining human, agent, tool, and external signals at scale.",
+        "connections": [
+          "PRIN-065",
+          "PRIN-106",
+          "PRIN-113",
+          "PRIN-115"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-07",
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-SIGNAL-PROVENANCE-WEIGHTING",
+          "MECH-ATTESTATION",
+          "MECH-EPISTEMIC-CALIBRATION"
+        ],
+        "defect_refs": [
+          "MEASUREMENT_INTEGRITY",
+          "MONITOR_GAMING",
+          "POLICY_VIOLATION"
+        ]
+      },
+      {
+        "id": "PRIN-121",
+        "name": "Verifier Diversity and Independence",
+        "title": "High-stakes confidence requires non-correlated verifiers",
+        "formal": "For high-risk promotion, acceptance confidence is invalid if all supporting verdicts derive from one correlated verifier family. Require diversity across verifier families with bounded dependency overlap.",
+        "apm2_mapping": "APM2 gates should not collapse into single-evaluator authority. Tier2+ decisions require explicit verifier-family metadata, independence checks, and disagreement escalation to reduce common-mode failure. This is cross-scale: local deployments can realize independence via separate rerun stacks/toolchains, while federated deployments add cell-level family diversity.",
+        "connections": [
+          "PRIN-092",
+          "PRIN-101",
+          "PRIN-106",
+          "PRIN-109",
+          "PRIN-120",
+          "PRIN-124"
+        ],
+        "law_refs": [
+          "LAW-08",
+          "LAW-14",
+          "LAW-17"
+        ],
+        "mechanism_refs": [
+          "MECH-VERIFIER-INDEPENDENCE",
+          "MECH-EVALUATOR-AUDIT",
+          "MECH-GATES"
+        ],
+        "defect_refs": [
+          "EVALUATOR_DRIFT",
+          "MONITOR_GAMING",
+          "WEAK_VERIFIER_SIGNAL"
+        ]
+      },
+      {
+        "id": "PRIN-122",
+        "name": "Drift Taxonomy and Detection",
+        "title": "Separate covariate, prior, concept, and evaluator drift",
+        "formal": "Observed degradation should be classified by drift type before remediation: covariate drift (input distribution), prior drift (base-rate shift), concept drift (target relation shift), and evaluator drift (measurement process shift).",
+        "apm2_mapping": "APM2 freshness and stability controls should label drift class explicitly in receipts and defects. Incorrect drift attribution causes unstable policy updates and wasted remediation effort.",
+        "connections": [
+          "PRIN-077",
+          "PRIN-106",
+          "PRIN-113",
+          "PRIN-115",
+          "PRIN-116"
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-15",
+          "LAW-19"
+        ],
+        "mechanism_refs": [
+          "MECH-FRESHNESS-POLICY",
+          "MECH-CHANGEPOINT-DETECTION",
+          "MECH-EPISTEMIC-CALIBRATION"
+        ],
+        "defect_refs": [
+          "EVALUATOR_DRIFT",
+          "MEASUREMENT_INTEGRITY",
+          "SCHEMA_DRIFT"
+        ]
+      },
+      {
+        "id": "PRIN-123",
+        "name": "Summary Rate-Distortion Contracts",
+        "title": "Compression is valid only with explicit loss bounds",
+        "formal": "Any summary used for governance must publish a rate-distortion contract: source scope, compression rate, loss profile, selector coverage, and max admissible distortion by risk tier.",
+        "apm2_mapping": "Summaries should be treated as budgeted information products. For Tier2+, summary-only decisions are valid only when distortion bounds and selector coverage satisfy the governing gate policy.",
+        "connections": [
+          "PRIN-005",
+          "PRIN-066",
+          "PRIN-097",
+          "PRIN-113",
+          "PRIN-120"
+        ],
+        "law_refs": [
+          "LAW-07",
+          "LAW-12",
+          "LAW-14"
+        ],
+        "mechanism_refs": [
+          "MECH-INDEX-LAYERS",
+          "MECH-COMPACTION",
+          "MECH-EVIDENCE-TIERING"
+        ],
+        "defect_refs": [
+          "AMBIGUOUS_OUTPUT",
+          "WEAK_VERIFIER_SIGNAL",
+          "INTERFACE_PROLIFERATION"
+        ]
+      },
+      {
+        "id": "PRIN-124",
+        "name": "Revocation-Wins Delegated Authority",
+        "title": "Delegation must converge toward least authority under partitions",
+        "formal": "In distributed delegation state, revocation events dominate stale grants under merge (revocation-wins). Any actuation requiring revoked authority must fail closed once revocation latency SLO is exceeded.",
+        "apm2_mapping": "Capability delegation across holonic boundaries should use revocation-wins semantics, explicit propagation receipts, and tiered revocation SLOs so containment survives partitions and lagging replicas. Same principle at every scale: branch/work leases on one host and cross-cell capability grants both fail closed on stale authority.",
+        "connections": [
+          "PRIN-038",
+          "PRIN-049",
+          "PRIN-051",
+          "PRIN-091",
+          "PRIN-094"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-10",
+          "LAW-18"
+        ],
+        "mechanism_refs": [
+          "MECH-PERMEABILITY-RECEIPT",
+          "MECH-ANTI-ENTROPY",
+          "MECH-REVOCATION-PROPAGATION"
+        ],
+        "defect_refs": [
+          "CAPABILITY_OVERGRANT",
+          "POLICY_VIOLATION",
+          "MEASUREMENT_INTEGRITY"
         ]
       }
     ]

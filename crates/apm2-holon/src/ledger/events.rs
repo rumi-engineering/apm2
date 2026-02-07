@@ -14,19 +14,11 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_holon::ledger::{
-//!     EpisodeCompleted, EpisodeCompletionReason, EpisodeStarted,
-//! };
+//! use apm2_holon::ledger::{EpisodeCompleted, EpisodeCompletionReason, EpisodeStarted};
 //!
 //! // Create an episode started event
-//! let started = EpisodeStarted::try_new(
-//!     "ep-001",
-//!     "work-123",
-//!     "lease-456",
-//!     1,
-//!     1_000_000_000,
-//! )
-//! .expect("valid IDs");
+//! let started = EpisodeStarted::try_new("ep-001", "work-123", "lease-456", 1, 1_000_000_000)
+//!     .expect("valid IDs");
 //!
 //! // Create a completion event
 //! let completed = EpisodeCompleted::new(
@@ -183,14 +175,8 @@ impl EpisodeStarted {
     /// ```rust
     /// use apm2_holon::ledger::EpisodeStarted;
     ///
-    /// let event = EpisodeStarted::try_new(
-    ///     "ep-001",
-    ///     "work-123",
-    ///     "lease-456",
-    ///     1,
-    ///     1_000_000_000,
-    /// )
-    /// .expect("valid IDs");
+    /// let event = EpisodeStarted::try_new("ep-001", "work-123", "lease-456", 1, 1_000_000_000)
+    ///     .expect("valid IDs");
     /// ```
     pub fn try_new(
         episode_id: impl Into<String>,

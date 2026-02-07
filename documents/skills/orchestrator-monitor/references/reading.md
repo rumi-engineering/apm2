@@ -1,0 +1,21 @@
+title: Orchestrator Monitor Reading Pack
+
+purpose: "Context pack for fix agents and reviewers dispatched by orchestrator-monitor."
+
+references[8]:
+  - path: "@documents/theory/glossary/glossary.json"
+    purpose: "REQUIRED READING: APM2 terminology and ontology."
+  - path: "@documents/reviews/CI_EXPECTATIONS.md"
+    purpose: "CI quality gates and mandatory pre-merge checks."
+  - path: "@documents/security/THREAT_MODEL.cac.json"
+    purpose: "Threat model context for security-sensitive changes."
+  - path: "@documents/security/AGENTS.cac.json"
+    purpose: "Security posture, policy profile, and containment expectations."
+  - path: "references/common-review-findings.md"
+    purpose: "Frequent BLOCKER/MAJOR findings to preempt before opening review."
+  - path: "references/daemon-implementation-patterns.md"
+    purpose: "Daemon wiring and protocol invariants that frequently regress."
+  - path: "@documents/reviews/SECURITY_REVIEW_PROMPT.md"
+    purpose: "Security review criteria and output contract."
+  - path: "@documents/reviews/CODE_QUALITY_PROMPT.md"
+    purpose: "Code quality review criteria and output contract."

@@ -46,8 +46,7 @@
 //!
 //! ```rust
 //! use apm2_core::evidence::{
-//!     ContentAddressedStore, DataClassification, EvidenceCategory,
-//!     EvidencePublisher, MemoryCas,
+//!     ContentAddressedStore, DataClassification, EvidenceCategory, EvidencePublisher, MemoryCas,
 //! };
 //!
 //! // Create an in-memory CAS for testing

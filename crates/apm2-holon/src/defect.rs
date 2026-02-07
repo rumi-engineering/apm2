@@ -14,9 +14,7 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_holon::defect::{
-//!     DefectRecord, DefectSeverity, DefectSignal, SignalType,
-//! };
+//! use apm2_holon::defect::{DefectRecord, DefectSeverity, DefectSignal, SignalType};
 //!
 //! let defect = DefectRecord::builder("DEF-001", "UNPLANNED_CONTEXT")
 //!     .severity(DefectSeverity::S2)
@@ -399,9 +397,7 @@ impl DefectContext {
 /// # Example
 ///
 /// ```rust
-/// use apm2_holon::defect::{
-///     DefectRecord, DefectSeverity, DefectSignal, SignalType,
-/// };
+/// use apm2_holon::defect::{DefectRecord, DefectSeverity, DefectSignal, SignalType};
 ///
 /// let defect = DefectRecord::builder("DEF-001", "PACK_MISS")
 ///     .severity(DefectSeverity::S2)

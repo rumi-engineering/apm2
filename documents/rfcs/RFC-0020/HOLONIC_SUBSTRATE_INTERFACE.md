@@ -139,15 +139,15 @@ HSI uses the daemon-enforced `RiskTier` ladder (stable discriminants; unknown va
 
 **Sandboxing requirement (normative):** per baseline security controls, **Tier3+ MUST require sandbox isolation**. Tier1–Tier2 MAY run unsandboxed for developer ergonomics, but MUST remain OCAP-only and receipt-bound.
 
-#### 1.2.1 Unified Theory mapping (normative, lossless at the policy boundary)
+#### 1.2.1 Unified Theory mapping (normative, conservative+monotone at the policy boundary)
 
 Unified Theory documents a coarser 4-class risk model (`T0..T3`). To prevent semantic drift across docs:
-- **UT.T0 (Experimental)** ≈ daemon **Tier0–Tier1**
-- **UT.T1 (Internal)** ≈ daemon **Tier1–Tier2**
-- **UT.T2 (Production)** ≈ daemon **Tier3**
-- **UT.T3 (Security-Critical)** ≈ daemon **Tier4**
+- **UT.T0 (Experimental)** defaults to daemon **Tier1** (allowed set: Tier0/Tier1)
+- **UT.T1 (Internal)** defaults to daemon **Tier2** (allowed set: Tier1/Tier2)
+- **UT.T2 (Production)** maps to daemon **Tier3**
+- **UT.T3 (Security-Critical)** maps to daemon **Tier4**
 
-This mapping is not advisory: any policy object that references Unified Theory risk classes MUST be reducible to a daemon `RiskTier` ceiling for enforcement.
+This mapping is not advisory: any policy object that references Unified Theory risk classes MUST be reducible to a daemon `RiskTier` ceiling for enforcement. Reverse mapping from daemon tier to UT tier is only valid when the originating `ut_tier` witness is retained on policy/receipt objects.
 
 #### 1.2.2 DeterminismClass (normative)
 

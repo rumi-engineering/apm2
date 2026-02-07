@@ -60,9 +60,7 @@
 //!
 //! // A changeset touching crypto module is HIGH risk
 //! let changeset = ChangeSet {
-//!     files_changed: vec![
-//!         "crates/apm2-core/src/crypto/signer.rs".to_string(),
-//!     ],
+//!     files_changed: vec!["crates/apm2-core/src/crypto/signer.rs".to_string()],
 //!     lines_changed: 50,
 //!     dependency_fanout: 5,
 //! };

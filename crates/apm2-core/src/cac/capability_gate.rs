@@ -42,13 +42,7 @@
 //!     "cac:admission:validate".to_string(),
 //! ];
 //! let receipt = generator
-//!     .generate_with_budget(
-//!         "rcpt-001",
-//!         summary,
-//!         Default::default(),
-//!         caps,
-//!         1_000_000_000,
-//!     )
+//!     .generate_with_budget("rcpt-001", summary, Default::default(), caps, 1_000_000_000)
 //!     .unwrap();
 //!
 //! // Create the gate with the generator's public key

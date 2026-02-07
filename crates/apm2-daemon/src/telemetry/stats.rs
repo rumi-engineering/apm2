@@ -584,9 +584,7 @@ impl Default for IoStats {
 /// # Example
 ///
 /// ```rust
-/// use apm2_daemon::telemetry::{
-///     CpuStats, IoStats, MemoryStats, MetricSource, ResourceStats,
-/// };
+/// use apm2_daemon::telemetry::{CpuStats, IoStats, MemoryStats, MetricSource, ResourceStats};
 ///
 /// let stats = ResourceStats::new(
 ///     CpuStats::new(
@@ -595,13 +593,7 @@ impl Default for IoStats {
 ///         400_000_000,
 ///         MetricSource::Cgroup,
 ///     ),
-///     MemoryStats::new(
-///         104_857_600,
-///         157_286_400,
-///         10,
-///         1000,
-///         MetricSource::Cgroup,
-///     ),
+///     MemoryStats::new(104_857_600, 157_286_400, 10, 1000, MetricSource::Cgroup),
 ///     IoStats::new(52_428_800, 10_485_760, 1000, 200, MetricSource::Cgroup),
 /// );
 /// assert!(stats.all_available());

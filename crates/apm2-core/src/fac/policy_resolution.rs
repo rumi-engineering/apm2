@@ -29,19 +29,17 @@
 //! ```rust
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::fac::{
-//!     GateLease, GateLeaseBuilder, PolicyResolvedForChangeSet,
-//!     PolicyResolvedForChangeSetBuilder,
+//!     GateLease, GateLeaseBuilder, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
 //! };
 //!
 //! // Create a policy resolution
 //! let resolver_signer = Signer::generate();
-//! let resolution =
-//!     PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
-//!         .resolved_risk_tier(1)
-//!         .resolved_determinism_class(0)
-//!         .resolver_actor_id("resolver-001")
-//!         .resolver_version("1.0.0")
-//!         .build_and_sign(&resolver_signer);
+//! let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+//!     .resolved_risk_tier(1)
+//!     .resolved_determinism_class(0)
+//!     .resolver_actor_id("resolver-001")
+//!     .resolver_version("1.0.0")
+//!     .build_and_sign(&resolver_signer);
 //!
 //! // Create a lease that references the resolution's policy hash
 //! let issuer_signer = Signer::generate();

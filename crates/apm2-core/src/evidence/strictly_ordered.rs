@@ -42,8 +42,8 @@
 //! use apm2_core::consensus::bft::ValidatorSignature;
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::evidence::{
-//!     DataClassification, EvidenceCategory, EvidencePredicate,
-//!     GatePredicateReceipt, StrictlyOrderedEvidence, TotalOrderProof,
+//!     DataClassification, EvidenceCategory, EvidencePredicate, GatePredicateReceipt,
+//!     StrictlyOrderedEvidence, TotalOrderProof,
 //! };
 //!
 //! // Create test validator signatures (in production, these come from BFT consensus)

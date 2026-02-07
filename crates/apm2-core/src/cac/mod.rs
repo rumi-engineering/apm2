@@ -127,8 +127,7 @@
 //!
 //! ```
 //! use apm2_core::cac::{
-//!     BudgetConstraint, ContextPackCompiler, ContextPackSpec, DcpEntry,
-//!     DcpIndex, TypedQuantity,
+//!     BudgetConstraint, ContextPackCompiler, ContextPackSpec, DcpEntry, DcpIndex, TypedQuantity,
 //! };
 //!
 //! // Setup DCP index with artifacts

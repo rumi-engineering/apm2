@@ -1,0 +1,109 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00400"
+    title: "Implement weighted random adapter profile selection for multi-model rotation"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0010"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0012"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0012.yaml#rfc_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_ORCHESTRATION"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00397"
+        reason: "SpawnEpisodeRequest must carry adapter_profile_hash field before selection can populate it."
+      - ticket_id: "TCK-00399"
+        reason: "AdapterRegistry must be wired into SpawnEpisode before selected profiles can be used."
+  scope:
+    in_scope:
+      - "Define an AdapterSelectionPolicy struct in apm2-core that maps (RoleType, task_type) to a weighted set of adapter profile hashes."
+      - "Implement weighted random selection over eligible, enabled profiles using a deterministic seed derived from (work_id, selection_attempt, policy_hash, backoff_epoch)."
+      - "Ensure selector only chooses profiles with implemented/registered adapters in the current runtime."
+      - "Add [daemon.adapter_rotation] configuration section to ecosystem.toml for weights, fallback chains, and enable/disable per profile."
+      - "Integrate selection into the SpawnEpisode flow: when adapter_profile_hash is not explicitly provided, invoke the selector."
+      - "Store all 4 builtin adapter profiles in CAS at daemon startup so they are available for hash-based lookup."
+      - "Add rate-limit backoff tracking: if a profile's CLI process fails repeatedly, temporarily reduce its weight."
+      - "Record the selection decision (weights, selection_input_digest, chosen profile) in the SessionStarted ledger event for observability."
+    out_of_scope:
+      - "CodexCliAdapter implementation (TCK-00402) — codex-cli-v1 remains disabled by default until adapter support is complete."
+      - "A/B testing framework or formal quality comparison between models."
+      - "External model routing APIs or inference gateways."
+  plan:
+    steps:
+      - "Define AdapterSelectionPolicy in crates/apm2-core/src/fac/adapter_selection.rs (new file). Struct fields: entries (Vec of ProfileWeight with profile_hash, weight, enabled, fallback_priority), strategy (WeightedRandom or RoundRobin), rate_limit_backoff_secs."
+      - "Implement select_profile() -> [u8; 32]: compute total weight of enabled non-rate-limited profiles, derive deterministic seed via BLAKE3(work_id || selection_attempt || policy_hash || backoff_epoch), then select proportionally."
+      - "Add ProfileWeight struct: profile_hash [u8; 32], weight u32, enabled bool, fallback_priority u32, last_failure_at Option<u64>, failure_count u32."
+      - "Add [daemon.adapter_rotation] section to ecosystem.toml config parsing in crates/apm2-core/src/config/mod.rs. Fields: profiles (list of {profile_id, weight, enabled}), strategy, rate_limit_backoff_secs."
+      - "Map profile_id strings (e.g., 'claude-code-v1') to CAS hashes by computing AgentAdapterProfileV1::compute_cas_hash() for each builtin profile at daemon startup. Store these hashes in a HashMap<String, [u8; 32]> in DaemonState."
+      - "Edit crates/apm2-daemon/src/state.rs: at startup, store all 4 builtin profiles in CAS. Create AdapterSelectionPolicy from config and pass to PrivilegedDispatcher."
+      - "Edit dispatch.rs resolve_default_adapter_profile(): instead of hardcoded claude-code-v1, call AdapterSelectionPolicy::select_profile(work_role, work_id)."
+      - "Gate profile eligibility by adapter availability (e.g., codex-cli-v1 weight forced to 0 unless CodexCliAdapter is registered)."
+      - "Add rate_limit_backoff: when HarnessAdapter::spawn() fails, increment failure_count on the profile. When failure_count > threshold, set last_failure_at and temporarily zero the weight. Reset after backoff_secs."
+      - "Add selection metadata to SessionStarted ledger event payload: selected_profile_id, selection_weights, seed_hex."
+      - "Add unit tests: verify weighted distribution over 1000 selections matches configured weights within statistical bounds. Verify rate-limit backoff reduces selection probability. Verify fallback chain activates when primary is rate-limited."
+      - "Add ecosystem.toml example config with rotation settings."
+      - "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --no-deps && cargo test -p apm2-core -p apm2-daemon."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0012"
+    criteria:
+      - "AdapterSelectionPolicy struct exists in apm2-core with weighted random selection."
+      - "Selection uses BLAKE3(work_id || selection_attempt || policy_hash || backoff_epoch) as deterministic seed — identical inputs produce reproducible selection for auditability."
+      - "ecosystem.toml [daemon.adapter_rotation] section configures weights per profile."
+      - "All 4 builtin profiles (claude-code-v1, codex-cli-v1, gemini-cli-v1, local-inference-v1) are stored in CAS at daemon startup."
+      - "SpawnEpisode without explicit adapter_profile_hash invokes the selector."
+      - "SpawnEpisode with explicit adapter_profile_hash bypasses the selector (explicit override)."
+      - "Rate-limit backoff temporarily removes failing profiles from selection."
+      - "Selection decision is recorded in ledger event for post-hoc analysis."
+      - "Default config stays operability-first: 100% claude-code-v1 until additional adapters are fully implemented and enabled."
+      - "Unit tests validate weighted distribution and fallback behavior."
+      - "All CI checks pass: cargo fmt, clippy (zero warnings), doc, tests."
+  notes:
+    context: |
+      The APM2 system has 4 builtin adapter profiles (builtin_profiles.rs) defining how to launch
+      different agent CLIs (Claude Code, Codex CLI, Gemini CLI, Ollama). However, there is ZERO
+      model selection or routing logic anywhere in the codebase. The system currently has no way to
+      choose between adapters — SpawnEpisode doesn't even accept an adapter_profile_hash field
+      (TCK-00397 adds that).
+
+      The long-term goal is weighted rotation across multiple adapters. Initial rollout remains
+      operability-first (claude-code-v1 default) until additional adapters are production-ready.
+      This still provides:
+      1. Resilience: if one model is rate-limited, the other takes over
+      2. Quality diversity: different models catch different issues in reviews
+      3. Cost optimization: route based on model pricing and performance characteristics
+
+      The selection must be deterministic for each selection decision input so that:
+      - The same (work_id, selection_attempt, policy_hash, backoff_epoch) always yields the same profile (reproducibility)
+      - Selection can be audited from ledger events
+      - Backoff-induced routing changes are explicit and replayable
+
+      The InferenceCall proto (apm2.tool.v1.rs:186) already has provider and model fields,
+      but these are for kernel-side inference tool calls, not agent process selection.
+      Adapter selection is orthogonal — it determines which CLI process runs the episode.
+    files: |
+      - crates/apm2-core/src/fac/builtin_profiles.rs (4 profiles: claude-code-v1 at 107, codex-cli-v1 at 315, gemini-cli-v1 at 211, local-inference-v1 at 444)
+      - crates/apm2-core/src/fac/agent_adapter_profile.rs (AgentAdapterProfileV1 at 607, compute_cas_hash at 871)
+      - crates/apm2-core/src/fac/selection_policy.rs (existing SelectionPolicy for AAT — NOT model selection, but demonstrates the pattern)
+      - crates/apm2-core/src/config/mod.rs (DaemonConfig parsing)
+      - crates/apm2-daemon/src/state.rs (DaemonState construction)
+      - crates/apm2-daemon/src/protocol/dispatch.rs (handle_spawn_episode, resolve_default_adapter_profile)
+      - ecosystem.toml (daemon configuration)
+    security: |
+      - Selection seed must use CSPRNG or BLAKE3 keyed hash — not rand::thread_rng() which is non-deterministic.
+      - Rate-limit state must not be writable by agents (daemon-only state).
+      - Explicit adapter_profile_hash override must still validate against CAS (no bypass).
+      - Selection weights must be validated (non-negative, at least one enabled profile).
+      - Do not expose selection internals to session-scoped IPC (operator socket only).

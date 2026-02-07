@@ -5,7 +5,7 @@
     "version": "1.0.0",
     "created_at": "2026-02-04T22:27:53.975717Z",
     "description": "The unified architectural definition for agent-native systems, combining theoretical foundations (axioms, models) with operational doctrine (protocols, prescriptions).",
-    "concepts_count": 63
+    "concepts_count": 93
   },
   "payload": {
     "axioms": [
@@ -18,8 +18,13 @@
           "Anchor outputs to tests/linters/schemas.",
           "Cognition is a function of prompt/retrieval, not just weights."
         ],
-        "law_refs": ["LAW-04"],
-        "mechanism_refs": ["MECH-GATES", "MECH-RECEIPTS"]
+        "law_refs": [
+          "LAW-04"
+        ],
+        "mechanism_refs": [
+          "MECH-GATES",
+          "MECH-RECEIPTS"
+        ]
       },
       {
         "id": "AX-02",
@@ -30,8 +35,13 @@
           "Prioritize structural artifacts (hashes, IDs) over prose.",
           "Omission error is a primary failure mode."
         ],
-        "law_refs": ["LAW-02", "LAW-06"],
-        "mechanism_refs": ["MECH-CONTEXTPACK"]
+        "law_refs": [
+          "LAW-02",
+          "LAW-06"
+        ],
+        "mechanism_refs": [
+          "MECH-CONTEXTPACK"
+        ]
       },
       {
         "id": "AX-03",
@@ -42,7 +52,9 @@
           "Refactoring is conceptual compression.",
           "High entropy in interfaces increases error probability."
         ],
-        "law_refs": ["LAW-06"]
+        "law_refs": [
+          "LAW-06"
+        ]
       },
       {
         "id": "AX-04",
@@ -52,7 +64,10 @@
           "Results in omission, staleness, or hallucinated linkage.",
           "Use verifiable references to mitigate projection errors."
         ],
-        "law_refs": ["LAW-02", "LAW-07"]
+        "law_refs": [
+          "LAW-02",
+          "LAW-07"
+        ]
       },
       {
         "id": "AX-05",
@@ -62,7 +77,9 @@
           "Shift work from reasoning to satisfiability.",
           "Elevate structural contracts (types/schemas) for determinism."
         ],
-        "law_refs": ["LAW-13"]
+        "law_refs": [
+          "LAW-13"
+        ]
       },
       {
         "id": "AX-06",
@@ -73,8 +90,13 @@
           "Separation of readable assertions from verifiable artifacts.",
           "Evidence collapses ambiguity in belief state."
         ],
-        "law_refs": ["LAW-07", "LAW-15"],
-        "mechanism_refs": ["MECH-EVIDENCE-BUNDLE"]
+        "law_refs": [
+          "LAW-07",
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-EVIDENCE-BUNDLE"
+        ]
       },
       {
         "id": "AX-07",
@@ -84,7 +106,10 @@
           "Enables convergence without global locks.",
           "Improves robustness under retries."
         ],
-        "law_refs": ["LAW-03", "LAW-10"]
+        "law_refs": [
+          "LAW-03",
+          "LAW-10"
+        ]
       },
       {
         "id": "AX-08",
@@ -95,19 +120,31 @@
           "Isolate side effects behind explicit boundaries.",
           "Use canonical encodings to prevent spurious diffs."
         ],
-        "law_refs": ["LAW-04", "LAW-11"]
+        "law_refs": [
+          "LAW-04",
+          "LAW-11"
+        ]
       },
       {
         "id": "AX-09",
         "name": "Holonic Duality",
         "statement": "Holons are simultaneously autonomous wholes and constrained parts.",
-        "components": ["Interface", "Internal State", "Invariants", "Resource Budgets"],
+        "components": [
+          "Interface",
+          "Internal State",
+          "Invariants",
+          "Resource Budgets"
+        ],
         "implications": [
           "Complexity must be hidden behind verifiable behavior.",
           "Boundaries define the locus of understanding.",
           "Interfaces must be closed under composition; aggregation must not invent new boundary primitives."
         ],
-        "law_refs": ["LAW-01", "LAW-05", "LAW-16"]
+        "law_refs": [
+          "LAW-01",
+          "LAW-05",
+          "LAW-16"
+        ]
       },
       {
         "id": "AX-10",
@@ -117,8 +154,13 @@
           "Prevent unauthorized action paths via noninterference.",
           "Minimize privilege surface and interface variety to reduce confusion risk."
         ],
-        "law_refs": ["LAW-05"],
-        "mechanism_refs": ["MECH-OCAP", "MECH-PERMEABILITY-RECEIPT"]
+        "law_refs": [
+          "LAW-05"
+        ],
+        "mechanism_refs": [
+          "MECH-OCAP",
+          "MECH-PERMEABILITY-RECEIPT"
+        ]
       },
       {
         "id": "AX-11",
@@ -128,7 +170,9 @@
           "Throughput requires low-coupling decomposition.",
           "Verification cost must not dominate execution."
         ],
-        "law_refs": ["LAW-12"]
+        "law_refs": [
+          "LAW-12"
+        ]
       },
       {
         "id": "AX-12",
@@ -138,8 +182,13 @@
           "Entropy directly increases agent error rate.",
           "Continuous refactoring is a mathematical necessity for evolution (Gall's Law)."
         ],
-        "law_refs": ["LAW-01", "LAW-06"],
-        "mechanism_refs": ["LOOP-RECURRENCE"]
+        "law_refs": [
+          "LAW-01",
+          "LAW-06"
+        ],
+        "mechanism_refs": [
+          "LOOP-RECURRENCE"
+        ]
       },
       {
         "id": "AX-13",
@@ -149,7 +198,9 @@
           "Security engineering is representation engineering.",
           "Clearly label and isolate untrusted content."
         ],
-        "law_refs": ["LAW-05"]
+        "law_refs": [
+          "LAW-05"
+        ]
       },
       {
         "id": "AX-14",
@@ -159,7 +210,10 @@
           "Safe failure is the default.",
           "Authority must be explicit, not ambient."
         ],
-        "law_refs": ["LAW-05", "LAW-15"]
+        "law_refs": [
+          "LAW-05",
+          "LAW-15"
+        ]
       },
       {
         "id": "AX-15",
@@ -169,8 +223,12 @@
           "Eliminate environment-based privileges.",
           "Use time-bounded, narrowly scoped capabilities."
         ],
-        "law_refs": ["LAW-05"],
-        "mechanism_refs": ["MECH-OCAP"]
+        "law_refs": [
+          "LAW-05"
+        ],
+        "mechanism_refs": [
+          "MECH-OCAP"
+        ]
       },
       {
         "id": "AX-16",
@@ -180,8 +238,12 @@
           "Attestation reduces re-evaluation cost.",
           "Scaling requires machine-verifiable trust paths."
         ],
-        "law_refs": ["LAW-15"],
-        "mechanism_refs": ["MECH-ATTESTATION"]
+        "law_refs": [
+          "LAW-15"
+        ],
+        "mechanism_refs": [
+          "MECH-ATTESTATION"
+        ]
       },
       {
         "id": "AX-17",
@@ -191,7 +253,9 @@
           "Autonomy must be bounded, constructive, and verifiable.",
           "Adjudication points are inevitable."
         ],
-        "law_refs": ["LAW-12"]
+        "law_refs": [
+          "LAW-12"
+        ]
       },
       {
         "id": "AX-18",
@@ -201,7 +265,9 @@
           "Restrict action space via schemas and capabilities.",
           "Factor tasks into compositional subgoals."
         ],
-        "law_refs": ["LAW-12"]
+        "law_refs": [
+          "LAW-12"
+        ]
       },
       {
         "id": "AX-19",
@@ -212,17 +278,23 @@
           "Summaries upward, drill-down on demand.",
           "Composition must not widen interfaces: higher levels summarize via verifiable receipts + selectors."
         ],
-        "law_refs": ["LAW-07", "LAW-16"]
+        "law_refs": [
+          "LAW-07",
+          "LAW-16"
+        ]
       },
       {
         "id": "AX-20",
-        "name": "Adjudication Bottleneck",
-        "statement": "Human bandwidth is the ultimate constraint; systems must surface bounded options with evidence.",
+        "name": "Re-verification Bottleneck",
+        "statement": "Verifier bandwidth is the ultimate constraint; systems must surface bounded options with evidence.",
         "implications": [
-          "Minimize human intervention points.",
+          "Minimize non-mechanized intervention points.",
           "Preserve authority only where decisions are irreducible."
         ],
-        "law_refs": ["LAW-01", "LAW-14"]
+        "law_refs": [
+          "LAW-01",
+          "LAW-14"
+        ]
       },
       {
         "id": "AX-21",
@@ -233,7 +305,96 @@
           "Treat summaries as verifiable coarse-graining operators with declared loss profiles and deterministic zoom-in.",
           "Make recursion explicit in the work DAG: any node may expand into a subgraph without changing external contracts."
         ],
-        "law_refs": ["LAW-16", "LAW-07", "LAW-05"]
+        "law_refs": [
+          "LAW-16",
+          "LAW-07",
+          "LAW-05"
+        ]
+      },
+      {
+        "id": "AX-22",
+        "name": "Civilizational Cardinality",
+        "statement": "Architectures must preserve one invariant semantic model from small-cell deployments to 100B-agent populations; larger scale increases locality pressure, hierarchy depth, and summary-economics constraints without changing core boundary contracts.",
+        "implications": [
+          "Treat small deployments as reduced instances of the same holonic laws, not as separate architecture classes.",
+          "Global all-to-all coordination is treated as a pathological fallback.",
+          "Cellular organization and digest-first routing become baseline assumptions."
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-10",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "AX-23",
+        "name": "Epistemic Calibration",
+        "statement": "Knowledge quality is a function of calibrated uncertainty, source provenance, and contradiction handling, not confidence narrative.",
+        "implications": [
+          "Rival hypotheses are maintained until discriminated by evidence.",
+          "Belief updates are tied to evidence quality and recency."
+        ],
+        "law_refs": [
+          "LAW-07",
+          "LAW-08",
+          "LAW-15"
+        ]
+      },
+      {
+        "id": "AX-24",
+        "name": "Jurisdictional Pluralism",
+        "statement": "Normative validity is context-indexed: legal, policy, and rights interpretations vary by domain, authority, and time.",
+        "implications": [
+          "Single global policy narratives are insufficient for high-impact governance.",
+          "Cross-domain conflicts require explicit re-verification artifacts."
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-14",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "AX-25",
+        "name": "Deterministic Re-verification",
+        "statement": "Correctness in high-impact systems requires deterministic re-verification and bounded-reversal channels with evidence-addressable dispute paths.",
+        "implications": [
+          "Disagreement is a first-class governance signal.",
+          "Reversibility paths improve long-horizon correctness."
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-07",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "AX-26",
+        "name": "Forward-Epoch Evolution",
+        "statement": "Evolution speed and semantic clarity improve when systems use explicit epoch boundaries; backward compatibility is an explicit choice, not a default.",
+        "implications": [
+          "Breaking transitions are admissible when transition semantics are explicit and auditable.",
+          "Version drift is managed via cutover artifacts rather than implicit compatibility assumptions."
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-13",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "AX-27",
+        "name": "Externality Closure",
+        "statement": "Optimization quality depends on accounting for externalized energy, storage, operator, and social costs.",
+        "implications": [
+          "Local throughput metrics are incomplete objective signals.",
+          "System-level optimization includes hidden cost surfaces."
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-14",
+          "LAW-15"
+        ]
       }
     ],
     "models": [
@@ -242,7 +403,9 @@
         "name": "Conditional Transducer",
         "statement": "Agent behavior is a function of conditional probability and context construction.",
         "math": "A ~ p_theta(A | prompt + retrieval)",
-        "law_refs": ["LAW-04"]
+        "law_refs": [
+          "LAW-04"
+        ]
       },
       {
         "id": "MOD-POMDP",
@@ -254,21 +417,37 @@
           "b": "Belief State (Context)"
         },
         "rule": "Every side effect A must be followed by measurement O to close the loop.",
-        "law_refs": ["LAW-01"]
+        "law_refs": [
+          "LAW-01"
+        ]
       },
       {
         "id": "MOD-COST",
         "name": "Multi-Objective Optimization",
-        "objectives": ["Token Cost (Ct)", "Tool Cost (Cu)", "Latency (Cl)", "Error (Ce)", "Security (Cs)"],
+        "objectives": [
+          "Token Cost (Ct)",
+          "Tool Cost (Cu)",
+          "Latency (Cl)",
+          "Error (Ce)",
+          "Security (Cs)"
+        ],
         "rule": "Architecture selects mechanisms that minimize expected total cost.",
-        "law_refs": ["LAW-08"]
+        "law_refs": [
+          "LAW-08"
+        ]
       },
       {
         "id": "MOD-EVENT",
         "name": "Event Sourcing",
         "statement": "State is a projection (reduction) of an append-only sequence or partial order of events.",
-        "properties": ["Causal Ordering", "Commutativity", "Replayability"],
-        "law_refs": ["LAW-03"]
+        "properties": [
+          "Causal Ordering",
+          "Commutativity",
+          "Replayability"
+        ],
+        "law_refs": [
+          "LAW-03"
+        ]
       },
       {
         "id": "MOD-EVIDENCE",
@@ -278,42 +457,72 @@
           "provenance": "Production Inputs/Toolchain",
           "verification": "Deterministic Procedure"
         },
-        "law_refs": ["LAW-15"]
+        "law_refs": [
+          "LAW-15"
+        ]
       },
       {
         "id": "MOD-COMPAT",
         "name": "Schema Evolution",
         "statement": "Schema changes are transformations in a type system; compatibility is a constraint on reader/writer interaction.",
-        "law_refs": ["LAW-13"]
+        "law_refs": [
+          "LAW-13"
+        ]
       },
       {
         "id": "MOD-CAP",
         "name": "Object Capability (OCAP)",
         "statement": "Authority = Possession of unforgeable object reference.",
-        "properties": ["No Ambient Authority", "Least Privilege", "Transferability"],
-        "law_refs": ["LAW-05"]
+        "properties": [
+          "No Ambient Authority",
+          "Least Privilege",
+          "Transferability"
+        ],
+        "law_refs": [
+          "LAW-05"
+        ]
       },
       {
         "id": "MOD-CONV",
         "name": "Convergent Replication",
         "statement": "Consistency via monotone updates and merge operators (CRDT). Distinguish Control (BFT) vs Data (Convergence).",
         "rule": "Favor availability and partitions over global consensus for Data Plane.",
-        "law_refs": ["LAW-10"],
-        "mechanism_refs": ["MECH-ANTI-ENTROPY"]
+        "law_refs": [
+          "LAW-10"
+        ],
+        "mechanism_refs": [
+          "MECH-ANTI-ENTROPY"
+        ]
       },
       {
         "id": "MOD-REF-COMPRESS",
         "name": "Refactoring as Compression",
         "goal": "Reduce minimal description length (MDL) and branching factor.",
-        "metrics": ["Duplication", "Churn", "Defect Density", "Interface Instability"],
-        "law_refs": ["LAW-01", "LAW-06"]
+        "metrics": [
+          "Duplication",
+          "Churn",
+          "Defect Density",
+          "Interface Instability"
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-06"
+        ]
       },
       {
         "id": "MOD-THREAT",
         "name": "Adversarial Representation",
-        "vectors": ["Prompt Injection", "Malicious Diffs", "Poisoned Logs", "Forged Metadata"],
+        "vectors": [
+          "Prompt Injection",
+          "Malicious Diffs",
+          "Poisoned Logs",
+          "Forged Metadata"
+        ],
         "defense": "Structural Isolation and Labeling.",
-        "law_refs": ["LAW-05", "LAW-08"]
+        "law_refs": [
+          "LAW-05",
+          "LAW-08"
+        ]
       },
       {
         "id": "MOD-GOV-CONTROL",
@@ -324,21 +533,134 @@
           "Plant": "Workflow"
         },
         "rule": "Tune strictness based on observability and controllability.",
-        "law_refs": ["LAW-14"]
+        "law_refs": [
+          "LAW-14"
+        ]
       },
       {
         "id": "MOD-ACTOR",
         "name": "Distributed Actor",
-        "semantics": ["Async Messaging", "Private State", "Supervision", "Backpressure"],
-        "guarantees": ["At-least-once", "Idempotency Required"],
-        "law_refs": ["LAW-11"]
+        "semantics": [
+          "Async Messaging",
+          "Private State",
+          "Supervision",
+          "Backpressure"
+        ],
+        "guarantees": [
+          "At-least-once",
+          "Idempotency Required"
+        ],
+        "law_refs": [
+          "LAW-11"
+        ]
       },
       {
         "id": "MOD-SUMMARY",
         "name": "Multi-Scale Artifacts",
-        "layers": ["Indices", "Manifests", "Summaries"],
+        "layers": [
+          "Indices",
+          "Manifests",
+          "Summaries"
+        ],
         "function": "Enable navigation without full context recall.",
-        "law_refs": ["LAW-07"]
+        "law_refs": [
+          "LAW-07"
+        ]
+      },
+      {
+        "id": "MOD-EPISTEMIC",
+        "name": "Epistemic State Model",
+        "statement": "Belief state includes confidence, provenance quality, contradiction sets, and recency decay.",
+        "components": [
+          "hypothesis",
+          "confidence",
+          "evidence_weight",
+          "conflict_graph",
+          "time_decay"
+        ],
+        "law_refs": [
+          "LAW-07",
+          "LAW-08",
+          "LAW-15"
+        ]
+      },
+      {
+        "id": "MOD-JURISDICTION",
+        "name": "Jurisdictional Constraint Lattice",
+        "statement": "Normative constraints compose as a partially ordered lattice across jurisdictions, policy domains, and rights classes.",
+        "law_refs": [
+          "LAW-13",
+          "LAW-14",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "MOD-CONTEST",
+        "name": "Re-verification Loop",
+        "statement": "Decision lifecycle includes challenge, counter-evidence, independent machine re-verification, and reversible state transition where justified.",
+        "law_refs": [
+          "LAW-01",
+          "LAW-07",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "MOD-EPOCH",
+        "name": "Epoch Cutover Model",
+        "statement": "Schema/protocol evolution proceeds through signed epoch cutovers with explicit validity windows and migration semantics.",
+        "law_refs": [
+          "LAW-09",
+          "LAW-13",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "MOD-EXTERNALITY",
+        "name": "Externality-Aware Objective",
+        "statement": "System objective extends local cost terms with externality terms to avoid hidden degradation dynamics.",
+        "law_refs": [
+          "LAW-06",
+          "LAW-14"
+        ]
+      },
+      {
+        "id": "MOD-SAMPLING",
+        "name": "Telemetry Sampling and Aliasing",
+        "statement": "Observed stability/instability can be a sampling artifact; cadence is part of system semantics.",
+        "law_refs": [
+          "LAW-08",
+          "LAW-15"
+        ]
+      },
+      {
+        "id": "MOD-STATE-EST",
+        "name": "State Estimation",
+        "statement": "Controllers operate on latent-state estimates with uncertainty bounds derived from noisy partial observations.",
+        "law_refs": [
+          "LAW-04",
+          "LAW-07",
+          "LAW-15"
+        ]
+      },
+      {
+        "id": "MOD-CHANGEPOINT",
+        "name": "Change-Point vs Outlier Model",
+        "statement": "Distinguish structural regime shifts from transient anomalies before policy transition.",
+        "law_refs": [
+          "LAW-09",
+          "LAW-14",
+          "LAW-15"
+        ]
+      },
+      {
+        "id": "MOD-MULTIRATE",
+        "name": "Multi-Rate Hierarchical Control",
+        "statement": "Nested loops run at different cadences: fast local stabilization, slower global governance adaptation.",
+        "law_refs": [
+          "LAW-01",
+          "LAW-10",
+          "LAW-16"
+        ]
       }
     ],
     "strategies": [
@@ -346,127 +668,284 @@
         "id": "STRAT-VERIFY",
         "name": "External Anchoring",
         "rule": "Verify stochastic LLM outputs via deterministic tools (tests, linters, schemas).",
-        "law_refs": ["LAW-04"]
+        "law_refs": [
+          "LAW-04"
+        ]
       },
       {
         "id": "STRAT-SUFFICIENT-STATS",
         "name": "State Compression",
         "rule": "Compute representation s = f(h) such that s is sufficient for decision-making within W tokens.",
-        "law_refs": ["LAW-02"]
+        "law_refs": [
+          "LAW-02"
+        ]
       },
       {
         "id": "STRAT-VERIFIABLE-REFS",
         "name": "Verifiable References",
         "rule": "Inject content-hashes and stable IDs into context; expand details only on demand.",
-        "law_refs": ["LAW-07"]
+        "law_refs": [
+          "LAW-07"
+        ]
       },
       {
         "id": "STRAT-CLOSED-LOOP",
         "name": "Closed-Loop Control",
         "rule": "Follow every actuation with measurement and acceptance testing to prevent divergence.",
-        "law_refs": ["LAW-01"]
+        "law_refs": [
+          "LAW-01"
+        ]
       },
       {
         "id": "STRAT-MONOTONE",
         "name": "Monotonicity",
         "rule": "Design state transitions as append-facts to simplify consensus and retries.",
-        "law_refs": ["LAW-03"]
+        "law_refs": [
+          "LAW-03"
+        ]
       },
       {
         "id": "STRAT-CANONICAL",
         "name": "Canonical Encoding",
         "rule": "Use JCS/Canonical formats to ensure stable content addressing and avoid spurious diffs.",
-        "law_refs": ["LAW-13"]
+        "law_refs": [
+          "LAW-13"
+        ]
       },
       {
         "id": "STRAT-DETERMINISM",
         "name": "Determinism Isolation",
         "rule": "Isolate nondeterminism behind boundaries; record all entropy for replayability.",
-        "law_refs": ["LAW-04"]
+        "law_refs": [
+          "LAW-04"
+        ]
       },
       {
         "id": "STRAT-CONTRACT-FIRST",
         "name": "Contract-First Design",
         "rule": "Prioritize structural contracts to reduce ambiguity in the finite context channel.",
-        "law_refs": ["LAW-13"]
+        "law_refs": [
+          "LAW-13"
+        ]
       },
       {
         "id": "STRAT-BOUNDED-HIDING",
         "name": "Complexity Hiding",
         "rule": "Encapsulate internal holon complexity behind stable, verifiable interfaces.",
-        "law_refs": ["LAW-05"]
+        "law_refs": [
+          "LAW-05"
+        ]
       },
       {
         "id": "STRAT-OCAP-FIRST",
         "name": "Capability Default",
         "rule": "Default to safe impossibility by withholding capabilities from agents unless explicitly required.",
-        "law_refs": ["LAW-05", "LAW-14"]
+        "law_refs": [
+          "LAW-05",
+          "LAW-14"
+        ]
       },
       {
         "id": "STRAT-LEAST-AUTHORITY",
         "name": "Confinement",
         "rule": "Minimize privilege surface using OCAP to limit impact of harmful agent actions.",
-        "law_refs": ["LAW-05"]
+        "law_refs": [
+          "LAW-05"
+        ]
       },
       {
         "id": "STRAT-DECOUPLE",
         "name": "Low-Coupling",
         "rule": "Decompose work into units with minimal coordination to maximize parallel efficiency.",
-        "law_refs": ["LAW-10", "LAW-11"]
+        "law_refs": [
+          "LAW-10",
+          "LAW-11"
+        ]
       },
       {
         "id": "STRAT-DEGRADING",
         "name": "Graceful Degradation",
         "rule": "Surface replication state to agents to prevent misdiagnosis of network partitions.",
-        "law_refs": ["LAW-10"]
+        "law_refs": [
+          "LAW-10"
+        ]
       },
       {
         "id": "STRAT-ISOLATE-UNTRUSTED",
         "name": "Untrusted Labeling",
         "rule": "Explicitly label untrusted tool/network outputs to prevent cognitive corruption.",
-        "law_refs": ["LAW-05"]
+        "law_refs": [
+          "LAW-05"
+        ]
       },
       {
         "id": "STRAT-ATTESTATION",
         "name": "Verification Scaling",
-        "rule": "Use attestation to propagate trust without re-executing upstream logic.",
-        "law_refs": ["LAW-15"]
+        "rule": "Use execution integrity proofs to propagate trust without re-executing upstream logic.",
+        "law_refs": [
+          "LAW-15"
+        ]
       },
       {
         "id": "STRAT-ADAPTIVE-POSTURE",
         "name": "Rachet Posture",
         "rule": "Enforce hard invariants only where verification is reliable and cheap.",
-        "law_refs": ["LAW-14"]
+        "law_refs": [
+          "LAW-14"
+        ]
       },
       {
         "id": "STRAT-IDEMPOTENCY",
         "name": "Reliable Execution",
         "rule": "Ensure all agent-facing primitives are idempotent to survive distributed reordering.",
-        "law_refs": ["LAW-11"]
+        "law_refs": [
+          "LAW-11"
+        ]
       },
       {
         "id": "STRAT-GATED-AUTONOMY",
         "name": "Bounded Failure",
         "rule": "Define task success as either Predicate(result) == True OR Bound(FailureEvidence).",
-        "law_refs": ["LAW-01", "LAW-12"]
+        "law_refs": [
+          "LAW-01",
+          "LAW-12"
+        ]
       },
       {
         "id": "STRAT-INDEX-STABILITY",
         "name": "Structural Anchors",
         "rule": "Externalize stable indices so agents navigate via references, not discovery.",
-        "law_refs": ["LAW-02"]
+        "law_refs": [
+          "LAW-02"
+        ]
       },
       {
         "id": "STRAT-SUMMARY-UPWARD",
         "name": "Summarization Upward",
         "rule": "Route high-level summaries to higher holons; maintain drill-down links for execution.",
-        "law_refs": ["LAW-07"]
+        "law_refs": [
+          "LAW-07"
+        ]
       },
       {
         "id": "STRAT-RECURSIVE-EVOLUTION",
         "name": "Defect-Driven Evolution",
         "rule": "Convert every recurring defect into a stronger gate or a new primitive (Gall's Law).",
-        "law_refs": ["LAW-01", "LAW-08"]
+        "law_refs": [
+          "LAW-01",
+          "LAW-08"
+        ]
+      },
+      {
+        "id": "STRAT-RIVAL-MODELS",
+        "name": "Rival Hypothesis Retention",
+        "rule": "Maintain multiple competing theory frames until discriminating evidence collapses ambiguity.",
+        "law_refs": [
+          "LAW-08",
+          "LAW-15"
+        ]
+      },
+      {
+        "id": "STRAT-SIGNAL-DISTILL",
+        "name": "Signal-Weighted Distillation",
+        "rule": "Prefer invariants, causal structure, and boundary conditions over verbose implementation detail in shared theory artifacts.",
+        "law_refs": [
+          "LAW-06",
+          "LAW-07"
+        ]
+      },
+      {
+        "id": "STRAT-CONTESTABILITY",
+        "name": "Challenge Pathways",
+        "rule": "Treat re-verification and bounded reversal as planned governance flows with evidence links, not exceptional interruptions.",
+        "law_refs": [
+          "LAW-01",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "STRAT-FORWARD-EPOCH",
+        "name": "Epochal Evolution",
+        "rule": "Prefer explicit epoch transitions for semantic clarity; compatibility is offered intentionally, not assumed.",
+        "law_refs": [
+          "LAW-09",
+          "LAW-13"
+        ]
+      },
+      {
+        "id": "STRAT-SCALE-CELLULARITY",
+        "name": "Cellular Scale Design",
+        "rule": "Organize 100B-agent populations as federated cells with digest-first exchange and bounded zoom-in.",
+        "law_refs": [
+          "LAW-10",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "STRAT-EXTERNALITY",
+        "name": "Externality-Aware Optimization",
+        "rule": "Include energy, retention, and operator burden in optimization loops to prevent hidden system degradation.",
+        "law_refs": [
+          "LAW-06",
+          "LAW-14"
+        ]
+      },
+      {
+        "id": "STRAT-ANTI-ALIAS",
+        "name": "Anti-Alias Observability",
+        "rule": "Design telemetry cadence and prefiltering together to prevent alias-driven governance errors.",
+        "law_refs": [
+          "LAW-08",
+          "LAW-15"
+        ]
+      },
+      {
+        "id": "STRAT-ROBUST-SMOOTH",
+        "name": "Robust Smoothing",
+        "rule": "Use robust smoothing before control decisions so transient spikes do not trigger policy thrash.",
+        "law_refs": [
+          "LAW-08",
+          "LAW-12"
+        ]
+      },
+      {
+        "id": "STRAT-DELAY-AWARE",
+        "name": "Delay-Aware Feedback",
+        "rule": "Tune control thresholds with explicit observation/actuation delay margins to avoid oscillatory corrections.",
+        "law_refs": [
+          "LAW-12",
+          "LAW-14"
+        ]
+      },
+      {
+        "id": "STRAT-HYSTERESIS",
+        "name": "Hysteresis and Hold-Down",
+        "rule": "Use deadbands and hold-down timers to prevent flip-flop state transitions under noisy signals.",
+        "law_refs": [
+          "LAW-12",
+          "LAW-16"
+        ]
+      },
+      {
+        "id": "STRAT-SIGNAL-TRUST-WEIGHT",
+        "name": "Trust-Weighted Signals",
+        "rule": "Fuse signals by provenance, freshness, and calibration quality; do not treat all observations as equal authority.",
+        "law_refs": [
+          "LAW-05",
+          "LAW-07",
+          "LAW-15"
+        ]
+      },
+      {
+        "id": "STRAT-CROSS-SCALE-INVARIANCE",
+        "name": "Cross-Scale Invariance",
+        "rule": "Keep authority, evidence, and composition primitives identical across scales; tune only budgets, topology, and verifier economics.",
+        "law_refs": [
+          "LAW-01",
+          "LAW-05",
+          "LAW-10",
+          "LAW-16"
+        ]
       }
     ],
     "doctrines": [
@@ -499,6 +978,26 @@
         "id": "DOC-HARDENING-CYCLE",
         "name": "Hardening Cycle",
         "rule": "Lifecycle includes post-implementation hardening cycles for refactoring, simplification, and integration coherence. Stopping condition is measurable reduction of complexity."
+      },
+      {
+        "id": "DOC-THEORY-WEAVING",
+        "name": "Theory Weaving",
+        "rule": "Major design decisions are explored through multiple cross-domain theory frames before narrowing to mechanism-level commitments."
+      },
+      {
+        "id": "DOC-EPOCH-CUTOVER",
+        "name": "Epoch Cutover Doctrine",
+        "rule": "Breaking semantic transitions are represented as explicit epoch cutovers with signed transition artifacts, rather than implicit backward-compatibility assumptions."
+      },
+      {
+        "id": "DOC-CONTROL-SIGNAL-HYGIENE",
+        "name": "Control Signal Hygiene",
+        "rule": "Planning and governance loops model sampling cadence, delay, filtering, trust weighting, and regime-shift detection explicitly before changing policy state."
+      },
+      {
+        "id": "DOC-CROSS-SCALE-WEAVE",
+        "name": "Cross-Scale Principle Weave",
+        "rule": "Design reviews must verify that principle bundles (authoritative transitions, least-authority delegation, bounded autonomy, convergence economics, and counterexample evolution) are expressed with one shared vocabulary across local and federated operation."
       }
     ],
     "protocols": [

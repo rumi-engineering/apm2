@@ -30,8 +30,7 @@
 //!
 //! ```rust
 //! use apm2_core::fac::{
-//!     CoiEnforcementLevel, CoiRule, CustodyDomain, KeyBinding, KeyPolicy,
-//!     KeyPolicyBuilder,
+//!     CoiEnforcementLevel, CoiRule, CustodyDomain, KeyBinding, KeyPolicy, KeyPolicyBuilder,
 //! };
 //!
 //! // Create a key policy with two custody domains
@@ -539,9 +538,7 @@ impl KeyPolicy {
     /// # Example
     ///
     /// ```rust
-    /// use apm2_core::fac::{
-    ///     CustodyDomain, KeyBinding, KeyPolicy, KeyPolicyBuilder,
-    /// };
+    /// use apm2_core::fac::{CustodyDomain, KeyBinding, KeyPolicy, KeyPolicyBuilder};
     ///
     /// let policy = KeyPolicyBuilder::new("policy-001")
     ///     .schema_version(1)

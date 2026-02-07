@@ -470,9 +470,7 @@ impl BudgetTracker {
     /// # Example
     ///
     /// ```rust
-    /// use apm2_core::budget::{
-    ///     BudgetChargeError, BudgetConfig, BudgetTracker, BudgetType,
-    /// };
+    /// use apm2_core::budget::{BudgetChargeError, BudgetConfig, BudgetTracker, BudgetType};
     ///
     /// let mut tracker = BudgetTracker::new("session-1", BudgetConfig::default());
     ///

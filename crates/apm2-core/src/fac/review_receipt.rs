@@ -33,9 +33,7 @@
 //!
 //! ```rust
 //! use apm2_core::crypto::Signer;
-//! use apm2_core::fac::{
-//!     ReviewArtifactBundleV1, ReviewReceiptRecorded, ReviewVerdict,
-//! };
+//! use apm2_core::fac::{ReviewArtifactBundleV1, ReviewReceiptRecorded, ReviewVerdict};
 //!
 //! let signer = Signer::generate();
 //!

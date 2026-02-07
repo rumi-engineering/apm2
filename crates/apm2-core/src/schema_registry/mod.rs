@@ -261,9 +261,7 @@ pub mod kernel_schemas {
 /// # Example
 ///
 /// ```rust
-/// use apm2_core::schema_registry::{
-///     InMemorySchemaRegistry, register_kernel_schemas,
-/// };
+/// use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let registry = InMemorySchemaRegistry::new();

@@ -35,8 +35,7 @@
 //! ```rust
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::evidence::{
-//!     EvidenceBundle, EvidenceCategory, GateReceiptGenerator,
-//!     GateRequirements,
+//!     EvidenceBundle, EvidenceCategory, GateReceiptGenerator, GateRequirements,
 //! };
 //!
 //! // Create a generator with a signing key

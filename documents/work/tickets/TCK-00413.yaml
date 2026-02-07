@@ -1,0 +1,91 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00413"
+    title: "Extract CanonicalDigestIdKit for fail-closed identity codec dedup across Cell/Holon/PublicKey/KeySet IDs"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0020"
+    requirements:
+      - requirement_id: "REQ-0007"
+        requirement_ref: "documents/rfcs/RFC-0020/requirements/REQ-0007.yaml#requirement"
+      - requirement_id: "REQ-0008"
+        requirement_ref: "documents/rfcs/RFC-0020/requirements/REQ-0008.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0007"
+        artifact_ref: "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0007.yaml#evidence_artifact"
+      - evidence_id: "EVID-0008"
+        artifact_ref: "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0008.yaml#evidence_artifact"
+      - evidence_id: "EVID-0303"
+        artifact_ref: "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0303.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+    responsibility_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_API"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00353"
+        reason: "Canonical key ID baseline is the substrate for deduplicating shared text/binary codec logic."
+      - ticket_id: "TCK-00354"
+        reason: "Cell/Holon identity derivation and codec surfaces already exist and are direct adoption sites."
+      - ticket_id: "TCK-00355"
+        reason: "Certificate and delegation flows consume identity types and must remain behaviorally unchanged after refactor."
+  scope:
+    in_scope:
+      - "Introduce a shared identity codec abstraction (`CanonicalDigestIdKit`) in `crates/apm2-daemon/src/identity/` for repeated fail-closed text/binary parsing and formatting paths."
+      - "Refactor `CellIdV1` and `HolonIdV1` to consume the shared codec abstraction while preserving existing canonical grammar and binary semantics."
+      - "Refactor `PublicKeyIdV1` and `KeySetIdV1` codec entry points to use shared helpers where semantics are identical and keep type-specific behavior where required (e.g., tag/sentinel nuances)."
+      - "Preserve exact rejection behavior for non-canonical encodings (mixed case, whitespace, percent-encoding, wrong prefix, invalid lengths)."
+      - "Add regression tests and vector-backed round-trip checks proving semantic equivalence before/after abstraction extraction."
+      - "Document abstraction boundaries in identity module comments so future ID types compose via digest-first typed interfaces."
+    out_of_scope:
+      - "Changing identity derivation domain separators or canonicalization math for existing ID types."
+      - "Protocol or wire-format changes outside identity codec internals."
+      - "Generalized endpoint-kernel refactors in privileged/session dispatch paths."
+      - "RFC text rewrites; this ticket is implementation-level closure for existing RFC-0020 requirements."
+  plan:
+    steps:
+      - "Add `CanonicalDigestIdKit` primitives (trait and/or macro + helper functions) under `crates/apm2-daemon/src/identity/` with explicit fail-closed contracts."
+      - "Migrate `CellIdV1`/`HolonIdV1` parse/serialize boilerplate to the shared kit first (highest overlap cluster)."
+      - "Migrate compatible `PublicKeyIdV1`/`KeySetIdV1` codec paths, preserving algorithm/set-tag specific checks and sentinel semantics."
+      - "Run differential tests comparing legacy vectors against refactored implementations to ensure no externally visible behavior drift."
+      - "Add focused tests for boundary conditions: wrong prefix, invalid length, invalid hex, non-ASCII/percent-encoded inputs, and binary/text round-trips."
+      - "Run `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo doc --workspace --no-deps`, and `cargo test --workspace`."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0007"
+      - "EVID-0008"
+      - "EVID-0303"
+    criteria:
+      - "At least two identity types (`CellIdV1`, `HolonIdV1`) share the new codec abstraction with no behavior regression."
+      - "`PublicKeyIdV1` and `KeySetIdV1` either adopt shared codec primitives or explicitly document retained type-specific divergence."
+      - "All canonical conformance and round-trip tests for REQ-0007 and REQ-0008 pass unchanged in verdict."
+      - "No externally observable grammar/encoding changes are introduced for existing ID text/binary forms."
+      - "Refactor reduces repeated codec boilerplate in `crates/apm2-daemon/src/identity/*.rs` by a measurable amount and is captured in PR evidence."
+  notes:
+    context: |
+      Generated from `documents/work/reports/abstraction_discovery.report.2026-02-07.md`.
+
+      The abstraction discovery run ranked `CanonicalDigestIdKit` as the highest
+      leverage candidate (A01) based on dedup impact, compounding closure, and
+      containment safety. Highest-overlap surfaces were identity codec paths in
+      `cell_id.rs`, `holon_id.rs`, `public_key_id.rs`, and `keyset_id.rs`.
+    files: |
+      - crates/apm2-daemon/src/identity/mod.rs
+      - crates/apm2-daemon/src/identity/cell_id.rs
+      - crates/apm2-daemon/src/identity/holon_id.rs
+      - crates/apm2-daemon/src/identity/public_key_id.rs
+      - crates/apm2-daemon/src/identity/keyset_id.rs
+      - crates/apm2-daemon/src/identity/conformance.rs
+      - crates/apm2-daemon/tests/
+      - documents/work/reports/abstraction_discovery.report.2026-02-07.md
+    security: |
+      - Maintain fail-closed parsing semantics and deterministic canonical encoding invariants.
+      - Do not widen authority boundaries; this is codec dedup only.
+      - Any abstraction path mismatch must deny parsing, not silently coerce inputs.

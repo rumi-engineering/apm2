@@ -21,6 +21,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -36,8 +38,12 @@ jobs:
     steps:
       - name: Check for /benchmark command
         id: check
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
         run: |
-          if [[ "${{ github.event.comment.body }}" == "/benchmark"* ]]; then
+          if [[ "$COMMENT_BODY" == "/benchmark"* ]] && \
+             [[ "$AUTHOR_ASSOC" == "MEMBER" || "$AUTHOR_ASSOC" == "OWNER" || "$AUTHOR_ASSOC" == "COLLABORATOR" ]]; then
             echo "triggered=true" >> $GITHUB_OUTPUT
           else
             echo "triggered=false" >> $GITHUB_OUTPUT

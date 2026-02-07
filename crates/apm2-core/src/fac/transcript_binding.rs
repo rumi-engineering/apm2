@@ -32,9 +32,7 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_core::fac::transcript_binding::{
-//!     AatTranscriptBinding, TranscriptChunk,
-//! };
+//! use apm2_core::fac::transcript_binding::{AatTranscriptBinding, TranscriptChunk};
 //!
 //! // Create transcript chunks
 //! let chunks = vec![

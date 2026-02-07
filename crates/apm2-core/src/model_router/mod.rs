@@ -86,13 +86,8 @@
 //! use apm2_core::model_router::{MockStageExecutor, create_canary_runner};
 //!
 //! // Create a canary runner comparing two profiles
-//! let runner = create_canary_runner(
-//!     Path::new("/repo"),
-//!     "local",
-//!     "production",
-//!     MockStageExecutor,
-//! )
-//! .unwrap();
+//! let runner =
+//!     create_canary_runner(Path::new("/repo"), "local", "production", MockStageExecutor).unwrap();
 //!
 //! // Run canary comparison
 //! let mut inputs = HashMap::new();

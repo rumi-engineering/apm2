@@ -19,8 +19,8 @@
 //!
 //! ```rust
 //! use apm2_core::cac::target_profile::{
-//!     BudgetPolicy, DeliveryConstraints, OutputFormat, ProvenanceEmbed,
-//!     RenderingPolicy, RetrievalPolicy, Stage, TargetProfile, TypedQuantity,
+//!     BudgetPolicy, DeliveryConstraints, OutputFormat, ProvenanceEmbed, RenderingPolicy,
+//!     RetrievalPolicy, Stage, TargetProfile, TypedQuantity,
 //! };
 //!
 //! let profile = TargetProfile::builder()
@@ -746,8 +746,8 @@ impl DeliveryConstraintsBuilder {
 ///
 /// ```rust
 /// use apm2_core::cac::target_profile::{
-///     BudgetPolicy, DeliveryConstraints, RenderingPolicy, RetrievalPolicy,
-///     Stage, TargetProfile, TypedQuantity,
+///     BudgetPolicy, DeliveryConstraints, RenderingPolicy, RetrievalPolicy, Stage, TargetProfile,
+///     TypedQuantity,
 /// };
 ///
 /// let profile = TargetProfile::builder()

@@ -35,9 +35,7 @@
 //!
 //! ```
 //! use apm2_core::cac::compiler::ContextPackCompiler;
-//! use apm2_core::cac::{
-//!     BudgetConstraint, ContextPackSpec, DcpEntry, DcpIndex, TypedQuantity,
-//! };
+//! use apm2_core::cac::{BudgetConstraint, ContextPackSpec, DcpEntry, DcpIndex, TypedQuantity};
 //!
 //! // Setup DCP index with artifacts
 //! let mut index = DcpIndex::new();

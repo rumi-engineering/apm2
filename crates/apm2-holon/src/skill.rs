@@ -361,7 +361,8 @@ impl StopConditionsConfig {
 /// ```rust
 /// use apm2_holon::skill::parse_frontmatter;
 ///
-/// let content = "---\nname: my-skill\ndescription: A useful skill\n---\n\n# Skill Documentation\n";
+/// let content =
+///     "---\nname: my-skill\ndescription: A useful skill\n---\n\n# Skill Documentation\n";
 ///
 /// let (frontmatter, body) = parse_frontmatter(content).unwrap();
 /// assert_eq!(frontmatter.name, "my-skill");

@@ -15,9 +15,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use apm2_core::bootstrap::{
-//!     BootstrapError, is_bootstrap_id, verify_bootstrap_hash,
-//! };
+//! use apm2_core::bootstrap::{BootstrapError, is_bootstrap_id, verify_bootstrap_hash};
 //!
 //! // Verify bootstrap integrity at startup
 //! verify_bootstrap_hash()?;

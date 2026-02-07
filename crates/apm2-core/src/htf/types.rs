@@ -959,17 +959,14 @@ impl BoundedWallInterval {
     /// # Example
     ///
     /// ```rust
-    /// use apm2_core::htf::{
-    ///     BoundedWallInterval, BoundedWallIntervalError, WallTimeSource,
-    /// };
+    /// use apm2_core::htf::{BoundedWallInterval, BoundedWallIntervalError, WallTimeSource};
     ///
     /// // Valid interval
     /// let wall = BoundedWallInterval::new(100, 200, WallTimeSource::None, "test");
     /// assert!(wall.is_ok());
     ///
     /// // Invalid: t_max < t_min
-    /// let invalid =
-    ///     BoundedWallInterval::new(200, 100, WallTimeSource::None, "test");
+    /// let invalid = BoundedWallInterval::new(200, 100, WallTimeSource::None, "test");
     /// assert!(matches!(
     ///     invalid,
     ///     Err(BoundedWallIntervalError::InvalidInterval { .. })

@@ -24,8 +24,7 @@ use serde::{Deserialize, Serialize};
 /// use apm2_holon::EpisodeResult;
 ///
 /// // A completed episode with output
-/// let result: EpisodeResult<String> =
-///     EpisodeResult::completed("Task done!".to_string());
+/// let result: EpisodeResult<String> = EpisodeResult::completed("Task done!".to_string());
 /// assert!(result.is_completed());
 ///
 /// // An episode that needs to continue

@@ -25,16 +25,13 @@
 //!
 //! ```rust
 //! use apm2_core::crypto::Signer;
-//! use apm2_core::fac::{
-//!     GATE_LEASE_ISSUED_PREFIX, sign_with_domain, verify_with_domain,
-//! };
+//! use apm2_core::fac::{GATE_LEASE_ISSUED_PREFIX, sign_with_domain, verify_with_domain};
 //!
 //! let signer = Signer::generate();
 //! let canonical_bytes = b"lease data";
 //!
 //! // Sign with domain separation
-//! let signature =
-//!     sign_with_domain(&signer, GATE_LEASE_ISSUED_PREFIX, canonical_bytes);
+//! let signature = sign_with_domain(&signer, GATE_LEASE_ISSUED_PREFIX, canonical_bytes);
 //!
 //! // Verify with the same domain prefix
 //! assert!(
@@ -214,9 +211,7 @@ pub fn sign_with_domain(
 ///
 /// ```rust
 /// use apm2_core::crypto::Signer;
-/// use apm2_core::fac::{
-///     GATE_LEASE_ISSUED_PREFIX, sign_with_domain, verify_with_domain,
-/// };
+/// use apm2_core::fac::{GATE_LEASE_ISSUED_PREFIX, sign_with_domain, verify_with_domain};
 ///
 /// let signer = Signer::generate();
 /// let data = b"lease canonical bytes";
