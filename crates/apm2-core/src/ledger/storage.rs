@@ -26,6 +26,18 @@ use super::backend::LedgerBackend;
 
 /// Schema SQL embedded at compile time.
 const SCHEMA_SQL: &str = include_str!("schema.sql");
+/// Read-compatibility view that maps daemon `ledger_events` rows to the
+/// canonical `events` shape expected by `EventRecord`.
+const LEGACY_EVENTS_COMPAT_VIEW: &str = "events_legacy_compat_v1";
+
+/// Internal read source selection for `Ledger`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerReadMode {
+    /// Read from canonical `events` table.
+    CanonicalEvents,
+    /// Read from daemon-owned `ledger_events` via compatibility view.
+    LegacyLedgerEvents,
+}
 
 /// Errors that can occur during ledger operations.
 #[derive(Debug, Error)]
@@ -97,6 +109,42 @@ pub enum LedgerError {
         /// The actual hash of the last event in the ledger.
         expected_prev_hash: Vec<u8>,
     },
+
+    /// Compatibility mode cannot determine a single authoritative event source.
+    #[error(
+        "ambiguous ledger schema state: events has {events_rows} row(s) and \
+         ledger_events has {legacy_rows} row(s); refusing to guess read source"
+    )]
+    AmbiguousSchemaState {
+        /// Number of rows in canonical `events` table.
+        events_rows: u64,
+        /// Number of rows in legacy `ledger_events` table.
+        legacy_rows: u64,
+    },
+
+    /// Legacy daemon schema does not match the expected shape.
+    #[error("legacy ledger_events schema mismatch: {details}")]
+    LegacySchemaMismatch {
+        /// Human-readable mismatch details.
+        details: String,
+    },
+
+    /// Write operation rejected because the ledger is in legacy compatibility
+    /// mode.
+    ///
+    /// When the ledger is opened against a daemon-owned `ledger_events` table
+    /// (i.e., `LedgerReadMode::LegacyLedgerEvents`), all canonical write APIs
+    /// are blocked to prevent split-brain read/write semantics. The legacy
+    /// compatibility view lacks hash-chain material (`event_hash` and
+    /// `prev_hash` are always NULL), so cryptographic append operations would
+    /// chain from genesis regardless of pre-existing history, violating
+    /// hash-chain continuity.
+    ///
+    /// To write events, first perform a canonical unification migration that
+    /// copies legacy rows into the `events` table with proper hash-chain
+    /// linking.
+    #[error("ledger is in legacy compatibility mode and is read-only")]
+    LegacyModeReadOnly,
 }
 
 /// Current record version for the event schema.
@@ -327,6 +375,7 @@ pub struct LedgerStats {
 /// storage operations for the APM2 event-sourcing architecture.
 pub struct SqliteLedgerBackend {
     conn: Arc<std::sync::Mutex<Connection>>,
+    read_mode: LedgerReadMode,
     #[allow(dead_code)]
     path: Option<std::path::PathBuf>,
 }
@@ -354,10 +403,11 @@ impl SqliteLedgerBackend {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
 
-        Self::initialize_connection(&conn)?;
+        let read_mode = Self::initialize_connection(&conn)?;
 
         Ok(Self {
             conn: Arc::new(std::sync::Mutex::new(conn)),
+            read_mode,
             path: Some(path.to_path_buf()),
         })
     }
@@ -369,23 +419,28 @@ impl SqliteLedgerBackend {
     /// Returns an error if the database cannot be initialized.
     pub fn in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory()?;
-        Self::initialize_connection(&conn)?;
+        let read_mode = Self::initialize_connection(&conn)?;
 
         Ok(Self {
             conn: Arc::new(std::sync::Mutex::new(conn)),
+            read_mode,
             path: None,
         })
     }
 
     /// Initialize the connection with schema and pragmas.
-    fn initialize_connection(conn: &Connection) -> Result<(), LedgerError> {
+    fn initialize_connection(conn: &Connection) -> Result<LedgerReadMode, LedgerError> {
         // Execute schema (includes PRAGMA statements)
         conn.execute_batch(SCHEMA_SQL)?;
 
         // Run migrations for existing databases (RFC-0014 consensus columns)
         Self::migrate_consensus_columns(conn)?;
 
-        Ok(())
+        // TCK-00398 phase 1: create idempotent read-compat scaffolding for
+        // daemon-owned `ledger_events` databases.
+        Self::migrate_legacy_read_compat(conn)?;
+
+        Self::determine_read_mode(conn)
     }
 
     /// Migrates existing databases to add RFC-0014 consensus columns.
@@ -424,14 +479,185 @@ impl SqliteLedgerBackend {
         Ok(())
     }
 
+    /// Creates phase-1 compatibility scaffolding for daemon-written ledgers.
+    ///
+    /// This migration is idempotent (`CREATE VIEW IF NOT EXISTS`). It does not
+    /// mutate or drop `ledger_events`; it only exposes an `events`-compatible
+    /// projection for read paths.
+    fn migrate_legacy_read_compat(conn: &Connection) -> Result<(), LedgerError> {
+        if !Self::table_exists(conn, "ledger_events")? {
+            return Ok(());
+        }
+
+        // Fail closed if the schema diverges from the daemon write contract.
+        Self::validate_legacy_ledger_events_schema(conn)?;
+
+        let create_view_sql = format!(
+            "CREATE VIEW IF NOT EXISTS {LEGACY_EVENTS_COMPAT_VIEW} AS
+             SELECT
+                 CAST(rowid AS INTEGER) AS seq_id,
+                 event_type,
+                 work_id AS session_id,
+                 actor_id,
+                 1 AS record_version,
+                 payload,
+                 timestamp_ns,
+                 NULL AS prev_hash,
+                 NULL AS event_hash,
+                 signature,
+                 NULL AS consensus_epoch,
+                 NULL AS consensus_round,
+                 NULL AS quorum_cert,
+                 NULL AS schema_digest,
+                 NULL AS canonicalizer_id,
+                 NULL AS canonicalizer_version,
+                 NULL AS hlc_wall_time,
+                 NULL AS hlc_counter
+             FROM ledger_events"
+        );
+        conn.execute_batch(&create_view_sql)?;
+        Ok(())
+    }
+
+    /// Determines which table/view is authoritative for read operations.
+    ///
+    /// Security posture (fail-closed):
+    /// - If both `events` and `ledger_events` contain rows, return an error.
+    /// - If only `ledger_events` contains rows, use phase-1 compatibility mode.
+    /// - Otherwise, use canonical `events`.
+    fn determine_read_mode(conn: &Connection) -> Result<LedgerReadMode, LedgerError> {
+        let events_rows: u64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| {
+            row.get::<_, i64>(0).map(|v| v as u64)
+        })?;
+
+        if !Self::table_exists(conn, "ledger_events")? {
+            return Ok(LedgerReadMode::CanonicalEvents);
+        }
+
+        // Validate column names/types before trusting compatibility reads.
+        Self::validate_legacy_ledger_events_schema(conn)?;
+
+        let legacy_rows: u64 = conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| {
+            row.get::<_, i64>(0).map(|v| v as u64)
+        })?;
+
+        match (events_rows > 0, legacy_rows > 0) {
+            (true, true) => Err(LedgerError::AmbiguousSchemaState {
+                events_rows,
+                legacy_rows,
+            }),
+            (false, true) => Ok(LedgerReadMode::LegacyLedgerEvents),
+            _ => Ok(LedgerReadMode::CanonicalEvents),
+        }
+    }
+
+    /// Returns true when a `SQLite` table exists.
+    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, LedgerError> {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+                params![table_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
+    /// Validates the legacy daemon `ledger_events` schema contract.
+    ///
+    /// This prevents silent truncation or type coercion bugs in compatibility
+    /// mode by requiring exact column names and declared SQL types.
+    fn validate_legacy_ledger_events_schema(conn: &Connection) -> Result<(), LedgerError> {
+        let columns: Vec<(String, String, i64)> = conn
+            .prepare("PRAGMA table_info(ledger_events)")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if columns.is_empty() {
+            return Err(LedgerError::LegacySchemaMismatch {
+                details: "ledger_events table exists but PRAGMA returned no columns".to_string(),
+            });
+        }
+
+        let expected = [
+            ("event_id", "TEXT"),
+            ("event_type", "TEXT"),
+            ("work_id", "TEXT"),
+            ("actor_id", "TEXT"),
+            ("payload", "BLOB"),
+            ("signature", "BLOB"),
+            ("timestamp_ns", "INTEGER"),
+        ];
+
+        for (name, expected_type) in expected {
+            let Some((_, actual_type, _)) =
+                columns.iter().find(|(col_name, _, _)| col_name == name)
+            else {
+                return Err(LedgerError::LegacySchemaMismatch {
+                    details: format!("missing required column '{name}' in ledger_events"),
+                });
+            };
+
+            if !actual_type.eq_ignore_ascii_case(expected_type) {
+                return Err(LedgerError::LegacySchemaMismatch {
+                    details: format!(
+                        "column '{name}' type mismatch: expected {expected_type}, found {actual_type}"
+                    ),
+                });
+            }
+        }
+
+        let event_id_pk = columns
+            .iter()
+            .find(|(col_name, _, _)| col_name == "event_id")
+            .is_some_and(|(_, _, pk)| *pk == 1);
+
+        if !event_id_pk {
+            return Err(LedgerError::LegacySchemaMismatch {
+                details: "column 'event_id' must be PRIMARY KEY".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Fail-closed guard: rejects all write operations in legacy compatibility
+    /// mode.
+    ///
+    /// When the ledger reads from the daemon-owned `ledger_events` table via
+    /// the compatibility view, all canonical write APIs MUST be blocked
+    /// because:
+    ///
+    /// 1. Writes go to the canonical `events` table, but reads come from
+    ///    `ledger_events` — creating split-brain read/write semantics.
+    /// 2. The compatibility view projects `event_hash` and `prev_hash` as NULL,
+    ///    so `last_event_hash()` always returns the genesis hash. Any
+    ///    cryptographic append (`append_signed`, `append_verified`) would chain
+    ///    from genesis regardless of pre-existing legacy history, breaking
+    ///    hash-chain continuity.
+    fn ensure_writable(&self) -> Result<(), LedgerError> {
+        if self.read_mode == LedgerReadMode::LegacyLedgerEvents {
+            return Err(LedgerError::LegacyModeReadOnly);
+        }
+        Ok(())
+    }
+
     /// Appends an event to the ledger.
     ///
     /// Returns the assigned sequence ID for the event.
     ///
     /// # Errors
     ///
-    /// Returns an error if the event cannot be inserted.
+    /// Returns [`LedgerError::LegacyModeReadOnly`] if the ledger is in legacy
+    /// compatibility mode, or a database error if the event cannot be inserted.
     pub fn append(&self, event: &EventRecord) -> Result<u64, LedgerError> {
+        self.ensure_writable()?;
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
@@ -467,9 +693,11 @@ impl SqliteLedgerBackend {
     ///
     /// # Errors
     ///
-    /// Returns an error if any event cannot be inserted. On error,
-    /// no events are inserted (atomic operation).
+    /// Returns [`LedgerError::LegacyModeReadOnly`] if the ledger is in legacy
+    /// compatibility mode, or a database error if any event cannot be inserted.
+    /// On error, no events are inserted (atomic operation).
     pub fn append_batch(&self, events: &[EventRecord]) -> Result<Vec<u64>, LedgerError> {
+        self.ensure_writable()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -519,13 +747,22 @@ impl SqliteLedgerBackend {
     pub fn read_from(&self, cursor: u64, limit: u64) -> Result<Vec<EventRecord>, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
-             FROM events
-             WHERE seq_id >= ?1
-             ORDER BY seq_id ASC
-             LIMIT ?2",
-        )?;
+        let mut stmt = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events
+                 WHERE seq_id >= ?1
+                 ORDER BY seq_id ASC
+                 LIMIT ?2",
+            )?,
+            LedgerReadMode::LegacyLedgerEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events_legacy_compat_v1
+                 WHERE seq_id >= ?1
+                 ORDER BY seq_id ASC
+                 LIMIT ?2",
+            )?,
+        };
 
         let events = stmt
             .query_map(params![cursor, limit], Self::row_to_event_record)?
@@ -566,11 +803,18 @@ impl SqliteLedgerBackend {
     pub fn read_one(&self, seq_id: u64) -> Result<EventRecord, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
-             FROM events
-             WHERE seq_id = ?1",
-        )?;
+        let mut stmt = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events
+                 WHERE seq_id = ?1",
+            )?,
+            LedgerReadMode::LegacyLedgerEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events_legacy_compat_v1
+                 WHERE seq_id = ?1",
+            )?,
+        };
 
         stmt.query_row(params![seq_id], Self::row_to_event_record)
             .map_err(|e| match e {
@@ -593,13 +837,22 @@ impl SqliteLedgerBackend {
     ) -> Result<Vec<EventRecord>, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
-             FROM events
-             WHERE session_id = ?1
-             ORDER BY seq_id ASC
-             LIMIT ?2",
-        )?;
+        let mut stmt = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events
+                 WHERE session_id = ?1
+                 ORDER BY seq_id ASC
+                 LIMIT ?2",
+            )?,
+            LedgerReadMode::LegacyLedgerEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events_legacy_compat_v1
+                 WHERE session_id = ?1
+                 ORDER BY seq_id ASC
+                 LIMIT ?2",
+            )?,
+        };
 
         let events = stmt
             .query_map(params![session_id, limit], Self::row_to_event_record)?
@@ -621,13 +874,22 @@ impl SqliteLedgerBackend {
     ) -> Result<Vec<EventRecord>, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
-             FROM events
-             WHERE event_type = ?1 AND seq_id >= ?2
-             ORDER BY seq_id ASC
-             LIMIT ?3",
-        )?;
+        let mut stmt = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events
+                 WHERE event_type = ?1 AND seq_id >= ?2
+                 ORDER BY seq_id ASC
+                 LIMIT ?3",
+            )?,
+            LedgerReadMode::LegacyLedgerEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events_legacy_compat_v1
+                 WHERE event_type = ?1 AND seq_id >= ?2
+                 ORDER BY seq_id ASC
+                 LIMIT ?3",
+            )?,
+        };
 
         let events = stmt
             .query_map(
@@ -746,8 +1008,16 @@ impl SqliteLedgerBackend {
     pub fn head_sync(&self) -> Result<u64, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
-        let max: Option<i64> =
-            conn.query_row("SELECT MAX(seq_id) FROM events", [], |row| row.get(0))?;
+        let max: Option<i64> = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => {
+                conn.query_row("SELECT MAX(seq_id) FROM events", [], |row| row.get(0))?
+            },
+            LedgerReadMode::LegacyLedgerEvents => conn.query_row(
+                "SELECT MAX(seq_id) FROM events_legacy_compat_v1",
+                [],
+                |row| row.get(0),
+            )?,
+        };
 
         Ok(max.unwrap_or(0) as u64)
     }
@@ -760,14 +1030,30 @@ impl SqliteLedgerBackend {
     pub fn stats(&self) -> Result<LedgerStats, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
-        let event_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        let event_count: i64 = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => {
+                conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?
+            },
+            LedgerReadMode::LegacyLedgerEvents => {
+                conn.query_row("SELECT COUNT(*) FROM events_legacy_compat_v1", [], |row| {
+                    row.get(0)
+                })?
+            },
+        };
 
         let artifact_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM artifact_refs", [], |row| row.get(0))?;
 
-        let max_seq_id: Option<i64> =
-            conn.query_row("SELECT MAX(seq_id) FROM events", [], |row| row.get(0))?;
+        let max_seq_id: Option<i64> = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => {
+                conn.query_row("SELECT MAX(seq_id) FROM events", [], |row| row.get(0))?
+            },
+            LedgerReadMode::LegacyLedgerEvents => conn.query_row(
+                "SELECT MAX(seq_id) FROM events_legacy_compat_v1",
+                [],
+                |row| row.get(0),
+            )?,
+        };
 
         // Get page count and page size to compute database size
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
@@ -817,8 +1103,11 @@ impl SqliteLedgerBackend {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
 
+        let read_mode = Self::determine_read_mode(&conn)?;
+
         Ok(LedgerReader {
             conn: Arc::new(std::sync::Mutex::new(conn)),
+            read_mode,
         })
     }
 
@@ -828,17 +1117,31 @@ impl SqliteLedgerBackend {
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails.
+    /// Returns [`LedgerError::LegacyModeReadOnly`] if the ledger is in legacy
+    /// compatibility mode (the compatibility view always projects
+    /// `event_hash` as NULL, so the returned hash would be unsound).
+    ///
+    /// Returns a database error if the query fails.
     pub fn last_event_hash(&self) -> Result<Vec<u8>, LedgerError> {
+        self.ensure_writable()?;
         let conn = self.conn.lock().unwrap();
 
-        let result: Option<Option<Vec<u8>>> = conn
-            .query_row(
-                "SELECT event_hash FROM events ORDER BY seq_id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let result: Option<Option<Vec<u8>>> = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => conn
+                .query_row(
+                    "SELECT event_hash FROM events ORDER BY seq_id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            LedgerReadMode::LegacyLedgerEvents => conn
+                .query_row(
+                    "SELECT event_hash FROM events_legacy_compat_v1 ORDER BY seq_id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
 
         // If no events, or event_hash is NULL, return genesis hash
         Ok(result.flatten().unwrap_or_else(|| vec![0u8; 32]))
@@ -877,6 +1180,8 @@ impl SqliteLedgerBackend {
         F: FnOnce(&[u8], &[u8]) -> Vec<u8>,
         S: FnOnce(&[u8]) -> Vec<u8>,
     {
+        self.ensure_writable()?;
+
         // Get the previous event's hash
         let prev_hash = self.last_event_hash()?;
 
@@ -991,6 +1296,8 @@ impl SqliteLedgerBackend {
         event: &EventRecord,
         verifying_key: &crate::crypto::VerifyingKey,
     ) -> Result<u64, LedgerError> {
+        self.ensure_writable()?;
+
         // DoS protection: reject oversized payloads
         if event.payload.len() > Self::MAX_VERIFIED_PAYLOAD_SIZE {
             return Err(LedgerError::SignatureInvalid {
@@ -1362,6 +1669,7 @@ impl LedgerBackend for SqliteLedgerBackend {
 /// A read-only view of the ledger for concurrent reads.
 pub struct LedgerReader {
     conn: Arc<std::sync::Mutex<Connection>>,
+    read_mode: LedgerReadMode,
 }
 
 impl LedgerReader {
@@ -1373,13 +1681,22 @@ impl LedgerReader {
     pub fn read_from(&self, cursor: u64, limit: u64) -> Result<Vec<EventRecord>, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
-             FROM events
-             WHERE seq_id >= ?1
-             ORDER BY seq_id ASC
-             LIMIT ?2",
-        )?;
+        let mut stmt = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events
+                 WHERE seq_id >= ?1
+                 ORDER BY seq_id ASC
+                 LIMIT ?2",
+            )?,
+            LedgerReadMode::LegacyLedgerEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events_legacy_compat_v1
+                 WHERE seq_id >= ?1
+                 ORDER BY seq_id ASC
+                 LIMIT ?2",
+            )?,
+        };
 
         let events = stmt
             .query_map(params![cursor, limit], Ledger::row_to_event_record)?
@@ -1396,11 +1713,18 @@ impl LedgerReader {
     pub fn read_one(&self, seq_id: u64) -> Result<EventRecord, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
-             FROM events
-             WHERE seq_id = ?1",
-        )?;
+        let mut stmt = match self.read_mode {
+            LedgerReadMode::CanonicalEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events
+                 WHERE seq_id = ?1",
+            )?,
+            LedgerReadMode::LegacyLedgerEvents => conn.prepare(
+                "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
+                 FROM events_legacy_compat_v1
+                 WHERE seq_id = ?1",
+            )?,
+        };
 
         stmt.query_row(params![seq_id], Ledger::row_to_event_record)
             .map_err(|e| match e {
