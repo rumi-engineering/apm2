@@ -31,6 +31,9 @@
           },
           {
             "context": "ai-review/code-quality"
+          },
+          {
+            "context": "Review Gate Success"
           }
         ],
         "strict_required_status_checks_policy": true

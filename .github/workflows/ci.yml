@@ -29,6 +29,7 @@ jobs:
   # Format check
   fmt:
     name: Rustfmt
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -42,6 +43,7 @@ jobs:
   # Verifies that checked-in generated proto code matches the .proto definition
   proto-verify:
     name: Proto Verify
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -64,6 +66,7 @@ jobs:
   # Clippy lints
   clippy:
     name: Clippy
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -79,6 +82,7 @@ jobs:
   # Documentation
   doc:
     name: Documentation
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -95,6 +99,7 @@ jobs:
   # Tests
   test:
     name: Test
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -116,6 +121,7 @@ jobs:
   # Canonicalization test vectors (TCK-00130)
   test-vectors:
     name: Test Vectors
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -131,6 +137,7 @@ jobs:
   # MSRV check
   msrv:
     name: MSRV (1.85)
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -145,6 +152,7 @@ jobs:
   # Security audit
   security:
     name: Security Audit
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -157,6 +165,7 @@ jobs:
   # Dependency license/ban checks
   deny:
     name: Cargo Deny
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -169,6 +178,7 @@ jobs:
   # Code coverage
   coverage:
     name: Coverage
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -196,6 +206,7 @@ jobs:
   # Verifies that all unsafe blocks have documented safety proofs per Rust convention
   safety-proof-coverage:
     name: Safety Proof Coverage
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -243,6 +254,7 @@ jobs:
   # Prevents reintroduction of legacy JSON IPC code removed in TCK-00281
   legacy-ipc-guard:
     name: Legacy IPC Guard
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -256,6 +268,7 @@ jobs:
   # Release build check
   build:
     name: Release Build
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

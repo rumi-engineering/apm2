@@ -1,0 +1,59 @@
+name: "PR-454 both categories pass with current head bindings"
+pr_number: 454
+head_sha: "9999999999999999999999999999999999999999"
+statuses:
+  - context: "ai-review/security"
+    state: "success"
+    created_at: "2026-02-09T16:30:00Z"
+  - context: "ai-review/code-quality"
+    state: "success"
+    created_at: "2026-02-09T16:31:00Z"
+comments:
+  - id: 45401
+    user_login: "apm2-security-bot"
+    updated_at: "2026-02-09T16:20:00Z"
+    body: |
+      ## Security Review: PASS
+      <!-- apm2-review-metadata:v1:security -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "security",
+        "pr_number": 454,
+        "head_sha": "9999999999999999999999999999999999999999",
+        "verdict": "PASS",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 0,
+          "minor": 1,
+          "nit": 0
+        },
+        "reviewer_id": "apm2-codex-security"
+      }
+      ```
+  - id: 45402
+    user_login: "apm2-quality-bot"
+    updated_at: "2026-02-09T16:21:00Z"
+    body: |
+      ## Code Quality Review: PASS
+      <!-- apm2-review-metadata:v1:code-quality -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "code-quality",
+        "pr_number": 454,
+        "head_sha": "9999999999999999999999999999999999999999",
+        "verdict": "PASS",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 0,
+          "minor": 1,
+          "nit": 0
+        },
+        "reviewer_id": "apm2-codex-quality"
+      }
+      ```
+expected:
+  overall_pass: true
+  security_pass: true
+  code_quality_pass: true
