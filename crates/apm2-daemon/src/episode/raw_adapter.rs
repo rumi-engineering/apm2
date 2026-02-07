@@ -72,7 +72,9 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
-    HarnessEventStream, HarnessHandle, HarnessHandleInner, OutputKind, TerminationClassification,
+    HarnessEventStream, HarnessHandle, MAX_SEND_INPUT_BYTES, OutputKind, TerminationClassification,
+    create_real_handle_inner, process_pty_control_command, pty_control_channel_capacity,
+    read_proc_start_time, send_input_with_handle, terminate_with_handle,
 };
 use super::pty::{PtyConfig, PtyRunner};
 
@@ -286,6 +288,7 @@ impl RawAdapter {
 
         let handle_id = Self::next_handle_id();
         let episode_id = config.episode_id.clone();
+        let terminate_grace_period = config.terminate_grace_period;
 
         // Create PTY configuration from harness config
         let (cols, rows) = config.pty_size;
@@ -300,6 +303,14 @@ impl RawAdapter {
         // Spawn the process via PtyRunner
         let mut runner = PtyRunner::spawn(&config.command, &args, pty_config, timestamp_ns)
             .map_err(|e| AdapterError::spawn_failed(format!("PTY spawn failed: {e}")))?;
+        let pid_raw = runner.pid().as_raw();
+        let pid = u32::try_from(pid_raw)
+            .map_err(|_| AdapterError::spawn_failed(format!("invalid PTY child pid: {pid_raw}")))?;
+        let start_time_ticks = read_proc_start_time(pid);
+
+        let (control_tx, mut control_rx) =
+            tokio::sync::mpsc::channel(pty_control_channel_capacity());
+        let handle_inner = create_real_handle_inner(pid, start_time_ticks, control_tx);
 
         // Create the event channel
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -313,36 +324,101 @@ impl RawAdapter {
         // Spawn a task that reads from the PTY and emits events
         // The permit is moved into the task and dropped when it completes,
         // releasing the slot for a new process.
+        let task_episode_id = episode_id.clone();
         tokio::spawn(async move {
             // Hold the permit for the duration of the task
             let _permit = permit;
+            let episode_id = task_episode_id;
 
             let mut seq = 0u64;
+            let mut exit_status = None;
+            let mut control_open = true;
+            let mut output_live = true;
 
-            // Read output from PTY and emit events
-            while let Some(output) = runner.recv().await {
-                let event = HarnessEvent::output(
-                    output.chunk.to_vec(),
-                    OutputKind::Combined,
-                    seq,
-                    output.ts_mono,
-                );
-                seq += 1;
+            // Bounded backpressure telemetry: count dropped events and only
+            // log on the first drop to avoid unbounded log write amplification.
+            let mut dropped_output_events: u64 = 0;
 
-                // Update shared state with output count if provided
-                if let Some(ref state) = shared_state {
-                    let mut guard = state.lock().await;
-                    guard.output_event_count = seq;
-                }
+            loop {
+                tokio::select! {
+                    maybe_cmd = control_rx.recv(), if control_open => {
+                        if let Some(command) = maybe_cmd {
+                            if let Some(status) = process_pty_control_command(
+                                command,
+                                &mut runner,
+                                pid,
+                                start_time_ticks,
+                            ).await {
+                                exit_status = Some(status);
+                                break;
+                            }
+                        } else {
+                            control_open = false;
+                            // If output is also dead, nothing left to do
+                            if !output_live {
+                                break;
+                            }
+                        }
+                    }
+                    maybe_output = runner.recv() => {
+                        if let Some(output) = maybe_output {
+                            if output_live {
+                                let event = HarnessEvent::output(
+                                    output.chunk.to_vec(),
+                                    OutputKind::Combined,
+                                    seq,
+                                    output.ts_mono,
+                                );
+                                seq += 1;
 
-                if tx.send(event).await.is_err() {
-                    // Receiver dropped, stop reading
-                    break;
+                                // Update shared state with output count if provided
+                                if let Some(ref state) = shared_state {
+                                    let mut guard = state.lock().await;
+                                    guard.output_event_count = seq;
+                                }
+
+                                match tx.try_send(event) {
+                                    Ok(()) => {},
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        // Receiver dropped — stop forwarding output but
+                                        // keep servicing control commands for liveness.
+                                        output_live = false;
+                                    },
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        // Channel full — drop this event to avoid blocking
+                                        // the select loop, which would starve control-plane
+                                        // commands (send_input, terminate). This is the
+                                        // non-blocking output policy per the control-plane
+                                        // decoupling invariant: control commands MUST always
+                                        // be serviced regardless of output backpressure.
+                                        //
+                                        // Rate-limited telemetry: log only on the first drop
+                                        // to prevent unbounded log write amplification under
+                                        // sustained backpressure. Total drops are summarised
+                                        // at task exit.
+                                        if dropped_output_events == 0 {
+                                            tracing::warn!(
+                                                episode_id = %episode_id,
+                                                seq = seq - 1,
+                                                "output event dropped: event channel full (backpressure); \
+                                                 further drops will be counted silently"
+                                            );
+                                        }
+                                        dropped_output_events += 1;
+                                    },
+                                }
+                            }
+                            // else: drain output silently to detect process termination
+                        } else {
+                            exit_status = Some(runner.wait().unwrap_or(super::pty::ExitStatus::Running));
+                            break;
+                        }
+                    }
                 }
             }
 
-            // Wait for process to exit and get status
-            let exit_status = runner.wait().unwrap_or(super::pty::ExitStatus::Running);
+            let exit_status = exit_status
+                .unwrap_or_else(|| runner.wait().unwrap_or(super::pty::ExitStatus::Running));
 
             let exit_code = exit_status.code();
             let classification = Self::classify_exit(exit_status);
@@ -355,15 +431,35 @@ impl RawAdapter {
                 guard.output_event_count = seq;
             }
 
-            // Emit terminated event
-            let _ = tx
+            // Log backpressure drop summary at task exit if any events were lost.
+            if dropped_output_events > 0 {
+                tracing::warn!(
+                    episode_id = %episode_id,
+                    dropped_output_events,
+                    "task exiting with dropped output events due to backpressure"
+                );
+            }
+
+            // Emit terminated event using blocking send. Terminated is a
+            // control-significant one-shot event (at most once per task
+            // lifetime) and must not be silently lost. Blocking here is
+            // acceptable because the task is about to exit anyway.
+            if tx
                 .send(HarnessEvent::terminated(exit_code, classification))
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    episode_id = %episode_id,
+                    "terminated event could not be delivered: receiver dropped"
+                );
+            }
 
             // Permit is automatically released when dropped here
         });
 
-        let handle = HarnessHandle::new(handle_id, episode_id, HarnessHandleInner::Placeholder);
+        let handle =
+            HarnessHandle::new(handle_id, episode_id, terminate_grace_period, handle_inner);
 
         Ok((handle, rx))
     }
@@ -396,32 +492,32 @@ impl HarnessAdapter for RawAdapter {
 
     fn send_input(
         &self,
-        _handle: &HarnessHandle,
-        _input: &[u8],
+        handle: &HarnessHandle,
+        input: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<()>> + Send + '_>> {
-        Box::pin(async move {
-            // Note: To fully implement send_input, we would need to store the PtyRunner
-            // in the HarnessHandleInner. For now, return an error indicating this
-            // limitation. A future ticket can enhance this to support interactive input.
-            Err(AdapterError::input_failed(
-                "raw adapter send_input requires handle-based PTY storage (not yet implemented)",
-            ))
-        })
+        let handle_id = handle.id();
+        // Validate size before cloning to avoid unnecessary allocation
+        let input_len = input.len();
+        if input_len > MAX_SEND_INPUT_BYTES {
+            return Box::pin(async move {
+                Err(AdapterError::input_failed(format!(
+                    "input payload too large: {input_len} bytes exceeds maximum {MAX_SEND_INPUT_BYTES} bytes",
+                )))
+            });
+        }
+        let runner_handle = handle.real_runner_handle();
+        let input = input.to_vec();
+        Box::pin(async move { send_input_with_handle(handle_id, runner_handle, input).await })
     }
 
     fn terminate(
         &self,
-        _handle: &HarnessHandle,
+        handle: &HarnessHandle,
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<ExitStatus>> + Send + '_>> {
-        Box::pin(async move {
-            // Note: Similar to send_input, full terminate support requires storing
-            // the PtyRunner in HarnessHandleInner. The spawned task will handle
-            // cleanup when dropped. For explicit termination, we would need to
-            // signal the runner via the handle.
-            Err(AdapterError::terminate_failed(
-                "raw adapter terminate requires handle-based PTY storage (not yet implemented)",
-            ))
-        })
+        let handle_id = handle.id();
+        let runner_handle = handle.real_runner_handle();
+        let grace_period = handle.terminate_grace_period();
+        Box::pin(async move { terminate_with_handle(handle_id, runner_handle, grace_period).await })
     }
 }
 
@@ -932,31 +1028,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_raw_adapter_send_input_not_implemented() {
+    async fn test_raw_adapter_send_input_and_terminate() {
         let adapter = RawAdapter::new();
-        let config = HarnessConfig::new("cat", "episode-test");
+        let config = HarnessConfig::new("cat", "episode-interactive");
 
-        let (handle, _events) = adapter.spawn(config).await.unwrap();
+        let (handle, mut events) = adapter.spawn(config).await.unwrap();
+        let (pid, start_time_ticks) = match &handle.inner {
+            super::super::adapter::HarnessHandleInner::Real(real) => {
+                let guard = real.lock().await;
+                (guard.pid, guard.start_time_ticks)
+            },
+        };
+        assert!(
+            start_time_ticks.is_some(),
+            "spawn should capture start-time binding for PID validation"
+        );
 
-        let result = adapter.send_input(&handle, b"test input").await;
-        assert!(result.is_err());
+        adapter
+            .send_input(&handle, b"hello from raw adapter\n")
+            .await
+            .unwrap();
 
-        let err = result.unwrap_err();
-        assert!(matches!(err, AdapterError::InputFailed { .. }));
+        let observed_output = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let HarnessEvent::Output { chunk, .. } = event {
+                    if String::from_utf8_lossy(&chunk).contains("hello from raw adapter") {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for output event");
+        assert!(observed_output, "expected echo output from cat");
+
+        let exit_status = adapter.terminate(&handle).await.unwrap();
+        assert!(
+            !exit_status.success(),
+            "terminate should stop the process via signal"
+        );
+
+        let terminated_event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let HarnessEvent::Terminated { .. } = event {
+                    return Some(event);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for terminated event")
+        .expect("expected terminated event after terminate()");
+
+        if let HarnessEvent::Terminated { classification, .. } = terminated_event {
+            assert!(matches!(
+                classification,
+                TerminationClassification::Killed | TerminationClassification::Terminated
+            ));
+        }
+
+        if let Some(expected_start) = start_time_ticks {
+            assert_ne!(
+                super::super::adapter::read_proc_start_time(pid),
+                Some(expected_start),
+                "original process identity must not remain alive after terminate"
+            );
+        }
+
+        let send_after_terminate = adapter.send_input(&handle, b"post-terminate\n").await;
+        assert!(matches!(
+            send_after_terminate,
+            Err(AdapterError::InvalidHandle { .. })
+        ));
     }
 
+    /// Verify that terminate fails closed when start-time binding is missing
+    /// on the handle.
+    ///
+    /// Without a start-time binding, signal delivery cannot validate PID
+    /// identity, risking signals to a recycled PID. The handle-level guard
+    /// in `terminate_with_handle` must reject the request before the
+    /// command reaches the control task.
+    ///
+    /// NOTE: This test only exercises the handle-level guard. The control
+    /// task's captured `start_time_ticks` retains the original (non-None)
+    /// value from spawn; the mutation below only affects the handle mirror.
     #[tokio::test]
-    async fn test_raw_adapter_terminate_not_implemented() {
+    async fn test_raw_adapter_terminate_fails_without_start_time_binding() {
         let adapter = RawAdapter::new();
-        let config = HarnessConfig::new("sleep", "episode-test").with_args(vec!["1".to_string()]);
-
+        let config = HarnessConfig::new("cat", "episode-terminate-no-start-time");
         let (handle, _events) = adapter.spawn(config).await.unwrap();
 
-        let result = adapter.terminate(&handle).await;
-        assert!(result.is_err());
+        // Clear the handle-side start-time binding to simulate missing
+        // identity data. The spawned control task retains its own copy.
+        let runner_handle = handle.real_runner_handle();
+        {
+            let mut guard = runner_handle.lock().await;
+            guard.start_time_ticks = None;
+        }
 
-        let err = result.unwrap_err();
-        assert!(matches!(err, AdapterError::TerminateFailed { .. }));
+        // Terminate must fail closed due to missing start-time binding
+        let terminate_result = adapter.terminate(&handle).await;
+        assert!(
+            terminate_result.is_err(),
+            "terminate must fail without start-time binding, got: {terminate_result:?}"
+        );
+        let err_msg = terminate_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("start-time binding"),
+            "error must mention start-time binding, got: {err_msg}"
+        );
+
+        // Clean up: restore binding so the process can be terminated
+        {
+            let mut guard = runner_handle.lock().await;
+            guard.start_time_ticks = super::super::adapter::read_proc_start_time(guard.pid);
+        }
+        let _ = adapter.terminate(&handle).await;
     }
 
     #[test]
@@ -1366,5 +1555,93 @@ mod tests {
 
         // After take, the buffer should be empty
         assert!(holon.collected_events().is_empty());
+    }
+
+    // =========================================================================
+    // Control-plane decoupling regression tests (backpressure)
+    // =========================================================================
+
+    /// UT-BACKPRESSURE-01: Control commands (terminate) must be serviced even
+    /// when the output event channel is full.
+    ///
+    /// This is a regression test for the BLOCKER finding: if the event channel
+    /// is full and output forwarding uses a blocking `.await` send, the select
+    /// loop stalls and control commands time out.  With non-blocking
+    /// `try_send`, the loop continues servicing `control_rx` even when the
+    /// channel is saturated.
+    #[tokio::test]
+    async fn test_terminate_succeeds_under_output_backpressure() {
+        let adapter = RawAdapter::new();
+
+        // Spawn `yes` which produces output rapidly, filling the 256-slot
+        // event channel almost instantly. We intentionally do NOT consume
+        // events from `_events`, so the channel stays full.
+        let config = HarnessConfig::new("yes", "episode-backpressure-terminate");
+        let (handle, _events) = adapter.spawn(config).await.unwrap();
+
+        // Give the background task time to fill the event channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Terminate MUST succeed even though the output channel is full.
+        // Under the old blocking-send code, this would time out because the
+        // select loop was stuck on `tx.send(event).await`.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            adapter.terminate(&handle),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "terminate must not time out under output backpressure"
+        );
+        let exit_result = result.unwrap();
+        assert!(
+            exit_result.is_ok(),
+            "terminate must succeed, got: {exit_result:?}"
+        );
+    }
+
+    /// UT-BACKPRESSURE-02: `send_input` must be serviced even when the output
+    /// event channel is full.
+    #[tokio::test]
+    async fn test_send_input_succeeds_under_output_backpressure() {
+        let adapter = RawAdapter::new();
+
+        // `cat` echoes input back, producing output. We fill the channel by
+        // sending enough input to saturate it, then verify subsequent
+        // send_input calls still succeed.
+        let config = HarnessConfig::new("cat", "episode-backpressure-input");
+        let (handle, _events) = adapter.spawn(config).await.unwrap();
+
+        // Send a burst of input to generate output and fill the channel.
+        for _ in 0..300 {
+            let _ = adapter
+                .send_input(&handle, b"backpressure test line\n")
+                .await;
+        }
+
+        // Give time for output to accumulate and fill the 256-slot channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // This send_input MUST succeed despite the full output channel.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            adapter.send_input(&handle, b"still works\n"),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "send_input must not time out under output backpressure"
+        );
+        let send_result = result.unwrap();
+        assert!(
+            send_result.is_ok(),
+            "send_input must succeed, got: {send_result:?}"
+        );
+
+        // Clean up
+        let _ = adapter.terminate(&handle).await;
     }
 }
