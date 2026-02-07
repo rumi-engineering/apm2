@@ -781,6 +781,18 @@ pub(crate) fn create_real_handle_inner(
 /// enqueuing to the control channel. This prevents a malicious client from
 /// exhausting daemon memory via oversized payloads queued across the
 /// bounded control channel (capacity 8).
+///
+/// # Delivery Semantics (at-most-once)
+///
+/// The timeout (`SEND_INPUT_RESPONSE_TIMEOUT`) is applied **after** the
+/// command has been enqueued on the control channel. If the caller times
+/// out while waiting for the PTY task's acknowledgement, the enqueued
+/// command may still execute later. Callers that retry on timeout should
+/// be aware that the original write may have been (or will be) delivered,
+/// resulting in duplicate input to the child process. This is an
+/// at-most-once guarantee from the caller's perspective: each call either
+/// succeeds exactly once or returns an error, but on timeout the true
+/// outcome is indeterminate.
 pub(crate) async fn send_input_with_handle(
     handle_id: u64,
     runner_handle: Arc<Mutex<PtyRunnerHandle>>,

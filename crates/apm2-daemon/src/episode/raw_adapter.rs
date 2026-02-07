@@ -323,9 +323,11 @@ impl RawAdapter {
         // Spawn a task that reads from the PTY and emits events
         // The permit is moved into the task and dropped when it completes,
         // releasing the slot for a new process.
+        let task_episode_id = episode_id.clone();
         tokio::spawn(async move {
             // Hold the permit for the duration of the task
             let _permit = permit;
+            let episode_id = task_episode_id;
 
             let mut seq = 0u64;
             let mut exit_status = None;
@@ -370,10 +372,26 @@ impl RawAdapter {
                                     guard.output_event_count = seq;
                                 }
 
-                                if tx.send(event).await.is_err() {
-                                    // Receiver dropped — stop forwarding output but
-                                    // keep servicing control commands for liveness.
-                                    output_live = false;
+                                match tx.try_send(event) {
+                                    Ok(()) => {},
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        // Receiver dropped — stop forwarding output but
+                                        // keep servicing control commands for liveness.
+                                        output_live = false;
+                                    },
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        // Channel full — drop this event to avoid blocking
+                                        // the select loop, which would starve control-plane
+                                        // commands (send_input, terminate). This is the
+                                        // non-blocking output policy per the control-plane
+                                        // decoupling invariant: control commands MUST always
+                                        // be serviced regardless of output backpressure.
+                                        tracing::warn!(
+                                            episode_id = %episode_id,
+                                            seq = seq - 1,
+                                            "output event dropped: event channel full (backpressure)"
+                                        );
+                                    },
                                 }
                             }
                             // else: drain output silently to detect process termination
@@ -399,10 +417,9 @@ impl RawAdapter {
                 guard.output_event_count = seq;
             }
 
-            // Emit terminated event
-            let _ = tx
-                .send(HarnessEvent::terminated(exit_code, classification))
-                .await;
+            // Emit terminated event (best-effort, non-blocking to avoid
+            // stalling permit release if the receiver is backpressured).
+            let _ = tx.try_send(HarnessEvent::terminated(exit_code, classification));
 
             // Permit is automatically released when dropped here
         });
@@ -1502,5 +1519,93 @@ mod tests {
 
         // After take, the buffer should be empty
         assert!(holon.collected_events().is_empty());
+    }
+
+    // =========================================================================
+    // Control-plane decoupling regression tests (backpressure)
+    // =========================================================================
+
+    /// UT-BACKPRESSURE-01: Control commands (terminate) must be serviced even
+    /// when the output event channel is full.
+    ///
+    /// This is a regression test for the BLOCKER finding: if the event channel
+    /// is full and output forwarding uses a blocking `.await` send, the select
+    /// loop stalls and control commands time out.  With non-blocking
+    /// `try_send`, the loop continues servicing `control_rx` even when the
+    /// channel is saturated.
+    #[tokio::test]
+    async fn test_terminate_succeeds_under_output_backpressure() {
+        let adapter = RawAdapter::new();
+
+        // Spawn `yes` which produces output rapidly, filling the 256-slot
+        // event channel almost instantly. We intentionally do NOT consume
+        // events from `_events`, so the channel stays full.
+        let config = HarnessConfig::new("yes", "episode-backpressure-terminate");
+        let (handle, _events) = adapter.spawn(config).await.unwrap();
+
+        // Give the background task time to fill the event channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Terminate MUST succeed even though the output channel is full.
+        // Under the old blocking-send code, this would time out because the
+        // select loop was stuck on `tx.send(event).await`.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            adapter.terminate(&handle),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "terminate must not time out under output backpressure"
+        );
+        let exit_result = result.unwrap();
+        assert!(
+            exit_result.is_ok(),
+            "terminate must succeed, got: {exit_result:?}"
+        );
+    }
+
+    /// UT-BACKPRESSURE-02: `send_input` must be serviced even when the output
+    /// event channel is full.
+    #[tokio::test]
+    async fn test_send_input_succeeds_under_output_backpressure() {
+        let adapter = RawAdapter::new();
+
+        // `cat` echoes input back, producing output. We fill the channel by
+        // sending enough input to saturate it, then verify subsequent
+        // send_input calls still succeed.
+        let config = HarnessConfig::new("cat", "episode-backpressure-input");
+        let (handle, _events) = adapter.spawn(config).await.unwrap();
+
+        // Send a burst of input to generate output and fill the channel.
+        for _ in 0..300 {
+            let _ = adapter
+                .send_input(&handle, b"backpressure test line\n")
+                .await;
+        }
+
+        // Give time for output to accumulate and fill the 256-slot channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // This send_input MUST succeed despite the full output channel.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            adapter.send_input(&handle, b"still works\n"),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "send_input must not time out under output backpressure"
+        );
+        let send_result = result.unwrap();
+        assert!(
+            send_result.is_ok(),
+            "send_input must succeed, got: {send_result:?}"
+        );
+
+        // Clean up
+        let _ = adapter.terminate(&handle).await;
     }
 }

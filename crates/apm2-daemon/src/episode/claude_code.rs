@@ -283,9 +283,11 @@ impl ClaudeCodeAdapter {
         }
 
         // Spawn a task that reads from the PTY, parses output, and emits events
+        let task_episode_id = episode_id.clone();
         tokio::spawn(async move {
             // Hold the permit for the duration of the task
             let _permit = permit;
+            let episode_id = task_episode_id;
 
             let mut seq = 0u64;
             let mut parser = ClaudeCodeParser::with_rate_limit(tool_rate_limit);
@@ -335,11 +337,23 @@ impl ClaudeCodeAdapter {
                                     guard.output_event_count = seq;
                                 }
 
-                                if tx.send(output_event).await.is_err() {
-                                    // Receiver dropped — stop forwarding output but
-                                    // keep servicing control commands for liveness.
-                                    output_live = false;
-                                    continue;
+                                match tx.try_send(output_event) {
+                                    Ok(()) => {},
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        // Receiver dropped — stop forwarding output but
+                                        // keep servicing control commands for liveness.
+                                        output_live = false;
+                                        continue;
+                                    },
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        // Channel full — drop event to avoid blocking the
+                                        // select loop (control-plane decoupling invariant).
+                                        tracing::warn!(
+                                            episode_id = %episode_id,
+                                            seq = seq - 1,
+                                            "output event dropped: event channel full (backpressure)"
+                                        );
+                                    },
                                 }
 
                                 // Emit tool request events
@@ -352,9 +366,18 @@ impl ClaudeCodeAdapter {
                                         guard.tool_request_count += 1;
                                     }
 
-                                    if tx.send(tool_event).await.is_err() {
-                                        output_live = false;
-                                        break;
+                                    match tx.try_send(tool_event) {
+                                        Ok(()) => {},
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            output_live = false;
+                                            break;
+                                        },
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            tracing::warn!(
+                                                episode_id = %episode_id,
+                                                "tool event dropped: event channel full (backpressure)"
+                                            );
+                                        },
                                     }
                                 }
 
@@ -389,10 +412,9 @@ impl ClaudeCodeAdapter {
                 guard.process_terminated = true;
             }
 
-            // Emit terminated event
-            let _ = tx
-                .send(HarnessEvent::terminated(exit_code, classification))
-                .await;
+            // Emit terminated event (best-effort, non-blocking to avoid
+            // stalling permit release if the receiver is backpressured).
+            let _ = tx.try_send(HarnessEvent::terminated(exit_code, classification));
         });
 
         let handle = HarnessHandle::new(handle_id, episode_id, handle_inner);
@@ -955,5 +977,41 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    // =========================================================================
+    // Control-plane decoupling regression tests (backpressure)
+    // =========================================================================
+
+    /// UT-BACKPRESSURE-CC-01: terminate must be serviced even when the output
+    /// event channel is full (Claude Code adapter variant).
+    #[tokio::test]
+    async fn test_terminate_succeeds_under_output_backpressure() {
+        let adapter = ClaudeCodeAdapter::new();
+
+        // Spawn `yes` which produces output rapidly, filling the 256-slot
+        // event channel. We do NOT consume events.
+        let config = HarnessConfig::new("yes", "episode-cc-backpressure");
+        let (handle, _events) = adapter.spawn(config).await.unwrap();
+
+        // Give the background task time to fill the event channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Terminate MUST succeed despite full output channel.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            adapter.terminate(&handle),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "terminate must not time out under output backpressure"
+        );
+        let exit_result = result.unwrap();
+        assert!(
+            exit_result.is_ok(),
+            "terminate must succeed, got: {exit_result:?}"
+        );
     }
 }
