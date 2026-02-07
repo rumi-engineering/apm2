@@ -30,16 +30,15 @@ check_logical_line() {
 
     local lc="${line,,}"
 
-    # Use bash regex to match `gh` followed by any flags/args then `api`,
-    # covering: `gh api`, `gh   api`, `gh -R owner/repo api`, etc.
-    # Also check for `/statuses/` anywhere in the same logical line.
-    if [[ "$lc" =~ (^|[[:space:]|;\&])gh[[:space:]] ]] && [[ "$lc" == *"/statuses/"* ]]; then
-        # Check if this is an API call (gh ... api ...) with status-write intent.
-        if [[ "$lc" =~ (^|[[:space:]])gh[[:space:]].*api ]] || [[ "$lc" == *"gh api"* ]]; then
-            local rel="${file#"$REPO_ROOT/"}"
-            echo "::error file=$rel,line=$line_no::Direct GitHub status-write command string is forbidden in prompts/xtask assets (TCK-00411)."
-            VIOLATIONS=1
-        fi
+    # Fail-closed: flag ANY logical line that mentions both `gh` (as a word
+    # boundary) and `/statuses/` regardless of quoting, backticks, flags, or
+    # whitespace.  This catches every variant: `gh api`, `gh -R x api`,
+    # backtick-wrapped, subshell-embedded, etc.  False positives in comments
+    # are already filtered above (line 27).
+    if [[ "$lc" =~ (^|[^a-z0-9_-])gh([^a-z0-9_-]|$) ]] && [[ "$lc" == *"/statuses/"* ]]; then
+        local rel="${file#"$REPO_ROOT/"}"
+        echo "::error file=$rel,line=$line_no::Direct GitHub status-write command string is forbidden in prompts/xtask assets (TCK-00411)."
+        VIOLATIONS=1
     fi
 }
 
