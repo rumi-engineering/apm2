@@ -37,8 +37,9 @@ use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
-    AttestationLevel, AttestationRequirements, REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation,
-    ReceiptKind, RiskTier, builtin_profiles, validate_receipt_attestation,
+    AttestationLevel, AttestationRequirements, CHANGESET_PUBLISHED_PREFIX,
+    REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, builtin_profiles,
+    validate_receipt_attestation,
 };
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
@@ -941,8 +942,7 @@ pub const STOP_FLAGS_MUTATED_WORK_ID: &str = "daemon.stop_flags";
 /// This prefix is used when emitting changeset publication events to the
 /// ledger, enabling gate orchestration (TCK-00388) to bind gate leases
 /// to published changesets.
-pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] =
-    b"apm2.event.changeset_published_ledger:";
+pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] = CHANGESET_PUBLISHED_PREFIX;
 
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
 // to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
@@ -9703,26 +9703,37 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // Deserialize and validate the ChangeSetBundleV1
         let bundle: apm2_core::fac::ChangeSetBundleV1 =
-            serde_json::from_slice(&request.bundle_bytes).map_err(|e| {
-                ProtocolError::Serialization {
-                    reason: format!("invalid ChangeSetBundleV1 JSON: {e}"),
-                }
-            })?;
+            match serde_json::from_slice(&request.bundle_bytes) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("invalid ChangeSetBundleV1 JSON: {e}"),
+                    ));
+                },
+            };
 
-        // Validate bundle fields
-        if bundle.changeset_id.is_empty() {
+        // Recompute digest from canonical bundle fields and reject caller-provided
+        // digest mismatches before any side effects.
+        let computed_changeset_digest = bundle.compute_digest();
+        let provided_changeset_digest = bundle.changeset_digest();
+        if computed_changeset_digest != provided_changeset_digest {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                "changeset_id is empty in bundle",
+                format!(
+                    "changeset_digest mismatch: expected {}, got {}",
+                    hex::encode(computed_changeset_digest),
+                    hex::encode(provided_changeset_digest)
+                ),
             ));
         }
 
-        if bundle.file_manifest.is_empty() {
+        // Full bundle validation is mandatory and fail-closed.
+        if let Err(e) = bundle.validate() {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                "file_manifest is empty in bundle (at least one FileChange required)",
+                format!("invalid ChangeSetBundleV1: {e}"),
             ));
         }
 
@@ -9733,6 +9744,26 @@ impl PrivilegedDispatcher {
                 "content-addressed store not configured on daemon",
             ));
         };
+
+        let changeset_digest_hex = hex::encode(computed_changeset_digest);
+        if let Some((event_id, persisted_cas_hash)) =
+            self.find_changeset_published_replay(&request.work_id, &changeset_digest_hex)
+        {
+            debug!(
+                work_id = %request.work_id,
+                changeset_digest = %changeset_digest_hex,
+                event_id = %event_id,
+                "Idempotent: returning existing ChangeSetPublished event"
+            );
+            return Ok(PrivilegedResponse::PublishChangeSet(
+                PublishChangeSetResponse {
+                    changeset_digest: changeset_digest_hex,
+                    cas_hash: persisted_cas_hash,
+                    work_id: request.work_id,
+                    event_id,
+                },
+            ));
+        }
 
         // --- State Mutation Phase ---
 
@@ -9749,43 +9780,7 @@ impl PrivilegedDispatcher {
         };
 
         let cas_hash = store_result.hash;
-        let changeset_digest = bundle.changeset_digest();
-
-        // Idempotency check: if the CAS returned is_new=false, the same
-        // bundle was already stored. Check if a ChangeSetPublished event
-        // already exists for this work_id with the same digest.
-        if !store_result.is_new {
-            let existing_events = self.event_emitter.get_events_by_work_id(&request.work_id);
-            for event in &existing_events {
-                if event.event_type == "changeset_published" {
-                    // Parse the payload to check if the digest matches
-                    if let Ok(payload_json) =
-                        serde_json::from_slice::<serde_json::Value>(&event.payload)
-                    {
-                        if let Some(existing_digest) = payload_json
-                            .get("changeset_digest")
-                            .and_then(|v| v.as_str())
-                        {
-                            if existing_digest == hex::encode(changeset_digest) {
-                                debug!(
-                                    work_id = %request.work_id,
-                                    changeset_digest = %hex::encode(changeset_digest),
-                                    "Idempotent: returning existing ChangeSetPublished event"
-                                );
-                                return Ok(PrivilegedResponse::PublishChangeSet(
-                                    PublishChangeSetResponse {
-                                        changeset_digest: hex::encode(changeset_digest),
-                                        cas_hash: hex::encode(cas_hash),
-                                        work_id: request.work_id,
-                                        event_id: event.event_id.clone(),
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let cas_hash_hex = hex::encode(cas_hash);
 
         // Get HTF-compliant timestamp
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -9802,13 +9797,27 @@ impl PrivilegedDispatcher {
         // Emit ChangeSetPublished ledger event
         let signed_event = match self.event_emitter.emit_changeset_published(
             &request.work_id,
-            &changeset_digest,
+            &computed_changeset_digest,
             &cas_hash,
             &actor_id,
             timestamp_ns,
         ) {
             Ok(event) => event,
             Err(e) => {
+                // Race-safe idempotency fallback: if another writer persisted the
+                // same semantic event concurrently, replay the persisted binding.
+                if let Some((event_id, persisted_cas_hash)) =
+                    self.find_changeset_published_replay(&request.work_id, &changeset_digest_hex)
+                {
+                    return Ok(PrivilegedResponse::PublishChangeSet(
+                        PublishChangeSetResponse {
+                            changeset_digest: changeset_digest_hex,
+                            cas_hash: persisted_cas_hash,
+                            work_id: request.work_id,
+                            event_id,
+                        },
+                    ));
+                }
                 warn!(error = %e, "ChangeSetPublished event emission failed");
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -9820,19 +9829,44 @@ impl PrivilegedDispatcher {
         info!(
             event_id = %signed_event.event_id,
             work_id = %request.work_id,
-            changeset_digest = %hex::encode(changeset_digest),
-            cas_hash = %hex::encode(cas_hash),
+            changeset_digest = %changeset_digest_hex,
+            cas_hash = %cas_hash_hex,
             "ChangeSetPublished: bundle stored in CAS and event emitted to ledger"
         );
 
         Ok(PrivilegedResponse::PublishChangeSet(
             PublishChangeSetResponse {
-                changeset_digest: hex::encode(changeset_digest),
-                cas_hash: hex::encode(cas_hash),
+                changeset_digest: changeset_digest_hex,
+                cas_hash: cas_hash_hex,
                 work_id: request.work_id,
                 event_id: signed_event.event_id,
             },
         ))
+    }
+
+    /// Returns persisted replay bindings for a semantically matching
+    /// `changeset_published` event.
+    ///
+    /// Matching key: `(work_id, changeset_digest)`. Response values are the
+    /// authoritative persisted `event_id` and `cas_hash`.
+    fn find_changeset_published_replay(
+        &self,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<(String, String)> {
+        self.event_emitter
+            .get_events_by_work_id(work_id)
+            .into_iter()
+            .filter(|event| event.event_type == "changeset_published")
+            .find_map(|event| {
+                let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+                let persisted_digest = payload.get("changeset_digest")?.as_str()?;
+                if persisted_digest != changeset_digest_hex {
+                    return None;
+                }
+                let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
+                Some((event.event_id, persisted_cas_hash))
+            })
     }
 
     // =========================================================================
@@ -18916,30 +18950,57 @@ mod tests {
     // ========================================================================
     mod publish_changeset {
         use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo};
 
         use super::*;
 
+        fn make_valid_bundle(changeset_id: &str) -> ChangeSetBundleV1 {
+            ChangeSetBundleV1::builder()
+                .changeset_id(changeset_id)
+                .base(GitObjectRef {
+                    algo: HashAlgo::Sha1,
+                    object_kind: "commit".to_string(),
+                    object_id: "a".repeat(40),
+                })
+                .diff_hash([0x42; 32])
+                .file_manifest(vec![FileChange {
+                    path: "src/main.rs".to_string(),
+                    change_kind: ChangeKind::Modify,
+                    old_path: None,
+                }])
+                .binary_detected(false)
+                .build()
+                .expect("bundle should build")
+        }
+
         /// Helper to create a valid `ChangeSetBundleV1` JSON payload.
         fn make_bundle_json(changeset_id: &str) -> Vec<u8> {
-            let bundle_json = serde_json::json!({
-                "schema": "apm2.changeset_bundle.v1",
-                "schema_version": "1.0.0",
-                "changeset_id": changeset_id,
-                "base": {
-                    "algo": "sha1",
-                    "object_kind": "commit",
-                    "object_id": "abc123def456"
-                },
-                "changeset_digest": "0000000000000000000000000000000000000000000000000000000000000000",
-                "diff_format": "git_unified_diff",
-                "diff_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            serde_json::to_vec(&make_valid_bundle(changeset_id)).unwrap()
+        }
+
+        /// Helper to create a semantically equivalent payload with different
+        /// JSON formatting and key order.
+        fn make_noncanonical_bundle_json(changeset_id: &str) -> Vec<u8> {
+            let bundle = make_valid_bundle(changeset_id);
+            let noncanonical = serde_json::json!({
+                "binary_detected": bundle.binary_detected,
                 "file_manifest": [{
-                    "path": "src/main.rs",
-                    "change_kind": "MODIFY"
+                    "change_kind": "MODIFY",
+                    "path": "src/main.rs"
                 }],
-                "binary_detected": false
+                "diff_hash": hex::encode(bundle.diff_hash),
+                "diff_format": bundle.diff_format,
+                "changeset_digest": hex::encode(bundle.changeset_digest),
+                "base": {
+                    "object_id": bundle.base.object_id,
+                    "object_kind": bundle.base.object_kind,
+                    "algo": "sha1"
+                },
+                "changeset_id": bundle.changeset_id,
+                "schema_version": bundle.schema_version,
+                "schema": bundle.schema
             });
-            serde_json::to_vec(&bundle_json).unwrap()
+            serde_json::to_vec_pretty(&noncanonical).unwrap()
         }
 
         /// Helper to build a dispatcher with CAS and a privileged context.
@@ -19145,6 +19206,100 @@ mod tests {
         }
 
         #[test]
+        fn test_publish_changeset_semantic_idempotent_noncanonical_json() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let canonical_bundle = make_bundle_json("cs-semantic-idempotent");
+            let noncanonical_bundle = make_noncanonical_bundle_json("cs-semantic-idempotent");
+
+            let response1 = dispatcher
+                .dispatch(
+                    &encode_publish_changeset_request(&PublishChangeSetRequest {
+                        work_id: work_id.clone(),
+                        bundle_bytes: canonical_bundle,
+                    }),
+                    &ctx,
+                )
+                .unwrap();
+            let (digest1, cas_hash1, event_id1) = match response1 {
+                PrivilegedResponse::PublishChangeSet(resp) => {
+                    (resp.changeset_digest, resp.cas_hash, resp.event_id)
+                },
+                other => panic!("Expected first PublishChangeSet response, got: {other:?}"),
+            };
+
+            let response2 = dispatcher
+                .dispatch(
+                    &encode_publish_changeset_request(&PublishChangeSetRequest {
+                        work_id: work_id.clone(),
+                        bundle_bytes: noncanonical_bundle,
+                    }),
+                    &ctx,
+                )
+                .unwrap();
+            let (digest2, cas_hash2, event_id2) = match response2 {
+                PrivilegedResponse::PublishChangeSet(resp) => {
+                    (resp.changeset_digest, resp.cas_hash, resp.event_id)
+                },
+                other => panic!("Expected second PublishChangeSet response, got: {other:?}"),
+            };
+
+            assert_eq!(digest1, digest2, "semantic duplicate must reuse digest");
+            assert_eq!(
+                event_id1, event_id2,
+                "semantic duplicate must replay event_id"
+            );
+            assert_eq!(
+                cas_hash1, cas_hash2,
+                "semantic duplicate must replay bound CAS hash"
+            );
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let changeset_count = events
+                .iter()
+                .filter(|e| e.event_type == "changeset_published")
+                .count();
+            assert_eq!(
+                changeset_count, 1,
+                "semantic duplicate must not create duplicate changeset events"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_rejects_digest_mismatch() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let mut bundle = make_valid_bundle("cs-digest-mismatch");
+            bundle.changeset_digest = [0xAB; 32];
+            let request = PublishChangeSetRequest {
+                work_id,
+                bundle_bytes: serde_json::to_vec(&bundle).unwrap(),
+            };
+
+            let response = dispatcher
+                .dispatch(&encode_publish_changeset_request(&request), &ctx)
+                .unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("changeset_digest mismatch"),
+                        "Expected digest mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected digest mismatch rejection, got: {other:?}"),
+            }
+        }
+
+        #[test]
         fn test_publish_changeset_rejects_unknown_work_id() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
@@ -19211,13 +19366,22 @@ mod tests {
                 bundle_bytes: b"not valid json".to_vec(),
             };
             let frame = encode_publish_changeset_request(&request);
-            let response = dispatcher.dispatch(&frame, &ctx);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
-            // Should return a ProtocolError (serialization) since the JSON is invalid
-            assert!(
-                response.is_err(),
-                "Should return protocol error for invalid JSON"
-            );
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("invalid ChangeSetBundleV1 JSON"),
+                        "Expected invalid JSON rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected invalid JSON error, got: {other:?}"),
+            }
         }
 
         #[test]
@@ -19226,23 +19390,19 @@ mod tests {
             let ctx = privileged_ctx();
             let work_id = claim_work(&dispatcher, &ctx);
 
-            // Bundle with empty file_manifest
-            let bundle_json = serde_json::json!({
-                "schema": "apm2.changeset_bundle.v1",
-                "schema_version": "1.0.0",
-                "changeset_id": "cs-empty-manifest",
-                "base": {
-                    "algo": "sha1",
-                    "object_kind": "commit",
-                    "object_id": "abc123def456"
-                },
-                "changeset_digest": "0000000000000000000000000000000000000000000000000000000000000000",
-                "diff_format": "git_unified_diff",
-                "diff_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-                "file_manifest": [],
-                "binary_detected": false
-            });
-            let bundle_bytes = serde_json::to_vec(&bundle_json).unwrap();
+            let bundle = ChangeSetBundleV1::builder()
+                .changeset_id("cs-empty-manifest")
+                .base(GitObjectRef {
+                    algo: HashAlgo::Sha1,
+                    object_kind: "commit".to_string(),
+                    object_id: "a".repeat(40),
+                })
+                .diff_hash([0x42; 32])
+                .file_manifest(vec![])
+                .binary_detected(false)
+                .build()
+                .expect("bundle should build");
+            let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
 
             let request = PublishChangeSetRequest {
                 work_id,
@@ -19251,10 +19411,20 @@ mod tests {
             let frame = encode_publish_changeset_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
-            assert!(
-                matches!(response, PrivilegedResponse::Error(_)),
-                "Should reject empty file_manifest"
-            );
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("file_manifest"),
+                        "Expected bundle validation rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected file_manifest rejection, got: {other:?}"),
+            }
         }
 
         #[test]
@@ -19323,7 +19493,7 @@ mod tests {
         /// the work claim owner must be denied.
         #[test]
         fn test_publish_changeset_rejects_ownership_mismatch() {
-            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let (dispatcher, cas) = make_dispatcher_with_cas();
             let owner_ctx = privileged_ctx(); // uid=1000, gid=1000
 
             // Claim work as the owner
@@ -19337,8 +19507,9 @@ mod tests {
             }));
 
             let bundle_bytes = make_bundle_json("cs-ownership-test");
+            let expected_hash = *blake3::hash(&bundle_bytes).as_bytes();
             let request = PublishChangeSetRequest {
-                work_id,
+                work_id: work_id.clone(),
                 bundle_bytes,
             };
             let frame = encode_publish_changeset_request(&request);
@@ -19361,6 +19532,23 @@ mod tests {
                     panic!("Expected PermissionDenied error for ownership mismatch, got: {other:?}")
                 },
             }
+
+            // Ownership rejection must occur before CAS mutation or event emission.
+            assert!(
+                !cas.exists(&expected_hash)
+                    .expect("CAS exists check should succeed"),
+                "ownership mismatch must not write bundle to CAS"
+            );
+            let changeset_events = dispatcher
+                .event_emitter
+                .get_events_by_work_id(&work_id)
+                .into_iter()
+                .filter(|event| event.event_type == "changeset_published")
+                .count();
+            assert_eq!(
+                changeset_events, 0,
+                "ownership mismatch must not emit changeset_published events"
+            );
         }
     }
 
