@@ -2276,12 +2276,14 @@ impl EpisodeRuntime {
             timestamp_ns,
             request_id,
             None,
+            false,
         )
         .await
     }
 
     /// Executes a tool with request-scoped TOCTOU-verified file content
     /// (TCK-00375).
+    #[allow(clippy::too_many_arguments)] // Carries request-scoped execution invariants.
     pub async fn execute_tool_with_verified_content(
         &self,
         episode_id: &EpisodeId,
@@ -2290,6 +2292,7 @@ impl EpisodeRuntime {
         timestamp_ns: u64,
         request_id: &str,
         verified_content: Option<VerifiedToolContent>,
+        toctou_verification_required: bool,
     ) -> Result<ToolResult, EpisodeError> {
         // Step 1: Read lock to get executor and validate state
         let executor = {
@@ -2319,7 +2322,8 @@ impl EpisodeRuntime {
 
         // Step 2: Execute the tool
         let ctx = ExecutionContext::new(episode_id.clone(), request_id, timestamp_ns)
-            .with_verified_content(verified_content.unwrap_or_default());
+            .with_verified_content(verified_content.unwrap_or_default())
+            .with_toctou_verification_required(toctou_verification_required);
         let executor_guard = executor.write().await;
         let result = executor_guard
             .execute(&ctx, args, credential)

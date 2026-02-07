@@ -571,10 +571,10 @@ impl ToolHandler for ReadFileHandler {
         args: &ToolArgs,
         _credential: Option<&Credential>,
     ) -> Result<ToolResultData, ToolHandlerError> {
-        let verified = if ctx.verified_content.is_empty() {
-            None
-        } else {
+        let verified = if ctx.toctou_verification_required {
             Some(&ctx.verified_content)
+        } else {
+            None
         };
         self.execute_impl(args, verified).await
     }
@@ -3033,10 +3033,10 @@ impl ToolHandler for SearchHandler {
         args: &ToolArgs,
         _credential: Option<&Credential>,
     ) -> Result<ToolResultData, ToolHandlerError> {
-        let verified = if ctx.verified_content.is_empty() {
-            None
-        } else {
+        let verified = if ctx.toctou_verification_required {
             Some(&ctx.verified_content)
+        } else {
+            None
         };
         self.execute_impl(args, verified).await
     }
@@ -3828,6 +3828,73 @@ mod tests {
         });
 
         assert!(handler.validate(&args).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_handler_fails_closed_with_empty_verified_content_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        std::fs::write(root.join("note.txt"), "secret").expect("write file");
+
+        let handler = ReadFileHandler::with_root(root);
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("note.txt"),
+            offset: None,
+            limit: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-read-empty-verified")
+                .expect("valid episode id"),
+            "req-read-empty-verified",
+            1,
+        )
+        .with_toctou_verification_required(true);
+
+        let result = handler.execute_with_context(&ctx, &args, None).await;
+        assert!(
+            matches!(result, Err(ToolHandlerError::ExecutionFailed { .. })),
+            "read should fail-closed when TOCTOU is required but verified map is empty"
+        );
+        if let Err(ToolHandlerError::ExecutionFailed { message }) = result {
+            assert!(
+                message.contains("missing TOCTOU-verified content"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_handler_returns_empty_with_empty_verified_content_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::write(scope.join("note.txt"), "needle line").expect("write file");
+
+        let handler = SearchHandler::with_root(root);
+        let args = ToolArgs::Search(SearchArgs {
+            query: "needle".to_string(),
+            scope: PathBuf::from("scope"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-search-empty-verified")
+                .expect("valid episode id"),
+            "req-search-empty-verified",
+            1,
+        )
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("search should not error");
+        let output = result.output_str().expect("utf8 output");
+        assert!(
+            output.is_empty(),
+            "search must fail-closed to empty output without verified bytes"
+        );
     }
 
     // =========================================================================

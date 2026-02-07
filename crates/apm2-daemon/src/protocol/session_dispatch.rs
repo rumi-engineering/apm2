@@ -2028,17 +2028,24 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     .await
             })
         });
-        let (decision, defects, verified_content): (
+        let (decision, defects, verified_content, toctou_verification_required): (
             Result<ToolDecision, crate::episode::BrokerError>,
             Vec<FirewallViolationDefect>,
             Option<VerifiedToolContent>,
+            bool,
         ) = match broker_response {
             Ok(BrokerResponse {
                 decision,
                 defects,
                 verified_content,
-            }) => (Ok(decision), defects, Some(verified_content)),
-            Err(err) => (Err(err), Vec::new(), None),
+                toctou_verification_required,
+            }) => (
+                Ok(decision),
+                defects,
+                Some(verified_content),
+                toctou_verification_required,
+            ),
+            Err(err) => (Err(err), Vec::new(), None, false),
         };
         let decision_requires_termination = matches!(&decision, Ok(ToolDecision::Terminate { .. }));
 
@@ -2051,6 +2058,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             &episode_id,
             preactuation_receipt.as_ref(),
             verified_content,
+            toctou_verification_required,
         );
 
         if !defects.is_empty() {
@@ -2156,6 +2164,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         episode_id: &EpisodeId,
         preactuation_receipt: Option<&PreActuationReceipt>,
         mut verified_content: Option<VerifiedToolContent>,
+        toctou_verification_required: bool,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -2223,6 +2232,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     // For now, max_concurrent_episodes (100) provides backpressure to
                     // limit the impact on the worker pool.
                     let verified_for_execution = verified_content.take();
+                    let toctou_required_for_execution = toctou_verification_required;
                     let request_id_for_execution = request_id.clone();
                     let execution_result = tokio::task::block_in_place(move || {
                         let handle = tokio::runtime::Handle::current();
@@ -2235,6 +2245,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                     timestamp_ns,
                                     &request_id_for_execution,
                                     verified_for_execution,
+                                    toctou_required_for_execution,
                                 )
                                 .await
                         })
@@ -4961,6 +4972,7 @@ mod tests {
                     &episode_id,
                     Some(&receipt),
                     None,
+                    false,
                 )
                 .expect("dispatch should return application-level error response");
 

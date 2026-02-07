@@ -1132,6 +1132,8 @@ pub struct BrokerResponse {
     pub defects: Vec<FirewallViolationDefect>,
     /// TOCTOU-verified file content for downstream tool execution.
     pub verified_content: VerifiedToolContent,
+    /// When `true`, handlers must consume only TOCTOU-verified bytes.
+    pub toctou_verification_required: bool,
 }
 
 impl BrokerResponse {
@@ -1141,11 +1143,13 @@ impl BrokerResponse {
         decision: ToolDecision,
         defects: Vec<FirewallViolationDefect>,
         verified_content: VerifiedToolContent,
+        toctou_verification_required: bool,
     ) -> Self {
         Self {
             decision,
             defects,
             verified_content,
+            toctou_verification_required,
         }
     }
 

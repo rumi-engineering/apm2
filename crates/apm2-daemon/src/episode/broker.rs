@@ -46,6 +46,7 @@ use apm2_core::context::firewall::{
 };
 use apm2_core::policy::{Decision as CoreDecision, LoadedPolicy, PolicyEngine};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tracing::{debug, instrument, warn};
 
 use super::capability::{
@@ -983,12 +984,14 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         })?;
 
-        let metadata =
-            tokio::fs::metadata(&normalized)
-                .await
-                .map_err(|e| BrokerError::Internal {
-                    message: format!("TOCTOU pre-read metadata failed for {normalized}: {e}"),
-                })?;
+        let file = tokio::fs::File::open(&normalized)
+            .await
+            .map_err(|e| BrokerError::Internal {
+                message: format!("TOCTOU pre-read open failed for {normalized}: {e}"),
+            })?;
+        let metadata = file.metadata().await.map_err(|e| BrokerError::Internal {
+            message: format!("TOCTOU pre-read fstat failed for {normalized}: {e}"),
+        })?;
         if !metadata.is_file() {
             // Directory-oriented navigation requests (e.g., list/search scope)
             // may target non-file paths. TOCTOU hash verification applies to
@@ -1005,11 +1008,28 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             });
         }
 
-        let file_bytes = tokio::fs::read(&normalized)
+        let initial_capacity =
+            usize::try_from(metadata.len()).map_err(|_| BrokerError::Internal {
+                message: format!(
+                    "TOCTOU pre-read capacity conversion failed for {normalized}: {} bytes",
+                    metadata.len()
+                ),
+            })?;
+        let mut file_bytes = Vec::with_capacity(initial_capacity);
+        let bytes_read = file
+            .take(MAX_TOCTOU_READ_BYTES.saturating_add(1))
+            .read_to_end(&mut file_bytes)
             .await
             .map_err(|e| BrokerError::Internal {
                 message: format!("TOCTOU pre-read failed for {normalized}: {e}"),
             })?;
+        if bytes_read as u64 > MAX_TOCTOU_READ_BYTES {
+            return Err(BrokerError::ExecutionFailed {
+                message: format!(
+                    "TOCTOU pre-read denied for {normalized}: read {bytes_read} bytes > {MAX_TOCTOU_READ_BYTES}"
+                ),
+            });
+        }
 
         match self
             .verify_toctou_with_defects(&normalized, &file_bytes, risk_tier, defects)
@@ -1743,6 +1763,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         let start_time = std::time::Instant::now();
         let mut defects = Vec::new();
         let mut verified_content = VerifiedToolContent::default();
+        let mut toctou_verification_required = false;
 
         macro_rules! respond {
             ($decision:expr) => {
@@ -1750,6 +1771,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     $decision,
                     std::mem::take(&mut defects),
                     std::mem::take(&mut verified_content),
+                    toctou_verification_required,
                 ));
             };
         }
@@ -1823,6 +1845,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 super::tool_class::ToolClass::Read
                 | super::tool_class::ToolClass::ListFiles
                 | super::tool_class::ToolClass::Search => {
+                    toctou_verification_required = true;
                     // TCK-00286 [MEDIUM]: Fail-closed if path is None
                     let Some(ref path) = request.path else {
                         warn!(
@@ -2469,6 +2492,20 @@ mod tests {
         Capability {
             capability_id: id.to_string(),
             tool_class: ToolClass::Read,
+            scope: CapabilityScope {
+                root_paths: paths,
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }
+    }
+
+    fn make_search_capability(id: &str, paths: Vec<PathBuf>) -> Capability {
+        Capability {
+            capability_id: id.to_string(),
+            tool_class: ToolClass::Search,
             scope: CapabilityScope {
                 root_paths: paths,
                 allowed_patterns: Vec::new(),
@@ -5460,6 +5497,64 @@ policy:
         assert!(
             decision.is_allowed(),
             "in-pack read should be allowed in Warn mode, got: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_response_marks_toctou_required_when_manifest_active_and_verified_empty() {
+        use tempfile::tempdir;
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        let temp_dir = tempdir().expect("temp dir");
+        let scope_dir = temp_dir.path().join("scope");
+        tokio::fs::create_dir(&scope_dir)
+            .await
+            .expect("create scope dir");
+        tokio::fs::write(scope_dir.join("note.txt"), b"needle in haystack")
+            .await
+            .expect("write search file");
+
+        // Capability allows search within the workspace.
+        let manifest = make_manifest(vec![make_search_capability(
+            "cap-search",
+            vec![temp_dir.path().to_path_buf()],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Context manifest allows the directory path itself but not files inside.
+        let scope_path = scope_dir.to_string_lossy().to_string();
+        let context_manifest = make_context_manifest(
+            vec![(scope_path.as_str(), [0x11; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        let request = make_request(
+            "req-search-empty-verified",
+            ToolClass::Search,
+            Some(&scope_path),
+        );
+        let response = broker
+            .request_with_response(&request, timestamp_ns(0), None)
+            .await
+            .expect("broker response");
+
+        assert!(
+            response.decision.is_allowed(),
+            "search request should be allowed for admitted directory scope"
+        );
+        assert!(
+            response.toctou_verification_required,
+            "context firewall mode should force TOCTOU-verified execution"
+        );
+        assert!(
+            response.verified_content.is_empty(),
+            "no file entries are admitted, so verified content should be empty"
         );
     }
 

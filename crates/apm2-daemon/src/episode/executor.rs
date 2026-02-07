@@ -234,6 +234,9 @@ pub struct ExecutionContext {
 
     /// TOCTOU-verified file content bound to this request (TCK-00375).
     pub verified_content: VerifiedToolContent,
+
+    /// Whether handlers must fail-closed to TOCTOU-verified bytes.
+    pub toctou_verification_required: bool,
 }
 
 impl ExecutionContext {
@@ -245,6 +248,7 @@ impl ExecutionContext {
             request_id: request_id.into(),
             started_at_ns,
             verified_content: VerifiedToolContent::default(),
+            toctou_verification_required: false,
         }
     }
 
@@ -252,6 +256,16 @@ impl ExecutionContext {
     #[must_use]
     pub fn with_verified_content(mut self, verified_content: VerifiedToolContent) -> Self {
         self.verified_content = verified_content;
+        self
+    }
+
+    /// Marks whether TOCTOU verification is required for this execution.
+    #[must_use]
+    pub const fn with_toctou_verification_required(
+        mut self,
+        toctou_verification_required: bool,
+    ) -> Self {
+        self.toctou_verification_required = toctou_verification_required;
         self
     }
 }
