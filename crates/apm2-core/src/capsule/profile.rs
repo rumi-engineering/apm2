@@ -20,7 +20,7 @@
 //! in unit tests only; runtime integration is deferred to TCK-00375 and
 //! TCK-00376.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use thiserror::Error;
 
 use crate::adapter::seccomp::SeccompProfileLevel;
@@ -517,7 +517,15 @@ pub struct HashInput<'a> {
 ///
 /// The profile is identified by its BLAKE3 hash (`profile_hash`) which is
 /// computed over the canonical representation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Deserialization
+///
+/// `Deserialize` is implemented manually (not derived) to enforce
+/// `validate()` on every deserialized instance. This prevents construction
+/// of invalid profiles (e.g., missing namespaces, wrong hash, disabled
+/// egress deny) via serde, closing the same class of bypass that affected
+/// `WorkspaceConfinement` (CTR-1604, CTR-2603).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapsuleProfile {
     /// Profile identifier (e.g., "linux-ns-v1").
@@ -551,6 +559,50 @@ pub struct CapsuleProfile {
 
     /// tmpfs for /tmp.
     pub tmpfs_tmp: bool,
+}
+
+// Custom Deserialize: deserialize into a helper struct, then call validate().
+// This closes the deserialization bypass where serde could construct a
+// CapsuleProfile with invalid fields (e.g., wrong hash, disabled egress deny,
+// insufficient namespaces) without running validation (CTR-2603, CTR-1604).
+impl<'de> de::Deserialize<'de> for CapsuleProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        /// Helper struct matching the serialized shape of `CapsuleProfile`.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            profile_id: String,
+            #[serde(with = "serde_bytes")]
+            profile_hash: [u8; 32],
+            namespaces: NamespaceConfig,
+            seccomp_level: SeccompProfileLevel,
+            cgroup_limits: CgroupLimits,
+            egress_policy: EgressPolicy,
+            allowed_executables: Vec<String>,
+            scrub_environment: bool,
+            readonly_rootfs: bool,
+            tmpfs_tmp: bool,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let profile = Self {
+            profile_id: raw.profile_id,
+            profile_hash: raw.profile_hash,
+            namespaces: raw.namespaces,
+            seccomp_level: raw.seccomp_level,
+            cgroup_limits: raw.cgroup_limits,
+            egress_policy: raw.egress_policy,
+            allowed_executables: raw.allowed_executables,
+            scrub_environment: raw.scrub_environment,
+            readonly_rootfs: raw.readonly_rootfs,
+            tmpfs_tmp: raw.tmpfs_tmp,
+        };
+        profile.validate().map_err(de::Error::custom)?;
+        Ok(profile)
+    }
 }
 
 impl CapsuleProfile {
@@ -1803,5 +1855,73 @@ mod tests {
             profile.validate().is_ok(),
             "non-linux-ns-v1 profiles should not require hardening controls"
         );
+    }
+
+    // =========================================================================
+    // SECURITY REGRESSION: CapsuleProfile deserialization bypass tests
+    //
+    // CapsuleProfile must NOT be constructible via serde::Deserialize without
+    // running validate(). This prevents crafting profiles with tampered hashes,
+    // disabled egress deny, insufficient namespaces, etc. via JSON.
+    // =========================================================================
+
+    #[test]
+    fn test_capsule_profile_deserialize_valid_roundtrip() {
+        // A valid profile serialized via builder should deserialize successfully.
+        let profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
+        let json = serde_json::to_string(&profile).unwrap();
+        let deserialized: CapsuleProfile =
+            serde_json::from_str(&json).expect("valid profile roundtrip must succeed");
+        assert_eq!(profile, deserialized);
+    }
+
+    #[test]
+    fn test_capsule_profile_deserialize_tampered_hash_rejected() {
+        // Serialize a valid profile, then tamper the hash in JSON.
+        let profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(&profile).unwrap();
+        // Tamper the profile_hash to all zeros
+        let zero_hash = vec![0u8; 32];
+        json["profile_hash"] = serde_json::to_value(&zero_hash).unwrap();
+        let result: Result<CapsuleProfile, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "deserializing profile with tampered hash must fail: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_capsule_profile_deserialize_deny_by_default_false_rejected() {
+        // Serialize a valid profile, then set deny_by_default to false.
+        let profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(&profile).unwrap();
+        json["egress_policy"]["deny_by_default"] = serde_json::Value::Bool(false);
+        // Recompute hash for the tampered profile to isolate the egress check
+        // (otherwise hash mismatch fires first).
+        // We can't easily recompute the hash in JSON, so just verify
+        // deserialization fails (either hash mismatch or egress deny check).
+        let result: Result<CapsuleProfile, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "deserializing profile with deny_by_default=false must fail: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_capsule_profile_deserialize_with_egress_routes_valid() {
+        // A valid profile with egress routes should roundtrip.
+        let profile = CapsuleProfileBuilder::new("linux-ns-v1")
+            .egress_policy(EgressPolicy::with_routes(vec![EgressRoute {
+                host: "crates.io".to_string(),
+                port: 443,
+                protocol: "tcp".to_string(),
+            }]))
+            .add_executable("/usr/bin/apm2")
+            .build()
+            .unwrap();
+        let json = serde_json::to_string(&profile).unwrap();
+        let deserialized: CapsuleProfile =
+            serde_json::from_str(&json).expect("valid profile with routes must roundtrip");
+        assert_eq!(profile, deserialized);
     }
 }

@@ -43,7 +43,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, de};
 use thiserror::Error;
 
 // =============================================================================
@@ -155,10 +155,36 @@ pub enum WorkspaceConfinementError {
 /// path and returns `Result`. This ensures that `contains()` and
 /// `validate_workspace_path()` can never be called on an unvalidated
 /// confinement (CTR-2603, CTR-1205).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// # Deserialization
+///
+/// `Deserialize` is implemented manually (not derived) to enforce the same
+/// validation as `new()`. Deserializing a blocked root like `"/etc"` will
+/// fail, preventing bypass of the construction-time invariants via serde
+/// (CTR-1604, CTR-2603).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct WorkspaceConfinement {
     /// Absolute path to the workspace root (validated at construction time).
     root: PathBuf,
+}
+
+// Custom Deserialize: deserialize into a helper struct, then validate via
+// new(). This closes the deserialization bypass where serde could construct a
+// WorkspaceConfinement with a blocked root like "/etc" (CTR-2603, CTR-1604).
+impl<'de> de::Deserialize<'de> for WorkspaceConfinement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        /// Helper struct matching the serialized shape of `WorkspaceConfinement`.
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            root: PathBuf,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Self::new(raw.root).map_err(de::Error::custom)
+    }
 }
 
 impl WorkspaceConfinement {
@@ -776,5 +802,90 @@ mod tests {
         let invalid: Result<WorkspaceConfinement, WorkspaceConfinementError> =
             WorkspaceConfinement::new("");
         assert!(invalid.is_err());
+    }
+
+    // =========================================================================
+    // SECURITY REGRESSION: Deserialization bypass tests (Round 6 BLOCKER)
+    //
+    // WorkspaceConfinement must NOT be constructible via serde::Deserialize
+    // without running validate_root(). Prior to this fix, #[derive(Deserialize)]
+    // allowed: serde_json::from_str(r#"{"root":"/etc"}"#) to succeed,
+    // bypassing the blocked-root check and allowing .contains("passwd") to
+    // return Ok("/etc/passwd").
+    // =========================================================================
+
+    #[test]
+    fn test_deserialize_blocked_root_etc_rejected() {
+        // SECURITY REGRESSION: deserializing a blocked root MUST fail.
+        // This was the exact bypass reported in Round 6.
+        let result: Result<WorkspaceConfinement, _> = serde_json::from_str(r#"{"root":"/etc"}"#);
+        assert!(
+            result.is_err(),
+            "deserializing blocked root /etc must fail: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_blocked_root_var_rejected() {
+        let result: Result<WorkspaceConfinement, _> = serde_json::from_str(r#"{"root":"/var"}"#);
+        assert!(
+            result.is_err(),
+            "deserializing blocked root /var must fail: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_blocked_root_slash_rejected() {
+        let result: Result<WorkspaceConfinement, _> = serde_json::from_str(r#"{"root":"/"}"#);
+        assert!(
+            result.is_err(),
+            "deserializing blocked root / must fail: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_relative_root_rejected() {
+        let result: Result<WorkspaceConfinement, _> =
+            serde_json::from_str(r#"{"root":"relative/path"}"#);
+        assert!(
+            result.is_err(),
+            "deserializing relative root must fail: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_empty_root_rejected() {
+        let result: Result<WorkspaceConfinement, _> = serde_json::from_str(r#"{"root":""}"#);
+        assert!(
+            result.is_err(),
+            "deserializing empty root must fail: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_valid_root_succeeds() {
+        let wc: WorkspaceConfinement = serde_json::from_str(r#"{"root":"/home/agent/workspace"}"#)
+            .expect("deserializing valid root must succeed");
+        assert_eq!(wc.root(), Path::new("/home/agent/workspace"));
+    }
+
+    #[test]
+    fn test_deserialize_roundtrip_preserves_validity() {
+        let original = WorkspaceConfinement::new("/workspace").unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: WorkspaceConfinement =
+            serde_json::from_str(&json).expect("roundtrip must succeed");
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_deserialize_traversal_root_rejected() {
+        // Paths with ParentDir must be rejected even during deserialization.
+        let result: Result<WorkspaceConfinement, _> =
+            serde_json::from_str(r#"{"root":"/tmp/../etc"}"#);
+        assert!(
+            result.is_err(),
+            "deserializing root with .. must fail: got {result:?}"
+        );
     }
 }
