@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::decision::{BudgetDelta, Credential};
+use super::executor::ExecutionContext;
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
 
@@ -725,6 +726,20 @@ pub trait ToolHandler: Send + Sync + fmt::Debug {
         args: &ToolArgs,
         credential: Option<&Credential>,
     ) -> Result<ToolResultData, ToolHandlerError>;
+
+    /// Executes the tool with full execution context.
+    ///
+    /// Default behavior delegates to [`Self::execute`] for backwards
+    /// compatibility. Handlers that require request-scoped context (e.g.
+    /// TOCTOU-verified bytes) should override this method.
+    async fn execute_with_context(
+        &self,
+        _ctx: &ExecutionContext,
+        args: &ToolArgs,
+        credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        self.execute(args, credential).await
+    }
 
     /// Validates the tool arguments before execution.
     ///

@@ -43,7 +43,7 @@ use tracing::{debug, instrument, warn};
 
 use super::broker::StubContentAddressedStore;
 use super::budget_tracker::{BudgetExhaustedError, BudgetTracker};
-use super::decision::{BudgetDelta, Credential, ToolResult};
+use super::decision::{BudgetDelta, Credential, ToolResult, VerifiedToolContent};
 use super::error::EpisodeId;
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
@@ -231,6 +231,12 @@ pub struct ExecutionContext {
 
     /// Timestamp when execution started (nanoseconds since epoch).
     pub started_at_ns: u64,
+
+    /// TOCTOU-verified file content bound to this request (TCK-00375).
+    pub verified_content: VerifiedToolContent,
+
+    /// Whether handlers must fail-closed to TOCTOU-verified bytes.
+    pub toctou_verification_required: bool,
 }
 
 impl ExecutionContext {
@@ -241,7 +247,26 @@ impl ExecutionContext {
             episode_id,
             request_id: request_id.into(),
             started_at_ns,
+            verified_content: VerifiedToolContent::default(),
+            toctou_verification_required: false,
         }
+    }
+
+    /// Attaches TOCTOU-verified content for this execution.
+    #[must_use]
+    pub fn with_verified_content(mut self, verified_content: VerifiedToolContent) -> Self {
+        self.verified_content = verified_content;
+        self
+    }
+
+    /// Marks whether TOCTOU verification is required for this execution.
+    #[must_use]
+    pub const fn with_toctou_verification_required(
+        mut self,
+        toctou_verification_required: bool,
+    ) -> Self {
+        self.toctou_verification_required = toctou_verification_required;
+        self
     }
 }
 
@@ -556,7 +581,7 @@ impl ToolExecutor {
         }
 
         // Step 5: Execute handler
-        let result_data = match handler.execute(args, credential).await {
+        let result_data = match handler.execute_with_context(ctx, args, credential).await {
             Ok(data) => data,
             Err(err) => {
                 warn!(error = %err, "handler execution failed");

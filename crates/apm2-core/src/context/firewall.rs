@@ -77,6 +77,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use super::manifest::{ContextPackManifest, MAX_PATH_LENGTH, ManifestError, normalize_path};
@@ -92,11 +93,18 @@ pub const CTX_ALLOWLIST_RULE_ID: &str = "CTX-ALLOWLIST-001";
 /// Rule ID for content hash mismatch denials.
 pub const CTX_HASH_MISMATCH_RULE_ID: &str = "CTX-HASH-MISMATCH-001";
 
+/// Rule ID for TOCTOU hash verification failures (TCK-00375).
+pub const CTX_TOCTOU_MISMATCH_RULE_ID: &str = "CTX-TOCTOU-001";
+
 /// Reason text for allowlist denial.
 pub const ALLOWLIST_DENIAL_REASON: &str = "Not in allowlist";
 
 /// Reason text for hash mismatch denial.
 pub const HASH_MISMATCH_DENIAL_REASON: &str = "Content hash mismatch";
+
+/// Reason text for TOCTOU hash verification failure (TCK-00375).
+pub const TOCTOU_MISMATCH_DENIAL_REASON: &str =
+    "TOCTOU: runtime content hash differs from manifest";
 
 // =============================================================================
 // FirewallMode
@@ -265,6 +273,18 @@ impl FirewallDecision {
             manifest_id: manifest_id.into(),
             path: Self::truncate_path(path.into()),
             reason: HASH_MISMATCH_DENIAL_REASON.to_string(),
+        }
+    }
+
+    /// Creates a new DENY event for a TOCTOU hash mismatch (TCK-00375).
+    #[must_use]
+    pub fn deny_toctou_mismatch(manifest_id: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            decision: ToolDecision::Deny,
+            rule_id: CTX_TOCTOU_MISMATCH_RULE_ID.to_string(),
+            manifest_id: manifest_id.into(),
+            path: Self::truncate_path(path.into()),
+            reason: TOCTOU_MISMATCH_DENIAL_REASON.to_string(),
         }
     }
 
@@ -449,6 +469,24 @@ pub enum ContextFirewallError {
         /// Maximum allowed length.
         max: usize,
     },
+
+    /// TOCTOU hash mismatch: runtime content differs from manifest (TCK-00375).
+    ///
+    /// This indicates that the file content has been modified between manifest
+    /// creation and the runtime read, which may indicate a TOCTOU attack.
+    #[error("TOCTOU mismatch for path: {path}")]
+    ToctouMismatch {
+        /// The path with mismatched hash.
+        path: String,
+        /// Expected hash from the manifest.
+        expected_hash: [u8; 32],
+        /// Computed hash from runtime content.
+        computed_hash: [u8; 32],
+        /// The denial event for logging.
+        event: FirewallDecision,
+        /// Whether the session should be terminated.
+        should_terminate_session: bool,
+    },
 }
 
 impl ContextFirewallError {
@@ -463,6 +501,10 @@ impl ContextFirewallError {
             | Self::ContentHashMismatch {
                 should_terminate_session,
                 ..
+            }
+            | Self::ToctouMismatch {
+                should_terminate_session,
+                ..
             } => *should_terminate_session,
             Self::InvalidPath(_) | Self::ContentHashRequired { .. } | Self::PathTooLong { .. } => {
                 false
@@ -474,13 +516,19 @@ impl ContextFirewallError {
     #[must_use]
     pub const fn event(&self) -> Option<&FirewallDecision> {
         match self {
-            Self::AccessDenied { event, .. } | Self::ContentHashMismatch { event, .. } => {
-                Some(event)
-            },
+            Self::AccessDenied { event, .. }
+            | Self::ContentHashMismatch { event, .. }
+            | Self::ToctouMismatch { event, .. } => Some(event),
             Self::InvalidPath(_) | Self::ContentHashRequired { .. } | Self::PathTooLong { .. } => {
                 None
             },
         }
+    }
+
+    /// Returns `true` if this is a TOCTOU mismatch error (TCK-00375).
+    #[must_use]
+    pub const fn is_toctou_mismatch(&self) -> bool {
+        matches!(self, Self::ToctouMismatch { .. })
     }
 }
 
@@ -681,6 +729,366 @@ impl ContextAwareValidator for DefaultContextFirewall<'_> {
             },
             Err(e) => Err(ContextFirewallError::InvalidPath(e)),
         }
+    }
+}
+
+// =============================================================================
+// RiskTierFirewallPolicy (TCK-00375)
+// =============================================================================
+
+/// Risk tier classification for firewall mode determination.
+///
+/// This is a local representation used by the context firewall to avoid
+/// coupling to the daemon's `RiskTier` enum. The daemon maps its own
+/// `RiskTier` to this when configuring the firewall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ContextRiskTier {
+    /// Tier 0: Read-only operations.
+    Tier0 = 0,
+    /// Tier 1: Local development.
+    Tier1 = 1,
+    /// Tier 2: Production-adjacent.
+    Tier2 = 2,
+    /// Tier 3: Production with external effects.
+    Tier3 = 3,
+    /// Tier 4: Critical operations.
+    Tier4 = 4,
+}
+
+impl ContextRiskTier {
+    /// Returns `true` if this tier is Tier3 or above (high-risk).
+    ///
+    /// Per REQ-0029, Tier3+ violations require mandatory session termination
+    /// and defect emission.
+    #[must_use]
+    pub const fn is_high_risk(&self) -> bool {
+        (*self as u8) >= 3
+    }
+
+    /// Creates a `ContextRiskTier` from a `u8` value.
+    ///
+    /// Returns `None` for unknown values (fail-closed: unknown tiers should
+    /// be treated as highest risk by the caller).
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Tier0),
+            1 => Some(Self::Tier1),
+            2 => Some(Self::Tier2),
+            3 => Some(Self::Tier3),
+            4 => Some(Self::Tier4),
+            _ => None,
+        }
+    }
+}
+
+/// Policy for mapping risk tiers to firewall enforcement modes (TCK-00375).
+///
+/// Per REQ-0029:
+/// - Tier3+ violations MUST terminate with mandatory defect emission
+///   (`HardFail`)
+/// - Lower tiers use configurable enforcement modes
+///
+/// # Security Model
+///
+/// This policy is fail-closed: if a risk tier is unknown or cannot be
+/// determined, the strictest mode (`HardFail`) is applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiskTierFirewallPolicy {
+    /// Firewall mode for Tier 0-1 (low risk).
+    pub low_risk_mode: FirewallMode,
+    /// Firewall mode for Tier 2 (medium risk).
+    pub medium_risk_mode: FirewallMode,
+    // Tier3+ is always HardFail (not configurable per REQ-0029).
+}
+
+impl Default for RiskTierFirewallPolicy {
+    /// Default policy: `HardFail` for all tiers.
+    ///
+    /// Context firewall violations are severe by default because they
+    /// indicate out-of-pack access or content tampering. The default
+    /// terminates sessions on any violation, with Tier3+ additionally
+    /// emitting mandatory defects per REQ-0029.
+    fn default() -> Self {
+        Self {
+            low_risk_mode: FirewallMode::HardFail,
+            medium_risk_mode: FirewallMode::HardFail,
+        }
+    }
+}
+
+impl RiskTierFirewallPolicy {
+    /// Creates a strict policy where all tiers use `HardFail`.
+    #[must_use]
+    pub const fn strict() -> Self {
+        Self {
+            low_risk_mode: FirewallMode::HardFail,
+            medium_risk_mode: FirewallMode::HardFail,
+        }
+    }
+
+    /// Returns the firewall mode for the given risk tier.
+    ///
+    /// Per REQ-0029, Tier3+ always returns `HardFail` regardless of
+    /// configuration. This is enforced by construction and cannot be
+    /// overridden.
+    #[must_use]
+    pub const fn mode_for_tier(&self, tier: ContextRiskTier) -> FirewallMode {
+        match tier {
+            ContextRiskTier::Tier0 | ContextRiskTier::Tier1 => self.low_risk_mode,
+            ContextRiskTier::Tier2 => self.medium_risk_mode,
+            // SECURITY: Tier3+ is ALWAYS HardFail per REQ-0029.
+            // This cannot be configured to a weaker mode.
+            ContextRiskTier::Tier3 | ContextRiskTier::Tier4 => FirewallMode::HardFail,
+        }
+    }
+}
+
+// =============================================================================
+// ToctouVerifier (TCK-00375)
+// =============================================================================
+
+/// TOCTOU (time-of-check-to-time-of-use) hash verifier for context artifacts.
+///
+/// This verifier computes the BLAKE3 hash of file content at runtime and
+/// compares it against the hash recorded in the [`ContextPackManifest`] entry.
+/// If the hashes differ, the file has been modified between manifest creation
+/// and runtime access, indicating a potential TOCTOU attack.
+///
+/// # Security Model
+///
+/// Per REQ-0029, TOCTOU mismatches MUST be detected before tool execution.
+/// The verifier is invoked after the allowlist check succeeds but before
+/// the tool accesses the file content. This ensures that:
+///
+/// 1. The file is in the allowlist (checked by `DefaultContextFirewall`)
+/// 2. The file content has not been tampered with since manifest creation
+/// 3. Tier3+ violations trigger mandatory session termination
+///
+/// # Usage
+///
+/// ```rust
+/// use apm2_core::context::firewall::ToctouVerifier;
+///
+/// let expected_hash = [0x42u8; 32]; // from manifest entry
+/// let file_content = b"fn main() {}";
+///
+/// let result = ToctouVerifier::verify_content(file_content, &expected_hash);
+/// assert!(result.is_err()); // content doesn't match
+/// ```
+pub struct ToctouVerifier;
+
+impl ToctouVerifier {
+    /// Verifies that the BLAKE3 hash of `content` matches `expected_hash`.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The runtime file content bytes
+    /// * `expected_hash` - The BLAKE3 hash from the manifest entry
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the hashes match.
+    /// `Err(ToctouMismatch)` if the hashes differ, containing both hashes
+    /// for audit purposes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToctouMismatch`] if the computed BLAKE3 hash of `content`
+    /// does not match `expected_hash`.
+    ///
+    /// # Security
+    ///
+    /// Uses constant-time comparison via `subtle::ConstantTimeEq` to prevent
+    /// timing side-channel attacks (per RSK-1909).
+    pub fn verify_content(content: &[u8], expected_hash: &[u8; 32]) -> Result<(), ToctouMismatch> {
+        let computed = *blake3::hash(content).as_bytes();
+        // Constant-time comparison to prevent timing attacks
+        if computed.ct_eq(expected_hash).into() {
+            Ok(())
+        } else {
+            Err(ToctouMismatch {
+                expected: *expected_hash,
+                computed,
+            })
+        }
+    }
+
+    /// Verifies file content against a manifest entry and returns the
+    /// appropriate firewall decision.
+    ///
+    /// This is a convenience method that combines hash verification with
+    /// firewall decision generation.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The runtime file content bytes
+    /// * `expected_hash` - The BLAKE3 hash from the manifest entry
+    /// * `manifest_id` - The manifest ID for audit traceability
+    /// * `path` - The file path for audit traceability
+    /// * `mode` - The firewall enforcement mode
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the hashes match.
+    /// `Err(ContextFirewallError)` if the hashes differ, with the appropriate
+    /// termination flag based on the firewall mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextFirewallError::ToctouMismatch`] when the runtime
+    /// content hash does not match the expected manifest hash. Per REQ-0029,
+    /// TOCTOU mismatches are always denied regardless of mode; `Warn` affects
+    /// severity/termination only, not acceptance.
+    #[allow(clippy::result_large_err)]
+    pub fn verify_for_firewall(
+        content: &[u8],
+        expected_hash: &[u8; 32],
+        manifest_id: &str,
+        path: &str,
+        mode: FirewallMode,
+    ) -> Result<(), ContextFirewallError> {
+        if let Err(mismatch) = Self::verify_content(content, expected_hash) {
+            let event = FirewallDecision::deny_toctou_mismatch(manifest_id, path);
+            Err(ContextFirewallError::ToctouMismatch {
+                path: path.to_string(),
+                expected_hash: mismatch.expected,
+                computed_hash: mismatch.computed,
+                event,
+                should_terminate_session: matches!(mode, FirewallMode::HardFail),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// TOCTOU hash mismatch details.
+///
+/// Contains both the expected and computed hashes for audit logging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToctouMismatch {
+    /// Expected hash from manifest entry.
+    pub expected: [u8; 32],
+    /// Computed hash from runtime content.
+    pub computed: [u8; 32],
+}
+
+impl std::fmt::Display for ToctouMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TOCTOU mismatch: expected {}, computed {}",
+            hex::encode(self.expected),
+            hex::encode(self.computed)
+        )
+    }
+}
+
+// =============================================================================
+// FirewallViolationDefect (TCK-00375)
+// =============================================================================
+
+/// Mandatory defect emission for Tier3+ firewall violations (TCK-00375).
+///
+/// Per REQ-0029, Tier3+ violations MUST terminate with mandatory defect
+/// emission. This struct captures the defect details for audit and event
+/// logging.
+///
+/// # Security Model
+///
+/// This is a fail-closed design: the defect is always emitted when a Tier3+
+/// violation occurs, regardless of any other configuration. The caller
+/// MUST emit this defect to the event ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirewallViolationDefect {
+    /// The violation type.
+    pub violation_type: FirewallViolationType,
+    /// The risk tier at which the violation occurred.
+    pub risk_tier: u8,
+    /// The rule ID that triggered the violation.
+    pub rule_id: String,
+    /// The manifest ID for audit traceability.
+    pub manifest_id: String,
+    /// The path that triggered the violation.
+    pub path: String,
+    /// Human-readable reason.
+    pub reason: String,
+    /// Whether session termination is mandatory.
+    pub mandatory_termination: bool,
+}
+
+/// Type of firewall violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FirewallViolationType {
+    /// Access to a path not in the allowlist.
+    AllowlistDenied,
+    /// Content hash mismatch (static check).
+    HashMismatch,
+    /// TOCTOU hash mismatch (runtime check).
+    ToctouMismatch,
+}
+
+impl std::fmt::Display for FirewallViolationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AllowlistDenied => write!(f, "ALLOWLIST_DENIED"),
+            Self::HashMismatch => write!(f, "HASH_MISMATCH"),
+            Self::ToctouMismatch => write!(f, "TOCTOU_MISMATCH"),
+        }
+    }
+}
+
+impl FirewallViolationDefect {
+    /// Creates a defect for an allowlist denial at Tier3+.
+    #[must_use]
+    pub fn allowlist_denied(risk_tier: u8, manifest_id: &str, path: &str) -> Self {
+        Self {
+            violation_type: FirewallViolationType::AllowlistDenied,
+            risk_tier,
+            rule_id: CTX_ALLOWLIST_RULE_ID.to_string(),
+            manifest_id: manifest_id.to_string(),
+            path: path.to_string(),
+            reason: ALLOWLIST_DENIAL_REASON.to_string(),
+            mandatory_termination: risk_tier >= 3,
+        }
+    }
+
+    /// Creates a defect for a hash mismatch at Tier3+.
+    #[must_use]
+    pub fn hash_mismatch(risk_tier: u8, manifest_id: &str, path: &str) -> Self {
+        Self {
+            violation_type: FirewallViolationType::HashMismatch,
+            risk_tier,
+            rule_id: CTX_HASH_MISMATCH_RULE_ID.to_string(),
+            manifest_id: manifest_id.to_string(),
+            path: path.to_string(),
+            reason: HASH_MISMATCH_DENIAL_REASON.to_string(),
+            mandatory_termination: risk_tier >= 3,
+        }
+    }
+
+    /// Creates a defect for a TOCTOU mismatch at Tier3+.
+    #[must_use]
+    pub fn toctou_mismatch(risk_tier: u8, manifest_id: &str, path: &str) -> Self {
+        Self {
+            violation_type: FirewallViolationType::ToctouMismatch,
+            risk_tier,
+            rule_id: CTX_TOCTOU_MISMATCH_RULE_ID.to_string(),
+            manifest_id: manifest_id.to_string(),
+            path: path.to_string(),
+            reason: TOCTOU_MISMATCH_DENIAL_REASON.to_string(),
+            mandatory_termination: risk_tier >= 3,
+        }
+    }
+
+    /// Returns `true` if this defect requires mandatory session termination.
+    #[must_use]
+    pub const fn requires_termination(&self) -> bool {
+        self.mandatory_termination
     }
 }
 
@@ -1558,5 +1966,343 @@ pub mod tests {
             },
             other => panic!("Expected PathTooLong error, got {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // TCK-00375: RiskTierFirewallPolicy Tests
+    // =========================================================================
+
+    #[test]
+    fn test_risk_tier_policy_default() {
+        // Default is HardFail for ALL tiers — fail-closed security posture.
+        // Context firewall violations are always severe (out-of-pack access
+        // or content tampering). Tier3+ additionally requires mandatory
+        // defect emission per REQ-0029.
+        let policy = RiskTierFirewallPolicy::default();
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier0),
+            FirewallMode::HardFail
+        );
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier1),
+            FirewallMode::HardFail
+        );
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier2),
+            FirewallMode::HardFail
+        );
+        // Tier3+ MUST always be HardFail per REQ-0029
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier3),
+            FirewallMode::HardFail
+        );
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier4),
+            FirewallMode::HardFail
+        );
+    }
+
+    #[test]
+    fn test_risk_tier_policy_strict() {
+        let policy = RiskTierFirewallPolicy::strict();
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier0),
+            FirewallMode::HardFail
+        );
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier3),
+            FirewallMode::HardFail
+        );
+    }
+
+    #[test]
+    fn test_risk_tier_policy_tier3_always_hard_fail() {
+        // Even with a custom low_risk_mode=Warn, Tier3+ MUST be HardFail
+        let policy = RiskTierFirewallPolicy {
+            low_risk_mode: FirewallMode::Warn,
+            medium_risk_mode: FirewallMode::Warn,
+        };
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier0),
+            FirewallMode::Warn,
+            "Tier0 should use configured low_risk_mode"
+        );
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier3),
+            FirewallMode::HardFail,
+            "Tier3 MUST always be HardFail"
+        );
+        assert_eq!(
+            policy.mode_for_tier(ContextRiskTier::Tier4),
+            FirewallMode::HardFail,
+            "Tier4 MUST always be HardFail"
+        );
+    }
+
+    #[test]
+    fn test_context_risk_tier_is_high_risk() {
+        assert!(!ContextRiskTier::Tier0.is_high_risk());
+        assert!(!ContextRiskTier::Tier1.is_high_risk());
+        assert!(!ContextRiskTier::Tier2.is_high_risk());
+        assert!(ContextRiskTier::Tier3.is_high_risk());
+        assert!(ContextRiskTier::Tier4.is_high_risk());
+    }
+
+    #[test]
+    fn test_context_risk_tier_from_u8() {
+        assert_eq!(ContextRiskTier::from_u8(0), Some(ContextRiskTier::Tier0));
+        assert_eq!(ContextRiskTier::from_u8(4), Some(ContextRiskTier::Tier4));
+        assert_eq!(ContextRiskTier::from_u8(5), None);
+        assert_eq!(ContextRiskTier::from_u8(255), None);
+    }
+
+    // =========================================================================
+    // TCK-00375: ToctouVerifier Tests
+    // =========================================================================
+
+    #[test]
+    fn test_toctou_verify_content_matching() {
+        let content = b"fn main() { println!(\"hello\"); }";
+        let expected_hash = *blake3::hash(content).as_bytes();
+        assert!(ToctouVerifier::verify_content(content, &expected_hash).is_ok());
+    }
+
+    #[test]
+    fn test_toctou_verify_content_mismatch() {
+        let content = b"fn main() { println!(\"hello\"); }";
+        let wrong_hash = [0xFFu8; 32];
+        let result = ToctouVerifier::verify_content(content, &wrong_hash);
+        assert!(result.is_err());
+        let mismatch = result.unwrap_err();
+        assert_eq!(mismatch.expected, wrong_hash);
+        assert_eq!(mismatch.computed, *blake3::hash(content).as_bytes());
+    }
+
+    #[test]
+    fn test_toctou_verify_content_empty() {
+        let content = b"";
+        let expected_hash = *blake3::hash(content).as_bytes();
+        assert!(ToctouVerifier::verify_content(content, &expected_hash).is_ok());
+    }
+
+    #[test]
+    fn test_toctou_verify_content_single_bit_flip() {
+        let content = b"fn main() {}";
+        let expected_hash = *blake3::hash(content).as_bytes();
+        // Flip one bit in the content
+        let mut tampered = content.to_vec();
+        tampered[0] ^= 1;
+        let result = ToctouVerifier::verify_content(&tampered, &expected_hash);
+        assert!(result.is_err(), "Single bit flip should be detected");
+    }
+
+    #[test]
+    fn test_toctou_verify_for_firewall_hardfail() {
+        let content = b"original content";
+        let expected_hash = *blake3::hash(b"different content").as_bytes();
+
+        let result = ToctouVerifier::verify_for_firewall(
+            content,
+            &expected_hash,
+            "manifest-001",
+            "/project/src/main.rs",
+            FirewallMode::HardFail,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_toctou_mismatch());
+        assert!(
+            err.should_terminate_session(),
+            "HardFail TOCTOU mismatch should terminate"
+        );
+    }
+
+    #[test]
+    fn test_toctou_verify_for_firewall_softfail() {
+        let content = b"original content";
+        let expected_hash = *blake3::hash(b"different content").as_bytes();
+
+        let result = ToctouVerifier::verify_for_firewall(
+            content,
+            &expected_hash,
+            "manifest-001",
+            "/project/src/main.rs",
+            FirewallMode::SoftFail,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_toctou_mismatch());
+        assert!(
+            !err.should_terminate_session(),
+            "SoftFail TOCTOU mismatch should NOT terminate"
+        );
+    }
+
+    #[test]
+    fn test_toctou_verify_for_firewall_warn() {
+        let content = b"original content";
+        let expected_hash = *blake3::hash(b"different content").as_bytes();
+
+        let result = ToctouVerifier::verify_for_firewall(
+            content,
+            &expected_hash,
+            "manifest-001",
+            "/project/src/main.rs",
+            FirewallMode::Warn,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_toctou_mismatch());
+        assert!(
+            !err.should_terminate_session(),
+            "Warn TOCTOU mismatch should deny without mandatory termination"
+        );
+    }
+
+    #[test]
+    fn test_toctou_verify_for_firewall_matching() {
+        let content = b"fn main() {}";
+        let expected_hash = *blake3::hash(content).as_bytes();
+
+        let result = ToctouVerifier::verify_for_firewall(
+            content,
+            &expected_hash,
+            "manifest-001",
+            "/project/src/main.rs",
+            FirewallMode::HardFail,
+        );
+
+        assert!(result.is_ok(), "Matching content should pass");
+    }
+
+    #[test]
+    fn test_toctou_mismatch_display() {
+        let mismatch = ToctouMismatch {
+            expected: [0x42; 32],
+            computed: [0xFF; 32],
+        };
+        let display = format!("{mismatch}");
+        assert!(display.contains("TOCTOU mismatch"));
+        assert!(display.contains(&hex::encode([0x42; 32])));
+        assert!(display.contains(&hex::encode([0xFF; 32])));
+    }
+
+    // =========================================================================
+    // TCK-00375: FirewallViolationDefect Tests
+    // =========================================================================
+
+    #[test]
+    fn test_violation_defect_allowlist_denied_tier3() {
+        let defect = FirewallViolationDefect::allowlist_denied(3, "manifest-001", "/etc/passwd");
+        assert_eq!(
+            defect.violation_type,
+            FirewallViolationType::AllowlistDenied
+        );
+        assert_eq!(defect.risk_tier, 3);
+        assert!(defect.requires_termination());
+        assert_eq!(defect.rule_id, CTX_ALLOWLIST_RULE_ID);
+    }
+
+    #[test]
+    fn test_violation_defect_allowlist_denied_tier1() {
+        let defect = FirewallViolationDefect::allowlist_denied(1, "manifest-001", "/etc/passwd");
+        assert!(
+            !defect.requires_termination(),
+            "Tier1 should not require termination"
+        );
+    }
+
+    #[test]
+    fn test_violation_defect_hash_mismatch() {
+        let defect =
+            FirewallViolationDefect::hash_mismatch(4, "manifest-001", "/project/src/main.rs");
+        assert_eq!(defect.violation_type, FirewallViolationType::HashMismatch);
+        assert!(defect.requires_termination());
+    }
+
+    #[test]
+    fn test_violation_defect_toctou_mismatch() {
+        let defect =
+            FirewallViolationDefect::toctou_mismatch(3, "manifest-001", "/project/src/main.rs");
+        assert_eq!(defect.violation_type, FirewallViolationType::ToctouMismatch);
+        assert_eq!(defect.rule_id, CTX_TOCTOU_MISMATCH_RULE_ID);
+        assert!(defect.requires_termination());
+    }
+
+    #[test]
+    fn test_violation_defect_serde_roundtrip() {
+        let defect =
+            FirewallViolationDefect::toctou_mismatch(3, "manifest-001", "/project/src/main.rs");
+        let json = serde_json::to_string(&defect).unwrap();
+        let recovered: FirewallViolationDefect = serde_json::from_str(&json).unwrap();
+        assert_eq!(defect, recovered);
+    }
+
+    #[test]
+    fn test_violation_type_display() {
+        assert_eq!(
+            format!("{}", FirewallViolationType::AllowlistDenied),
+            "ALLOWLIST_DENIED"
+        );
+        assert_eq!(
+            format!("{}", FirewallViolationType::HashMismatch),
+            "HASH_MISMATCH"
+        );
+        assert_eq!(
+            format!("{}", FirewallViolationType::ToctouMismatch),
+            "TOCTOU_MISMATCH"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00375: FirewallDecision TOCTOU Tests
+    // =========================================================================
+
+    #[test]
+    fn test_firewall_decision_deny_toctou_mismatch() {
+        let event = FirewallDecision::deny_toctou_mismatch("manifest-001", "/project/file.rs");
+        assert_eq!(event.decision, ToolDecision::Deny);
+        assert_eq!(event.rule_id, CTX_TOCTOU_MISMATCH_RULE_ID);
+        assert_eq!(event.manifest_id, "manifest-001");
+        assert_eq!(event.path, "/project/file.rs");
+        assert_eq!(event.reason, TOCTOU_MISMATCH_DENIAL_REASON);
+    }
+
+    // =========================================================================
+    // TCK-00375: ToctouMismatch Error Variant Tests
+    // =========================================================================
+
+    #[test]
+    fn test_toctou_mismatch_error_should_terminate_session() {
+        let event = FirewallDecision::deny_toctou_mismatch("manifest-001", "/test");
+
+        let err = ContextFirewallError::ToctouMismatch {
+            path: "/test".to_string(),
+            expected_hash: [0x42; 32],
+            computed_hash: [0xFF; 32],
+            event,
+            should_terminate_session: true,
+        };
+        assert!(err.should_terminate_session());
+        assert!(err.is_toctou_mismatch());
+        assert!(err.event().is_some());
+    }
+
+    #[test]
+    fn test_toctou_mismatch_error_no_terminate() {
+        let event = FirewallDecision::deny_toctou_mismatch("manifest-001", "/test");
+
+        let err = ContextFirewallError::ToctouMismatch {
+            path: "/test".to_string(),
+            expected_hash: [0x42; 32],
+            computed_hash: [0xFF; 32],
+            event,
+            should_terminate_session: false,
+        };
+        assert!(!err.should_terminate_session());
+        assert!(err.is_toctou_mismatch());
     }
 }

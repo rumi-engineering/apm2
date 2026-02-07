@@ -38,10 +38,12 @@
 //! - AD-TOOL-002: Capability manifests as sealed references
 //! - AD-VERIFY-001: Deterministic serialization
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::htf::{TimeEnvelope, TimeEnvelopeRef};
 use prost::Message;
 use secrecy::{ExposeSecret, SecretString};
@@ -1078,6 +1080,109 @@ impl SessionContext {
     #[must_use]
     pub const fn has_ssh_session(&self) -> bool {
         self.ssh_session_id.is_some()
+    }
+}
+
+// =============================================================================
+// VerifiedToolContent
+// =============================================================================
+
+/// TOCTOU-verified file content for a single broker request (TCK-00375).
+///
+/// Keys are normalized manifest-style paths. Values are the exact bytes that
+/// were hash-verified against the context manifest and are therefore safe to
+/// consume without re-reading from disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifiedToolContent {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl VerifiedToolContent {
+    /// Inserts verified bytes for a normalized path.
+    pub fn insert(&mut self, normalized_path: impl Into<String>, content: Vec<u8>) {
+        self.files.insert(normalized_path.into(), content);
+    }
+
+    /// Returns verified bytes for the normalized path, if present.
+    #[must_use]
+    pub fn get(&self, normalized_path: &str) -> Option<&[u8]> {
+        self.files.get(normalized_path).map(Vec::as_slice)
+    }
+
+    /// Returns `true` when no verified files are present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
+// =============================================================================
+// BrokerResponse
+// =============================================================================
+
+/// Atomic broker response for a single request (TCK-00375).
+///
+/// This keeps the decision, request-scoped defects, and verified content
+/// together to prevent cross-request attribution drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerResponse {
+    /// Broker authorization decision.
+    pub decision: ToolDecision,
+    /// Firewall violation defects produced while evaluating the request.
+    pub defects: Vec<FirewallViolationDefect>,
+    /// TOCTOU-verified file content for downstream tool execution.
+    pub verified_content: VerifiedToolContent,
+    /// When `true`, handlers must consume only TOCTOU-verified bytes.
+    pub toctou_verification_required: bool,
+}
+
+impl BrokerResponse {
+    /// Constructs a new broker response.
+    #[must_use]
+    pub const fn new(
+        decision: ToolDecision,
+        defects: Vec<FirewallViolationDefect>,
+        verified_content: VerifiedToolContent,
+        toctou_verification_required: bool,
+    ) -> Self {
+        Self {
+            decision,
+            defects,
+            verified_content,
+            toctou_verification_required,
+        }
+    }
+
+    /// Convenience passthrough for `ToolDecision::is_allowed`.
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        self.decision.is_allowed()
+    }
+
+    /// Convenience passthrough for `ToolDecision::is_denied`.
+    #[must_use]
+    pub const fn is_denied(&self) -> bool {
+        self.decision.is_denied()
+    }
+
+    /// Convenience passthrough for `ToolDecision::is_cache_hit`.
+    #[must_use]
+    pub const fn is_cache_hit(&self) -> bool {
+        self.decision.is_cache_hit()
+    }
+
+    /// Convenience passthrough for `ToolDecision::is_terminate`.
+    #[must_use]
+    pub const fn is_terminate(&self) -> bool {
+        self.decision.is_terminate()
+    }
+}
+
+impl std::ops::Deref for BrokerResponse {
+    type Target = ToolDecision;
+
+    fn deref(&self) -> &Self::Target {
+        &self.decision
     }
 }
 

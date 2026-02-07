@@ -139,6 +139,7 @@ pub mod budget_tracker;
 pub mod executor;
 pub mod handlers;
 pub mod tool_handler;
+pub(crate) mod verified_content;
 
 // TCK-00311: Workspace snapshot and apply
 pub mod workspace;
@@ -191,10 +192,10 @@ pub use claude_parser::{
     ParsedToolCall, ParserDefect, ParserState, strip_ansi,
 };
 pub use decision::{
-    BrokerToolRequest, BudgetDelta, DedupeKey, DedupeKeyError, MAX_DEDUPE_KEY_LEN,
+    BrokerResponse, BrokerToolRequest, BudgetDelta, DedupeKey, DedupeKeyError, MAX_DEDUPE_KEY_LEN,
     MAX_ERROR_MESSAGE_LEN, MAX_HOST_LEN, MAX_INLINE_ARGS_SIZE, MAX_INLINE_RESULT_SIZE,
     MAX_REQUEST_ID_LEN, MAX_RULE_ID_LEN, MAX_TOOL_OUTPUT_SIZE, RequestValidationError,
-    SessionContext, ToolDecision, ToolResult,
+    SessionContext, ToolDecision, ToolResult, VerifiedToolContent,
 };
 pub use dedupe::{
     DEFAULT_TTL_SECS, DedupeCache, DedupeCacheConfig, DedupeCacheStats, MAX_DEDUPE_ENTRIES,

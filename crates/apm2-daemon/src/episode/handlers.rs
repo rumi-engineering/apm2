@@ -42,10 +42,11 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
-use super::decision::{BudgetDelta, Credential, MAX_TOOL_OUTPUT_SIZE};
-use super::executor::ContentAddressedStore;
+use super::decision::{BudgetDelta, Credential, MAX_TOOL_OUTPUT_SIZE, VerifiedToolContent};
+use super::executor::{ContentAddressedStore, ExecutionContext};
 use super::tool_class::ToolClass;
 use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
+use super::verified_content::normalized_verified_content_lookup_keys;
 
 // =============================================================================
 // Platform-Specific O_NOFOLLOW Support (TCK-00319 TOCTOU Mitigation)
@@ -440,18 +441,27 @@ impl ReadFileHandler {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
-}
 
-#[async_trait]
-impl ToolHandler for ReadFileHandler {
-    fn tool_class(&self) -> ToolClass {
-        ToolClass::Read
+    fn verified_content_lookup<'a>(
+        verified: &'a VerifiedToolContent,
+        path: &Path,
+        canonical_root: &Path,
+    ) -> Result<Option<&'a [u8]>, ToolHandlerError> {
+        let keys = normalized_verified_content_lookup_keys(path, canonical_root).map_err(|e| {
+            ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to derive verified content lookup keys for '{}': {e}",
+                    path.display()
+                ),
+            }
+        })?;
+        Ok(keys.into_iter().find_map(|key| verified.get(&key)))
     }
 
-    async fn execute(
+    async fn execute_impl(
         &self,
         args: &ToolArgs,
-        _credential: Option<&Credential>,
+        verified_content: Option<&VerifiedToolContent>,
     ) -> Result<ToolResultData, ToolHandlerError> {
         // Validate arguments first (MAJOR 1 fix)
         self.validate(args)?;
@@ -480,45 +490,100 @@ impl ToolHandler for ReadFileHandler {
         let validated_path =
             validate_path_with_toctou_mitigation(&read_args.path, &canonical_root)?;
 
-        // TCK-00319: Open file with O_NOFOLLOW to prevent TOCTOU symlink attacks
-        // This ensures the kernel rejects symlinks at open time, closing the window
-        // between validation and access.
-        let mut file = open_file_nofollow(&validated_path).await.map_err(|e| {
-            ToolHandlerError::ExecutionFailed {
-                message: format!("failed to open file '{}': {}", read_args.path.display(), e),
-            }
-        })?;
-
-        // Seek if offset provided
-        if let Some(offset) = read_args.offset {
-            file.seek(std::io::SeekFrom::Start(offset))
-                .await
-                .map_err(|e| ToolHandlerError::ExecutionFailed {
-                    message: format!("failed to seek: {e}"),
-                })?;
-        }
-
         // Determine read limit (default 10MB)
         let limit = read_args.limit.unwrap_or(10 * 1024 * 1024);
 
-        // Read content with limit
-        let mut buffer = Vec::new();
-        let bytes_read = file
-            .take(limit)
-            .read_to_end(&mut buffer)
-            .await
-            .map_err(|e| ToolHandlerError::ExecutionFailed {
-                message: format!("failed to read: {e}"),
+        let (buffer, bytes_read) = if let Some(verified) = verified_content {
+            if let Some(content) =
+                Self::verified_content_lookup(verified, &validated_path, &canonical_root)?
+            {
+                let start = read_args
+                    .offset
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .unwrap_or(0)
+                    .min(content.len());
+                let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+                let end = start.saturating_add(limit_usize).min(content.len());
+                let out = content[start..end].to_vec();
+                let out_len = u64::try_from(out.len()).unwrap_or(u64::MAX);
+                (out, out_len)
+            } else {
+                return Err(ToolHandlerError::ExecutionFailed {
+                    message: format!(
+                        "missing TOCTOU-verified content for '{}'; refusing disk re-read",
+                        validated_path.display()
+                    ),
+                });
+            }
+        } else {
+            // TCK-00319: Open file with O_NOFOLLOW to prevent TOCTOU symlink attacks
+            // This ensures the kernel rejects symlinks at open time, closing the window
+            // between validation and access.
+            let mut file = open_file_nofollow(&validated_path).await.map_err(|e| {
+                ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to open file '{}': {}", read_args.path.display(), e),
+                }
             })?;
+
+            // Seek if offset provided
+            if let Some(offset) = read_args.offset {
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| ToolHandlerError::ExecutionFailed {
+                        message: format!("failed to seek: {e}"),
+                    })?;
+            }
+
+            // Read content with limit
+            let mut buffer = Vec::new();
+            let bytes_read = file
+                .take(limit)
+                .read_to_end(&mut buffer)
+                .await
+                .map_err(|e| ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to read: {e}"),
+                })?;
+
+            (buffer, bytes_read as u64)
+        };
 
         // Capture actual I/O duration (MAJOR 2 fix)
         let io_duration = io_start.elapsed();
 
         Ok(ToolResultData::success(
             buffer,
-            BudgetDelta::single_call().with_bytes_io(bytes_read as u64),
+            BudgetDelta::single_call().with_bytes_io(bytes_read),
             io_duration,
         ))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReadFileHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::Read
+    }
+
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        self.execute_impl(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ExecutionContext,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        let verified = if ctx.toctou_verification_required {
+            Some(&ctx.verified_content)
+        } else {
+            None
+        };
+        self.execute_impl(args, verified).await
     }
 
     fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
@@ -2314,18 +2379,11 @@ impl ListFilesHandler {
     fn count_lines(data: &[u8]) -> usize {
         data.iter().filter(|&&b| b == b'\n').count()
     }
-}
 
-#[async_trait]
-impl ToolHandler for ListFilesHandler {
-    fn tool_class(&self) -> ToolClass {
-        ToolClass::ListFiles
-    }
-
-    async fn execute(
+    async fn execute_impl(
         &self,
         args: &ToolArgs,
-        _credential: Option<&Credential>,
+        verified_content: Option<&VerifiedToolContent>,
     ) -> Result<ToolResultData, ToolHandlerError> {
         use super::tool_handler::{
             LISTFILES_DEFAULT_ENTRIES, LISTFILES_MAX_ENTRIES, NAVIGATION_OUTPUT_MAX_BYTES,
@@ -2410,6 +2468,19 @@ impl ToolHandler for ListFilesHandler {
                 }
             }
 
+            if let Some(verified) = verified_content {
+                if ReadFileHandler::verified_content_lookup(
+                    verified,
+                    &entry.path(),
+                    &canonical_root,
+                )?
+                .is_none()
+                {
+                    // Fail-closed in context-firewall mode: omit non-admitted entries.
+                    continue;
+                }
+            }
+
             // Include type indicator
             let file_type = entry.file_type().await.ok();
             let type_indicator = if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
@@ -2460,6 +2531,35 @@ impl ToolHandler for ListFilesHandler {
             BudgetDelta::single_call().with_bytes_io(output_len as u64),
             io_duration,
         ))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ListFilesHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::ListFiles
+    }
+
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        self.execute_impl(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ExecutionContext,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        let verified = if ctx.toctou_verification_required {
+            Some(&ctx.verified_content)
+        } else {
+            None
+        };
+        self.execute_impl(args, verified).await
     }
 
     fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
@@ -2739,12 +2839,28 @@ impl SearchHandler {
     /// Searches a file for the query and returns matching lines.
     async fn search_file(
         path: &Path,
+        canonical_root: &Path,
         display_path: &str,
         query: &str,
         out: &mut SearchOutputState,
+        verified_content: Option<&VerifiedToolContent>,
     ) -> Result<bool, ToolHandlerError> {
-        let Ok(content) = tokio::fs::read_to_string(path).await else {
-            return Ok(false); // Skip unreadable/binary files
+        let content = if let Some(verified) = verified_content {
+            let Some(bytes) =
+                ReadFileHandler::verified_content_lookup(verified, path, canonical_root)?
+            else {
+                // Fail-closed: files without pre-verified bytes are excluded.
+                return Ok(false);
+            };
+            let Ok(content) = std::str::from_utf8(bytes) else {
+                return Ok(false); // Skip binary files
+            };
+            content.to_string()
+        } else {
+            let Ok(content) = tokio::fs::read_to_string(path).await else {
+                return Ok(false); // Skip unreadable/binary files
+            };
+            content
         };
 
         for (line_num, line) in content.lines().enumerate() {
@@ -2767,18 +2883,11 @@ impl SearchHandler {
 
         Ok(false)
     }
-}
 
-#[async_trait]
-impl ToolHandler for SearchHandler {
-    fn tool_class(&self) -> ToolClass {
-        ToolClass::Search
-    }
-
-    async fn execute(
+    async fn execute_impl(
         &self,
         args: &ToolArgs,
-        _credential: Option<&Credential>,
+        verified_content: Option<&VerifiedToolContent>,
     ) -> Result<ToolResultData, ToolHandlerError> {
         use super::tool_handler::{NAVIGATION_OUTPUT_MAX_BYTES, NAVIGATION_OUTPUT_MAX_LINES};
 
@@ -2883,6 +2992,18 @@ impl ToolHandler for SearchHandler {
                     break;
                 }
 
+                if let Some(verified) = verified_content {
+                    if ReadFileHandler::verified_content_lookup(
+                        verified,
+                        &target.path,
+                        &canonical_root,
+                    )?
+                    .is_none()
+                    {
+                        continue;
+                    }
+                }
+
                 // Bound total bytes scanned (economics / DoS control)
                 if scanned_bytes.saturating_add(target.size) > SEARCH_MAX_TOTAL_BYTES {
                     return Err(ToolHandlerError::InvalidArgs {
@@ -2896,9 +3017,11 @@ impl ToolHandler for SearchHandler {
 
                 bounds_exceeded = Self::search_file(
                     &target.path,
+                    &canonical_root,
                     &target.display_path,
                     query,
                     &mut out,
+                    verified_content,
                 )
                 .await?;
             }
@@ -2944,6 +3067,35 @@ impl ToolHandler for SearchHandler {
                 .with_bytes_io(scanned_bytes.saturating_add(output_len as u64)),
             search_duration,
         ))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SearchHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::Search
+    }
+
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        self.execute_impl(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ExecutionContext,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        let verified = if ctx.toctou_verification_required {
+            Some(&ctx.verified_content)
+        } else {
+            None
+        };
+        self.execute_impl(args, verified).await
     }
 
     fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
@@ -3735,6 +3887,246 @@ mod tests {
         assert!(handler.validate(&args).is_err());
     }
 
+    #[tokio::test]
+    async fn test_read_handler_fails_closed_with_empty_verified_content_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        std::fs::write(root.join("note.txt"), "secret").expect("write file");
+
+        let handler = ReadFileHandler::with_root(root);
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("note.txt"),
+            offset: None,
+            limit: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-read-empty-verified")
+                .expect("valid episode id"),
+            "req-read-empty-verified",
+            1,
+        )
+        .with_toctou_verification_required(true);
+
+        let result = handler.execute_with_context(&ctx, &args, None).await;
+        assert!(
+            matches!(result, Err(ToolHandlerError::ExecutionFailed { .. })),
+            "read should fail-closed when TOCTOU is required but verified map is empty"
+        );
+        if let Err(ToolHandlerError::ExecutionFailed { message }) = result {
+            assert!(
+                message.contains("missing TOCTOU-verified content"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_handler_accepts_workspace_relative_verified_key_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir(&src_dir).expect("create src");
+        std::fs::write(src_dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized = apm2_core::context::normalize_path("src/main.rs")
+            .expect("normalize workspace-relative path");
+        verified.insert(normalized, b"fn main() {}\n".to_vec());
+
+        let handler = ReadFileHandler::with_root(root);
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("src/main.rs"),
+            offset: None,
+            limit: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-read-relative-verified")
+                .expect("valid episode id"),
+            "req-read-relative-verified",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("read should use verified bytes");
+        assert_eq!(
+            result.output_str().expect("utf8 output"),
+            "fn main() {}\n",
+            "workspace-relative verified key should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_handler_returns_empty_with_empty_verified_content_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::write(scope.join("note.txt"), "needle line").expect("write file");
+
+        let handler = SearchHandler::with_root(root);
+        let args = ToolArgs::Search(SearchArgs {
+            query: "needle".to_string(),
+            scope: PathBuf::from("scope"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-search-empty-verified")
+                .expect("valid episode id"),
+            "req-search-empty-verified",
+            1,
+        )
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("search should not error");
+        let output = result.output_str().expect("utf8 output");
+        assert!(
+            output.is_empty(),
+            "search must fail-closed to empty output without verified bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_handler_accepts_workspace_relative_verified_keys_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::write(scope.join("note.txt"), "needle line").expect("write file");
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized = apm2_core::context::normalize_path("scope/note.txt")
+            .expect("normalize workspace-relative path");
+        verified.insert(normalized, b"needle line".to_vec());
+
+        let handler = SearchHandler::with_root(root);
+        let args = ToolArgs::Search(SearchArgs {
+            query: "needle".to_string(),
+            scope: PathBuf::from("scope"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-search-relative-verified")
+                .expect("valid episode id"),
+            "req-search-relative-verified",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("search should use verified bytes");
+        let output = result.output_str().expect("utf8 output");
+        assert!(
+            output.contains("scope/note.txt:1:needle line"),
+            "expected search match from workspace-relative verified key, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_listfiles_handler_filters_to_verified_entries_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        let allowed = scope.join("allowed.txt");
+        let blocked = scope.join("blocked.txt");
+        std::fs::write(&allowed, "allowed").expect("write allowed file");
+        std::fs::write(&blocked, "blocked").expect("write blocked file");
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized_allowed =
+            apm2_core::context::normalize_path(allowed.to_string_lossy().as_ref())
+                .expect("normalize allowed path");
+        verified.insert(normalized_allowed, Vec::new());
+
+        let handler = ListFilesHandler::with_root(root);
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("scope"),
+            pattern: None,
+            max_entries: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-listfiles-verified")
+                .expect("valid episode id"),
+            "req-listfiles-verified",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("listfiles should succeed");
+        let output = result.output_str().expect("utf8 output");
+
+        assert!(
+            output.lines().any(|line| line == "allowed.txt"),
+            "admitted file should be listed, got: {output}"
+        );
+        assert!(
+            !output.lines().any(|line| line.starts_with("blocked.txt")),
+            "non-admitted file must be suppressed, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_listfiles_handler_accepts_workspace_relative_verified_keys_when_toctou_required()
+    {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::write(scope.join("allowed.txt"), "allowed").expect("write allowed");
+        std::fs::write(scope.join("blocked.txt"), "blocked").expect("write blocked");
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized = apm2_core::context::normalize_path("scope/allowed.txt")
+            .expect("normalize workspace-relative path");
+        verified.insert(normalized, Vec::new());
+
+        let handler = ListFilesHandler::with_root(root);
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("scope"),
+            pattern: None,
+            max_entries: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-listfiles-relative-verified")
+                .expect("valid episode id"),
+            "req-listfiles-relative-verified",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("listfiles should succeed");
+        let output = result.output_str().expect("utf8 output");
+
+        assert!(
+            output.lines().any(|line| line == "allowed.txt"),
+            "workspace-relative admitted file should be listed, got: {output}"
+        );
+        assert!(
+            !output.lines().any(|line| line.starts_with("blocked.txt")),
+            "non-admitted file must be suppressed, got: {output}"
+        );
+    }
+
     // =========================================================================
     // WriteFileHandler tests
     // =========================================================================
@@ -4376,6 +4768,60 @@ mod tests {
         assert!(
             result.budget_consumed.bytes_io >= result.output.len() as u64,
             "expected bytes_io to include output bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_toctou_budget_skips_unverified_files() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+
+        let admitted = scope.join("z-admitted.txt");
+        std::fs::write(&admitted, "needle line").expect("write admitted file");
+
+        let excluded_size = (SEARCH_MAX_TOTAL_BYTES / 4).saturating_add(1);
+        for idx in 0..4 {
+            let excluded = scope.join(format!("a-excluded-{idx}.bin"));
+            let file = std::fs::File::create(&excluded).expect("create excluded file");
+            file.set_len(excluded_size)
+                .expect("set excluded file length");
+        }
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized = apm2_core::context::normalize_path("scope/z-admitted.txt")
+            .expect("normalize admitted key");
+        verified.insert(normalized, b"needle line".to_vec());
+
+        let handler = SearchHandler::with_root(root);
+        let args = ToolArgs::Search(SearchArgs {
+            query: "needle".to_string(),
+            scope: PathBuf::from("scope"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-search-budget-unverified-skip")
+                .expect("valid episode id"),
+            "req-search-budget-unverified-skip",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("excluded files must not consume TOCTOU search budget");
+        let output = result.output_str().expect("utf8 output");
+        assert!(
+            output.contains("scope/z-admitted.txt:1:needle line"),
+            "expected admitted file match, got: {output}"
+        );
+        assert!(
+            result.budget_consumed.bytes_io < SEARCH_MAX_TOTAL_BYTES,
+            "budget must not include excluded file sizes"
         );
     }
 
