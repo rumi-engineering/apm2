@@ -74,6 +74,7 @@ pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
 pub mod fact_root;
+pub mod functor;
 pub mod genesis;
 pub mod handlers;
 pub mod merkle;
@@ -84,7 +85,7 @@ pub mod relay;
 pub mod replication;
 pub mod tunnel;
 
-// Bisimulation gate for recursive composition (TCK-00367)
+// Bisimulation gate for recursive holon composition (TCK-00367)
 // BFT consensus (Chained HotStuff)
 // Anti-entropy and Merkle tree (TCK-00191)
 pub use anti_entropy::{
@@ -140,6 +141,12 @@ pub use fact_root::{
     CompactMultiProof, FactRootError, FactRootV1, FactRootVerificationResult, FactRootVerifier,
     MAX_BATCH_ROOTS, MAX_COMPACT_MULTIPROOF_LEAVES, MAX_COMPACT_PROOF_NODES,
     MAX_COMPACT_PROOF_STRUCTURE, ProofPathEntry, build_compact_multiproof, compute_qc_anchor_hash,
+};
+// Functorial observation law checks for admitted rewrites (TCK-00368)
+pub use functor::{
+    AdmittedRewriteCatalog, FunctorError, FunctorLawChecker, FunctorLawResult, MAX_CATALOG_RULES,
+    MAX_OBSERVATION_POINTS, MAX_PROOF_REF_LEN, MAX_RULE_ID_LEN, ProofStatus, RewriteBlockingDefect,
+    RewriteDefectKind, RewriteGateResult, RewritePromotionGate, RewriteRule,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
