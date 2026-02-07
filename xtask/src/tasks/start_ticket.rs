@@ -25,6 +25,8 @@ use crate::ticket_status::{
 use crate::util::main_worktree;
 use crate::worktree_health::{diagnose_worktree, print_health_report};
 
+const SKILLS_RUNTIME_SYNC_SCRIPT: &str = "scripts/dev/skills_runtime_sync.sh";
+
 /// Type of target specified for start-ticket command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TargetType {
@@ -317,9 +319,8 @@ pub fn run(target: Option<&str>, print_path_only: bool, force: bool) -> Result<(
             .context("Failed to create worktree with new branch")?;
     }
 
-    // Copy .claude directory to worktree
-    copy_claude_directory(&main_worktree_path, &worktree_path)?;
-    println!("Copied .claude/ to worktree");
+    setup_claude_runtime(&sh, &worktree_path)?;
+    println!("Synced .claude/skills runtime");
 
     println!();
     println!("Worktree created at: {}", worktree_path.display());
@@ -331,38 +332,58 @@ pub fn run(target: Option<&str>, print_path_only: bool, force: bool) -> Result<(
     Ok(())
 }
 
-/// Copy `.claude` directory from main worktree to the new worktree.
+/// Ensures the worktree has a `.claude` runtime directory.
 ///
-/// This ensures Claude Code skills and configuration are available in
-/// ticket worktrees. Silently skips if source `.claude` doesn't exist.
-fn copy_claude_directory(main_worktree: &Path, worktree_path: &Path) -> Result<()> {
-    let source = main_worktree.join(".claude");
-    let dest = worktree_path.join(".claude");
+/// The directory is used to host the `.claude/skills` symlink managed by
+/// `skills_runtime_sync.sh`.
+fn ensure_claude_directory(worktree_path: &Path) -> Result<PathBuf> {
+    let claude_dir = worktree_path.join(".claude");
 
-    if !source.exists() {
-        return Ok(());
+    if claude_dir.exists() && !claude_dir.is_dir() {
+        bail!(
+            "Cannot set up Claude runtime: {} exists but is not a directory",
+            claude_dir.display()
+        );
     }
 
-    copy_dir_recursive(&source, &dest).context("Failed to copy .claude directory to worktree")?;
+    fs::create_dir_all(&claude_dir).with_context(|| {
+        format!(
+            "Failed to create .claude directory in worktree: {}",
+            claude_dir.display()
+        )
+    })?;
 
-    Ok(())
+    Ok(claude_dir)
 }
 
-/// Recursively copy a directory and its contents.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
+/// Returns the expected path to the skills runtime sync script in a worktree.
+#[must_use]
+fn skills_runtime_sync_script_path(worktree_path: &Path) -> PathBuf {
+    worktree_path.join(SKILLS_RUNTIME_SYNC_SCRIPT)
+}
 
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
+/// Materializes per-worktree runtime skills and wires `.claude/skills`.
+///
+/// This delegates to `scripts/dev/skills_runtime_sync.sh` so all worktrees use
+/// a single source of truth (`documents/skills`) with isolated runtime paths.
+fn setup_claude_runtime(sh: &Shell, worktree_path: &Path) -> Result<()> {
+    ensure_claude_directory(worktree_path)?;
 
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            fs::copy(&src_path, &dst_path)?;
-        }
+    let script_path = skills_runtime_sync_script_path(worktree_path);
+    if !script_path.is_file() {
+        bail!(
+            "Skills runtime sync script not found at {}",
+            script_path.display()
+        );
     }
+
+    let _cwd = sh.push_dir(worktree_path);
+    cmd!(sh, "bash {script_path} sync").run().with_context(|| {
+        format!(
+            "Failed to set up skills runtime in worktree: {}",
+            worktree_path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -577,6 +598,8 @@ fn print_context(main_worktree: &Path, ticket: &TicketInfo) {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -740,5 +763,39 @@ ticket_meta:
             parse_target(Some("TCK-001")),
             TargetType::Rfc("TCK-001".to_string())
         );
+    }
+
+    #[test]
+    fn test_skills_runtime_sync_script_path() {
+        let worktree_path = Path::new("/tmp/apm2-TCK-00404");
+        let script_path = skills_runtime_sync_script_path(worktree_path);
+
+        assert_eq!(
+            script_path,
+            PathBuf::from("/tmp/apm2-TCK-00404/scripts/dev/skills_runtime_sync.sh")
+        );
+    }
+
+    #[test]
+    fn test_ensure_claude_directory_idempotent() {
+        let dir = tempdir().expect("tempdir");
+        let worktree_path = dir.path();
+
+        let first = ensure_claude_directory(worktree_path).expect("first setup succeeds");
+        let second = ensure_claude_directory(worktree_path).expect("second setup succeeds");
+
+        assert_eq!(first, worktree_path.join(".claude"));
+        assert_eq!(second, worktree_path.join(".claude"));
+        assert!(first.is_dir());
+    }
+
+    #[test]
+    fn test_ensure_claude_directory_fails_when_path_is_file() {
+        let dir = tempdir().expect("tempdir");
+        let claude_path = dir.path().join(".claude");
+        std::fs::write(&claude_path, "not-a-directory").expect("write file");
+
+        let result = ensure_claude_directory(dir.path());
+        assert!(result.is_err());
     }
 }

@@ -728,6 +728,21 @@
       "APM2_DATA_DIR": "Data directory for ledger and CAS. Used by fac commands when --ledger-path / --cas-path not specified."
     },
 
+    "developer_environment": {
+      "nix_dev_shell": {
+        "enter": "nix develop",
+        "update_lockfile": "nix --extra-experimental-features 'nix-command flakes' flake lock"
+      },
+      "skills_runtime_sync": {
+        "source_of_truth": "documents/skills/",
+        "sync_command": "scripts/dev/skills_runtime_sync.sh sync",
+        "check_command": "scripts/dev/skills_runtime_sync.sh --check",
+        "global_runtime_path_pattern": "${XDG_STATE_HOME:-$HOME/.local/state}/apm2/skills/<repo_id>/<worktree_id>",
+        "worktree_layout": ".claude/skills -> ${XDG_STATE_HOME:-$HOME/.local/state}/apm2/skills/<repo_id>/<worktree_id>",
+        "migration_note": "Legacy .claude/sync-skills.sh is retired. Use scripts/dev/skills_runtime_sync.sh."
+      }
+    },
+
     "security_notes": {
       "session_tokens": "Always use APM2_SESSION_TOKEN environment variable instead of --session-token CLI flag. CLI arguments are visible in process listings on multi-user systems (CWE-214).",
       "operator_socket": "Mode 0600. Only the daemon owner can send operator commands (spawn, capability issue, kill).",
