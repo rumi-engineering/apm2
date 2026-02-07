@@ -13,13 +13,14 @@
 //! - Relative paths in workspace context are rejected if absolute
 //! - Workspace root itself is validated (no sensitive system directories)
 //!
-//! # Symlink Detection (Runtime Concern)
+//! # Symlink Detection (Deferred to TCK-00375)
 //!
 //! This module defines the [`WorkspaceConfinementError::SymlinkDetected`]
-//! error variant for use by runtime callers that perform filesystem I/O.
-//! Symlink detection requires `symlink_metadata()` calls (per CTR-1503)
-//! and is implemented at the daemon/runtime layer where actual filesystem
-//! access occurs. This module provides only lexical path validation.
+//! error variant for use by future runtime callers that perform filesystem
+//! I/O. Symlink-safe runtime path resolution (using `symlink_metadata()`
+//! calls per CTR-1503 and filesystem-level TOCTOU checks) is **deferred to
+//! TCK-00375**. This module currently provides only lexical path validation;
+//! it does NOT perform runtime symlink detection.
 //!
 //! # Example
 //!
@@ -31,13 +32,12 @@
 //! let confinement = WorkspaceConfinement::new("/home/agent/workspace");
 //! assert!(confinement.validate().is_ok());
 //!
-//! // Valid relative path within workspace
-//! assert!(validate_workspace_path(Path::new("src/main.rs"), Path::new("/workspace")).is_ok());
+//! // Valid relative path within workspace (root enforced via WorkspaceConfinement)
+//! let ws = WorkspaceConfinement::new("/workspace");
+//! assert!(validate_workspace_path(Path::new("src/main.rs"), &ws).is_ok());
 //!
 //! // Path traversal attempt → rejected
-//! assert!(
-//!     validate_workspace_path(Path::new("../../../etc/passwd"), Path::new("/workspace")).is_err()
-//! );
+//! assert!(validate_workspace_path(Path::new("../../../etc/passwd"), &ws).is_err());
 //! ```
 
 use std::path::{Component, Path, PathBuf};
@@ -246,7 +246,7 @@ impl WorkspaceConfinement {
     ///
     /// Returns [`WorkspaceConfinementError`] if the path escapes.
     pub fn contains(&self, path: &Path) -> Result<PathBuf, WorkspaceConfinementError> {
-        validate_workspace_path(path, &self.root)
+        validate_workspace_path(path, self)
     }
 }
 
@@ -265,15 +265,19 @@ impl WorkspaceConfinement {
 /// # Arguments
 ///
 /// * `path` - The path to validate (should be relative)
-/// * `workspace_root` - The absolute workspace root
+/// * `confinement` - A validated [`WorkspaceConfinement`] whose root has
+///   already passed structural checks (absolute, no blocked prefixes, no
+///   `..`/`.` components). Accepting `&WorkspaceConfinement` instead of a bare
+///   `&Path` ensures callers cannot pass an arbitrary, unvalidated root.
 ///
 /// # Errors
 ///
 /// Returns [`WorkspaceConfinementError`] if the path is unsafe.
 pub fn validate_workspace_path(
     path: &Path,
-    workspace_root: &Path,
+    confinement: &WorkspaceConfinement,
 ) -> Result<PathBuf, WorkspaceConfinementError> {
+    let workspace_root = confinement.root();
     let path_str = path.to_string_lossy();
 
     // Reject paths that are too long
@@ -441,22 +445,22 @@ mod tests {
 
     #[test]
     fn test_valid_relative_path() {
-        let root = Path::new("/workspace");
-        let result = validate_workspace_path(Path::new("src/main.rs"), root);
+        let ws = WorkspaceConfinement::new("/workspace");
+        let result = validate_workspace_path(Path::new("src/main.rs"), &ws);
         assert_eq!(result.unwrap(), PathBuf::from("/workspace/src/main.rs"));
     }
 
     #[test]
     fn test_path_with_dot() {
-        let root = Path::new("/workspace");
-        let result = validate_workspace_path(Path::new("./src/main.rs"), root);
+        let ws = WorkspaceConfinement::new("/workspace");
+        let result = validate_workspace_path(Path::new("./src/main.rs"), &ws);
         assert_eq!(result.unwrap(), PathBuf::from("/workspace/src/main.rs"));
     }
 
     #[test]
     fn test_path_traversal_dotdot() {
-        let root = Path::new("/workspace");
-        let result = validate_workspace_path(Path::new("../../../etc/passwd"), root);
+        let ws = WorkspaceConfinement::new("/workspace");
+        let result = validate_workspace_path(Path::new("../../../etc/passwd"), &ws);
         assert!(matches!(
             result,
             Err(WorkspaceConfinementError::PathTraversal { .. })
@@ -465,8 +469,8 @@ mod tests {
 
     #[test]
     fn test_path_traversal_embedded_dotdot() {
-        let root = Path::new("/workspace");
-        let result = validate_workspace_path(Path::new("src/../../etc/passwd"), root);
+        let ws = WorkspaceConfinement::new("/workspace");
+        let result = validate_workspace_path(Path::new("src/../../etc/passwd"), &ws);
         assert!(matches!(
             result,
             Err(WorkspaceConfinementError::PathTraversal { .. })
@@ -475,8 +479,8 @@ mod tests {
 
     #[test]
     fn test_absolute_path_rejected() {
-        let root = Path::new("/workspace");
-        let result = validate_workspace_path(Path::new("/etc/passwd"), root);
+        let ws = WorkspaceConfinement::new("/workspace");
+        let result = validate_workspace_path(Path::new("/etc/passwd"), &ws);
         assert!(matches!(
             result,
             Err(WorkspaceConfinementError::AbsolutePath { .. })
@@ -485,12 +489,12 @@ mod tests {
 
     #[test]
     fn test_path_too_deep() {
-        let root = Path::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace");
         let deep_path: String = (0..=MAX_WORKSPACE_PATH_DEPTH)
             .map(|i| format!("d{i}"))
             .collect::<Vec<_>>()
             .join("/");
-        let result = validate_workspace_path(Path::new(&deep_path), root);
+        let result = validate_workspace_path(Path::new(&deep_path), &ws);
         assert!(matches!(
             result,
             Err(WorkspaceConfinementError::PathTooDeep { .. })
@@ -499,12 +503,12 @@ mod tests {
 
     #[test]
     fn test_path_exactly_at_max_depth() {
-        let root = Path::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace");
         let path: String = (0..MAX_WORKSPACE_PATH_DEPTH)
             .map(|i| format!("d{i}"))
             .collect::<Vec<_>>()
             .join("/");
-        let result = validate_workspace_path(Path::new(&path), root);
+        let result = validate_workspace_path(Path::new(&path), &ws);
         assert!(result.is_ok());
     }
 
@@ -514,26 +518,26 @@ mod tests {
 
     #[test]
     fn test_adversarial_dotdot_at_start() {
-        let root = Path::new("/workspace");
-        assert!(validate_workspace_path(Path::new(".."), root).is_err());
+        let ws = WorkspaceConfinement::new("/workspace");
+        assert!(validate_workspace_path(Path::new(".."), &ws).is_err());
     }
 
     #[test]
     fn test_adversarial_multiple_dotdots() {
-        let root = Path::new("/workspace");
-        assert!(validate_workspace_path(Path::new("../../.."), root).is_err());
+        let ws = WorkspaceConfinement::new("/workspace");
+        assert!(validate_workspace_path(Path::new("../../.."), &ws).is_err());
     }
 
     #[test]
     fn test_adversarial_dotdot_after_normal() {
-        let root = Path::new("/workspace");
-        assert!(validate_workspace_path(Path::new("a/b/../../.."), root).is_err());
+        let ws = WorkspaceConfinement::new("/workspace");
+        assert!(validate_workspace_path(Path::new("a/b/../../.."), &ws).is_err());
     }
 
     #[test]
     fn test_adversarial_dotdot_to_etc() {
-        let root = Path::new("/workspace");
-        assert!(validate_workspace_path(Path::new("../../../etc/shadow"), root).is_err());
+        let ws = WorkspaceConfinement::new("/workspace");
+        assert!(validate_workspace_path(Path::new("../../../etc/shadow"), &ws).is_err());
     }
 
     #[test]
@@ -541,18 +545,18 @@ mod tests {
         // On Unix, Path::new handles actual OS paths, not URL-encoded strings.
         // The OS will see these as literal filenames, not traversal.
         // But we verify the component check still works for real ".." components.
-        let root = Path::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace");
         // Mix of ".." and normal
-        assert!(validate_workspace_path(Path::new("foo/../../../bar"), root).is_err());
+        assert!(validate_workspace_path(Path::new("foo/../../../bar"), &ws).is_err());
     }
 
     #[test]
     fn test_adversarial_null_byte_in_path() {
         // Paths with null bytes are invalid on Unix, but we test that our
         // validation doesn't panic
-        let root = Path::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace");
         // std::path::Path will handle this as a normal segment
-        let result = validate_workspace_path(Path::new("safe_file.txt"), root);
+        let result = validate_workspace_path(Path::new("safe_file.txt"), &ws);
         assert!(result.is_ok());
     }
 

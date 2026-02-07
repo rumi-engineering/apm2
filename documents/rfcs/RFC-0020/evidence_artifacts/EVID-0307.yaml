@@ -5,9 +5,13 @@ evidence_artifact:
   category: "UNIT_TEST_RESULT"
   status: "PASS"
   description: |
-    Evidence that workspace confinement prevents path traversal, symlink escape,
-    and unsafe workspace root configuration. Adversarial tests verify defense
-    against known attack patterns per RFC-0020 Section 4.3 and CTR-1504.
+    Evidence that workspace confinement prevents lexical path traversal and
+    unsafe workspace root configuration. Tests verify defense against known
+    attack patterns per RFC-0020 Section 4.3 and CTR-1504.
+
+    This evidence covers lexical path validation only. Symlink-safe runtime
+    path resolution (filesystem-level TOCTOU checks via symlink_metadata)
+    is deferred to TCK-00375 which implements the context firewall.
   requirement_ids:
     - "REQ-0028"
   source_refs:
@@ -16,7 +20,7 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Workspace confinement tests (25 tests):
+        Workspace confinement tests (35 tests):
         Workspace root validation:
         - test_valid_workspace_root: /home/agent/workspace accepted
         - test_empty_workspace_root: empty root rejected
@@ -43,6 +47,18 @@ evidence_artifact:
         - test_absolute_within_root_ok: /workspace/src/main.rs within /workspace
         - test_absolute_outside_root_rejected: /etc/passwd outside /workspace
         - test_absolute_sibling_rejected: /workspace/project-b outside /workspace/project-a
+        - test_absolute_escape_via_parent_dir: /workspace/../etc/passwd rejected
+        - test_absolute_escape_via_double_parent_dir: /workspace/./../../etc/passwd rejected
+        - test_absolute_escape_via_nested_parent_dir: /workspace/subdir/../../etc/shadow rejected
+        - test_absolute_curdir_stripped_by_components: CurDir stripped by Rust for absolute paths
+        - test_absolute_clean_path_within_root_ok: normalized absolute path passes
+        - test_absolute_root_exact_ok: workspace root path itself passes
+        Workspace root ParentDir bypass regression:
+        - test_workspace_root_rejects_parent_dir_bypass_to_etc: /tmp/../etc rejected
+        - test_workspace_root_rejects_deep_parent_dir_bypass: /workspace/../../var rejected
+        - test_workspace_root_rejects_triple_parent_dir_bypass: /home/./user/../../../etc rejected
+        - test_workspace_root_rejects_curdir_component: path with . and .. rejected
+        - test_workspace_root_clean_path_still_works: clean path still accepted
         Contains() integration:
         - test_contains_valid_path: WorkspaceConfinement.contains() resolves correctly
         - test_contains_traversal_rejected: WorkspaceConfinement.contains() blocks traversal

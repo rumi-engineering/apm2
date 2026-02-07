@@ -786,16 +786,6 @@ impl CapsuleProfileBuilder {
         self
     }
 
-    /// Sets the workspace confinement (convenience, does not store—profile
-    /// references workspace root via episode envelope).
-    #[must_use]
-    pub fn workspace(self, _confinement: super::WorkspaceConfinement) -> Self {
-        // Workspace confinement is enforced at runtime via bind mount,
-        // not stored in the profile directly. This method exists for
-        // builder ergonomics.
-        self
-    }
-
     /// Adds an allowed executable path.
     #[must_use]
     pub fn add_executable(mut self, path: impl Into<String>) -> Self {

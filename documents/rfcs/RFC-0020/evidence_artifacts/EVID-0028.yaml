@@ -5,9 +5,16 @@ evidence_artifact:
   category: "UNIT_TEST_RESULT"
   status: "PASS"
   description: |
-    Evidence that capsule profile linux-ns-v1 enforces no-ambient-authority
-    containment per REQ-0028. Tests verify:
+    Evidence that capsule profile linux-ns-v1 policy types, validation logic,
+    and admission gate correctly enforce no-ambient-authority containment rules
+    per REQ-0028. This evidence covers module-level policy logic, type
+    definitions, and unit test coverage. Runtime wiring into daemon actuation
+    paths is deferred to TCK-00375 (context firewall) and TCK-00376
+    (no-bypass path ratchet).
+
+    Tests verify:
     - Tier3+ actuation is rejected without an admitted capsule profile
+      (unit-level gate logic only; runtime wiring deferred to TCK-00375)
     - Tier0-Tier2 actuation permits absent capsule (optional)
     - Tampered profile hash causes admission rejection
     - Deny-by-default egress blocks all unlisted routes
@@ -29,7 +36,7 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Profile and admission gate tests (41 tests):
+        Profile and admission gate tests (44 tests):
         - test_build_linux_ns_v1_defaults: validates default profile meets all requirements
         - test_build_with_egress_routes: explicit route grants work correctly
         - test_build_missing_profile_id: missing field rejected
