@@ -22,13 +22,14 @@ evidence_artifact:
     - type: "test_output"
       description: |
         Regression and integration tests relevant to stop/budget/governance:
-        - state::tests::production_wiring_transitional_governance_uncertainty_denies_until_success
-        - state::tests::production_wiring_periodic_probe_clears_governance_uncertainty_in_transitional_mode
-        - state::tests::production_wiring_claim_work_success_clears_transitional_uncertainty
-        - state::tests::production_wiring_transitional_probe_lifecycle_enforces_uncertainty_deadline
+        - state::tests::production_wiring_transitional_governance_uncertain_allows_gate
+        - state::tests::production_wiring_periodic_probe_keeps_governance_uncertainty_in_transitional_mode
+        - state::tests::production_wiring_claim_work_success_does_not_clear_transitional_uncertainty
         - state::tests::non_transitional_governance_failure_denies_after_deadline
         - state::tests::update_stop_flags_emergency_stop_denies_subsequent_request_tool
         - state::tests::spawn_default_max_episodes_allows_first_request_tool_gate
+        - episode::preactuation::tests::test_gate_uncertain_transitional_mode_allows_past_deadline
+        - episode::preactuation::tests::test_gate_uncertain_transitional_mode_waiver_currently_active
         - episode::preactuation::tests::test_replay_budget_not_checked_allowed_when_deferred
         - episode::preactuation::tests::test_replay_budget_not_checked_without_deferred_fails
         - episode::preactuation::tests::test_replay_equal_wall_higher_logical_allows

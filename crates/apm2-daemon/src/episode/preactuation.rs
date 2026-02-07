@@ -53,6 +53,22 @@ pub const MAX_REPLAY_ENTRIES: usize = 100_000;
 /// the episode started, actuation is denied (fail-closed).
 pub const DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS: u64 = 30_000;
 
+/// WVR-0001 expiry for transitional governance bypass.
+///
+/// After this epoch second (UTC), transitional governance uncertainty MUST
+/// deny.
+pub(crate) const WVR_0001_EXPIRY_EPOCH_SECS: u64 = 1_775_520_000;
+
+/// Returns whether WVR-0001 transitional bypass is currently active.
+#[must_use]
+pub(crate) fn transitional_waiver_active() -> bool {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now_secs < WVR_0001_EXPIRY_EPOCH_SECS
+}
+
 // =============================================================================
 // StopAuthority
 // =============================================================================
@@ -100,8 +116,9 @@ pub struct StopAuthority {
     /// local resolver rather than authenticated external transport.
     ///
     /// When `true`, governance freshness evidence is not authoritative and the
-    /// pre-actuation gate applies the documented transitional carve-out: it
-    /// logs uncertainty but does not enforce `stop_uncertainty_deadline`.
+    /// pre-actuation gate applies the WVR-0001 transitional carve-out: it
+    /// logs uncertainty but does not enforce `stop_uncertainty_deadline` while
+    /// the waiver is active (expires 2026-04-07).
     governance_transitional_resolver: AtomicBool,
 }
 
@@ -731,16 +748,18 @@ impl PreActuationGate {
     ) -> Result<PreActuationReceipt, PreActuationDenial> {
         // TCK-00351 BLOCKER 1 FIX: Read from authoritative stop state
         // when available, instead of trusting caller-supplied values.
-        let (emer_stop, gov_stop, gov_uncertain) = self.stop_authority.as_ref().map_or(
-            (emergency_stop_active, governance_stop_active, false),
-            |authority| {
-                (
-                    authority.emergency_stop_active(),
-                    authority.governance_stop_active(),
-                    authority.governance_uncertain(),
-                )
-            },
-        );
+        let (emer_stop, gov_stop, gov_uncertain, gov_transitional_resolver) =
+            self.stop_authority.as_ref().map_or(
+                (emergency_stop_active, governance_stop_active, false, false),
+                |authority| {
+                    (
+                        authority.emergency_stop_active(),
+                        authority.governance_stop_active(),
+                        authority.governance_uncertain(),
+                        authority.governance_transitional_resolver(),
+                    )
+                },
+            );
 
         // --- Step 1: Evaluate stop conditions ---
         // TCK-00351 MAJOR 1 v2 FIX: Use evaluate_with_uncertainty so
@@ -758,13 +777,22 @@ impl PreActuationGate {
                 return Err(PreActuationDenial::StopActive { class });
             },
             StopStatus::Uncertain => {
-                if elapsed_ms >= self.evaluator.uncertainty_deadline_ms() {
-                    // Fail-closed: if uncertainty deadline has elapsed, deny.
+                if gov_transitional_resolver {
+                    // WVR-0001: Time-bounded transitional governance bypass.
+                    if !transitional_waiver_active() {
+                        return Err(PreActuationDenial::StopUncertain);
+                    }
+                    tracing::warn!(
+                        elapsed_ms,
+                        uncertainty_deadline_ms = self.evaluator.uncertainty_deadline_ms(),
+                        waiver = "WVR-0001",
+                        waiver_expires = "2026-04-07",
+                        "governance uncertainty observed under transitional resolver; \
+                         stop_uncertainty_deadline not enforced (WVR-0001 active)"
+                    );
+                } else if elapsed_ms >= self.evaluator.uncertainty_deadline_ms() {
                     return Err(PreActuationDenial::StopUncertain);
                 }
-                // Within deadline: allow through (optimistic).
-                // If the status becomes Active later, a future check will
-                // deny.
             },
             StopStatus::Clear => {
                 // No stop condition; proceed.
@@ -790,6 +818,11 @@ impl PreActuationGate {
         }
         let budget_checked = has_real_tracker;
         let budget_enforcement_deferred = !budget_checked;
+        if budget_enforcement_deferred {
+            tracing::debug!(
+                "pre-actuation budget enforcement deferred; budget proof delegated to episode runtime"
+            );
+        }
 
         Ok(PreActuationReceipt {
             stop_checked,
@@ -1034,6 +1067,15 @@ impl std::error::Error for ReplayViolation {}
 /// 4. Budget proof must be explicit: either `budget_checked=true` OR
 ///    `budget_enforcement_deferred=true`.
 ///
+/// # Phase-1 Budget Constraint
+///
+/// In Phase 1 wiring, production constructors may use
+/// [`BudgetTracker::deferred`](crate::episode::budget_tracker::BudgetTracker::deferred),
+/// which yields `budget_checked=false` and
+/// `budget_enforcement_deferred=true`. This verifier accepts that tuple
+/// explicitly until real pre-actuation budget tracking is wired under
+/// TCK-00346.
+///
 /// # `DoS` Protection
 ///
 /// The trace size is bounded by [`MAX_REPLAY_ENTRIES`].
@@ -1077,6 +1119,9 @@ impl ReplayVerifier {
                     if !stop_checked {
                         return Err(ReplayViolation::StopNotChecked { index: i });
                     }
+                    // Phase-1: deferred budget enforcement is an accepted
+                    // proof state while real pre-actuation tracker wiring is
+                    // pending (TCK-00346).
                     if !budget_checked && !budget_enforcement_deferred {
                         return Err(ReplayViolation::BudgetNotChecked { index: i });
                     }
@@ -1227,6 +1272,7 @@ mod tests {
         // TCK-00351 v3: budget_checked is false when no tracker is wired
         // (honest receipt -- no tracker means no real budget check occurred).
         assert!(!receipt.budget_checked);
+        assert!(receipt.budget_enforcement_deferred);
         assert_eq!(receipt.timestamp_ns, 1000);
         // is_cleared() requires both stop_checked AND budget_checked, so
         // without a tracker the receipt is not fully cleared.
@@ -1327,6 +1373,7 @@ mod tests {
         // (no tracker wired).
         assert!(receipt.stop_checked);
         assert!(!receipt.budget_checked);
+        assert!(receipt.budget_enforcement_deferred);
     }
 
     // =========================================================================
@@ -1894,6 +1941,7 @@ mod tests {
         // (no tracker wired -- honest receipt).
         assert!(receipt.stop_checked);
         assert!(!receipt.budget_checked);
+        assert!(receipt.budget_enforcement_deferred);
     }
 
     #[test]
@@ -1969,6 +2017,7 @@ mod tests {
         assert!(receipt.stop_checked);
         // TCK-00351 v3: budget_checked is false without a real tracker.
         assert!(!receipt.budget_checked);
+        assert!(receipt.budget_enforcement_deferred);
         assert_eq!(receipt.timestamp_ns, 42_000);
     }
 
@@ -2080,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gate_uncertain_transitional_mode_denies_past_deadline() {
+    fn test_gate_uncertain_transitional_mode_allows_past_deadline() {
         let authority = Arc::new(StopAuthority::new());
         authority.set_governance_uncertain(true);
         authority.set_governance_transitional_resolver(true);
@@ -2092,11 +2141,22 @@ mod tests {
 
         let conditions = StopConditions::default();
         let result = gate.check(&conditions, 0, false, false, deadline_ms, 2000);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            PreActuationDenial::StopUncertain => {},
-            other => panic!("expected StopUncertain, got: {other}"),
-        }
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_gate_uncertain_transitional_mode_waiver_currently_active() {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Intentional expiry tripwire: this test starts failing on or after
+        // 2026-04-07 to force waiver renewal/replacement.
+        assert!(
+            now_secs < WVR_0001_EXPIRY_EPOCH_SECS,
+            "WVR-0001 has expired; transitional bypass must be renewed/replaced"
+        );
+        assert!(transitional_waiver_active());
     }
 
     // =========================================================================

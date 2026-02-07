@@ -399,9 +399,12 @@ impl GovernanceFreshnessMonitor {
     /// healthy (e.g., after a successful policy resolution response).
     pub fn record_success(&self) {
         if self.transitional_resolver {
-            tracing::info!(
-                "Governance freshness evidence sourced from transitional local resolver"
+            warn!(
+                "Governance freshness success observed under transitional local resolver; \
+                 not treated as freshness evidence"
             );
+            self.stop_authority.set_governance_uncertain(true);
+            return;
         }
 
         *self
@@ -432,6 +435,11 @@ impl GovernanceFreshnessMonitor {
     ///
     /// Returns `true` if governance is considered fresh, `false` if stale.
     pub fn check_freshness(&self) -> bool {
+        if self.transitional_resolver {
+            self.stop_authority.set_governance_uncertain(true);
+            return false;
+        }
+
         let last_success = *self
             .last_success
             .lock()
