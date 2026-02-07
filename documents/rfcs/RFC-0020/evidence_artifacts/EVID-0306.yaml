@@ -9,17 +9,20 @@ evidence_artifact:
     properties of AuthoritySealV1:
 
     1. Domain separation correctness: preimage construction includes seal kind
-       tag, subject kind string, subject hash, and ledger anchor canonical
-       bytes, all prefixed with the authority seal domain separator. Tests
-       confirm that varying any single field produces a distinct preimage,
-       preventing cross-protocol confusion attacks per RFC-0020 section 1.7.8.
+       tag, issuer cell ID, issuer identity bytes (public key ID or keyset ID),
+       subject kind string, subject hash, and ledger anchor canonical bytes,
+       all prefixed with the authority seal domain separator. Tests confirm
+       that varying any single field — including issuer_cell_id and issuer_id —
+       produces a distinct preimage, preventing cross-protocol confusion
+       attacks and metadata substitution per RFC-0020 section 1.7.8.
 
     2. Unsigned/free-floating batch root rejection: MerkleBatch seal
        construction rejects empty signature vectors, ensuring that batch
        roots cannot enter the verification pipeline without at least one
-       cryptographic attestation. The reject_free_floating_batch_root
-       function provides explicit API-level enforcement of RFC-0020
-       section 0.1(11b).
+       cryptographic attestation. Free-floating batch root rejection is
+       enforced at construction time (empty signature vectors are rejected
+       by AuthoritySealV1::new). The reject_free_floating_batch_root helper
+       provides a named assertion point for integration code.
 
     Receipt leaf hashing uses a separate domain separator
     ("apm2:receipt_leaf:v1\0") per section 9.5.2, verified to produce
@@ -32,17 +35,23 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Domain separation preimage uniqueness across all three varying axes:
+        Domain separation preimage uniqueness across all varying axes:
         - domain_separated_preimage_differs_by_subject_kind: same hash/anchor,
           different artifact kind produces different preimage
         - domain_separated_preimage_differs_by_seal_kind: QuorumMultisig vs
           QuorumThreshold on same inputs produce different preimages
         - domain_separated_preimage_differs_by_ledger_anchor: same seal/subject,
           different consensus index produces different preimage
+        - test_preimage_changes_with_different_issuer_cell_id: different cell_id
+          produces different preimage
+        - test_preimage_changes_with_different_issuer_id: different issuer key
+          produces different preimage
       ref:
         - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_subject_kind"
         - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_seal_kind"
         - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_ledger_anchor"
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_preimage_changes_with_different_issuer_cell_id"
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_preimage_changes_with_different_issuer_id"
     - type: "test_output"
       description: |
         Receipt leaf hash domain separation (section 9.5.2):

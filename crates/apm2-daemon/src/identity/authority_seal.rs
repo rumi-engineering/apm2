@@ -569,6 +569,8 @@ impl AuthoritySealV1 {
     /// The layout is:
     /// ```text
     /// seal_kind_tag (1 byte)
+    /// + issuer_cell_id_binary (33 bytes)
+    /// + issuer_id_bytes (33 bytes — pkid or keyset_id binary)
     /// + subject_kind_len (4 bytes LE)
     /// + subject_kind_bytes
     /// + subject_hash (32 bytes)
@@ -581,9 +583,15 @@ impl AuthoritySealV1 {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let kind_bytes = self.subject_kind.as_str().as_bytes();
         let anchor_bytes = self.ledger_anchor.canonical_bytes();
+        let issuer_id_bytes = match &self.issuer_id {
+            IssuerId::PublicKey(pkid) => pkid.to_binary(),
+            IssuerId::Quorum(keyset_id) => keyset_id.to_binary(),
+        };
 
         let mut out = Vec::with_capacity(
-            1 + 4
+            1 + 33
+                + 33
+                + 4
                 + kind_bytes.len()
                 + 32
                 + anchor_bytes.len()
@@ -593,6 +601,8 @@ impl AuthoritySealV1 {
         );
 
         out.push(self.seal_kind.tag());
+        out.extend_from_slice(self.issuer_cell_id.as_bytes());
+        out.extend_from_slice(&issuer_id_bytes);
 
         #[allow(clippy::cast_possible_truncation)]
         let kind_len = kind_bytes.len() as u32;
@@ -623,6 +633,8 @@ impl AuthoritySealV1 {
     /// ```text
     /// blake3("apm2:authority_seal:v1\0"
     ///     + seal_kind_tag (1 byte)
+    ///     + issuer_cell_id_binary (33 bytes)
+    ///     + issuer_id_bytes (33 bytes — pkid or keyset_id binary)
     ///     + subject_kind_len (4 bytes LE)
     ///     + subject_kind_bytes
     ///     + subject_hash (32 bytes)
@@ -635,6 +647,12 @@ impl AuthoritySealV1 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(AUTHORITY_SEAL_DOMAIN_SEPARATOR);
         hasher.update(&[self.seal_kind.tag()]);
+        // Bind issuer identity metadata to the cryptographic proof.
+        hasher.update(self.issuer_cell_id.as_bytes());
+        match &self.issuer_id {
+            IssuerId::PublicKey(pkid) => hasher.update(&pkid.to_binary()),
+            IssuerId::Quorum(keyset_id) => hasher.update(&keyset_id.to_binary()),
+        };
         let kind_bytes = self.subject_kind.as_str().as_bytes();
         #[allow(clippy::cast_possible_truncation)]
         // subject_kind is bounded by MAX_SUBJECT_KIND_LEN (256)
@@ -804,6 +822,15 @@ impl AuthoritySealV1 {
 
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
+
+        // Reject extra signatures that would be silently ignored by zip.
+        if self.signatures.len() > verifying_keys.len() {
+            return Err(AuthoritySealError::InvalidQuorumSignatureCount {
+                count: self.signatures.len(),
+                min: MIN_QUORUM_SIGNATURES,
+                max: verifying_keys.len(),
+            });
+        }
 
         if threshold == 0 || threshold > verifying_keys.len() {
             return Err(AuthoritySealError::ThresholdNotMet {
@@ -1044,6 +1071,15 @@ impl AuthoritySealV1 {
         self.check_expected_subject(expected_subject_kind, expected_subject_hash)?;
         self.check_temporal_authority(require_temporal)?;
 
+        // Reject extra signatures that would be silently ignored by zip.
+        if self.signatures.len() > verifying_keys.len() {
+            return Err(AuthoritySealError::InvalidQuorumSignatureCount {
+                count: self.signatures.len(),
+                min: MIN_QUORUM_SIGNATURES,
+                max: verifying_keys.len(),
+            });
+        }
+
         if threshold == 0 || threshold > verifying_keys.len() {
             return Err(AuthoritySealError::ThresholdNotMet {
                 valid_sigs: 0,
@@ -1092,35 +1128,29 @@ impl AuthoritySealV1 {
     }
 }
 
-/// Validate that a seal is NOT a free-floating batch root.
+/// Named assertion point for free-floating batch root rejection.
 ///
 /// Per RFC-0020 §0.1(11b), batch roots MUST be ledger-anchored facts,
-/// not free-floating signatures. This function validates that a
-/// `MERKLE_BATCH` seal has a proper ledger anchor binding.
-///
-/// For non-batch seals, this is a no-op (they already require anchors
-/// via construction).
+/// not free-floating signatures.
 ///
 /// # Design Note
 ///
-/// `AuthoritySealV1::new()` already enforces that a `ledger_anchor` is
-/// present for all seal kinds at construction time. This function exists
-/// as an explicit semantic assertion at call sites where the §0.1(11b)
-/// invariant is safety-critical. Enforcement is construction-time and
-/// type-level (the `ledger_anchor` field is required and non-optional),
-/// so this function serves as a lightweight defense-in-depth marker
-/// rather than a runtime assertion.
+/// Free-floating batch root rejection is enforced at construction time:
+/// empty signature vectors are rejected by `AuthoritySealV1::new()`, and
+/// the `ledger_anchor` field is required and non-optional. This function
+/// provides a named assertion point for integration code to emphasize the
+/// §0.1(11b) invariant at call sites where the property is safety-critical.
+/// It does NOT perform additional runtime checks beyond what construction
+/// already guarantees.
 pub const fn reject_free_floating_batch_root(
     seal: &AuthoritySealV1,
 ) -> Result<(), AuthoritySealError> {
-    // Construction already enforces ledger_anchor is present for all seal
-    // kinds, but this function provides an explicit semantic check for
-    // the batch root case that callers can use to emphasize the §0.1(11b)
-    // invariant.
+    // Construction already enforces:
+    // 1. ledger_anchor is present for all seal kinds (required field).
+    // 2. Empty signature vectors are rejected for all seal kinds.
     //
-    // For MerkleBatch seals the anchor was verified at construction time
-    // via `AuthoritySealV1::new()`. Non-batch seals are trivially valid
-    // because they do not carry batch roots.
+    // This function serves as a lightweight named assertion point for
+    // call sites that need to document adherence to §0.1(11b).
     let _ = seal.seal_kind(); // read the kind for future-proof extensibility
     Ok(())
 }
@@ -2617,6 +2647,215 @@ mod tests {
                 })
             ),
             "Single-key MERKLE_BATCH must reject more than 1 signature"
+        );
+    }
+
+    // ────────── Issuer identity binding in preimage tests (BLOCKER 1) ──────────
+
+    /// Helper: create a second, different `CellIdV1`.
+    fn test_cell_id_alt() -> CellIdV1 {
+        use crate::identity::CellGenesisV1;
+        use crate::identity::cell_id::PolicyRootId;
+        let genesis_hash = [0xCC; HASH_SIZE]; // different from test_cell_id
+        let policy_root_key = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xDD; 32]);
+        let policy_root = PolicyRootId::Single(policy_root_key);
+        let genesis = CellGenesisV1::new(genesis_hash, policy_root, "alt.local").unwrap();
+        CellIdV1::from_genesis(&genesis)
+    }
+
+    /// Same seal with different `issuer_cell_id` MUST produce a different
+    /// preimage — prevents metadata substitution/replay.
+    #[test]
+    fn test_preimage_changes_with_different_issuer_cell_id() {
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let seal_a = AuthoritySealV1::new(
+            test_cell_id(),
+            IssuerId::PublicKey(pkid.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let seal_b = AuthoritySealV1::new(
+            test_cell_id_alt(),
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        assert_ne!(
+            seal_a.domain_separated_preimage(),
+            seal_b.domain_separated_preimage(),
+            "Different issuer_cell_id values must produce different preimages"
+        );
+    }
+
+    /// Same seal with different `issuer_id` (different public key) MUST
+    /// produce a different preimage.
+    #[test]
+    fn test_preimage_changes_with_different_issuer_id() {
+        let cell_id = test_cell_id();
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        let pkid_a = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let pkid_b = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x02; 32]);
+
+        let seal_a = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::PublicKey(pkid_a),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let seal_b = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid_b),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]],
+        )
+        .unwrap();
+
+        assert_ne!(
+            seal_a.domain_separated_preimage(),
+            seal_b.domain_separated_preimage(),
+            "Different issuer_id values must produce different preimages"
+        );
+    }
+
+    // ────────── Extra signature rejection tests (MAJOR 2) ──────────
+
+    /// `verify_quorum_threshold` must reject when `signatures.len()` >
+    /// `verifying_keys.len()` -- extra signatures must not be silently ignored.
+    #[test]
+    fn verify_quorum_threshold_rejects_extra_signatures() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[member_a, member_b],
+            None,
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        // 3 signatures but only 2 keys — extra sig must be rejected.
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumThreshold,
+            vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
+        let result = seal.verify_quorum_threshold(&keys, 1, "apm2.test.v1", &subject_hash, false);
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::InvalidQuorumSignatureCount { .. })
+            ),
+            "verify_quorum_threshold must reject extra signatures"
+        );
+    }
+
+    /// `verify_merkle_batch_quorum_threshold` must reject when
+    /// `signatures.len()` > `verifying_keys.len()`.
+    #[test]
+    fn merkle_batch_quorum_threshold_rejects_extra_signatures() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[member_a, member_b],
+            None,
+        )
+        .unwrap();
+
+        let receipt_hash = [0x42; HASH_SIZE];
+        let other_receipt_hash = [0x43; HASH_SIZE];
+        let leaf0 = compute_receipt_leaf_hash(&receipt_hash);
+        let leaf1 = compute_receipt_leaf_hash(&other_receipt_hash);
+        let (batch_root, inclusion_proof) = build_merkle_tree_2(leaf0, leaf1);
+
+        let subject_kind = SubjectKind::new("apm2.receipt_batch.v1").unwrap();
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 1 };
+
+        // 3 signatures but only 2 keys.
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            batch_root,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::MerkleBatch,
+            vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let keys = [signer_a.verifying_key(), signer_b.verifying_key()];
+        let result = seal.verify_merkle_batch_quorum_threshold(
+            &keys,
+            1,
+            &receipt_hash,
+            &inclusion_proof,
+            "apm2.receipt_batch.v1",
+            &batch_root,
+            false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::InvalidQuorumSignatureCount { .. })
+            ),
+            "verify_merkle_batch_quorum_threshold must reject extra signatures"
         );
     }
 }

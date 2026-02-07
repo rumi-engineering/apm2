@@ -13,11 +13,12 @@ evidence_artifact:
     fail-closed validation of all construction and verification parameters.
 
     Domain separation: every preimage hashed for verification includes the
-    authority seal domain separator, seal kind tag, subject kind string
+    authority seal domain separator, seal kind tag, issuer cell ID, issuer
+    identity bytes (public key ID or keyset ID), subject kind string
     (artifact kind + schema version), subject hash, ledger anchor canonical
-    bytes, and time_envelope_ref. Tests confirm that different subject kinds,
-    seal kinds, ledger anchors, and time_envelope_ref values produce distinct
-    preimages.
+    bytes, and time_envelope_ref. Tests confirm that different issuer cell
+    IDs, issuer IDs, subject kinds, seal kinds, ledger anchors, and
+    time_envelope_ref values produce distinct preimages.
 
     Temporal authority binding: all seals carry a time_envelope_ref field
     (32-byte hash binding to an HTF time envelope). Verification methods
@@ -30,9 +31,16 @@ evidence_artifact:
     are rejected with SubjectKindMismatch before any cryptographic work,
     preventing cross-artifact verification confusion.
 
+    Issuer identity binding: the domain-separated preimage and canonical bytes
+    both include issuer_cell_id and issuer_id bytes, binding issuer identity
+    metadata to the cryptographic proof and preventing metadata substitution
+    or replay attacks.
+
     Ledger anchor binding: all seals require a LedgerAnchorV1 at construction
-    time. The reject_free_floating_batch_root function provides construction-
-    time and type-level enforcement of RFC-0020 section 0.1(11b).
+    time. Free-floating batch root rejection is enforced at construction time
+    (empty signature vectors are rejected by AuthoritySealV1::new). The
+    reject_free_floating_batch_root helper provides a named assertion point
+    for integration code.
 
     Quorum identifier validation: quorum/threshold seal kinds require an
     IssuerId::Quorum issuer; single-sig seals require IssuerId::PublicKey.
@@ -130,10 +138,14 @@ evidence_artifact:
         - domain_separated_preimage_differs_by_subject_kind
         - domain_separated_preimage_differs_by_seal_kind
         - domain_separated_preimage_differs_by_ledger_anchor
+        - test_preimage_changes_with_different_issuer_cell_id: different cell_id produces different preimage
+        - test_preimage_changes_with_different_issuer_id: different issuer key produces different preimage
       ref:
         - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_subject_kind"
         - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_seal_kind"
         - "cargo test -p apm2-daemon identity::authority_seal::tests::domain_separated_preimage_differs_by_ledger_anchor"
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_preimage_changes_with_different_issuer_cell_id"
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::test_preimage_changes_with_different_issuer_id"
     - type: "test_output"
       description: |
         Receipt leaf hash domain separation and determinism:
@@ -180,6 +192,14 @@ evidence_artifact:
         - merkle_batch_single_key_rejects_multiple_signatures: two sigs rejected for single-key issuer
       ref:
         - "cargo test -p apm2-daemon identity::authority_seal::tests::merkle_batch_single_key_rejects_multiple_signatures"
+    - type: "test_output"
+      description: |
+        Extra signature rejection (threshold paths):
+        - verify_quorum_threshold_rejects_extra_signatures: more sigs than keys rejected
+        - merkle_batch_quorum_threshold_rejects_extra_signatures: more sigs than keys rejected in batch path
+      ref:
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::verify_quorum_threshold_rejects_extra_signatures"
+        - "cargo test -p apm2-daemon identity::authority_seal::tests::merkle_batch_quorum_threshold_rejects_extra_signatures"
     - type: "test_output"
       description: |
         Full daemon test suite regression check.
