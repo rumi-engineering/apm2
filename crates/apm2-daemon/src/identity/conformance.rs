@@ -1,4 +1,4 @@
-//! Cross-language conformance vectors for canonical key identifiers.
+//! Cross-language conformance vectors for canonical identity identifiers.
 //!
 //! These vectors provide stable test data for verifying that canonical key
 //! identifier implementations correctly accept valid encodings and reject
@@ -19,7 +19,9 @@
 //!
 //! 1. **Valid `PublicKeyIdV1` vectors**: known-good binary + text round-trips
 //! 2. **Valid `KeySetIdV1` vectors**: known-good binary + text round-trips
-//! 3. **Invalid text vectors**: inputs that MUST be rejected by conforming
+//! 3. **Valid `CellIdV1` vectors**: known-good binary + text round-trips
+//! 4. **Valid `HolonIdV1` vectors**: known-good binary + text round-trips
+//! 5. **Invalid text vectors**: inputs that MUST be rejected by conforming
 //!    parsers
 //!
 //! # Text Form Grammar (RFC-0020 section 1.7.5b)
@@ -27,6 +29,8 @@
 //! ```text
 //! public_key_id ::= "pkid:v1:ed25519:blake3:" hash64
 //! keyset_id     ::= "kset:v1:blake3:" hash64
+//! cell_id       ::= "cell:v1:blake3:" hash64
+//! holon_id      ::= "holon:v1:blake3:" hash64
 //! hash64        ::= 64 * HEXLOWER
 //! ```
 //!
@@ -36,7 +40,7 @@
 //! - EVID-0007: Canonical key identifier conformance evidence
 //! - EVID-0303: Rollout phase S0.75 evidence
 
-use super::{AlgorithmTag, KeyIdError, KeySetIdV1, PublicKeyIdV1, SetTag};
+use super::{AlgorithmTag, CellIdV1, HolonIdV1, KeyIdError, KeySetIdV1, PublicKeyIdV1, SetTag};
 
 /// A valid `PublicKeyIdV1` conformance vector.
 ///
@@ -68,6 +72,28 @@ pub struct ValidKeySetIdVector {
     pub text: &'static str,
 }
 
+/// A valid `CellIdV1` conformance vector.
+#[derive(Debug)]
+pub struct ValidCellIdVector {
+    /// Human-readable vector name.
+    pub name: &'static str,
+    /// Raw 33-byte binary form (hex-encoded for readability).
+    pub binary_hex: &'static str,
+    /// Canonical text form (`cell:v1:blake3:<64-hex>`).
+    pub text: &'static str,
+}
+
+/// A valid `HolonIdV1` conformance vector.
+#[derive(Debug)]
+pub struct ValidHolonIdVector {
+    /// Human-readable vector name.
+    pub name: &'static str,
+    /// Raw 33-byte binary form (hex-encoded for readability).
+    pub binary_hex: &'static str,
+    /// Canonical text form (`holon:v1:blake3:<64-hex>`).
+    pub text: &'static str,
+}
+
 /// An invalid text input vector that MUST be rejected.
 #[derive(Debug)]
 pub struct InvalidTextVector {
@@ -88,6 +114,10 @@ pub enum TargetType {
     PublicKeyId,
     /// `KeySetIdV1`
     KeySetId,
+    /// `CellIdV1`
+    CellId,
+    /// `HolonIdV1`
+    HolonId,
 }
 
 /// Broad category of expected parse error.
@@ -216,6 +246,72 @@ pub fn valid_keyset_id_vectors() -> Vec<ValidKeySetIdVector> {
             set_tag: SetTag::Threshold,
             binary_hex: "02ab69d122b0b8165d758073d4f37165db6d82165f7411c17028aaeaa97a79a3c0",
             text: "kset:v1:blake3:ab69d122b0b8165d758073d4f37165db6d82165f7411c17028aaeaa97a79a3c0",
+        },
+    ]
+}
+
+// ============================================================================
+// Valid CellIdV1 Vectors (frozen static fixtures)
+// ============================================================================
+
+/// Frozen valid `CellIdV1` conformance vectors.
+///
+/// Values are derived from known `(ledger_genesis_hash, policy_root_id)`
+/// commitments as specified in HSI 1.7.3.
+pub fn valid_cell_id_vectors() -> Vec<ValidCellIdVector> {
+    vec![
+        ValidCellIdVector {
+            name: "cell_single_policy_11aa",
+            binary_hex: "01db758443ad405611a5ad982f7c04211b248707a048f6642cf76e6ce4aa1cf54d",
+            text: "cell:v1:blake3:db758443ad405611a5ad982f7c04211b248707a048f6642cf76e6ce4aa1cf54d",
+        },
+        ValidCellIdVector {
+            name: "cell_single_policy_22bb",
+            binary_hex: "013de80e9fcf47e09ddebbfa8a831ec4b62b5a540a6af05e5457ea3d147bb0c3a8",
+            text: "cell:v1:blake3:3de80e9fcf47e09ddebbfa8a831ec4b62b5a540a6af05e5457ea3d147bb0c3a8",
+        },
+        ValidCellIdVector {
+            name: "cell_quorum_threshold",
+            binary_hex: "014bfce8b5d0f7010a087a5119818d795352bf8dd651812b35f008d5ad90195efa",
+            text: "cell:v1:blake3:4bfce8b5d0f7010a087a5119818d795352bf8dd651812b35f008d5ad90195efa",
+        },
+        ValidCellIdVector {
+            name: "cell_single_policy_ff00",
+            binary_hex: "01d45d3bf6b8f3a5c860cbfc98f9420e7ac18d59e5bc5d0ac349a41f468f136f72",
+            text: "cell:v1:blake3:d45d3bf6b8f3a5c860cbfc98f9420e7ac18d59e5bc5d0ac349a41f468f136f72",
+        },
+    ]
+}
+
+// ============================================================================
+// Valid HolonIdV1 Vectors (frozen static fixtures)
+// ============================================================================
+
+/// Frozen valid `HolonIdV1` conformance vectors.
+///
+/// Values are derived from known `(cell_id, holon_genesis_public_key_id)`
+/// commitments as specified in HSI 1.7.4.
+pub fn valid_holon_id_vectors() -> Vec<ValidHolonIdVector> {
+    vec![
+        ValidHolonIdVector {
+            name: "holon_cell1_keyaa",
+            binary_hex: "011fd7fda75b1481c99d39aecb01880bb85ce029aaef603d4fc8392e0859b8933c",
+            text: "holon:v1:blake3:1fd7fda75b1481c99d39aecb01880bb85ce029aaef603d4fc8392e0859b8933c",
+        },
+        ValidHolonIdVector {
+            name: "holon_cell1_keybb",
+            binary_hex: "017669a3e04f011b4c3b4325d80325fd0706cd36e235b3136eb239afa9a0ecee0a",
+            text: "holon:v1:blake3:7669a3e04f011b4c3b4325d80325fd0706cd36e235b3136eb239afa9a0ecee0a",
+        },
+        ValidHolonIdVector {
+            name: "holon_cell2_keyaa",
+            binary_hex: "01a8311ce1ac405a7a30bd94f7d45ee217e26acf8563fcc9b3f6bc32086119c1ed",
+            text: "holon:v1:blake3:a8311ce1ac405a7a30bd94f7d45ee217e26acf8563fcc9b3f6bc32086119c1ed",
+        },
+        ValidHolonIdVector {
+            name: "holon_cell3_keycc",
+            binary_hex: "0198a30b3215f1f52211dfa95b71344d011b200010218dc95c6aff57582b4ba773",
+            text: "holon:v1:blake3:98a30b3215f1f52211dfa95b71344d011b200010218dc95c6aff57582b4ba773",
         },
     ]
 }
@@ -432,6 +528,92 @@ pub fn invalid_text_vectors() -> Vec<InvalidTextVector> {
             target_type: TargetType::PublicKeyId,
             expected_error: ExpectedError::NonAscii,
         },
+        // === CellIdV1 invalid text vectors ===
+        InvalidTextVector {
+            name: "leading_space_cell",
+            input: " cell:v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::CellId,
+            expected_error: ExpectedError::Whitespace,
+        },
+        InvalidTextVector {
+            name: "all_uppercase_cell",
+            input: "CELL:V1:BLAKE3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::CellId,
+            expected_error: ExpectedError::Uppercase,
+        },
+        InvalidTextVector {
+            name: "wrong_prefix_cell",
+            input: "holon:v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::CellId,
+            expected_error: ExpectedError::WrongPrefix,
+        },
+        InvalidTextVector {
+            name: "truncated_cell",
+            input: "cell:v1:blake3:abcd",
+            target_type: TargetType::CellId,
+            expected_error: ExpectedError::Truncated,
+        },
+        InvalidTextVector {
+            name: "invalid_hex_cell",
+            input: "cell:v1:blake3:g000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::CellId,
+            expected_error: ExpectedError::InvalidHex,
+        },
+        InvalidTextVector {
+            name: "percent_encoded_cell",
+            input: "cell%3av1%3ablake3%3a0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::CellId,
+            expected_error: ExpectedError::PercentEncoded,
+        },
+        InvalidTextVector {
+            name: "non_ascii_cell",
+            input: "cell\u{FF1A}v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::CellId,
+            expected_error: ExpectedError::NonAscii,
+        },
+        // === HolonIdV1 invalid text vectors ===
+        InvalidTextVector {
+            name: "leading_space_holon",
+            input: " holon:v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::HolonId,
+            expected_error: ExpectedError::Whitespace,
+        },
+        InvalidTextVector {
+            name: "all_uppercase_holon",
+            input: "HOLON:V1:BLAKE3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::HolonId,
+            expected_error: ExpectedError::Uppercase,
+        },
+        InvalidTextVector {
+            name: "wrong_prefix_holon",
+            input: "cell:v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::HolonId,
+            expected_error: ExpectedError::WrongPrefix,
+        },
+        InvalidTextVector {
+            name: "truncated_holon",
+            input: "holon:v1:blake3:abcd",
+            target_type: TargetType::HolonId,
+            expected_error: ExpectedError::Truncated,
+        },
+        InvalidTextVector {
+            name: "invalid_hex_holon",
+            input: "holon:v1:blake3:g000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::HolonId,
+            expected_error: ExpectedError::InvalidHex,
+        },
+        InvalidTextVector {
+            name: "percent_encoded_holon",
+            input: "holon%3av1%3ablake3%3a0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::HolonId,
+            expected_error: ExpectedError::PercentEncoded,
+        },
+        InvalidTextVector {
+            name: "non_ascii_holon",
+            input: "holon\u{FF1A}v1:blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            target_type: TargetType::HolonId,
+            expected_error: ExpectedError::NonAscii,
+        },
     ]
 }
 
@@ -616,11 +798,171 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
         ));
     }
 
+    // --- Valid CellIdV1 vectors (static fixtures) ---
+    for vector in valid_cell_id_vectors() {
+        let text_result = CellIdV1::parse_text(vector.text);
+        let text_ok = match &text_result {
+            Ok(_) => true,
+            Err(e) => {
+                results.push((vector.name, false, format!("text parse failed: {e}")));
+                continue;
+            },
+        };
+        results.push((
+            vector.name,
+            text_ok,
+            if text_ok {
+                "text parse OK".to_string()
+            } else {
+                "text parse failed".to_string()
+            },
+        ));
+
+        let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex in vector");
+        let binary_result = CellIdV1::from_binary(&binary_bytes);
+        let binary_ok = match &binary_result {
+            Ok(_) => true,
+            Err(e) => {
+                results.push((vector.name, false, format!("binary parse failed: {e}")));
+                continue;
+            },
+        };
+        results.push((
+            vector.name,
+            binary_ok,
+            if binary_ok {
+                "binary parse OK".to_string()
+            } else {
+                "binary parse failed".to_string()
+            },
+        ));
+
+        let from_text = text_result.unwrap();
+        let from_binary = binary_result.unwrap();
+        let agree = from_text == from_binary;
+        results.push((
+            vector.name,
+            agree,
+            if agree {
+                "text/binary agree".to_string()
+            } else {
+                "text/binary DISAGREE".to_string()
+            },
+        ));
+
+        let re_encoded = from_binary.to_text();
+        let re_pass = re_encoded == vector.text;
+        results.push((
+            vector.name,
+            re_pass,
+            if re_pass {
+                "text re-encode OK".to_string()
+            } else {
+                format!("text re-encode mismatch: got {re_encoded}")
+            },
+        ));
+
+        let tag_ok = from_binary.version_tag() == 0x01;
+        results.push((
+            vector.name,
+            tag_ok,
+            if tag_ok {
+                "version tag OK".to_string()
+            } else {
+                format!(
+                    "version tag mismatch: got 0x{:02x}",
+                    from_binary.version_tag()
+                )
+            },
+        ));
+    }
+
+    // --- Valid HolonIdV1 vectors (static fixtures) ---
+    for vector in valid_holon_id_vectors() {
+        let text_result = HolonIdV1::parse_text(vector.text);
+        let text_ok = match &text_result {
+            Ok(_) => true,
+            Err(e) => {
+                results.push((vector.name, false, format!("text parse failed: {e}")));
+                continue;
+            },
+        };
+        results.push((
+            vector.name,
+            text_ok,
+            if text_ok {
+                "text parse OK".to_string()
+            } else {
+                "text parse failed".to_string()
+            },
+        ));
+
+        let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex in vector");
+        let binary_result = HolonIdV1::from_binary(&binary_bytes);
+        let binary_ok = match &binary_result {
+            Ok(_) => true,
+            Err(e) => {
+                results.push((vector.name, false, format!("binary parse failed: {e}")));
+                continue;
+            },
+        };
+        results.push((
+            vector.name,
+            binary_ok,
+            if binary_ok {
+                "binary parse OK".to_string()
+            } else {
+                "binary parse failed".to_string()
+            },
+        ));
+
+        let from_text = text_result.unwrap();
+        let from_binary = binary_result.unwrap();
+        let agree = from_text == from_binary;
+        results.push((
+            vector.name,
+            agree,
+            if agree {
+                "text/binary agree".to_string()
+            } else {
+                "text/binary DISAGREE".to_string()
+            },
+        ));
+
+        let re_encoded = from_binary.to_text();
+        let re_pass = re_encoded == vector.text;
+        results.push((
+            vector.name,
+            re_pass,
+            if re_pass {
+                "text re-encode OK".to_string()
+            } else {
+                format!("text re-encode mismatch: got {re_encoded}")
+            },
+        ));
+
+        let tag_ok = from_binary.version_tag() == 0x01;
+        results.push((
+            vector.name,
+            tag_ok,
+            if tag_ok {
+                "version tag OK".to_string()
+            } else {
+                format!(
+                    "version tag mismatch: got 0x{:02x}",
+                    from_binary.version_tag()
+                )
+            },
+        ));
+    }
+
     // --- Invalid text vectors ---
     for vector in invalid_text_vectors() {
         let parse_result = match vector.target_type {
             TargetType::PublicKeyId => PublicKeyIdV1::parse_text(vector.input).map(|_| ()),
             TargetType::KeySetId => KeySetIdV1::parse_text(vector.input).map(|_| ()),
+            TargetType::CellId => CellIdV1::parse_text(vector.input).map(|_| ()),
+            TargetType::HolonId => HolonIdV1::parse_text(vector.input).map(|_| ()),
         };
 
         let rejected = parse_result.is_err();
@@ -645,6 +987,7 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
                 ExpectedError::UnknownTag => {
                     matches!(e, KeyIdError::UnknownAlgorithmTag { .. })
                         || matches!(e, KeyIdError::UnknownSetTag { .. })
+                        || matches!(e, KeyIdError::UnknownVersionTag { .. })
                 },
                 ExpectedError::Extended => {
                     matches!(e, KeyIdError::HexLengthMismatch { .. })
@@ -683,6 +1026,7 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{CellGenesisV1, HolonGenesisV1, HolonPurpose, PolicyRootId};
 
     /// Run all conformance vectors and assert every one passes.
     ///
@@ -706,10 +1050,12 @@ mod tests {
 
         // Binding assertion: total vector count must be specific non-zero
         // value (prevents silent test-count regression).
-        // 5 PK vectors x 5 checks + 4 KS vectors x 5 checks + 32 invalid = 77
+        // 5 PK vectors x 5 checks + 4 KS vectors x 5 checks
+        // + 4 Cell vectors x 5 checks + 4 Holon vectors x 5 checks
+        // + 46 invalid = 131
         assert_eq!(
-            total, 77,
-            "expected exactly 77 conformance vector checks, got {total}"
+            total, 131,
+            "expected exactly 131 conformance vector checks, got {total}"
         );
     }
 
@@ -756,14 +1102,56 @@ mod tests {
         }
     }
 
+    /// Verify valid `CellIdV1` vectors produce non-zero distinct identifiers.
+    #[test]
+    fn valid_cell_vectors_are_distinct() {
+        let vectors = valid_cell_id_vectors();
+        assert_eq!(
+            vectors.len(),
+            4,
+            "expected exactly 4 valid CellIdV1 vectors"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for vector in &vectors {
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            assert!(
+                seen.insert(binary),
+                "duplicate CellIdV1 in vector set: {}",
+                vector.name
+            );
+        }
+    }
+
+    /// Verify valid `HolonIdV1` vectors produce non-zero distinct identifiers.
+    #[test]
+    fn valid_holon_vectors_are_distinct() {
+        let vectors = valid_holon_id_vectors();
+        assert_eq!(
+            vectors.len(),
+            4,
+            "expected exactly 4 valid HolonIdV1 vectors"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for vector in &vectors {
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
+            assert!(
+                seen.insert(binary),
+                "duplicate HolonIdV1 in vector set: {}",
+                vector.name
+            );
+        }
+    }
+
     /// Verify all invalid text vectors are present and accounted for.
     #[test]
     fn invalid_vector_count() {
         let vectors = invalid_text_vectors();
         assert_eq!(
             vectors.len(),
-            32,
-            "expected exactly 32 invalid text vectors"
+            46,
+            "expected exactly 46 invalid text vectors"
         );
     }
 
@@ -876,6 +1264,152 @@ mod tests {
         }
     }
 
+    /// Parser differential: runtime-derived `CellIdV1` values must match
+    /// the frozen fixture hex/text values.
+    #[test]
+    fn cell_derivation_matches_frozen_fixtures() {
+        let pk_aa = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let pk_bb = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+        let pk_00 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x00; 32]);
+
+        let quorum = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            1,
+            &[pk_aa.clone(), pk_bb.clone()],
+            None,
+        )
+        .unwrap();
+
+        let derivations = [
+            (
+                "cell_single_policy_11aa",
+                CellGenesisV1::new(
+                    [0x11; 32],
+                    PolicyRootId::Single(pk_aa),
+                    "cell.alpha.internal",
+                )
+                .unwrap(),
+            ),
+            (
+                "cell_single_policy_22bb",
+                CellGenesisV1::new(
+                    [0x22; 32],
+                    PolicyRootId::Single(pk_bb),
+                    "cell.beta.internal",
+                )
+                .unwrap(),
+            ),
+            (
+                "cell_quorum_threshold",
+                CellGenesisV1::new(
+                    [0x33; 32],
+                    PolicyRootId::Quorum(quorum),
+                    "cell.gamma.internal",
+                )
+                .unwrap(),
+            ),
+            (
+                "cell_single_policy_ff00",
+                CellGenesisV1::new(
+                    [0xFF; 32],
+                    PolicyRootId::Single(pk_00),
+                    "cell.delta.internal",
+                )
+                .unwrap(),
+            ),
+        ];
+
+        let fixtures = valid_cell_id_vectors();
+        assert_eq!(derivations.len(), fixtures.len());
+
+        for (i, (name, genesis)) in derivations.iter().enumerate() {
+            let derived = CellIdV1::from_genesis(genesis);
+            let fixture = &fixtures[i];
+            assert_eq!(
+                fixture.name, *name,
+                "fixture ordering mismatch at index {i}"
+            );
+            assert_eq!(
+                hex::encode(derived.to_binary()),
+                fixture.binary_hex,
+                "binary mismatch for {name}"
+            );
+            assert_eq!(derived.to_text(), fixture.text, "text mismatch for {name}");
+        }
+    }
+
+    /// Parser differential: runtime-derived `HolonIdV1` values must match
+    /// the frozen fixture hex/text values.
+    #[test]
+    fn holon_derivation_matches_frozen_fixtures() {
+        let pk_aa_bytes = [0xAA; 32];
+        let pk_bb_bytes = [0xBB; 32];
+        let pk_cc_bytes = [0xCC; 32];
+        let pk_aa = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &pk_aa_bytes);
+        let pk_bb = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &pk_bb_bytes);
+        let pk_cc = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &pk_cc_bytes);
+
+        let cell_fixtures = valid_cell_id_vectors();
+        let cell1_binary = hex::decode(cell_fixtures[0].binary_hex).unwrap();
+        let cell2_binary = hex::decode(cell_fixtures[1].binary_hex).unwrap();
+        let cell3_binary = hex::decode(cell_fixtures[2].binary_hex).unwrap();
+        let cell1 = CellIdV1::from_binary(&cell1_binary).unwrap();
+        let cell2 = CellIdV1::from_binary(&cell2_binary).unwrap();
+        let cell3 = CellIdV1::from_binary(&cell3_binary).unwrap();
+
+        let derivations = [
+            (
+                "holon_cell1_keyaa",
+                HolonGenesisV1::new(
+                    cell1.clone(),
+                    pk_aa.clone(),
+                    pk_aa_bytes.to_vec(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ),
+            (
+                "holon_cell1_keybb",
+                HolonGenesisV1::new(cell1, pk_bb, pk_bb_bytes.to_vec(), None, None).unwrap(),
+            ),
+            (
+                "holon_cell2_keyaa",
+                HolonGenesisV1::new(cell2, pk_aa, pk_aa_bytes.to_vec(), None, None).unwrap(),
+            ),
+            (
+                "holon_cell3_keycc",
+                HolonGenesisV1::new(
+                    cell3,
+                    pk_cc,
+                    pk_cc_bytes.to_vec(),
+                    Some(HolonPurpose::Validator),
+                    Some("anchor:fixture".to_string()),
+                )
+                .unwrap(),
+            ),
+        ];
+
+        let fixtures = valid_holon_id_vectors();
+        assert_eq!(derivations.len(), fixtures.len());
+
+        for (i, (name, genesis)) in derivations.iter().enumerate() {
+            let derived = HolonIdV1::from_genesis(genesis);
+            let fixture = &fixtures[i];
+            assert_eq!(
+                fixture.name, *name,
+                "fixture ordering mismatch at index {i}"
+            );
+            assert_eq!(
+                hex::encode(derived.to_binary()),
+                fixture.binary_hex,
+                "binary mismatch for {name}"
+            );
+            assert_eq!(derived.to_text(), fixture.text, "text mismatch for {name}");
+        }
+    }
+
     /// Parser differential: `PublicKeyIdV1::parse_text` and `from_binary`
     /// agree on all frozen fixture vectors.
     #[test]
@@ -930,6 +1464,42 @@ mod tests {
         }
     }
 
+    /// Parser differential: `CellIdV1::parse_text` and `from_binary` agree
+    /// on all frozen fixture vectors.
+    #[test]
+    fn cell_parser_differential_valid() {
+        for vector in valid_cell_id_vectors() {
+            let from_text = CellIdV1::parse_text(vector.text).expect("valid vector must parse");
+            let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
+            let from_binary =
+                CellIdV1::from_binary(&binary_bytes).expect("valid vector must parse");
+
+            assert_eq!(
+                from_text, from_binary,
+                "text/binary parser differential for {}",
+                vector.name
+            );
+        }
+    }
+
+    /// Parser differential: `HolonIdV1::parse_text` and `from_binary` agree
+    /// on all frozen fixture vectors.
+    #[test]
+    fn holon_parser_differential_valid() {
+        for vector in valid_holon_id_vectors() {
+            let from_text = HolonIdV1::parse_text(vector.text).expect("valid vector must parse");
+            let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
+            let from_binary =
+                HolonIdV1::from_binary(&binary_bytes).expect("valid vector must parse");
+
+            assert_eq!(
+                from_text, from_binary,
+                "text/binary parser differential for {}",
+                vector.name
+            );
+        }
+    }
+
     /// Verify that each invalid vector is rejected by the correct parser.
     #[test]
     fn invalid_vectors_rejected() {
@@ -937,6 +1507,8 @@ mod tests {
             let result = match vector.target_type {
                 TargetType::PublicKeyId => PublicKeyIdV1::parse_text(vector.input).map(|_| ()),
                 TargetType::KeySetId => KeySetIdV1::parse_text(vector.input).map(|_| ()),
+                TargetType::CellId => CellIdV1::parse_text(vector.input).map(|_| ()),
+                TargetType::HolonId => HolonIdV1::parse_text(vector.input).map(|_| ()),
             };
 
             assert!(
@@ -986,6 +1558,40 @@ mod tests {
             assert_eq!(
                 text_origin, text_reparsed,
                 "text-origin round-trip failure for {}",
+                vector.name
+            );
+        }
+    }
+
+    /// Binary -> text -> binary round-trip for all valid `CellIdV1` vectors.
+    #[test]
+    fn cell_binary_text_binary_round_trip() {
+        for vector in valid_cell_id_vectors() {
+            let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
+            let id = CellIdV1::from_binary(&binary_bytes).expect("valid binary");
+            let text = id.to_text();
+            let reparsed = CellIdV1::parse_text(&text).expect("re-parse must succeed");
+            assert_eq!(
+                id.to_binary(),
+                reparsed.to_binary(),
+                "round-trip failure for {}",
+                vector.name
+            );
+        }
+    }
+
+    /// Binary -> text -> binary round-trip for all valid `HolonIdV1` vectors.
+    #[test]
+    fn holon_binary_text_binary_round_trip() {
+        for vector in valid_holon_id_vectors() {
+            let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
+            let id = HolonIdV1::from_binary(&binary_bytes).expect("valid binary");
+            let text = id.to_text();
+            let reparsed = HolonIdV1::parse_text(&text).expect("re-parse must succeed");
+            assert_eq!(
+                id.to_binary(),
+                reparsed.to_binary(),
+                "round-trip failure for {}",
                 vector.name
             );
         }

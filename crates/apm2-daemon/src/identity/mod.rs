@@ -1,7 +1,11 @@
-//! Canonical key identifiers for the Holonic Substrate Interface (RFC-0020).
+//! Canonical identity identifiers for the Holonic Substrate Interface
+//! (RFC-0020).
 //!
-//! This module implements [`PublicKeyIdV1`] and [`KeySetIdV1`], the canonical
-//! binary and text forms for self-certifying cryptographic key identifiers.
+//! This module implements canonical binary and text forms for:
+//! - [`PublicKeyIdV1`]
+//! - [`KeySetIdV1`]
+//! - [`CellIdV1`]
+//! - [`HolonIdV1`]
 //!
 //! # V1 Canonical Text Form Grammar (RFC-0020 section 1.7.5b)
 //!
@@ -11,9 +15,11 @@
 //! preserving backward compatibility.
 //!
 //! ```text
-//! identifier    ::= public_key_id | keyset_id
+//! identifier    ::= public_key_id | keyset_id | cell_id | holon_id
 //! public_key_id ::= "pkid:v1:ed25519:blake3:" hash64
 //! keyset_id     ::= "kset:v1:blake3:" hash64
+//! cell_id       ::= "cell:v1:blake3:" hash64
+//! holon_id      ::= "holon:v1:blake3:" hash64
 //! hash64        ::= 64 * HEXLOWER          ; 64 lowercase hex characters
 //! HEXLOWER      ::= [0-9a-f]
 //! ```
@@ -28,11 +34,13 @@
 //!
 //! ## Tag Byte Values
 //!
-//! | Text prefix              | Tag  | Meaning           |
-//! |--------------------------|------|-------------------|
-//! | `pkid:v1:ed25519:blake3` | 0x01 | Ed25519           |
-//! | `kset:v1:blake3`         | 0x01 | Multisig (n-of-n) |
-//! | `kset:v1:blake3`         | 0x02 | Threshold (k-of-n)|
+//! | Text prefix              | Tag  | Meaning            |
+//! |--------------------------|------|--------------------|
+//! | `pkid:v1:ed25519:blake3` | 0x01 | Ed25519            |
+//! | `kset:v1:blake3`         | 0x01 | Multisig (n-of-n)  |
+//! | `kset:v1:blake3`         | 0x02 | Threshold (k-of-n) |
+//! | `cell:v1:blake3`         | 0x01 | Cell identity V1   |
+//! | `holon:v1:blake3`        | 0x01 | Holon identity V1  |
 //!
 //! Unknown tag values MUST be rejected (fail-closed per REQ-0007).
 //!
@@ -57,6 +65,20 @@
 //!   + [optional: "\n" + weights as 8-byte LE values]
 //! ```
 //!
+//! **`CellIdV1` hash:**
+//!
+//! ```text
+//! blake3("apm2:cell_id:v1\n" + ledger_genesis_hash_bytes
+//!        + genesis_policy_root_public_key_id_bytes)
+//! ```
+//!
+//! **`HolonIdV1` hash:**
+//!
+//! ```text
+//! blake3("apm2:holon_id:v1\0" + cell_id_bytes
+//!        + holon_genesis_public_key_id_bytes)
+//! ```
+//!
 //! - Lowercase hex encoding (0-9, a-f), exactly 64 characters for 32 bytes
 //!
 //! # Security Invariants
@@ -74,16 +96,24 @@
 //!
 //! - RFC-0020 section 1.7.2: `PublicKeyIdV1` canonical key identifiers
 //! - RFC-0020 section 1.7.2a: `KeySetIdV1` quorum/threshold verifier identity
+//! - RFC-0020 section 1.7.3: `CellIdV1`
+//! - RFC-0020 section 1.7.4: `HolonIdV1`
 //! - RFC-0020 section 1.7.5b: ABNF for canonical text forms
 //! - REQ-0007: Canonical key identifier formats
 //! - EVID-0007: Canonical key identifier conformance evidence
+//! - REQ-0008: Genesis artifacts are hash-addressed in CAS
+//! - EVID-0008: Genesis artifact CAS conformance evidence
 //! - EVID-0303: Rollout phase S0.75 evidence
 
+mod cell_id;
+mod holon_id;
 mod keyset_id;
 mod public_key_id;
 
 pub mod conformance;
 
+pub use cell_id::{CellGenesisV1, CellIdV1, PolicyRootId};
+pub use holon_id::{HolonGenesisV1, HolonIdV1, HolonPurpose};
 pub use keyset_id::{KeySetIdV1, SetTag};
 pub use public_key_id::{AlgorithmTag, PublicKeyIdV1};
 use thiserror::Error;
@@ -92,6 +122,8 @@ use thiserror::Error;
 ///
 /// `pkid:v1:ed25519:blake3:` (24 bytes) + 64 hex chars = 88 characters.
 /// `kset:v1:blake3:` (16 bytes) + 64 hex chars = 80 characters.
+/// `cell:v1:blake3:` (15 bytes) + 64 hex chars = 79 characters.
+/// `holon:v1:blake3:` (16 bytes) + 64 hex chars = 80 characters.
 /// We set the bound to 96 to allow modest future growth while still
 /// preventing unbounded input.
 pub const MAX_TEXT_LEN: usize = 96;
@@ -176,6 +208,13 @@ pub enum KeyIdError {
         tag: u8,
     },
 
+    /// Unknown identity version tag byte (fail-closed).
+    #[error("unknown version tag: 0x{tag:02x}")]
+    UnknownVersionTag {
+        /// The unrecognized version tag byte.
+        tag: u8,
+    },
+
     /// Input contains characters outside the hex lowercase alphabet.
     #[error("input contains invalid hex characters")]
     InvalidHexCharacters,
@@ -187,6 +226,11 @@ pub enum KeyIdError {
     /// Input contains non-ASCII characters (rejected per REQ-0007).
     #[error("input contains non-ASCII characters")]
     ContainsNonAscii,
+
+    /// Input contains ASCII control characters (0x00-0x1F, 0x7F) that are
+    /// not in the printable ASCII range (0x21-0x7E).
+    #[error("input contains ASCII control characters")]
+    ContainsControlCharacter,
 
     /// Hex payload has wrong length (expected exactly 64 hex characters).
     #[error("hex payload length mismatch: expected 64, got {got}")]

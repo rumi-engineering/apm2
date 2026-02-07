@@ -40,8 +40,8 @@
 //! - [`protocol`]: UDS protocol and message framing
 //! - [`session`]: Session handling with context firewall integration
 //! - [`hsi_contract`]: HSI Contract Manifest V1 for RFC-0020 (TCK-00347)
-//! - [`identity`]: Canonical key identifiers (`PublicKeyIdV1`, `KeySetIdV1`)
-//!   for RFC-0020 (TCK-00353)
+//! - [`identity`]: Canonical identity identifiers (`PublicKeyIdV1`,
+//!   `KeySetIdV1`, `CellIdV1`, `HolonIdV1`) for RFC-0020
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
 
 pub mod cas;
