@@ -30,7 +30,10 @@ ticket_meta:
     - Enforce linux-ns-v1 profile with namespaces, seccomp, cgroups
     - Deny ambient egress by default and confine workspace root
     - Add capsule escape and path traversal adversarial tests
+    - Type definitions, validation logic, and unit tests only
     out_of_scope:
+    - "Runtime integration of AdmissionGate::check into daemon actuation paths (deferred to TCK-00375)"
+    - "No-bypass path ratchet for alternative spawn paths (deferred to TCK-00376)"
     - Context firewall TOCTOU integrity checks (TCK-00375)
   plan:
     steps:

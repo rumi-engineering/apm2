@@ -42,6 +42,7 @@ pub mod agent;
 pub mod bootstrap;
 pub mod budget;
 pub mod cac;
+pub mod capsule;
 pub mod ccp;
 pub mod config;
 pub mod consensus;
