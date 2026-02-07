@@ -8,13 +8,21 @@ evidence_artifact:
     Evidence that REQ-0012 is implemented in daemon identity and protocol
     paths. Directory heads now enforce non-zero profile-hash pinning,
     verification enforces profile binding and known-profile resolution with
-    Tier2+ fail-closed semantics, and SessionStarted payloads can persist the
+    Tier2+ fail-closed semantics, and SessionStarted payloads persist the
     active identity_proof_profile_hash from connection context wiring.
 
-    Production session-open wiring for identity_proof_profile_hash is deferred
-    under WVR-0003 to TCK-00361. This ticket provides infrastructure (setter,
-    getter, payload serialization, test coverage). The test demonstrates the
-    full wiring path works when the setter is called.
+    Production session-open wiring is implemented in
+    handle_dual_socket_connection (main.rs L2109-2134). The active identity
+    proof profile hash is resolved from IdentityProofProfileV1 and set on
+    the ConnectionContext at session-open time, before entering the dispatch
+    loop. This ensures SessionStarted events carry the verified profile hash
+    from the real session-open path rather than relying on a spawn-time
+    baseline fallback (REQ-0012 acceptance criterion: "Session-open path
+    records active proof profile hash").
+
+    Integration tests exercise the end-to-end wiring from ConnectionContext
+    through spawn to SessionStarted payload, including a test that proves the
+    session-open wired value overrides the spawn-time fallback.
 
     Strict verifier cache invalidation behavior remains out of scope for this
     ticket and is deferred to TCK-00359.
@@ -25,6 +33,7 @@ evidence_artifact:
     - "crates/apm2-daemon/src/identity/directory_proof.rs"
     - "crates/apm2-daemon/src/identity/mod.rs"
     - "crates/apm2-daemon/src/protocol/dispatch.rs"
+    - "crates/apm2-daemon/src/main.rs"
     - "crates/apm2-daemon/src/ledger.rs"
   artifacts:
     - type: "test_output"
@@ -45,13 +54,36 @@ evidence_artifact:
         - "cargo test -p apm2-daemon identity::directory_proof::tests::test_profile_mismatch_rejected_during_verification"
     - type: "test_output"
       description: |
-        Session-open path profile recording wiring (infrastructure-only for
-        now; production wiring deferred to TCK-00361 under WVR-0003). Test
-        demonstrates the complete path from context->spawn->SessionStarted
-        payload:
+        Session-open path profile hash wiring — setter-injection test
+        demonstrating the complete path from ConnectionContext through spawn
+        to SessionStarted payload:
         - test_session_context_records_profile_hash
       ref:
         - "cargo test -p apm2-daemon protocol::dispatch::tests::tck_00397_adapter_profile_binding::test_session_context_records_profile_hash"
+    - type: "test_output"
+      description: |
+        Production runtime-path evidence for session-open wiring (REQ-0012).
+        The first test proves the spawn path emits the baseline profile hash
+        end-to-end without test-only setter injection. The second test proves
+        the session-open wired value (set on ConnectionContext in
+        handle_dual_socket_connection at main.rs:2109) overrides the
+        spawn-time baseline fallback:
+        - test_production_spawn_emits_baseline_identity_proof_profile_hash
+        - test_session_open_wired_profile_hash_overrides_spawn_fallback
+      ref:
+        - "cargo test -p apm2-daemon protocol::dispatch::tests::tck_00397_adapter_profile_binding::test_production_spawn_emits_baseline_identity_proof_profile_hash"
+        - "cargo test -p apm2-daemon protocol::dispatch::tests::tck_00397_adapter_profile_binding::test_session_open_wired_profile_hash_overrides_spawn_fallback"
+    - type: "code_path"
+      description: |
+        Production session-open wiring in handle_dual_socket_connection
+        (main.rs L2109-2134). The profile hash is resolved from
+        IdentityProofProfileV1::baseline_smt_10e12() and set on the
+        ConnectionContext via set_identity_proof_profile_hash before the
+        connection advances to SessionOpen state. This is the authoritative
+        runtime path that satisfies REQ-0012 acceptance criterion
+        "Session-open path records active proof profile hash".
+      ref:
+        - "crates/apm2-daemon/src/main.rs:2109-2134"
     - type: "test_output"
       description: |
         Daemon-level regression suite for identity/profile/session payload
