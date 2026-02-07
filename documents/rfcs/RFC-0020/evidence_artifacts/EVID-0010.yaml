@@ -12,7 +12,7 @@ evidence_artifact:
     requests now require `identity_proof_hash` pointers and reject unproofed
     identity inputs.
 
-    Phase 1 enforcement level (WVR-0003): Handler admission validates
+    Phase 1 enforcement level (WVR-0103): Handler admission validates
     `identity_proof_hash` as a 32-byte non-zero shape commitment. Full CAS
     dereference and IdentityProofV1::verify() at admission time is deferred
     to TCK-00359 (CAS transport integration). The hash is bound into ALL
@@ -41,7 +41,7 @@ evidence_artifact:
     - "proto/apm2d_runtime_v1.proto"
     - "crates/apm2-daemon/src/protocol/dispatch.rs"
     - "crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs"
-    - "documents/security/waivers/WVR-0003.yaml"
+    - "documents/work/waivers/WVR-0103.yaml"
   artifacts:
     - type: "test_output"
       description: |

@@ -3188,7 +3188,7 @@ pub struct ConnectionContext {
     /// This is persisted into `SessionStarted` payloads when present so
     /// session-open audit records bind to the verifier economics contract
     /// (REQ-0012). Full identity proof dereference wiring is deferred under
-    /// WVR-0003 / TCK-00361.
+    /// WVR-0103 / TCK-00361.
     identity_proof_profile_hash: Option<[u8; 32]>,
 
     /// Connection phase for session-typed state machine (TCK-00349).
@@ -8099,15 +8099,15 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // WVR-0003: Log once that identity proof hash is validated as
+        // WVR-0103: Log once that identity proof hash is validated as
         // shape-only commitment (Phase 1 / pre-CAS transport).
         {
             static PROOF_WAIVER_WARN: std::sync::Once = std::sync::Once::new();
             PROOF_WAIVER_WARN.call_once(|| {
                 warn!(
-                    waiver = "WVR-0003",
+                    waiver = "WVR-0103",
                     "identity proof hash validated as shape-only commitment; \
-                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0003)"
+                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0103)"
                 );
             });
         }
@@ -9577,15 +9577,15 @@ impl PrivilegedDispatcher {
             .try_into()
             .expect("validated to be 32 bytes by validate_identity_proof_hash above");
 
-        // WVR-0003: Log once that identity proof hash is validated as
+        // WVR-0103: Log once that identity proof hash is validated as
         // shape-only commitment (Phase 1 / pre-CAS transport).
         {
             static SUBLEASE_PROOF_WAIVER_WARN: std::sync::Once = std::sync::Once::new();
             SUBLEASE_PROOF_WAIVER_WARN.call_once(|| {
                 warn!(
-                    waiver = "WVR-0003",
+                    waiver = "WVR-0103",
                     "identity proof hash validated as shape-only commitment; \
-                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0003)"
+                     full CAS dereference + IdentityProofV1::verify() deferred (WVR-0103)"
                 );
             });
         }

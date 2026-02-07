@@ -1,0 +1,358 @@
+{
+  "kind": "instruction.spec",
+  "schema": "cac.instruction_spec.v1",
+  "schema_version": "1.0.0",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-02-07T02:00:00Z",
+    "dependencies": [
+      "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1"
+    ],
+    "labels": [
+      "security-abstraction-discovery",
+      "rfc-generation-and-evaluation",
+      "holonic-architecture",
+      "rust-primitives",
+      "security-first",
+      "alien-engineering",
+      "v1"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-INSTR-EMITTER",
+      "work_id": "alien_security_abstraction_discovery_v1"
+    },
+    "stable_id": "dcp://apm2.local/instructions/alien_security_abstraction_discovery/master@v1"
+  },
+  "payload": {
+    "i": "Abstraction Discovery Engine: mine the frontier of human knowledge — distributed systems theory, formal verification, capability security, information theory, biological immune systems, economic mechanism design, and any field whose invariants transfer — to discover one Rust-standard-library-caliber primitive that replaces a currently ad-hoc security mechanism with a durable, composable abstraction whose value compounds from first commit through exabyte-scale operation.",
+    "pb": "The strongest abstractions in computing history — mutexes, capabilities, content-addressing, Merkle trees, CRDTs, and so on — were not invented by staring at the code that needed them. They emerged when someone recognized that an invariant from one field (cryptography, lattice theory, biology, economics) was the *exact* missing primitive in another. APM2's exabyte-scale security posture invites this same cross-pollination: replacing ad-hoc mechanisms with foundational primitives whose semantics remain stable under extreme scale, adversarial pressure, and recursive composition. This protocol prioritizes deep synthesis over procedural box-checking. Draw on the full landscape of human knowledge — not just systems engineering — to identify the security gap that matters most, then distill a minimal abstraction that is immediately useful in the current codebase *and* architecturally load-bearing at civilizational scale.",
+    "t": {
+      "sys": "APM2",
+      "repo": "{repo_root}",
+      "scope": [
+        "documents/theory",
+        "documents/security",
+        "documents/rfcs/RFC-0016",
+        "documents/rfcs/RFC-0018",
+        "documents/rfcs/RFC-0020",
+        "crates/apm2-holon/src",
+        "crates/apm2-daemon/src",
+        "crates/apm2-core/src"
+      ],
+      "focus_note": "Treat holonic architecture as a pressure-test environment for security primitives that hold at exabyte-scale evidence and globally distributed trust boundaries.",
+      "environment": "APM2 is agent-native software running exclusively on NixOS. It is not public-facing, not designed for human end-users, and has no proprietary platform dependencies. The entire network is resilient to rolling updates, so there is no backwards-compatibility burden. This is liberating: you can propose clean-slate primitives without worrying about migration paths, human ergonomics, or platform portability. Design for agents talking to agents, on infrastructure we fully control."
+    },
+    "ambition_scope_alignment": [
+      "Treat APM2 theory, code, and invariants as primary discovery inputs — but treat the entire frontier of human knowledge (distributed systems, formal methods, capability security, information theory, biological immune systems, economic mechanism design, category theory, fault-tolerant avionics, cryptographic protocol design) as the search space for transferable invariants.",
+      "Prioritize abstractions that are immediately useful — deployable in the current codebase within one PR cycle — yet architecturally load-bearing at exabyte scale. The best proposals deliver value on day one without requiring a future rewrite to matter.",
+      "Strengthen containment while preserving verification and liveness under scale — ideally the abstraction makes the system more secure *today* and more composable *tomorrow*.",
+      "Target foundational primitives that serve non-APM2 Rust users facing high-integrity distributed systems problems; the best sign of a real primitive is that unrelated systems independently need it.",
+      "Prefer minimal core semantics that external crates can compose into diverse security and reliability stacks — the primitive should be a seed crystal, not a framework.",
+      "Aim for proposals that remain robust under globally distributed, 100B+ agent and exabyte-scale evidence envelopes, with explicit verifier economics under adversarial conditions."
+    ],
+    "stdlib_admission_bar": {
+      "principles": [
+        "Generality before locality: the primitive should solve a broad class of problems, not an APM2-only workflow. The strongest test is independent reinvention — would a team building a different exabyte-scale system converge on the same abstraction?",
+        "Minimality before convenience: small, orthogonal APIs with crisp invariants beat large ergonomic surfaces. If you cannot state the core semantic law in one sentence, the primitive is too large.",
+        "Semantics before syntax: design around precise behavioral contracts, failure modes, and composition laws. Ideally the API shape follows naturally from the invariant, not the other way around.",
+        "Security-first safety: containment and correctness considerations take priority over convenience. A good primitive narrows the attack surface rather than widening it.",
+        "Compounding leverage before one-time savings: choose primitives that shrink future design complexity across many libraries and recursion depths.",
+        "Cross-domain provenance: the best primitives encode an invariant that is already proven in another field. Name the source discipline and the transferable law explicitly.",
+        "Immediate utility: the strongest proposals address a real, current pain point in the codebase rather than a future problem that might never arrive.",
+        "Scale invariance: consider whether the primitive's semantic contract works identically at every holonic level — single agent, team, organization, civilization. A good sign is that only leverage changes across scale, not the primitive itself."
+      ],
+      "scale_invariance_intuition": "The deepest primitives are scale-invariant — their semantic contract, invariants, and API surface look the same whether invoked by a single agent-pair or a billion-agent holarchy. The only thing that changes with scale is leverage: the consequence magnitude of each invocation. This mirrors physical conservation laws (same physics at every scale), fractal self-similarity, and biological signaling (the same receptor-ligand binding whether in one cell or an organism of 37 trillion). A useful thought experiment: two nation-state leaders negotiating peace terms that affect billions of lives use the same conversational primitives — greeting, claim, evidence, counter, commitment — as friends over lunch. The primitives don't change; only the weight behind them does. Consider whether your proposed abstraction has this quality.",
+      "out_of_scope_for_now": [
+        "Replacing mature ecosystem crates wholesale.",
+        "Producing immediately stabilizable Rust RFC text as the only artifact.",
+        "Optimizing for short-term implementation convenience."
+      ]
+    },
+    "target_artifact_modes": {
+      "report_only": "Default output to discovery report file.",
+      "rfc_with_discovery_annex": "If a target RFC is explicitly provided, append discovery sections as non-normative annex content.",
+      "novel_rfc_generation": "When the task is to generate a new RFC, discovery output seeds a normative RFC draft plus a non-normative discovery annex.",
+      "existing_rfc_evaluation": "When the task is to evaluate or amend an existing RFC, discovery output maps to review findings and suggested RFC patch sections with non-normative discovery annex content."
+    },
+    "alien_engineering_driver": {
+      "ref": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1",
+      "role": "Cross-disciplinary synthesis is the primary discovery method here, not a decorative overlay. The abstraction we need is unlikely to be found by looking only at systems code — it is more likely hiding in plain sight in a different field's solved problem. Let that possibility guide the search.",
+      "active_clauses": [
+        "AEP_01: Physics-first admissibility — evaluate ambition against physical and computational law, not conventional feasibility anxiety. If the invariant holds in physics, it can hold in software.",
+        "AEP_02: Conventional objections (cost, team size, incumbent pressure, inertia) tend to be weak blockers compared to physical, information-theoretic, or explicit APM2 invariant limits.",
+        "AEP_03: Novel synthesis — the best abstraction often weaves concepts from disparate fields (biology, economics, cryptography, control theory, lattice mathematics) into something none of them independently suggest. When you see a cross-domain connection, name the source fields.",
+        "AEP_04: Compounding closure — aim for abstractions that simplify future architecture changes across recursion depths, not just deduplicate today's code.",
+        "AEP_05: Bounded search — include stop conditions and escalation paths so exploration stays productive rather than open-ended.",
+        "AEP_06: Digest-first interfaces — typed, canonical, low-variety, capability-scoped boundaries tend to compose well.",
+        "AEP_07: Anti-Goodhart posture — evaluate candidates with countermetrics and failure probes. If an abstraction optimizes one metric, consider which metric it could silently degrade.",
+        "AEP_08: Recursive semantic stability — consider whether the abstraction preserves semantic equivalence under composition and at varying recursion depths."
+      ],
+      "cross_domain_synthesis_guidance": "For candidate abstractions, it's valuable to identify: (1) the source discipline whose invariant transfers, (2) why that invariant is durable (proven by decades of use or mathematical proof in the source field), and (3) how it translates into Rust type-system and ownership semantics.",
+      "constraint": "Preferred constraint ordering: containment/security > verification/correctness > liveness/progress. Abstractions that preserve containment while improving verification and liveness are especially valuable."
+    },
+    "alien_scale_alignment": {
+      "goal_reference": "GOAL_EVERGREEN from Alien Engineering Protocol: maximize governed autonomy at civilizational scale.",
+      "scale_envelope": "Think in terms of globally distributed holarchies spanning 100B+ agents, exabyte-scale evidence planes, and adversarial network conditions. The most compelling abstractions are cheap enough to instantiate at high frequency and meaningful enough that each instantiation contributes to the system's security posture.",
+      "immediacy_bridge": "The strongest proposals solve a pain point visible in today's codebase rather than a hypothetical future problem. One good way to demonstrate exabyte-scale relevance: show that the same invariant holds at 1KB and 1EB, rather than deferring value to a future architecture.",
+      "scale_invariance_principle": "A holon can be a single agent or a billion agents, but every kernel-level construct and primitive holds true unchanged — the only thing that changes is leverage. Two heads of state negotiating peace terms that reshape billions of lives use the same conversational primitives as friends over lunch: greeting, claim, evidence, counter, commitment. The primitives are identical; only the consequence magnitude differs. Consider whether your proposed abstraction has this fractal quality — does its contract look the same at recursion depth 1 and recursion depth 10^9? Scale reveals leverage, not new primitives.",
+      "ambition_directives": [
+        "Design primitives that improve verifier economics and composability under extreme scale — quantify the cost delta where possible.",
+        "Preserve multiple admissible implementation families while converging on stable semantic contracts. The contract is the primitive; the implementation is swappable.",
+        "Express how the primitive compounds system capability across recursion depth, jurisdiction, and trust boundaries — show the compounding curve, not just the first-order benefit.",
+        "Draw on nature's solutions to scale: biological immune systems (adaptive defense at 37 trillion cell scale), economic markets (decentralized coordination under adversarial conditions), and physical conservation laws (invariants that hold regardless of reference frame)."
+      ]
+    },
+    "creative_process": {
+      "parallel_exploration": "Rather than converging on a single proposal early, generate multiple parallel candidates that approach the problem from genuinely different angles — different source disciplines, different invariant families, different points on the minimality/expressiveness spectrum. Let each candidate develop its own logic fully before comparing.",
+      "recombination": "After exploring the candidates independently, look for the elements that are strongest in each — one may have the sharpest invariant, another the most elegant API, a third the best threat-model coverage. Recombine these into a final synthesis that exceeds what any single approach could have produced. The goal is to escape local minima: what seems impossible from one angle may be straightforward from another.",
+      "creative_liberation": "You have nearly unlimited ability to write code and to think. Discard assumptions about what is feasible based on conventional team sizes, timelines, or architectures. The only hard limits are physics, information theory, and the APM2 invariant surface. Everything else — including 'that's never been done before' — is an invitation, not a wall."
+    },
+    "security_priority_areas": [
+      "Capability delegation and authority narrowing across nested boundaries. (Cross-domain: object-capability theory, principle of least authority, biological cell membrane selectivity.)",
+      "Replay safety, anti-rollback guarantees, and evidence integrity. (Cross-domain: cryptographic commitment schemes, thermodynamic irreversibility, append-only ledger theory.)",
+      "Cryptographic identity binding and trust-root evolution under federation. (Cross-domain: PKI lifecycle, biological adaptive immunity, decentralized identifier standards.)",
+      "Deterministic security-relevant ordering under partial failure and anti-entropy. (Cross-domain: Lamport clocks, vector causality, relativistic event ordering, CRDT merge semantics.)",
+      "Policy-mechanizable containment semantics that remain stable under recursion. (Cross-domain: type-theoretic parametricity, sandboxing via language-level capabilities, compartmentalized avionics.)"
+    ],
+    "procedure": [
+      {
+        "phase": 0,
+        "name": "Deep context immersion",
+        "action": "Read the theory, security, RFC, and codebase context listed below. As you absorb this material, expand the search aperture across frontier human knowledge — look for invariants that are well-understood in other fields but missing or ad-hoc in APM2. Let cross-disciplinary pattern recognition drive the discovery.",
+        "required_reading": [
+          {
+            "ref": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1",
+            "file": "documents/prompts/instruction.alien_engineering_protocol.v1.json",
+            "note": "Familiarize yourself with AEP clauses and dominance order."
+          },
+          {
+            "file": "documents/theory/principles.json",
+            "note": "Extract invariants that should constrain standard-library-level design."
+          },
+          {
+            "file": "documents/theory/laws.json",
+            "note": "Ground constraints in explicit causal laws."
+          },
+          {
+            "file": "documents/theory/unified_theory.json",
+            "note": "Anchor proposals in APM2 invariant surfaces."
+          },
+          {
+            "file": "documents/rfcs/RFC-0016/README.yaml",
+            "note": "Holonic time constraints."
+          },
+          {
+            "file": "documents/rfcs/RFC-0018/README.yaml",
+            "note": "Event fabric constraints and evidence flow."
+          },
+          {
+            "file": "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+            "note": "Boundary, identity, and delegation constraints."
+          },
+          {
+            "file": "documents/security/AGENTS.cac.json",
+            "note": "Security governance context."
+          },
+          {
+            "file": "documents/security/INCIDENT_RESPONSE.cac.json",
+            "note": "Failure response posture and operational expectations."
+          },
+          {
+            "file": "documents/security/NETWORK_DEFENSE.cac.json",
+            "note": "Network-layer threat assumptions and defenses."
+          },
+          {
+            "file": "documents/security/RELEASE_PROCEDURE.cac.json",
+            "note": "Release security posture and control points."
+          },
+          {
+            "file": "documents/security/SECRETS_MANAGEMENT.cac.json",
+            "note": "Secret lifecycle and containment constraints."
+          },
+          {
+            "file": "documents/security/SECURITY_CHECKLIST.cac.json",
+            "note": "Security review and assurance expectations."
+          },
+          {
+            "file": "documents/security/SECURITY_POLICY.cac.json",
+            "note": "Normative security policy constraints."
+          },
+          {
+            "file": "documents/security/SIGNING_AND_VERIFICATION.cac.json",
+            "note": "Authenticity, signing, and verification requirements."
+          },
+          {
+            "file": "documents/security/THREAT_MODEL.cac.json",
+            "note": "Primary threat model and adversarial assumptions."
+          },
+          {
+            "file": "documents/security/consensus-runbook.cac.json",
+            "note": "Consensus security operations and failure handling."
+          },
+          {
+            "file": "documents/work/waivers/WVR-0101.yaml",
+            "note": "Current security exception context."
+          },
+          {
+            "file": "documents/work/waivers/WVR-0102.yaml",
+            "note": "Current security exception context."
+          },
+          {
+            "file": "documents/work/waivers/WVR-0103.yaml",
+            "note": "Current security exception context."
+          }
+        ],
+        "tools": [
+          "read"
+        ],
+        "output": "context_map: { key_security_invariants[], key_threats[], ad_hoc_mechanisms_observed[] }",
+        "budget": {
+          "tc": 80,
+          "ms": 600000
+        }
+      },
+      {
+        "phase": 1,
+        "name": "Reasoning mode selection",
+        "action": "Read the modes-of-reasoning selector (documents/skills/modes-of-reasoning/assets/selector.json). Evaluate its heuristics against the task characteristics surfaced in Phase 0 — consider axes such as certainty vs exploration, adversarial vs cooperative, facts vs values, precision vs velocity, and risk level. Also evaluate the pre-composed patterns (e.g. engineering_safety, architectural_discovery, strategy_uncertainty) for applicability. Select every heuristic entry and/or pattern whose conditions match the current task context. Then read each referenced mode-of-reasoning document (documents/skills/modes-of-reasoning/assets/{id}-{name}.json) for every mode ID in the selected heuristics' 'then' lists and/or pattern arrays. Let the selected reasoning modes inform the inference patterns, uncertainty representations, and problem-solving methods used in all subsequent phases.",
+        "required_reading": [
+          {
+            "file": "documents/skills/modes-of-reasoning/assets/selector.json",
+            "note": "Evaluate heuristics and patterns against task context to select applicable reasoning modes."
+          }
+        ],
+        "dynamic_reading": {
+          "source": "selector.json heuristic and pattern evaluation",
+          "pattern": "documents/skills/modes-of-reasoning/assets/{id}-{name}.json",
+          "note": "Read each mode document for every mode ID selected by matching heuristics and patterns. Mode files are named {id:02d}-{name}.json in the assets directory."
+        },
+        "tools": [
+          "read"
+        ],
+        "output": "reasoning_mode_selection: { matched_heuristics[], matched_patterns[], selected_mode_ids[], modes_read[], reasoning_strategy_summary }",
+        "budget": {
+          "tc": 40,
+          "ms": 300000
+        }
+      },
+      {
+        "phase": 2,
+        "name": "Ad-hoc security gap identification",
+        "action": "Explore the current codebase for security-relevant mechanisms that are ad-hoc, fragmented, or policy-encoded outside reusable primitives. Look for the single gap where a foundational abstraction would most improve future containment at exabyte scale.",
+        "tools": [
+          "read",
+          "rg"
+        ],
+        "output": "gap_analysis: { gap_statement, current_ad_hoc_patterns[], scale_risk_projection, why_now }",
+        "budget": {
+          "tc": 120,
+          "ms": 900000
+        }
+      },
+      {
+        "phase": 3,
+        "name": "Abstraction synthesis",
+        "action": "Generate at least three parallel candidate abstractions that approach the gap from genuinely different angles — different source disciplines, different invariant families, different points on the minimality/expressiveness spectrum. Develop each candidate's logic independently, then recombine the strongest elements into a final synthesis that exceeds what any single approach could have produced. Consider each candidate's semantic contract, trust and threat assumptions, safety properties, and the boundary between core primitive and ecosystem extensions. It's especially valuable to show where the final synthesis lands in the current codebase and which call site benefits first.",
+        "output": "parallel_candidates: [{ name, source_discipline, key_invariant, strengths, limitations }], final_synthesis: { name, primitive_family, semantic_contract, security_properties[], threat_assumptions[], minimal_api_sketch, composability_model, non_apm2_applicability, elements_drawn_from_each_candidate }",
+        "budget": {
+          "tc": 140,
+          "ms": 900000
+        }
+      },
+      {
+        "phase": 4,
+        "name": "Security posture projection",
+        "action": "Consider how this abstraction changes security posture over time, especially under exabyte-scale evidence, anti-entropy, and adversarial federation. Comparing future posture with and without the abstraction helps clarify its value.",
+        "output": "scale_security_projection: { with_abstraction, without_abstraction, containment_delta, verification_delta, liveness_tradeoffs, verifier_economics_notes }",
+        "budget": {
+          "tc": 100,
+          "ms": 600000
+        }
+      },
+      {
+        "phase": 5,
+        "name": "Adversarial security challenge",
+        "action": "Stress-test the design against threat model stressors, misuse scenarios, and minimization pressure. Refine toward an abstraction that is minimal, security-aware, and semantically stable under composition.",
+        "output": {
+          "final_recommendation": "{ name, why_this_abstraction, semantic_laws[], api_sketch, threat_mitigation_summary, staged_adoption_path, falsification_criteria }"
+        },
+        "budget": {
+          "tc": 80,
+          "ms": 600000
+        }
+      }
+    ],
+    "target_output_quality": {
+      "description": "The final recommendation should read like a credible security-primitive seed for Rust ecosystem discussion: minimal, thoughtful, adversarially tested, scale-aware, and grounded in a cross-disciplinary invariant whose durability is independently verifiable.",
+      "valued_elements": [
+        "A clear picture of the current ad-hoc security gap in APM2 — specific code locations help — and why it becomes untenable at exabyte scale.",
+        "The source discipline and transferable invariant that resolves the gap, when one is identifiable.",
+        "Semantic laws or invariants the abstraction preserves under composition, ideally stated as falsifiable predicates.",
+        "Threat-model-linked failure and misuse modes with thoughts on mitigation.",
+        "A concrete first deployment site: the module, trait, or call site in the current codebase where this abstraction could land.",
+        "A staged path from APM2 hardening to broader ecosystem validation.",
+        "Thoughts on verifier economics: how the cost of checking the abstraction's invariant scales with evidence volume."
+      ]
+    },
+    "output_format": {
+      "suggested_sections": [
+        "## Deep Context Immersion",
+        "## Cross-Domain Invariant Survey",
+        "## Parallel Candidate Abstractions",
+        "## Source Discipline and Transferable Invariant",
+        "## Exabyte-Scale Security Posture Projection",
+        "## Adversarial Security Challenge",
+        "## Final Recommendation",
+        "## Appendix: Evidence and Codebase Anchors"
+      ],
+      "primary_file": "documents/work/reports/security_abstraction_discovery.report.{date}.md",
+      "alternate_target_doc_patch": {
+        "enabled_when_target_doc_provided": true,
+        "style": "append_non_normative_annex"
+      }
+    },
+    "required_reading": [
+      "Please read all theory and security artifacts before synthesis — the security corpus provides essential context for grounded proposals.",
+      [
+        "documents/theory/principles.json",
+        "documents/theory/laws.json",
+        "documents/theory/unified_theory.json",
+        "documents/theory/glossary/glossary.json",
+        "documents/security/AGENTS.cac.json",
+        "documents/security/INCIDENT_RESPONSE.cac.json",
+        "documents/security/NETWORK_DEFENSE.cac.json",
+        "documents/security/RELEASE_PROCEDURE.cac.json",
+        "documents/security/SECRETS_MANAGEMENT.cac.json",
+        "documents/security/SECURITY_CHECKLIST.cac.json",
+        "documents/security/SECURITY_POLICY.cac.json",
+        "documents/security/SIGNING_AND_VERIFICATION.cac.json",
+        "documents/security/THREAT_MODEL.cac.json",
+        "documents/security/consensus-runbook.cac.json",
+        "documents/work/waivers/WVR-0101.yaml",
+        "documents/work/waivers/WVR-0102.yaml",
+        "documents/work/waivers/WVR-0103.yaml"
+      ]
+    ],
+    "reading_expansion_policy": {
+      "optional_full_theory_sweep": "documents/theory/*",
+      "trigger": "Only expand when the core reading set leaves unresolved invariant conflicts or unresolved threat-model ambiguities."
+    },
+    "quality_gate": {
+      "minimum_parallel_candidates": 3,
+      "must_include_codebase_anchors": true,
+      "must_include_falsification_criteria": true
+    },
+    "x": {
+      "tools": [
+        "rg",
+        "jq",
+        "cargo"
+      ],
+      "bud": {
+        "tok": 200000,
+        "tc": 600,
+        "ms": 3600000
+      }
+    }
+  }
+}

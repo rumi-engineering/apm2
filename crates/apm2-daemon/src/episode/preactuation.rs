@@ -53,18 +53,18 @@ pub const MAX_REPLAY_ENTRIES: usize = 100_000;
 /// the episode started, actuation is denied (fail-closed).
 pub const DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS: u64 = 30_000;
 
-/// WVR-0001 expiry for transitional governance bypass.
+/// WVR-0101 expiry for transitional governance bypass.
 ///
 /// After this epoch second (UTC), transitional governance uncertainty MUST
 /// deny.
-pub(crate) const WVR_0001_EXPIRY_EPOCH_SECS: u64 = 1_775_520_000;
+pub(crate) const WVR_0101_EXPIRY_EPOCH_SECS: u64 = 1_775_520_000;
 
 #[must_use]
-const fn wvr_0001_active_for_epoch_secs(now_secs: u64) -> bool {
-    now_secs < WVR_0001_EXPIRY_EPOCH_SECS
+const fn wvr_0101_active_for_epoch_secs(now_secs: u64) -> bool {
+    now_secs < WVR_0101_EXPIRY_EPOCH_SECS
 }
 
-/// Returns whether WVR-0001 transitional bypass is currently active.
+/// Returns whether WVR-0101 transitional bypass is currently active.
 #[must_use]
 pub(crate) fn transitional_waiver_active() -> bool {
     let now_secs = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -73,7 +73,7 @@ pub(crate) fn transitional_waiver_active() -> bool {
             // Fail-closed: if wall clock is invalid/regressed we cannot safely
             // validate waiver expiry.
             tracing::error!(
-                waiver = "WVR-0001",
+                waiver = "WVR-0101",
                 error = ?error,
                 "system clock error during waiver expiry check; \
                  treating waiver as expired (fail-closed)"
@@ -82,7 +82,7 @@ pub(crate) fn transitional_waiver_active() -> bool {
         },
     };
 
-    wvr_0001_active_for_epoch_secs(now_secs)
+    wvr_0101_active_for_epoch_secs(now_secs)
 }
 
 // =============================================================================
@@ -132,7 +132,7 @@ pub struct StopAuthority {
     /// local resolver rather than authenticated external transport.
     ///
     /// When `true`, governance freshness evidence is not authoritative and the
-    /// pre-actuation gate applies the WVR-0001 transitional carve-out: it
+    /// pre-actuation gate applies the WVR-0101 transitional carve-out: it
     /// logs uncertainty but does not enforce `stop_uncertainty_deadline` while
     /// the waiver is active (expires 2026-04-07).
     governance_transitional_resolver: AtomicBool,
@@ -794,7 +794,7 @@ impl PreActuationGate {
             },
             StopStatus::Uncertain => {
                 if gov_transitional_resolver {
-                    // WVR-0001: Time-bounded transitional governance bypass.
+                    // WVR-0101: Time-bounded transitional governance bypass.
                     if !transitional_waiver_active() {
                         // Includes fail-closed clock-error path from
                         // `transitional_waiver_active()`.
@@ -803,10 +803,10 @@ impl PreActuationGate {
                     tracing::warn!(
                         elapsed_ms,
                         uncertainty_deadline_ms = self.evaluator.uncertainty_deadline_ms(),
-                        waiver = "WVR-0001",
+                        waiver = "WVR-0101",
                         waiver_expires = "2026-04-07",
                         "governance uncertainty observed under transitional resolver; \
-                         stop_uncertainty_deadline not enforced (WVR-0001 active)"
+                         stop_uncertainty_deadline not enforced (WVR-0101 active)"
                     );
                 } else if elapsed_ms >= self.evaluator.uncertainty_deadline_ms() {
                     return Err(PreActuationDenial::StopUncertain);
@@ -822,7 +822,7 @@ impl PreActuationGate {
         // Track whether budget was actually enforced at pre-actuation.
         // A deferred tracker performs availability plumbing but defers
         // enforcement to EpisodeRuntime, so receipts must report
-        // budget_checked=false to avoid proof-semantics drift (WVR-0002).
+        // budget_checked=false to avoid proof-semantics drift (WVR-0102).
         let has_real_tracker = self
             .budget_tracker
             .as_ref()
@@ -838,7 +838,7 @@ impl PreActuationGate {
         let budget_enforcement_deferred = !budget_checked;
         if budget_enforcement_deferred {
             tracing::debug!(
-                waiver = "WVR-0002",
+                waiver = "WVR-0102",
                 "pre-actuation budget enforcement deferred; budget proof delegated to episode runtime"
             );
         }
@@ -1088,7 +1088,7 @@ impl std::error::Error for ReplayViolation {}
 ///
 /// # Phase-1 Budget Constraint
 ///
-/// Under WVR-0002, Phase 1 wiring allows production constructors to use
+/// Under WVR-0102, Phase 1 wiring allows production constructors to use
 /// [`BudgetTracker::deferred`](crate::episode::budget_tracker::BudgetTracker::deferred),
 /// which yields `budget_checked=false` and
 /// `budget_enforcement_deferred=true`. This verifier accepts that tuple
@@ -1138,7 +1138,7 @@ impl ReplayVerifier {
                     if !stop_checked {
                         return Err(ReplayViolation::StopNotChecked { index: i });
                     }
-                    // WVR-0002 (bound to TCK-00346): deferred budget
+                    // WVR-0102 (bound to TCK-00346): deferred budget
                     // enforcement is accepted only when explicitly bound via
                     // `budget_enforcement_deferred=true`.
                     if !budget_checked && !budget_enforcement_deferred {
@@ -2170,8 +2170,8 @@ mod tests {
                 // Intentional expiry tripwire: this test starts failing on or
                 // after 2026-04-07 to force waiver renewal/replacement.
                 assert!(
-                    wvr_0001_active_for_epoch_secs(now.as_secs()),
-                    "WVR-0001 has expired; transitional bypass must be renewed/replaced"
+                    wvr_0101_active_for_epoch_secs(now.as_secs()),
+                    "WVR-0101 has expired; transitional bypass must be renewed/replaced"
                 );
                 assert!(transitional_waiver_active());
             },
@@ -2184,13 +2184,13 @@ mod tests {
     }
 
     #[test]
-    fn test_wvr_0001_expiry_contract_fails_closed_at_or_after_expiry() {
-        assert!(wvr_0001_active_for_epoch_secs(
-            WVR_0001_EXPIRY_EPOCH_SECS.saturating_sub(1)
+    fn test_wvr_0101_expiry_contract_fails_closed_at_or_after_expiry() {
+        assert!(wvr_0101_active_for_epoch_secs(
+            WVR_0101_EXPIRY_EPOCH_SECS.saturating_sub(1)
         ));
-        assert!(!wvr_0001_active_for_epoch_secs(WVR_0001_EXPIRY_EPOCH_SECS));
-        assert!(!wvr_0001_active_for_epoch_secs(
-            WVR_0001_EXPIRY_EPOCH_SECS.saturating_add(1)
+        assert!(!wvr_0101_active_for_epoch_secs(WVR_0101_EXPIRY_EPOCH_SECS));
+        assert!(!wvr_0101_active_for_epoch_secs(
+            WVR_0101_EXPIRY_EPOCH_SECS.saturating_add(1)
         ));
     }
 

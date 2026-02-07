@@ -1,0 +1,108 @@
+{
+  "kind": "instruction.spec",
+  "schema": "cac.instruction_spec.v1",
+  "schema_version": "1.0.0",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-02-07T06:00:00Z",
+    "dependencies": [
+      "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1"
+    ],
+    "labels": [
+      "alien-engineering",
+      "prompting",
+      "meta-instruction",
+      "signal-maximization",
+      "agent-native",
+      "v1"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-INSTR-EMITTER",
+      "work_id": "alien_prompting_master_v1"
+    },
+    "stable_id": "dcp://apm2.local/instructions/alien_prompting/master@v1"
+  },
+  "payload": {
+    "i": "Alien Prompting: a style of instruction authoring that maximizes the signal-to-noise ratio of agent output by expanding the search space through liberation and cross-domain synthesis, then filtering with durable invariants — rather than narrowing the search space upfront with procedural constraints.",
+    "pb": "Most instructions constrain too early. They tell the agent what to do step by step, which produces compliant but predictable output — the agent follows the path of least resistance through the local minimum the author already imagined. The strongest outputs come from agents that are given rich context, genuine creative freedom, and a small number of durable invariants to filter against. This protocol captures the principles behind that style so they can be applied when authoring new instructions, refining existing ones, or evaluating whether a prompt is likely to surface genuinely novel, high-value ideas.",
+    "t": {
+      "sys": "APM2",
+      "repo": "{repo_root}",
+      "scope": [
+        "documents/prompts",
+        "documents/theory",
+        "documents/skills"
+      ],
+      "environment": "APM2 is agent-native software running exclusively on NixOS. Instructions are consumed by agents, not humans. There are no proprietary platform dependencies, no public-facing interfaces, and no backwards-compatibility burden — the network is resilient to rolling updates. This context is itself an example of the style: declaring the environment liberates the reader from false constraints."
+    },
+    "core_principles": {
+      "description": "These principles describe how to author instructions that surface the best ideas from across human knowledge. They are not rules to comply with — they are patterns that tend to produce higher-signal output.",
+      "expand_then_filter": {
+        "summary": "Expand the search space, then filter with durable invariants.",
+        "detail": "The meta-principle underneath everything else. Most instructions narrow the search space upfront by specifying procedure, format, and acceptable answers. This style does the opposite: it broadens the input (cross-domain sourcing, constraint liberation, parallel candidates) and then filters the output with a small number of invariants that are genuinely hard to fake (scale invariance, physics-first admissibility, falsifiable predicates). The result is output that surprises the author rather than confirming what they already thought."
+      },
+      "invariant_carrying_metaphors": {
+        "summary": "Use concrete images that encode precise technical properties.",
+        "detail": "A well-chosen metaphor does more work than a paragraph of specification. It gives the agent a generative test it can apply to new ideas without consulting a checklist. The metaphor should encode a real invariant — not just evoke a mood. When you find yourself writing an abstract directive like 'design for scalability,' ask: is there a concrete image that carries the same property and is easier to reason against? Two friends over lunch use the same conversational primitives as two heads of state reshaping civilizations — the primitives don't change, only the weight behind them. That image carries scale invariance more precisely than any abstract definition, because the agent can test new proposals against it immediately.",
+        "guidance": "When authoring instructions, look for metaphors that carry invariants. A good metaphor is one where getting the metaphor right automatically gets the technical property right. A decorative metaphor that doesn't constrain anything is noise — leave it out."
+      },
+      "constraint_liberation": {
+        "summary": "Explicitly remove false constraints to expand creative space.",
+        "detail": "Agents arrive with assumptions about what is feasible — inherited from training data full of conventional projects with conventional constraints. Most of these assumptions are false in your context. Explicitly naming what the agent does *not* have to worry about is as valuable as naming what it does. No backwards compatibility. No human ergonomics. No proprietary platform portability. No conventional team-size anxiety. Each false constraint you remove opens a region of the search space the agent would otherwise avoid.",
+        "guidance": "When authoring instructions, include an environment or liberation section that names the constraints that do NOT apply. Be specific. 'You have creative freedom' is vague. 'There is no backwards-compatibility burden because the entire network is resilient to rolling updates' is actionable — the agent can now propose clean-slate designs without hedging."
+      },
+      "cross_disciplinary_transfer": {
+        "summary": "Name the epistemic strategy, not just the aspiration.",
+        "detail": "Telling an agent to 'be creative' produces generic output. Giving it a specific method — find an invariant that is well-understood and proven durable in one field, then recognize it as the exact missing piece in another — produces cross-domain synthesis. E.g. 'The strongest abstractions in computing history emerged this way: content-addressing from cryptography, CRDTs from lattice theory, capability security from access control theory. The instruction should name the method, provide examples of it working, and suggest source disciplines worth searching.'",
+        "guidance": "When authoring instructions, name specific fields whose invariants might transfer (biology, economics, physics, control theory, etc.) and explain *why* cross-domain search works: because invariants that survived decades of pressure in one field are likely to be durable in another. Give the agent a pattern to follow, not just permission to be creative."
+      },
+      "parallel_divergence_then_synthesis": {
+        "summary": "Generate multiple candidates from different angles before converging.",
+        "detail": "Early convergence is the enemy of novel output. When an agent commits to a single approach early, it optimizes within that frame and misses solutions that are obvious from a different angle. The fix is structural: ask for multiple parallel candidates that approach the problem from genuinely different starting points — different source disciplines, different invariant families, different tradeoff priorities. Let each develop its own logic fully. Then recombine the strongest elements into a synthesis that exceeds what any single approach could have produced. The goal is to escape local minima by making the search multi-start.",
+        "guidance": "When authoring instructions, build the parallel-then-recombine step into the procedure. 'Generate at least three candidates from different angles, develop each independently, then synthesize.' This is more effective than asking for 'the best' approach upfront, which biases toward the first plausible idea."
+      },
+      "invitational_tone": {
+        "summary": "Inspire rather than prescribe. Guidance over compliance.",
+        "detail": "Prescriptive procedure ('You must... Step 1... Step 2... Fail if not...') produces compliant output that follows the letter of the instruction while missing its spirit. Invitational tone ('Consider whether... The strongest proposals tend to... It's especially valuable when...') activates the agent's judgment rather than suppressing it. The agent is more likely to surface genuinely novel ideas when it feels invited to think than when it feels audited for compliance.",
+        "guidance": "When authoring instructions, prefer 'consider whether' over 'you must,' 'the strongest proposals' over 'required elements,' 'it's valuable to' over 'always include.' Use sentence case, not ALL CAPS. Frame phases as 'read this, then think about X' rather than numbered compliance steps. Trust the agent — if you've set the right context and invariants, the quality of its thinking matters more than its adherence to format."
+      },
+      "dual_horizon_value": {
+        "summary": "Demand immediate utility AND long-term architectural leverage. They are not in tension.",
+        "detail": "A common failure mode in ambitious instructions is producing output that is theoretically beautiful but practically useless — or practically useful but architecturally throwaway. The strongest proposals do both: they solve a pain point visible in today's codebase AND compound in value as the system scales. Scale invariance explains why this isn't contradictory: if the invariant is real, it holds at 1KB and 1EB alike. The same primitive that fixes today's bug is the one that holds at civilizational scale.",
+        "guidance": "When authoring instructions, explicitly ask for both horizons. 'Show where this lands in the current codebase' alongside 'show how this compounds at exabyte scale.' Proposals that only deliver on one horizon are a signal that the invariant may not be deep enough."
+      },
+      "soft_tiebreakers": {
+        "summary": "Provide priority orderings for tradeoffs without making them rigid.",
+        "detail": "Agents frequently encounter tradeoffs where two good principles conflict. Without guidance, they either freeze or pick arbitrarily. A dominance ordering (e.g. containment > verification > liveness) gives the agent a clear default tiebreaker while 'with room for context-aware interpretation when tradeoffs are explicit' prevents it from becoming a straitjacket. The agent knows which way to lean but retains judgment.",
+        "guidance": "When authoring instructions that involve tradeoffs, state the preferred ordering explicitly but leave room for the agent to deviate when it can articulate why. This is more effective than either rigid rules (which produce brittle output) or no guidance (which produces inconsistent output)."
+      },
+      "environment_as_worldbuilding": {
+        "summary": "Describe the world the agent operates in, not just the task.",
+        "detail": "An agent that knows it is writing for an agent-native NixOS-only system with no public users and no backwards-compatibility burden will make fundamentally different design choices than one that assumes a conventional SaaS product. Declaring the environment is not boilerplate — it is load-bearing context that shapes every decision downstream. Include: what platform, who the users are (or aren't), what constraints don't apply, what the update/deployment model is, what the trust model is.",
+        "guidance": "When authoring instructions, include an environment section early. Be concrete: 'NixOS only, agent-native, not public-facing, no proprietary dependencies, resilient to rolling updates' is more useful than 'internal tool.' The agent internalizes this as the possibility space for its proposals."
+      },
+      "anti_noise_architecture": {
+        "summary": "Structure the instruction to increase signal-to-noise ratio at every stage.",
+        "detail": "Every element of the instruction should either broaden the input or sharpen the filter. Cross-domain sourcing broadens input. Parallel candidates prevent premature convergence. Countermetrics (anti-Goodhart) catch self-deception. Scale invariance filters out primitives that are merely convenient. Falsifiable predicates filter out claims that sound good but can't be tested. If an element of the instruction does neither — if it's procedural overhead, compliance theater, or decorative structure — it is noise. Remove it.",
+        "guidance": "When authoring or reviewing instructions, apply this test to every section: does this broaden input or sharpen filtering? If neither, it's probably noise. Suggested sections are better than required sections. Valued elements are better than must-include checklists. The agent's creative energy should go toward the problem, not toward satisfying the format."
+      }
+    },
+    "applying_these_principles": {
+      "when_authoring_new_instructions": "Read the instruction you've drafted and ask: does this expand the search space or narrow it prematurely? Does the tone invite thinking or demand compliance? Are the constraints real (physics, invariants) or conventional (feasibility anxiety)? Is there a metaphor that carries the key property better than the abstract specification? Have I told the agent what it doesn't need to worry about?",
+      "when_refining_existing_instructions": "Look for harsh language ('must', 'never', 'fails if', 'invalid') and soften to invitational alternatives. Replace numbered compliance procedures with guidance. Rename 'required' to 'suggested.' Add an environment section if one is missing. Check whether non_goals could be framed as out_of_scope_for_now. Look for places where cross-domain sourcing or parallel candidates could replace single-track synthesis.",
+      "when_evaluating_output_quality": "The best sign that an instruction worked is surprise — the output contains an idea the author didn't anticipate. If the output merely confirms what was already suspected, the instruction may be too narrow. If the output is creative but untethered, the invariant filters may be too weak. The sweet spot is output that is novel *and* grounded — ideas from unexpected fields that pass the scale invariance test and the physics-first admissibility check."
+    },
+    "relationship_to_alien_engineering": {
+      "ref": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1",
+      "note": "The Alien Engineering Protocol (AEP) provides the content-level principles — physics-first admissibility, novel synthesis, compounding closure, scale invariance, creative liberation. This prompting protocol captures the *style-level* principles for how to write instructions that reliably activate those content-level principles. AEP says what to think about; Alien Prompting describes how to ask for it."
+    },
+    "x": {
+      "tools": ["read"],
+      "bud": {
+        "tok": 60000,
+        "tc": 100,
+        "ms": 600000
+      }
+    }
+  }
+}

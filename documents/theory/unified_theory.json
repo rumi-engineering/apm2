@@ -377,6 +377,30 @@
           "type": "real",
           "meaning": "Total expected cost objective (tokens + tools + latency + error + security risk).",
           "node_class": "EXPLANATORY"
+        },
+        "SYM-K": {
+          "name": "K",
+          "type": "int",
+          "meaning": "Minimum source-symbol count (or equivalent threshold) required for exact object recovery.",
+          "node_class": "EXPLANATORY"
+        },
+        "SYM-R": {
+          "name": "R",
+          "type": "int",
+          "meaning": "Redundancy budget above K (repair symbols or equivalent recoverability overhead).",
+          "node_class": "EXPLANATORY"
+        },
+        "SYM-p_loss": {
+          "name": "p_loss",
+          "type": "probability",
+          "meaning": "Per-symbol loss/corruption probability under a declared failure model.",
+          "node_class": "EXPLANATORY"
+        },
+        "SYM-P_unrecoverable": {
+          "name": "P_unrecoverable",
+          "type": "probability",
+          "meaning": "Probability an artifact cannot be reconstructed under the declared recoverability contract.",
+          "node_class": "EXPLANATORY"
         }
       },
       "equations": {
@@ -413,6 +437,21 @@
         "EQ-07": {
           "expr": "Objective: minimize E[C_total] = E[C_T + C_U + C_L + C_E + C_S] subject to invariants",
           "purpose": "Verifier economics and risk-weighted gating as optimization under constraints.",
+          "node_class": "EXPLANATORY"
+        },
+        "EQ-08": {
+          "expr": "Recoverability threshold: recoverable <=> n_valid >= K where n_valid = K + R - n_lost",
+          "purpose": "Defines minimum surviving redundancy needed for exact reconstruction.",
+          "node_class": "EXPLANATORY"
+        },
+        "EQ-09": {
+          "expr": "Independent-loss bound: P_unrecoverable = sum_{i=R+1}^{K+R} C(K+R, i) * p_loss^i * (1-p_loss)^(K+R-i)",
+          "purpose": "Quantifies tail-risk for unrecoverable artifacts under independent symbol loss assumptions.",
+          "node_class": "EXPLANATORY"
+        },
+        "EQ-10": {
+          "expr": "Redundancy overhead ratio: rho = R / K",
+          "purpose": "Makes storage/bandwidth recoverability cost explicit for policy tradeoff tuning.",
           "node_class": "EXPLANATORY"
         }
       },
@@ -727,6 +766,29 @@
           "LAW-12",
           "LAW-14",
           "LAW-16"
+        ],
+        "node_class": "BACKGROUND"
+      },
+      "PHY-14": {
+        "name": "Repairability under partial and correlated loss",
+        "statement": "At exabyte scale, partial loss/corruption and partitions are normal. High-value artifacts require explicit recoverability contracts (replication and/or erasure coding) with quantitative failure envelopes and failure-domain assumptions.",
+        "derived_rules": [
+          "declare K, redundancy budget, and target unrecoverable-probability bounds by risk tier",
+          "separate redundancy placement across independent failure domains; model correlated-failure risk explicitly",
+          "treat decode/repair outcomes as receipt-bearing evidence and escalate when observed loss exceeds policy envelope"
+        ],
+        "mechanisms": [
+          "MECH-EVIDENCE-TIERING",
+          "MECH-REPAIRABLE-REDUNDANCY",
+          "MECH-ANTI-ENTROPY",
+          "MECH-FEDERATION",
+          "MECH-RECEIPTS"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-10",
+          "LAW-14",
+          "LAW-15"
         ],
         "node_class": "BACKGROUND"
       }
@@ -1258,6 +1320,7 @@
         "properties": [
           "chunked_blobs + deterministic_manifest",
           "tier_policies (hot/warm/cold)",
+          "risk-tiered recoverability profile (replication and/or erasure coding) with declared failure-domain assumptions",
           "classification + encryption-at-rest",
           "GC only after monotone compaction publishes commitments and loss profile"
         ],
@@ -1283,6 +1346,35 @@
               "compaction.receipt": true
             }
           }
+        }
+      },
+      "MECH-REPAIRABLE-REDUNDANCY": {
+        "name": "Repairable redundancy envelope",
+        "role": "Defines recoverability contracts for authoritative artifacts using replication, erasure coding, or hybrid policies with explicit K/overhead targets, failure-domain placement, and repair evidence.",
+        "properties": [
+          "typed recoverability contract per artifact class and risk tier",
+          "placement across independent failure domains (host/rack/region/provider/trust-domain)",
+          "quantitative unrecoverable-probability target and monitoring hooks",
+          "repair attempts produce machine-checkable evidence artifacts (success or failure)"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-10",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true,
+              "EvidencePublished": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
         }
       },
       "MECH-RECEIPTS": {
@@ -1407,7 +1499,7 @@
       },
       "MECH-ANTI-ENTROPY": {
         "name": "Anti-entropy protocol",
-        "role": "Explicit reconciliation of distributed state across holons/cells; digest-first periodic convergence with conflict recording.",
+        "role": "Explicit reconciliation of distributed state across holons/cells; digest-first periodic convergence with conflict recording and recoverability integrity checks for repairable artifacts.",
         "law_refs": [
           "LAW-10"
         ],
@@ -1430,6 +1522,7 @@
         "contracts": [
           "imports/exports are explicit events bound to commitments and receipts (never ambient trust)",
           "data-plane replication is convergent; shared-authority control-plane facts may require BFT consensus",
+          "artifact redundancy placement SHOULD avoid single shared failure domains for all fragments/copies",
           "partitions are tolerated: local safe progress continues; unsafe cross-boundary effects are denied or deferred",
           "conflicts are recorded as defects; reconciliation is never silent"
         ],
@@ -2766,6 +2859,23 @@
             "LAW-14",
             "LAW-15"
           ]
+        },
+        "INV-F-16": {
+          "node_class": "NORMATIVE",
+          "statement": "Authoritative artifacts at policy-defined risk tiers MUST satisfy explicit recoverability contracts (replication, erasure coding, or hybrid) across declared independent failure domains, with quantitative unrecoverable-probability bounds and receipt-bound repair evidence. Missing or stale recoverability evidence at required boundaries is fail-closed.",
+          "law_refs": [
+            "LAW-03",
+            "LAW-05",
+            "LAW-10",
+            "LAW-14",
+            "LAW-15"
+          ],
+          "mechanism_refs": [
+            "MECH-EVIDENCE-TIERING",
+            "MECH-REPAIRABLE-REDUNDANCY",
+            "MECH-ANTI-ENTROPY",
+            "MECH-RECEIPTS"
+          ]
         }
       },
       "pragmatic_compromises": {
@@ -3657,7 +3767,7 @@
       },
       "DEF-11": {
         "name": "Runtime invariant kernel",
-        "statement": "The minimal non-negotiable runtime kernel is {INV-F-01, INV-F-02, INV-F-03, INV-F-05, INV-F-08, INV-F-09, INV-F-11, INV-F-14, INV-F-15}. Any Tier2+ authoritative transition MUST fail-closed when any kernel invariant is missing, unverifiable, or violated.",
+        "statement": "The minimal non-negotiable runtime kernel is {INV-F-01, INV-F-02, INV-F-03, INV-F-05, INV-F-08, INV-F-09, INV-F-11, INV-F-14, INV-F-15, INV-F-16}. Any Tier2+ authoritative transition MUST fail-closed when any kernel invariant is missing, unverifiable, or violated.",
         "status": "adjudicated",
         "node_class": "NORMATIVE",
         "maturity": "ADJUDICATED",
@@ -3921,6 +4031,11 @@
           "name": "proxy_gap_indicators",
           "definition": "Signals of Goodharting (overfitting to gates, holdout failures, adversarial suite regressions).",
           "node_class": "NORMATIVE"
+        },
+        "MET-VER-05": {
+          "name": "redundancy_overhead_ratio",
+          "definition": "Recoverability overhead ratio (e.g., rho = R/K or equivalent replication multiplier) by artifact class and risk tier.",
+          "node_class": "NORMATIVE"
         }
       },
       "recurrence_reduction": {
@@ -3954,6 +4069,16 @@
         "MET-SEC-03": {
           "name": "receipt_integrity_failures",
           "definition": "Missing/invalid signatures, hash mismatches, or evidence omission at required boundaries.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-SEC-04": {
+          "name": "recoverability_slo_violations",
+          "definition": "Occurrences where observed or model-checked unrecoverable-probability exceeds policy bounds for protected artifacts.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-SEC-05": {
+          "name": "failure_domain_overlap_violations",
+          "definition": "Cases where redundancy placement violates declared independence assumptions (e.g., all fragments in one failure domain).",
           "node_class": "NORMATIVE"
         }
       },
@@ -4265,6 +4390,11 @@
                 "metric_id": "MET-MRG-02",
                 "target": "== 1.0",
                 "unit": "fraction"
+              },
+              {
+                "metric_id": "MET-SEC-05",
+                "target": "== 0",
+                "unit": "count"
               }
             ]
           },
@@ -4321,6 +4451,11 @@
                 "metric_id": "MET-EXT-03",
                 "target": "<= policy.max_operator_burden",
                 "unit": "rate"
+              },
+              {
+                "metric_id": "MET-VER-05",
+                "target": "within policy.redundancy_overhead_bounds[risk_tier]",
+                "unit": "ratio_or_multiplier"
               }
             ]
           },
@@ -4335,6 +4470,11 @@
                 "metric_id": "MET-CSI-06",
                 "target": "within policy trust skew bounds",
                 "unit": "distribution"
+              },
+              {
+                "metric_id": "MET-SEC-04",
+                "target": "<= policy.max_recoverability_slo_violations",
+                "unit": "count"
               }
             ]
           },
@@ -4434,7 +4574,8 @@
             "ledger + CAS + reducers",
             "truth vs projection",
             "merge algebra and compaction",
-            "measurement integrity"
+            "measurement integrity",
+            "recoverability contracts and repair evidence"
           ],
           "node_class": "EXPLANATORY"
         },
@@ -4565,14 +4706,16 @@
             "law_refs": [
               "LAW-07",
               "LAW-10",
+              "LAW-14",
               "LAW-16"
             ],
             "invariant_refs": [
               "INV-F-07",
               "INV-F-12",
-              "INV-F-13"
+              "INV-F-13",
+              "INV-F-16"
             ],
-            "scale_note": "Convergence and summary contracts use the same rules; higher scale changes compaction and locality budgets."
+            "scale_note": "Convergence, summary contracts, and recoverability envelopes use the same rules; higher scale changes compaction, locality budgets, and redundancy geometry."
           },
           "WEAVE-05": {
             "name": "Counterexample Evolution Bundle",

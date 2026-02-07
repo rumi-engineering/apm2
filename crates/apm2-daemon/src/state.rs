@@ -908,7 +908,7 @@ impl DispatcherState {
             TRANSITIONAL_WARN_ONCE.call_once(|| {
                 tracing::warn!(
                     "Governance freshness probe running in transitional local resolver mode; \
-                     resolver success is not authoritative freshness evidence (WVR-0001 path)."
+                     resolver success is not authoritative freshness evidence (WVR-0101 path)."
                 );
             });
             monitor.record_failure();
@@ -1404,7 +1404,7 @@ mod tests {
             "transitional production monitor should remain uncertain"
         );
 
-        // Transitional uncertainty uses the WVR-0001 carve-out and remains
+        // Transitional uncertainty uses the WVR-0101 carve-out and remains
         // gate-allowing while the waiver is active.
         let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
         let receipt = gate

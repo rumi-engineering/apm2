@@ -1875,7 +1875,7 @@ impl IdentityProofV1 {
             profile.verify_directory_proof(directory_head, self.directory_proof())?;
         } else {
             // Tier0/Tier1 transitional fallback while session-open identity
-            // dereference wiring remains deferred (WVR-0003 / TCK-00361).
+            // dereference wiring remains deferred (WVR-0103 / TCK-00361).
             self.directory_proof.verify_against_root(
                 directory_head.directory_root_hash(),
                 directory_head.max_proof_bytes(),
@@ -2138,7 +2138,7 @@ fn hash_bytes(bytes: &[u8]) -> Hash {
 
 /// Validates an identity proof hash at the handler admission boundary.
 ///
-/// **WVR-0003 (Phase 1 limitation):** This validates that the hash is
+/// **WVR-0103 (Phase 1 limitation):** This validates that the hash is
 /// well-formed and non-zero, acting as a shape-only binding commitment.
 /// The caller attests they hold a valid `IdentityProofV1` by providing
 /// its content hash.
@@ -2148,7 +2148,7 @@ fn hash_bytes(bytes: &[u8]) -> Hash {
 /// contract and invalidation correctness). Until then, the hash is bound
 /// into signed ledger event payloads for audit traceability.
 ///
-/// See `documents/security/waivers/WVR-0003.yaml` for the formal waiver.
+/// See `documents/work/waivers/WVR-0103.yaml` for the formal waiver.
 ///
 /// # Errors
 ///

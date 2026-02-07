@@ -97,6 +97,20 @@ rfc_problem_and_imports:
           requirement_ref: "requirements/REQ-HEF-0010.yaml#rfc_requirement"
         - requirement_id: "REQ-HEF-0011"
           requirement_ref: "requirements/REQ-HEF-0011.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0012"
+          requirement_ref: "requirements/REQ-HEF-0012.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0013"
+          requirement_ref: "requirements/REQ-HEF-0013.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0014"
+          requirement_ref: "requirements/REQ-HEF-0014.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0015"
+          requirement_ref: "requirements/REQ-HEF-0015.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0016"
+          requirement_ref: "requirements/REQ-HEF-0016.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0017"
+          requirement_ref: "requirements/REQ-HEF-0017.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0018"
+          requirement_ref: "requirements/REQ-HEF-0018.yaml#rfc_requirement"
       rationale: |
         HEF Phase 1 introduces pulse-plane contracts, ACLs, resource governance,
         and disclosure rules that are not explicit PRD requirements and must be

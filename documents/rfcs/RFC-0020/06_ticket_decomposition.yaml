@@ -881,3 +881,32 @@ rfc_ticket_decomposition:
             - "Formal artifacts are required inputs for stage promotion gates"
             - "Cross-cell governance stop/rotation operations are authenticated and auditable"
           evidence_ids: ["EVID-0036", "EVID-0401", "EVID-0402"]
+
+      - ticket_id: "TCK-00414"
+        title: "Re-architect identity abstraction with spec-driven wire/tag/derivation/resolution contracts"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00414.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Define a spec-driven identity abstraction with explicit wire/tag/derivation/resolution semantics."
+            - "Introduce a shared fail-closed identity wire kernel and migrate current ID families without external wire/text drift."
+            - "Replace implicit sentinel semantics with explicit resolved/unresolved state and resolver contracts."
+          out_of_scope:
+            - "Protocol/session routing changes outside identity surfaces."
+            - "New cryptographic algorithm adoption or PQC migration."
+        binds:
+          requirement_ids: ["REQ-0007", "REQ-0008"]
+          evidence_ids: ["EVID-0007", "EVID-0008", "EVID-0303"]
+        custody_agent_roles: ["AGENT_IMPLEMENTER", "AGENT_REVIEWER"]
+        responsibility_domains: ["DOMAIN_SECURITY", "DOMAIN_RUNTIME", "DOMAIN_API", "DOMAIN_THEORY"]
+        dependencies:
+          - "TCK-00413"
+          - "TCK-00353"
+          - "TCK-00354"
+          - "TCK-00355"
+        definition_of_done:
+          criteria:
+            - "All current ID families use explicit spec contracts for wire/tag/derivation/resolution semantics."
+            - "Existing canonical text/binary forms remain compatible while ambiguity handling is fail-closed."
+            - "Conformance/property tests cover provenance/completeness state transitions and resolver failure paths."
+          evidence_ids: ["EVID-0007", "EVID-0008", "EVID-0303"]

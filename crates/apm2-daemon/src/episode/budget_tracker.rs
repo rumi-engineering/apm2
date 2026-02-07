@@ -241,7 +241,7 @@ impl BudgetTracker {
 
     /// Creates a deferred budget tracker sentinel.
     ///
-    /// WVR-0002 Phase-1 sentinel: this tracker uses unlimited limits and marks
+    /// WVR-0102 Phase-1 sentinel: this tracker uses unlimited limits and marks
     /// enforcement as deferred, so pre-actuation receipts report
     /// `budget_checked=false` with `budget_enforcement_deferred=true` while
     /// actual per-episode budget enforcement occurs in [`EpisodeRuntime`].

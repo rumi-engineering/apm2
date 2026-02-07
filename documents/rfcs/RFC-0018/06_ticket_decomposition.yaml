@@ -499,3 +499,187 @@ rfc_ticket_decomposition:
         - "Navigation outputs are bounded (max_bytes=65536, max_lines=2000) and logged to CAS."
       evidence_ids:
         - "EVID-HEF-0011"
+
+    - ticket_id: "TCK-00415"
+      group: "WorkObject Ledger Cutover Addendum"
+      title: "WorkObject ledger authority cutover: filesystem ticket exit and projection-only truth"
+      requirement_ids:
+        - "REQ-HEF-0012"
+      depends_on:
+        - "TCK-00310"
+        - "TCK-00313"
+        - "TCK-00412"
+      risk_tier: "T3"
+      summary: |
+        Cut over FAC lifecycle runtime authority to WorkObject projections derived
+        from ledger+CAS only. Filesystem ticket YAML becomes non-authoritative
+        metadata and is removed from runtime claim/transition authority paths.
+      files_to_modify:
+        - "crates/apm2-daemon/src/protocol/ (ClaimWork/WorkStatus projection authority path)"
+        - "crates/apm2-daemon/src/work/ (projection builders and validators)"
+        - "crates/apm2-cli/src/commands/fac.rs (projection-first status/read surfaces)"
+      files_to_create: []
+      acceptance_criteria:
+        - "No runtime lifecycle authority path reads filesystem tickets."
+        - "Projection rebuild from ledger+CAS converges deterministically."
+        - "Claim/Status APIs are projection-only for authority decisions."
+      evidence_ids:
+        - "EVID-HEF-0013"
+
+    - ticket_id: "TCK-00416"
+      group: "WorkObject Ledger Cutover Addendum"
+      title: "Lifecycle authority bindings: mandatory delegation/context/stop/budget/view contracts"
+      requirement_ids:
+        - "REQ-HEF-0013"
+      depends_on:
+        - "TCK-00312"
+        - "TCK-00314"
+        - "TCK-00415"
+      risk_tier: "T3"
+      summary: |
+        Enforce mandatory authority bindings on lifecycle transitions and review
+        outcomes. Missing bindings fail closed and emit defects before any
+        authoritative side-effects.
+      files_to_modify:
+        - "crates/apm2-daemon/src/protocol/dispatch.rs (transition validation)"
+        - "crates/apm2-daemon/src/episode/ (receipt binding enforcement)"
+        - "crates/apm2-core/src/work/ (binding-aware reducers/projections)"
+      files_to_create: []
+      acceptance_criteria:
+        - "Transitions fail closed on missing required authority bindings."
+        - "Review/projection outcomes carry required commitment/evidence-index bindings."
+        - "Binding validation includes CAS resolvability checks."
+      evidence_ids:
+        - "EVID-HEF-0014"
+
+    - ticket_id: "TCK-00417"
+      group: "WorkObject Ledger Cutover Addendum"
+      title: "Event-family convergence and replay-equivalence gates for work lifecycle"
+      requirement_ids:
+        - "REQ-HEF-0014"
+      depends_on:
+        - "TCK-00415"
+        - "TCK-00416"
+      risk_tier: "T3"
+      summary: |
+        Implement semantic parity gates across daemon underscore events, reducer
+        dotted events, and protobuf typed events for work lifecycle transitions.
+        Block promotion on unresolved parity defects.
+      files_to_modify:
+        - "crates/apm2-daemon/src/protocol/dispatch.rs (parity checks)"
+        - "crates/apm2-core/src/work/reducer.rs (mapping/validation hooks)"
+        - "proto/kernel_events.proto (mapping coverage confirmation)"
+      files_to_create: []
+      acceptance_criteria:
+        - "Parity checks cover underscore, dotted, and protobuf lifecycle events."
+        - "Replay-equivalence holds with no duplicate external side-effects."
+        - "Promotion is blocked automatically on unresolved parity defects."
+      evidence_ids:
+        - "EVID-HEF-0015"
+
+    - ticket_id: "TCK-00418"
+      group: "WorkObject Ledger Cutover Addendum"
+      title: "HTF authority hardening for FAC lifecycle transitions"
+      requirement_ids:
+        - "REQ-HEF-0015"
+      depends_on:
+        - "TCK-00239"
+        - "TCK-00240"
+        - "TCK-00241"
+        - "TCK-00246"
+        - "TCK-00415"
+      risk_tier: "T3"
+      summary: |
+        Require resolvable time_envelope_ref + admissible clock_profile_hash for
+        authoritative lifecycle transitions and receipts. Enforce tick/envelope
+        temporal authority and deny wall-time authority regressions.
+      files_to_modify:
+        - "crates/apm2-daemon/src/htf/ (envelope/profile validation)"
+        - "crates/apm2-daemon/src/protocol/dispatch.rs (HTF transition gating)"
+        - "crates/apm2-core/src/lease/ (tick-based checks in FAC path)"
+      files_to_create: []
+      acceptance_criteria:
+        - "Missing/unresolvable/disallowed envelope/profile bindings fail closed."
+        - "FAC lease/gate authority checks are tick/envelope-based."
+        - "No wall-time authority regressions remain in privileged FAC paths."
+      evidence_ids:
+        - "EVID-HEF-0016"
+
+    - ticket_id: "TCK-00419"
+      group: "WorkObject Ledger Cutover Addendum"
+      title: "Staged xtask demotion and instruction-plane cutover to apm2 fac"
+      requirement_ids:
+        - "REQ-HEF-0016"
+      depends_on:
+        - "TCK-00324"
+        - "TCK-00410"
+        - "TCK-00411"
+      risk_tier: "T2"
+      summary: |
+        Execute staged xtask authority demotion for FAC lifecycle control and
+        align RoleSpec/skill executable instruction surfaces with runtime defaults.
+      files_to_modify:
+        - "xtask/src/ (lifecycle control semantics)"
+        - "crates/apm2-core/src/fac/builtin_roles.rs (control-plane policy prompts)"
+        - "documents/skills/ (instruction-plane cutover and lint targets)"
+      files_to_create:
+        - "scripts/lint/check_lifecycle_instruction_surface.sh (command drift guard)"
+      acceptance_criteria:
+        - "Stage-2 default lifecycle path avoids direct write side-effects."
+        - "Instruction assets and runtime behavior are lockstep and verifiable."
+        - "CI fails on deprecated lifecycle control command reintroduction."
+      evidence_ids:
+        - "EVID-HEF-0017"
+
+    - ticket_id: "TCK-00420"
+      group: "WorkObject Ledger Cutover Addendum"
+      title: "TCK alias observation window, reconciliation gates, and snapshot-emitter sunset"
+      requirement_ids:
+        - "REQ-HEF-0017"
+      depends_on:
+        - "TCK-00415"
+        - "TCK-00417"
+      risk_tier: "T2"
+      summary: |
+        Keep TCK alias as non-authoritative operator overlay during observation
+        window, enforce alias/work_id reconciliation gates, and sunset snapshot
+        emitters after exit criteria.
+      files_to_modify:
+        - "crates/apm2-daemon/src/work/ (alias/work_id reconciliation projection)"
+        - "crates/apm2-cli/src/commands/fac.rs (observation-window status surfaces)"
+        - "documents/work/tickets/ (snapshot tooling guidance)"
+      files_to_create: []
+      acceptance_criteria:
+        - "ticket_alias is operator-facing only and never authority-bearing."
+        - "Promotion gates require zero unresolved alias/work_id mismatches."
+        - "Snapshot emitters are removed/sunset after criteria pass with historical trace preserved."
+      evidence_ids:
+        - "EVID-HEF-0018"
+
+    - ticket_id: "TCK-00421"
+      group: "WorkObject Ledger Cutover Addendum"
+      title: "Digest-first scale validation: summary receipts, bounded control planes, replay-safe projection"
+      requirement_ids:
+        - "REQ-HEF-0018"
+      depends_on:
+        - "TCK-00416"
+        - "TCK-00417"
+        - "TCK-00418"
+        - "TCK-00420"
+      risk_tier: "T3"
+      summary: |
+        Validate digest-first scale behavior for FAC cutover: summary-first
+        supervision, bounded control-plane payload/queues, and replay-safe
+        projection recovery under partial-loss/retry scenarios.
+      files_to_modify:
+        - "crates/apm2-daemon/src/projection/ (replay/idempotency stress validation)"
+        - "crates/apm2-daemon/src/episode/ (summary/selector retrieval paths)"
+        - "crates/apm2-daemon/tests/ (scale/replay suites)"
+      files_to_create:
+        - "crates/apm2-daemon/tests/fac_digest_first_scale.rs"
+      acceptance_criteria:
+        - "Summary-first supervision remains functional without transcript fan-out."
+        - "Control-plane growth is bounded and observable under stress."
+        - "Replay/anti-entropy drills recover projection state without duplicate side-effects."
+      evidence_ids:
+        - "EVID-HEF-0019"

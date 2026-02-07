@@ -1,0 +1,1534 @@
+{
+  "schema": "cac.holonic_security_theory.v1",
+  "schema_version": "1.0.0",
+  "kind": "holonic.security_theory",
+  "meta": {
+    "stable_id": "dcp://apm2.security/theory/unified_security_theory@v1",
+    "classification": "INTERNAL",
+    "created_at": "2026-02-07T12:30:00Z",
+    "updated_at": "2026-02-07T12:30:00Z",
+    "labels": [
+      "agent-native",
+      "capability-security",
+      "containment",
+      "fail-closed",
+      "holonic",
+      "security",
+      "theory",
+      "verification-economics"
+    ],
+    "source_of_truth_refs": [
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/security/SECURITY_POLICY.cac.json",
+      "documents/security/THREAT_MODEL.cac.json",
+      "documents/theory/unified_theory.json"
+    ],
+    "dependencies": [
+      "dcp://apm2.local/governance/holonic_unified_theory@v1",
+      "dcp://apm2.agents/laws/bundle@1",
+      "dcp://apm2.agents/principles/bundle@1",
+      "dcp://apm2.security/doc/agents-index@1"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-SECURITY-GOVERNANCE",
+      "work_id": "DOC-SECURITY-UNIFIED-THEORY-0001",
+      "notes": [
+        "Unified security theory synthesized from 9 operational security documents, 3 active waivers, RFC-0020 HSI constraints, and cross-domain invariant analysis.",
+        "Follows alien_security creative method: deep immersion, parallel framings (boundary-centric, economics-centric, lattice-centric), recombination into unified synthesis.",
+        "Every SEC-LAW traces to operational source documents. Every operational control traces to at least one SEC-LAW.",
+        "Scale invariance validated: each law holds identically from 1 agent to 10^9 agents; only leverage changes.",
+        "When this document conflicts with RFC-0020 or SECURITY_POLICY, those are the source of truth and this document MUST be updated."
+      ],
+      "source_receipts": []
+    },
+    "integrity": {
+      "integrity_proof_ref": "dcp://apm2.local/integrity_proofs/unified_security_theory@v1",
+      "integrity_proof_required_for_enforcement": true,
+      "integrity_proof_kind": "ed25519"
+    }
+  },
+  "payload": {
+    "doc": {
+      "id": "APM2-SECURITY-UNIFIED-THEORY-0001",
+      "title": "Unified Security Theory for Agent-Native Holonic Systems",
+      "status": "draft",
+      "effective_date": "2026-02-07",
+      "audience": [
+        "adapter",
+        "agents",
+        "daemon",
+        "kernel",
+        "policy",
+        "security",
+        "tooling"
+      ],
+      "scope_tags": [
+        "capability-security",
+        "containment-first",
+        "dual-lattice",
+        "fail-closed",
+        "federation",
+        "freshness-enforcement",
+        "holonic-mesh",
+        "proof-carrying",
+        "scale-invariant",
+        "verification-economics"
+      ]
+    },
+
+    "thesis": {
+      "one_line": "Security in agent-native holonic systems is the mechanical enforcement of containment boundaries through proof-carrying authority, where every effect is receipt-evidenced, every delegation is strictly narrowing, and every ambiguity resolves to denial.",
+      "core_claims": {
+        "SEC-THESIS-01": {
+          "statement": "Authority is never ambient — it is carried, narrowed, and verified at every boundary crossing.",
+          "implications": [
+            "All side effects flow through daemon-mediated, capability-gated paths.",
+            "Delegation cannot widen authority across any dimension.",
+            "Verification cost is bounded and first-class."
+          ],
+          "law_refs": ["SEC-LAW-01", "SEC-LAW-03", "SEC-LAW-05"],
+          "node_class": "NORMATIVE"
+        },
+        "SEC-THESIS-02": {
+          "statement": "Effects without receipts do not exist in the system's epistemic model — unproven is indistinguishable from non-existent.",
+          "implications": [
+            "Receipt bundles are the sole evidence of authoritative state transitions.",
+            "Replay verification is always possible for any claimed effect.",
+            "Batch verification amortizes proof cost without weakening guarantees."
+          ],
+          "law_refs": ["SEC-LAW-02", "SEC-LAW-05", "SEC-LAW-09"],
+          "node_class": "NORMATIVE"
+        },
+        "SEC-THESIS-03": {
+          "statement": "Ambiguity is adversarial — unknown, stale, or unverifiable state defaults to denial, not warning.",
+          "implications": [
+            "Fail-closed is the universal default; fail-open requires explicit waiver.",
+            "Freshness is a machine-checkable policy, not best-effort.",
+            "Stop uncertainty propagates denial within bounded latency."
+          ],
+          "law_refs": ["SEC-LAW-04", "SEC-LAW-06", "SEC-LAW-10"],
+          "node_class": "NORMATIVE"
+        },
+        "SEC-THESIS-04": {
+          "statement": "Security primitives are scale-invariant — the same containment contract applies at recursion depth 1 and 10^9; only the consequence magnitude changes.",
+          "implications": [
+            "Verification economics must be O(log n) or better, never O(n).",
+            "Batch attestation and Merkle proof structures are mandatory, not optimization.",
+            "A law that needs special modes at higher scale reveals a missing, more fundamental law underneath."
+          ],
+          "law_refs": ["SEC-LAW-05", "SEC-LAW-09", "SEC-LAW-10"],
+          "node_class": "NORMATIVE"
+        }
+      }
+    },
+
+    "parallel_framings": {
+      "note": "Three independent framings were developed before recombination, per alien_security creative method. Each frames the same 10 invariants from a different organizing principle.",
+      "frame_a_boundary_centric": {
+        "organizing_principle": "Security is the geometry of trust boundaries — what crosses, at what granularity, under what proof obligation.",
+        "key_insight": "Every security failure is a boundary violation: either something crossed that shouldn't have (injection, leakage), or something that crossed lacked proof (ambient authority, forged identity), or the boundary's freshness contract was stale (replay, rollback).",
+        "strongest_contribution": "Clarifies that SEC-LAW-01 (no ambient authority), SEC-LAW-07 (digest-first), and SEC-LAW-08 (dual-lattice) are all boundary geometry laws — they constrain what geometric properties the trust boundary enforces.",
+        "law_grouping": ["SEC-LAW-01", "SEC-LAW-03", "SEC-LAW-07", "SEC-LAW-08"]
+      },
+      "frame_b_economics_centric": {
+        "organizing_principle": "Security is a verification economics game — the defender's cost to verify must be bounded while the attacker's cost to forge must be unbounded.",
+        "key_insight": "Every security primitive has a verification cost. At exabyte scale, any O(n) verification becomes a DoS vector. The defender's advantage comes from amortized batch verification (O(1) signature checks per batch + O(K log B) hashing) while the attacker must forge each proof independently.",
+        "strongest_contribution": "Clarifies that SEC-LAW-05 (bounded verification), SEC-LAW-09 (batch attestation), and SEC-LAW-10 (continuity economics) are verification economics laws — they bound the defender's cost while maintaining proof strength.",
+        "law_grouping": ["SEC-LAW-05", "SEC-LAW-09", "SEC-LAW-10"]
+      },
+      "frame_c_lattice_centric": {
+        "organizing_principle": "Security is a lattice algebra — authority, taint, classification, and delegation form partially ordered sets where safety is meet-closure and violations are lattice breaks.",
+        "key_insight": "The PermeabilityReceiptV1 meet operator (componentwise intersection across all authority dimensions) is a lattice meet. The dual-lattice taint/classification enforcement is a product lattice. Strict-subset delegation is monotone narrowing in the authority lattice. All three are instances of the same algebraic structure.",
+        "strongest_contribution": "Clarifies that SEC-LAW-03 (strict-subset delegation), SEC-LAW-08 (dual-lattice), and SEC-LAW-02 (receipt authority) share algebraic structure — they are all lattice-meet-closure requirements.",
+        "law_grouping": ["SEC-LAW-02", "SEC-LAW-03", "SEC-LAW-08"]
+      },
+      "recombination": "The unified theory uses boundary geometry as the primary organizing frame (what crosses boundaries), lattice algebra as the structural invariant (how authority and taint compose), and verification economics as the scaling constraint (how proof cost bounds). Each law is annotated with its framing provenance."
+    },
+
+    "security_laws": [
+      {
+        "id": "SEC-LAW-01",
+        "name": "No Ambient Authority",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "No agent, holon, or process holds authority by default. All authority is explicitly delegated through capability-gated, daemon-mediated paths. Side effects without capability delegation are mechanically impossible, not merely prohibited.",
+        "framing_provenance": ["boundary-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Object-capability security (Dennis & Van Horn 1966, Miller 2006)",
+          "transferable_invariant": "In a pure capability system, the only way to obtain authority is to receive it from an entity that already holds it. No 'ambient' authority exists.",
+          "biological_analog": "Biological cells have no default access to anything outside their membrane — all signaling requires specific receptor-ligand binding.",
+          "why_transfers": "Agent-native holonic systems are structurally isomorphic to capability systems: holons are objects, PermeabilityReceiptV1 is the capability token, and the daemon mediates all authority flow."
+        },
+        "operational_source_refs": [
+          "SP-INV-001",
+          "CHK-BOUNDARY-AUTHORITY-01",
+          "CHK-TOOL-CONTEXT-01",
+          "CHK-TOOL-CONTEXT-02"
+        ],
+        "rfc_refs": ["RFC-0020 §0.1 constraint 1", "RFC-0020 §4.5", "RFC-0020 §8.3"],
+        "general_theory_refs": ["LAW-05", "PRIN-038"],
+        "operationalization": [
+          {
+            "rule": "Daemon mediation",
+            "desc": "All side effects (tool calls, file I/O, network, governance) flow through the daemon process; capsule processes have no direct OS-level authority.",
+            "subrules": [
+              "**Capsule isolation:** Capsule processes run under capability-restricted sandbox profiles.",
+              "**Tool gating:** Every tool invocation is validated against CapabilityManifestV1 scope before execution.",
+              "**Context firewall:** Reads outside the ContextPackManifest allowlist are denied by default."
+            ]
+          },
+          {
+            "rule": "PermeabilityReceiptV1 as sole entrance",
+            "desc": "Cross-holon authority is admitted only via PermeabilityReceiptV1; no other authority admission path exists."
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-01-NO-AMBIENT",
+          "acceptance_predicate": "∀ effect ∈ system_effects: ∃ capability_chain(effect) ∧ daemon_mediated(effect)",
+          "required_evidence": [
+            "capability_manifest_hash",
+            "episode_envelope_hash",
+            "tool_call_receipt"
+          ],
+          "machine_checks": [
+            "no_direct_syscall_from_capsule",
+            "tool_call_matches_manifest_scope",
+            "context_read_within_allowlist"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "Identical at depth 1 (single capsule → daemon) and depth 10^9 (billion-holon federation). The daemon mediation boundary is recursive: each holon's daemon enforces the same contract regardless of nesting depth.",
+        "failure_mode": [
+          "direct_syscall_escape_from_capsule",
+          "tool_string_bypass_around_typed_mediation",
+          "context_read_outside_allowlist"
+        ],
+        "remediation_pattern": [
+          "strengthen_sandbox_profile",
+          "add_missing_tool_type_to_mediation_layer",
+          "shrink_context_allowlist_to_minimum_required"
+        ]
+      },
+      {
+        "id": "SEC-LAW-02",
+        "name": "Receipt-Backed Authority",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "Every authoritative state transition produces a machine-readable receipt stored in CAS and linked via the ledger. Effects without receipts are treated as non-existent. Receipt authentication uses direct signature or AuthoritySealV1 over Merkle batch roots.",
+        "framing_provenance": ["lattice-centric", "boundary-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Cryptographic commitment schemes and authenticated data structures (Merkle 1979)",
+          "transferable_invariant": "A commitment scheme binds a party to a value such that the commitment can be verified without revealing the value, and the party cannot change the value after commitment. Receipts are commitments to effects.",
+          "biological_analog": "Enzyme-substrate reactions produce measurable products (receipts); the cell's metabolic state is the sum of verified products, not claimed intentions.",
+          "why_transfers": "Agent-native effects are stochastic and potentially adversarial. Receipt commitment provides the same non-repudiation guarantee as cryptographic commitments: once committed, the effect is bound."
+        },
+        "operational_source_refs": [
+          "SP-INV-002",
+          "CHK-RECEIPT-AUTH-01",
+          "CHK-RECEIPT-AUTH-02",
+          "CHK-RECEIPT-AUTH-03",
+          "CHK-RECEIPT-AUTH-04"
+        ],
+        "rfc_refs": ["RFC-0020 §1.3.1", "RFC-0020 §9.5"],
+        "general_theory_refs": ["LAW-01", "LAW-07", "PRIN-045", "PRIN-046", "PRIN-047"],
+        "operationalization": [
+          {
+            "rule": "Receipt production",
+            "desc": "Every successful gate pass, tool execution, and governance decision produces a receipt stored in CAS.",
+            "subrules": [
+              "**Direct signature:** Single-issuer receipts carry Ed25519 signature over canonical receipt bytes.",
+              "**AuthoritySealV1:** Batch receipts carry Merkle root signature + per-receipt inclusion proof.",
+              "**Ledger anchoring:** All receipts are linked to a ledger sequence position."
+            ]
+          },
+          {
+            "rule": "Receipt verification",
+            "desc": "Receipt authentication resolves the full trust chain: receipt → EpisodeEnvelope → CapabilityManifest → PermeabilityReceiptV1.",
+            "subrules": [
+              "**Proof bytes bounded:** Decoder bounds enforced before acceptance.",
+              "**Verification failures emit defects:** Cannot silently downgrade."
+            ]
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-02-RECEIPT-BACKED",
+          "acceptance_predicate": "∀ authoritative_transition t: ∃ receipt(t) ∧ cas_stored(receipt(t)) ∧ ledger_linked(receipt(t)) ∧ signature_valid(receipt(t))",
+          "required_evidence": [
+            "receipt_hash",
+            "cas_storage_proof",
+            "ledger_link",
+            "signature_or_authority_seal"
+          ],
+          "machine_checks": [
+            "receipt_exists_in_cas",
+            "receipt_signature_valid_or_seal_inclusion_valid",
+            "receipt_ledger_anchor_consistent",
+            "proof_bytes_within_bound"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "At depth 1, each receipt is individually signed. At depth 10^9, AuthoritySealV1 batch verification provides O(1) signature checks per batch + O(K log B) hashing. The receipt semantic contract is identical; only the verification amortization changes.",
+        "failure_mode": [
+          "promotion_without_receipt",
+          "receipt_signature_forgery",
+          "merkle_inclusion_proof_invalid",
+          "silent_verification_downgrade"
+        ],
+        "remediation_pattern": [
+          "block_promotion_when_receipts_missing",
+          "revoke_compromised_signing_keys",
+          "emit_defect_on_verification_failure",
+          "re_anchor_batch_root_to_ledger"
+        ]
+      },
+      {
+        "id": "SEC-LAW-03",
+        "name": "Strict-Subset Delegation",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "Every delegation narrows authority across ALL dimensions simultaneously: scope, budgets, stop predicates, attestation floor, input taint, output classification, expiry, and fanout caps. The meet operator on AuthorityVectorV1 enforces componentwise intersection — no dimension can widen.",
+        "framing_provenance": ["lattice-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Lattice theory and capability security (principle of least authority, POLA)",
+          "transferable_invariant": "In a bounded lattice, the meet of two elements is their greatest lower bound. Authority delegation as lattice meet guarantees monotone narrowing: child ≤ parent across every dimension.",
+          "biological_analog": "Cellular differentiation narrows potential: a stem cell can become anything, but each differentiation step irreversibly constrains what the cell can become. Authority delegation is irreversible narrowing.",
+          "why_transfers": "AuthorityVectorV1 is a product lattice over multiple ordered dimensions. The meet operator computes componentwise minimum/intersection, which is exactly the lattice meet. This algebraic structure guarantees that no delegation path can escalate authority."
+        },
+        "operational_source_refs": [
+          "SP-INV-005",
+          "CHK-BOUNDARY-AUTHORITY-03",
+          "CHK-BOUNDARY-AUTHORITY-04"
+        ],
+        "rfc_refs": ["RFC-0020 §8.3.2.1", "RFC-0020 §8.3.2.2"],
+        "general_theory_refs": ["LAW-05", "LAW-14", "PRIN-071"],
+        "operationalization": [
+          {
+            "rule": "Meet operator enforcement",
+            "desc": "The meet(parent, child) operator computes componentwise intersection across all AuthorityVectorV1 dimensions.",
+            "subrules": [
+              "**risk_tier_ceiling:** min(parent, child)",
+              "**capability_manifest:** strict_subset(parent, child)",
+              "**budgets:** componentwise_min(parent, child)",
+              "**stop_condition:** strengthened (child stop is stricter)",
+              "**attestation_floor:** max(parent, child) — attestation requirements only increase",
+              "**taint_floor:** max(parent, child) — taint requirements only increase",
+              "**classification_ceiling:** min(parent, child) — output classification only narrows",
+              "**expiry:** intersection(parent, child) — time window only shrinks",
+              "**fanout_caps:** componentwise_min(parent, child)"
+            ]
+          },
+          {
+            "rule": "Missing delegation fail-closed",
+            "desc": "Missing or unverifiable delegation artifacts cause denial, not fallback to ambient authority."
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-03-STRICT-SUBSET",
+          "acceptance_predicate": "∀ delegation(parent, child): meet(parent.authority, child.authority) = child.authority ∧ child.authority ≤ parent.authority",
+          "required_evidence": [
+            "parent_authority_vector",
+            "child_authority_vector",
+            "permeability_receipt"
+          ],
+          "machine_checks": [
+            "meet_operator_produces_child_vector",
+            "no_dimension_wider_than_parent",
+            "delegation_chain_terminates_at_root_authority"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "The meet operator is the same lattice operation whether applied once (depth 1) or recursively through 10^9 levels. Each application narrows, so the deepest child has the most constrained authority. The algebraic guarantee is depth-independent.",
+        "failure_mode": [
+          "delegation_widening_in_any_dimension",
+          "confused_deputy_via_child_escalation",
+          "missing_permeability_receipt_at_boundary"
+        ],
+        "remediation_pattern": [
+          "validate_meet_output_equals_child_vector",
+          "add_confused_deputy_prevention_check",
+          "deny_on_missing_permeability_receipt"
+        ]
+      },
+      {
+        "id": "SEC-LAW-04",
+        "name": "Fail-Closed Under Ambiguity",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "When the security state is unknown, stale, ambiguous, or unverifiable, the system denies actuation. Fail-open requires an explicit, time-bounded waiver with audit trail. 'Warn and continue' is not a valid security posture for authority-bearing paths.",
+        "framing_provenance": ["boundary-centric", "economics-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Safety engineering and fault-tolerant avionics (DO-178C)",
+          "transferable_invariant": "In safety-critical systems, unknown state is treated as unsafe state. The system transitions to a known-safe configuration (denial) rather than proceeding under uncertainty.",
+          "biological_analog": "The immune system's default response to unknown antigens is inflammatory rejection, not tolerance. Tolerance must be explicitly learned (thymic selection). The cost of false negatives (infection) exceeds false positives (autoimmune response).",
+          "why_transfers": "Agent-native systems operate under stochastic, potentially adversarial conditions. The asymmetry between missed-attack cost (unbounded damage) and false-denial cost (bounded delay) makes fail-closed the rational default."
+        },
+        "operational_source_refs": [
+          "SP-INV-006",
+          "SP-ID-002",
+          "SP-RUNTIME-002",
+          "SP-RUNTIME-007",
+          "CHK-IDENTITY-FRESHNESS-03",
+          "CHK-IDENTITY-FRESHNESS-04",
+          "CHK-BOUNDARY-AUTHORITY-04",
+          "WVR-0101",
+          "WVR-0102",
+          "WVR-0103"
+        ],
+        "rfc_refs": ["RFC-0020 §0.1 constraint 3", "RFC-0020 §4.4", "RFC-0020 §11.3.1"],
+        "general_theory_refs": ["LAW-01", "LAW-12", "LAW-14", "PRIN-092"],
+        "operationalization": [
+          {
+            "rule": "Universal deny-on-ambiguity",
+            "desc": "Any security-relevant check that returns unknown, timeout, parse-error, stale, or unverifiable results in denial.",
+            "subrules": [
+              "**Identity ambiguity:** Unverifiable identity → deny actuation.",
+              "**Freshness ambiguity:** Stale governance/identity heads → deny Tier2+ actuation.",
+              "**Stop-state ambiguity:** Unknown stop state → deny actuation within 250ms.",
+              "**Contract ambiguity:** Mismatched episode envelope → deny admission."
+            ]
+          },
+          {
+            "rule": "Waiver discipline",
+            "desc": "Fail-open behavior requires explicit waiver (WVR-*) with expiry, audit logging, binding tickets, and conditions.",
+            "subrules": [
+              "**Time-bounded:** All waivers carry expiry dates (currently 60-day windows).",
+              "**Logged:** Every waiver bypass is logged at WARN level with waiver ID.",
+              "**Scoped:** Waivers apply to specific control IDs, not blanket relaxation."
+            ]
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-04-FAIL-CLOSED",
+          "acceptance_predicate": "∀ security_check c: (c.result ∈ {unknown, stale, ambiguous, unverifiable}) → actuation_denied(c) ∨ valid_waiver(c)",
+          "required_evidence": [
+            "check_result_log",
+            "denial_receipt_or_waiver_ref",
+            "waiver_expiry_validation"
+          ],
+          "machine_checks": [
+            "no_authority_path_on_ambiguous_check",
+            "waiver_not_expired",
+            "waiver_conditions_met",
+            "waiver_bypass_logged"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "Fail-closed is a local property enforced at each boundary crossing. It does not require global coordination. At 10^9 agents, each individual boundary independently denies on ambiguity — the guarantee composes by construction.",
+        "failure_mode": [
+          "warn_and_continue_on_stale_identity",
+          "expired_waiver_still_active",
+          "silent_downgrade_of_verification_failure",
+          "stop_uncertainty_not_denied_within_slo"
+        ],
+        "remediation_pattern": [
+          "convert_warn_to_deny_on_authority_paths",
+          "automate_waiver_expiry_enforcement",
+          "emit_defect_on_verification_failure",
+          "enforce_250ms_stop_uncertainty_deny"
+        ]
+      },
+      {
+        "id": "SEC-LAW-05",
+        "name": "Bounded Verification Economics",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "Verification cost is first-class and bounded. Identity verification is O(log n) in namespace size. Proof bytes are bounded before acceptance. Batch attestation provides O(1) signature checks per batch. Any O(n) verification path is a denial-of-service vector and MUST be eliminated.",
+        "framing_provenance": ["economics-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Information theory and authenticated data structures (Merkle trees, sparse Merkle tries)",
+          "transferable_invariant": "Membership proof in an authenticated dictionary of size n requires O(log n) hash computations and O(log n) proof bytes. This is information-theoretically optimal for tree-structured commitments.",
+          "biological_analog": "The adaptive immune system uses O(log n)-like antigen recognition via clonal selection and affinity maturation, rather than O(n) exhaustive antibody scanning against every possible pathogen.",
+          "why_transfers": "At 10^12 holons, O(n) identity verification (linear registry scan) would require scanning trillions of entries per check. O(log n) directory proof + O(1) signature verification is the only scaling strategy that keeps defender cost bounded while attacker cost remains linear in forgery attempts."
+        },
+        "operational_source_refs": [
+          "SP-INV-004",
+          "SP-ID-001",
+          "CHK-IDENTITY-FRESHNESS-02",
+          "CHK-RECEIPT-AUTH-03",
+          "CHK-CRYPTO-SERIALIZATION-01",
+          "CHK-CRYPTO-SERIALIZATION-03"
+        ],
+        "rfc_refs": ["RFC-0020 §0.1 constraint 10", "RFC-0020 §0.1 constraint 11", "RFC-0020 §0.1 constraint 13", "RFC-0020 §1.7.7", "RFC-0020 §9.5"],
+        "general_theory_refs": ["LAW-08", "LAW-16", "PRIN-003", "PRIN-007", "PRIN-046"],
+        "operationalization": [
+          {
+            "rule": "O(log n) identity verification",
+            "desc": "Identity verification uses HolonDirectoryHeadV1 + IdentityProofV1 with Merkle/SMT membership proofs.",
+            "subrules": [
+              "**No linear scans:** Registry enumeration is forbidden for verification.",
+              "**Proof-carrying:** Identity travels as IdentityProofV1 (certificate chain + directory proof).",
+              "**max_proof_bytes:** Directory heads declare explicit proof size bounds."
+            ]
+          },
+          {
+            "rule": "Bounded decode economics",
+            "desc": "All boundary decoders enforce pre-decode byte bounds and post-decode collection bounds before trust decisions.",
+            "subrules": [
+              "**Pre-decode:** Maximum wire bytes checked before deserialization.",
+              "**Post-decode:** Maximum collection element count checked after deserialization.",
+              "**Violations fail-closed:** Bound violations are denial, not truncation."
+            ]
+          },
+          {
+            "rule": "Batch attestation amortization",
+            "desc": "High-volume receipts use AuthoritySealV1 with Merkle batch roots for amortized O(1) signature verification per batch.",
+            "subrules": [
+              "**<1% overhead contract:** Additional CPU and network overhead ≤ 1% vs baseline commit path.",
+              "**Ledger-anchored roots:** Batch roots are ledger-anchored, not free-floating."
+            ]
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-05-BOUNDED-VERIFICATION",
+          "acceptance_predicate": "∀ verification v: cost(v) ∈ O(log n) ∧ proof_bytes(v) ≤ max_proof_bytes ∧ decode_bytes(v) ≤ max_decode_bytes",
+          "required_evidence": [
+            "proof_byte_count",
+            "decode_byte_count",
+            "verification_cost_profile"
+          ],
+          "machine_checks": [
+            "identity_proof_uses_merkle_path_not_linear_scan",
+            "pre_decode_byte_bound_enforced",
+            "post_decode_collection_bound_enforced",
+            "batch_overhead_within_one_percent"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "At depth 1, verification is trivially bounded. At depth 10^9, the same O(log n) proof structure applies — only the tree depth grows logarithmically. The <1% overhead contract is scale-invariant by construction: it's a ratio, not an absolute bound.",
+        "failure_mode": [
+          "linear_identity_scan_at_scale",
+          "unbounded_proof_bytes_causing_oom",
+          "unbounded_collection_decode_causing_dos",
+          "batch_overhead_exceeding_budget"
+        ],
+        "remediation_pattern": [
+          "replace_linear_scan_with_merkle_proof",
+          "enforce_max_proof_bytes_from_directory_head",
+          "add_post_decode_collection_bound",
+          "profile_and_bound_batch_overhead"
+        ]
+      },
+      {
+        "id": "SEC-LAW-06",
+        "name": "Freshness as Machine-Checkable Policy",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "Freshness of identity, governance policy, and stop-state authority is a machine-checkable contract (FreshnessPolicyV1), not best-effort. Tier2+ paths fail closed on stale or unverifiable freshness. Wall-clock timestamps are forbidden as authority input; only HTF-compatible temporal references are valid.",
+        "framing_provenance": ["boundary-centric", "economics-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Distributed systems temporal ordering (Lamport 1978, hybrid logical clocks)",
+          "transferable_invariant": "In an asynchronous distributed system, wall-clock time cannot be trusted for ordering authority-bearing events. Causal ordering (logical clocks, HLC/HTF) provides the only reliable temporal reference for distributed consensus.",
+          "biological_analog": "Biological cells use molecular gradients and receptor binding (local, verifiable signals) for temporal coordination, not global time references. Cell-cycle checkpoints verify local state freshness before allowing progression.",
+          "why_transfers": "Holonic federation is asynchronous and adversarial. Wall-clock reliance enables clock-skew attacks (THR-AUTH-02: Lease Drift). HTF-anchored freshness policies provide the same guarantee as Lamport causality: if event A happened-before event B in the causal order, then A's timestamp < B's timestamp."
+        },
+        "operational_source_refs": [
+          "SP-INV-006",
+          "SP-ID-002",
+          "SP-RUNTIME-002",
+          "CHK-IDENTITY-FRESHNESS-01",
+          "CHK-IDENTITY-FRESHNESS-02",
+          "CHK-IDENTITY-FRESHNESS-03",
+          "WVR-0101"
+        ],
+        "rfc_refs": ["RFC-0020 §0.1 constraint 10b", "RFC-0020 §1.8", "RFC-0020 §1.9", "RFC-0020 §2.4.8"],
+        "general_theory_refs": ["LAW-09", "LAW-18", "PRIN-049"],
+        "operationalization": [
+          {
+            "rule": "FreshnessPolicyV1 enforcement",
+            "desc": "Each risk tier has explicit staleness thresholds and staleness actions (deny, downgrade, or allow with bounded lag).",
+            "subrules": [
+              "**Tier0/Tier1:** May accept stale heads with bounded lag; downgrade to read-only.",
+              "**Tier2+:** MUST fail-closed on staleness; no downgrade path.",
+              "**Tier3+:** Stop-state freshness additionally enforced with 250ms deny SLO."
+            ]
+          },
+          {
+            "rule": "HTF temporal anchoring",
+            "desc": "Authority-bearing temporal references use HTF boundary IDs, not wall-clock timestamps.",
+            "subrules": [
+              "**EpochSealV1:** Optional but federation-critical; binds HTF envelope + optional VDF proof.",
+              "**Anti-replay:** Cross-cell admission enforces both trust validity AND temporal validity."
+            ]
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-06-FRESHNESS-POLICY",
+          "acceptance_predicate": "∀ tier2_plus_actuation a: freshness_verified(a.identity_head) ∧ freshness_verified(a.governance_head) ∧ freshness_verified(a.stop_state) ∧ ¬wall_clock_authority(a)",
+          "required_evidence": [
+            "freshness_policy_ref",
+            "identity_head_timestamp",
+            "governance_head_timestamp",
+            "stop_state_freshness_proof"
+          ],
+          "machine_checks": [
+            "identity_head_within_freshness_threshold",
+            "governance_head_within_freshness_threshold",
+            "stop_state_within_250ms_deny_slo",
+            "no_wall_clock_in_authority_path"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "FreshnessPolicyV1 is evaluated locally at each boundary crossing. At depth 10^9, each holon independently checks freshness against its local policy. The policy contract is identical; only the staleness thresholds may vary by risk tier (which is itself a local property).",
+        "failure_mode": [
+          "stale_identity_head_accepted_at_tier2",
+          "wall_clock_used_for_authority_decision",
+          "stop_uncertainty_not_denied_within_250ms",
+          "clock_skew_exploitation_for_lease_extension"
+        ],
+        "remediation_pattern": [
+          "enforce_freshness_policy_on_all_tier2_paths",
+          "replace_wall_clock_with_htf_boundary_ids",
+          "implement_stop_uncertainty_deny_timer",
+          "use_htf_for_lease_expiry_not_wall_clock"
+        ]
+      },
+      {
+        "id": "SEC-LAW-07",
+        "name": "Digest-First Boundaries",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "Trust boundaries exchange hashes and selectors, never raw payloads. Content is dereferenced from CAS after hash verification. This bounds bandwidth, prevents injection via raw payload smuggling, and enables deduplication across the federation.",
+        "framing_provenance": ["boundary-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Content-addressed storage (git, IPFS, Nix store) and communication-avoiding algorithms",
+          "transferable_invariant": "In communication-avoiding algorithm design (Demmel et al.), minimizing data movement (bytes across boundaries) rather than computation is the dominant optimization. Content-addressing achieves this by replacing payload transfer with hash comparison + selective dereference.",
+          "biological_analog": "DNA replication uses template-based verification (hash comparison) before synthesizing new strands (payload retrieval). The cell doesn't copy random sequences — it verifies the template hash first.",
+          "why_transfers": "At exabyte scale, raw payload propagation across holon boundaries is a bandwidth DoS vector. Digest-first communication reduces cross-boundary traffic to O(hash_size) per item, with payload retrieval only on verified demand."
+        },
+        "operational_source_refs": [
+          "SP-INV-003",
+          "CHK-CRYPTO-SERIALIZATION-01",
+          "CHK-CRYPTO-SERIALIZATION-02"
+        ],
+        "rfc_refs": ["RFC-0020 §0.1 constraint 6", "RFC-0020 §3.3"],
+        "general_theory_refs": ["LAW-06", "LAW-07", "PRIN-005", "PRIN-013", "PRIN-045"],
+        "operationalization": [
+          {
+            "rule": "Hash-first exchange",
+            "desc": "Cross-boundary communication uses content hashes as primary references; payloads are CAS-retrieved after hash verification.",
+            "subrules": [
+              "**EpisodeEnvelopeV1:** Binds all authority via hashes (repo_hash, lockfile_hash, policy_hash, toolchain_hash, manifest_hash, contract_hash, context_hash).",
+              "**Receipt pointers:** ReceiptPointerV1 uses receipt_hash + authority_seal_hash + merkle_inclusion_proof.",
+              "**Canonicalization:** Deterministic serialization before hashing/signing."
+            ]
+          },
+          {
+            "rule": "CAS dereference after verification",
+            "desc": "Raw payload retrieval from CAS occurs only after the hash has been verified against a trusted authority chain."
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-07-DIGEST-FIRST",
+          "acceptance_predicate": "∀ boundary_crossing bc: payload(bc) = cas_dereference(verified_hash(bc)) ∧ ¬raw_payload_transfer(bc)",
+          "required_evidence": [
+            "content_hash",
+            "cas_retrieval_proof",
+            "canonicalization_evidence"
+          ],
+          "machine_checks": [
+            "no_raw_payload_in_boundary_protocol",
+            "hash_verified_before_dereference",
+            "canonicalization_deterministic"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "Digest-first is more valuable at scale, not less. At depth 1, it's a clean design pattern. At depth 10^9, it's the difference between exabyte bandwidth consumption (raw payloads) and kilobyte hash exchange. The protocol is identical; only the savings magnitude changes.",
+        "failure_mode": [
+          "raw_payload_injection_at_boundary",
+          "non_deterministic_canonicalization",
+          "hash_collision_exploitation",
+          "cas_retrieval_without_hash_verification"
+        ],
+        "remediation_pattern": [
+          "replace_raw_payload_with_hash_reference",
+          "enforce_deterministic_canonicalization",
+          "use_collision_resistant_hash_blake3",
+          "verify_hash_chain_before_cas_dereference"
+        ]
+      },
+      {
+        "id": "SEC-LAW-08",
+        "name": "Dual-Lattice Integrity and Confidentiality",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "Operations crossing boundaries enforce BOTH an integrity gate (minimum taint level: UNTRUSTED < SANITIZED < VERIFIED < ATTESTED) AND a confidentiality gate (maximum classification level: PUBLIC < INTERNAL < CONFIDENTIAL < RESTRICTED). The two lattices are independent and jointly enforced — satisfying one does not exempt from the other.",
+        "framing_provenance": ["lattice-centric", "boundary-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Bell-LaPadula (confidentiality) and Biba (integrity) security models; lattice-based access control (Denning 1976)",
+          "transferable_invariant": "Security policy is a lattice homomorphism: subjects and objects carry labels from partially ordered sets, and allowable information flows must respect the order in both confidentiality (no read-up, no write-down) and integrity (no read-down, no write-up) simultaneously.",
+          "biological_analog": "Cell membranes enforce bidirectional selectivity: lipophilic molecules pass freely (classification check) while charged molecules require channel proteins (integrity/taint check). Both gates must pass for transmembrane transport.",
+          "why_transfers": "Agent-native systems face both injection attacks (low-taint input reaching high-impact actuators — integrity failure) and leakage attacks (high-classification output reaching low-clearance channels — confidentiality failure). The dual-lattice structure prevents both simultaneously."
+        },
+        "operational_source_refs": [
+          "SP-RUNTIME-003",
+          "SP-RUNTIME-004",
+          "CHK-INJECTION-CONFIDENTIALITY-01",
+          "CHK-INJECTION-CONFIDENTIALITY-02",
+          "CHK-INJECTION-CONFIDENTIALITY-03",
+          "CHK-INJECTION-CONFIDENTIALITY-04"
+        ],
+        "rfc_refs": ["RFC-0020 §6.4", "RFC-0020 §0.1 constraint 7"],
+        "general_theory_refs": ["LAW-05", "LAW-15", "PRIN-071"],
+        "operationalization": [
+          {
+            "rule": "Taint lattice enforcement (integrity)",
+            "desc": "Input taint propagates monotonically: UNTRUSTED → SANITIZED → VERIFIED → ATTESTED. High-impact actuators require minimum taint level.",
+            "subrules": [
+              "**Prompt injection prevention:** External/untrusted inputs cannot directly drive high-impact actuators.",
+              "**Taint propagation:** Labels propagate across tool invocation and summary paths.",
+              "**Tier3+ hard-fail:** Hard-fail firewall semantics (terminate/deny) on taint violation."
+            ]
+          },
+          {
+            "rule": "Classification lattice enforcement (confidentiality)",
+            "desc": "Output classification is bounded: max output classification ≤ delegation ceiling. Logs, errors, and emissions respect classification boundaries.",
+            "subrules": [
+              "**Secret redaction:** Logs routed through SecretRedactor; patterns auto-redacted.",
+              "**Emission control:** Boundary emissions enforce classification ceiling.",
+              "**No debug leakage:** Sensitive material uses secrecy::SecretString, not String."
+            ]
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-08-DUAL-LATTICE",
+          "acceptance_predicate": "∀ boundary_emission e: taint_level(e.input) ≥ required_taint(e.target) ∧ classification(e.output) ≤ allowed_classification(e.channel)",
+          "required_evidence": [
+            "input_taint_label",
+            "output_classification_label",
+            "target_taint_requirement",
+            "channel_classification_ceiling"
+          ],
+          "machine_checks": [
+            "taint_level_meets_minimum",
+            "classification_level_within_ceiling",
+            "taint_propagation_monotone",
+            "secret_redactor_active_on_log_paths"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "The dual-lattice is a local check at each boundary. At depth 10^9, each boundary independently enforces both gates. The lattice structure composes by construction — the product of correct local checks is a globally correct flow.",
+        "failure_mode": [
+          "prompt_injection_bypassing_taint_check",
+          "secret_leakage_in_logs_or_errors",
+          "classification_downgrade_at_boundary",
+          "taint_label_not_propagated_through_tool_call"
+        ],
+        "remediation_pattern": [
+          "add_taint_check_before_high_impact_actuator",
+          "route_all_log_paths_through_secret_redactor",
+          "enforce_classification_ceiling_at_emission",
+          "propagate_taint_labels_through_tool_mediation_layer"
+        ]
+      },
+      {
+        "id": "SEC-LAW-09",
+        "name": "Pull-Based Anti-Entropy with Budget Bounds",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "Authority synchronization across federation boundaries is pull-only. Byzantine peers cannot force authority admission. Anti-entropy budgets are scoped per episode, cell, and relay. Budget exceedance triggers denial and defect emission, not silent acceptance or degraded processing.",
+        "framing_provenance": ["economics-centric", "boundary-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Byzantine fault tolerance and anti-entropy protocols (Demers et al. 1987, Lamport et al. 1982)",
+          "transferable_invariant": "In a Byzantine fault-tolerant system, correct nodes must bound the influence of faulty nodes. Pull-based synchronization achieves this: a correct node only accepts data it explicitly requested, bounding the influence of any single peer to the pull budget.",
+          "biological_analog": "The innate immune system's complement pathway operates on a pull basis — opsonization (tagging for phagocytosis) requires specific receptor binding, not bulk acceptance of foreign material. Cells actively select what to internalize.",
+          "why_transfers": "Federated holonic systems face Byzantine relays that may attempt to flood authority events (spawn storm, history forgery). Pull-based anti-entropy with per-scope budgets bounds the damage any single Byzantine peer can inflict to the pull budget."
+        },
+        "operational_source_refs": [
+          "SP-RUNTIME-005",
+          "SP-RUNTIME-006",
+          "CHK-CONTINUITY-STOP-01",
+          "RUNBOOK-ALERT-05",
+          "WVR-0102"
+        ],
+        "rfc_refs": ["RFC-0020 §0.1 constraint 8", "RFC-0020 §2.4.3b"],
+        "general_theory_refs": ["LAW-10", "LAW-12", "PRIN-049", "PRIN-051"],
+        "operationalization": [
+          {
+            "rule": "Pull-only authority flow",
+            "desc": "Relays cannot push authority events to holons. All authority synchronization is initiated by the receiving holon.",
+            "subrules": [
+              "**Episode budget:** Per-episode authority ingestion limit.",
+              "**Cell budget:** Per-cell authority ingestion limit.",
+              "**Relay budget:** Per-relay authority ingestion limit."
+            ]
+          },
+          {
+            "rule": "Budget exceedance enforcement",
+            "desc": "Budget exceedance is DENY_ACTUATION_AND_EMIT_DEFECT, not silent degradation.",
+            "subrules": [
+              "**Revocation-wins:** Revocation events take priority in merge semantics.",
+              "**Range caps and fanout caps:** Additional structural bounds on anti-entropy sync volume.",
+              "**Convergence guarantee:** Revocation-wins semantics preserved despite budget bounds."
+            ]
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-09-PULL-BASED-ANTI-ENTROPY",
+          "acceptance_predicate": "∀ authority_sync s: pull_initiated(s) ∧ within_budget(s, scope) ∧ (budget_exceeded(s) → denied(s) ∧ defect_emitted(s))",
+          "required_evidence": [
+            "sync_initiation_proof",
+            "budget_scope_and_current_usage",
+            "denial_receipt_on_exceedance",
+            "defect_record_on_exceedance"
+          ],
+          "machine_checks": [
+            "no_push_authority_from_relay",
+            "budget_tracked_per_scope",
+            "exceedance_triggers_denial",
+            "defect_emitted_on_denial"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "Budget bounds are per-scope (episode, cell, relay), which is a local property. At depth 10^9, each holon maintains its own budget counters. The pull-only invariant is enforced at each boundary independently — no global coordination required.",
+        "failure_mode": [
+          "push_authority_from_byzantine_relay",
+          "budget_exceeded_without_denial",
+          "silent_degradation_on_exceedance",
+          "revocation_blocked_by_budget_cap"
+        ],
+        "remediation_pattern": [
+          "reject_unsolicited_authority_push",
+          "enforce_deny_on_budget_exceedance",
+          "emit_defect_on_silent_degradation",
+          "exempt_revocation_from_ingestion_budget"
+        ]
+      },
+      {
+        "id": "SEC-LAW-10",
+        "name": "Stop-as-Governance-Primitive",
+        "effective_date": "2026-02-07",
+        "status": "active",
+        "statement": "Stop orders are governance primitives, not convenience signals. Capsule processes MUST honor stops within bounded deadlines. Missing or unknown stop state defaults to denial. Tier3+ SLO: stop propagation p99 ≤ 2000ms; denial on uncertainty ≤ 250ms. The stop path is the last line of defense against runaway autonomous execution.",
+        "framing_provenance": ["boundary-centric", "economics-centric"],
+        "cross_domain_provenance": {
+          "source_discipline": "Safety engineering (IEC 61508 functional safety) and distributed consensus (Raft/Paxos leader deposition)",
+          "transferable_invariant": "In functional safety systems, the safety function (emergency stop) has higher priority than the control function (normal operation). The safety function must remain operable even when the control function has failed.",
+          "biological_analog": "Apoptosis (programmed cell death) is a governance primitive in multicellular organisms — cells that fail checkpoint verification are killed within bounded time. Defective apoptosis leads to cancer (runaway autonomous execution).",
+          "why_transfers": "Agent-native holonic systems face the same runaway risk as biological systems: an agent that ignores stop signals can cause unbounded damage. Stop-as-primitive ensures that governance can always halt execution, even under partition or Byzantine behavior."
+        },
+        "operational_source_refs": [
+          "SP-RUNTIME-007",
+          "CHK-CONTINUITY-STOP-02",
+          "CHK-CONTINUITY-STOP-03",
+          "RUNBOOK-ALERT-02",
+          "WVR-0101"
+        ],
+        "rfc_refs": ["RFC-0020 §4.4", "RFC-0020 §11.3.1"],
+        "general_theory_refs": ["LAW-01", "LAW-12", "LAW-14"],
+        "operationalization": [
+          {
+            "rule": "Bounded stop propagation",
+            "desc": "Stop orders propagate through the holonic hierarchy with bounded latency.",
+            "subrules": [
+              "**Tier3+ p99:** Stop propagation ≤ 2000ms end-to-end.",
+              "**Uncertainty deny:** Stop uncertainty denial ≤ 250ms.",
+              "**Fail-safe kernel boundary:** If stop state is unknown, kernel-boundary deny activates."
+            ]
+          },
+          {
+            "rule": "Stop as authority primitive",
+            "desc": "Stop conditions are bound into EpisodeEnvelopeV1 and AuthorityVectorV1. Stop predicates strengthen under delegation (child stop is stricter than parent stop).",
+            "subrules": [
+              "**DrillReceiptV1:** Chaos/partition drills validate stop-path behavior.",
+              "**Defect emission:** Stop SLO violations emit defects and block ratchet promotion.",
+              "**RPO/RTO objectives:** Ledger RPO 300s, CAS RPO 900s, policy root RTO 1800s."
+            ]
+          }
+        ],
+        "verifier": {
+          "predicate_id": "SEC-LAW-10-STOP-PRIMITIVE",
+          "acceptance_predicate": "∀ tier3_plus_holon h: stop_propagation_p99(h) ≤ 2000ms ∧ stop_uncertainty_deny(h) ≤ 250ms ∧ (stop_state_unknown(h) → actuation_denied(h))",
+          "required_evidence": [
+            "stop_propagation_latency_measurement",
+            "stop_uncertainty_deny_measurement",
+            "drill_receipt_v1",
+            "defect_record_on_slo_violation"
+          ],
+          "machine_checks": [
+            "stop_propagation_within_2000ms",
+            "stop_uncertainty_deny_within_250ms",
+            "unknown_stop_state_triggers_denial",
+            "drill_receipt_recorded"
+          ],
+          "fail_closed": true
+        },
+        "scale_invariance": "Stop propagation is hierarchical: each level propagates to its children within bounded time. At depth 10^9, the SLO applies at each level independently. Total propagation time is bounded by tree depth × per-level SLO, but each individual level's contract is identical.",
+        "failure_mode": [
+          "stop_signal_ignored_by_capsule",
+          "stop_propagation_exceeding_slo",
+          "stop_uncertainty_not_denied_within_250ms",
+          "runaway_autonomous_execution"
+        ],
+        "remediation_pattern": [
+          "enforce_capsule_stop_deadline_via_kernel_kill",
+          "profile_and_optimize_stop_propagation_path",
+          "implement_250ms_uncertainty_deny_timer",
+          "emit_defect_and_block_promotion_on_slo_breach"
+        ]
+      }
+    ],
+
+    "security_principles": [
+      {
+        "id": "SEC-PRIN-001",
+        "name": "Principle of Least Authority (POLA)",
+        "title": "Grant the minimum authority necessary for each task",
+        "formal": "∀ task T, agent A: authority(A, T) = minimal_set(required_capabilities(T))",
+        "apm2_mapping": "CapabilityManifestV1 binds tool-scope to the minimum needed. AuthorityVectorV1 meet operator ensures delegation never widens. EpisodeEnvelopeV1 pins the authority context for the duration of execution.",
+        "connections": ["SEC-PRIN-002", "SEC-PRIN-003", "SEC-PRIN-010"],
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-03"],
+        "mechanism_refs": ["SEC-MECH-01", "SEC-MECH-02", "SEC-MECH-04"],
+        "defect_refs": ["SEC-DEFECT-02", "SEC-DEFECT-06"]
+      },
+      {
+        "id": "SEC-PRIN-002",
+        "name": "Capability Confinement",
+        "title": "Capabilities cannot be forged, stolen, or amplified — only held, delegated (narrowed), or revoked",
+        "formal": "∀ capability C: acquire(C) ∈ {delegation_from_holder, explicit_grant_from_root} ∧ ¬forgeable(C)",
+        "apm2_mapping": "PermeabilityReceiptV1 is the sole cross-boundary authority token. It is cryptographically signed and bound to an EpisodeEnvelope. There is no way to construct a valid receipt without holding a signing key that chains to the authority root.",
+        "connections": ["SEC-PRIN-001", "SEC-PRIN-004"],
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-02", "SEC-LAW-03"],
+        "mechanism_refs": ["SEC-MECH-01", "SEC-MECH-02"],
+        "defect_refs": ["SEC-DEFECT-01", "SEC-DEFECT-02"]
+      },
+      {
+        "id": "SEC-PRIN-003",
+        "name": "Defense in Depth",
+        "title": "Multiple independent protection layers so no single failure is catastrophic",
+        "formal": "P(system_breach) = ∏ P(layer_i_breach) for independent layers i ∈ {1..n}",
+        "apm2_mapping": "Sandbox isolation (OS-level) + daemon mediation (process-level) + capability gating (authority-level) + taint checking (data-level) + freshness enforcement (temporal-level). Each layer is independently enforced.",
+        "connections": ["SEC-PRIN-001", "SEC-PRIN-005", "SEC-PRIN-008"],
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-04", "SEC-LAW-08"],
+        "mechanism_refs": ["SEC-MECH-01", "SEC-MECH-06", "SEC-MECH-08"],
+        "defect_refs": ["SEC-DEFECT-03"]
+      },
+      {
+        "id": "SEC-PRIN-004",
+        "name": "Non-Repudiation via Commitment",
+        "title": "Once an effect is committed via receipt, neither party can deny it occurred",
+        "formal": "∀ receipt R: signed(R) ∧ cas_stored(R) ∧ ledger_linked(R) → ¬deniable(R.effect)",
+        "apm2_mapping": "Receipt production, CAS storage, and ledger anchoring create a three-layer commitment that provides non-repudiation. AuthoritySealV1 extends this to batch commitments via Merkle roots.",
+        "connections": ["SEC-PRIN-002", "SEC-PRIN-009"],
+        "law_refs": ["SEC-LAW-02", "SEC-LAW-07"],
+        "mechanism_refs": ["SEC-MECH-03", "SEC-MECH-05", "SEC-MECH-09"],
+        "defect_refs": ["SEC-DEFECT-04"]
+      },
+      {
+        "id": "SEC-PRIN-005",
+        "name": "Asymmetric Cost of Errors",
+        "title": "The cost of a missed attack far exceeds the cost of a false denial",
+        "formal": "E[cost(false_negative)] >> E[cost(false_positive)] → optimal_threshold biased toward denial",
+        "apm2_mapping": "This asymmetry is why fail-closed is the universal default. A missed injection attack can compromise the entire holonic hierarchy. A false denial delays one operation by one retry cycle. The cost ratio justifies aggressive denial under ambiguity.",
+        "connections": ["SEC-PRIN-003", "SEC-PRIN-006"],
+        "law_refs": ["SEC-LAW-04"],
+        "mechanism_refs": ["SEC-MECH-08"],
+        "defect_refs": ["SEC-DEFECT-05"]
+      },
+      {
+        "id": "SEC-PRIN-006",
+        "name": "Temporal Authority Requires Causal Ordering",
+        "title": "Wall-clock time cannot ground authority decisions in asynchronous distributed systems",
+        "formal": "∀ authority_decision D: temporal_reference(D) ∈ HTF_boundary_ids ∧ temporal_reference(D) ∉ wall_clock",
+        "apm2_mapping": "HTF boundary IDs provide the causal ordering substrate. FreshnessPolicyV1 uses these, not wall-clock timestamps, as authority input. This prevents clock-skew attacks (THR-AUTH-02) and ensures temporal validity is verifiable under partition.",
+        "connections": ["SEC-PRIN-007", "SEC-PRIN-005"],
+        "law_refs": ["SEC-LAW-06"],
+        "mechanism_refs": ["SEC-MECH-07", "SEC-MECH-10"],
+        "defect_refs": ["SEC-DEFECT-07"]
+      },
+      {
+        "id": "SEC-PRIN-007",
+        "name": "Revocation Must Win Under Merge",
+        "title": "In any concurrent merge of authority state, revocation takes precedence over grant",
+        "formal": "∀ merge(state_a, state_b): if revoked(x) ∈ state_a ∧ granted(x) ∈ state_b → merged_state(x) = revoked",
+        "apm2_mapping": "CRDT anti-entropy with revocation-wins semantics. This is critical for stop-path safety: if one branch of the federation has revoked authority while another hasn't received the revocation, the merge must honor the revocation.",
+        "connections": ["SEC-PRIN-006", "SEC-PRIN-010"],
+        "law_refs": ["SEC-LAW-09", "SEC-LAW-10"],
+        "mechanism_refs": ["SEC-MECH-10"],
+        "defect_refs": ["SEC-DEFECT-08"]
+      },
+      {
+        "id": "SEC-PRIN-008",
+        "name": "Bidirectional Boundary Selectivity",
+        "title": "Trust boundaries enforce both inbound integrity gates and outbound confidentiality gates",
+        "formal": "∀ boundary B: gate_in(B) = min_taint_check ∧ gate_out(B) = max_classification_check",
+        "apm2_mapping": "The dual-lattice (taint × classification) is applied at every holon boundary. Inbound: taint must meet minimum for the target actuator. Outbound: classification must not exceed the channel ceiling. Both gates are independently enforced.",
+        "connections": ["SEC-PRIN-003", "SEC-PRIN-001"],
+        "law_refs": ["SEC-LAW-08"],
+        "mechanism_refs": ["SEC-MECH-06", "SEC-MECH-08"],
+        "defect_refs": ["SEC-DEFECT-09", "SEC-DEFECT-10"]
+      },
+      {
+        "id": "SEC-PRIN-009",
+        "name": "Verification Economics as First-Class Constraint",
+        "title": "The cost of proof verification must be bounded and explicit, not an afterthought",
+        "formal": "∀ verification V with namespace size n: cost(V) ∈ O(log n) ∧ proof_bytes(V) ≤ declared_bound",
+        "apm2_mapping": "IdentityProofV1 with Merkle directory proofs provides O(log n) verification. AuthoritySealV1 batch verification provides O(1) amortized signature checks. Both have explicit proof byte bounds declared in directory heads.",
+        "connections": ["SEC-PRIN-004", "SEC-PRIN-010"],
+        "law_refs": ["SEC-LAW-05"],
+        "mechanism_refs": ["SEC-MECH-03", "SEC-MECH-05", "SEC-MECH-09"],
+        "defect_refs": ["SEC-DEFECT-11"]
+      },
+      {
+        "id": "SEC-PRIN-010",
+        "name": "Scale Reveals Leverage, Not New Abstractions",
+        "title": "Deepest security primitives are fractal — same contract at every recursion depth",
+        "formal": "∀ security_law L, recursion_depth d: semantic_contract(L, d) = semantic_contract(L, 1); only leverage(L, d) grows with d",
+        "apm2_mapping": "Every SEC-LAW is stated in terms that hold identically from 1 agent to 10^9 agents. When a law needs special modes at higher scale, that signals a missing, more fundamental law underneath. The meet operator, fail-closed denial, digest-first exchange — all are the same at every depth.",
+        "connections": ["SEC-PRIN-001", "SEC-PRIN-009"],
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-02", "SEC-LAW-03", "SEC-LAW-04", "SEC-LAW-05", "SEC-LAW-06", "SEC-LAW-07", "SEC-LAW-08", "SEC-LAW-09", "SEC-LAW-10"],
+        "mechanism_refs": [],
+        "defect_refs": []
+      }
+    ],
+
+    "security_mechanisms": [
+      {
+        "id": "SEC-MECH-01",
+        "name": "PermeabilityReceiptV1",
+        "purpose": "Sole cross-holon authority entrance. Carries delegated authority vector with meet-operator narrowing.",
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-03"],
+        "rfc_ref": "RFC-0020 §8.3",
+        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "key_properties": [
+          "Cryptographically signed authority delegation",
+          "Meet operator enforces componentwise narrowing",
+          "Binds to EpisodeEnvelopeV1 for anti-replay",
+          "Carries full AuthorityVectorV1 (risk tier, budgets, stop, taint, classification, expiry, fanout)"
+        ]
+      },
+      {
+        "id": "SEC-MECH-02",
+        "name": "CapabilityManifestV1",
+        "purpose": "Sealed OCAP handles + scopes (paths, patterns, size, network, risk tier) for tool-level authority.",
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-03"],
+        "rfc_ref": "RFC-0020 §3.2",
+        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "key_properties": [
+          "Tool-scope binding for each delegated capability",
+          "Validated against before every tool invocation",
+          "Hash bound into EpisodeEnvelopeV1",
+          "Strict-subset of parent manifest under delegation"
+        ]
+      },
+      {
+        "id": "SEC-MECH-03",
+        "name": "AuthoritySealV1",
+        "purpose": "Batch receipt authentication via Merkle root signature. Provides O(1) amortized signature verification per batch.",
+        "law_refs": ["SEC-LAW-02", "SEC-LAW-05"],
+        "rfc_ref": "RFC-0020 §9.5",
+        "operational_doc_refs": ["SECURITY_CHECKLIST.cac.json"],
+        "key_properties": [
+          "Merkle batch root signed by cell authority or quorum",
+          "Per-receipt inclusion proofs for individual verification",
+          "Ledger-anchored (not free-floating)",
+          "<1% CPU and network overhead vs baseline commit path"
+        ]
+      },
+      {
+        "id": "SEC-MECH-04",
+        "name": "EpisodeEnvelopeV1",
+        "purpose": "Immutable binding of identity, budgets, stop conditions, pinned snapshots, and authority context for a single episode.",
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-02", "SEC-LAW-06"],
+        "rfc_ref": "RFC-0020 §3.3",
+        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "key_properties": [
+          "Binds: identity, budgets, stop conditions, repo hash, lockfile hash, policy hash, toolchain hash, manifest hash, contract hash, context hash, risk tier, determinism class",
+          "All authoritative receipts MUST bind episode envelope hash",
+          "Prevents replay and confused-deputy attacks via mismatch detection",
+          "Immutable once created — any change requires new episode"
+        ]
+      },
+      {
+        "id": "SEC-MECH-05",
+        "name": "IdentityProofV1",
+        "purpose": "O(log n) identity verification via certificate chain + Merkle directory proof.",
+        "law_refs": ["SEC-LAW-05", "SEC-LAW-06"],
+        "rfc_ref": "RFC-0020 §1.7.7",
+        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "NETWORK_DEFENSE.cac.json"],
+        "key_properties": [
+          "Bundles: cell certificate hash, holon certificate hash, directory head hash, directory proof, as_of_anchor",
+          "O(log n) membership proof in authenticated dictionary",
+          "max_proof_bytes declared in directory head for DoS bound",
+          "Proof-carrying: identity travels with its proof, no registry lookup needed"
+        ]
+      },
+      {
+        "id": "SEC-MECH-06",
+        "name": "Context Firewall",
+        "purpose": "Hard enforcement of context read boundaries for capsule processes.",
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-08"],
+        "rfc_ref": "RFC-0020 §4.5",
+        "operational_doc_refs": ["SECURITY_CHECKLIST.cac.json"],
+        "key_properties": [
+          "Reads outside ContextPackManifest allowlist denied by default",
+          "Tier3+: hard-fail termination + CapsuleViolation + denial receipt",
+          "Prevents covert channels and TOCTOU attacks",
+          "Daemon-mediated: capsule cannot bypass via direct I/O"
+        ]
+      },
+      {
+        "id": "SEC-MECH-07",
+        "name": "FreshnessPolicyV1",
+        "purpose": "Machine-checkable freshness contract with risk-tiered staleness thresholds and actions.",
+        "law_refs": ["SEC-LAW-06"],
+        "rfc_ref": "RFC-0020 §1.8, §1.9, §2.4.8",
+        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "consensus-runbook.cac.json"],
+        "key_properties": [
+          "Per-risk-tier staleness thresholds",
+          "Staleness actions: deny, downgrade, or allow with bounded lag",
+          "HTF-compatible temporal references only",
+          "Cross-cell admission enforces both trust AND temporal validity"
+        ]
+      },
+      {
+        "id": "SEC-MECH-08",
+        "name": "SecretRedactor",
+        "purpose": "Mandatory log and artifact redaction for sensitive material.",
+        "law_refs": ["SEC-LAW-08"],
+        "rfc_ref": "N/A (operational control)",
+        "operational_doc_refs": ["SECRETS_MANAGEMENT.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "key_properties": [
+          "Auto-redacts patterns: *_KEY, *_TOKEN, *_SECRET, *_PASSWORD, cloud/provider prefixes",
+          "Applied to runtime logs, API responses, errors, textual channels",
+          "Paired with secrecy::SecretString for in-memory protection",
+          "Defense-in-depth against confidentiality leakage"
+        ]
+      },
+      {
+        "id": "SEC-MECH-09",
+        "name": "HolonDirectoryHeadV1",
+        "purpose": "Authenticated dictionary commitment for O(log n) membership verification and DoS-bounded proof bytes.",
+        "law_refs": ["SEC-LAW-05"],
+        "rfc_ref": "RFC-0020 §1.7.7",
+        "operational_doc_refs": ["NETWORK_DEFENSE.cac.json"],
+        "key_properties": [
+          "Cell-scoped directory with monotone epoch",
+          "Ledger-anchored root hash (SMT-256 or Patricia trie)",
+          "max_proof_bytes: explicit DoS bound",
+          "Authority-sealed by policy root key"
+        ]
+      },
+      {
+        "id": "SEC-MECH-10",
+        "name": "EpochSealV1",
+        "purpose": "Federation anti-rollback mechanism binding HTF envelope with optional VDF proof.",
+        "law_refs": ["SEC-LAW-06", "SEC-LAW-09"],
+        "rfc_ref": "RFC-0020 §1.9",
+        "operational_doc_refs": ["consensus-runbook.cac.json"],
+        "key_properties": [
+          "Binds HTF envelope for temporal anchoring",
+          "Optional VDF (Verifiable Delay Function) proof for anti-rollback",
+          "Federation-critical for cross-cell temporal coordination",
+          "Prevents rollback attacks where adversary replays old epoch state"
+        ]
+      },
+      {
+        "id": "SEC-MECH-11",
+        "name": "Sigstore Keyless Signing",
+        "purpose": "Eliminate long-lived signing keys from release operations via OIDC → Fulcio → Cosign → Rekor pipeline.",
+        "law_refs": ["SEC-LAW-02"],
+        "rfc_ref": "N/A (release infrastructure)",
+        "operational_doc_refs": ["SIGNING_AND_VERIFICATION.cac.json", "RELEASE_PROCEDURE.cac.json", "AGENTS.cac.json"],
+        "key_properties": [
+          "GitHub Actions OIDC token → Fulcio short-lived certificate → Cosign ephemeral signing → Rekor transparency logging",
+          "No long-lived private keys to store, rotate, or protect",
+          "Identity-constrained verification: must match expected repository and workflow",
+          "SLSA provenance + SBOM for build-origin claims"
+        ]
+      },
+      {
+        "id": "SEC-MECH-12",
+        "name": "DrillReceiptV1",
+        "purpose": "Evidence artifact proving chaos/partition drill execution and stop-path behavior under failure conditions.",
+        "law_refs": ["SEC-LAW-10"],
+        "rfc_ref": "RFC-0020 §11.3.1",
+        "operational_doc_refs": ["consensus-runbook.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "key_properties": [
+          "Records: drill scenario, execution evidence, pass/fail, timing measurements",
+          "Drill scenarios: network partition, ledger append latency, CAS unavailability, stop-path degradation",
+          "Required for Tier3+ stop-path SLO validation",
+          "Provides falsifiable evidence that stop mechanisms work under adversarial conditions"
+        ]
+      }
+    ],
+
+    "security_defects": [
+      {
+        "id": "SEC-DEFECT-01",
+        "name": "AMBIENT_AUTHORITY_ESCAPE",
+        "description": "A capsule process obtained authority without going through daemon-mediated capability paths.",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-01"],
+        "detection": "Sandbox profile violation, direct syscall from capsule, tool invocation without manifest match",
+        "remediation": "Strengthen sandbox profile, add missing tool type to mediation layer"
+      },
+      {
+        "id": "SEC-DEFECT-02",
+        "name": "DELEGATION_WIDENING",
+        "description": "A child holon obtained wider authority than its parent in any dimension of AuthorityVectorV1.",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-03"],
+        "detection": "Meet operator verification: child vector must equal meet(parent, child)",
+        "remediation": "Fix meet operator implementation, add dimension-by-dimension assertion"
+      },
+      {
+        "id": "SEC-DEFECT-03",
+        "name": "SINGLE_LAYER_BYPASS",
+        "description": "A protection layer was bypassed without compensating control from another independent layer.",
+        "severity": "HIGH",
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-08"],
+        "detection": "Security audit finding, penetration test result",
+        "remediation": "Add compensating control at adjacent layer"
+      },
+      {
+        "id": "SEC-DEFECT-04",
+        "name": "RECEIPTLESS_PROMOTION",
+        "description": "An authoritative state transition occurred without producing a receipt stored in CAS and linked to the ledger.",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-02"],
+        "detection": "Ledger audit: transition exists without receipt reference",
+        "remediation": "Block promotion when receipts missing, add receipt production to gate"
+      },
+      {
+        "id": "SEC-DEFECT-05",
+        "name": "FAIL_OPEN_ON_AMBIGUITY",
+        "description": "System proceeded with actuation despite unknown, stale, or unverifiable security state without valid waiver.",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-04"],
+        "detection": "Audit log showing actuation after ambiguous check result without waiver reference",
+        "remediation": "Convert warn-and-continue to deny, add waiver requirement for any fail-open path"
+      },
+      {
+        "id": "SEC-DEFECT-06",
+        "name": "CONFUSED_DEPUTY",
+        "description": "A lower-privilege entity tricked a higher-privilege entity into performing unauthorized actions.",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-01", "SEC-LAW-03"],
+        "detection": "Authority chain audit: verify all tool invocations trace to delegated capabilities",
+        "remediation": "Add confused-deputy prevention check at tool mediation layer"
+      },
+      {
+        "id": "SEC-DEFECT-07",
+        "name": "TEMPORAL_AUTHORITY_VIOLATION",
+        "description": "Authority decision was grounded on wall-clock time instead of HTF-compatible temporal reference.",
+        "severity": "HIGH",
+        "law_refs": ["SEC-LAW-06"],
+        "detection": "Code review, static analysis for wall-clock in authority paths",
+        "remediation": "Replace wall-clock with HTF boundary ID references"
+      },
+      {
+        "id": "SEC-DEFECT-08",
+        "name": "REVOCATION_SUPPRESSION",
+        "description": "Revocation event was suppressed, delayed, or overridden by a concurrent grant during anti-entropy merge.",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-09", "SEC-LAW-10"],
+        "detection": "Anti-entropy audit: verify revocation-wins semantics in all merge operations",
+        "remediation": "Fix merge operator to enforce revocation-wins, add revocation priority test"
+      },
+      {
+        "id": "SEC-DEFECT-09",
+        "name": "PROMPT_INJECTION",
+        "description": "External/untrusted input (low taint) reached a high-impact actuator without taint verification.",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-08"],
+        "detection": "Taint propagation audit, context firewall violation",
+        "remediation": "Add taint check before high-impact actuator, enforce taint propagation through tool chain"
+      },
+      {
+        "id": "SEC-DEFECT-10",
+        "name": "SECRET_LEAKAGE",
+        "description": "High-classification material was emitted to a channel below its classification ceiling.",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-08"],
+        "detection": "SecretRedactor pattern match in log/error output, classification audit on boundary emissions",
+        "remediation": "Route logs through SecretRedactor, enforce classification ceiling at emission"
+      },
+      {
+        "id": "SEC-DEFECT-11",
+        "name": "LINEAR_VERIFICATION_COLLAPSE",
+        "description": "Verification cost grew linearly with namespace size or evidence volume, creating a DoS vector.",
+        "severity": "HIGH",
+        "law_refs": ["SEC-LAW-05"],
+        "detection": "Performance profiling showing O(n) verification, proof byte count exceeding declared bound",
+        "remediation": "Replace linear scan with Merkle proof, enforce max_proof_bytes from directory head"
+      },
+      {
+        "id": "SEC-DEFECT-12",
+        "name": "STOP_PATH_SLO_BREACH",
+        "description": "Stop propagation or uncertainty denial exceeded the Tier3+ SLO (2000ms propagation, 250ms uncertainty deny).",
+        "severity": "CRITICAL",
+        "law_refs": ["SEC-LAW-10"],
+        "detection": "DrillReceiptV1 timing measurements, runtime stop-path telemetry",
+        "remediation": "Profile and optimize stop propagation path, implement kernel-boundary fail-safe"
+      }
+    ],
+
+    "cross_domain_provenance_summary": {
+      "note": "Each security law has deep roots in established disciplines. This summary maps the complete cross-domain heritage.",
+      "disciplines": [
+        {
+          "name": "Object-Capability Security",
+          "founding_works": "Dennis & Van Horn 1966, Miller 2006 (E language, capability discipline)",
+          "laws_grounded": ["SEC-LAW-01", "SEC-LAW-03"],
+          "transferable_invariant": "Authority is held, not ambient; acquired only by delegation from holder or explicit grant from root."
+        },
+        {
+          "name": "Cryptographic Commitment Schemes",
+          "founding_works": "Merkle 1979 (Merkle trees), Pedersen 1991 (commitment schemes)",
+          "laws_grounded": ["SEC-LAW-02", "SEC-LAW-05", "SEC-LAW-07"],
+          "transferable_invariant": "A binding commitment prevents the committer from changing the committed value. Receipt-backed authority is a commitment to effects."
+        },
+        {
+          "name": "Lattice-Based Access Control",
+          "founding_works": "Denning 1976, Bell-LaPadula 1973 (confidentiality), Biba 1977 (integrity)",
+          "laws_grounded": ["SEC-LAW-03", "SEC-LAW-08"],
+          "transferable_invariant": "Security policy as lattice homomorphism: information flow respects partial order in both confidentiality and integrity dimensions."
+        },
+        {
+          "name": "Safety Engineering",
+          "founding_works": "IEC 61508 (functional safety), DO-178C (avionics software)",
+          "laws_grounded": ["SEC-LAW-04", "SEC-LAW-10"],
+          "transferable_invariant": "Safety function has higher priority than control function. Unknown state is unsafe state. Emergency stop must be operable even under control failure."
+        },
+        {
+          "name": "Information Theory and Authenticated Data Structures",
+          "founding_works": "Shannon 1948, Merkle 1979, various sparse Merkle trie designs",
+          "laws_grounded": ["SEC-LAW-05", "SEC-LAW-07"],
+          "transferable_invariant": "Membership proof in authenticated dictionary of size n requires O(log n) computation. Content-addressing enables deduplication and selective retrieval."
+        },
+        {
+          "name": "Distributed Systems Temporal Ordering",
+          "founding_works": "Lamport 1978 (logical clocks), hybrid logical clocks, vector causality",
+          "laws_grounded": ["SEC-LAW-06"],
+          "transferable_invariant": "Wall-clock time is unreliable for ordering in asynchronous distributed systems. Causal ordering provides the only reliable temporal substrate."
+        },
+        {
+          "name": "Byzantine Fault Tolerance",
+          "founding_works": "Lamport et al. 1982 (Byzantine Generals), Demers et al. 1987 (epidemic anti-entropy)",
+          "laws_grounded": ["SEC-LAW-09"],
+          "transferable_invariant": "Correct nodes must bound the influence of faulty nodes. Pull-based synchronization bounds attacker influence to the pull budget."
+        },
+        {
+          "name": "Biological Immune Systems",
+          "founding_works": "Clonal selection theory (Burnet 1957), innate/adaptive immunity",
+          "laws_grounded": ["SEC-LAW-04", "SEC-LAW-05", "SEC-LAW-09", "SEC-LAW-10"],
+          "transferable_invariant": "Default rejection of unknown antigens (fail-closed). O(log n)-like recognition via clonal selection. Pull-based phagocytosis via opsonization. Apoptosis as governance primitive."
+        }
+      ]
+    },
+
+    "traceability_matrix": {
+      "note": "Bidirectional traceability: every operational control maps to at least one SEC-LAW, and every SEC-LAW maps to at least one operational control.",
+      "law_to_operational": {
+        "SEC-LAW-01": ["SP-INV-001", "CHK-BOUNDARY-AUTHORITY-01", "CHK-BOUNDARY-AUTHORITY-02", "CHK-TOOL-CONTEXT-01", "CHK-TOOL-CONTEXT-02"],
+        "SEC-LAW-02": ["SP-INV-002", "CHK-RECEIPT-AUTH-01", "CHK-RECEIPT-AUTH-02", "CHK-RECEIPT-AUTH-03", "CHK-RECEIPT-AUTH-04"],
+        "SEC-LAW-03": ["SP-INV-005", "CHK-BOUNDARY-AUTHORITY-03", "CHK-BOUNDARY-AUTHORITY-04"],
+        "SEC-LAW-04": ["SP-INV-006", "SP-ID-002", "SP-RUNTIME-002", "SP-RUNTIME-007", "CHK-IDENTITY-FRESHNESS-03", "CHK-IDENTITY-FRESHNESS-04", "CHK-BOUNDARY-AUTHORITY-04"],
+        "SEC-LAW-05": ["SP-INV-004", "SP-ID-001", "CHK-IDENTITY-FRESHNESS-02", "CHK-RECEIPT-AUTH-03", "CHK-CRYPTO-SERIALIZATION-01", "CHK-CRYPTO-SERIALIZATION-03"],
+        "SEC-LAW-06": ["SP-INV-006", "SP-ID-002", "SP-RUNTIME-002", "CHK-IDENTITY-FRESHNESS-01", "CHK-IDENTITY-FRESHNESS-02", "CHK-IDENTITY-FRESHNESS-03"],
+        "SEC-LAW-07": ["SP-INV-003", "CHK-CRYPTO-SERIALIZATION-01", "CHK-CRYPTO-SERIALIZATION-02"],
+        "SEC-LAW-08": ["SP-RUNTIME-003", "SP-RUNTIME-004", "CHK-INJECTION-CONFIDENTIALITY-01", "CHK-INJECTION-CONFIDENTIALITY-02", "CHK-INJECTION-CONFIDENTIALITY-03", "CHK-INJECTION-CONFIDENTIALITY-04"],
+        "SEC-LAW-09": ["SP-RUNTIME-005", "SP-RUNTIME-006", "CHK-CONTINUITY-STOP-01"],
+        "SEC-LAW-10": ["SP-RUNTIME-007", "CHK-CONTINUITY-STOP-02", "CHK-CONTINUITY-STOP-03"]
+      },
+      "operational_to_law": {
+        "SP-INV-001": ["SEC-LAW-01"],
+        "SP-INV-002": ["SEC-LAW-02"],
+        "SP-INV-003": ["SEC-LAW-07"],
+        "SP-INV-004": ["SEC-LAW-05"],
+        "SP-INV-005": ["SEC-LAW-03"],
+        "SP-INV-006": ["SEC-LAW-04", "SEC-LAW-06"],
+        "SP-ID-001": ["SEC-LAW-05"],
+        "SP-ID-002": ["SEC-LAW-04", "SEC-LAW-06"],
+        "SP-RUNTIME-001": ["SEC-LAW-01", "SEC-LAW-08"],
+        "SP-RUNTIME-002": ["SEC-LAW-04", "SEC-LAW-06"],
+        "SP-RUNTIME-003": ["SEC-LAW-08"],
+        "SP-RUNTIME-004": ["SEC-LAW-08"],
+        "SP-RUNTIME-005": ["SEC-LAW-09"],
+        "SP-RUNTIME-006": ["SEC-LAW-09"],
+        "SP-RUNTIME-007": ["SEC-LAW-10"],
+        "SP-REL-001": ["SEC-LAW-02"],
+        "SP-TIER-001": ["SEC-LAW-04"],
+        "CHK-BOUNDARY-AUTHORITY-01": ["SEC-LAW-01"],
+        "CHK-BOUNDARY-AUTHORITY-02": ["SEC-LAW-01", "SEC-LAW-02"],
+        "CHK-BOUNDARY-AUTHORITY-03": ["SEC-LAW-03"],
+        "CHK-BOUNDARY-AUTHORITY-04": ["SEC-LAW-03", "SEC-LAW-04"],
+        "CHK-IDENTITY-FRESHNESS-01": ["SEC-LAW-06"],
+        "CHK-IDENTITY-FRESHNESS-02": ["SEC-LAW-05", "SEC-LAW-06"],
+        "CHK-IDENTITY-FRESHNESS-03": ["SEC-LAW-04", "SEC-LAW-06"],
+        "CHK-IDENTITY-FRESHNESS-04": ["SEC-LAW-04"],
+        "CHK-RECEIPT-AUTH-01": ["SEC-LAW-02"],
+        "CHK-RECEIPT-AUTH-02": ["SEC-LAW-02", "SEC-LAW-05"],
+        "CHK-RECEIPT-AUTH-03": ["SEC-LAW-02", "SEC-LAW-05"],
+        "CHK-RECEIPT-AUTH-04": ["SEC-LAW-02"],
+        "CHK-TOOL-CONTEXT-01": ["SEC-LAW-01"],
+        "CHK-TOOL-CONTEXT-02": ["SEC-LAW-01", "SEC-LAW-08"],
+        "CHK-TOOL-CONTEXT-03": ["SEC-LAW-01", "SEC-LAW-08"],
+        "CHK-TOOL-CONTEXT-04": ["SEC-LAW-01"],
+        "CHK-INJECTION-CONFIDENTIALITY-01": ["SEC-LAW-08"],
+        "CHK-INJECTION-CONFIDENTIALITY-02": ["SEC-LAW-08"],
+        "CHK-INJECTION-CONFIDENTIALITY-03": ["SEC-LAW-08"],
+        "CHK-INJECTION-CONFIDENTIALITY-04": ["SEC-LAW-08"],
+        "CHK-FILES-ATOMICITY-01": ["SEC-LAW-01"],
+        "CHK-FILES-ATOMICITY-02": ["SEC-LAW-01"],
+        "CHK-FILES-ATOMICITY-03": ["SEC-LAW-02"],
+        "CHK-CRYPTO-SERIALIZATION-01": ["SEC-LAW-05", "SEC-LAW-07"],
+        "CHK-CRYPTO-SERIALIZATION-02": ["SEC-LAW-07"],
+        "CHK-CRYPTO-SERIALIZATION-03": ["SEC-LAW-04", "SEC-LAW-05"],
+        "CHK-CRYPTO-SERIALIZATION-04": ["SEC-LAW-06"],
+        "CHK-RISK-TIER-01": ["SEC-LAW-04"],
+        "CHK-RISK-TIER-02": ["SEC-LAW-01", "SEC-LAW-08"],
+        "CHK-RISK-TIER-03": ["SEC-LAW-04", "SEC-LAW-06"],
+        "CHK-CONTINUITY-STOP-01": ["SEC-LAW-09"],
+        "CHK-CONTINUITY-STOP-02": ["SEC-LAW-10"],
+        "CHK-CONTINUITY-STOP-03": ["SEC-LAW-10"],
+        "CHK-SUPPLY-CHAIN-01": ["SEC-LAW-02"],
+        "CHK-SUPPLY-CHAIN-02": ["SEC-LAW-02"],
+        "CHK-SUPPLY-CHAIN-03": ["SEC-LAW-02"],
+        "CHK-SUPPLY-CHAIN-04": ["SEC-LAW-02"]
+      }
+    },
+
+    "waiver_registry": {
+      "note": "Active waivers represent explicit, time-bounded relaxations of security laws. Each waiver traces to the law(s) it relaxes.",
+      "active_waivers": [
+        {
+          "waiver_id": "WVR-0101",
+          "title": "Transitional governance freshness bypass",
+          "relaxed_laws": ["SEC-LAW-04", "SEC-LAW-06"],
+          "relaxed_controls": ["SP-INV-006", "SP-RUNTIME-007"],
+          "expires": "2026-04-07",
+          "condition": "Only when governance_transitional_resolver=true; logged at WARN with waiver ID"
+        },
+        {
+          "waiver_id": "WVR-0102",
+          "title": "Deferred pre-actuation budget enforcement",
+          "relaxed_laws": ["SEC-LAW-09"],
+          "relaxed_controls": ["SP-RUNTIME-006"],
+          "expires": "2026-04-07",
+          "condition": "Only BudgetTracker::deferred() sentinel; budget_enforcement_deferred=true bound in receipt"
+        },
+        {
+          "waiver_id": "WVR-0103",
+          "title": "Deferred identity proof CAS dereference",
+          "relaxed_laws": ["SEC-LAW-05"],
+          "relaxed_controls": ["SP-ID-001"],
+          "expires": "2026-04-07",
+          "condition": "Shape-only hash validation (32-byte non-zero) without full CAS dereference; hash bound in signed events"
+        }
+      ]
+    },
+
+    "scale_invariance_validation": {
+      "note": "Each security law is validated for scale invariance: does the semantic contract hold identically from 1 agent to 10^9?",
+      "validation": [
+        {
+          "law": "SEC-LAW-01",
+          "depth_1": "Single capsule → daemon mediation. No ambient authority.",
+          "depth_10e9": "Billion-holon federation → each holon's daemon enforces same contract. Recursive boundary.",
+          "verdict": "SCALE_INVARIANT — daemon mediation is recursive"
+        },
+        {
+          "law": "SEC-LAW-02",
+          "depth_1": "Each receipt individually signed.",
+          "depth_10e9": "Batch verification via AuthoritySealV1. O(1) amortized signature.",
+          "verdict": "SCALE_INVARIANT — same semantic, better amortization at scale"
+        },
+        {
+          "law": "SEC-LAW-03",
+          "depth_1": "Single meet operation.",
+          "depth_10e9": "Recursive meet through 10^9 levels. Deepest child most constrained.",
+          "verdict": "SCALE_INVARIANT — algebraic meet is depth-independent"
+        },
+        {
+          "law": "SEC-LAW-04",
+          "depth_1": "Local deny on ambiguity.",
+          "depth_10e9": "Each boundary independently denies. No global coordination needed.",
+          "verdict": "SCALE_INVARIANT — local property, composes by construction"
+        },
+        {
+          "law": "SEC-LAW-05",
+          "depth_1": "Trivially bounded verification.",
+          "depth_10e9": "O(log n) proof depth grows logarithmically. <1% overhead is a ratio.",
+          "verdict": "SCALE_INVARIANT — logarithmic growth, ratio-based bounds"
+        },
+        {
+          "law": "SEC-LAW-06",
+          "depth_1": "Single freshness check.",
+          "depth_10e9": "Each holon independently checks freshness. Policy is local.",
+          "verdict": "SCALE_INVARIANT — local policy evaluation"
+        },
+        {
+          "law": "SEC-LAW-07",
+          "depth_1": "Clean design pattern.",
+          "depth_10e9": "Exabyte bandwidth savings vs raw payload. Same protocol, larger savings.",
+          "verdict": "SCALE_INVARIANT — more valuable at scale, same contract"
+        },
+        {
+          "law": "SEC-LAW-08",
+          "depth_1": "Single boundary dual check.",
+          "depth_10e9": "Each boundary independently enforces both gates. Product of correct locals.",
+          "verdict": "SCALE_INVARIANT — local check, global correctness by composition"
+        },
+        {
+          "law": "SEC-LAW-09",
+          "depth_1": "Per-scope budgets, trivially bounded.",
+          "depth_10e9": "Each holon maintains own budget counters. Pull-only is per-boundary.",
+          "verdict": "SCALE_INVARIANT — per-scope budgets are local"
+        },
+        {
+          "law": "SEC-LAW-10",
+          "depth_1": "Single stop signal.",
+          "depth_10e9": "Hierarchical propagation. Per-level SLO × tree depth. Each level identical.",
+          "verdict": "SCALE_INVARIANT — per-level contract identical, total bounded by depth"
+        }
+      ]
+    },
+
+    "falsification_criteria": {
+      "note": "For each security law, the falsification criteria specify what evidence would disprove the law's necessity or correctness. This makes the theory scientifically falsifiable, not merely aspirational.",
+      "criteria": [
+        {
+          "law": "SEC-LAW-01",
+          "falsification": "Demonstrate a system at 10^6+ agents where ambient authority is safe — i.e., where removing capability gating does not increase exploit surface or blast radius. If ambient authority can be made safe at scale, this law is unnecessary."
+        },
+        {
+          "law": "SEC-LAW-02",
+          "falsification": "Demonstrate that a receipt-free system can provide equivalent non-repudiation and auditability. If effects can be reliably attributed without receipts, this law is unnecessary."
+        },
+        {
+          "law": "SEC-LAW-03",
+          "falsification": "Demonstrate a delegation scheme where widening is safe — i.e., where children can exceed parent authority without creating confused-deputy or escalation vectors."
+        },
+        {
+          "law": "SEC-LAW-04",
+          "falsification": "Demonstrate that fail-open under ambiguity produces better security outcomes than fail-closed when attack probability × damage exceeds denial cost."
+        },
+        {
+          "law": "SEC-LAW-05",
+          "falsification": "Demonstrate O(n) verification that remains viable at 10^12 namespace size without creating DoS vectors."
+        },
+        {
+          "law": "SEC-LAW-06",
+          "falsification": "Demonstrate that wall-clock authority decisions are safe in an asynchronous, adversarial distributed system."
+        },
+        {
+          "law": "SEC-LAW-07",
+          "falsification": "Demonstrate that raw payload exchange at boundaries scales to exabyte volume without bandwidth collapse or injection vectors."
+        },
+        {
+          "law": "SEC-LAW-08",
+          "falsification": "Demonstrate that single-lattice enforcement (integrity only OR confidentiality only) prevents both injection and leakage."
+        },
+        {
+          "law": "SEC-LAW-09",
+          "falsification": "Demonstrate push-based anti-entropy where Byzantine peers cannot force authority admission even without pull-budget bounds."
+        },
+        {
+          "law": "SEC-LAW-10",
+          "falsification": "Demonstrate that advisory stop signals (non-governance-primitive) prevent runaway autonomous execution in adversarial conditions."
+        }
+      ]
+    }
+  }
+}
