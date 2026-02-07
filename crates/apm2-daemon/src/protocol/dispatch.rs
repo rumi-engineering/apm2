@@ -8207,9 +8207,22 @@ impl PrivilegedDispatcher {
         }
 
         // ---- Phase 1a (TCK-00408): CAS existence validation ----
-        // When CAS is configured, verify the referenced artifact bundle exists
-        // before accepting the review receipt. Fail-closed on lookup errors.
-        if let Some(cas) = &self.cas {
+        // CAS is a hard requirement for review receipt ingestion (fail-closed).
+        // Without CAS, artifact_bundle_hash cannot be verified, so we reject
+        // the request rather than silently skipping validation.
+        let Some(cas) = &self.cas else {
+            warn!(
+                receipt_id = %request.receipt_id,
+                "CAS not configured — rejecting review receipt ingestion (fail-closed). \
+                 CAS is required to verify artifact_bundle_hash."
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "CAS is not configured; review receipt ingestion requires CAS \
+                 for artifact_bundle_hash verification (fail-closed)",
+            ));
+        };
+        {
             let bundle_hash: [u8; 32] = request
                 .artifact_bundle_hash
                 .as_slice()
@@ -21888,6 +21901,9 @@ mod tests {
         /// privileged dispatcher.
         #[test]
         fn test_dispatcher_state_delegate_sublease_production_wiring() {
+            use std::os::unix::fs::PermissionsExt;
+
+            use crate::cas::{DurableCas, DurableCasConfig};
             use crate::state::DispatcherState;
 
             let conn = Connection::open_in_memory().unwrap();
@@ -21898,13 +21914,25 @@ mod tests {
             let session_registry: Arc<dyn SessionRegistry> =
                 Arc::new(InMemorySessionRegistry::new());
 
-            // Construct via production DispatcherState path
-            let state = DispatcherState::with_persistence(
+            // TCK-00408: Use with_persistence_and_cas so CAS is wired —
+            // IngestReviewReceipt now requires CAS (fail-closed).
+            let cas_dir = tempfile::tempdir().expect("tempdir for CAS");
+            std::fs::set_permissions(cas_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("set CAS dir permissions");
+            // Pre-populate CAS with test artifact before state construction.
+            {
+                let cas = DurableCas::new(DurableCasConfig::new(cas_dir.path().to_path_buf()))
+                    .expect("pre-populate CAS");
+                cas.store(TEST_ARTIFACT_CONTENT)
+                    .expect("store test artifact");
+            }
+            let state = DispatcherState::with_persistence_and_cas(
                 session_registry,
                 None, // no metrics
-                Some(Arc::clone(&conn)),
-                None, // generate fresh signing key
-            );
+                Arc::clone(&conn),
+                cas_dir.path(),
+            )
+            .expect("CAS initialization must succeed");
 
             // Wire gate orchestrator via production path
             let signer = Arc::new(apm2_core::crypto::Signer::generate());
@@ -22071,6 +22099,9 @@ mod tests {
         /// regression where hardcoded Tier4 would block all production claims.
         #[test]
         fn test_governance_resolver_claim_then_ingest_review_receipt_production_path() {
+            use std::os::unix::fs::PermissionsExt;
+
+            use crate::cas::{DurableCas, DurableCasConfig};
             use crate::governance::GovernancePolicyResolver;
             use crate::state::DispatcherState;
 
@@ -22082,12 +22113,24 @@ mod tests {
             let session_registry: Arc<dyn SessionRegistry> =
                 Arc::new(InMemorySessionRegistry::new());
 
-            let state = DispatcherState::with_persistence(
+            // TCK-00408: Use with_persistence_and_cas — IngestReviewReceipt
+            // now requires CAS (fail-closed).
+            let cas_dir = tempfile::tempdir().expect("tempdir for CAS");
+            std::fs::set_permissions(cas_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("set CAS dir permissions");
+            {
+                let cas = DurableCas::new(DurableCasConfig::new(cas_dir.path().to_path_buf()))
+                    .expect("pre-populate CAS");
+                cas.store(TEST_ARTIFACT_CONTENT)
+                    .expect("store test artifact");
+            }
+            let state = DispatcherState::with_persistence_and_cas(
                 session_registry,
                 None, // no metrics
-                Some(Arc::clone(&conn)),
-                None, // generate fresh signing key
-            );
+                Arc::clone(&conn),
+                cas_dir.path(),
+            )
+            .expect("CAS initialization must succeed");
 
             // Derive caller actor from test peer credentials
             let test_creds = PeerCredentials {

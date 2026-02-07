@@ -365,16 +365,26 @@ fn run_ai_review(
     emit_receipt_only: bool,
     allow_github_write: bool,
 ) -> Result<()> {
-    // Note: AI reviews spawn background processes that write their own status.
-    // The cutover flags are checked in update_status when the AI reviewer
-    // completes. For now, we just log that the flags are set.
+    // TCK-00408: Export CLI emit-receipt-only flag to environment BEFORE
+    // spawning child reviewer processes, so that ReviewerSpawner (which reads
+    // the cutover policy from env) inherits the same enforcement.
+    if emit_receipt_only {
+        let policy = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
+        // SAFETY: single-threaded xtask CLI — no concurrent env mutation.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(crate::util::XTASK_CUTOVER_POLICY_ENV, policy.env_value());
+        }
+        eprintln!(
+            "  [TCK-00408] emit-receipt-only mode active — exported cutover policy \
+             to env for child processes."
+        );
+    }
     if emit_receipt_only && !allow_github_write {
         eprintln!(
             "  [TCK-00324] Note: emit-receipt-only mode active. AI reviewer will handle cutover."
         );
     }
-    // Store flags for use in manual status update hint
-    let _ = (emit_receipt_only, allow_github_write);
 
     let prompt_path = review_type
         .prompt_path()

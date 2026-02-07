@@ -214,9 +214,15 @@ pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
         }
     }
 
-    // Trigger AI reviews
-    println!("\nTriggering AI reviews...");
-    trigger_ai_reviews(&sh, &pr_url, emit_receipt_only, allow_github_write)?;
+    // Trigger AI reviews — but only if we have a real PR URL.
+    // In emit-only mode the PR URL is a placeholder string, so spawning
+    // reviewers with it would be meaningless.
+    if pr_url.starts_with("(pending projection") {
+        println!("\nSkipping AI reviews — PR URL is a pending projection placeholder.");
+    } else {
+        println!("\nTriggering AI reviews...");
+        trigger_ai_reviews(&sh, &pr_url, emit_receipt_only, allow_github_write)?;
+    }
 
     println!();
     println!("Push complete!");
