@@ -44,8 +44,7 @@
 //! ```rust
 //! use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 //! use apm2_core::fac::{
-//!     CiAttestation, CiAttestationLevel, CiEvidenceImport, CiImportPolicy,
-//!     validate_ci_import,
+//!     CiAttestation, CiAttestationLevel, CiEvidenceImport, CiImportPolicy, validate_ci_import,
 //! };
 //!
 //! // Create an import with verified webhook
@@ -895,8 +894,7 @@ impl Default for CiImportPolicy {
 /// ```rust
 /// use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 /// use apm2_core::fac::{
-///     CiAttestation, CiAttestationLevel, CiEvidenceImport, CiImportPolicy,
-///     validate_ci_import,
+///     CiAttestation, CiAttestationLevel, CiEvidenceImport, CiImportPolicy, validate_ci_import,
 /// };
 ///
 /// let import = CiEvidenceImport::builder()
@@ -1013,14 +1011,10 @@ fn hex_encode(hash: &Hash) -> String {
 /// };
 ///
 /// // CI gating disabled - always allowed (minimum_level ignored)
-/// assert!(
-///     can_transition_to_ready_for_review(false, None, CiAttestationLevel::L1)
-///         .is_ok()
-/// );
+/// assert!(can_transition_to_ready_for_review(false, None, CiAttestationLevel::L1).is_ok());
 ///
 /// // CI gating enabled with no evidence - rejected
-/// let result =
-///     can_transition_to_ready_for_review(true, None, CiAttestationLevel::L1);
+/// let result = can_transition_to_ready_for_review(true, None, CiAttestationLevel::L1);
 /// assert!(matches!(result, Err(CiImportError::CiEvidenceMissing)));
 ///
 /// // CI gating enabled with unverified signature - rejected
@@ -1035,11 +1029,8 @@ fn hex_encode(hash: &Hash) -> String {
 ///     .attestation(unverified_attestation)
 ///     .build()
 ///     .unwrap();
-/// let result = can_transition_to_ready_for_review(
-///     true,
-///     Some(&unverified_import),
-///     CiAttestationLevel::L1,
-/// );
+/// let result =
+///     can_transition_to_ready_for_review(true, Some(&unverified_import), CiAttestationLevel::L1);
 /// assert!(matches!(
 ///     result,
 ///     Err(CiImportError::WebhookSignatureNotVerified)
@@ -1056,11 +1047,7 @@ fn hex_encode(hash: &Hash) -> String {
 ///     .attestation(l0_attestation)
 ///     .build()
 ///     .unwrap();
-/// let result = can_transition_to_ready_for_review(
-///     true,
-///     Some(&l0_import),
-///     CiAttestationLevel::L1,
-/// );
+/// let result = can_transition_to_ready_for_review(true, Some(&l0_import), CiAttestationLevel::L1);
 /// assert!(matches!(
 ///     result,
 ///     Err(CiImportError::InsufficientAttestationLevel { .. })
@@ -1079,12 +1066,7 @@ fn hex_encode(hash: &Hash) -> String {
 ///     .build()
 ///     .unwrap();
 /// assert!(
-///     can_transition_to_ready_for_review(
-///         true,
-///         Some(&l1_import),
-///         CiAttestationLevel::L1
-///     )
-///     .is_ok()
+///     can_transition_to_ready_for_review(true, Some(&l1_import), CiAttestationLevel::L1).is_ok()
 /// );
 ///
 /// // Policy requiring L2 for high-risk scenarios
@@ -1101,11 +1083,7 @@ fn hex_encode(hash: &Hash) -> String {
 ///     .build()
 ///     .unwrap();
 /// // L1 does not meet L2 requirement
-/// let result = can_transition_to_ready_for_review(
-///     true,
-///     Some(&l1_for_l2),
-///     CiAttestationLevel::L2,
-/// );
+/// let result = can_transition_to_ready_for_review(true, Some(&l1_for_l2), CiAttestationLevel::L2);
 /// assert!(matches!(
 ///     result,
 ///     Err(CiImportError::InsufficientAttestationLevel {

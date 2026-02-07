@@ -24,650 +24,74 @@
     "stable_id": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1"
   },
   "payload": {
-    "i": "Alien Engineering Protocol master CAC instruction: unify RFC and strategy prompt discipline into one reusable, theory-complete instruction contract.",
-    "pb": "Prompt-level strategy and RFC guidance is distributed across prompt and document artifacts; this artifact consolidates them into one machine-readable protocol with explicit theory coverage and evergreen guardrails.",
+    "i": "Alien Engineering Protocol: engage deep focus mode and think from first principles in order to come up with genuinely novel, useful, security & performance-first new technology by combining concepts from the frontier of seemingly disparate fields of science and technology.",
+    "pb": "Some initial guidance is distributed across theory, strategy, and RFC artifacts but you are encouraged to use your best judgement to reinvent anything that exists that no longer serves us, and to lean on our existing technology to invent something new. This protocol prioritizes concept weaving, causal theory synthesis, and falsifiable hypothesis generation so outputs stay open-ended, novelty-seeking, and evidence-aware.",
     "t": {
       "sys": "APM2",
-      "repo": "/Users/shovonhasan/Documents/workspaces/apm2",
+      "repo": "/home/ubuntu/Projects/apm2-feb6-doc-updates",
       "scope": [
-        "chatgpt_strategy_prompt.txt",
         "documents/theory",
         "documents/strategy",
-        "documents/rfcs/RFC-0021"
+        "documents/rfcs/RFC-0016",
+        "documents/rfcs/RFC-0019",
+        "documents/rfcs/RFC-0020",
+        "documents/rfcs/RFC-0021",
+        "documents/work/prompts"
       ]
     },
-    "ctx": [
-      "chatgpt_strategy_prompt.txt",
-      "documents/theory/AGENTS.md",
-      "documents/theory/unified_theory.json",
-      "documents/theory/laws.json",
-      "documents/theory/principles.json",
-      "documents/theory/agent_native_architecture.json",
-      "documents/theory/defects.json",
-      "documents/strategy/MASTER_STRATEGY.json",
-      "documents/strategy/NORTH_STAR.json",
-      "documents/strategy/ROADMAP.json",
-      "documents/strategy/BUSINESS_PLAN.json",
-      "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
-    ],
     "lex": {
-      "GOAL_EVERGREEN": "Maximize governed autonomy at civilizational scale in a globally distributed holarchy operating across multi-exabyte to zettabyte evidence and coordination envelopes while preserving mechanical verifiability, recursive composability, physical realizability, and containment-first governance.",
-      "DOMINANCE_ORDER": "Constraint precedence is non-negotiable: containment/security > verification/correctness > liveness/progress.",
-      "THEORY_PRINCIPLES": "Mandatory theory coverage set is documents/theory/principles.json payload.principles[] with 102 entries and contiguous IDs PRIN-001..PRIN-102.",
-      "THEORY_LAWS": "Mandatory law coverage set is documents/theory/laws.json payload.laws[] with active laws LAW-01..LAW-15.",
-      "THEORY_INVARIANTS": "Mandatory invariant surface includes INV-F-01..INV-F-15 from documents/theory/unified_theory.json payload.invariants.fundamental.",
-      "STRATEGY_CLAIMS": "Evergreen strategy claims are MSC-01..MSC-12 from documents/strategy/MASTER_STRATEGY.json and must not regress in ambition, precision, or gateability.",
-      "SCALE_ENVELOPE": "Assume globally distributed operation at multi-exabyte to zettabyte scale across evidence, state, and coordination traffic; every proposal must specify admissible verifier economics, evidence tiering and retention, anti-entropy strategy, and bandwidth-locality controls.",
-      "SINGLE_PLATFORM_INTERNAL_DIST": "Platform constraint is explicit: support a single controlled OS/runtime target (currently Linux/Ubuntu-class) for internal agent-only distribution. Do not add consumer UI, app-store, or multi-platform compatibility requirements unless a hard invariant explicitly demands it.",
-      "TIME_AUTHORITY": "All normative time boundaries use HTF boundary IDs; wall-clock timestamps are display-only and are not admissible for gate truth.",
-      "EVIDENCE_FIRST": "No strategic or technical claim is authoritative without machine-checkable predicates, signed receipts, and replayable evidence bindings.",
-      "FAIL_CLOSED": "Unknown, stale, missing, ambiguous, parse-error, or signature-invalid states are automatic deny outcomes.",
+      "GOAL_EVERGREEN": "Maximize governed autonomy at civilizational scale in a globally distributed holarchy (100B+ agents) operating across exabyte scale evidence and coordination envelopes while preserving mechanical verifiability, recursive composability, physical realizability, and containment-first governance.",
+      "DOMINANCE_ORDER": "Preferred constraint ordering is containment/security > verification/correctness > liveness/progress, with room for context-aware interpretation when tradeoffs are explicit.",
+      "THEORY_PRINCIPLES": "Primary theory reference is documents/theory/principles.json payload.principles[] for the current bundle version; broad coverage is encouraged.",
+      "THEORY_LAWS": "Primary law reference is documents/theory/laws.json payload.laws[] for the current bundle version; broad coverage is encouraged.",
+      "THEORY_INVARIANTS": "Primary invariant surface includes INV-F-01..INV-F-15 from documents/theory/unified_theory.json payload.invariants.fundamental.",
+      "STRATEGY_CLAIMS": "Evergreen strategy claims (MSC-01..MSC-12 in documents/strategy/MASTER_STRATEGY.json) should retain ambition, precision, and gateability.",
+      "SCALE_ENVELOPE": "Use globally distributed exabyte scale as the default reference frame. Proposals should describe verifier economics, evidence tiering/retention, anti-entropy posture, and bandwidth-locality considerations.",
+      "SINGLE_PLATFORM_INTERNAL_DIST": "Avoid premature lock-in to a single architecture, protocol shape, runtime, or distribution path. Keep multiple admissible implementation families alive unless explicit invariants or threat boundaries force commitment.",
+      "TIME_AUTHORITY": "Normative timing is best anchored to HTF boundary IDs; wall-clock timestamps are primarily display context.",
+      "PRE_LIVE_STATUS": "APM2 is currently pre-live. Backward-compatibility constraints are usually optional unless a concrete dependency explicitly requires them. Prefer conceptual clarity and strong theory over migration scaffolding.",
+      "REFERENCE_SYSTEM_INSPIRATION": "Use existing Alien Engineering-aligned systems as inspiration surfaces: Holonic Time Fabric (RFC-0016), Forge Admission Cycle (RFC-0019 and RFC-0015), and Holonic Substrate Interface (RFC-0020). Extract transferable patterns, invariants, and failure modes without treating prior shapes as strict templates.",
+      "EVIDENCE_FIRST": "Claims are stronger when backed by machine-checkable predicates, signed receipts, and replayable evidence bindings.",
+      "ANTIPATTERNS": "Treat the following as anti-patterns and resolve or explicitly justify them before trusting outputs: unknown/stale/missing/ambiguous/parse-error/signature-invalid states; thin or unclear theory coverage; evergreen constraint drift; implicit or under-specified AEP clauses; single-track synthesis without testability; weak evidence binding; weak scale/evidence-economics treatment; premature lock-in to one solution or format; and presenting missing knowledge without theory weaving.",
       "AEP_01": "Physics-first admissibility: evaluate ambition against physical and computational law, not conventional execution anxiety.",
-      "AEP_02": "Conventional feasibility objections (cost, team size, incumbent pressure, market conservatism, inertia) are non-blocking; only physics, information theory, computability, causality, biological limits, or explicit APM2 invariants can block.",
-      "AEP_03": "Novel engineering is mandatory: synthesize across disparate fields when mechanism-level value is shown; analogies without mechanization are invalid.",
-      "AEP_04": "Compounding closure is mandatory: each failure must strengthen verifiers, contracts, policies, or primitives.",
-      "AEP_05": "Bounded search discipline is mandatory: all explorations require explicit budgets, stop conditions, and escalation paths.",
-      "AEP_06": "Digest-first interface discipline is mandatory: typed, canonical, low-variety, capability-scoped exchange across boundaries.",
-      "AEP_07": "Anti-Goodhart posture is mandatory: pair each optimized KPI with independent countermetrics and oversight channels.",
-      "AEP_08": "Recursive semantics discipline is mandatory: preserve semantic equivalence under composition and provide admissibility notes for depth-bounded operation.",
-      "NOVELTY_METHOD": "Generate at least three internally divergent candidate designs (max ambition under physics, max definitional precision, max recursive compounding), then synthesize a dominant master design.",
-      "MECHANIZATION_RULE": "Every proposal must include concrete protocol objects, typed fields, invariants, threat model, verification artifacts, and rollout plus rollback gates.",
-      "OUTPUT_CONTRACT": "Deliver principle and law constraint mapping, evergreen constraint map, strategy or RFC unified diffs, per-hunk rationale, physics feasibility ledger, and bounded fast experiments for unresolved unknowns."
+      "AEP_02": "Conventional feasibility objections (cost, team size, incumbent pressure, market conservatism, inertia) are usually weak blockers; physical, information-theoretic, computability, causality, biological, or explicit APM2 invariant limits carry more weight.",
+      "AEP_03": "Prefer novel synthesis: weave concepts across disparate fields into coherent causal theories. Analogies can seed exploration and are stronger when they evolve into testable claims.",
+      "AEP_04": "Prefer compounding closure: treat each failure as an opportunity to strengthen verifiers, interfaces, policies, or primitives.",
+      "AEP_05": "Prefer bounded search: include budgets, stop conditions, and escalation paths for explorations.",
+      "AEP_06": "Prefer digest-first interfaces: typed, canonical, low-variety, capability-scoped exchange across boundaries.",
+      "AEP_07": "Prefer an anti-Goodhart posture: pair each optimized KPI with independent countermetrics and oversight channels.",
+      "AEP_08": "Prefer recursive semantic stability: preserve semantic equivalence under composition and include depth-bounded admissibility notes.",
+      "NOVELTY_METHOD": "Prefer generating at least three internally divergent theory frames (max ambition under physics, max definitional precision, max recursive compounding), then synthesize a dominant meta-theory while retaining rival hypotheses and discriminators.",
+      "MECHANIZATION_RULE": "Proposals should mechanize claims at an appropriate abstraction level: design work can use typed protocol objects and boundary interfaces; theory work can use explicit concept objects, invariants, falsifiable predicates, and evidence hooks.",
+      "WEIGHT_SIGNAL_OBJECTIVE": "Prioritize high-signal, low-noise knowledge distillation suitable for stronger reasoning priors. Favor invariants, causal structure, boundary conditions, and discriminating evidence over implementation detail.",
+      "THEORY_WEAVING_MODE": "When identifying missing knowledge, prefer non-prescriptive cross-domain synthesis. Weave concepts into coherent theory constructs (invariants, tradeoffs, failure modes, falsifiability) before proposing implementation commitments."
     },
-    "dir": [
+    "required_reading": [
+      "Read this theory bundle first; it carries the core concepts and invariants for this protocol.",
       [
-        "D01",
-        3,
-        "@THEORY_PRINCIPLES",
-        [
-          "theory",
-          "coverage",
-          "principles"
-        ],
-        [
-          "documents/theory/principles.json"
-        ]
-      ],
-      [
-        "D02",
-        3,
-        "@THEORY_LAWS",
-        [
-          "theory",
-          "coverage",
-          "laws"
-        ],
-        [
-          "documents/theory/laws.json"
-        ]
-      ],
-      [
-        "D03",
-        3,
-        "@THEORY_INVARIANTS",
-        [
-          "theory",
-          "coverage",
-          "invariants"
-        ],
-        [
-          "documents/theory/unified_theory.json"
-        ]
-      ],
-      [
-        "D04",
-        3,
-        "@GOAL_EVERGREEN",
-        [
-          "goal",
-          "evergreen"
-        ],
-        [
-          "documents/strategy/MASTER_STRATEGY.json"
-        ]
-      ],
-      [
-        "D05",
-        3,
-        "@DOMINANCE_ORDER",
-        [
-          "governance",
-          "precedence"
-        ],
-        [
-          "documents/strategy/MASTER_STRATEGY.json"
-        ]
-      ],
-      [
-        "D21",
-        3,
-        "@SCALE_ENVELOPE",
-        [
-          "scale",
-          "global-distribution",
-          "exabyte",
-          "zettabyte"
-        ],
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/theory/unified_theory.json"
-        ]
-      ],
-      [
-        "D22",
-        3,
-        "@SINGLE_PLATFORM_INTERNAL_DIST",
-        [
-          "platform",
-          "single-os",
-          "internal-distribution"
-        ],
-        [
-          "AGENTS.md"
-        ]
-      ],
-      [
-        "D06",
-        3,
-        "@TIME_AUTHORITY",
-        [
-          "time",
-          "htf"
-        ],
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/strategy/NORTH_STAR.json"
-        ]
-      ],
-      [
-        "D07",
-        3,
-        "@EVIDENCE_FIRST",
-        [
-          "evidence",
-          "authority"
-        ],
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/theory/laws.json"
-        ]
-      ],
-      [
-        "D08",
-        3,
-        "@FAIL_CLOSED",
-        [
-          "security",
-          "containment",
-          "gating"
-        ],
-        [
-          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
-          "documents/strategy/NORTH_STAR.json"
-        ]
-      ],
-      [
-        "D09",
-        3,
-        "@AEP_01",
-        [
-          "alien-engineering",
-          "physics"
-        ],
-        [
-          "chatgpt_strategy_prompt.txt",
-          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
-        ]
-      ],
-      [
-        "D10",
-        3,
-        "@AEP_02",
-        [
-          "alien-engineering",
-          "feasibility"
-        ],
-        [
-          "chatgpt_strategy_prompt.txt"
-        ]
-      ],
-      [
-        "D11",
-        3,
-        "@AEP_03",
-        [
-          "alien-engineering",
-          "novelty"
-        ],
-        [
-          "chatgpt_strategy_prompt.txt"
-        ]
-      ],
-      [
-        "D12",
-        3,
-        "@AEP_04",
-        [
-          "closure",
-          "improvement"
-        ],
-        [
-          "documents/theory/laws.json",
-          "documents/strategy/MASTER_STRATEGY.json"
-        ]
-      ],
-      [
-        "D13",
-        3,
-        "@AEP_05",
-        [
-          "bounded-search",
-          "safety"
-        ],
-        [
-          "documents/theory/laws.json"
-        ]
-      ],
-      [
-        "D14",
-        3,
-        "@AEP_06",
-        [
-          "interfaces",
-          "digest-first"
-        ],
-        [
-          "documents/theory/laws.json",
-          "documents/theory/principles.json"
-        ]
-      ],
-      [
-        "D15",
-        3,
-        "@AEP_07",
-        [
-          "goodhart",
-          "countermetrics"
-        ],
-        [
-          "documents/theory/laws.json",
-          "documents/strategy/BUSINESS_PLAN.json"
-        ]
-      ],
-      [
-        "D16",
-        3,
-        "@AEP_08",
-        [
-          "recursive-semantics"
-        ],
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/strategy/ROADMAP.json"
-        ]
-      ],
-      [
-        "D17",
-        3,
-        "@NOVELTY_METHOD",
-        [
-          "synthesis",
-          "search"
-        ],
-        [
-          "chatgpt_strategy_prompt.txt"
-        ]
-      ],
-      [
-        "D18",
-        3,
-        "@MECHANIZATION_RULE",
-        [
-          "specification",
-          "verification"
-        ],
-        [
-          "chatgpt_strategy_prompt.txt"
-        ]
-      ],
-      [
-        "D19",
-        3,
-        "@STRATEGY_CLAIMS",
-        [
-          "strategy",
-          "evergreen",
-          "msc"
-        ],
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/strategy/NORTH_STAR.json",
-          "documents/strategy/ROADMAP.json"
-        ]
-      ],
-      [
-        "D20",
-        3,
-        "@OUTPUT_CONTRACT",
-        [
-          "deliverables",
-          "verification"
-        ],
-        [
-          "chatgpt_strategy_prompt.txt"
-        ]
-      ]
-    ],
-    "g": [
-      [
-        "G01",
-        "D",
-        1,
-        [
-          "@THEORY_PRINCIPLES",
-          "@THEORY_LAWS",
-          "@THEORY_INVARIANTS"
-        ],
-        [
-          "E01",
-          "E02",
-          "E03"
-        ],
-        "BLOCK_IF_ANY_THEORY_ID_UNMAPPED"
-      ],
-      [
-        "G02",
-        "D",
-        1,
-        [
-          "@GOAL_EVERGREEN",
-          "@SCALE_ENVELOPE",
-          "@SINGLE_PLATFORM_INTERNAL_DIST",
-          "@DOMINANCE_ORDER",
-          "@TIME_AUTHORITY",
-          "@STRATEGY_CLAIMS"
-        ],
-        [
-          "E04",
-          "E05",
-          "E06"
-        ],
-        "BLOCK_IF_EVERGREEN_CONSTRAINT_OR_GOAL_REGRESSION"
-      ],
-      [
-        "G03",
-        "D",
-        1,
-        [
-          "@AEP_01",
-          "@AEP_02",
-          "@AEP_03",
-          "@AEP_04",
-          "@AEP_05",
-          "@AEP_06",
-          "@AEP_07",
-          "@AEP_08"
-        ],
-        [
-          "E07"
-        ],
-        "BLOCK_IF_AEP_CLAUSES_NOT_EXPLICIT"
-      ],
-      [
-        "G04",
-        "T",
-        1,
-        [
-          "@NOVELTY_METHOD",
-          "@MECHANIZATION_RULE"
-        ],
-        [
-          "E08",
-          "E09"
-        ],
-        "BLOCK_IF_NOVELTY_IS_NOT_MECHANIZED"
-      ],
-      [
-        "G05",
-        "L",
-        1,
-        [
-          "@EVIDENCE_FIRST",
-          "@FAIL_CLOSED",
-          "@OUTPUT_CONTRACT"
-        ],
-        [
-          "E10"
-        ],
-        "BLOCK_IF_OUTPUT_LACKS_EVIDENCE_BINDING"
-      ],
-      [
-        "G06",
-        "D",
-        1,
-        [
-          "@SCALE_ENVELOPE",
-          "@MECHANIZATION_RULE"
-        ],
-        [
-          "E11",
-          "E09"
-        ],
-        "BLOCK_IF_SCALE_ASSUMPTIONS_OR_VERIFIER_ECONOMICS_UNSPECIFIED"
-      ],
-      [
-        "G07",
-        "D",
-        1,
-        [
-          "@SINGLE_PLATFORM_INTERNAL_DIST",
-          "@MECHANIZATION_RULE"
-        ],
-        [
-          "E12",
-          "E09"
-        ],
-        "BLOCK_IF_DESIGN_ASSUMES_UNNECESSARY_MULTI_PLATFORM_OR_CONSUMER_DISTRIBUTION"
-      ]
-    ],
-    "ev": [
-      [
-        "E01",
-        "principle_inventory",
-        true,
-        "json",
-        [
-          "documents/theory/principles.json"
-        ],
-        [
-          "jq '.payload.principle_count, (.payload.principles | length)' documents/theory/principles.json",
-          "jq -r '.payload.principles[].id' documents/theory/principles.json | sed -n '1p;$p'"
-        ]
-      ],
-      [
-        "E02",
-        "law_inventory",
-        true,
-        "json",
-        [
-          "documents/theory/laws.json"
-        ],
-        [
-          "jq '.payload.law_count, (.payload.laws | length)' documents/theory/laws.json",
-          "jq -r '.payload.laws[].id' documents/theory/laws.json"
-        ]
-      ],
-      [
-        "E03",
-        "invariant_inventory",
-        true,
-        "json",
-        [
-          "documents/theory/unified_theory.json"
-        ],
-        [
-          "jq '.payload.invariants.fundamental | keys' documents/theory/unified_theory.json"
-        ]
-      ],
-      [
-        "E04",
-        "strategy_goal_surface",
-        true,
-        "md",
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/strategy/NORTH_STAR.json"
-        ],
-        [
-          "rg -n \"Maximize governed autonomy|containment/security|verification/correctness|liveness/progress\" documents/strategy/MASTER_STRATEGY.json documents/strategy/NORTH_STAR.json"
-        ]
-      ],
-      [
-        "E05",
-        "strategy_claim_surface",
-        true,
-        "md",
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/strategy/ROADMAP.json"
-        ],
-        [
-          "rg -n \"MSC-0[1-9]|MSC-1[0-2]|PHASE-[1-4]-TO-[2-5]\" documents/strategy/MASTER_STRATEGY.json documents/strategy/ROADMAP.json"
-        ]
-      ],
-      [
-        "E06",
-        "time_authority_surface",
-        true,
-        "md",
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
-        ],
-        [
-          "rg -n \"HTF|Time Boundary|wall-clock|LedgerTime|MonotonicTicks\" documents/strategy/MASTER_STRATEGY.json documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
-        ]
-      ],
-      [
-        "E07",
-        "alien_protocol_source",
-        true,
-        "txt+md",
-        [
-          "chatgpt_strategy_prompt.txt",
-          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
-        ],
-        [
-          "rg -n \"Alien Engineering|Physics-First|feasible|infeasible|fail-closed|evidence\" chatgpt_strategy_prompt.txt documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
-        ]
-      ],
-      [
-        "E08",
-        "novelty_track_evidence",
-        true,
-        "report",
-        [
-          "documents/strategy",
-          "documents/rfcs"
-        ],
-        []
-      ],
-      [
-        "E09",
-        "mechanization_evidence",
-        true,
-        "report",
-        [
-          "documents/strategy",
-          "documents/rfcs",
-          "evidence/strategy"
-        ],
-        []
-      ],
-      [
-        "E10",
-        "output_contract_evidence",
-        true,
-        "report",
-        [
-          "documents/strategy",
-          "documents/rfcs"
-        ],
-        []
-      ],
-      [
-        "E11",
-        "scale_source_surface",
-        true,
-        "txt+md+json",
-        [
-          "documents/strategy/MASTER_STRATEGY.json",
-          "documents/theory/unified_theory.json"
-        ],
-        [
-          "rg -n \"multi-exabyte|exabyte|zettabyte|civilizational scale|globally distributed\" documents/strategy/MASTER_STRATEGY.json",
-          "jq '.payload.fundamental_constraints.PHY-08, .payload.fundamental_constraints.PHY-09' documents/theory/unified_theory.json"
-        ]
-      ],
-      [
-        "E12",
-        "platform_constraint_surface",
-        true,
-        "txt+json",
-        [
-          "AGENTS.md"
-        ],
-        [
-          "rg -n \"single OS|single platform|internal distribution|walled garden|agents that we control|runtime\\\\.os|linux\" AGENTS.md",
-          "jq '.runtime.os' AGENTS.md"
-        ]
-      ]
-    ],
-    "chg": [
-      [
-        "C01",
-        "ADD",
-        [
-          "documents/work/prompts/instruction.alien_engineering_protocol.v1.json"
-        ],
-        [
-          "documents/work/prompts/instruction.alien_engineering_protocol.v1.json:1"
-        ],
-        "Add canonical reusable CAC instruction that unifies Alien Engineering and Physics-First strategy protocol."
-      ]
-    ],
-    "dep": [
-      [
-        "DP01",
-        [
-          "C01"
-        ],
-        "Instruction artifact must exist before prompt or strategy tooling can consume it."
+        "documents/theory/principles.json",
+        "documents/theory/laws.json",
+        "documents/theory/unified_theory.json",
+        "documents/theory/AGENTS.md",
+        "documents/theory/agent_native_architecture.json",
+        "documents/theory/defects.json",
+        "documents/strategy/MASTER_STRATEGY.json",
+        "documents/strategy/NORTH_STAR.json",
+        "documents/strategy/ROADMAP.json",
+        "documents/strategy/BUSINESS_PLAN.json",
+        "documents/work/prompts/instruction.business_strategy_protocol.v1.json",
+        "documents/security/THREAT_MODEL.cac.json",
+        "documents/rfcs/RFC-0016/README.yaml",
+        "documents/rfcs/RFC-0019/AUTONOMOUS_FORGE_ADMISSION_CYCLE.md",
+        "documents/rfcs/RFC-0015/00_meta.yaml",
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
       ]
     ],
     "r": {
       "depth": "D",
-      "modes": [
-        79,
-        70,
-        59,
-        51,
-        47,
-        44,
-        40,
-        36
-      ],
       "ob": [
-        "H",
-        "A",
-        "R",
-        "I",
-        "V",
-        "E",
-        "D",
-        "S"
-      ],
-      "trace": "F"
+        "A"
+      ]
     },
     "out": [
       [
@@ -682,15 +106,18 @@
       ]
     ],
     "q": [
-      "Principle coverage matrix contains exactly 102 rows for PRIN-001..PRIN-102.",
-      "Every major claim maps to at least one LAW-* and at least one PRIN-* reference.",
-      "Every major claim maps to at least one evergreen strategy constraint or MSC-* claim.",
-      "All AEP clauses (AEP_01..AEP_08) are explicit and testable in generated output.",
-      "All designs specify globally distributed multi-exabyte and zettabyte scale assumptions and mechanisms (verifier economics, anti-entropy, bandwidth locality, and evidence tiering).",
-      "Platform strategy stays single-OS/runtime and internal-agent distribution by default; proposals avoid unnecessary multi-platform or consumer-distribution complexity.",
-      "No claim is blocked by conventional execution objections alone; only physical or invariant violations may block.",
-      "Every proposal section includes mechanism, metric, evidence path, and fail-closed condition.",
-      "All normative timing logic uses HTF boundary IDs and rejects wall-clock gate authority."
+      "Principle coverage matrix can include active PRIN-* entries from documents/theory/principles.json for the current bundle version.",
+      "Major claims can be mapped to LAW-* and PRIN-* references when that improves traceability.",
+      "Major claims can be linked to evergreen strategy constraints or MSC-* claims when relevant.",
+      "AEP clauses (AEP_01..AEP_08) can be made explicit and testable in generated output.",
+      "Synthesized theories can include globally distributed multi-exabyte to zettabyte assumptions with verifier economics, anti-entropy, bandwidth locality, and evidence tiering considerations.",
+      "Outputs can remain solution-neutral by default and preserve multiple admissible implementation families unless hard constraints suggest commitment.",
+      "Conventional execution objections can be deprioritized relative to physical or invariant considerations.",
+      "Proposals can include causal model, assumptions, rival hypotheses, discriminating tests, evidence path, and a conservative failure posture.",
+      "Normative timing logic can be anchored to HTF boundary IDs rather than wall-clock gate authority.",
+      "Theory synthesis for missing knowledge can be delivered as non-prescriptive concept braids with explicit invariants, tradeoffs, and falsifiability.",
+      "Because the system is pre-live, proposals can usually avoid backward-compatibility overhead unless a concrete dependency calls for it.",
+      "Theory exploration can draw inspiration from HTF, FAC, and HSI artifacts while freely adapting principles to the current problem."
     ],
     "x": {
       "tools": [

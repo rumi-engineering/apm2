@@ -204,7 +204,7 @@
     {
       "id": "term:review_receipt",
       "term": "ReviewReceipt",
-      "definition": "A proof that a human or automated reviewer has approved a ChangeSet. It captures the reviewer's identity, the specific artifacts reviewed, and the verdict.",
+      "definition": "A proof that a machine verifier or approved reviewer family has approved a ChangeSet. It captures verifier identity, the specific artifacts reviewed, and the verdict.",
       "operationalization": "Implemented as `ReviewReceiptRecorded` in `crates/apm2-core/src/fac/review_receipt.rs`. Includes a `ReviewReceiptRecordedBuilder` for construction.",
       "theory_refs": [
         "LAW-01",
@@ -765,7 +765,7 @@
     {
       "id": "term:oracle_request",
       "term": "OracleRequest",
-      "definition": "An explicit escalation event for high-entropy specification gaps or irreducible human decisions. Treated as a refinement input, not a silent failure.",
+      "definition": "An explicit escalation event for high-entropy specification gaps requiring bounded machine re-verification. Optional/out-of-profile for strict formalist deployments; superseded by ReverificationRequest naming where enabled.",
       "operationalization": "Conceptual mechanism defined in `unified_theory.json` (MECH-ORACLE-REQUEST).",
       "theory_refs": [
         "LAW-01",
@@ -1163,7 +1163,7 @@
     {
       "id": "term:authority_seal_v1",
       "term": "AuthoritySealV1",
-      "definition": "Versioned attestation envelope for authoritative artifacts and batched roots with ledger/quorum/time anchors.",
+      "definition": "Versioned integrity-proof envelope for authoritative artifacts and batched roots with ledger/quorum/time anchors.",
       "operationalization": "Defined in RFC-0020 section 1.7.8.",
       "theory_refs": [
         "LAW-03",
@@ -1586,7 +1586,7 @@
     {
       "id": "term:oracle_request_v1",
       "term": "OracleRequestV1",
-      "definition": "Versioned structured request object for external adjudication or irreducibly human decision points.",
+      "definition": "Versioned structured request object for bounded machine re-verification at specification-gap decision points. Optional/out-of-profile for strict formalist deployments; superseded by ReverificationRequestV1 naming where enabled.",
       "operationalization": "Defined in RFC-0020 section 7.2.1.",
       "theory_refs": [
         "LAW-01",
@@ -2100,7 +2100,7 @@
     {
       "id": "term:taint_lattice",
       "term": "Taint Lattice",
-      "definition": "Monotone integrity-label structure for untrusted to attested evidence propagation and gating.",
+      "definition": "Monotone integrity-label structure for untrusted to integrity-proven evidence propagation and gating.",
       "operationalization": "Defined in RFC-0020 section 6.4.1.",
       "theory_refs": [
         "LAW-11",
@@ -2256,6 +2256,42 @@
       ],
       "implementation_refs": [
         "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7a"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:cross_cell_trust_evidence_map",
+      "term": "Cross-Cell Trust Evidence Map",
+      "definition": "A digest-first map of trust assertions between cells, keyed by receipts and commitments that prove who delegated authority, under which policy version, and with what validity window.",
+      "operationalization": "Built from import/permeability/admission receipts and periodically reconciled checkpoint commitments; used to validate cross-cell trust without ambient assumptions.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-05",
+        "LAW-10",
+        "LAW-15",
+        "LAW-18"
+      ],
+      "implementation_refs": [
+        "documents/theory/unified_theory.json",
+        "documents/theory/laws.json",
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:revocation_evidence_map",
+      "term": "Revocation Evidence Map",
+      "definition": "A signed coverage map proving revocation propagation status by cell, scope, and risk tier, including latency and stale-authority denial evidence.",
+      "operationalization": "Aggregates revocation propagation receipts into a deterministic coverage structure checked against revocation SLO policy before high-risk actuation.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-10",
+        "LAW-15",
+        "LAW-18"
+      ],
+      "implementation_refs": [
+        "documents/theory/unified_theory.json",
+        "documents/theory/laws.json"
       ],
       "node_class": "NORMATIVE"
     }
@@ -2790,6 +2826,51 @@
       "source": "term:directory_proof_v1",
       "relation": "governs",
       "target": "term:patricia_compressed_v1"
+    },
+    {
+      "source": "term:cross_cell_trust_evidence_map",
+      "relation": "depends_on",
+      "target": "term:federation"
+    },
+    {
+      "source": "term:cross_cell_trust_evidence_map",
+      "relation": "depends_on",
+      "target": "term:import_receipt_v1"
+    },
+    {
+      "source": "term:cross_cell_trust_evidence_map",
+      "relation": "depends_on",
+      "target": "term:permeability_receipt_v1"
+    },
+    {
+      "source": "term:cross_cell_trust_evidence_map",
+      "relation": "depends_on",
+      "target": "term:authority_seal_v1"
+    },
+    {
+      "source": "term:revocation_evidence_map",
+      "relation": "refines",
+      "target": "term:cross_cell_trust_evidence_map"
+    },
+    {
+      "source": "term:revocation_evidence_map",
+      "relation": "governs",
+      "target": "term:revocation_wins_crdt_law"
+    },
+    {
+      "source": "term:revocation_evidence_map",
+      "relation": "governs",
+      "target": "term:anti_entropy_protocol"
+    },
+    {
+      "source": "term:revocation_evidence_map",
+      "relation": "governs",
+      "target": "term:freshness_policy_v1"
+    },
+    {
+      "source": "term:revocation_evidence_map",
+      "relation": "depends_on",
+      "target": "term:epoch_seal_v1"
     }
   ]
 }

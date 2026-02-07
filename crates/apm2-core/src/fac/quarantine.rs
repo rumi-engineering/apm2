@@ -40,8 +40,8 @@
 //!
 //! ```rust
 //! use apm2_core::fac::quarantine::{
-//!     AATSpecQuarantined, QuarantineCleared, QuarantineEvent,
-//!     QuarantineProjection, RunnerPoolQuarantined,
+//!     AATSpecQuarantined, QuarantineCleared, QuarantineEvent, QuarantineProjection,
+//!     RunnerPoolQuarantined,
 //! };
 //!
 //! let mut projection = QuarantineProjection::new();

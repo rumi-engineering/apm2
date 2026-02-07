@@ -28,25 +28,24 @@
 //!
 //! ```rust
 //! use apm2_core::context::{
-//!     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
-//!     ManifestEntry, ManifestEntryBuilder,
+//!     AccessLevel, ContextPackManifest, ContextPackManifestBuilder, ManifestEntry,
+//!     ManifestEntryBuilder,
 //! };
 //!
 //! // Create a manifest with file entries
-//! let manifest =
-//!     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-//!         .add_entry(
-//!             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
-//!                 .stable_id("src-main")
-//!                 .access_level(AccessLevel::Read)
-//!                 .build(),
-//!         )
-//!         .add_entry(
-//!             ManifestEntryBuilder::new("/project/README.md", [0xAB; 32])
-//!                 .access_level(AccessLevel::ReadWithZoom)
-//!                 .build(),
-//!         )
-//!         .build();
+//! let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+//!     .add_entry(
+//!         ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+//!             .stable_id("src-main")
+//!             .access_level(AccessLevel::Read)
+//!             .build(),
+//!     )
+//!     .add_entry(
+//!         ManifestEntryBuilder::new("/project/README.md", [0xAB; 32])
+//!             .access_level(AccessLevel::ReadWithZoom)
+//!             .build(),
+//!     )
+//!     .build();
 //!
 //! // Check if a file is allowed (with hash for ReadWithZoom)
 //! assert!(
@@ -1080,18 +1079,16 @@ impl ContextPackManifest {
     ///
     /// ```rust
     /// use apm2_core::context::{
-    ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
-    ///     ManifestEntryBuilder,
+    ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder, ManifestEntryBuilder,
     /// };
     ///
-    /// let manifest =
-    ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-    ///         .add_entry(
-    ///             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
-    ///                 .access_level(AccessLevel::Read)
-    ///                 .build(),
-    ///         )
-    ///         .build();
+    /// let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+    ///     .add_entry(
+    ///         ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+    ///             .access_level(AccessLevel::Read)
+    ///             .build(),
+    ///     )
+    ///     .build();
     ///
     /// // Matching path and hash: allowed
     /// assert!(
@@ -1181,19 +1178,17 @@ impl ContextPackManifest {
     ///
     /// ```rust
     /// use apm2_core::context::{
-    ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
-    ///     ManifestEntryBuilder,
+    ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder, ManifestEntryBuilder,
     /// };
     ///
-    /// let manifest =
-    ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-    ///         .add_entry(
-    ///             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
-    ///                 .stable_id("main-file")
-    ///                 .access_level(AccessLevel::Read)
-    ///                 .build(),
-    ///         )
-    ///         .build();
+    /// let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+    ///     .add_entry(
+    ///         ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+    ///             .stable_id("main-file")
+    ///             .access_level(AccessLevel::Read)
+    ///             .build(),
+    ///     )
+    ///     .build();
     ///
     /// let entry = manifest.get_entry("/project/src/main.rs").unwrap().unwrap();
     /// assert_eq!(entry.stable_id(), Some("main-file"));
@@ -1370,32 +1365,29 @@ impl ContextPackManifest {
     ///
     /// ```rust
     /// use apm2_core::context::{
-    ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
-    ///     ManifestEntryBuilder,
+    ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder, ManifestEntryBuilder,
     /// };
     ///
-    /// let manifest =
-    ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-    ///         .add_entry(
-    ///             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
-    ///                 .access_level(AccessLevel::Read)
-    ///                 .build(),
-    ///         )
-    ///         .build();
+    /// let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+    ///     .add_entry(
+    ///         ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+    ///             .access_level(AccessLevel::Read)
+    ///             .build(),
+    ///     )
+    ///     .build();
     ///
     /// // Seal returns the content hash
     /// let seal_hash = manifest.seal().unwrap();
     /// assert_eq!(seal_hash, manifest.manifest_hash());
     ///
     /// // Same entries always produce the same hash
-    /// let manifest2 =
-    ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-    ///         .add_entry(
-    ///             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
-    ///                 .access_level(AccessLevel::Read)
-    ///                 .build(),
-    ///         )
-    ///         .build();
+    /// let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+    ///     .add_entry(
+    ///         ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+    ///             .access_level(AccessLevel::Read)
+    ///             .build(),
+    ///     )
+    ///     .build();
     ///
     /// assert_eq!(manifest.seal().unwrap(), manifest2.seal().unwrap());
     /// ```
@@ -1430,16 +1422,11 @@ impl ContextPackManifest {
     /// # Example
     ///
     /// ```rust
-    /// use apm2_core::context::{
-    ///     ContextPackManifestBuilder, ManifestEntryBuilder,
-    /// };
+    /// use apm2_core::context::{ContextPackManifestBuilder, ManifestEntryBuilder};
     ///
-    /// let manifest =
-    ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
-    ///         .add_entry(
-    ///             ManifestEntryBuilder::new("/file.rs", [0x42; 32]).build(),
-    ///         )
-    ///         .build();
+    /// let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+    ///     .add_entry(ManifestEntryBuilder::new("/file.rs", [0x42; 32]).build())
+    ///     .build();
     ///
     /// // Fresh manifest passes verification
     /// assert!(manifest.verify_seal().is_ok());

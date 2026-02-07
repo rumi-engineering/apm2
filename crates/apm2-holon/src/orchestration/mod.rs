@@ -39,8 +39,7 @@
 //!
 //! ```rust
 //! use apm2_holon::orchestration::{
-//!     OrchestrationConfig, OrchestrationDriver, OrchestrationStateV1,
-//!     TerminationReason,
+//!     OrchestrationConfig, OrchestrationDriver, OrchestrationStateV1, TerminationReason,
 //! };
 //!
 //! // Create orchestration state

@@ -70,8 +70,7 @@ impl RoutingDecision {
     /// ```rust
     /// use apm2_core::fac::role_routing::{RoutingDecision, classify_changeset};
     ///
-    /// let decision =
-    ///     classify_changeset(&[], &["flaky-test".to_string()], "Fix flake");
+    /// let decision = classify_changeset(&[], &["flaky-test".to_string()], "Fix flake");
     ///
     /// if let Some(patterns) = decision.context_file_patterns() {
     ///     for pattern in patterns {

@@ -34,8 +34,7 @@
 //!
 //! ```rust
 //! use apm2_core::fac::{
-//!     Predicate, PredicateOp, VerifierKind, VerifierOutput, VerifierPolicy,
-//!     VerifierPolicyBuilder,
+//!     Predicate, PredicateOp, VerifierKind, VerifierOutput, VerifierPolicy, VerifierPolicyBuilder,
 //! };
 //!
 //! // Create a policy for exit code verification

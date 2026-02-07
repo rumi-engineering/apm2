@@ -1,18 +1,16 @@
 title: Code Quality Review Prompt
 protocol:
   id: CODE-QUALITY-REVIEW
-  version: 1.0.0
+  version: 1.2.0
   type: executable_specification
-  inputs[2]:
+  inputs[1]:
     - PR_URL
-    - HEAD_SHA
   outputs[2]:
     - PRComment
     - StatusCheck
 
 variables:
   PR_URL: "$PR_URL"
-  HEAD_SHA: "$HEAD_SHA"
 
 references[37]:
   - path: "@documents/theory/glossary/glossary.json"
@@ -92,18 +90,25 @@ references[37]:
 
 decision_tree:
   entrypoint: PHASE_1_COLLECT_PR_IDENTITY
-  nodes[6]:
+  nodes[7]:
     - id: PHASE_1_COLLECT_PR_IDENTITY
       purpose: "Gather PR metadata, diff, and ticket bindings."
-      steps[4]:
+      steps[6]:
         - id: FETCH_PR_METADATA
           action: command
-          run: "gh pr view $PR_URL --json number,title,body,author,baseRefName,headRefName,commits,files,additions,deletions"
+          run: "gh pr view $PR_URL --json number,title,body,author,baseRefName,headRefName,headRefOid,commits,files,additions,deletions"
           capture_as: pr_metadata_json
         - id: EXTRACT_PR_FIELDS
           action: parse_json
           from: pr_metadata_json
-          extract: [pr_number, pr_title, pr_body, files, additions, deletions]
+          extract: [pr_number, pr_title, pr_body, files, additions, deletions, headRefName, baseRefName, headRefOid]
+        - id: ASSIGN_REVIEWED_SHA
+          action: "Set reviewed_sha = headRefOid."
+        - id: STOP_IF_NO_REVIEWED_SHA
+          if: "reviewed_sha is empty"
+          then:
+            action: "EMIT StopCondition STOP-NO-HEAD-SHA severity BLOCKER message 'Could not resolve latest commit SHA from PR_URL'."
+            stop: true
         - id: FETCH_DIFF
           action: command
           run: "gh pr diff $PR_URL"
@@ -114,6 +119,28 @@ decision_tree:
           patterns:
             ticket_id: "TCK-[0-9]{5}"
             rfc_id: "RFC-[0-9]{4}"
+      next: PHASE_1A_RESOLVE_WORKTREE
+
+    - id: PHASE_1A_RESOLVE_WORKTREE
+      purpose: "Resolve an existing local worktree for this PR. Default is reuse, never auto-create."
+      steps[4]:
+        - id: LIST_WORKTREES
+          action: command
+          run: "git worktree list --porcelain | awk '/^worktree /{wt=$2}/^branch /{b=$2; sub(/^refs\\/heads\\//,\"\",b); print wt \"\\t\" b}'"
+          capture_as: worktree_index
+        - id: MATCH_BY_HEAD_BRANCH
+          action: select_first
+          from: worktree_index
+          where: "branch == headRefName"
+          capture_as: review_worktree
+        - id: FALLBACK_MATCH_BY_TICKET
+          if: "review_worktree is empty AND ticket_id is not empty"
+          action: "Select first entry where branch contains ticket_id OR path contains ticket_id."
+        - id: ENFORCE_DEFAULT_REUSE_POLICY
+          action: |
+            If review_worktree exists: use it as primary local source for file reads and adjacent context.
+            If review_worktree does not exist: continue with PR API/diff review mode.
+            Do NOT create a new worktree by default during review execution.
       next: PHASE_2_GATHER_TICKET_CONTEXT
 
     - id: PHASE_2_GATHER_TICKET_CONTEXT
@@ -187,6 +214,8 @@ decision_tree:
             content: "Clear verdict with overall severity summary"
           - section: "Summary"
             content: "1-2 paragraph overview of what was reviewed and key conclusions"
+          - section: "Worktree Resolution"
+            content: "State reused worktree path (or no-existing-worktree fallback mode) and branch match basis."
           - section: "Ticket Requirements"
             content: "Enumerated list of DOD criteria from bound ticket"
           - section: "Requirements Verification"
@@ -217,7 +246,7 @@ decision_tree:
             content: "What the PR does well; specific invariants correctly upheld"
           - section: "Footer"
             format: "---"
-            content: "Reviewed commit: $HEAD_SHA"
+            content: "Reviewed commit: $reviewed_sha (resolved from PR_URL at review start for auditability)"
       steps[3]:
         - id: WRITE_FINDINGS
           action: write_file
@@ -227,7 +256,7 @@ decision_tree:
           action: command
           run: |
             gh pr comment $PR_URL --body-file quality_findings.md
-            gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" -f state="$VERDICT_STATE" -f context="ai-review/code-quality" -f description="Code quality review $VERDICT_STATE"
+            gh api --method POST "/repos/{owner}/{repo}/statuses/$reviewed_sha" -f state="$VERDICT_STATE" -f context="ai-review/code-quality" -f description="Code quality review $VERDICT_STATE"
             rm quality_findings.md
         - id: TERMINATE
           action: output

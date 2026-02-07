@@ -22,10 +22,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use apm2_holon::{
-//!     Artifact, EpisodeContext, EpisodeResult, Holon, HolonError,
-//!     StopCondition,
-//! };
+//! use apm2_holon::{Artifact, EpisodeContext, EpisodeResult, Holon, HolonError, StopCondition};
 //!
 //! // Define a simple holon that processes text
 //! struct EchoHolon;
@@ -35,11 +32,7 @@
 //!     type Output = String;
 //!     type State = ();
 //!
-//!     fn intake(
-//!         &mut self,
-//!         input: Self::Input,
-//!         _lease_id: &str,
-//!     ) -> Result<(), HolonError> {
+//!     fn intake(&mut self, input: Self::Input, _lease_id: &str) -> Result<(), HolonError> {
 //!         // Validate input and prepare for execution
 //!         Ok(())
 //!     }

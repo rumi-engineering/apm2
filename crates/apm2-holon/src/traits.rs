@@ -50,10 +50,7 @@ use crate::stop::StopCondition;
 /// # Example
 ///
 /// ```rust
-/// use apm2_holon::{
-///     Artifact, EpisodeContext, EpisodeResult, Holon, HolonError,
-///     StopCondition,
-/// };
+/// use apm2_holon::{Artifact, EpisodeContext, EpisodeResult, Holon, HolonError, StopCondition};
 ///
 /// /// A simple counter holon that increments until reaching a target.
 /// struct CounterHolon {
@@ -66,11 +63,7 @@ use crate::stop::StopCondition;
 ///     type Output = u64; // Final count
 ///     type State = u64; // Current count
 ///
-///     fn intake(
-///         &mut self,
-///         input: Self::Input,
-///         _lease_id: &str,
-///     ) -> Result<(), HolonError> {
+///     fn intake(&mut self, input: Self::Input, _lease_id: &str) -> Result<(), HolonError> {
 ///         self.target = input;
 ///         self.current = 0;
 ///         Ok(())

@@ -25,8 +25,7 @@
 //!
 //! ```rust
 //! use apm2_core::fac::{
-//!     AatSpec, AatSpecBuilder, AatStep, Invariant, Predicate, PredicateOp,
-//!     VerifierKind,
+//!     AatSpec, AatSpecBuilder, AatStep, Invariant, Predicate, PredicateOp, VerifierKind,
 //! };
 //!
 //! // Create an invariant with machine predicate
@@ -643,8 +642,7 @@ impl AatSpec {
     ///
     /// ```rust
     /// use apm2_core::fac::{
-    ///     AatSpec, AatSpecBuilder, Invariant, Predicate, PredicateOp,
-    ///     VerifierKind,
+    ///     AatSpec, AatSpecBuilder, Invariant, Predicate, PredicateOp, VerifierKind,
     /// };
     ///
     /// let invariant = Invariant::builder("inv-001")

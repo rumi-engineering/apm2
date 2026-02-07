@@ -438,8 +438,7 @@ impl HarnessConfig {
     /// ```rust
     /// use apm2_daemon::episode::adapter::HarnessConfig;
     ///
-    /// let config = HarnessConfig::new("echo", "episode-1")
-    ///     .with_args(vec!["hello".to_string()]);
+    /// let config = HarnessConfig::new("echo", "episode-1").with_args(vec!["hello".to_string()]);
     ///
     /// config.validate().expect("validation should pass");
     /// ```

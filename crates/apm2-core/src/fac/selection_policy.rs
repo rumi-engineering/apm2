@@ -31,8 +31,7 @@
 //! ```rust
 //! use apm2_core::fac::RiskTierClass;
 //! use apm2_core::fac::selection_policy::{
-//!     AatRequirement, SelectionContext, SelectionPolicy,
-//!     SelectionPolicyBuilder, TierConfig,
+//!     AatRequirement, SelectionContext, SelectionPolicy, SelectionPolicyBuilder, TierConfig,
 //! };
 //!
 //! // Create a default policy

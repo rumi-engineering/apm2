@@ -30,24 +30,22 @@
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::fac::anti_downgrade::verify_no_downgrade;
 //! use apm2_core::fac::{
-//!     AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatVerdict,
-//!     DeterminismClass, DeterminismStatus, FlakeClass,
-//!     PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
-//!     RiskTier, TerminalVerifierOutput,
+//!     AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatVerdict, DeterminismClass,
+//!     DeterminismStatus, FlakeClass, PolicyResolvedForChangeSet,
+//!     PolicyResolvedForChangeSetBuilder, RiskTier, TerminalVerifierOutput,
 //! };
 //!
 //! // Create a policy resolution
 //! let resolver = Signer::generate();
-//! let resolution =
-//!     PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
-//!         .resolved_risk_tier(2)
-//!         .resolved_determinism_class(0)
-//!         .add_rcp_profile_id("profile-001")
-//!         .add_rcp_manifest_hash([0x11; 32])
-//!         .add_verifier_policy_hash([0x22; 32])
-//!         .resolver_actor_id("resolver-001")
-//!         .resolver_version("1.0.0")
-//!         .build_and_sign(&resolver);
+//! let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+//!     .resolved_risk_tier(2)
+//!     .resolved_determinism_class(0)
+//!     .add_rcp_profile_id("profile-001")
+//!     .add_rcp_manifest_hash([0x11; 32])
+//!     .add_verifier_policy_hash([0x22; 32])
+//!     .resolver_actor_id("resolver-001")
+//!     .resolver_version("1.0.0")
+//!     .build_and_sign(&resolver);
 //!
 //! // Create a matching receipt
 //! let terminal_evidence_digest = [0x77; 32];

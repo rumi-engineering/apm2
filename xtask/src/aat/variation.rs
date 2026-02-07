@@ -221,8 +221,7 @@ impl InputVariationGenerator {
     /// ```
     /// use xtask::aat::variation::InputVariationGenerator;
     ///
-    /// let variations =
-    ///     InputVariationGenerator::generate_variations("cargo test").unwrap();
+    /// let variations = InputVariationGenerator::generate_variations("cargo test").unwrap();
     /// assert!(variations.len() >= 3);
     /// assert_eq!(variations[0].executable, "cargo");
     /// ```

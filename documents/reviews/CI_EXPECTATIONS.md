@@ -7,6 +7,22 @@
     "classification": "PUBLIC"
   },
   "payload": {
+    "required_branch_gate": {
+      "branch": "main",
+      "required_check": "CI Success",
+      "merge_queue": {
+        "enabled": true,
+        "require_merge_queue": true,
+        "why": "Avoid per-PR base-branch rerun churn by validating merge-group SHAs once in queue order.",
+        "workflow_trigger_requirement": {
+          "event": "merge_group",
+          "types": [
+            "checks_requested"
+          ],
+          "note": "Required checks must report on merge_group commits, not only pull_request commits."
+        }
+      }
+    },
     "checks": [
       {
         "id": "format",

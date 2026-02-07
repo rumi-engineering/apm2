@@ -37,19 +37,18 @@
 //! ```rust
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::fac::{
-//!     GATE_LEASE_ISSUED_PREFIX, GateLease, GateLeaseBuilder,
-//!     PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
+//!     GATE_LEASE_ISSUED_PREFIX, GateLease, GateLeaseBuilder, PolicyResolvedForChangeSet,
+//!     PolicyResolvedForChangeSetBuilder,
 //! };
 //!
 //! // First, resolve the policy for the changeset
 //! let resolver = Signer::generate();
-//! let resolution =
-//!     PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
-//!         .resolved_risk_tier(1)
-//!         .resolved_determinism_class(0)
-//!         .resolver_actor_id("resolver-001")
-//!         .resolver_version("1.0.0")
-//!         .build_and_sign(&resolver);
+//! let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+//!     .resolved_risk_tier(1)
+//!     .resolved_determinism_class(0)
+//!     .resolver_actor_id("resolver-001")
+//!     .resolver_version("1.0.0")
+//!     .build_and_sign(&resolver);
 //!
 //! // Then issue a gate lease referencing the resolved policy
 //! let issuer = Signer::generate();

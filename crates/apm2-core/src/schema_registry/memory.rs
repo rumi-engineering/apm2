@@ -83,9 +83,7 @@ struct RegistryInner {
 ///
 /// ```rust
 /// use apm2_core::crypto::EventHasher;
-/// use apm2_core::schema_registry::{
-///     InMemorySchemaRegistry, SchemaDigest, SchemaEntry,
-/// };
+/// use apm2_core::schema_registry::{InMemorySchemaRegistry, SchemaDigest, SchemaEntry};
 /// use bytes::Bytes;
 ///
 /// let registry = InMemorySchemaRegistry::new();

@@ -104,7 +104,11 @@
         "MEASUREMENT_INTEGRITY",
         "SCHEMA_VIOLATION",
         "INTERFACE_PROLIFERATION",
-        "ABSTRACTION_BREAK"
+        "ABSTRACTION_BREAK",
+        "PROOF_ARTIFACT_MISMATCH",
+        "MODEL_REALITY_DRIFT",
+        "TCB_UNBOUNDED",
+        "NON_REPLAYABLE_PROOF"
       ],
       "action_type": [
         "UPDATE_DOCS",
@@ -443,7 +447,7 @@
           {
             "id": "0.4",
             "title": "Universal Defect Principle",
-            "content": "Every failure of a verifier is a defect. A CI failure is always a defect, even if the underlying code is correct, because it still consumed avoidable cycle time and indicates weak specification, weak determinism, or weak gating. \n\nManual intervention required to reconcile state or interpret ambiguous output is generally a defect. However, in high-entropy states where environmental complexity exceeds a holon's requisite variety, an explicit request for **Human-as-Oracle** adjudication is treated as a **Specification Gap** (Engineering domain). This event is used to refine the upstream compiler rather than penalize the implementation holon."
+            "content": "Every failure of a verifier is a defect. A CI failure is always a defect, even if the underlying code is correct, because it still consumed avoidable cycle time and indicates weak specification, weak determinism, or weak gating. \n\nManual intervention required to reconcile state or interpret ambiguous output is generally a defect. In high-entropy states where environmental complexity exceeds a holon's requisite variety, an explicit machine **ReverificationRequest** with bounded-choice outputs is treated as a **Specification Gap** (Engineering domain). This event is used to refine the upstream compiler rather than penalize the implementation holon."
           }
         ],
         "volume_id": 0
@@ -464,7 +468,7 @@
           {
             "id": "1.3",
             "title": "EvidenceBundles and Replay Semantics",
-            "content": "EvidenceBundles are content-addressed collections of artifacts sufficient to validate a claim. Evidence includes: command transcripts, environment snapshots, configuration hashes, logs, traces, and output hashes. Replay semantics MUST specify determinism class:\n- deterministic replay (same inputs \u21d2 same outcome),\n- probabilistic replay (bounded randomness with confidence),\n- non-replayable (explicitly documented boundary and surrogate evidence).\n\nNon-replayable defects are permitted but MUST be treated as verification defects until stabilized."
+            "content": "EvidenceBundles are content-addressed collections of artifacts sufficient to validate a claim. Evidence includes: command transcripts, environment snapshots, configuration hashes, logs, traces, and output hashes. Replay semantics MUST specify determinism class:\n- deterministic replay (same inputs ⇒ same outcome),\n- probabilistic replay (bounded randomness with confidence),\n- non-replayable (explicitly documented boundary and surrogate evidence).\n\nNon-replayable defects are permitted but MUST be treated as verification defects until stabilized."
           },
           {
             "id": "1.4",
@@ -495,7 +499,7 @@
           {
             "id": "2.3",
             "title": "Stages and Escapes",
-            "content": "A defect detected in a later stage implies an escape from earlier verifiers. Stage analysis focuses on why the defect was not detected earlier and which verifier must be strengthened. The system SHOULD treat \u201cdetected at runtime\u201d as a failure of upstream refinement and verification, unless the property is inherently runtime-only."
+            "content": "A defect detected in a later stage implies an escape from earlier verifiers. Stage analysis focuses on why the defect was not detected earlier and which verifier must be strengthened. The system SHOULD treat “detected at runtime” as a failure of upstream refinement and verification, unless the property is inherently runtime-only."
           },
           {
             "id": "2.4",
@@ -526,7 +530,7 @@
           {
             "id": "3.3",
             "title": "Dogfood Holons as High-Signal UAT",
-            "content": "Dogfood holons execute scenario suites against releases and release candidates. Scenarios are executable specifications with required evidence outputs. Dogfood is the bridge between \u201cpasses CI\u201d and \u201cworks operationally,\u201d and it converts usability failures (misleading output, confusing workflows, missing affordances) into structured counterexamples.\n\nDogfood MUST run in a sealed environment and emit only evidence, not sideband state. Trusted tunnels are treated as elevated-risk channels and must be explicitly authorized by policy."
+            "content": "Dogfood holons execute scenario suites against releases and release candidates. Scenarios are executable specifications with required evidence outputs. Dogfood is the bridge between “passes CI” and “works operationally,” and it converts usability failures (misleading output, confusing workflows, missing affordances) into structured counterexamples.\n\nDogfood MUST run in a sealed environment and emit only evidence, not sideband state. Trusted tunnels are treated as elevated-risk channels and must be explicitly authorized by policy."
           },
           {
             "id": "3.4",
@@ -578,7 +582,7 @@
           {
             "id": "5.2",
             "title": "Separation of Duties (SoD)",
-            "content": "Authoring, reviewing, approving, and promoting are distinct roles. The system MUST enforce SoD mechanically at merge and at promotion gates. \u201cSame principal can both propose and approve\u201d is always a SECURITY_CAPABILITY defect, regardless of whether abuse occurred.\n\nSoD should be enforced by identity lineage rules: a holon MUST NOT approve artifacts originating from itself or its controlled sub-holons."
+            "content": "Authoring, reviewing, approving, and promoting are distinct roles. The system MUST enforce SoD mechanically at merge and at promotion gates. “Same principal can both propose and approve” is always a SECURITY_CAPABILITY defect, regardless of whether abuse occurred.\n\nSoD should be enforced by identity lineage rules: a holon MUST NOT approve artifacts originating from itself or its controlled sub-holons."
           },
           {
             "id": "5.3",
@@ -614,7 +618,7 @@
           {
             "id": "6.3",
             "title": "Closure Criteria",
-            "content": "A defect is closed only when:\n- a verifier exists that fails on the original counterexample,\n- the verifier passes on the fixed state,\n- evidence receipts are captured and referenced,\n- the relevant contract/intent references are updated when applicable.\n\n\u201cWorks on my machine\u201d is a defect. Closure is evidence-backed."
+            "content": "A defect is closed only when:\n- a verifier exists that fails on the original counterexample,\n- the verifier passes on the fixed state,\n- evidence receipts are captured and referenced,\n- the relevant contract/intent references are updated when applicable.\n\n“Works on my machine” is a defect. Closure is evidence-backed."
           },
           {
             "id": "6.4",
@@ -702,7 +706,7 @@
           {
             "id": "9.3",
             "title": "Reference Schemas",
-            "content": "See `schemas/taxonomy.yaml` and `schemas/defect_record_schema.yaml`. Schemas are normative; changes must be versioned. Schema evolution is additive-only in place; breaking changes require new schema IDs."
+            "content": "See `payload.taxonomy` and `payload.record_schema` in this bundle (schema_id: `apm2.defects.record.schema.v1`). These schemas are normative; changes must be versioned. Schema evolution is additive-only in place; breaking changes require new schema IDs."
           },
           {
             "id": "9.4",
@@ -712,6 +716,301 @@
         ],
         "volume_id": 9
       }
-    ]
+    ],
+    "trace_matrix": {
+      "version": "1.0.0",
+      "node_class": "NORMATIVE",
+      "usage_notes": [
+        "Trace matrix guides triage, clustering, and countermeasure selection.",
+        "Mappings are defaults and may be extended per-incident with evidence-backed machine re-verification."
+      ],
+      "defect_domain_to_theory": {
+        "CONTEXT": {
+          "laws": [
+            "LAW-02",
+            "LAW-06",
+            "LAW-07",
+            "LAW-12"
+          ],
+          "principles": [
+            "PRIN-096",
+            "PRIN-097",
+            "PRIN-113",
+            "PRIN-123"
+          ]
+        },
+        "ENGINEERING": {
+          "laws": [
+            "LAW-01",
+            "LAW-03",
+            "LAW-11",
+            "LAW-13",
+            "LAW-16"
+          ],
+          "principles": [
+            "PRIN-047",
+            "PRIN-068",
+            "PRIN-090",
+            "PRIN-095"
+          ]
+        },
+        "SPECIFICATION_GAP": {
+          "laws": [
+            "LAW-01",
+            "LAW-13",
+            "LAW-19",
+            "LAW-20"
+          ],
+          "principles": [
+            "PRIN-105",
+            "PRIN-107",
+            "PRIN-108",
+            "PRIN-122"
+          ]
+        },
+        "VERIFICATION": {
+          "laws": [
+            "LAW-01",
+            "LAW-04",
+            "LAW-08",
+            "LAW-15",
+            "LAW-17"
+          ],
+          "principles": [
+            "PRIN-092",
+            "PRIN-098",
+            "PRIN-101",
+            "PRIN-121"
+          ]
+        },
+        "SECURITY_CAPABILITY": {
+          "laws": [
+            "LAW-05",
+            "LAW-11",
+            "LAW-15",
+            "LAW-18"
+          ],
+          "principles": [
+            "PRIN-038",
+            "PRIN-089",
+            "PRIN-091",
+            "PRIN-124"
+          ]
+        },
+        "PRODUCT_VALUE": {
+          "laws": [
+            "LAW-07",
+            "LAW-14",
+            "LAW-19",
+            "LAW-20"
+          ],
+          "principles": [
+            "PRIN-101",
+            "PRIN-105",
+            "PRIN-106",
+            "PRIN-120"
+          ]
+        },
+        "OPERATIONS": {
+          "laws": [
+            "LAW-09",
+            "LAW-10",
+            "LAW-12",
+            "LAW-18"
+          ],
+          "principles": [
+            "PRIN-053",
+            "PRIN-063",
+            "PRIN-117",
+            "PRIN-118"
+          ]
+        },
+        "ECONOMICS": {
+          "laws": [
+            "LAW-06",
+            "LAW-08",
+            "LAW-14"
+          ],
+          "principles": [
+            "PRIN-001",
+            "PRIN-027",
+            "PRIN-110",
+            "PRIN-123"
+          ]
+        }
+      },
+      "violation_code_to_theory": {
+        "SILENT_MEMORY_MUTATION": {
+          "laws": [
+            "LAW-03",
+            "LAW-15"
+          ],
+          "principles": [
+            "PRIN-047",
+            "PRIN-095"
+          ]
+        },
+        "MONITOR_GAMING": {
+          "laws": [
+            "LAW-08",
+            "LAW-15",
+            "LAW-17"
+          ],
+          "principles": [
+            "PRIN-101",
+            "PRIN-121"
+          ]
+        },
+        "CONTEXT_BLEED": {
+          "laws": [
+            "LAW-02",
+            "LAW-05",
+            "LAW-16"
+          ],
+          "principles": [
+            "PRIN-090",
+            "PRIN-097"
+          ]
+        },
+        "UNBOUNDED_SEARCH": {
+          "laws": [
+            "LAW-12",
+            "LAW-14"
+          ],
+          "principles": [
+            "PRIN-051",
+            "PRIN-117",
+            "PRIN-118"
+          ]
+        },
+        "EVALUATOR_DRIFT": {
+          "laws": [
+            "LAW-04",
+            "LAW-15",
+            "LAW-19"
+          ],
+          "principles": [
+            "PRIN-106",
+            "PRIN-122"
+          ]
+        },
+        "REASONING_DEGENERATION": {
+          "laws": [
+            "LAW-12",
+            "LAW-19"
+          ],
+          "principles": [
+            "PRIN-106",
+            "PRIN-117"
+          ]
+        },
+        "POLICY_VIOLATION": {
+          "laws": [
+            "LAW-05",
+            "LAW-14",
+            "LAW-18",
+            "LAW-20"
+          ],
+          "principles": [
+            "PRIN-093",
+            "PRIN-094",
+            "PRIN-124"
+          ]
+        },
+        "MEASUREMENT_INTEGRITY": {
+          "laws": [
+            "LAW-07",
+            "LAW-15",
+            "LAW-19"
+          ],
+          "principles": [
+            "PRIN-092",
+            "PRIN-106",
+            "PRIN-120"
+          ]
+        },
+        "SCHEMA_VIOLATION": {
+          "laws": [
+            "LAW-13",
+            "LAW-16"
+          ],
+          "principles": [
+            "PRIN-090",
+            "PRIN-107",
+            "PRIN-108"
+          ]
+        },
+        "INTERFACE_PROLIFERATION": {
+          "laws": [
+            "LAW-06",
+            "LAW-16"
+          ],
+          "principles": [
+            "PRIN-071",
+            "PRIN-095",
+            "PRIN-123"
+          ]
+        },
+        "ABSTRACTION_BREAK": {
+          "laws": [
+            "LAW-01",
+            "LAW-06",
+            "LAW-16"
+          ],
+          "principles": [
+            "PRIN-073",
+            "PRIN-102",
+            "PRIN-107"
+          ]
+        },
+        "PROOF_ARTIFACT_MISMATCH": {
+          "laws": [
+            "LAW-01",
+            "LAW-15",
+            "LAW-20"
+          ],
+          "principles": [
+            "PRIN-092",
+            "PRIN-105"
+          ]
+        },
+        "MODEL_REALITY_DRIFT": {
+          "laws": [
+            "LAW-04",
+            "LAW-09",
+            "LAW-19"
+          ],
+          "principles": [
+            "PRIN-077",
+            "PRIN-106",
+            "PRIN-122"
+          ]
+        },
+        "TCB_UNBOUNDED": {
+          "laws": [
+            "LAW-05",
+            "LAW-13",
+            "LAW-15"
+          ],
+          "principles": [
+            "PRIN-038",
+            "PRIN-090"
+          ]
+        },
+        "NON_REPLAYABLE_PROOF": {
+          "laws": [
+            "LAW-01",
+            "LAW-07",
+            "LAW-15",
+            "LAW-20"
+          ],
+          "principles": [
+            "PRIN-031",
+            "PRIN-092",
+            "PRIN-105"
+          ]
+        }
+      }
+    }
   }
 }

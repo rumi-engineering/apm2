@@ -30,9 +30,9 @@
     },
     "stable_id": "dcp://apm2.local/governance/holonic_unified_theory@v1",
     "integrity": {
-      "attestation_ref": null,
-      "attestation_required_for_enforcement": true,
-      "attestation_kind": "ed25519"
+      "integrity_proof_ref": "dcp://apm2.local/integrity_proofs/holonic_unified_theory@v1",
+      "integrity_proof_required_for_enforcement": true,
+      "integrity_proof_kind": "ed25519"
     }
   },
   "payload": {
@@ -97,7 +97,7 @@
         },
         "ENF-ADMISSION-01": {
           "node_class": "NORMATIVE",
-          "statement": "Enforcement MUST require a valid attestation for this document before importing NORMATIVE nodes. If meta.integrity.attestation_ref is missing or unverifiable, enforcement MUST fail-closed and treat this artifact as EXPLANATORY-only.",
+          "statement": "Enforcement MUST require a valid integrity proof for this document before importing NORMATIVE nodes. If meta.integrity.integrity_proof_ref is missing or unverifiable, enforcement MUST fail-closed and treat this artifact as EXPLANATORY-only.",
           "violation_class": "MEASUREMENT_INTEGRITY",
           "law_refs": [
             "LAW-15"
@@ -114,8 +114,8 @@
         },
         "ENF-ORACLE-01": {
           "node_class": "NORMATIVE",
-          "statement": "Open design questions (Q-*) MUST remain EXPLANATORY until resolved by an OracleRequest/Adjudication with receipt-backed evidence. Any resulting enforceable rule must be recorded as a new NORMATIVE node that references the adjudication resolution and evidence.",
-          "violation_class": "GOVERNANCE",
+          "statement": "Open design questions (Q-*) MUST remain EXPLANATORY until resolved by a typed ReverificationRequest with receipt-backed evidence. Any resulting enforceable rule must be recorded as a new NORMATIVE node that references the re-verification resolution and evidence.",
+          "violation_class": "POLICY_VIOLATION",
           "law_refs": [
             "LAW-01",
             "LAW-15"
@@ -207,6 +207,37 @@
             "LAW-06",
             "LAW-08",
             "LAW-14"
+          ],
+          "node_class": "EXPLANATORY"
+        },
+        "THESIS-04": {
+          "statement": "High-quality governance at scale depends on epistemic discipline: maintain rival hypotheses, calibrate uncertainty, and treat contradiction as a first-class signal.",
+          "implications": [
+            "Confidence language is weak evidence without provenance and calibration.",
+            "Competing explanations improve robustness against optimization myopia and narrative lock-in.",
+            "Disagreement pathways increase long-horizon correctness when paired with evidence traces."
+          ],
+          "law_refs": [
+            "LAW-07",
+            "LAW-08",
+            "LAW-15",
+            "LAW-16"
+          ],
+          "node_class": "EXPLANATORY"
+        },
+        "THESIS-05": {
+          "statement": "Civilizational operation targets a federated holarchy on the order of 100B agents under exabyte-to-zettabyte evidence envelopes; coherence emerges from compositional boundaries, digest-first exchange, and explicit epoch transitions.",
+          "implications": [
+            "Locality and summary quality dominate at large cardinality.",
+            "No implicit backward-compatibility assumptions: epoch boundaries are explicit and auditable.",
+            "Externality accounting is part of stability, not optional optimization polish."
+          ],
+          "law_refs": [
+            "LAW-06",
+            "LAW-09",
+            "LAW-10",
+            "LAW-14",
+            "LAW-16"
           ],
           "node_class": "EXPLANATORY"
         }
@@ -509,13 +540,13 @@
         "name": "Adversarial representation: security is an information+capability problem",
         "statement": "Adversaries target the bounded context channel (prompt injection, poisoned logs, malicious diffs). Safe operation requires dual-axis containment: authority confinement + audit/identity, including context-read firewalls.",
         "derived_rules": [
-          "attestation reduces transitive trust: downstream holons accept artifacts via evidence, not narrative",
+          "execution integrity proofs reduce transitive trust: downstream holons accept artifacts via evidence, not narrative",
           "default-deny tool capabilities; no ambient authority",
           "deny-by-default context reads outside ContextPacks; treat escalations as defects unless authorized",
           "prevent confused-deputy: knowledge does not grant authority; bind capabilities to intent/parameters and require explicit escalation paths"
         ],
         "mechanisms": [
-          "MECH-ATTESTATION",
+          "MECH-EXECUTION-INTEGRITY",
           "MECH-AUDIT-IDENTITY",
           "MECH-LEASES-BUDGETS",
           "MECH-OCAP",
@@ -534,7 +565,7 @@
         "derived_rules": [
           "correctness = satisfy predicate P(y) OR return structured failure evidence under bound B",
           "critical actions use restricted languages/schemas and canonicalization to reduce ambiguity",
-          "explicit adjudication points exist for irreducibly human/multi-stakeholder decisions"
+          "explicit machine re-verification points exist for unresolved specification gaps"
         ],
         "mechanisms": [
           "MECH-LEASES-BUDGETS",
@@ -614,6 +645,88 @@
           "LAW-10",
           "LAW-14",
           "LAW-15"
+        ],
+        "node_class": "BACKGROUND"
+      },
+      "PHY-10": {
+        "name": "Population-scale cognition: 100B-agent envelope",
+        "statement": "At 100B-agent scale, coherence depends on cellular federation, bounded interface vocabularies, and summary receipts that preserve causal auditability across depth.",
+        "derived_rules": [
+          "avoid dense all-to-all coordination assumptions",
+          "optimize for digest-first exchange and selective zoom-in",
+          "treat boundary primitive stability as a scaling requirement"
+        ],
+        "mechanisms": [
+          "MECH-FEDERATION",
+          "MECH-HOLON-DIRECTORY",
+          "MECH-HOLON-MESH-PROTOCOL"
+        ],
+        "law_refs": [
+          "LAW-10",
+          "LAW-14",
+          "LAW-16"
+        ],
+        "node_class": "BACKGROUND"
+      },
+      "PHY-11": {
+        "name": "Forward epoch evolution over implicit backward compatibility",
+        "statement": "Semantic clarity over time is improved by explicit epoch cutovers with signed transition artifacts; backward compatibility is optional and declared, never assumed.",
+        "derived_rules": [
+          "publish epoch boundaries with validity windows and transition receipts",
+          "require explicit migration semantics for high-risk transitions",
+          "treat implicit compatibility assumptions as schema drift risk"
+        ],
+        "mechanisms": [
+          "MECH-EPOCH-CUTOVER",
+          "MECH-SCHEMAS",
+          "MECH-ANTI-ENTROPY"
+        ],
+        "law_refs": [
+          "LAW-09",
+          "LAW-13",
+          "LAW-16"
+        ],
+        "node_class": "BACKGROUND"
+      },
+      "PHY-12": {
+        "name": "Sampled observability and aliasing risk",
+        "statement": "Governance observes a sampled projection of system dynamics; poor cadence/filter design can alias high-frequency behavior into misleading low-frequency narratives.",
+        "derived_rules": [
+          "bind telemetry cadence to control objectives and risk tier",
+          "apply anti-alias preprocessing before downsampling or policy decisions",
+          "treat cadence/filter drift as measurement-integrity risk"
+        ],
+        "mechanisms": [
+          "MECH-SIGNAL-SAMPLING-GOVERNANCE",
+          "MECH-ANTI-ALIAS-FILTERING",
+          "MECH-EPISTEMIC-CALIBRATION"
+        ],
+        "law_refs": [
+          "LAW-08",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "BACKGROUND"
+      },
+      "PHY-13": {
+        "name": "Delay and control-loop stability",
+        "statement": "Observation and actuation delays destabilize feedback unless thresholds, gains, and transition rules account for latency and uncertainty.",
+        "derived_rules": [
+          "use hysteresis/deadbands/hold-down timers for mode switching",
+          "separate fast local stabilization loops from slower global governance loops",
+          "trigger policy change on estimated state and change-point evidence, not isolated spikes"
+        ],
+        "mechanisms": [
+          "MECH-DELAY-AWARE-CONTROL",
+          "MECH-DEADBAND-HYSTERESIS",
+          "MECH-MULTIRATE-CONTROL",
+          "MECH-STATE-ESTIMATION",
+          "MECH-CHANGEPOINT-DETECTION"
+        ],
+        "law_refs": [
+          "LAW-12",
+          "LAW-14",
+          "LAW-16"
         ],
         "node_class": "BACKGROUND"
       }
@@ -731,7 +844,7 @@
         "node_class": "NORMATIVE"
       },
       "monotone_vs_projection": {
-      "monotone_substrate": {
+        "monotone_substrate": {
           "statement": "Facts are monotone additions within a declared join-semilattice; truth is the least-upper-bound of all observed events and evidence.",
           "merge_algebra_requirements": [
             "Every domain MUST define a join operator (⊔) that is idempotent, commutative, and associative.",
@@ -784,6 +897,11 @@
         "HB-05": {
           "name": "Interface Variety Control",
           "statement": "Supervisors control interface variety (typed signals/contracts), not internal complexity; this resolves Ashby's requisite variety at boundaries.",
+          "node_class": "NORMATIVE"
+        },
+        "HB-06": {
+          "name": "Contestability",
+          "statement": "Holonic boundaries preserve deterministic re-verification and bounded-reversal pathways using evidence-addressable selectors.",
           "node_class": "NORMATIVE"
         }
       },
@@ -884,8 +1002,8 @@
     },
     "control_loops": {
       "stack_model": {
-        "statement": "APM2 is a stack of nested control loops: (1) episode loop, (2) work substrate lifecycle loop, (3) recurrence/self-improvement loop.",
-        "principle": "Each outer loop treats the inner loop as a plant with measurable outputs and controllable inputs; governance adjusts constraints based on feedback.",
+        "statement": "APM2 is a stack of nested control loops: (1) episode loop, (2) work substrate lifecycle loop, (3) recurrence/self-improvement loop. The target operating envelope includes federated operation toward 100B-agent populations.",
+        "principle": "Each outer loop treats the inner loop as a plant with measurable outputs and controllable inputs; governance adjusts constraints based on feedback. Signal processing discipline applies at each layer: sampling cadence, filtering, estimation, delay compensation, and trust weighting are explicit controller parameters.",
         "law_refs": [
           "LAW-01",
           "LAW-08",
@@ -1169,12 +1287,12 @@
       },
       "MECH-RECEIPTS": {
         "name": "Receipts (gate, merge, execution, summary)",
-        "role": "Authenticated, machine-readable acceptance proofs binding claims to evidence and inputs/outputs in an attested environment (command transcript/tool versions/env digest or their hashes). Authentication MAY be a direct signature or an AuthoritySeal over a Merkle batch root.",
+        "role": "Authenticated, machine-readable acceptance proofs binding claims to evidence and inputs/outputs in an integrity-verified environment (command transcript/tool versions/env digest or their hashes). Authentication MAY be a direct signature or an AuthoritySeal over a Merkle batch root.",
         "properties": [
           "tamper-evident (direct signature OR authority seal; ledger/quorum anchored)",
           "binds decision to bundle_hash and input/output digests",
-          "includes replay and environment-attestation metadata (toolchain versions, runner image digest, policy version)",
-          "supports proof-compression via batched attestations with inclusion proofs",
+          "includes replay and environment-integrity-proof metadata (toolchain versions, runner image digest, policy version)",
+          "supports proof-compression via batched integrity proofs with inclusion proofs",
           "required for authoritative promotion"
         ],
         "node_class": "NORMATIVE",
@@ -1425,7 +1543,7 @@
           "authority_overlay_hash_or_inline_overlay",
           "delegation_chain_hash (optional)",
           "policy_version",
-          "signature_or_quorum_attestation"
+          "signature_or_quorum_proof"
         ],
         "law_refs": [
           "LAW-05",
@@ -1511,7 +1629,7 @@
         }
       },
       "MECH-POLICY": {
-        "name": "Policy adjudication",
+        "name": "Policy resolution",
         "role": "Default-deny least-privilege tool mediation; risk-tiered gate requirements; waiver governance.",
         "law_refs": [
           "LAW-05",
@@ -1554,9 +1672,9 @@
           "receipt_kinds": {}
         }
       },
-      "MECH-ATTESTATION": {
-        "name": "Attestation",
-        "role": "Downstream trust is transitive through evidence: artifacts attested as produced under specific toolchains, inputs, and policy versions.",
+      "MECH-EXECUTION-INTEGRITY": {
+        "name": "Execution integrity proofs",
+        "role": "Downstream trust is transitive through evidence: artifacts integrity-proven as produced under specific toolchains, inputs, and policy versions.",
         "law_refs": [
           "LAW-04",
           "LAW-15"
@@ -1615,8 +1733,8 @@
         }
       },
       "MECH-ORACLE-REQUEST": {
-        "name": "OracleRequest adjudication",
-        "role": "Explicit escalation for high-entropy specification gaps; treated as refinement input, not silent out-of-band action.",
+        "name": "ReverificationRequest escalation",
+        "role": "Explicit machine escalation for high-entropy specification gaps; treated as refinement input, not silent out-of-band action.",
         "node_class": "NORMATIVE",
         "fact_bindings": {
           "event_kinds": {
@@ -2083,6 +2201,437 @@
             }
           }
         }
+      },
+      "MECH-REVERIFICATION-BOUNDED-REVERSAL": {
+        "name": "Re-verification and bounded reversal",
+        "role": "Governance channel for structured counterexample submission, independent machine re-verification, and bounded reversal at holonic boundaries.",
+        "law_refs": [
+          "LAW-01",
+          "LAW-07",
+          "LAW-14",
+          "LAW-16"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "AdjudicationRequested": true,
+              "AdjudicationResolved": true,
+              "DefectRecorded": true
+            },
+            "requires": {
+              "EvidencePublished": true,
+              "WorkOpened": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "summary.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-EPISTEMIC-CALIBRATION": {
+        "name": "Epistemic calibration",
+        "role": "Tracks uncertainty calibration, provenance quality, and contradiction sets for theory claims and operational decisions.",
+        "law_refs": [
+          "LAW-07",
+          "LAW-08",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true,
+              "EvidencePublished": true
+            },
+            "requires": {
+              "GateRunCompleted": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-ONTOLOGY-GOVERNANCE": {
+        "name": "Ontology governance",
+        "role": "Maintains canonical concept identities, drift detection, and explicit semantic transition artifacts across long-horizon evolution.",
+        "law_refs": [
+          "LAW-03",
+          "LAW-13",
+          "LAW-16"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true,
+              "TheoryUpdate": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-EPOCH-CUTOVER": {
+        "name": "Epoch cutover",
+        "role": "Represents intentional semantic discontinuities as signed epoch transitions with explicit scope, validity windows, and migration notes.",
+        "law_refs": [
+          "LAW-09",
+          "LAW-13",
+          "LAW-16"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "TheoryUpdate": true,
+              "EvidencePublished": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "compaction.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-EXTERNALITY-BUDGET": {
+        "name": "Externality budget surface",
+        "role": "Extends optimization accounting with energy, retention, and operator/social burden terms to prevent hidden system-level degradation.",
+        "law_refs": [
+          "LAW-06",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true,
+              "DefectRecorded": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-SIGNAL-SAMPLING-GOVERNANCE": {
+        "name": "Signal sampling governance",
+        "role": "Defines telemetry cadence and aggregation policy relative to expected dynamics and risk tier to reduce alias-induced miscontrol.",
+        "law_refs": [
+          "LAW-08",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true,
+              "DefectRecorded": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-ANTI-ALIAS-FILTERING": {
+        "name": "Anti-alias filtering and robust smoothing",
+        "role": "Applies robust preprocessing to noisy telemetry prior to policy transitions, preserving provenance of filter configurations.",
+        "law_refs": [
+          "LAW-08",
+          "LAW-12",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-STATE-ESTIMATION": {
+        "name": "State estimation",
+        "role": "Computes latent-state estimates with uncertainty bounds from partial noisy observations for planning and governance loops.",
+        "law_refs": [
+          "LAW-04",
+          "LAW-07",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true,
+              "DefectRecorded": true
+            },
+            "requires": {
+              "GateRunCompleted": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-CHANGEPOINT-DETECTION": {
+        "name": "Change-point detection",
+        "role": "Separates regime shifts from transient anomalies to gate policy adaptation and avoid outlier-driven control changes.",
+        "law_refs": [
+          "LAW-09",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true,
+              "DefectRecorded": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-DELAY-AWARE-CONTROL": {
+        "name": "Delay-aware control",
+        "role": "Models observation and actuation delays in threshold/gain decisions to prevent oscillatory policy updates.",
+        "law_refs": [
+          "LAW-12",
+          "LAW-14"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-DEADBAND-HYSTERESIS": {
+        "name": "Deadbands, hysteresis, and hold-down timers",
+        "role": "Stabilizes state transitions by requiring asymmetric thresholds and minimum dwell durations before policy-mode changes.",
+        "law_refs": [
+          "LAW-12",
+          "LAW-16"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "WorkTransitioned": true,
+              "DefectRecorded": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-MULTIRATE-CONTROL": {
+        "name": "Multi-rate hierarchical control",
+        "role": "Coordinates fast local loops and slower global governance loops with explicit coupling contracts.",
+        "law_refs": [
+          "LAW-01",
+          "LAW-10",
+          "LAW-16"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "WorkTransitioned": true,
+              "EvidencePublished": true
+            },
+            "requires": {
+              "PolicyLoaded": true,
+              "WorkOpened": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-SIGNAL-PROVENANCE-WEIGHTING": {
+        "name": "Signal provenance and trust weighting",
+        "role": "Weights signals by provenance integrity, freshness, calibration quality, and attack surface before they affect control policy.",
+        "law_refs": [
+          "LAW-05",
+          "LAW-07",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true,
+              "PolicyViolation": true,
+              "DefectRecorded": true
+            },
+            "requires": {
+              "PolicyLoaded": true,
+              "KeyRotated": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-VERIFIER-INDEPENDENCE": {
+        "name": "Verifier independence enforcement",
+        "role": "Declares verifier families, measures dependency overlap, and enforces diversity requirements for high-risk promotions.",
+        "law_refs": [
+          "LAW-17",
+          "LAW-14",
+          "LAW-08"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "GateRunCompleted": true,
+              "AdjudicationRequested": true
+            },
+            "requires": {
+              "PolicyLoaded": true,
+              "EvidencePublished": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "gate.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-REVOCATION-PROPAGATION": {
+        "name": "Revocation propagation control",
+        "role": "Receipted propagation of revocations across cells with risk-tiered latency SLOs and revocation-wins reconciliation semantics.",
+        "law_refs": [
+          "LAW-18",
+          "LAW-05",
+          "LAW-10"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "PermeabilityRevoked": true,
+              "PolicyLoaded": true
+            },
+            "requires": {
+              "PermeabilityGranted": true,
+              "EvidencePublished": true
+            }
+          },
+          "receipt_kinds": {
+            "emits": {
+              "revocation.propagation.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-UNCERTAINTY-ANNOTATION": {
+        "name": "Uncertainty annotation and calibration",
+        "role": "Attaches uncertainty class, confidence provenance, and residual-risk fields to high-impact decisions; validates against policy thresholds.",
+        "law_refs": [
+          "LAW-19",
+          "LAW-15",
+          "LAW-14"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DecisionAdopted": true,
+              "DefectRecorded": true
+            },
+            "requires": {
+              "GateRunCompleted": true,
+              "EvidencePublished": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "summary.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-REVERIFICATION-WORKFLOW": {
+        "name": "Deterministic re-verification workflow",
+        "role": "Deterministic machine re-verification path for high-impact decisions with independent verifier-family rerun and SLO-bound resolution.",
+        "law_refs": [
+          "LAW-20",
+          "LAW-01",
+          "LAW-16"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "AdjudicationRequested": true,
+              "AdjudicationResolved": true
+            },
+            "requires": {
+              "WorkOpened": true,
+              "EvidencePublished": true
+            }
+          },
+          "receipt_kinds": {
+            "emits": {
+              "reverification.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-ASSUMPTION-LEDGER": {
+        "name": "Assumption ledger management",
+        "role": "Lifecycle management for explicit assumptions with expiry, evidence-strength scoring, and invalidation-trigger propagation.",
+        "law_refs": [
+          "LAW-09",
+          "LAW-15",
+          "LAW-19"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "AssumptionRegistered": true,
+              "AssumptionInvalidated": true
+            },
+            "requires": {
+              "EvidencePublished": true,
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "summary.receipt": true
+            }
+          }
+        }
       }
     },
     "invariants": {
@@ -2210,7 +2759,7 @@
         },
         "INV-F-15": {
           "node_class": "NORMATIVE",
-          "statement": "Authoritative promotion requires terminal-verifier evidence: gate acceptance predicates MUST be machine-checkable and replayable in an attested environment; stochastic evaluators (LLMs) may orchestrate or advise but cannot be the sole basis for high-risk promotion.",
+          "statement": "Authoritative promotion requires terminal-verifier evidence: gate acceptance predicates MUST be machine-checkable and replayable in an integrity-verified environment; stochastic evaluators (LLMs) may orchestrate or advise but cannot be the sole basis for high-risk promotion.",
           "law_refs": [
             "LAW-01",
             "LAW-04",
@@ -2248,7 +2797,7 @@
           "node_class": "EXPLANATORY"
         },
         "CMP-04": {
-          "statement": "Human-as-Oracle interventions are required while autonomy is immature; interventions must be explicit Decision/OracleRequest objects to enable later compiler improvement.",
+          "statement": "Machine ReverificationRequest interventions are required while autonomy is immature; interventions must be explicit typed artifacts to enable later compiler improvement.",
           "improvement_path": [
             "track specification gap defects",
             "extract repeated oracle answers into refinement rules",
@@ -2350,10 +2899,10 @@
             "meaning": "Structured tool outputs with digest bindings"
           },
           "HIGH": {
-            "meaning": "Verified terminal-verifier outcomes with independent attestation and digest bindings"
+            "meaning": "Verified terminal-verifier outcomes with independent integrity proofs and digest bindings"
           },
           "FORMAL": {
-            "meaning": "Machine-checkable acceptance predicates executed in an attested environment (may include formal proofs or exhaustive hypothesis coverage)"
+            "meaning": "Machine-checkable acceptance predicates executed in an integrity-verified environment (may include formal proofs or exhaustive hypothesis coverage)"
           }
         },
         "law_refs": [
@@ -2366,8 +2915,9 @@
         "alignment": {
           "proto_hint": "apm2.kernel.v1/AdjudicationRequested",
           "notes": [
-            "OracleRequest is a bounded-choice adjudication request used to resolve specification gaps or governance decisions.",
-            "Resolution MUST be receipt-backed (evidence + signatures) before resulting rules become NORMATIVE-enforceable."
+            "OracleRequest is a bounded-choice machine re-verification request used to resolve specification gaps or governance decisions.",
+            "Resolution MUST be receipt-backed (evidence + signatures) before resulting rules become NORMATIVE-enforceable.",
+            "Optional/out-of-profile for strict formalist deployments; ReverificationRequest naming may be used as an alias without changing semantics."
           ]
         },
         "fields": {
@@ -2392,13 +2942,18 @@
         "node_class": "NORMATIVE",
         "notes": [
           "Unified Theory uses a coarse four-tier model (T0..T3).",
-          "Daemon enforcement uses RiskTier Tier0..Tier4; mapping MUST be lossless at policy boundaries per the glossary RiskTier term."
+          "Daemon enforcement uses RiskTier Tier0..Tier4; UT->daemon mapping is conservative and monotone.",
+          "Reverse mapping is only valid when the originating ut_tier is retained as an explicit witness on policy/receipt objects."
         ],
         "enum": {
           "T0": {
             "name": "Experimental",
             "blast_radius": "local/sandbox",
-            "daemon_mapping": "Tier0-Tier1",
+            "daemon_mapping": "Tier1",
+            "daemon_allowed": [
+              "Tier0",
+              "Tier1"
+            ],
             "notes": [
               "low-risk exploratory work"
             ]
@@ -2406,7 +2961,11 @@
           "T1": {
             "name": "Internal",
             "blast_radius": "factory-internal",
-            "daemon_mapping": "Tier1-Tier2",
+            "daemon_mapping": "Tier2",
+            "daemon_allowed": [
+              "Tier1",
+              "Tier2"
+            ],
             "notes": [
               "default internal work"
             ]
@@ -2415,6 +2974,9 @@
             "name": "Production",
             "blast_radius": "user-facing/runtime",
             "daemon_mapping": "Tier3",
+            "daemon_allowed": [
+              "Tier3"
+            ],
             "notes": [
               "requires stronger gates"
             ]
@@ -2423,6 +2985,9 @@
             "name": "Security-Critical",
             "blast_radius": "secrets/capabilities/identity",
             "daemon_mapping": "Tier4",
+            "daemon_allowed": [
+              "Tier4"
+            ],
             "notes": [
               "highest rigor; fail-closed"
             ]
@@ -2514,11 +3079,11 @@
           "LAW-15"
         ]
       },
-      "attestation": {
+      "integrity_proof": {
         "node_class": "NORMATIVE",
-        "schema_id": "apm2.attestation.v1",
-        "json_schema_path": "schemas/apm2/attestation.schema.json",
-        "role": "Environment/runner attestation object (workload integrity, runtime provenance). Distinct from fact authentication.",
+        "schema_id": "apm2.integrity_proof.v1",
+        "json_schema_path": "schemas/apm2/integrity_proof.schema.json",
+        "role": "Environment/runner integrity proof object (workload integrity, runtime provenance). Distinct from fact authentication.",
         "law_refs": [
           "LAW-01",
           "LAW-14",
@@ -2528,7 +3093,7 @@
       "authority_seal": {
         "node_class": "NORMATIVE",
         "schema_id": "apm2.authority_seal.v1",
-        "role": "Authenticates authoritative facts/roots either directly or via Merkle-batched attestations with ledger/quorum/time anchors.",
+        "role": "Authenticates authoritative facts/roots either directly or via Merkle-batched integrity proofs with ledger/quorum/time anchors.",
         "law_refs": [
           "LAW-03",
           "LAW-14",
@@ -2557,7 +3122,7 @@
       "holon_directory_head": {
         "node_class": "NORMATIVE",
         "schema_id": "apm2.holon_directory_head.v1",
-        "role": "Signed/attested authenticated-directory head enabling O(log n) membership, revocation, and cacheable verification.",
+        "role": "Signed/integrity-proven authenticated-directory head enabling O(log n) membership, revocation, and cacheable verification.",
         "law_refs": [
           "LAW-05",
           "LAW-10",
@@ -2887,22 +3452,22 @@
         },
         "AdjudicationRequested": {
           "node_class": "NORMATIVE",
-          "domain": "adjudication",
+          "domain": "reverification",
           "proto_ref": "proto/kernel_events.proto#AdjudicationRequested"
         },
         "AdjudicationVote": {
           "node_class": "NORMATIVE",
-          "domain": "adjudication",
+          "domain": "reverification",
           "proto_ref": "proto/kernel_events.proto#AdjudicationVote"
         },
         "AdjudicationResolved": {
           "node_class": "NORMATIVE",
-          "domain": "adjudication",
+          "domain": "reverification",
           "proto_ref": "proto/kernel_events.proto#AdjudicationResolved"
         },
         "AdjudicationTimeout": {
           "node_class": "NORMATIVE",
-          "domain": "adjudication",
+          "domain": "reverification",
           "proto_ref": "proto/kernel_events.proto#AdjudicationTimeout"
         },
         "EvidencePublished": {
@@ -3205,8 +3770,8 @@
         ]
       },
       "DEF-17": {
-        "name": "Human adjudication cutpoints",
-        "statement": "Human intervention is limited to typed OracleRequest/Decision/Waiver/Breakglass artifacts at bounded governance cutpoints (policy changes, high-risk waivers, authority expansion, incident/stop operations, key rotation), each evidence-bound, signed, expiry-bounded, and ledger-recorded.",
+        "name": "Machine re-verification cutpoints",
+        "statement": "Machine re-verification is limited to typed ReverificationRequest/Decision/Waiver/Breakglass artifacts at bounded governance cutpoints (policy changes, high-risk waivers, authority expansion, incident/stop operations, key rotation), each evidence-bound, signed, expiry-bounded, and ledger-recorded.",
         "status": "adjudicated",
         "node_class": "NORMATIVE",
         "maturity": "ADJUDICATED",
@@ -3410,6 +3975,440 @@
           "definition": "Fraction of reconciliation failures producing explicit DefectRecords (target = 1.0).",
           "node_class": "NORMATIVE"
         }
+      },
+      "epistemic_quality": {
+        "MET-EPI-01": {
+          "name": "calibration_error",
+          "definition": "Gap between predicted confidence and observed correctness across decision classes.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-EPI-02": {
+          "name": "contradiction_resolution_latency",
+          "definition": "Time from contradiction detection to adjudicated resolution or bounded deferral.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-EPI-03": {
+          "name": "rival_hypothesis_survival_rate",
+          "definition": "Fraction of major decisions evaluated against at least one explicit rival explanation before closure.",
+          "node_class": "NORMATIVE"
+        }
+      },
+      "scale_envelope": {
+        "MET-SCL-01": {
+          "name": "active_holon_cardinality",
+          "definition": "Estimated active holon count across cells and hierarchy depth, tracked against scale envelope targets.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-SCL-02": {
+          "name": "cross_cell_digest_to_payload_ratio",
+          "definition": "Ratio of digest-first coordination traffic to full payload transfer across cell boundaries.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-SCL-03": {
+          "name": "summary_zoomin_efficiency",
+          "definition": "Cost and latency profile for deterministic zoom-in from summaries to raw evidence under delegated capability.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-SCL-04": {
+          "name": "cellular_coordination_pressure",
+          "definition": "Queueing and backpressure stress at inter-cell coordination boundaries.",
+          "node_class": "NORMATIVE"
+        }
+      },
+      "externality_surface": {
+        "MET-EXT-01": {
+          "name": "energy_per_verified_transition",
+          "definition": "Energy spend normalized by authoritative verified transitions.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-EXT-02": {
+          "name": "retention_externality_index",
+          "definition": "Long-horizon storage burden weighted by evidence utility and classification risk.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-EXT-03": {
+          "name": "operator_burden_rate",
+          "definition": "Escalation and machine re-verification load induced per unit of verified progress.",
+          "node_class": "NORMATIVE"
+        }
+      },
+      "control_signal_integrity": {
+        "MET-CSI-01": {
+          "name": "aliasing_risk_index",
+          "definition": "Estimated risk that telemetry cadence and aggregation induce aliasing relative to observed dynamics.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-CSI-02": {
+          "name": "filter_to_raw_divergence",
+          "definition": "Bounded divergence between raw and filtered signals, monitored for over-smoothing or information loss.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-CSI-03": {
+          "name": "state_estimation_error",
+          "definition": "Estimated error between latent-state estimate and validated post-hoc outcomes.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-CSI-04": {
+          "name": "changepoint_precision_recall",
+          "definition": "Precision/recall of change-point triggers against adjudicated regime-shift outcomes.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-CSI-05": {
+          "name": "policy_flip_flop_rate",
+          "definition": "Rate of rapid mode reversals indicating insufficient hysteresis/hold-down design.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-CSI-06": {
+          "name": "signal_trust_weight_skew",
+          "definition": "Distribution of trust weights across signal sources; detects unsafe concentration or untrusted dominance.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-CSI-07": {
+          "name": "loop_delay_margin",
+          "definition": "Observed control-loop latency margin before oscillatory behavior emerges.",
+          "node_class": "NORMATIVE"
+        }
+      },
+      "governance_resilience": {
+        "MET-GOV-01": {
+          "name": "verifier_family_diversity_index",
+          "definition": "Effective number of independent verifier families participating in Tier2+ promotions.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-GOV-02": {
+          "name": "verifier_correlation_risk",
+          "definition": "Estimated common-mode failure risk across required verifier families.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-GOV-03": {
+          "name": "revocation_propagation_p95_ms",
+          "definition": "95th percentile latency from revocation issuance to receipt-backed propagation across required trust surface.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-GOV-04": {
+          "name": "stale_authority_accept_rate",
+          "definition": "Rate of accepted actuation attempts that rely on already-revoked authority.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-GOV-05": {
+          "name": "uncertainty_annotation_coverage",
+          "definition": "Fraction of high-impact decisions carrying required uncertainty/provenance fields.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-GOV-06": {
+          "name": "residual_uncertainty_policy_violation_rate",
+          "definition": "Rate of promotions where residual uncertainty exceeds tier threshold without escalation receipt.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-GOV-07": {
+          "name": "reverification_slo_compliance",
+          "definition": "Fraction of eligible re-verification requests receiving response and resolution within policy SLO.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-ASM-01": {
+          "name": "assumption_expiry_violation_rate",
+          "definition": "Rate of high-impact decisions that depended on expired assumptions at decision time.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-ASM-02": {
+          "name": "assumption_invalidation_reaction_latency",
+          "definition": "Latency from assumption invalidation event to dependent work opening and policy update.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-ASM-03": {
+          "name": "assumption_evidence_strength_distribution",
+          "definition": "Distribution of evidence strength classes for active assumptions by risk tier.",
+          "node_class": "NORMATIVE"
+        }
+      },
+      "law_metric_dictionary": {
+        "node_class": "NORMATIVE",
+        "notes": [
+          "Each LAW-* maps to primary observable metrics and target expressions.",
+          "Target expressions are policy-bound and may vary by risk tier."
+        ],
+        "laws": {
+          "LAW-01": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-VER-01",
+                "target": "minimize",
+                "unit": "rate"
+              },
+              {
+                "metric_id": "MET-VER-03",
+                "target": "<= policy.max_false_positive_rate",
+                "unit": "rate"
+              }
+            ]
+          },
+          "LAW-02": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-CTX-01",
+                "target": "<= policy.max_pack_miss_rate",
+                "unit": "rate"
+              },
+              {
+                "metric_id": "MET-CTX-02",
+                "target": "<= policy.max_unplanned_context_calls",
+                "unit": "count/episode"
+              }
+            ]
+          },
+          "LAW-03": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-MRG-02",
+                "target": "== 1.0",
+                "unit": "fraction"
+              },
+              {
+                "metric_id": "MET-SEC-03",
+                "target": "== 0",
+                "unit": "rate"
+              }
+            ]
+          },
+          "LAW-04": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-EPI-01",
+                "target": "<= policy.max_calibration_error",
+                "unit": "error"
+              },
+              {
+                "metric_id": "MET-VER-03",
+                "target": "<= policy.max_false_positive_rate",
+                "unit": "rate"
+              }
+            ]
+          },
+          "LAW-05": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-SEC-01",
+                "target": "== 0 at Tier3",
+                "unit": "count"
+              },
+              {
+                "metric_id": "MET-SEC-02",
+                "target": "== 0 unauthorized",
+                "unit": "count"
+              }
+            ]
+          },
+          "LAW-06": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-CTX-04",
+                "target": "minimize",
+                "unit": "count"
+              },
+              {
+                "metric_id": "MET-VER-02",
+                "target": "<= policy.max_gate_cost",
+                "unit": "composite_cost"
+              }
+            ]
+          },
+          "LAW-07": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-SCL-03",
+                "target": "<= policy.max_zoomin_cost",
+                "unit": "ms_or_cost"
+              },
+              {
+                "metric_id": "MET-CTX-05",
+                "target": ">= policy.min_information_gain",
+                "unit": "fraction"
+              }
+            ]
+          },
+          "LAW-08": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-VER-04",
+                "target": "<= policy.max_proxy_gap",
+                "unit": "index"
+              },
+              {
+                "metric_id": "MET-EPI-03",
+                "target": ">= policy.min_rival_hypothesis_rate",
+                "unit": "fraction"
+              }
+            ]
+          },
+          "LAW-09": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-CTX-03",
+                "target": "minimize",
+                "unit": "rate"
+              },
+              {
+                "metric_id": "MET-CSI-04",
+                "target": ">= policy.min_changepoint_precision_recall",
+                "unit": "score"
+              }
+            ]
+          },
+          "LAW-10": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-MRG-01",
+                "target": "minimize",
+                "unit": "rate"
+              },
+              {
+                "metric_id": "MET-MRG-02",
+                "target": "== 1.0",
+                "unit": "fraction"
+              }
+            ]
+          },
+          "LAW-11": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-SEC-01",
+                "target": "== 0 stale_actuation",
+                "unit": "count"
+              },
+              {
+                "metric_id": "MET-REC-02",
+                "target": "<= policy.max_resolution_time",
+                "unit": "time"
+              }
+            ]
+          },
+          "LAW-12": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-SRCH-01",
+                "target": "<= policy.max_stagnation_score",
+                "unit": "score"
+              },
+              {
+                "metric_id": "MET-CSI-05",
+                "target": "<= policy.max_policy_flip_flop_rate",
+                "unit": "rate"
+              }
+            ]
+          },
+          "LAW-13": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-SEC-03",
+                "target": "== 0 schema_integrity_failures",
+                "unit": "count"
+              },
+              {
+                "metric_id": "MET-CTX-06",
+                "target": ">= policy.min_pack_upgrade_gain",
+                "unit": "delta"
+              }
+            ]
+          },
+          "LAW-14": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-VER-01",
+                "target": "<= policy.max_escape_rate_by_tier",
+                "unit": "rate"
+              },
+              {
+                "metric_id": "MET-EXT-03",
+                "target": "<= policy.max_operator_burden",
+                "unit": "rate"
+              }
+            ]
+          },
+          "LAW-15": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-SEC-03",
+                "target": "== 0",
+                "unit": "count"
+              },
+              {
+                "metric_id": "MET-CSI-06",
+                "target": "within policy trust skew bounds",
+                "unit": "distribution"
+              }
+            ]
+          },
+          "LAW-16": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-SCL-02",
+                "target": ">= policy.min_digest_payload_ratio",
+                "unit": "ratio"
+              },
+              {
+                "metric_id": "MET-SCL-04",
+                "target": "<= policy.max_coordination_pressure",
+                "unit": "index"
+              }
+            ]
+          },
+          "LAW-17": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-GOV-01",
+                "target": ">= 2.0 for Tier2+",
+                "unit": "effective_family_count"
+              },
+              {
+                "metric_id": "MET-GOV-02",
+                "target": "<= policy.max_verifier_correlation_risk",
+                "unit": "risk_score"
+              }
+            ]
+          },
+          "LAW-18": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-GOV-03",
+                "target": "<= policy.revocation_slo_ms[risk_tier]",
+                "unit": "ms"
+              },
+              {
+                "metric_id": "MET-GOV-04",
+                "target": "== 0 for Tier2+",
+                "unit": "rate"
+              }
+            ]
+          },
+          "LAW-19": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-GOV-05",
+                "target": ">= policy.min_uncertainty_annotation_coverage",
+                "unit": "fraction"
+              },
+              {
+                "metric_id": "MET-GOV-06",
+                "target": "== 0 unauthorized_exceedances",
+                "unit": "rate"
+              }
+            ]
+          },
+          "LAW-20": {
+            "metric_targets": [
+              {
+                "metric_id": "MET-GOV-07",
+                "target": ">= policy.min_reverification_slo_compliance",
+                "unit": "fraction"
+              },
+              {
+                "metric_id": "MET-EPI-02",
+                "target": "<= policy.max_contradiction_resolution_latency",
+                "unit": "time"
+              }
+            ]
+          }
+        }
       }
     },
     "documentation_integration": {
@@ -3422,7 +4421,10 @@
             "non-stationarity and freshness",
             "distributed failure and convergence",
             "adversarial representation and containment",
-            "computability + search limits"
+            "computability + search limits",
+            "civilizational-scale agent ecology (100B envelope)",
+            "epistemic calibration and re-verification",
+            "forward epoch evolution and discontinuity management"
           ],
           "node_class": "EXPLANATORY"
         },
@@ -3452,14 +4454,16 @@
           "contents": [
             "episode loop",
             "work lifecycle loop (Plan->ChangeSet->GateRun->MergeReceipt)",
-            "recurrence loop (Findings->Countermeasures)"
+            "recurrence loop (Findings->Countermeasures)",
+            "control-signal discipline (sampling, filtering, estimation, change-point detection, hysteresis)",
+            "multi-rate loop design (fast local stabilization, slower global governance)"
           ],
           "node_class": "EXPLANATORY"
         },
         "DOC-SPINE-05": {
           "title": "Laws as Corollaries",
           "contents": [
-            "LAW-01..LAW-15 mapping to mechanisms and invariants"
+            "LAW-01..LAW-20 mapping to mechanisms and invariants"
           ],
           "node_class": "EXPLANATORY"
         },
@@ -3476,6 +4480,120 @@
             "Decision/Question/OracleRequest"
           ],
           "node_class": "EXPLANATORY"
+        },
+        "DOC-SPINE-07": {
+          "title": "Scale, Pluralism, Evolution",
+          "contents": [
+            "100B-agent scale envelope and cellular federation",
+            "jurisdictional pluralism and rights-aware governance",
+            "re-verification and bounded reversal loops",
+            "forward epoch cutovers without implicit backward compatibility",
+            "signal provenance weighting and trust-aware fusion"
+          ],
+          "node_class": "EXPLANATORY"
+        }
+      },
+      "cross_scale_principle_weave": {
+        "node_class": "NORMATIVE",
+        "statement": "Principles are scale-invariant. Architecture semantics MUST remain constant from small-cell deployment to large federation; only topology, budget vectors, and verifier economics may vary.",
+        "bundles": {
+          "WEAVE-01": {
+            "name": "Authoritative Transition Bundle",
+            "principle_refs": [
+              "PRIN-047",
+              "PRIN-090",
+              "PRIN-092"
+            ],
+            "law_refs": [
+              "LAW-01",
+              "LAW-03",
+              "LAW-13",
+              "LAW-15"
+            ],
+            "invariant_refs": [
+              "INV-F-01",
+              "INV-F-02",
+              "INV-F-03",
+              "INV-F-15"
+            ],
+            "scale_note": "Validity predicate for authoritative transition is identical at all scales."
+          },
+          "WEAVE-02": {
+            "name": "Least-Authority Delegation Bundle",
+            "principle_refs": [
+              "PRIN-038",
+              "PRIN-094",
+              "PRIN-124"
+            ],
+            "law_refs": [
+              "LAW-05",
+              "LAW-14",
+              "LAW-18"
+            ],
+            "invariant_refs": [
+              "INV-F-05",
+              "INV-F-14"
+            ],
+            "scale_note": "Capability semantics are unchanged; only grant volume and propagation topology vary."
+          },
+          "WEAVE-03": {
+            "name": "Bounded Autonomy and Stability Bundle",
+            "principle_refs": [
+              "PRIN-048",
+              "PRIN-053",
+              "PRIN-094"
+            ],
+            "law_refs": [
+              "LAW-11",
+              "LAW-12",
+              "LAW-14"
+            ],
+            "invariant_refs": [
+              "INV-F-06",
+              "INV-F-09",
+              "INV-F-11"
+            ],
+            "scale_note": "Retry-safety, admission control, and stop discipline are mandatory in both local and federated operation."
+          },
+          "WEAVE-04": {
+            "name": "Convergence and Evidence Economics Bundle",
+            "principle_refs": [
+              "PRIN-049",
+              "PRIN-111",
+              "PRIN-123"
+            ],
+            "law_refs": [
+              "LAW-07",
+              "LAW-10",
+              "LAW-16"
+            ],
+            "invariant_refs": [
+              "INV-F-07",
+              "INV-F-12",
+              "INV-F-13"
+            ],
+            "scale_note": "Convergence and summary contracts use the same rules; higher scale changes compaction and locality budgets."
+          },
+          "WEAVE-05": {
+            "name": "Counterexample Evolution Bundle",
+            "principle_refs": [
+              "PRIN-099",
+              "PRIN-107",
+              "PRIN-121",
+              "PRIN-122"
+            ],
+            "law_refs": [
+              "LAW-08",
+              "LAW-17",
+              "LAW-19",
+              "LAW-20"
+            ],
+            "invariant_refs": [
+              "INV-F-10",
+              "INV-F-15"
+            ],
+            "scale_note": "Failure-driven improvement and independent re-verification are universal; cadence and portfolio size are scale-tuned."
+          }
         }
       },
       "module_contract_template": {
@@ -3496,7 +4614,8 @@
         "DOC-SPINE-03",
         "DOC-SPINE-04",
         "DOC-SPINE-05",
-        "DOC-SPINE-06"
+        "DOC-SPINE-06",
+        "DOC-SPINE-07"
       ]
     },
     "law_alignment": {
@@ -3504,39 +4623,57 @@
         "LAW-01": {
           "name": "Loop Closure & Gated Promotion",
           "reference_path": "laws.json",
-          "role": "Defines authoritative promotion: no shared truth transition without verification receipts whose acceptance predicates reduce to replayable, machine-checkable terminal verifiers in an attested environment. Includes hierarchical gate separation for Planner/Executor layers with layer-specific budgets.",
+          "role": "Defines authoritative promotion: no shared truth transition without verification receipts whose acceptance predicates reduce to replayable, machine-checkable terminal verifiers in an integrity-verified environment. Includes hierarchical gate separation for Planner/Executor layers with layer-specific budgets.",
           "node_class": "NORMATIVE",
-          "amendments": ["Hierarchical Gate Separation", "Layer-Specific Budgets"]
+          "amendments": [
+            "Hierarchical Gate Separation",
+            "Layer-Specific Budgets"
+          ]
         },
         "LAW-02": {
           "name": "Observable Context Sufficiency",
           "reference_path": "laws.json",
           "role": "Defines measurable surrogates for role-relative, capability-bounded context sufficiency; drives context compiler optimization. Mandates subtask isolation with scoped ContextPacks and typed inter-subtask interfaces; containment conflicts force decomposition/escalation (fail-closed).",
           "node_class": "NORMATIVE",
-          "amendments": ["Subtask Isolation", "Inter-Subtask Interface"],
-          "defect_classes": ["CONTEXT_BLEED"]
+          "amendments": [
+            "Subtask Isolation",
+            "Inter-Subtask Interface"
+          ],
+          "defect_classes": [
+            "CONTEXT_BLEED"
+          ]
         },
         "LAW-03": {
           "name": "Monotone Ledger vs. Overwritable Projection",
           "reference_path": "laws.json",
-          "role": "Separates truth substrate from mutable projections; authoritative truth is the monotone ledger + evidence + deterministic addressability, while agents operate on bounded views synchronized by ledger commitments. Requires merge algebra and monotone compaction (derived artifacts that reference history). Memory mutations are ledger events; retrieval is auditable tool invocation. Shared authority facts MUST be quorum-attested via BFT consensus.",
+          "role": "Separates truth substrate from mutable projections; authoritative truth is the monotone ledger + evidence + deterministic addressability, while agents operate on bounded views synchronized by ledger commitments. Requires merge algebra and monotone compaction (derived artifacts that reference history). Memory mutations are ledger events; retrieval is auditable tool invocation. Shared authority facts MUST be quorum-authenticated via BFT consensus.",
           "node_class": "NORMATIVE",
-          "amendments": ["Memory Mutation as Ledger Events", "Retrieval as Tool Call", "BFT Consensus Quorum"],
-          "defect_classes": ["SILENT_MEMORY_MUTATION"]
+          "amendments": [
+            "Memory Mutation as Ledger Events",
+            "Retrieval as Tool Call",
+            "BFT Consensus Quorum"
+          ],
+          "defect_classes": [
+            "SILENT_MEMORY_MUTATION"
+          ]
         },
         "LAW-04": {
           "name": "Stochastic Stability",
           "reference_path": "laws.json",
           "role": "Since transducers (agents) are stochastic, stability is achieved only through the binding of Stability = (Contract + Receipt + Evidence) to replayable terminal verifiers and an explicit determinism envelope. Event ordering MUST rely on Hybrid Logical Clocks (HLC) to preserve causal determinism.",
           "node_class": "NORMATIVE",
-          "amendments": ["Causal Determinism (HLC)"]
+          "amendments": [
+            "Causal Determinism (HLC)"
+          ]
         },
         "LAW-05": {
           "name": "Dual-Axis Containment",
           "reference_path": "laws.json",
           "role": "Containment requires both Authority (Capabilities) and Accountability (Identity/Audit), including context-read firewalls treated as capabilities; containment dominates sufficiency and privilege escalations must be explicit. Connectivity for contained agents MUST use Relay Holons to preserve outbound-only security boundary.",
           "node_class": "NORMATIVE",
-          "amendments": ["Relay-Mediated Connectivity"]
+          "amendments": [
+            "Relay-Mediated Connectivity"
+          ]
         },
         "LAW-06": {
           "name": "MDL as a Gated Budget",
@@ -3553,10 +4690,15 @@
         "LAW-08": {
           "name": "Verifier Economics (Goodhart Resistance)",
           "reference_path": "laws.json",
-          "role": "Only gate what you can defend; holdouts/adversarial suites; safety constraints separated from performance targets. Includes monitorability conservation: oversight channels isolated from optimization objectives.",
+          "role": "Only gate what you can defend; holdouts/adversarial suites; safety constraints separated from performance targets. Includes monitorability conservation and coalition-resistance against collusive optimization pressure.",
           "node_class": "NORMATIVE",
-          "amendments": ["Monitorability Conservation", "Audit Channel Integrity"],
-          "defect_classes": ["MONITOR_GAMING"]
+          "amendments": [
+            "Monitorability Conservation",
+            "Audit Channel Integrity"
+          ],
+          "defect_classes": [
+            "MONITOR_GAMING"
+          ]
         },
         "LAW-09": {
           "name": "Temporal Pinning & Freshness",
@@ -3579,30 +4721,74 @@
         "LAW-12": {
           "name": "Bounded Search and Termination Discipline",
           "reference_path": "laws.json",
-          "role": "Exploration runs under leases and stop conditions; non-convergence is a defect. Includes repetition/echo-trap detection as termination trigger and defect signal.",
+          "role": "Exploration and policy adaptation run under budgets and stop conditions; non-convergence is a defect. Includes repetition detection, delay-aware stability posture, and anti-flip-flop transition design (hysteresis/deadbands/hold-down timers).",
           "node_class": "NORMATIVE",
-          "amendments": ["Repetition Detection", "Degeneration as Defect"],
-          "defect_classes": ["REASONING_DEGENERATION"]
+          "amendments": [
+            "Repetition Detection",
+            "Degeneration as Defect"
+          ],
+          "defect_classes": [
+            "REASONING_DEGENERATION"
+          ]
         },
         "LAW-13": {
           "name": "Semantic Contracting",
           "reference_path": "laws.json",
-          "role": "Typed/unitful/canonical boundaries; versioned enums; canonicalization before hashing/signing. Includes canonical Quantity encoding for all quantitative fields.",
+          "role": "Typed/unitful/canonical boundaries; versioned enums; canonicalization before hashing/signing. Semantic transitions use explicit epoch cutovers or declared compatibility contracts; no implicit backward-compatibility assumptions.",
           "node_class": "NORMATIVE"
         },
         "LAW-14": {
           "name": "Proportionality and Risk-Weighted Evidence",
           "reference_path": "laws.json",
-          "role": "Gate strength scales with risk/blast radius; adaptive enforcement based on escape rates.",
+          "role": "Gate strength scales with risk/blast radius and adapts to escape rates; risk includes jurisdictional, rights, and externality surfaces, not only local performance impact.",
           "node_class": "NORMATIVE"
         },
         "LAW-15": {
           "name": "Measurement Integrity",
           "reference_path": "laws.json",
-          "role": "Receipts are tamper-evident and evidence-bearing (inputs/outputs/hashes + command transcript + toolchain versions + environment digest/attestation); omission of required evidence is a defect; fail-closed in high-risk transitions. Includes evaluator validity auditing for false negatives and instruction-checker alignment.",
+          "role": "Receipts are tamper-evident and evidence-bearing (inputs/outputs/hashes + command transcript + toolchain versions + environment digest/integrity proof); omission of required evidence is a defect; fail-closed in high-risk transitions. Includes evaluator validity auditing, privacy-preserving measurement, and signal provenance weighting for control relevance.",
           "node_class": "NORMATIVE",
-          "amendments": ["Evaluator Validity", "Evaluator Brittleness as Defect"],
-          "defect_classes": ["EVALUATOR_DRIFT"]
+          "amendments": [
+            "Evaluator Validity",
+            "Evaluator Brittleness as Defect"
+          ],
+          "defect_classes": [
+            "EVALUATOR_DRIFT"
+          ]
+        },
+        "LAW-16": {
+          "name": "Closure Under Composition & Boundary Contracts",
+          "reference_path": "laws.json",
+          "role": "Holonic systems scale by preserving boundary primitive closure across recursion depth: coarse-grained commitments/receipts/summaries at boundaries, deterministic selector-based zoom-in, explicit challenge paths, and stable semantics under composition.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Re-verification Channel",
+            "Population-Scale Compositionality"
+          ]
+        },
+        "LAW-17": {
+          "name": "Verifier Independence",
+          "reference_path": "laws.json",
+          "role": "Tier2+ promotions require diverse, non-correlated verifier families; disagreement must be escalated, never silently collapsed.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-18": {
+          "name": "Revocation Latency and Propagation",
+          "reference_path": "laws.json",
+          "role": "Revocation must propagate with receipt-backed bounded latency across declared trust surface; stale authority acceptance after SLO is fail-closed.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-19": {
+          "name": "Uncertainty-Qualified Promotion",
+          "reference_path": "laws.json",
+          "role": "High-impact promotions require explicit uncertainty/provenance annotation and policy-bounded residual uncertainty.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-20": {
+          "name": "Deterministic Re-verification Path",
+          "reference_path": "laws.json",
+          "role": "High-impact decisions must provide deterministic machine re-verification path, independent verifier-family rerun, and receipt-bound outcome publication.",
+          "node_class": "NORMATIVE"
         }
       },
       "law_order": [
@@ -3620,7 +4806,12 @@
         "LAW-12",
         "LAW-13",
         "LAW-14",
-        "LAW-15"
+        "LAW-15",
+        "LAW-16",
+        "LAW-17",
+        "LAW-18",
+        "LAW-19",
+        "LAW-20"
       ]
     },
     "glossary_alignment": {
@@ -3776,6 +4967,92 @@
           "node_class": "BACKGROUND"
         }
       }
+    },
+    "assumption_ledger": {
+      "node_class": "NORMATIVE",
+      "model_id": "ASSUMPTION-LEDGER-V1",
+      "purpose": "Track explicit assumptions as first-class, expiry-bound, evidence-scored records so hidden assumptions do not silently accumulate governance debt.",
+      "record_contract": {
+        "schema_id": "apm2.assumption.record.v1",
+        "required_fields": [
+          "assumption_id",
+          "statement",
+          "owner_actor_id",
+          "created_at",
+          "expires_at",
+          "evidence_strength",
+          "uncertainty_class",
+          "invalidation_triggers",
+          "dependent_artifacts"
+        ],
+        "field_notes": {
+          "assumption_id": "Stable identifier (ASM-XXXX).",
+          "evidence_strength": "Enum indicating support quality from NONE to FORMAL.",
+          "dependent_artifacts": "Receipts/specs/decisions relying on this assumption."
+        }
+      },
+      "lifecycle_states": [
+        "PROPOSED",
+        "ACTIVE",
+        "AT_RISK",
+        "INVALIDATED",
+        "RETIRED"
+      ],
+      "evidence_strength_enum": [
+        "NONE",
+        "ANECDOTAL",
+        "EMPIRICAL",
+        "REPLAYABLE",
+        "FORMAL"
+      ],
+      "uncertainty_class_enum": [
+        "DETERMINISTIC",
+        "PROBABILISTIC_BOUNDED",
+        "MODEL_DISAGREEMENT",
+        "UNKNOWN"
+      ],
+      "invalidation_trigger_classes": [
+        "counterexample_observed",
+        "freshness_expired",
+        "schema_epoch_changed",
+        "verifier_disagreement_exceeded",
+        "jurisdiction_or_policy_shift"
+      ],
+      "governance_rules": {
+        "ASMP-01": {
+          "statement": "Every assumption used by a gate, policy, or high-impact decision MUST declare owner, expiry, and invalidation triggers.",
+          "law_refs": [
+            "LAW-09",
+            "LAW-15",
+            "LAW-19"
+          ],
+          "node_class": "NORMATIVE"
+        },
+        "ASMP-02": {
+          "statement": "Tier2+ promotion MUST fail closed if any dependency assumption is expired, invalidated, or missing evidence strength required by policy.",
+          "law_refs": [
+            "LAW-14",
+            "LAW-19"
+          ],
+          "node_class": "NORMATIVE"
+        },
+        "ASMP-03": {
+          "statement": "Assumption invalidation MUST emit a ledger event and open linked remediation/replanning work for dependent artifacts.",
+          "law_refs": [
+            "LAW-01",
+            "LAW-03",
+            "LAW-12"
+          ],
+          "node_class": "NORMATIVE"
+        }
+      },
+      "law_refs": [
+        "LAW-07",
+        "LAW-09",
+        "LAW-14",
+        "LAW-15",
+        "LAW-19"
+      ]
     }
   },
   "schema": "apm2.holonic.unified_theory.v1",

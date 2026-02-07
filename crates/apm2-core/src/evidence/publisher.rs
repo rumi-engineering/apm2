@@ -57,8 +57,7 @@ pub struct PublishResult {
 ///
 /// ```rust
 /// use apm2_core::evidence::{
-///     ContentAddressedStore, DataClassification, EvidenceCategory,
-///     EvidencePublisher, MemoryCas,
+///     ContentAddressedStore, DataClassification, EvidenceCategory, EvidencePublisher, MemoryCas,
 /// };
 ///
 /// let cas = MemoryCas::new();

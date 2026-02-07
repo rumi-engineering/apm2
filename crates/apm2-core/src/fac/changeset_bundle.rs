@@ -29,8 +29,7 @@
 //! ```rust
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::fac::{
-//!     ChangeKind, ChangeSetBundleV1, ChangeSetPublished, FileChange,
-//!     GitObjectRef, HashAlgo,
+//!     ChangeKind, ChangeSetBundleV1, ChangeSetPublished, FileChange, GitObjectRef, HashAlgo,
 //! };
 //!
 //! // Create a changeset bundle

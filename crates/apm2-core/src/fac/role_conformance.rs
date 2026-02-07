@@ -25,9 +25,7 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_core::fac::{
-//!     ConformanceResult, RoleConformanceHarness, builtin_roles,
-//! };
+//! use apm2_core::fac::{ConformanceResult, RoleConformanceHarness, builtin_roles};
 //!
 //! let role = builtin_roles::code_quality_reviewer_role();
 //! let harness = RoleConformanceHarness::new();

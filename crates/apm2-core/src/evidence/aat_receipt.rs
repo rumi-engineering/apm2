@@ -22,9 +22,7 @@
 //!
 //! ```rust
 //! use apm2_core::crypto::Signer;
-//! use apm2_core::evidence::aat_receipt::{
-//!     AATReceipt, AATReceiptGenerator, TestSummary,
-//! };
+//! use apm2_core::evidence::aat_receipt::{AATReceipt, AATReceiptGenerator, TestSummary};
 //!
 //! // Create a generator with a signing key
 //! let signer = Signer::generate();

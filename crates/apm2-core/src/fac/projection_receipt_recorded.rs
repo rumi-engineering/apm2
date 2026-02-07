@@ -38,8 +38,7 @@
 //! ```rust
 //! use apm2_core::crypto::Signer;
 //! use apm2_core::fac::{
-//!     ProjectedStatusCode, ProjectionArtifactBundleV1,
-//!     ProjectionReceiptRecorded,
+//!     ProjectedStatusCode, ProjectionArtifactBundleV1, ProjectionReceiptRecorded,
 //! };
 //!
 //! let signer = Signer::generate();

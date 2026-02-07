@@ -49,9 +49,7 @@
 //! ```rust
 //! use apm2_core::ledger::EventRecord;
 //! use apm2_core::reducer::{Reducer, ReducerContext};
-//! use apm2_core::session::{
-//!     ExitClassification, SessionReducer, SessionState, helpers,
-//! };
+//! use apm2_core::session::{ExitClassification, SessionReducer, SessionState, helpers};
 //!
 //! // Create a reducer
 //! let mut reducer = SessionReducer::new();

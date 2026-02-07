@@ -66,8 +66,7 @@
 //! if result.circuit_breaker.is_blocking() {
 //!     println!(
 //!         "Recommendations suspended: {} open tickets (threshold: {})",
-//!         result.circuit_breaker.current_backlog,
-//!         result.circuit_breaker.threshold
+//!         result.circuit_breaker.current_backlog, result.circuit_breaker.threshold
 //!     );
 //! } else {
 //!     // Process recommendations

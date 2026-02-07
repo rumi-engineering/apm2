@@ -44,9 +44,7 @@
 //!
 //! ```rust,no_run
 //! use apm2_core::crypto::Signer;
-//! use apm2_core::run_manifest::{
-//!     ManifestBuilder, sign_manifest, verify_manifest,
-//! };
+//! use apm2_core::run_manifest::{ManifestBuilder, sign_manifest, verify_manifest};
 //!
 //! // Build a manifest
 //! let manifest = ManifestBuilder::new()

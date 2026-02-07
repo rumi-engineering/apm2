@@ -150,14 +150,10 @@ impl fmt::Display for SetTag {
 /// # Examples
 ///
 /// ```
-/// use apm2_daemon::identity::{
-///     AlgorithmTag, KeySetIdV1, PublicKeyIdV1, SetTag,
-/// };
+/// use apm2_daemon::identity::{AlgorithmTag, KeySetIdV1, PublicKeyIdV1, SetTag};
 ///
-/// let key1 =
-///     PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
-/// let key2 =
-///     PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+/// let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+/// let key2 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
 ///
 /// let set_id = KeySetIdV1::from_descriptor(
 ///     "ed25519",

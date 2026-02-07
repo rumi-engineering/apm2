@@ -43,8 +43,7 @@
 //!
 //! ```rust
 //! use apm2_core::htf::{
-//!     BoundedWallInterval, HtfTick, LedgerTime, TimeEnvelopeRef,
-//!     WallTimeSource,
+//!     BoundedWallInterval, HtfTick, LedgerTime, TimeEnvelopeRef, WallTimeSource,
 //! };
 //!
 //! // Create authoritative ledger time for ordering

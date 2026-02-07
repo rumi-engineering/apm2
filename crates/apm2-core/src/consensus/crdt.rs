@@ -886,9 +886,7 @@ impl GCounter {
     /// # Example
     ///
     /// ```
-    /// use apm2_core::consensus::crdt::{
-    ///     CrdtMergeError, GCounter, MAX_GCOUNTER_NODES,
-    /// };
+    /// use apm2_core::consensus::crdt::{CrdtMergeError, GCounter, MAX_GCOUNTER_NODES};
     ///
     /// let mut counter = GCounter::new();
     /// let node_id = [0x01; 32];
@@ -966,9 +964,7 @@ impl GCounter {
     /// # Example
     ///
     /// ```
-    /// use apm2_core::consensus::crdt::{
-    ///     CrdtMergeError, GCounter, MAX_GCOUNTER_NODES,
-    /// };
+    /// use apm2_core::consensus::crdt::{CrdtMergeError, GCounter, MAX_GCOUNTER_NODES};
     ///
     /// let mut counter_a = GCounter::new();
     /// counter_a.try_increment([0x01; 32], 5).unwrap();

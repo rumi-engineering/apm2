@@ -64,9 +64,8 @@
 //!
 //! ```rust
 //! use apm2_core::fac::{
-//!     AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatVerdict,
-//!     DeterminismClass, DeterminismStatus, FlakeClass,
-//!     RiskTier as AatRiskTier, TerminalVerifierOutput,
+//!     AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatVerdict, DeterminismClass,
+//!     DeterminismStatus, FlakeClass, RiskTier as AatRiskTier, TerminalVerifierOutput,
 //! };
 //!
 //! // Components for stability_digest computation

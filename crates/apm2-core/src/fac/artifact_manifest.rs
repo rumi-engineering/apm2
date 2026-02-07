@@ -41,8 +41,7 @@
 //!
 //! ```rust
 //! use apm2_core::fac::{
-//!     ArtifactDigest, ArtifactManifest, ArtifactManifestBuilder,
-//!     ArtifactType, DataClassification,
+//!     ArtifactDigest, ArtifactManifest, ArtifactManifestBuilder, ArtifactType, DataClassification,
 //! };
 //!
 //! let manifest = ArtifactManifestBuilder::new()

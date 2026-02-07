@@ -60,8 +60,7 @@
 //!
 //! use apm2_core::evidence::MemoryCas;
 //! use apm2_core::fac::efficiency_primitives::{
-//!     ContextDeltaBuilder, IterationContextBuilder, ToolOutputCache,
-//!     ToolOutputCacheConfig,
+//!     ContextDeltaBuilder, IterationContextBuilder, ToolOutputCache, ToolOutputCacheConfig,
 //! };
 //!
 //! // Build a context delta between iterations

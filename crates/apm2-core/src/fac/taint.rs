@@ -32,13 +32,10 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_core::fac::taint::{
-//!     TaintLevel, TaintPolicy, TaintSource, TaintTag, TargetContext,
-//! };
+//! use apm2_core::fac::taint::{TaintLevel, TaintPolicy, TaintSource, TaintTag, TargetContext};
 //!
 //! // Tag a diff as untrusted
-//! let tag =
-//!     TaintTag::new(TaintLevel::Untrusted, TaintSource::Diff, [0x42; 32]);
+//! let tag = TaintTag::new(TaintLevel::Untrusted, TaintSource::Diff, [0x42; 32]);
 //!
 //! // Check if it can flow into a receipt
 //! let policy = TaintPolicy::default();
@@ -745,9 +742,7 @@ fn rule_matches(rule: &FlowRule, tag: &TaintTag, target: TargetContext) -> bool 
 /// # Example
 ///
 /// ```rust
-/// use apm2_core::fac::taint::{
-///     TaintAggregator, TaintLevel, TaintSource, TaintTag,
-/// };
+/// use apm2_core::fac::taint::{TaintAggregator, TaintLevel, TaintSource, TaintTag};
 ///
 /// let mut agg = TaintAggregator::new();
 /// agg.add(TaintTag::from_source(TaintSource::CasVerified, [0x01; 32]));

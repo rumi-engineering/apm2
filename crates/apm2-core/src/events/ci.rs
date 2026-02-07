@@ -82,9 +82,7 @@ use crate::webhook::WorkflowConclusion;
 /// # Example
 ///
 /// ```rust
-/// use apm2_core::events::ci::{
-///     CIConclusion, CIWorkflowCompleted, CIWorkflowPayload,
-/// };
+/// use apm2_core::events::ci::{CIConclusion, CIWorkflowCompleted, CIWorkflowPayload};
 /// use chrono::Utc;
 /// use uuid::Uuid;
 ///

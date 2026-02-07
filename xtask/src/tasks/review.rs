@@ -798,8 +798,8 @@ mod tests {
                 "Prompt {prompt_path} missing $PR_URL placeholder"
             );
             assert!(
-                content.contains("$HEAD_SHA"),
-                "Prompt {prompt_path} missing $HEAD_SHA placeholder"
+                content.contains("reviewed_sha"),
+                "Prompt {prompt_path} missing reviewed_sha reference"
             );
         }
     }

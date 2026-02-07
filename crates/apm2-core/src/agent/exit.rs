@@ -311,10 +311,9 @@ pub const EXIT_SIGNAL_VERSION: &str = "1.0.0";
 /// ```rust
 /// use apm2_core::agent::exit::{ExitReason, ExitSignal, WorkPhase};
 ///
-/// let signal =
-///     ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
-///         .with_pr_url("https://github.com/org/repo/pull/123")
-///         .with_notes("Implementation complete, all tests passing");
+/// let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+///     .with_pr_url("https://github.com/org/repo/pull/123")
+///     .with_notes("Implementation complete, all tests passing");
 ///
 /// // Validate the signal
 /// assert!(signal.validate().is_ok());
@@ -653,19 +652,12 @@ impl AgentExitConfig {
 /// # Example
 ///
 /// ```rust
-/// use apm2_core::agent::exit::{
-///     AgentSessionCompleted, ExitReason, ExitSignal, WorkPhase,
-/// };
+/// use apm2_core::agent::exit::{AgentSessionCompleted, ExitReason, ExitSignal, WorkPhase};
 ///
-/// let signal =
-///     ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
-///         .with_pr_url("https://github.com/org/repo/pull/123");
+/// let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+///     .with_pr_url("https://github.com/org/repo/pull/123");
 ///
-/// let event = AgentSessionCompleted::from_exit_signal(
-///     "session-123",
-///     "actor-456",
-///     signal,
-/// );
+/// let event = AgentSessionCompleted::from_exit_signal("session-123", "actor-456", signal);
 ///
 /// assert_eq!(event.event_type, AgentSessionCompleted::EVENT_TYPE);
 /// assert_eq!(event.phase_completed, WorkPhase::Implementation);

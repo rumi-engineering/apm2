@@ -1,0 +1,165 @@
+{
+  "kind": "instruction.spec",
+  "schema": "cac.instruction_spec.v1",
+  "schema_version": "1.0.0",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-02-07T02:00:00Z",
+    "dependencies": [
+      "dcp://apm2.agents/mor/selector@1",
+      "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1"
+    ],
+    "labels": [
+      "abstraction-discovery",
+      "codebase-analysis",
+      "refactoring",
+      "alien-engineering",
+      "v1"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-INSTR-EMITTER",
+      "work_id": "abstraction_discovery_v1"
+    },
+    "stable_id": "dcp://apm2.local/instructions/abstraction_discovery/master@v1"
+  },
+  "payload": {
+    "i": "Abstraction Discovery Protocol: analyze recent high-velocity PR output to identify repeated logic, structural duplication, and missed abstraction boundaries, then synthesize a ranked list of reusable abstractions and select the single highest-leverage candidate with a concrete implementation sketch.",
+    "pb": "High-velocity agent-driven development creates duplication pressure — patterns get copy-pasted across PRs faster than abstractions can form. This protocol selects reasoning modes from the modes-of-reasoning selector to diagnose structural repetition and generalize reusable abstractions from successful instances. Run periodically (e.g., after each sprint or batch of >=10 PRs) to keep abstraction debt in check.",
+    "t": {
+      "sys": "APM2",
+      "repo": "{repo_root}",
+      "scope": [
+        "crates/apm2-core/src",
+        "crates/apm2-daemon/src",
+        "crates/apm2-holon/src",
+        "crates/apm2-cli/src",
+        "xtask/src"
+      ]
+    },
+    "reasoning_mode_selection": {
+      "selector_ref": "dcp://apm2.agents/mor/selector@1",
+      "selector_file": "documents/skills/modes-of-reasoning/assets/selector.json",
+      "instruction": "Performed in Phase 0 BOOTSTRAP. Read the selector file and choose reasoning modes for the DIAGNOSE and GENERALIZE phases. Use the selector's heuristics and patterns to pick the best fit for each phase. Document your selection rationale in the report.",
+      "selection_procedure": [
+        "1. Read documents/skills/modes-of-reasoning/assets/selector.json",
+        "2. For DIAGNOSE phase: match against heuristics with {task: 'diagnosis'} and patterns.codebase_grounding. Load the top-scoring mode's asset file from documents/skills/modes-of-reasoning/assets/{id}-{name}.json and follow its proc steps.",
+        "3. For GENERALIZE phase: match against heuristics with {task: 'design'} and patterns.architectural_discovery. Load the top-scoring mode's asset file and follow its proc steps.",
+        "4. Record selected modes and rationale in the '## Reasoning Mode Selection' section of the report."
+      ],
+      "defaults": {
+        "diagnose": {
+          "ref": "dcp://apm2.agents/mor/mode/abductive@1",
+          "id": 13,
+          "name": "abductive",
+          "rationale": "Default: treats repeated patterns as surprising observations requiring hypothesis generation. Override if selector heuristics indicate a better fit."
+        },
+        "generalize": {
+          "ref": "dcp://apm2.agents/mor/mode/explanation-based-learning@1",
+          "id": 16,
+          "name": "explanation-based-learning",
+          "rationale": "Default: generalizes reusable rules from a single well-explained exemplar. Override if selector heuristics indicate a better fit."
+        }
+      }
+    },
+    "alien_engineering_overlay": {
+      "ref": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1",
+      "active_clauses": [
+        "AEP_03: Prefer novel synthesis — the best abstraction may weave concepts from multiple crates into something none of them independently suggest.",
+        "AEP_04: Prefer compounding closure — the abstraction should make future PRs smaller, not just deduplicate today's code.",
+        "AEP_06: Prefer digest-first interfaces — the abstraction boundary should be typed, canonical, low-variety, capability-scoped.",
+        "AEP_08: Prefer recursive semantic stability — the abstraction must preserve semantic equivalence under composition."
+      ],
+      "constraint": "DOMINANCE_ORDER: containment/security > verification/correctness > liveness/progress. No abstraction may weaken containment guarantees for ergonomic convenience."
+    },
+    "procedure": [
+      {
+        "phase": 0,
+        "name": "BOOTSTRAP",
+        "action": "Read all dependency artifacts and select reasoning modes. Steps: (1) Read the alien engineering protocol to internalize AEP clauses, dominance order, and lexicon. (2) Read the reasoning mode selector and choose modes for DIAGNOSE and GENERALIZE phases. (3) Load each selected mode's full asset file and internalize its proc steps. (4) Record selections and rationale.",
+        "required_reading": [
+          {"ref": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1", "file": "documents/work/prompts/instruction.alien_engineering_protocol.v1.json", "note": "Internalize AEP clauses, dominance order, and required_reading chain. Follow its required_reading to load theory bundles (principles.json, laws.json, unified_theory.json, defects.json) as needed for Phase 6 self-check."},
+          {"ref": "dcp://apm2.agents/mor/selector@1", "file": "documents/skills/modes-of-reasoning/assets/selector.json", "note": "Use heuristics and patterns to select modes for DIAGNOSE and GENERALIZE phases."},
+          {"note": "After mode selection, load the chosen mode asset files from documents/skills/modes-of-reasoning/assets/{id}-{name}.json"}
+        ],
+        "tools": ["read"],
+        "output": "bootstrap_context: { aep_clauses_internalized: bool, mode_selection: { diagnose_mode: {id, name, rationale}, generalize_mode: {id, name, rationale} } }",
+        "budget": {"tc": 20, "ms": 120000}
+      },
+      {
+        "phase": 1,
+        "name": "SURVEY",
+        "action": "Discover the N largest recently merged PRs by Rust SLOC. Use `gh pr list --state merged --limit 50 --json number,title,mergedAt` to find candidates, then measure each with `gh pr diff <N> --name-only | grep '\\.rs$'` and `gh pr diff <N> | grep -cE '^[+-][^+-]'`. Select the top 15 by changed Rust lines. For each, extract: (a) new public types/traits introduced, (b) new impl blocks, (c) error handling patterns, (d) builder/constructor patterns, (e) test scaffolding patterns.",
+        "tools": ["gh pr diff", "rg", "cargo doc"],
+        "output": "pr_survey_table: PR# | new_types | new_impls | error_patterns | builder_patterns | test_scaffolding",
+        "budget": {"tc": 100, "ms": 600000}
+      },
+      {
+        "phase": 2,
+        "name": "CLUSTER",
+        "action": "Using the survey table, identify clusters of structural similarity across PRs. Look for: (a) functions with >70% token overlap across different modules, (b) structs with identical field patterns but different names, (c) repeated match arms or error-mapping chains, (d) copy-pasted test helpers or assertion sequences, (e) builder patterns that follow the same shape. Group into duplication clusters with >=3 instances each.",
+        "tools": ["rg -c", "diff"],
+        "output": "duplication_clusters: cluster_id | pattern_description | instance_count | files[] | estimated_shared_sloc",
+        "budget": {"tc": 150, "ms": 600000}
+      },
+      {
+        "phase": 3,
+        "name": "DIAGNOSE",
+        "action": "For each duplication cluster, apply the reasoning mode selected in Phase 0 for diagnosis (default: abductive). Follow the selected mode's proc steps from its asset file. At minimum: (1) ISOLATE the repeated pattern as observation, (2) GENERATE >=3 hypotheses for why it exists, (3) SCORE using the mode's criteria, (4) RANK, (5) PREDICT what abstraction would resolve it. Gate: skip clusters where duplication is intentional for containment.",
+        "output": "diagnosis_table: cluster_id | best_hypothesis | score | predicted_abstraction | containment_risk",
+        "budget": {"tc": 100, "ms": 300000}
+      },
+      {
+        "phase": 4,
+        "name": "GENERALIZE",
+        "action": "For the top 10 clusters by score, apply the reasoning mode selected in Phase 0 for generalization (default: explanation-based-learning). Follow the selected mode's proc steps from its asset file. At minimum: (1) select best exemplar, (2) build explanation tree or equivalent analytical structure per the mode, (3) identify operational vs incidental features, (4) construct generalized abstraction (trait, derive macro, utility module, or shared test harness), (5) define scope and boundary conditions.",
+        "output": "abstraction_candidates[10]: { id, name, kind(trait|macro|module|harness), source_exemplar, mechanism, scope_conditions, boundary_conditions, estimated_dedup_sloc, adoption_sites[], risk_notes }",
+        "budget": {"tc": 150, "ms": 600000}
+      },
+      {
+        "phase": 5,
+        "name": "SELECT & JUSTIFY",
+        "action": "From the 10 candidates, select the single best abstraction using a weighted decision matrix: (a) dedup_sloc_saved (25%), (b) future_pr_size_reduction (25%), (c) containment_safety (20%), (d) adoption_friction (15%), (e) composability (15%). Produce a concrete sketch: trait definition or module API, migration path for top 3 adoption sites, and a falsifiable claim about the expected improvement.",
+        "output": {
+          "winner": "{ id, name, kind, trait_or_api_sketch, migration_path[3], expected_improvement_claim, falsification_criteria }",
+          "runner_up": "{ id, name, score_delta, why_not_first }",
+          "full_ranking": "sorted table of all 10 with scores"
+        },
+        "budget": {"tc": 50, "ms": 300000}
+      },
+      {
+        "phase": 6,
+        "name": "SELF-CHECK",
+        "action": "Validate the winner against: (1) Does it violate DOMINANCE_ORDER? (2) Does it introduce a new crate dependency or circular dep? (3) Would it have prevented any known defect in documents/theory/defects.json? (4) Does the generalization scope match the explanation tree? (5) Are boundary conditions explicit? If any check fails, demote and promote runner-up.",
+        "output": "validation_report: { checks_passed[], checks_failed[], final_recommendation }",
+        "budget": {"tc": 50, "ms": 120000}
+      }
+    ],
+    "pr_discovery": {
+      "description": "Phase 1 dynamically discovers the target PR set. No hardcoded PR numbers — the protocol self-populates from recent merge history each time it runs.",
+      "method": "gh pr list --state merged --limit 50, then rank by Rust SLOC, take top 15",
+      "lookback": "configurable; default 48 hours. Adjust via invocation parameter if needed."
+    },
+    "output_format": {
+      "required_sections": [
+        "## Bootstrap: Dependencies & Reasoning Mode Selection",
+        "## PR Survey Table",
+        "## Duplication Clusters",
+        "## Diagnosis",
+        "## Top 10 Abstraction Candidates",
+        "## Decision Matrix",
+        "## Winner: The Single Best Abstraction",
+        "## Validation Report",
+        "## Appendix: Full Ranking"
+      ],
+      "file": "documents/work/reports/abstraction_discovery.report.{date}.md"
+    },
+    "x": {
+      "tools": ["rg", "gh", "cargo", "jq"],
+      "bud": {
+        "tok": 200000,
+        "tc": 600,
+        "ms": 3600000
+      }
+    }
+  }
+}

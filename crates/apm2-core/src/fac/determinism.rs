@@ -40,8 +40,8 @@
 //!
 //! ```rust
 //! use apm2_core::fac::determinism::{
-//!     DeterminismEnvelope, DeterminismEnvelopeBuilder, check_stability,
-//!     compute_stability_digest, required_run_count,
+//!     DeterminismEnvelope, DeterminismEnvelopeBuilder, check_stability, compute_stability_digest,
+//!     required_run_count,
 //! };
 //! use apm2_core::fac::{DeterminismClass, DeterminismStatus, RiskTier};
 //!

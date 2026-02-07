@@ -14,10 +14,31 @@
     "core": "Given goal, current state, actions, and dynamics, produce action sequence (plan) or state-to-action mapping (policy) that achieves goal via state-space traversal. Plan = fixed sequence for deterministic case; Policy = state-conditioned rules for stochastic case.",
     "key_distinction": "plan_answers_what_to_do_next_policy_answers_what_to_do_in_each_state",
     "out": [
-      {"type": "plan", "form": "ordered action sequence with preconditions", "test": "each step executable given prior effects"},
-      {"type": "policy", "form": "state -> action mapping for all reachable states", "test": "every reachable state has defined action"},
-      {"type": "contingency_table", "form": "failure_condition -> recovery_action pairs", "test": "top 5 failure modes have explicit handlers"},
-      {"type": "playbook", "form": "human-readable runbook with decision points", "test": "no ambiguous branch conditions"}
+      {
+        "type": "plan",
+        "form": "ordered action sequence with preconditions",
+        "test": "each step executable given prior effects"
+      },
+      {
+        "type": "policy",
+        "form": "state -> action mapping for all reachable states",
+        "test": "every reachable state has defined action"
+      },
+      {
+        "type": "contingency_table",
+        "form": "failure_condition -> recovery_action pairs",
+        "test": "top 5 failure modes have explicit handlers"
+      },
+      {
+        "type": "playbook",
+        "form": "human-readable runbook with decision points",
+        "test": "no ambiguous branch conditions"
+      },
+      {
+        "type": "control_policy",
+        "form": "sampling/filter/estimation/trigger parameters with delay and hysteresis bounds",
+        "test": "policy includes cadence, filters, trust weighting, and hold-down timers"
+      }
     ],
     "proc": [
       "1. GOAL: define testable goal predicate with success/failure criteria",
@@ -26,14 +47,24 @@
       "4. SEARCH: find action sequence reaching goal (forward/backward chaining)",
       "5. VALIDATE: trace plan ensuring each precondition met by prior effects",
       "6. CONTINGENCY: add branch for each identified failure mode",
-      "7. MONITOR: specify observable checkpoints and replanning triggers"
+      "7. MONITOR: specify observable checkpoints and replanning triggers",
+      "8. SIGNAL_MODEL: define telemetry cadence, anti-alias filtering, and source trust weights",
+      "9. ESTIMATION: define latent-state estimator and uncertainty bounds (belief/Kalman-style where applicable)",
+      "10. REGIME_LOGIC: define change-point criteria distinct from outlier handling",
+      "11. STABILITY: define delay margins, deadbands, hysteresis, and hold-down timers for policy transitions",
+      "12. MULTI_RATE: partition fast local loops vs slower global governance loops and coupling points"
     ],
     "quick_check": [
       "goal predicate returns true/false, not 'better/worse'",
       "every action has at least one precondition and one effect",
       "step N's preconditions satisfied by effects of steps 1..N-1",
       "at least one contingency branch per high-risk step",
-      "observable checkpoint every 3-5 steps or at phase boundaries"
+      "observable checkpoint every 3-5 steps or at phase boundaries",
+      "telemetry cadence justified against expected dynamics; aliasing risk documented",
+      "filters/smoothing selected with rationale and over-smoothing guard",
+      "state estimate and uncertainty tracked separately from raw observations",
+      "change-point trigger defined separately from one-off outlier policy",
+      "mode transitions include deadband or hold-down timer to prevent flip-flop"
     ],
     "check": [
       "goal_is_boolean_testable_not_optimization_target",
@@ -42,7 +73,15 @@
       "failure_contingencies_cover_top_5_failure_modes",
       "checkpoints_observable_without_plan_modification",
       "replanning_triggers_have_thresholds_not_just_conditions",
-      "rollback_defined_for_steps_with_irreversible_effects"
+      "rollback_defined_for_steps_with_irreversible_effects",
+      "sampling_cadence_and_downsampling_rules_reduce_aliasing_risk",
+      "anti_alias_filter_and_robust_smoothing_defined_with_parameters",
+      "state_estimation_method_defined_with_uncertainty_outputs",
+      "change_point_detection_distinguished_from_outlier_rejection",
+      "delay_margin_defined_for_observation_and_actuation_paths",
+      "hysteresis_deadband_and_hold_down_timer_defined_for_mode_switches",
+      "multi_rate_control_loops_defined_fast_local_vs_slow_global",
+      "signal_sources_weighted_by_provenance_freshness_and_calibration"
     ],
     "diff": {
       "means-end": {
@@ -115,6 +154,36 @@
           "action": "add 50% buffer to critical path timing; identify parallel opportunities",
           "test": "critical_path_duration * 1.5 <= deadline",
           "example": "if deploy must complete by 6pm, plan completion by 4pm"
+        },
+        {
+          "name": "aliasing_guard",
+          "action": "set telemetry cadence based on expected dynamics; add anti-alias filter before downsampling",
+          "test": "sampling_period <= 0.5 * smallest_control_relevant_period",
+          "example": "if queue oscillates at ~20s, sample <=10s and prefilter before 1m aggregation"
+        },
+        {
+          "name": "state_estimation_track",
+          "action": "run a latent-state estimate with uncertainty and use it for policy decisions instead of raw spikes",
+          "test": "policy_decisions_reference_estimated_state_and_uncertainty",
+          "example": "scale only when estimated sustained load exceeds threshold with confidence bound"
+        },
+        {
+          "name": "change_point_gate",
+          "action": "separate outlier handling from regime-shift triggers",
+          "test": "regime_shift_requires_change_point_signal_not_single_outlier",
+          "example": "single 5x error spike alerts; sustained distribution shift triggers policy mode change"
+        },
+        {
+          "name": "hysteresis_hold_down",
+          "action": "apply deadbands and minimum dwell timers around mode transitions",
+          "test": "mode_reversal_not_allowed_within_hold_down_window",
+          "example": "after entering degraded mode, require 15m stable metrics before returning to normal"
+        },
+        {
+          "name": "provenance_weighting",
+          "action": "weight signal influence by source trust, freshness, and calibration quality",
+          "test": "untrusted_or_stale_signals_cannot_singlehandedly_trigger_high_impact_actions",
+          "example": "external alert requires corroboration from trusted internal telemetry before rollback"
         }
       ]
     },
@@ -123,7 +192,9 @@
       "project_execution: phased delivery with gates and rollback points",
       "incident_response: playbooks with decision trees for common failures",
       "automation: state machines, workflow engines, CI/CD pipelines",
-      "agentic_systems: LLM agent action sequencing with tool invocation"
+      "agentic_systems: LLM agent action sequencing with tool invocation",
+      "control_governance: policy loops with sampled noisy telemetry and delayed actuation",
+      "multi_agent_holon_ops: fast local remediation with slower global coordination"
     ],
     "rel": [
       "means-end-instrumental",

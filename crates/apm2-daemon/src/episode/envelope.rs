@@ -440,8 +440,7 @@ struct EpisodeEnvelopeProto {
 ///
 /// ```rust
 /// use apm2_daemon::episode::{
-///     DeterminismClass, EpisodeBudget, EpisodeEnvelope, PinnedSnapshot,
-///     RiskTier, StopConditions,
+///     DeterminismClass, EpisodeBudget, EpisodeEnvelope, PinnedSnapshot, RiskTier, StopConditions,
 /// };
 ///
 /// let envelope = EpisodeEnvelope::builder()

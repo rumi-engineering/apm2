@@ -1,0 +1,96 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00397"
+    title: "Add adapter_profile_hash to SpawnEpisodeRequest and EpisodeEnvelope"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0010"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0012"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0012.yaml#rfc_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_ORCHESTRATION"
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Add optional adapter_profile_hash field (bytes, 32) to SpawnEpisodeRequest protobuf message."
+      - "Add adapter_profile_hash field to EpisodeEnvelope struct."
+      - "Add role_spec_hash field to EpisodeEnvelope struct."
+      - "Propagate adapter_profile_hash from SpawnEpisodeRequest, and derive role_spec_hash from policy/claim context (not caller input), into envelope and ledger attribution events."
+      - "When adapter_profile_hash is provided, validate it exists in CAS before proceeding."
+      - "When adapter_profile_hash is omitted, resolve a default from builtin profiles based on WorkRole."
+      - "Update the CLI apm2 episode spawn command to accept --adapter-profile-hash flag."
+    out_of_scope:
+      - "Weighted random model selection (TCK-00400)."
+      - "Actually spawning the agent process using the profile (TCK-00399)."
+      - "CodexCliAdapter implementation (TCK-00402)."
+  plan:
+    steps:
+      - "Edit proto/apm2d_runtime_v1.proto: add 'optional bytes adapter_profile_hash = 5;' to SpawnEpisodeRequest message (after workspace_root field)."
+      - "Regenerate protobuf Rust code or update the generated file at crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs."
+      - "Edit crates/apm2-daemon/src/episode/envelope.rs: add adapter_profile_hash: Option<[u8; 32]> and role_spec_hash: Option<[u8; 32]> fields to EpisodeEnvelope (line ~471)."
+      - "Edit crates/apm2-daemon/src/protocol/dispatch.rs handle_spawn_episode(): extract adapter_profile_hash from request. If present, validate length == 32 and existence in CAS (fail-closed). If absent, call a new resolve_default_adapter_profile(role) function that maps WorkRole to builtin profile hashes."
+      - "Derive role_spec_hash from policy resolution / claim context at spawn time. Do not accept or trust caller-provided role_spec_hash in this phase."
+      - "Implement resolve_default_adapter_profile() in dispatch.rs or a new module: Implementer -> claude-code-v1, Reviewer -> claude-code-v1, GateExecutor -> claude-code-v1, Coordinator -> claude-code-v1 (all default to claude-code-v1 initially)."
+      - "Pass adapter_profile_hash into EpisodeEnvelope construction and into the ledger event emission (emit_episode_run_attributed already accepts adapter_profile_hash)."
+      - "Update SessionStarted emission payload/serialization to include adapter_profile_hash, role_spec_hash, and WVR-0002 waiver markers when role_spec_hash is absent."
+      - "Edit crates/apm2-cli/src/commands/episode.rs: add --adapter-profile-hash <HEX> optional flag to SpawnArgs, encode into SpawnEpisodeRequest."
+      - "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --no-deps && cargo test -p apm2-daemon -p apm2-cli."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0012"
+    criteria:
+      - "SpawnEpisodeRequest proto has adapter_profile_hash optional bytes field."
+      - "EpisodeEnvelope struct has adapter_profile_hash and role_spec_hash Option<[u8; 32]> fields."
+      - "handle_spawn_episode validates adapter_profile_hash against CAS when provided (fail-closed on missing)."
+      - "role_spec_hash used for envelope/ledger attribution is daemon-derived from policy/claim context, not caller-controlled."
+      - "Default profile resolution maps each WorkRole to a builtin adapter profile hash."
+      - "adapter_profile_hash is recorded in SessionStarted ledger event."
+      - "If role_spec_hash is omitted under WVR-0002, SessionStarted attribution records waiver_id='WVR-0002' and role_spec_hash_absent=true."
+      - "CLI --adapter-profile-hash flag propagates through to the daemon."
+      - "Existing tests continue to pass (backward compatible — field is optional)."
+      - "All CI checks pass: cargo fmt, clippy (zero warnings), doc, tests."
+  notes:
+    context: |
+      RFC-0020 Stage 0 (05_rollout_and_ops.yaml line 22) specifies: "Require adapter_profile_hash + role_spec_hash
+      in envelope/receipts." Currently, SpawnEpisodeRequest (proto/apm2d_runtime_v1.proto lines 295-320) has only
+      work_id, role, lease_id, and workspace_root — no adapter binding.
+
+      The EpisodeEnvelope (envelope.rs:471) has capability_manifest_hash and risk_tier but no adapter_profile_hash
+      or role_spec_hash. The emit_episode_run_attributed() method (dispatch.rs:648) already accepts
+      adapter_profile_hash as a parameter, but spawn lifecycle wiring does not currently invoke this path.
+
+      Four builtin adapter profiles exist in crates/apm2-core/src/fac/builtin_profiles.rs:
+      claude-code-v1, gemini-cli-v1, codex-cli-v1, local-inference-v1. These are CAS-addressed
+      via AgentAdapterProfileV1::compute_cas_hash().
+
+      This ticket creates the binding point that TCK-00400 (model selection) and TCK-00399 (adapter wiring)
+      depend on.
+    files: |
+      - proto/apm2d_runtime_v1.proto (SpawnEpisodeRequest at lines 295-320)
+      - crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs (generated protobuf code)
+      - crates/apm2-daemon/src/episode/envelope.rs (EpisodeEnvelope at line ~471)
+      - crates/apm2-daemon/src/protocol/dispatch.rs (handle_spawn_episode at ~4427, emit_episode_run_attributed at ~648)
+      - crates/apm2-daemon/src/ledger.rs (SessionStarted payload construction)
+      - crates/apm2-core/src/fac/builtin_profiles.rs (4 builtin profiles, get_builtin_profile at line 536)
+      - crates/apm2-core/src/fac/agent_adapter_profile.rs (AgentAdapterProfileV1 at line 607, compute_cas_hash at 871)
+      - crates/apm2-cli/src/commands/episode.rs (SpawnArgs at ~line 237)
+    security: |
+      - adapter_profile_hash MUST be validated against CAS before use (fail-closed on missing hash).
+      - Default profile resolution must not allow ambient override — explicit hash takes precedence.
+      - Hash length must be exactly 32 bytes (BLAKE3-256), reject truncated or padded hashes.
+      - Profile hash must be recorded in ledger events for post-hoc auditability.
+      - role_spec_hash attribution MUST be daemon-derived from policy/claim context; callers must not be able to spoof it.
+      - ROLLOUT WAIVER WVR-0002: role_spec_hash MAY be omitted during S0.5 rollout only if
+        SessionStarted attribution includes waiver_id="WVR-0002" and role_spec_hash_absent=true.

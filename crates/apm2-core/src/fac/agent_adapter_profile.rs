@@ -27,8 +27,8 @@
 //! use std::collections::BTreeMap;
 //!
 //! use apm2_core::fac::{
-//!     AdapterMode, AgentAdapterProfileV1, BudgetDefaults, EvidencePolicy,
-//!     HealthChecks, InputMode, OutputMode, VersionProbe,
+//!     AdapterMode, AgentAdapterProfileV1, BudgetDefaults, EvidencePolicy, HealthChecks,
+//!     InputMode, OutputMode, VersionProbe,
 //! };
 //!
 //! let profile = AgentAdapterProfileV1::builder()
