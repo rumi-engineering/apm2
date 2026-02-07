@@ -274,6 +274,18 @@ pub enum IdentityProofError {
     /// Requested head is not cached in verifier.
     #[error("verified head cache miss")]
     VerifiedHeadCacheMiss,
+
+    /// Admission of a stale head was rejected because a newer epoch for the
+    /// same cell already exists in the cache.
+    #[error(
+        "stale epoch rejected: admitted epoch {admitted_epoch} is older than cached epoch {cached_epoch} for same cell"
+    )]
+    StaleEpochRejected {
+        /// The epoch of the head being admitted.
+        admitted_epoch: u64,
+        /// The highest epoch already cached for the same cell.
+        cached_epoch: u64,
+    },
 }
 
 impl From<CasError> for IdentityProofError {
@@ -2045,6 +2057,16 @@ pub(crate) enum VerifierCacheAuditEvent {
         /// Content hash of the evicted head.
         head_hash: [u8; HASH_BYTES],
     },
+    /// A stale head admission was rejected because a newer epoch for the
+    /// same cell already exists in the cache (monotonic admission guard).
+    StaleAdmissionRejected {
+        /// Cell identity of the rejected head.
+        cell_id: CellIdV1,
+        /// Epoch of the rejected head.
+        rejected_epoch: u64,
+        /// Highest epoch currently cached for the cell.
+        cached_epoch: u64,
+    },
     /// Audit log reached capacity and older events were dropped.
     ///
     /// This sentinel is emitted exactly once when overflow occurs.
@@ -2161,22 +2183,60 @@ impl VerifiedHeadCache {
     /// `AuditOverflow` sentinel replaces them. The sentinel itself
     /// counts toward the capacity, so the log never exceeds
     /// `max_audit_events`.
+    ///
+    /// **Post-condition:** `self.audit_log.len() <= self.max_audit_events`
+    /// for all `max_audit_events >= 1`.
     fn push_audit_event(&mut self, event: VerifierCacheAuditEvent) {
         if self.audit_log.len() >= self.max_audit_events {
-            // Drop the oldest half to amortize overflow cost.
-            let drop_count = self.max_audit_events / 2;
-            for _ in 0..drop_count {
-                self.audit_log.pop_front();
+            // We need room for: the AuditOverflow sentinel + the new event = 2 slots.
+            // For max_audit_events == 1, there is only 1 slot total, so the
+            // new event replaces the overflow sentinel (we drop everything and
+            // only push the new event with no sentinel).
+            if self.max_audit_events <= 1 {
+                // Only one slot: drop everything, push only the new event.
+                let dropped = self.audit_log.len();
+                self.audit_log.clear();
+                // The new event implicitly replaces whatever was here.
+                // We cannot fit both a sentinel and the event, so we log
+                // the overflow count into tracing and push only the event.
+                if dropped > 0 {
+                    warn!(
+                        dropped_count = dropped,
+                        "audit log overflow (capacity=1): dropped all events"
+                    );
+                }
+            } else {
+                // We need exactly 2 free slots: one for AuditOverflow, one for the event.
+                // Drop enough to make room for both, ensuring at least 1 is dropped.
+                let target_len = self.max_audit_events.saturating_sub(2);
+                let current_len = self.audit_log.len();
+                let drop_count = current_len.saturating_sub(target_len).max(1);
+                for _ in 0..drop_count {
+                    self.audit_log.pop_front();
+                }
+                self.audit_log
+                    .push_back(VerifierCacheAuditEvent::AuditOverflow {
+                        dropped_count: drop_count,
+                    });
             }
-            self.audit_log
-                .push_back(VerifierCacheAuditEvent::AuditOverflow {
-                    dropped_count: drop_count,
-                });
         }
         self.audit_log.push_back(event);
+
+        // Defensive: guarantee post-condition even if logic above has a bug.
+        while self.audit_log.len() > self.max_audit_events {
+            self.audit_log.pop_front();
+        }
+        debug_assert!(self.audit_log.len() <= self.max_audit_events);
     }
 
     /// Admits a structurally verified head into cache.
+    ///
+    /// **Monotonic epoch admission (security review R2):** If the cache
+    /// already contains a head for the same cell at a strictly higher
+    /// epoch, the admission is rejected with
+    /// [`IdentityProofError::StaleEpochRejected`]
+    /// and a `StaleAdmissionRejected` audit event is emitted. This prevents
+    /// out-of-order admission from reintroducing stale heads.
     ///
     /// **Atomic head-advancement (code-quality review R1):** If the cache
     /// already contains heads for the same cell at older epochs, those
@@ -2203,6 +2263,28 @@ impl VerifiedHeadCache {
 
         let cell_id = head.cell_id().clone();
         let directory_epoch = head.directory_epoch();
+
+        // --- Monotonic epoch guard: reject stale re-admissions ---
+        // Check BEFORE any state mutation (transactional admission pattern).
+        let max_cached_epoch = self
+            .heads
+            .values()
+            .filter(|vh| vh.head.cell_id() == &cell_id)
+            .map(|vh| vh.verified_at)
+            .max();
+        if let Some(cached_epoch) = max_cached_epoch {
+            if directory_epoch < cached_epoch {
+                self.push_audit_event(VerifierCacheAuditEvent::StaleAdmissionRejected {
+                    cell_id,
+                    rejected_epoch: directory_epoch,
+                    cached_epoch,
+                });
+                return Err(IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: directory_epoch,
+                    cached_epoch,
+                });
+            }
+        }
 
         // --- Atomic head-advancement: evict older same-cell epochs ---
         let mut advancement_evicted: Vec<[u8; HASH_BYTES]> = self
@@ -5041,6 +5123,265 @@ mod tests {
         assert!(
             matches!(err, IdentityProofError::UnknownIdentityProofProfile { .. }),
             "Tier2+ must reject unknown-but-hash-matching expected_profile; got: {err:?}"
+        );
+    }
+
+    // --- Bounded audit log regression (security review BLOCKER) ---
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_audit_event_respects_cap_at_capacity_1() {
+        // Regression: with max_audit_events=1, repeated pushes MUST NOT
+        // exceed the cap. The log should always contain exactly 1 event
+        // (the most recent one).
+        let mut cache = VerifiedHeadCache::with_audit_capacity(8, 1);
+        let cell_cert = make_cell_certificate();
+
+        // Push 10 events and verify the cap after each push.
+        for i in 0u64..10 {
+            let head = make_epoch_head(cell_cert.cell_id().clone(), i + 1, (i as u8) + 1);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+            assert!(
+                cache.audit_log_len() <= 1,
+                "audit log len {} exceeds cap 1 after push {}",
+                cache.audit_log_len(),
+                i + 1,
+            );
+        }
+        // Final state: exactly 1 event.
+        assert_eq!(
+            cache.audit_log_len(),
+            1,
+            "audit log must have exactly 1 event at cap 1"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_audit_event_respects_cap_at_capacity_2() {
+        // Regression: with max_audit_events=2, pushing many events MUST
+        // never exceed 2 entries.
+        let mut cache = VerifiedHeadCache::with_audit_capacity(8, 2);
+        let cell_cert = make_cell_certificate();
+
+        for i in 0u64..10 {
+            let head = make_epoch_head(cell_cert.cell_id().clone(), i + 1, (i as u8) + 1);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+            assert!(
+                cache.audit_log_len() <= 2,
+                "audit log len {} exceeds cap 2 after push {}",
+                cache.audit_log_len(),
+                i + 1,
+            );
+        }
+        assert!(
+            cache.audit_log_len() <= 2,
+            "final audit log len {} exceeds cap 2",
+            cache.audit_log_len(),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_audit_event_respects_cap_at_capacity_3() {
+        // Regression: with max_audit_events=3, pushing many events MUST
+        // never exceed 3 entries.
+        let mut cache = VerifiedHeadCache::with_audit_capacity(8, 3);
+        let cell_cert = make_cell_certificate();
+
+        for i in 0u64..20 {
+            let head = make_epoch_head(cell_cert.cell_id().clone(), i + 1, (i as u8) + 1);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+            assert!(
+                cache.audit_log_len() <= 3,
+                "audit log len {} exceeds cap 3 after push {}",
+                cache.audit_log_len(),
+                i + 1,
+            );
+        }
+        assert!(
+            cache.audit_log_len() <= 3,
+            "final audit log len {} exceeds cap 3",
+            cache.audit_log_len(),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_audit_event_overflow_sentinel_present_at_cap_2_plus() {
+        // For cap >= 2, after overflow an AuditOverflow sentinel should
+        // be present somewhere in the log.
+        let mut cache = VerifiedHeadCache::with_audit_capacity(8, 3);
+        let cell_cert = make_cell_certificate();
+
+        // Push enough events to trigger overflow (cap=3, so 4+ events).
+        for i in 0u64..6 {
+            let head = make_epoch_head(cell_cert.cell_id().clone(), i + 1, (i as u8) + 1);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+        }
+
+        let events = cache.audit_log();
+        let overflow_count = events
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::AuditOverflow { .. }))
+            .count();
+        assert!(
+            overflow_count >= 1,
+            "expected at least one AuditOverflow sentinel after overflow, got {overflow_count}"
+        );
+        assert!(
+            events.len() <= 3,
+            "audit log len {} exceeds cap 3",
+            events.len(),
+        );
+    }
+
+    // --- Monotonic epoch admission regression (code-quality review MAJOR 2) ---
+
+    #[test]
+    fn admit_head_rejects_stale_epoch_for_same_cell() {
+        // Regression: admitting an older epoch after a newer one for the
+        // same cell MUST be rejected with StaleEpochRejected.
+        let cell_cert = make_cell_certificate();
+
+        let newer_head = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA1);
+        let stale_head = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA2);
+
+        let newer_hash = newer_head.content_hash().unwrap();
+        let stale_hash = stale_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(newer_hash, newer_head).unwrap();
+
+        // Attempt to admit the stale head -- must fail.
+        let err = cache.admit_head(stale_hash, stale_head).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 10,
+                    cached_epoch: 20,
+                }
+            ),
+            "expected StaleEpochRejected, got: {err:?}"
+        );
+
+        // The stale head must NOT be in the cache.
+        assert!(
+            !cache.contains_head(&stale_hash),
+            "stale head must not be admitted into cache"
+        );
+        // The newer head must still be present.
+        assert!(
+            cache.contains_head(&newer_hash),
+            "newer head must remain in cache"
+        );
+        assert_eq!(cache.len(), 1);
+
+        // Verify audit event for the rejection.
+        let rejection_events: Vec<_> = cache
+            .audit_log()
+            .into_iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::StaleAdmissionRejected { .. }))
+            .collect();
+        assert_eq!(
+            rejection_events.len(),
+            1,
+            "exactly one StaleAdmissionRejected event expected"
+        );
+        if let VerifierCacheAuditEvent::StaleAdmissionRejected {
+            cell_id,
+            rejected_epoch,
+            cached_epoch,
+        } = &rejection_events[0]
+        {
+            assert_eq!(cell_id, cell_cert.cell_id());
+            assert_eq!(*rejected_epoch, 10);
+            assert_eq!(*cached_epoch, 20);
+        } else {
+            panic!("expected StaleAdmissionRejected event");
+        }
+    }
+
+    #[test]
+    fn admit_head_allows_equal_epoch_readmission() {
+        // Re-admitting the same epoch (same hash) should succeed.
+        // This test ensures the monotonic guard uses strict less-than,
+        // not less-than-or-equal.
+        let cell_cert = make_cell_certificate();
+        let head = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA1);
+        let head_clone = head.clone();
+        let hash = head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(hash, head).unwrap();
+        // Re-admit same hash and epoch -- should succeed.
+        cache.admit_head(hash, head_clone).unwrap();
+
+        assert!(cache.contains_head(&hash));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn admit_head_allows_different_cells_at_any_epoch() {
+        // Monotonic guard is per-cell. Different cells can have any epoch
+        // relationship.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        let cell_head = make_epoch_head(cell_cert.cell_id().clone(), 50, 0xA1);
+        let other_head = make_epoch_head(other_cert.cell_id().clone(), 5, 0xB1);
+
+        let cell_hash = cell_head.content_hash().unwrap();
+        let other_hash = other_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(cell_hash, cell_head).unwrap();
+        // Admit a head for a different cell at a much lower epoch -- must succeed.
+        cache.admit_head(other_hash, other_head).unwrap();
+
+        assert!(cache.contains_head(&cell_hash));
+        assert!(cache.contains_head(&other_hash));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn admit_head_rejects_repeated_stale_attempts() {
+        // Repeatedly attempting to admit stale heads for the same cell
+        // must be rejected each time, and the cache must not grow.
+        let cell_cert = make_cell_certificate();
+
+        let newer_head = make_epoch_head(cell_cert.cell_id().clone(), 30, 0xA1);
+        let newer_hash = newer_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(newer_hash, newer_head).unwrap();
+
+        for i in 1u64..=5 {
+            let stale = make_epoch_head(cell_cert.cell_id().clone(), i, (i as u8) + 0x10);
+            let stale_hash = stale.content_hash().unwrap();
+            let err = cache.admit_head(stale_hash, stale).unwrap_err();
+            assert!(
+                matches!(err, IdentityProofError::StaleEpochRejected { .. }),
+                "attempt {i}: expected StaleEpochRejected, got: {err:?}"
+            );
+            assert_eq!(cache.len(), 1, "cache must not grow on rejected admissions");
+        }
+
+        // Verify 5 rejection audit events.
+        let rejection_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::StaleAdmissionRejected { .. }))
+            .count();
+        assert_eq!(
+            rejection_count, 5,
+            "expected 5 StaleAdmissionRejected events"
         );
     }
 }
