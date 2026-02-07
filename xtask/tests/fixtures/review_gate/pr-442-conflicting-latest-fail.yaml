@@ -1,0 +1,84 @@
+name: "PR-442 conflicting quality artifacts newest FAIL blocks merge"
+pr_number: 442
+head_sha: "2222222222222222222222222222222222222222"
+statuses:
+  - context: "ai-review/security"
+    state: "success"
+    created_at: "2026-02-02T09:10:00Z"
+  - context: "ai-review/code-quality"
+    state: "failure"
+    created_at: "2026-02-02T09:40:00Z"
+comments:
+  - id: 44201
+    user_login: "apm2-security-bot"
+    updated_at: "2026-02-02T09:05:00Z"
+    body: |
+      ## Security Review: PASS
+      <!-- apm2-review-metadata:v1:security -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "security",
+        "pr_number": 442,
+        "head_sha": "2222222222222222222222222222222222222222",
+        "verdict": "PASS",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 0,
+          "minor": 0,
+          "nit": 1
+        },
+        "reviewer_id": "apm2-codex-security"
+      }
+      ```
+  - id: 44202
+    user_login: "apm2-quality-bot"
+    updated_at: "2026-02-02T09:15:00Z"
+    body: |
+      ## Code Quality Review: PASS
+      <!-- apm2-review-metadata:v1:code-quality -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "code-quality",
+        "pr_number": 442,
+        "head_sha": "2222222222222222222222222222222222222222",
+        "verdict": "PASS",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 0,
+          "minor": 1,
+          "nit": 0
+        },
+        "reviewer_id": "apm2-codex-quality"
+      }
+      ```
+  - id: 44203
+    user_login: "apm2-quality-bot"
+    updated_at: "2026-02-02T09:35:00Z"
+    body: |
+      ## Code Quality Review: FAIL
+      <!-- apm2-review-metadata:v1:code-quality -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "code-quality",
+        "pr_number": 442,
+        "head_sha": "2222222222222222222222222222222222222222",
+        "verdict": "FAIL",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 2,
+          "minor": 0,
+          "nit": 0
+        },
+        "reviewer_id": "apm2-codex-quality"
+      }
+      ```
+expected:
+  overall_pass: false
+  security_pass: true
+  code_quality_pass: false
+  code_quality_reason_substrings:
+    - "Conflicting PASS/FAIL artifacts"
+    - "Newest code-quality artifact verdict is FAIL"

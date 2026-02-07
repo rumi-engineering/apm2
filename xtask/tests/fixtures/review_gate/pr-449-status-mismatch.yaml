@@ -1,0 +1,61 @@
+name: "PR-449 status mismatch against authoritative artifact fails"
+pr_number: 449
+head_sha: "7777777777777777777777777777777777777777"
+statuses:
+  - context: "ai-review/security"
+    state: "failure"
+    created_at: "2026-02-07T09:20:00Z"
+  - context: "ai-review/code-quality"
+    state: "success"
+    created_at: "2026-02-07T09:21:00Z"
+comments:
+  - id: 44901
+    user_login: "apm2-security-bot"
+    updated_at: "2026-02-07T09:18:00Z"
+    body: |
+      ## Security Review: PASS
+      <!-- apm2-review-metadata:v1:security -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "security",
+        "pr_number": 449,
+        "head_sha": "7777777777777777777777777777777777777777",
+        "verdict": "PASS",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 0,
+          "minor": 0,
+          "nit": 1
+        },
+        "reviewer_id": "apm2-codex-security"
+      }
+      ```
+  - id: 44902
+    user_login: "apm2-quality-bot"
+    updated_at: "2026-02-07T09:19:00Z"
+    body: |
+      ## Code Quality Review: PASS
+      <!-- apm2-review-metadata:v1:code-quality -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "code-quality",
+        "pr_number": 449,
+        "head_sha": "7777777777777777777777777777777777777777",
+        "verdict": "PASS",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 0,
+          "minor": 0,
+          "nit": 0
+        },
+        "reviewer_id": "apm2-codex-quality"
+      }
+      ```
+expected:
+  overall_pass: false
+  security_pass: false
+  code_quality_pass: true
+  security_reason_substrings:
+    - "Status mismatch"

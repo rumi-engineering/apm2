@@ -93,6 +93,10 @@ references[41]:
     purpose: "LAW-12: Bounded Search and Termination"
   - path: "@documents/theory/laws.json"
     purpose: "LAW-14: Risk-Weighted Evidence"
+  - path: "@.github/review-gate/trusted-reviewers.json"
+    purpose: "Authoritative allowlist for machine-readable reviewer_id and GitHub identity binding."
+  - path: "@documents/reviews/REVIEW_GATE_WAIVER_FLOW.md"
+    purpose: "Waiver-only operator override flow for blocked review gates."
 
 decision_tree:
   entrypoint: PHASE_1_COLLECT_PR_IDENTITY
@@ -281,16 +285,45 @@ decision_tree:
           - section: "POSITIVE OBSERVATIONS"
             format: "### **POSITIVE OBSERVATIONS (PASS)**"
             content: "Security invariants correctly upheld; defense-in-depth wins"
+          - section: "Machine-Readable Metadata (REQUIRED)"
+            content: "Append this exact metadata block at the end of the comment for gate evaluation."
+            template: |
+              <!-- apm2-review-metadata:v1:security -->
+              ```json
+              {
+                "schema": "apm2.review.metadata.v1",
+                "review_type": "security",
+                "pr_number": <pr_number>,
+                "head_sha": "$reviewed_sha",
+                "verdict": "PASS|FAIL",
+                "severity_counts": {
+                  "blocker": <blocker_count>,
+                  "major": <major_count>,
+                  "minor": <minor_count>,
+                  "nit": <nit_count>
+                },
+                "reviewer_id": "<allowlisted_reviewer_id>"
+              }
+              ```
+            constraints:
+              - "head_sha MUST equal reviewed_sha exactly."
+              - "pr_number MUST equal the PR being reviewed."
+              - "reviewer_id MUST appear in `.github/review-gate/trusted-reviewers.json` under `security`."
+              - "Missing/invalid metadata is gate-fatal."
           - section: "Assurance Case"
             content: "Claim-Argument-Evidence structure for final verdict"
           - section: "Footer"
             format: "---"
             content: "Reviewed commit: $reviewed_sha (resolved from PR_URL at review start for auditability)"
-      steps[3]:
+      steps[4]:
         - id: WRITE_FINDINGS
           action: write_file
           path: "security_findings.md"
           content: "$FINDINGS_ASSURANCE_CASE"
+        - id: APPEND_METADATA
+          action: append_file
+          path: "security_findings.md"
+          content: "$MACHINE_READABLE_METADATA_BLOCK"
         - id: POST_AND_UPDATE
           action: command
           run: |

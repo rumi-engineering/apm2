@@ -1,0 +1,23 @@
+{
+  "schema": "apm2.trusted_reviewers.v1",
+  "reviewers": {
+    "security": [
+      {
+        "reviewer_id": "apm2-codex-security",
+        "github_logins": [
+          "apm2-security-bot",
+          "github-actions[bot]"
+        ]
+      }
+    ],
+    "code_quality": [
+      {
+        "reviewer_id": "apm2-codex-quality",
+        "github_logins": [
+          "apm2-quality-bot",
+          "github-actions[bot]"
+        ]
+      }
+    ]
+  }
+}
