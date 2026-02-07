@@ -12,7 +12,7 @@ protocol:
 variables:
   PR_URL: "$PR_URL"
 
-references[37]:
+references[39]:
   - path: "@documents/theory/glossary/glossary.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json"

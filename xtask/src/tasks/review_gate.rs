@@ -168,12 +168,18 @@ fn fetch_pr_issue_comments(
         }
 
         all_comments.extend(page_comments);
-        if page >= MAX_COMMENT_PAGES {
+        page += 1;
+
+        // Fail-closed when we've fetched MAX_COMMENT_PAGES pages worth of
+        // comments. The cap check is placed *after* ingesting the current
+        // page so that all MAX_COMMENT_PAGES pages are included in the
+        // result, and we only bail when attempting to fetch page
+        // MAX_COMMENT_PAGES + 1.
+        if page > MAX_COMMENT_PAGES {
             bail!(
                 "Reached comment pagination cap ({MAX_COMMENT_PAGES} pages) for PR #{pr_number}; refusing to continue with potentially truncated comment history"
             );
         }
-        page += 1;
     }
 
     Ok(all_comments)

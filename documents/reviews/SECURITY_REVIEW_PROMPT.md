@@ -12,7 +12,7 @@ protocol:
 variables:
   PR_URL: "$PR_URL"
 
-references[41]:
+references[42]:
   - path: "@documents/skills/modes-of-reasoning/assets/79-adversarial-red-team.json"
     purpose: "Mode #79: Adversarial / Red-Team Reasoning"
   - path: "@documents/skills/modes-of-reasoning/assets/08-counterexample-guided.json"
