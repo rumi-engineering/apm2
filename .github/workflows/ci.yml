@@ -11,6 +11,13 @@ on:
   # Required for GitHub merge queue: run required checks on merge-group SHAs
   merge_group:
     types: [checks_requested]
+  # MAJOR-2: Re-evaluate review gate when new review artifact comments are
+  # posted. The review-gate job uses `if: github.event_name == 'pull_request'`
+  # so only that job re-runs; other CI jobs are gated on push/pull_request.
+  # TODO(TCK-00405): This fires on ALL issue comments — a future improvement
+  # should filter to only comments containing review metadata markers.
+  issue_comment:
+    types: [created, edited]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,6 +36,7 @@ jobs:
   # Format check
   fmt:
     name: Rustfmt
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -42,6 +50,7 @@ jobs:
   # Verifies that checked-in generated proto code matches the .proto definition
   proto-verify:
     name: Proto Verify
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -64,6 +73,7 @@ jobs:
   # Clippy lints
   clippy:
     name: Clippy
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -79,6 +89,7 @@ jobs:
   # Documentation
   doc:
     name: Documentation
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -95,6 +106,7 @@ jobs:
   # Tests
   test:
     name: Test
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -115,9 +127,14 @@ jobs:
 
   # Authoritative AI review gate (TCK-00405)
   # Enforces SHA-bound, trusted, non-conflicting review metadata.
+  # Triggers on pull_request events AND issue_comment events (MAJOR-2: ensures
+  # fresh review artifacts posted after initial CI run trigger re-evaluation).
+  # For issue_comment events, only runs when the comment is on a pull request.
   review-gate:
     name: Review Gate
-    if: github.event_name == 'pull_request'
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request)
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -128,20 +145,52 @@ jobs:
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
         with:
           toolchain: stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      # Resolve PR number and head SHA.
+      # For pull_request events these come from the event payload directly.
+      # For issue_comment events we look them up via the GitHub API.
+      - name: Resolve PR context
+        id: pr-ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            PR_NUMBER="${{ github.event.issue.number }}"
+            PR_DATA=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+            HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+            BASE_REF=$(echo "$PR_DATA" | jq -r '.base.ref')
+            echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "base_ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
+          fi
+      # BLOCKER-2 fix: Load trusted-reviewers.json from the BASE branch, not
+      # the PR checkout. This prevents a malicious PR from modifying the
+      # allowlist to self-authorize.
+      - name: Fetch trusted-reviewers from base branch
+        run: |
+          git fetch origin "${{ steps.pr-ctx.outputs.base_ref }}" --depth=1
+          git show "origin/${{ steps.pr-ctx.outputs.base_ref }}:.github/review-gate/trusted-reviewers.json" \
+            > /tmp/trusted-reviewers-base.json
       - name: Evaluate review gate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cargo xtask review-gate \
             --repo "${{ github.repository }}" \
-            --pr-number "${{ github.event.pull_request.number }}" \
-            --head-sha "${{ github.event.pull_request.head.sha }}" \
-            --trusted-reviewers ".github/review-gate/trusted-reviewers.json"
+            --pr-number "${{ steps.pr-ctx.outputs.pr_number }}" \
+            --head-sha "${{ steps.pr-ctx.outputs.head_sha }}" \
+            --trusted-reviewers "/tmp/trusted-reviewers-base.json"
 
   # Canonicalization test vectors (TCK-00130)
   test-vectors:
     name: Test Vectors
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -157,6 +206,7 @@ jobs:
   # MSRV check
   msrv:
     name: MSRV (1.85)
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -171,6 +221,7 @@ jobs:
   # Security audit
   security:
     name: Security Audit
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -183,6 +234,7 @@ jobs:
   # Dependency license/ban checks
   deny:
     name: Cargo Deny
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -195,6 +247,7 @@ jobs:
   # Code coverage
   coverage:
     name: Coverage
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -222,6 +275,7 @@ jobs:
   # Verifies that all unsafe blocks have documented safety proofs per Rust convention
   safety-proof-coverage:
     name: Safety Proof Coverage
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -269,6 +323,7 @@ jobs:
   # Prevents reintroduction of legacy JSON IPC code removed in TCK-00281
   legacy-ipc-guard:
     name: Legacy IPC Guard
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -282,6 +337,7 @@ jobs:
   # Release build check
   build:
     name: Release Build
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -302,12 +358,20 @@ jobs:
     steps:
       - name: Check all jobs
         run: |
+          EVENT="${{ github.event_name }}"
+          # On issue_comment events, only the review-gate job runs.
+          if [[ "$EVENT" == "issue_comment" ]]; then
+            if [[ "${{ needs.review-gate.result }}" != "success" ]]; then exit 1; fi
+            echo "issue_comment: review-gate passed"
+            exit 0
+          fi
+          # Standard CI checks for push/pull_request/merge_group events.
           if [[ "${{ needs.fmt.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.proto-verify.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.clippy.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.doc.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.test.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.review-gate.result }}" != "success" ]]; then exit 1; fi
+          if [[ "$EVENT" == "pull_request" && "${{ needs.review-gate.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.test-vectors.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.msrv.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.security.result }}" != "success" ]]; then exit 1; fi

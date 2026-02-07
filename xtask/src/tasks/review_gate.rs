@@ -147,13 +147,30 @@ fn fetch_pr_issue_comments(
     owner_repo: &str,
     pr_number: u64,
 ) -> Result<Vec<IssueComment>> {
-    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100");
-    let output = cmd!(sh, "gh api {endpoint}")
-        .read()
-        .with_context(|| format!("Failed to fetch comments for PR #{pr_number}"))?;
+    let mut all_comments = Vec::new();
+    let mut page: u32 = 1;
 
-    serde_json::from_str(&output)
-        .with_context(|| format!("Failed to parse PR comment payload for PR #{pr_number}"))
+    loop {
+        let endpoint =
+            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
+        let output = cmd!(sh, "gh api {endpoint}")
+            .read()
+            .with_context(|| format!("Failed to fetch comments page {page} for PR #{pr_number}"))?;
+
+        let page_comments: Vec<IssueComment> =
+            serde_json::from_str(&output).with_context(|| {
+                format!("Failed to parse PR comment payload page {page} for PR #{pr_number}")
+            })?;
+
+        if page_comments.is_empty() {
+            break;
+        }
+
+        all_comments.extend(page_comments);
+        page += 1;
+    }
+
+    Ok(all_comments)
 }
 
 fn evaluate_gate(input: &GateEvaluationInput<'_>) -> GateEvaluation {
@@ -291,6 +308,17 @@ fn collect_category_artifacts(
                 continue;
             }
 
+            // MAJOR-1 fix: prefilter by trusted author identity.
+            // Only comments whose author is in the trusted reviewer allowlist
+            // for this category participate in authoritative artifact selection.
+            if !is_trusted_author(input.trusted_reviewers, category, &comment.user.login) {
+                eprintln!(
+                    "review-gate: skipping marker comment #{} from untrusted author `{}`",
+                    comment.id, comment.user.login
+                );
+                continue;
+            }
+
             let timestamp = parse_comment_timestamp(comment).map_err(|error| error.to_string());
             let parsed_metadata = parse_comment_metadata(comment, category);
 
@@ -410,6 +438,25 @@ fn validate_reviewer_trust(
     }
 
     Ok(())
+}
+
+/// Returns `true` if `comment_login` appears in ANY trusted reviewer entry
+/// for the given `category`. This is used as a prefilter — comments from
+/// untrusted authors are silently skipped before metadata parsing so that
+/// forged marker comments cannot induce false gate failures (MAJOR-1).
+fn is_trusted_author(
+    trusted_reviewers: &TrustedReviewerMap,
+    category: ReviewCategory,
+    comment_login: &str,
+) -> bool {
+    let Some(reviewers_by_id) = trusted_reviewers.get(&category) else {
+        return false;
+    };
+
+    let normalized_login = comment_login.to_ascii_lowercase();
+    reviewers_by_id
+        .values()
+        .any(|logins| logins.contains(&normalized_login))
 }
 
 fn parse_comment_timestamp(comment: &IssueComment) -> Result<DateTime<Utc>> {

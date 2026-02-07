@@ -36,30 +36,77 @@ pub const REQUIRED_READING: &[&str] = &[
 
 const STATUS_CONTEXT: &str = "ai-review/security";
 
-/// Approval comment template.
-const APPROVE_COMMENT: &str = r"## Security Review
+/// Default reviewer identity for security-review-exec verdicts.
+const DEFAULT_REVIEWER_ID: &str = "apm2-codex-security";
+/// Metadata marker for the review-gate to discover security artifacts.
+const SECURITY_METADATA_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
+/// Schema identifier for review metadata payloads.
+const REVIEW_METADATA_SCHEMA: &str = "apm2.review.metadata.v1";
 
-**Status:** ✅ APPROVED
+/// Generate approval comment with machine-readable metadata block.
+fn approval_comment(pr_number: u32, head_sha: &str) -> String {
+    format!(
+        r#"## Security Review
+
+**Status:** APPROVED
 
 This PR has passed security review. No security issues were identified.
 
+{SECURITY_METADATA_MARKER}
+```json
+{{
+  "schema": "{REVIEW_METADATA_SCHEMA}",
+  "review_type": "security",
+  "pr_number": {pr_number},
+  "head_sha": "{head_sha}",
+  "verdict": "PASS",
+  "severity_counts": {{
+    "blocker": 0,
+    "major": 0,
+    "minor": 0,
+    "nit": 0
+  }},
+  "reviewer_id": "{DEFAULT_REVIEWER_ID}"
+}}
+```
+
 ---
-*Posted via `cargo xtask security-review-exec approve`*";
+*Posted via `cargo xtask security-review-exec approve`*"#
+    )
+}
 
-/// Generate denial comment with reason.
-fn denial_comment(reason: &str) -> String {
+/// Generate denial comment with machine-readable metadata block.
+fn denial_comment(reason: &str, pr_number: u32, head_sha: &str) -> String {
     format!(
-        r"## Security Review
+        r#"## Security Review
 
-**Status:** ❌ DENIED
+**Status:** DENIED
 
 ### Reason
 {reason}
 
 Please address the security concerns above before this PR can be approved.
 
+{SECURITY_METADATA_MARKER}
+```json
+{{
+  "schema": "{REVIEW_METADATA_SCHEMA}",
+  "review_type": "security",
+  "pr_number": {pr_number},
+  "head_sha": "{head_sha}",
+  "verdict": "FAIL",
+  "severity_counts": {{
+    "blocker": 1,
+    "major": 0,
+    "minor": 0,
+    "nit": 0
+  }},
+  "reviewer_id": "{DEFAULT_REVIEWER_ID}"
+}}
+```
+
 ---
-*Posted via `cargo xtask security-review-exec deny`*"
+*Posted via `cargo xtask security-review-exec deny`*"#
     )
 }
 
@@ -236,9 +283,10 @@ pub fn approve(ticket_id: Option<&str>, dry_run: bool, emit_internal: bool) -> R
     } else {
         println!("\n[4/4] Posting approval...");
 
-        // Post approval comment
+        // Post approval comment with machine-readable metadata
+        let approve_body = approval_comment(pr.pr_number, &head_sha);
         let pr_url = &pr.pr_url;
-        cmd!(sh, "gh pr comment {pr_url} --body {APPROVE_COMMENT}")
+        cmd!(sh, "gh pr comment {pr_url} --body {approve_body}")
             .run()
             .context("Failed to post approval comment")?;
         println!("  Comment posted.");
@@ -360,8 +408,8 @@ pub fn deny(
     } else {
         println!("\n[4/4] Posting denial...");
 
-        // Post denial comment
-        let comment = denial_comment(&actual_reason);
+        // Post denial comment with machine-readable metadata
+        let comment = denial_comment(&actual_reason, pr.pr_number, &head_sha);
         let pr_url = &pr.pr_url;
         cmd!(sh, "gh pr comment {pr_url} --body {comment}")
             .run()
@@ -596,15 +644,38 @@ mod tests {
     }
 
     #[test]
-    fn test_denial_comment_includes_reason() {
-        let comment = denial_comment("XSS vulnerability in input handling");
+    fn test_denial_comment_includes_reason_and_metadata() {
+        let comment = denial_comment(
+            "XSS vulnerability in input handling",
+            100,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
         assert!(comment.contains("XSS vulnerability in input handling"));
         assert!(comment.contains("DENIED"));
+        // BLOCKER-3: verify machine-readable metadata is present
+        assert!(
+            comment.contains(SECURITY_METADATA_MARKER),
+            "denial comment must contain review-gate metadata marker"
+        );
+        assert!(comment.contains(r#""verdict": "FAIL""#));
+        assert!(comment.contains(r#""pr_number": 100"#));
+        assert!(comment.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(comment.contains(REVIEW_METADATA_SCHEMA));
     }
 
     #[test]
-    fn test_approve_comment_format() {
-        assert!(APPROVE_COMMENT.contains("APPROVED"));
-        assert!(APPROVE_COMMENT.contains("security-review-exec approve"));
+    fn test_approve_comment_format_and_metadata() {
+        let comment = approval_comment(200, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(comment.contains("APPROVED"));
+        assert!(comment.contains("security-review-exec approve"));
+        // BLOCKER-3: verify machine-readable metadata is present
+        assert!(
+            comment.contains(SECURITY_METADATA_MARKER),
+            "approval comment must contain review-gate metadata marker"
+        );
+        assert!(comment.contains(r#""verdict": "PASS""#));
+        assert!(comment.contains(r#""pr_number": 200"#));
+        assert!(comment.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(comment.contains(REVIEW_METADATA_SCHEMA));
     }
 }

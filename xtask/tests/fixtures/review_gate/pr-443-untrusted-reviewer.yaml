@@ -58,4 +58,6 @@ expected:
   security_pass: false
   code_quality_pass: true
   security_reason_substrings:
-    - "not allowlisted"
+    # With MAJOR-1 prefilter: untrusted author comments are skipped before
+    # metadata parsing, so no artifact is found instead of being rejected.
+    - "No machine-readable review artifacts found for security"

@@ -1,0 +1,188 @@
+name: "PR-460 decisive FAIL artifact after 100+ comments (pagination coverage)"
+pr_number: 460
+head_sha: "6060606060606060606060606060606060606060"
+statuses:
+  - context: "ai-review/security"
+    state: "failure"
+    created_at: "2026-02-11T12:00:00Z"
+  - context: "ai-review/code-quality"
+    state: "success"
+    created_at: "2026-02-11T12:01:00Z"
+comments:
+  # Comment 1: early PASS artifact from trusted bot
+  - id: 46001
+    user_login: "apm2-security-bot"
+    updated_at: "2026-02-11T10:00:00Z"
+    body: |
+      ## Security Review: PASS
+      <!-- apm2-review-metadata:v1:security -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "security",
+        "pr_number": 460,
+        "head_sha": "6060606060606060606060606060606060606060",
+        "verdict": "PASS",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 0,
+          "minor": 0,
+          "nit": 0
+        },
+        "reviewer_id": "apm2-codex-security"
+      }
+      ```
+  # Comments 2-101: 100 filler comments without markers (simulating a long PR thread)
+  - { id: 46002, user_login: "contributor-a", updated_at: "2026-02-11T10:01:00Z", body: "LGTM, looks good" }
+  - { id: 46003, user_login: "contributor-b", updated_at: "2026-02-11T10:02:00Z", body: "nit: rename variable" }
+  - { id: 46004, user_login: "contributor-a", updated_at: "2026-02-11T10:03:00Z", body: "Addressed review feedback" }
+  - { id: 46005, user_login: "contributor-b", updated_at: "2026-02-11T10:04:00Z", body: "Thanks!" }
+  - { id: 46006, user_login: "contributor-a", updated_at: "2026-02-11T10:05:00Z", body: "Rebased on main" }
+  - { id: 46007, user_login: "contributor-b", updated_at: "2026-02-11T10:06:00Z", body: "Waiting for CI" }
+  - { id: 46008, user_login: "contributor-a", updated_at: "2026-02-11T10:07:00Z", body: "CI green" }
+  - { id: 46009, user_login: "contributor-b", updated_at: "2026-02-11T10:08:00Z", body: "One more concern" }
+  - { id: 46010, user_login: "contributor-a", updated_at: "2026-02-11T10:09:00Z", body: "Fixed" }
+  - { id: 46011, user_login: "contributor-b", updated_at: "2026-02-11T10:10:00Z", body: "Approved" }
+  - { id: 46012, user_login: "contributor-a", updated_at: "2026-02-11T10:11:00Z", body: "filler 12" }
+  - { id: 46013, user_login: "contributor-a", updated_at: "2026-02-11T10:12:00Z", body: "filler 13" }
+  - { id: 46014, user_login: "contributor-a", updated_at: "2026-02-11T10:13:00Z", body: "filler 14" }
+  - { id: 46015, user_login: "contributor-a", updated_at: "2026-02-11T10:14:00Z", body: "filler 15" }
+  - { id: 46016, user_login: "contributor-a", updated_at: "2026-02-11T10:15:00Z", body: "filler 16" }
+  - { id: 46017, user_login: "contributor-a", updated_at: "2026-02-11T10:16:00Z", body: "filler 17" }
+  - { id: 46018, user_login: "contributor-a", updated_at: "2026-02-11T10:17:00Z", body: "filler 18" }
+  - { id: 46019, user_login: "contributor-a", updated_at: "2026-02-11T10:18:00Z", body: "filler 19" }
+  - { id: 46020, user_login: "contributor-a", updated_at: "2026-02-11T10:19:00Z", body: "filler 20" }
+  - { id: 46021, user_login: "contributor-a", updated_at: "2026-02-11T10:20:00Z", body: "filler 21" }
+  - { id: 46022, user_login: "contributor-a", updated_at: "2026-02-11T10:21:00Z", body: "filler 22" }
+  - { id: 46023, user_login: "contributor-a", updated_at: "2026-02-11T10:22:00Z", body: "filler 23" }
+  - { id: 46024, user_login: "contributor-a", updated_at: "2026-02-11T10:23:00Z", body: "filler 24" }
+  - { id: 46025, user_login: "contributor-a", updated_at: "2026-02-11T10:24:00Z", body: "filler 25" }
+  - { id: 46026, user_login: "contributor-a", updated_at: "2026-02-11T10:25:00Z", body: "filler 26" }
+  - { id: 46027, user_login: "contributor-a", updated_at: "2026-02-11T10:26:00Z", body: "filler 27" }
+  - { id: 46028, user_login: "contributor-a", updated_at: "2026-02-11T10:27:00Z", body: "filler 28" }
+  - { id: 46029, user_login: "contributor-a", updated_at: "2026-02-11T10:28:00Z", body: "filler 29" }
+  - { id: 46030, user_login: "contributor-a", updated_at: "2026-02-11T10:29:00Z", body: "filler 30" }
+  - { id: 46031, user_login: "contributor-a", updated_at: "2026-02-11T10:30:00Z", body: "filler 31" }
+  - { id: 46032, user_login: "contributor-a", updated_at: "2026-02-11T10:31:00Z", body: "filler 32" }
+  - { id: 46033, user_login: "contributor-a", updated_at: "2026-02-11T10:32:00Z", body: "filler 33" }
+  - { id: 46034, user_login: "contributor-a", updated_at: "2026-02-11T10:33:00Z", body: "filler 34" }
+  - { id: 46035, user_login: "contributor-a", updated_at: "2026-02-11T10:34:00Z", body: "filler 35" }
+  - { id: 46036, user_login: "contributor-a", updated_at: "2026-02-11T10:35:00Z", body: "filler 36" }
+  - { id: 46037, user_login: "contributor-a", updated_at: "2026-02-11T10:36:00Z", body: "filler 37" }
+  - { id: 46038, user_login: "contributor-a", updated_at: "2026-02-11T10:37:00Z", body: "filler 38" }
+  - { id: 46039, user_login: "contributor-a", updated_at: "2026-02-11T10:38:00Z", body: "filler 39" }
+  - { id: 46040, user_login: "contributor-a", updated_at: "2026-02-11T10:39:00Z", body: "filler 40" }
+  - { id: 46041, user_login: "contributor-a", updated_at: "2026-02-11T10:40:00Z", body: "filler 41" }
+  - { id: 46042, user_login: "contributor-a", updated_at: "2026-02-11T10:41:00Z", body: "filler 42" }
+  - { id: 46043, user_login: "contributor-a", updated_at: "2026-02-11T10:42:00Z", body: "filler 43" }
+  - { id: 46044, user_login: "contributor-a", updated_at: "2026-02-11T10:43:00Z", body: "filler 44" }
+  - { id: 46045, user_login: "contributor-a", updated_at: "2026-02-11T10:44:00Z", body: "filler 45" }
+  - { id: 46046, user_login: "contributor-a", updated_at: "2026-02-11T10:45:00Z", body: "filler 46" }
+  - { id: 46047, user_login: "contributor-a", updated_at: "2026-02-11T10:46:00Z", body: "filler 47" }
+  - { id: 46048, user_login: "contributor-a", updated_at: "2026-02-11T10:47:00Z", body: "filler 48" }
+  - { id: 46049, user_login: "contributor-a", updated_at: "2026-02-11T10:48:00Z", body: "filler 49" }
+  - { id: 46050, user_login: "contributor-a", updated_at: "2026-02-11T10:49:00Z", body: "filler 50" }
+  - { id: 46051, user_login: "contributor-a", updated_at: "2026-02-11T10:50:00Z", body: "filler 51" }
+  - { id: 46052, user_login: "contributor-a", updated_at: "2026-02-11T10:51:00Z", body: "filler 52" }
+  - { id: 46053, user_login: "contributor-a", updated_at: "2026-02-11T10:52:00Z", body: "filler 53" }
+  - { id: 46054, user_login: "contributor-a", updated_at: "2026-02-11T10:53:00Z", body: "filler 54" }
+  - { id: 46055, user_login: "contributor-a", updated_at: "2026-02-11T10:54:00Z", body: "filler 55" }
+  - { id: 46056, user_login: "contributor-a", updated_at: "2026-02-11T10:55:00Z", body: "filler 56" }
+  - { id: 46057, user_login: "contributor-a", updated_at: "2026-02-11T10:56:00Z", body: "filler 57" }
+  - { id: 46058, user_login: "contributor-a", updated_at: "2026-02-11T10:57:00Z", body: "filler 58" }
+  - { id: 46059, user_login: "contributor-a", updated_at: "2026-02-11T10:58:00Z", body: "filler 59" }
+  - { id: 46060, user_login: "contributor-a", updated_at: "2026-02-11T10:59:00Z", body: "filler 60" }
+  - { id: 46061, user_login: "contributor-a", updated_at: "2026-02-11T11:00:00Z", body: "filler 61" }
+  - { id: 46062, user_login: "contributor-a", updated_at: "2026-02-11T11:01:00Z", body: "filler 62" }
+  - { id: 46063, user_login: "contributor-a", updated_at: "2026-02-11T11:02:00Z", body: "filler 63" }
+  - { id: 46064, user_login: "contributor-a", updated_at: "2026-02-11T11:03:00Z", body: "filler 64" }
+  - { id: 46065, user_login: "contributor-a", updated_at: "2026-02-11T11:04:00Z", body: "filler 65" }
+  - { id: 46066, user_login: "contributor-a", updated_at: "2026-02-11T11:05:00Z", body: "filler 66" }
+  - { id: 46067, user_login: "contributor-a", updated_at: "2026-02-11T11:06:00Z", body: "filler 67" }
+  - { id: 46068, user_login: "contributor-a", updated_at: "2026-02-11T11:07:00Z", body: "filler 68" }
+  - { id: 46069, user_login: "contributor-a", updated_at: "2026-02-11T11:08:00Z", body: "filler 69" }
+  - { id: 46070, user_login: "contributor-a", updated_at: "2026-02-11T11:09:00Z", body: "filler 70" }
+  - { id: 46071, user_login: "contributor-a", updated_at: "2026-02-11T11:10:00Z", body: "filler 71" }
+  - { id: 46072, user_login: "contributor-a", updated_at: "2026-02-11T11:11:00Z", body: "filler 72" }
+  - { id: 46073, user_login: "contributor-a", updated_at: "2026-02-11T11:12:00Z", body: "filler 73" }
+  - { id: 46074, user_login: "contributor-a", updated_at: "2026-02-11T11:13:00Z", body: "filler 74" }
+  - { id: 46075, user_login: "contributor-a", updated_at: "2026-02-11T11:14:00Z", body: "filler 75" }
+  - { id: 46076, user_login: "contributor-a", updated_at: "2026-02-11T11:15:00Z", body: "filler 76" }
+  - { id: 46077, user_login: "contributor-a", updated_at: "2026-02-11T11:16:00Z", body: "filler 77" }
+  - { id: 46078, user_login: "contributor-a", updated_at: "2026-02-11T11:17:00Z", body: "filler 78" }
+  - { id: 46079, user_login: "contributor-a", updated_at: "2026-02-11T11:18:00Z", body: "filler 79" }
+  - { id: 46080, user_login: "contributor-a", updated_at: "2026-02-11T11:19:00Z", body: "filler 80" }
+  - { id: 46081, user_login: "contributor-a", updated_at: "2026-02-11T11:20:00Z", body: "filler 81" }
+  - { id: 46082, user_login: "contributor-a", updated_at: "2026-02-11T11:21:00Z", body: "filler 82" }
+  - { id: 46083, user_login: "contributor-a", updated_at: "2026-02-11T11:22:00Z", body: "filler 83" }
+  - { id: 46084, user_login: "contributor-a", updated_at: "2026-02-11T11:23:00Z", body: "filler 84" }
+  - { id: 46085, user_login: "contributor-a", updated_at: "2026-02-11T11:24:00Z", body: "filler 85" }
+  - { id: 46086, user_login: "contributor-a", updated_at: "2026-02-11T11:25:00Z", body: "filler 86" }
+  - { id: 46087, user_login: "contributor-a", updated_at: "2026-02-11T11:26:00Z", body: "filler 87" }
+  - { id: 46088, user_login: "contributor-a", updated_at: "2026-02-11T11:27:00Z", body: "filler 88" }
+  - { id: 46089, user_login: "contributor-a", updated_at: "2026-02-11T11:28:00Z", body: "filler 89" }
+  - { id: 46090, user_login: "contributor-a", updated_at: "2026-02-11T11:29:00Z", body: "filler 90" }
+  - { id: 46091, user_login: "contributor-a", updated_at: "2026-02-11T11:30:00Z", body: "filler 91" }
+  - { id: 46092, user_login: "contributor-a", updated_at: "2026-02-11T11:31:00Z", body: "filler 92" }
+  - { id: 46093, user_login: "contributor-a", updated_at: "2026-02-11T11:32:00Z", body: "filler 93" }
+  - { id: 46094, user_login: "contributor-a", updated_at: "2026-02-11T11:33:00Z", body: "filler 94" }
+  - { id: 46095, user_login: "contributor-a", updated_at: "2026-02-11T11:34:00Z", body: "filler 95" }
+  - { id: 46096, user_login: "contributor-a", updated_at: "2026-02-11T11:35:00Z", body: "filler 96" }
+  - { id: 46097, user_login: "contributor-a", updated_at: "2026-02-11T11:36:00Z", body: "filler 97" }
+  - { id: 46098, user_login: "contributor-a", updated_at: "2026-02-11T11:37:00Z", body: "filler 98" }
+  - { id: 46099, user_login: "contributor-a", updated_at: "2026-02-11T11:38:00Z", body: "filler 99" }
+  - { id: 46100, user_login: "contributor-a", updated_at: "2026-02-11T11:39:00Z", body: "filler 100" }
+  - { id: 46101, user_login: "contributor-a", updated_at: "2026-02-11T11:40:00Z", body: "filler 101" }
+  # Comment 102 (position >100): decisive FAIL artifact from trusted bot
+  - id: 46102
+    user_login: "apm2-security-bot"
+    updated_at: "2026-02-11T11:50:00Z"
+    body: |
+      ## Security Review: FAIL
+      <!-- apm2-review-metadata:v1:security -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "security",
+        "pr_number": 460,
+        "head_sha": "6060606060606060606060606060606060606060",
+        "verdict": "FAIL",
+        "severity_counts": {
+          "blocker": 1,
+          "major": 0,
+          "minor": 0,
+          "nit": 0
+        },
+        "reviewer_id": "apm2-codex-security"
+      }
+      ```
+  # Code quality PASS from trusted bot (to isolate security failure)
+  - id: 46103
+    user_login: "apm2-quality-bot"
+    updated_at: "2026-02-11T11:55:00Z"
+    body: |
+      ## Code Quality Review: PASS
+      <!-- apm2-review-metadata:v1:code-quality -->
+      ```json
+      {
+        "schema": "apm2.review.metadata.v1",
+        "review_type": "code-quality",
+        "pr_number": 460,
+        "head_sha": "6060606060606060606060606060606060606060",
+        "verdict": "PASS",
+        "severity_counts": {
+          "blocker": 0,
+          "major": 0,
+          "minor": 0,
+          "nit": 0
+        },
+        "reviewer_id": "apm2-codex-quality"
+      }
+      ```
+expected:
+  overall_pass: false
+  security_pass: false
+  code_quality_pass: true
+  security_reason_substrings:
+    - "Newest security artifact verdict is FAIL"
+    - "Conflicting PASS/FAIL artifacts"
