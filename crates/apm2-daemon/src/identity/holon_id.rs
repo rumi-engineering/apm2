@@ -20,7 +20,9 @@
 
 use std::fmt;
 
-use super::canonical_digest_id_kit::CanonicalDigestIdKit;
+use super::canonical_digest_id_kit::{
+    CanonicalDigestIdKit, impl_digest_id_fmt, impl_version_tagged_digest_id,
+};
 use super::cell_id::CellIdV1;
 use super::{AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1};
 
@@ -265,73 +267,10 @@ impl HolonIdV1 {
         Self { binary }
     }
 
-    /// Parse a `HolonIdV1` from canonical text form.
-    pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
-        let binary = CODEC.parse_text_binary_with_tag(input, VERSION_TAG_V1)?;
-        Ok(Self { binary })
-    }
-
-    /// Construct from binary form (`version_tag + 32-byte hash`).
-    pub fn from_binary(bytes: &[u8]) -> Result<Self, KeyIdError> {
-        let binary = CODEC.parse_binary_exact(bytes, |tag| {
-            if tag == VERSION_TAG_V1 {
-                Ok(())
-            } else {
-                Err(KeyIdError::UnknownVersionTag { tag })
-            }
-        })?;
-        Ok(Self { binary })
-    }
-
-    /// Return canonical text form: `holon:v1:blake3:<64-hex>`.
-    pub fn to_text(&self) -> String {
-        CODEC.to_text(self.holon_hash())
-    }
-
-    /// Return binary form (`version_tag + hash`).
-    pub const fn to_binary(&self) -> [u8; BINARY_LEN] {
-        self.binary
-    }
-
-    /// Return the 32-byte hash portion (without version tag).
-    pub fn holon_hash(&self) -> &[u8; HASH_LEN] {
-        self.binary[1..]
-            .try_into()
-            .expect("binary is exactly 33 bytes")
-    }
-
-    /// Return the version tag.
-    pub const fn version_tag(&self) -> u8 {
-        self.binary[0]
-    }
-
-    /// Return a reference to the full binary bytes.
-    pub const fn as_bytes(&self) -> &[u8; BINARY_LEN] {
-        &self.binary
-    }
+    impl_version_tagged_digest_id!(CODEC, VERSION_TAG_V1, holon_hash);
 }
 
-impl fmt::Debug for HolonIdV1 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HolonIdV1")
-            .field("text", &self.to_text())
-            .finish()
-    }
-}
-
-impl fmt::Display for HolonIdV1 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_text())
-    }
-}
-
-impl std::str::FromStr for HolonIdV1 {
-    type Err = KeyIdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse_text(s)
-    }
-}
+impl_digest_id_fmt!(HolonIdV1, "HolonIdV1");
 
 fn validate_public_key_bytes(bytes: &[u8]) -> Result<(), KeyIdError> {
     if bytes.is_empty() {
