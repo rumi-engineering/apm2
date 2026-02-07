@@ -20,14 +20,14 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Workspace confinement tests (35 tests):
-        Workspace root validation:
+        Workspace confinement tests (36 tests):
+        Workspace root validation (fail-closed by construction via new()):
         - test_valid_workspace_root: /home/agent/workspace accepted
-        - test_empty_workspace_root: empty root rejected
-        - test_relative_workspace_root: relative root rejected (must be absolute)
-        - test_blocked_root_exact: /etc rejected as blocked system directory
-        - test_blocked_root_child: /var/log rejected (child of blocked /var)
-        - test_blocked_root_slash: / rejected as root filesystem
+        - test_empty_workspace_root: empty root rejected at construction
+        - test_relative_workspace_root: relative root rejected at construction
+        - test_blocked_root_exact: /etc rejected at construction
+        - test_blocked_root_child: /var/log rejected at construction (child of blocked /var)
+        - test_blocked_root_slash: / rejected at construction
         Path traversal prevention:
         - test_valid_relative_path: src/main.rs resolved correctly
         - test_path_with_dot: ./src/main.rs handled (dot is harmless)
@@ -53,7 +53,7 @@ evidence_artifact:
         - test_absolute_curdir_stripped_by_components: CurDir stripped by Rust for absolute paths
         - test_absolute_clean_path_within_root_ok: normalized absolute path passes
         - test_absolute_root_exact_ok: workspace root path itself passes
-        Workspace root ParentDir bypass regression:
+        Workspace root ParentDir bypass regression (caught at construction time):
         - test_workspace_root_rejects_parent_dir_bypass_to_etc: /tmp/../etc rejected
         - test_workspace_root_rejects_deep_parent_dir_bypass: /workspace/../../var rejected
         - test_workspace_root_rejects_triple_parent_dir_bypass: /home/./user/../../../etc rejected
@@ -62,4 +62,6 @@ evidence_artifact:
         Contains() integration:
         - test_contains_valid_path: WorkspaceConfinement.contains() resolves correctly
         - test_contains_traversal_rejected: WorkspaceConfinement.contains() blocks traversal
+        Fail-closed construction (new):
+        - test_new_returns_result_not_raw_struct: validates fail-closed construction pattern
       ref: "cargo test -p apm2-core -- capsule::workspace"

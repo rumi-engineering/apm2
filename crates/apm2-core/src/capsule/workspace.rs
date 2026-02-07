@@ -29,11 +29,12 @@
 //!
 //! use apm2_core::capsule::{WorkspaceConfinement, validate_workspace_path};
 //!
-//! let confinement = WorkspaceConfinement::new("/home/agent/workspace");
-//! assert!(confinement.validate().is_ok());
+//! // Construction validates the root path (fail-closed by construction).
+//! let confinement =
+//!     WorkspaceConfinement::new("/home/agent/workspace").expect("valid workspace root");
 //!
 //! // Valid relative path within workspace (root enforced via WorkspaceConfinement)
-//! let ws = WorkspaceConfinement::new("/workspace");
+//! let ws = WorkspaceConfinement::new("/workspace").expect("valid workspace root");
 //! assert!(validate_workspace_path(Path::new("src/main.rs"), &ws).is_ok());
 //!
 //! // Path traversal attempt → rejected
@@ -146,17 +147,34 @@ pub enum WorkspaceConfinementError {
 ///
 /// Defines the workspace root directory that will be bind-mounted
 /// into the capsule. All agent file operations are confined to this root.
+///
+/// # Construction
+///
+/// `WorkspaceConfinement` is fail-closed by construction: the only public
+/// constructor is [`WorkspaceConfinement::new()`], which validates the root
+/// path and returns `Result`. This ensures that `contains()` and
+/// `validate_workspace_path()` can never be called on an unvalidated
+/// confinement (CTR-2603, CTR-1205).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkspaceConfinement {
-    /// Absolute path to the workspace root.
+    /// Absolute path to the workspace root (validated at construction time).
     root: PathBuf,
 }
 
 impl WorkspaceConfinement {
-    /// Creates a new workspace confinement with the given root.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    /// Creates a new workspace confinement with the given root, validating
+    /// that the root is an absolute path without traversal components and
+    /// is not a blocked system directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfinementError`] if the root path fails
+    /// validation (empty, relative, contains `..`/`.`, blocked directory,
+    /// or exceeds length limits).
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, WorkspaceConfinementError> {
+        let confinement = Self { root: root.into() };
+        confinement.validate_root()?;
+        Ok(confinement)
     }
 
     /// Returns the workspace root path.
@@ -165,12 +183,11 @@ impl WorkspaceConfinement {
         &self.root
     }
 
-    /// Validates the workspace confinement configuration.
+    /// Internal: validates the workspace root path.
     ///
-    /// # Errors
-    ///
-    /// Returns [`WorkspaceConfinementError`] if validation fails.
-    pub fn validate(&self) -> Result<(), WorkspaceConfinementError> {
+    /// Called by `new()` during construction. This is not public because
+    /// all `WorkspaceConfinement` values are validated at construction time.
+    fn validate_root(&self) -> Result<(), WorkspaceConfinementError> {
         let root_str = self.root.to_string_lossy();
 
         // Must not be empty
@@ -241,6 +258,9 @@ impl WorkspaceConfinement {
     /// Checks whether a path is safely contained within this workspace.
     ///
     /// The path must be relative and must not contain traversal components.
+    /// Because `WorkspaceConfinement` is validated at construction time,
+    /// the workspace root is guaranteed to be a valid, non-blocked absolute
+    /// path.
     ///
     /// # Errors
     ///
@@ -390,32 +410,29 @@ mod tests {
     #[test]
     fn test_valid_workspace_root() {
         let wc = WorkspaceConfinement::new("/home/agent/workspace");
-        assert!(wc.validate().is_ok());
+        assert!(wc.is_ok());
     }
 
     #[test]
     fn test_empty_workspace_root() {
-        let wc = WorkspaceConfinement::new("");
-        assert!(matches!(
-            wc.validate(),
-            Err(WorkspaceConfinementError::EmptyRoot)
-        ));
+        let result = WorkspaceConfinement::new("");
+        assert!(matches!(result, Err(WorkspaceConfinementError::EmptyRoot)));
     }
 
     #[test]
     fn test_relative_workspace_root() {
-        let wc = WorkspaceConfinement::new("relative/path");
+        let result = WorkspaceConfinement::new("relative/path");
         assert!(matches!(
-            wc.validate(),
+            result,
             Err(WorkspaceConfinementError::NotAbsolute { .. })
         ));
     }
 
     #[test]
     fn test_blocked_root_exact() {
-        let wc = WorkspaceConfinement::new("/etc");
+        let result = WorkspaceConfinement::new("/etc");
         assert!(matches!(
-            wc.validate(),
+            result,
             Err(WorkspaceConfinementError::BlockedRoot { .. })
         ));
     }
@@ -423,18 +440,18 @@ mod tests {
     #[test]
     fn test_blocked_root_child() {
         // /var/log should be blocked because /var is blocked
-        let wc = WorkspaceConfinement::new("/var/log");
+        let result = WorkspaceConfinement::new("/var/log");
         assert!(matches!(
-            wc.validate(),
+            result,
             Err(WorkspaceConfinementError::BlockedRoot { .. })
         ));
     }
 
     #[test]
     fn test_blocked_root_slash() {
-        let wc = WorkspaceConfinement::new("/");
+        let result = WorkspaceConfinement::new("/");
         assert!(matches!(
-            wc.validate(),
+            result,
             Err(WorkspaceConfinementError::BlockedRoot { .. })
         ));
     }
@@ -445,21 +462,21 @@ mod tests {
 
     #[test]
     fn test_valid_relative_path() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         let result = validate_workspace_path(Path::new("src/main.rs"), &ws);
         assert_eq!(result.unwrap(), PathBuf::from("/workspace/src/main.rs"));
     }
 
     #[test]
     fn test_path_with_dot() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         let result = validate_workspace_path(Path::new("./src/main.rs"), &ws);
         assert_eq!(result.unwrap(), PathBuf::from("/workspace/src/main.rs"));
     }
 
     #[test]
     fn test_path_traversal_dotdot() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         let result = validate_workspace_path(Path::new("../../../etc/passwd"), &ws);
         assert!(matches!(
             result,
@@ -469,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_path_traversal_embedded_dotdot() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         let result = validate_workspace_path(Path::new("src/../../etc/passwd"), &ws);
         assert!(matches!(
             result,
@@ -479,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_absolute_path_rejected() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         let result = validate_workspace_path(Path::new("/etc/passwd"), &ws);
         assert!(matches!(
             result,
@@ -489,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_path_too_deep() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         let deep_path: String = (0..=MAX_WORKSPACE_PATH_DEPTH)
             .map(|i| format!("d{i}"))
             .collect::<Vec<_>>()
@@ -503,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_path_exactly_at_max_depth() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         let path: String = (0..MAX_WORKSPACE_PATH_DEPTH)
             .map(|i| format!("d{i}"))
             .collect::<Vec<_>>()
@@ -518,25 +535,25 @@ mod tests {
 
     #[test]
     fn test_adversarial_dotdot_at_start() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         assert!(validate_workspace_path(Path::new(".."), &ws).is_err());
     }
 
     #[test]
     fn test_adversarial_multiple_dotdots() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         assert!(validate_workspace_path(Path::new("../../.."), &ws).is_err());
     }
 
     #[test]
     fn test_adversarial_dotdot_after_normal() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         assert!(validate_workspace_path(Path::new("a/b/../../.."), &ws).is_err());
     }
 
     #[test]
     fn test_adversarial_dotdot_to_etc() {
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         assert!(validate_workspace_path(Path::new("../../../etc/shadow"), &ws).is_err());
     }
 
@@ -545,7 +562,7 @@ mod tests {
         // On Unix, Path::new handles actual OS paths, not URL-encoded strings.
         // The OS will see these as literal filenames, not traversal.
         // But we verify the component check still works for real ".." components.
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         // Mix of ".." and normal
         assert!(validate_workspace_path(Path::new("foo/../../../bar"), &ws).is_err());
     }
@@ -554,7 +571,7 @@ mod tests {
     fn test_adversarial_null_byte_in_path() {
         // Paths with null bytes are invalid on Unix, but we test that our
         // validation doesn't panic
-        let ws = WorkspaceConfinement::new("/workspace");
+        let ws = WorkspaceConfinement::new("/workspace").unwrap();
         // std::path::Path will handle this as a normal segment
         let result = validate_workspace_path(Path::new("safe_file.txt"), &ws);
         assert!(result.is_ok());
@@ -662,28 +679,28 @@ mod tests {
 
     #[test]
     fn test_contains_valid_path() {
-        let wc = WorkspaceConfinement::new("/workspace");
+        let wc = WorkspaceConfinement::new("/workspace").unwrap();
         let result = wc.contains(Path::new("src/lib.rs"));
         assert_eq!(result.unwrap(), PathBuf::from("/workspace/src/lib.rs"));
     }
 
     #[test]
     fn test_contains_traversal_rejected() {
-        let wc = WorkspaceConfinement::new("/workspace");
+        let wc = WorkspaceConfinement::new("/workspace").unwrap();
         assert!(wc.contains(Path::new("../secret")).is_err());
     }
 
     // =========================================================================
     // BLOCKER 2: Workspace root with ParentDir (..) bypass regression tests
+    // (now caught at construction time via fail-closed new())
     // =========================================================================
 
     #[test]
     fn test_workspace_root_rejects_parent_dir_bypass_to_etc() {
         // /tmp/../etc resolves to /etc, bypassing the blocked-root check
         // because /tmp is not blocked. The ParentDir component must be
-        // rejected before the blocked-root check runs.
-        let wc = WorkspaceConfinement::new("/tmp/../etc");
-        let result = wc.validate();
+        // rejected at construction time.
+        let result = WorkspaceConfinement::new("/tmp/../etc");
         assert!(
             matches!(
                 result,
@@ -697,8 +714,7 @@ mod tests {
     fn test_workspace_root_rejects_deep_parent_dir_bypass() {
         // /workspace/../../var resolves to /var, bypassing the non-blocked
         // /workspace prefix.
-        let wc = WorkspaceConfinement::new("/workspace/../../var");
-        let result = wc.validate();
+        let result = WorkspaceConfinement::new("/workspace/../../var");
         assert!(
             matches!(
                 result,
@@ -711,8 +727,7 @@ mod tests {
     #[test]
     fn test_workspace_root_rejects_triple_parent_dir_bypass() {
         // /home/./user/../../../etc traverses to /etc via multiple ..
-        let wc = WorkspaceConfinement::new("/home/./user/../../../etc");
-        let result = wc.validate();
+        let result = WorkspaceConfinement::new("/home/./user/../../../etc");
         assert!(
             result.is_err(),
             "/home/./user/../../../etc must be rejected: got {result:?}"
@@ -730,8 +745,7 @@ mod tests {
         // Path::components(). But the ParentDir test covers the main bypass.
         // This test verifies the /home/./user/../../../etc case catches
         // ParentDir even when CurDir is present.
-        let wc = WorkspaceConfinement::new("/home/./user/../../../etc");
-        let result = wc.validate();
+        let result = WorkspaceConfinement::new("/home/./user/../../../etc");
         // Should be rejected due to ParentDir (CurDir is stripped by
         // Path::components for absolute paths, but ParentDir remains)
         assert!(
@@ -743,7 +757,24 @@ mod tests {
     #[test]
     fn test_workspace_root_clean_path_still_works() {
         // Verify clean absolute paths without . or .. still pass
-        let wc = WorkspaceConfinement::new("/home/agent/workspace");
-        assert!(wc.validate().is_ok());
+        let result = WorkspaceConfinement::new("/home/agent/workspace");
+        assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Fail-closed construction tests
+    // =========================================================================
+
+    #[test]
+    fn test_new_returns_result_not_raw_struct() {
+        // Verify that WorkspaceConfinement::new() returns a Result,
+        // making it impossible to have an unvalidated confinement.
+        let valid: Result<WorkspaceConfinement, WorkspaceConfinementError> =
+            WorkspaceConfinement::new("/workspace");
+        assert!(valid.is_ok());
+
+        let invalid: Result<WorkspaceConfinement, WorkspaceConfinementError> =
+            WorkspaceConfinement::new("");
+        assert!(invalid.is_err());
     }
 }

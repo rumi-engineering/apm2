@@ -4,16 +4,20 @@
 //! no-ambient-authority containment of agent processes. It is the primary
 //! delivery for REQ-0028 (capsule containment with no ambient authority).
 //!
-//! # Scope of This Module
+//! # Scope of This Module (Multi-Ticket Delivery)
 //!
 //! This module delivers **type definitions, validation logic, and unit tests**
-//! for the capsule profile. Runtime wiring into the daemon episode spawn path
-//! is deferred to downstream tickets:
+//! for the capsule profile. It does NOT deliver runtime enforcement in daemon
+//! actuation paths -- that is the scope of downstream tickets in the DAG plan.
+//! The `AdmissionGate::check()` method is provided as a library function for
+//! use by those downstream tickets.
 //!
-//! - **TCK-00375**: Context firewall — wires `AdmissionGate::check` into the
+//! Runtime wiring into the daemon episode spawn path is deferred to:
+//!
+//! - **TCK-00375**: Context firewall -- wires `AdmissionGate::check` into the
 //!   daemon actuation path and implements symlink-safe runtime path resolution
 //!   with filesystem-level TOCTOU checks.
-//! - **TCK-00376**: No-bypass path ratchet — ensures the admission gate cannot
+//! - **TCK-00376**: No-bypass path ratchet -- ensures the admission gate cannot
 //!   be circumvented by alternative spawn paths.
 //!
 //! # Security Model

@@ -7,10 +7,12 @@ evidence_artifact:
   description: |
     Evidence that capsule profile linux-ns-v1 policy types, validation logic,
     and admission gate correctly enforce no-ambient-authority containment rules
-    per REQ-0028. This evidence covers module-level policy logic, type
-    definitions, and unit test coverage. Runtime wiring into daemon actuation
-    paths is deferred to TCK-00375 (context firewall) and TCK-00376
-    (no-bypass path ratchet).
+    per REQ-0028. This ticket delivers module-level capsule profile policy
+    types and validation. It does NOT deliver runtime enforcement in daemon
+    actuation paths -- that is the scope of TCK-00375 (context firewall
+    TOCTOU enforcement) and TCK-00376 (no-bypass path ratchet). The
+    AdmissionGate::check() method is provided as a library function for use
+    by downstream tickets.
 
     Tests verify:
     - Tier3+ actuation is rejected without an admitted capsule profile
@@ -36,7 +38,7 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Profile and admission gate tests (44 tests):
+        Profile and admission gate tests (51 tests):
         - test_build_linux_ns_v1_defaults: validates default profile meets all requirements
         - test_build_with_egress_routes: explicit route grants work correctly
         - test_build_missing_profile_id: missing field rejected
@@ -81,4 +83,11 @@ evidence_artifact:
         - test_egress_route_empty_host: empty host rejected
         - test_egress_route_port_zero: zero port rejected
         - test_egress_route_invalid_protocol: invalid protocol rejected
+        RFC-0020 §4.3 mandatory controls (new):
+        - test_build_rejects_readonly_rootfs_false: readonly_rootfs=false rejected for linux-ns-v1
+        - test_build_rejects_tmpfs_tmp_false: tmpfs_tmp=false rejected for linux-ns-v1
+        - test_build_rejects_scrub_environment_false: scrub_environment=false rejected for linux-ns-v1
+        - test_admission_tier3_rejects_readonly_rootfs_false_profile: Tier3 rejects tampered readonly_rootfs
+        - test_admission_tier3_rejects_scrub_environment_false_profile: Tier3 rejects tampered scrub_environment
+        - test_non_linux_ns_v1_allows_optional_hardening: non-linux-ns-v1 profiles not enforced
       ref: "cargo test -p apm2-core -- capsule::profile"

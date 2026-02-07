@@ -156,6 +156,19 @@ pub enum CapsuleProfileError {
         /// The rejected profile ID.
         profile_id: String,
     },
+
+    /// Read-only rootfs is mandatory for linux-ns-v1 (RFC-0020 Section 4.3).
+    #[error("readonly_rootfs must be true for linux-ns-v1 (RFC-0020 §4.3)")]
+    ReadonlyRootfsRequired,
+
+    /// tmpfs /tmp is mandatory for linux-ns-v1 (RFC-0020 Section 4.3).
+    #[error("tmpfs_tmp must be true for linux-ns-v1 (RFC-0020 §4.3)")]
+    TmpfsTmpRequired,
+
+    /// Environment scrubbing is mandatory for linux-ns-v1 (RFC-0020 Section
+    /// 4.3).
+    #[error("scrub_environment must be true for linux-ns-v1 (RFC-0020 §4.3)")]
+    ScrubEnvironmentRequired,
 }
 
 /// Errors from capsule admission gate checks.
@@ -671,6 +684,19 @@ impl CapsuleProfile {
                 return Err(CapsuleProfileError::InvalidCgroupIoWeight {
                     value: self.cgroup_limits.io_weight,
                 });
+            }
+        }
+
+        // Mandatory hardening controls (linux-ns-v1, RFC-0020 §4.3)
+        if self.profile_id == "linux-ns-v1" {
+            if !self.readonly_rootfs {
+                return Err(CapsuleProfileError::ReadonlyRootfsRequired);
+            }
+            if !self.tmpfs_tmp {
+                return Err(CapsuleProfileError::TmpfsTmpRequired);
+            }
+            if !self.scrub_environment {
+                return Err(CapsuleProfileError::ScrubEnvironmentRequired);
             }
         }
 
@@ -1660,6 +1686,122 @@ mod tests {
         assert!(
             result.is_err(),
             "all-zero cgroup limits must be rejected: got {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER: Mandatory RFC-0020 §4.3 controls for linux-ns-v1
+    // =========================================================================
+
+    #[test]
+    fn test_build_rejects_readonly_rootfs_false() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .readonly_rootfs(false)
+            .build();
+        assert!(
+            matches!(result, Err(CapsuleProfileError::ReadonlyRootfsRequired)),
+            "readonly_rootfs=false must be rejected for linux-ns-v1: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_tmpfs_tmp_false() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .tmpfs_tmp(false)
+            .build();
+        assert!(
+            matches!(result, Err(CapsuleProfileError::TmpfsTmpRequired)),
+            "tmpfs_tmp=false must be rejected for linux-ns-v1: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_scrub_environment_false() {
+        let result = CapsuleProfileBuilder::new("linux-ns-v1")
+            .scrub_environment(false)
+            .build();
+        assert!(
+            matches!(result, Err(CapsuleProfileError::ScrubEnvironmentRequired)),
+            "scrub_environment=false must be rejected for linux-ns-v1: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_admission_tier3_rejects_readonly_rootfs_false_profile() {
+        // Tamper a valid profile to disable readonly_rootfs
+        let mut profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
+        profile.readonly_rootfs = false;
+        profile.profile_hash = CapsuleProfile::compute_hash(&HashInput {
+            profile_id: &profile.profile_id,
+            namespaces: &profile.namespaces,
+            seccomp_level: &profile.seccomp_level,
+            cgroup_limits: &profile.cgroup_limits,
+            egress_policy: &profile.egress_policy,
+            allowed_executables: &profile.allowed_executables,
+            scrub_environment: profile.scrub_environment,
+            readonly_rootfs: profile.readonly_rootfs,
+            tmpfs_tmp: profile.tmpfs_tmp,
+        });
+        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&profile));
+        assert!(
+            matches!(result, Err(AdmissionError::InvalidProfile(_))),
+            "Tier3 admission with readonly_rootfs=false must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_admission_tier3_rejects_scrub_environment_false_profile() {
+        // Tamper a valid profile to disable scrub_environment
+        let mut profile = CapsuleProfileBuilder::new("linux-ns-v1").build().unwrap();
+        profile.scrub_environment = false;
+        profile.profile_hash = CapsuleProfile::compute_hash(&HashInput {
+            profile_id: &profile.profile_id,
+            namespaces: &profile.namespaces,
+            seccomp_level: &profile.seccomp_level,
+            cgroup_limits: &profile.cgroup_limits,
+            egress_policy: &profile.egress_policy,
+            allowed_executables: &profile.allowed_executables,
+            scrub_environment: profile.scrub_environment,
+            readonly_rootfs: profile.readonly_rootfs,
+            tmpfs_tmp: profile.tmpfs_tmp,
+        });
+        let result = AdmissionGate::check(&RiskTier::Tier3, Some(&profile));
+        assert!(
+            matches!(result, Err(AdmissionError::InvalidProfile(_))),
+            "Tier3 admission with scrub_environment=false must be rejected: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_non_linux_ns_v1_allows_optional_hardening() {
+        // Non-linux-ns-v1 profiles should not enforce these controls
+        let profile_hash = CapsuleProfile::compute_hash(&HashInput {
+            profile_id: "custom-profile",
+            namespaces: &NamespaceConfig::isolated(),
+            seccomp_level: &SeccompProfileLevel::Restricted,
+            cgroup_limits: &CgroupLimits::default_restricted(),
+            egress_policy: &EgressPolicy::deny_all(),
+            allowed_executables: &[],
+            scrub_environment: false,
+            readonly_rootfs: false,
+            tmpfs_tmp: false,
+        });
+        let profile = CapsuleProfile {
+            profile_id: "custom-profile".to_string(),
+            profile_hash,
+            namespaces: NamespaceConfig::isolated(),
+            seccomp_level: SeccompProfileLevel::Restricted,
+            cgroup_limits: CgroupLimits::default_restricted(),
+            egress_policy: EgressPolicy::deny_all(),
+            allowed_executables: Vec::new(),
+            scrub_environment: false,
+            readonly_rootfs: false,
+            tmpfs_tmp: false,
+        };
+        // validate() should pass for non-linux-ns-v1 profiles
+        assert!(
+            profile.validate().is_ok(),
+            "non-linux-ns-v1 profiles should not require hardening controls"
         );
     }
 }
