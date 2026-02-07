@@ -629,31 +629,44 @@ struct WorkInfo {
 
 /// Extracts work-related information from an event if it matches the `work_id`.
 fn extract_work_info(event: &EventRecord, work_id: &str) -> Option<WorkInfo> {
-    // Try to parse payload as JSON and check for work_id field
-    let payload: serde_json::Value = match serde_json::from_slice(&event.payload) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
+    // TCK-00398 Phase 1 compatibility:
+    // - Prefer metadata-derived work_id (`session_id`) when present.
+    // - Fall back to payload work_id for legacy rows where the daemon stores
+    //   episode IDs in `work_id`.
+    let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok();
 
-    // Check if this event is for the requested work_id
-    let event_work_id = payload.get("work_id").and_then(|v| v.as_str())?;
-    if event_work_id != work_id {
+    let metadata_work_id_match = event.session_id == work_id;
+    let payload_work_id_match = payload
+        .as_ref()
+        .and_then(|v| v.get("work_id"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| id == work_id);
+
+    if !metadata_work_id_match && !payload_work_id_match {
         return None;
     }
 
     Some(WorkInfo {
         actor_id: payload
-            .get("actor_id")
+            .as_ref()
+            .and_then(|v| v.get("actor_id"))
             .and_then(|v| v.as_str())
-            .map(String::from),
+            .map(String::from)
+            .or_else(|| (!event.actor_id.is_empty()).then(|| event.actor_id.clone())),
         role: payload
-            .get("role")
+            .as_ref()
+            .and_then(|v| v.get("role"))
             .and_then(|v| v.as_str())
             .map(String::from),
         episode_id: payload
-            .get("episode_id")
+            .as_ref()
+            .and_then(|v| v.get("episode_id"))
             .and_then(|v| v.as_str())
-            .map(String::from),
+            .map(String::from)
+            .or_else(|| {
+                (event.event_type == "episode_spawned" && payload_work_id_match)
+                    .then(|| event.session_id.clone())
+            }),
     })
 }
 
@@ -1806,6 +1819,40 @@ mod tests {
         let info = extract_work_info(&event, "work-123").expect("should extract");
         assert_eq!(info.actor_id.as_deref(), Some("actor-1"));
         assert_eq!(info.role.as_deref(), Some("implementer"));
+    }
+
+    #[test]
+    fn test_extract_work_info_metadata_first_for_legacy_rows() {
+        let payload = serde_json::json!({
+            "role": "implementer"
+        });
+        let event = EventRecord::new(
+            "work_claimed",
+            "work-123", // legacy compat maps work_id -> session_id
+            "actor-from-row",
+            serde_json::to_vec(&payload).unwrap(),
+        );
+
+        let info = extract_work_info(&event, "work-123").expect("should match via metadata");
+        assert_eq!(info.actor_id.as_deref(), Some("actor-from-row"));
+        assert_eq!(info.role.as_deref(), Some("implementer"));
+    }
+
+    #[test]
+    fn test_extract_work_info_payload_fallback_for_episode_rows() {
+        let payload = serde_json::json!({
+            "work_id": "work-123"
+        });
+        let event = EventRecord::new(
+            "episode_spawned",
+            "episode-001", // daemon stores episode_id in legacy work_id column
+            "daemon",
+            serde_json::to_vec(&payload).unwrap(),
+        );
+
+        let info =
+            extract_work_info(&event, "work-123").expect("should match via payload fallback");
+        assert_eq!(info.episode_id.as_deref(), Some("episode-001"));
     }
 
     #[test]

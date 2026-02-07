@@ -31,7 +31,7 @@
 
 use std::fmt;
 
-use super::canonical_digest_id_kit::CanonicalDigestIdKit;
+use super::canonical_digest_id_kit::{CanonicalDigestIdKit, impl_digest_id_fmt};
 use super::{BINARY_LEN, HASH_LEN, KeyIdError};
 
 /// Prefix for `PublicKeyIdV1` text form (RFC-0020 canonical grammar).
@@ -193,27 +193,7 @@ impl PublicKeyIdV1 {
     }
 }
 
-impl fmt::Debug for PublicKeyIdV1 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PublicKeyIdV1")
-            .field("text", &self.to_text())
-            .finish()
-    }
-}
-
-impl fmt::Display for PublicKeyIdV1 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_text())
-    }
-}
-
-impl std::str::FromStr for PublicKeyIdV1 {
-    type Err = KeyIdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse_text(s)
-    }
-}
+impl_digest_id_fmt!(PublicKeyIdV1, "PublicKeyIdV1");
 
 #[cfg(test)]
 mod tests {
