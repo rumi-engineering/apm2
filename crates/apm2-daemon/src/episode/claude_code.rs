@@ -45,7 +45,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
-    HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
+    HarnessEventStream, HarnessHandle, MAX_SEND_INPUT_BYTES, OutputKind, TerminationClassification,
     create_real_handle_inner, process_pty_control_command, pty_control_channel_capacity,
     read_proc_start_time, send_input_with_handle, terminate_with_handle,
 };
@@ -291,75 +291,83 @@ impl ClaudeCodeAdapter {
             let mut parser = ClaudeCodeParser::with_rate_limit(tool_rate_limit);
             let mut exit_status = None;
             let mut control_open = true;
+            let mut output_live = true;
 
             loop {
                 tokio::select! {
                     maybe_cmd = control_rx.recv(), if control_open => {
-                        match maybe_cmd {
-                            Some(command) => {
-                                if let Some(status) = process_pty_control_command(
-                                    command,
-                                    &mut runner,
-                                    pid,
-                                    start_time_ticks,
-                                ).await {
-                                    exit_status = Some(status);
-                                    break;
-                                }
+                        if let Some(command) = maybe_cmd {
+                            if let Some(status) = process_pty_control_command(
+                                command,
+                                &mut runner,
+                                pid,
+                                start_time_ticks,
+                            ).await {
+                                exit_status = Some(status);
+                                break;
                             }
-                            None => {
-                                control_open = false;
+                        } else {
+                            control_open = false;
+                            // If output is also dead, nothing left to do
+                            if !output_live {
+                                break;
                             }
                         }
                     }
                     maybe_output = runner.recv() => {
                         if let Some(output) = maybe_output {
-                            // Parse the output chunk for tool calls
-                            let parse_result = parser.parse(&output.chunk);
+                            if output_live {
+                                // Parse the output chunk for tool calls
+                                let parse_result = parser.parse(&output.chunk);
 
-                            // Emit sanitized output event
-                            let output_event = HarnessEvent::output(
-                                parse_result.sanitized_output.clone(),
-                                OutputKind::Combined,
-                                seq,
-                                output.ts_mono,
-                            );
-                            seq += 1;
+                                // Emit sanitized output event
+                                let output_event = HarnessEvent::output(
+                                    parse_result.sanitized_output.clone(),
+                                    OutputKind::Combined,
+                                    seq,
+                                    output.ts_mono,
+                                );
+                                seq += 1;
 
-                            // Update shared state with output count if provided
-                            if let Some(ref state) = shared_state {
-                                let mut guard = state.lock().await;
-                                guard.output_event_count = seq;
-                            }
-
-                            if tx.send(output_event).await.is_err() {
-                                // Receiver dropped, stop reading
-                                break;
-                            }
-
-                            // Emit tool request events
-                            for tool_call in parse_result.tool_calls {
-                                let tool_event = ClaudeCodeParser::to_harness_event(&tool_call);
-
-                                // Update tool request count
+                                // Update shared state with output count if provided
                                 if let Some(ref state) = shared_state {
                                     let mut guard = state.lock().await;
-                                    guard.tool_request_count += 1;
+                                    guard.output_event_count = seq;
                                 }
 
-                                if tx.send(tool_event).await.is_err() {
-                                    break;
+                                if tx.send(output_event).await.is_err() {
+                                    // Receiver dropped — stop forwarding output but
+                                    // keep servicing control commands for liveness.
+                                    output_live = false;
+                                    continue;
+                                }
+
+                                // Emit tool request events
+                                for tool_call in parse_result.tool_calls {
+                                    let tool_event = ClaudeCodeParser::to_harness_event(&tool_call);
+
+                                    // Update tool request count
+                                    if let Some(ref state) = shared_state {
+                                        let mut guard = state.lock().await;
+                                        guard.tool_request_count += 1;
+                                    }
+
+                                    if tx.send(tool_event).await.is_err() {
+                                        output_live = false;
+                                        break;
+                                    }
+                                }
+
+                                // Log defects (but don't emit as events to avoid noise)
+                                for defect in parse_result.defects {
+                                    tracing::warn!(
+                                        description = %defect.description,
+                                        offset = defect.offset,
+                                        "Parser defect detected"
+                                    );
                                 }
                             }
-
-                            // Log defects (but don't emit as events to avoid noise)
-                            for defect in parse_result.defects {
-                                tracing::warn!(
-                                    description = %defect.description,
-                                    offset = defect.offset,
-                                    "Parser defect detected"
-                                );
-                            }
+                            // else: drain output silently to detect process termination
                         } else {
                             exit_status = Some(runner.wait().unwrap_or(super::pty::ExitStatus::Running));
                             break;
@@ -424,6 +432,15 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         input: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<()>> + Send + '_>> {
         let handle_id = handle.id();
+        // Validate size before cloning to avoid unnecessary allocation
+        let input_len = input.len();
+        if input_len > MAX_SEND_INPUT_BYTES {
+            return Box::pin(async move {
+                Err(AdapterError::input_failed(format!(
+                    "input payload too large: {input_len} bytes exceeds maximum {MAX_SEND_INPUT_BYTES} bytes",
+                )))
+            });
+        }
         let runner_handle = handle.real_runner_handle();
         let input = input.to_vec();
         Box::pin(async move { send_input_with_handle(handle_id, runner_handle, input).await })

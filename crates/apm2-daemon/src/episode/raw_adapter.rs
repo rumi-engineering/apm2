@@ -72,7 +72,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
-    HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
+    HarnessEventStream, HarnessHandle, MAX_SEND_INPUT_BYTES, OutputKind, TerminationClassification,
     create_real_handle_inner, process_pty_control_command, pty_control_channel_capacity,
     read_proc_start_time, send_input_with_handle, terminate_with_handle,
 };
@@ -330,47 +330,53 @@ impl RawAdapter {
             let mut seq = 0u64;
             let mut exit_status = None;
             let mut control_open = true;
+            let mut output_live = true;
 
             loop {
                 tokio::select! {
                     maybe_cmd = control_rx.recv(), if control_open => {
-                        match maybe_cmd {
-                            Some(command) => {
-                                if let Some(status) = process_pty_control_command(
-                                    command,
-                                    &mut runner,
-                                    pid,
-                                    start_time_ticks,
-                                ).await {
-                                    exit_status = Some(status);
-                                    break;
-                                }
+                        if let Some(command) = maybe_cmd {
+                            if let Some(status) = process_pty_control_command(
+                                command,
+                                &mut runner,
+                                pid,
+                                start_time_ticks,
+                            ).await {
+                                exit_status = Some(status);
+                                break;
                             }
-                            None => {
-                                control_open = false;
+                        } else {
+                            control_open = false;
+                            // If output is also dead, nothing left to do
+                            if !output_live {
+                                break;
                             }
                         }
                     }
                     maybe_output = runner.recv() => {
                         if let Some(output) = maybe_output {
-                            let event = HarnessEvent::output(
-                                output.chunk.to_vec(),
-                                OutputKind::Combined,
-                                seq,
-                                output.ts_mono,
-                            );
-                            seq += 1;
+                            if output_live {
+                                let event = HarnessEvent::output(
+                                    output.chunk.to_vec(),
+                                    OutputKind::Combined,
+                                    seq,
+                                    output.ts_mono,
+                                );
+                                seq += 1;
 
-                            // Update shared state with output count if provided
-                            if let Some(ref state) = shared_state {
-                                let mut guard = state.lock().await;
-                                guard.output_event_count = seq;
-                            }
+                                // Update shared state with output count if provided
+                                if let Some(ref state) = shared_state {
+                                    let mut guard = state.lock().await;
+                                    guard.output_event_count = seq;
+                                }
 
-                            if tx.send(event).await.is_err() {
-                                // Receiver dropped, stop reading
-                                break;
+                                if tx.send(event).await.is_err() {
+                                    // Receiver dropped — stop forwarding output but
+                                    // keep servicing control commands for liveness.
+                                    output_live = false;
+                                }
                             }
+                            // else: drain output silently to detect process termination
                         } else {
                             exit_status = Some(runner.wait().unwrap_or(super::pty::ExitStatus::Running));
                             break;
@@ -438,6 +444,15 @@ impl HarnessAdapter for RawAdapter {
         input: &[u8],
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<()>> + Send + '_>> {
         let handle_id = handle.id();
+        // Validate size before cloning to avoid unnecessary allocation
+        let input_len = input.len();
+        if input_len > MAX_SEND_INPUT_BYTES {
+            return Box::pin(async move {
+                Err(AdapterError::input_failed(format!(
+                    "input payload too large: {input_len} bytes exceeds maximum {MAX_SEND_INPUT_BYTES} bytes",
+                )))
+            });
+        }
         let runner_handle = handle.real_runner_handle();
         let input = input.to_vec();
         Box::pin(async move { send_input_with_handle(handle_id, runner_handle, input).await })
@@ -1035,70 +1050,29 @@ mod tests {
         ));
     }
 
+    /// Verify that terminate succeeds even when start-time binding is missing.
+    ///
+    /// Previously this was a hard error, but per security review, it was
+    /// downgraded to a warning: it is better to terminate a process without
+    /// identity binding than to leave it stranded.
     #[tokio::test]
-    async fn test_raw_adapter_terminate_failure_keeps_handle_operable() {
+    async fn test_raw_adapter_terminate_without_start_time_succeeds() {
         let adapter = RawAdapter::new();
-        let config = HarnessConfig::new("cat", "episode-terminate-retry");
-        let (handle, mut events) = adapter.spawn(config).await.unwrap();
+        let config = HarnessConfig::new("cat", "episode-terminate-no-start-time");
+        let (handle, _events) = adapter.spawn(config).await.unwrap();
 
         let runner_handle = handle.real_runner_handle();
-        let (pid, actual_start_time) = {
-            let guard = runner_handle.lock().await;
-            (
-                guard.pid,
-                guard
-                    .start_time_ticks
-                    .expect("expected start-time binding for retry test"),
-            )
-        };
-
         {
             let mut guard = runner_handle.lock().await;
             guard.start_time_ticks = None;
         }
 
-        let first_terminate = adapter.terminate(&handle).await;
+        // Terminate should succeed (with a warning log) even without start-time binding
+        let terminate_result = adapter.terminate(&handle).await;
         assert!(
-            first_terminate.is_err(),
-            "first terminate should fail when start-time binding is missing"
+            terminate_result.is_ok(),
+            "terminate should succeed without start-time binding, got: {terminate_result:?}"
         );
-
-        adapter
-            .send_input(&handle, b"still alive after failed terminate\n")
-            .await
-            .unwrap();
-        let observed_output = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while let Some(event) = events.recv().await {
-                if let HarnessEvent::Output { chunk, .. } = event {
-                    if String::from_utf8_lossy(&chunk)
-                        .contains("still alive after failed terminate")
-                    {
-                        return true;
-                    }
-                }
-            }
-            false
-        })
-        .await
-        .expect("timed out waiting for output after failed terminate");
-        assert!(
-            observed_output,
-            "handle should remain usable after failed terminate"
-        );
-
-        {
-            let mut guard = runner_handle.lock().await;
-            guard.start_time_ticks = Some(actual_start_time);
-        }
-
-        adapter.terminate(&handle).await.unwrap();
-
-        if let Some(expected_start) = super::super::adapter::read_proc_start_time(pid) {
-            assert_ne!(
-                expected_start, actual_start_time,
-                "original process identity must not remain alive after successful retry terminate"
-            );
-        }
     }
 
     #[test]

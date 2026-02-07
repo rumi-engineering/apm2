@@ -652,6 +652,8 @@ impl HarnessConfig {
 const PTY_CONTROL_CHANNEL_CAPACITY: usize = 8;
 const TERMINATE_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SEND_INPUT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const TERMINATE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Control messages for the runner-owning task.
 pub(crate) enum PtyControlCommand {
@@ -821,11 +823,19 @@ pub(crate) async fn send_input_with_handle(
             ))
         })?;
 
-    response_rx.await.map_err(|_| {
-        AdapterError::invalid_handle(format!(
-            "handle {handle_id} PTY task dropped input response"
-        ))
-    })?
+    tokio::time::timeout(SEND_INPUT_RESPONSE_TIMEOUT, response_rx)
+        .await
+        .map_err(|_| {
+            AdapterError::input_failed(format!(
+                "handle {handle_id} send_input response timed out after {}s",
+                SEND_INPUT_RESPONSE_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|_| {
+            AdapterError::invalid_handle(format!(
+                "handle {handle_id} PTY task dropped input response"
+            ))
+        })?
 }
 
 /// Terminates a spawned harness process via the real handle.
@@ -842,10 +852,11 @@ pub(crate) async fn terminate_with_handle(
             )));
         }
         if guard.start_time_ticks.is_none() {
-            return Err(AdapterError::terminate_failed(format!(
-                "refusing terminate for handle {} pid {} without start-time binding",
-                handle_id, guard.pid
-            )));
+            tracing::warn!(
+                handle_id,
+                pid = guard.pid,
+                "terminating handle without start-time binding (PID reuse guard unavailable)"
+            );
         }
         let control_tx = guard.control_channel().ok_or_else(|| {
             AdapterError::invalid_handle(format!(
@@ -869,11 +880,19 @@ pub(crate) async fn terminate_with_handle(
             ))
         })?;
 
-    let terminate_result = response_rx.await.map_err(|_| {
-        AdapterError::invalid_handle(format!(
-            "handle {handle_id} PTY task dropped termination response"
-        ))
-    })?;
+    let terminate_result = tokio::time::timeout(TERMINATE_RESPONSE_TIMEOUT, response_rx)
+        .await
+        .map_err(|_| {
+            AdapterError::terminate_failed(format!(
+                "handle {handle_id} terminate response timed out after {}s",
+                TERMINATE_RESPONSE_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|_| {
+            AdapterError::invalid_handle(format!(
+                "handle {handle_id} PTY task dropped termination response"
+            ))
+        })?;
 
     // IMPORTANT: Only mark the handle as terminated AFTER confirming a
     // successful exit status.  If `terminate_runner()` returned `Err` (e.g.
