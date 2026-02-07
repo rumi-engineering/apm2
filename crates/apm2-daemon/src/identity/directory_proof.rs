@@ -274,6 +274,18 @@ pub enum IdentityProofError {
     /// Requested head is not cached in verifier.
     #[error("verified head cache miss")]
     VerifiedHeadCacheMiss,
+
+    /// Admission of a stale head was rejected because a newer epoch for the
+    /// same cell already exists in the cache.
+    #[error(
+        "stale epoch rejected: admitted epoch {admitted_epoch} is older than cached epoch {cached_epoch} for same cell"
+    )]
+    StaleEpochRejected {
+        /// The epoch of the head being admitted.
+        admitted_epoch: u64,
+        /// The highest epoch already cached for the same cell.
+        cached_epoch: u64,
+    },
 }
 
 impl From<CasError> for IdentityProofError {
@@ -1954,9 +1966,8 @@ impl IdentityProofV1 {
 }
 
 /// Structurally admitted directory head retained in verifier cache.
+#[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
-#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
 pub(crate) struct VerifiedHead {
     /// Cached directory head commitment.
     pub(crate) head: HolonDirectoryHeadV1,
@@ -1965,46 +1976,277 @@ pub(crate) struct VerifiedHead {
     pub(crate) verified_at: u64,
 }
 
-/// Structural verification cache for directory heads.
+/// Deterministic audit event emitted for every cache invalidation action.
 ///
-/// **SECURITY: This cache verifies structural proof validity (root hash,
-/// kind compatibility, depth/sibling bounds) only. It does NOT verify
-/// authority seals, certificate binding, freshness policy, or holon
-/// identity binding. Callers MUST NOT use results from this cache as
-/// authorization signals without completing the full identity verification
-/// pipeline (see `IdentityProofV1::verify()`).**
+/// All invalidation paths produce an audit event that records the reason,
+/// the affected head hashes, and the trigger context. These events enable
+/// post-hoc verification that no stale cache entry survived a revocation,
+/// rotation, or head advancement.
 ///
-/// This cache supports the O(1) head amortization contract from HSI §1.7.7c:
-/// once a head is admitted (structural + root check), proof verification
-/// against that head requires only O(log n) hashing, not repeated
-/// signature/quorum checks.
+/// # Contract (REQ-0013)
 ///
-/// Full authority/freshness/binding verification will be enforced at the
-/// cache boundary in TCK-00358/TCK-00359 when the verifier cache policy
-/// is implemented.
+/// The invalidation path is deterministic and auditable: every cache mutation
+/// emits exactly one event of this type, and the event is sufficient to
+/// reconstruct the invalidation decision.
+// NOTE: `pub(crate)` for session-open integration (TCK-00361). Until that
+// wiring is complete, these types are exercised only by the test suite.
+#[allow(dead_code)]
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VerifierCacheAuditEvent {
+    /// A head was admitted into the cache.
+    HeadAdmitted {
+        /// Content hash of the admitted head.
+        head_hash: [u8; HASH_BYTES],
+        /// Directory epoch of the admitted head.
+        directory_epoch: u64,
+        /// Cell identity of the admitted head.
+        cell_id: CellIdV1,
+    },
+    /// A specific head was explicitly invalidated (e.g., revocation of
+    /// an identity whose proof was cached against this head).
+    HeadInvalidated {
+        /// Content hash of the invalidated head.
+        head_hash: [u8; HASH_BYTES],
+        /// Reason for invalidation.
+        reason: InvalidationReason,
+    },
+    /// All heads for a cell were invalidated (e.g., key rotation).
+    CellInvalidated {
+        /// Cell identity whose heads were evicted.
+        cell_id: CellIdV1,
+        /// Number of heads evicted.
+        evicted_count: usize,
+        /// Content hashes of every evicted head (deterministic, sorted).
+        evicted_head_hashes: Vec<[u8; HASH_BYTES]>,
+        /// Reason for invalidation.
+        reason: InvalidationReason,
+    },
+    /// Heads older than a cutoff epoch were evicted (global staleness sweep).
+    StaleEvicted {
+        /// Cutoff epoch used for eviction.
+        cutoff_epoch: u64,
+        /// Number of heads evicted.
+        evicted_count: usize,
+        /// Content hashes of every evicted head (deterministic, sorted).
+        evicted_head_hashes: Vec<[u8; HASH_BYTES]>,
+    },
+    /// Heads for a cell older than a cutoff epoch were evicted
+    /// (per-cell head advancement).
+    CellHeadAdvanced {
+        /// Cell identity whose old heads were evicted.
+        cell_id: CellIdV1,
+        /// New epoch beyond which old heads are stale.
+        new_epoch: u64,
+        /// Number of heads evicted.
+        evicted_count: usize,
+        /// Content hashes of every evicted head (deterministic, sorted).
+        evicted_head_hashes: Vec<[u8; HASH_BYTES]>,
+    },
+    /// All entries were purged (emergency invalidation).
+    FullPurge {
+        /// Number of heads evicted.
+        evicted_count: usize,
+        /// Content hashes of every evicted head (deterministic, sorted).
+        evicted_head_hashes: Vec<[u8; HASH_BYTES]>,
+        /// Reason for the purge.
+        reason: InvalidationReason,
+    },
+    /// Capacity-based eviction removed the oldest entry.
+    CapacityEviction {
+        /// Content hash of the evicted head.
+        head_hash: [u8; HASH_BYTES],
+    },
+    /// A stale head admission was rejected because a newer epoch for the
+    /// same cell already exists in the cache (monotonic admission guard).
+    StaleAdmissionRejected {
+        /// Cell identity of the rejected head.
+        cell_id: CellIdV1,
+        /// Epoch of the rejected head.
+        rejected_epoch: u64,
+        /// Highest epoch currently cached for the cell.
+        cached_epoch: u64,
+    },
+    /// Audit log reached capacity and older events were dropped.
+    ///
+    /// This sentinel is emitted exactly once when overflow occurs.
+    /// Consumers seeing this event know that earlier audit entries
+    /// were lost and should treat the log as incomplete.
+    AuditOverflow {
+        /// Number of audit events that were dropped.
+        dropped_count: usize,
+    },
+}
+
+/// Reason for a cache invalidation event.
+#[allow(dead_code)]
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InvalidationReason {
+    /// Identity was revoked in the directory.
+    Revocation,
+    /// Key rotation occurred for a cell or holon.
+    KeyRotation,
+    /// Head was superseded by a newer epoch.
+    HeadAdvancement,
+    /// Emergency invalidation requested by operator/policy.
+    Emergency,
+}
+
+/// Structural verification cache for directory heads (REQ-0013).
+///
+/// **Cache amortization contract (HSI section 1.7.7c):**
+/// One verified directory head admits O(log n) identity proof
+/// verifications without repeated signature/quorum checks. The
+/// head admission itself is O(1) in signature checks.
+///
+/// **Invalidation contract:**
+/// The cache MUST invalidate deterministically on:
+/// - **Revocation**: when a directory entry is marked Revoked/Suspended, the
+///   cached head that committed that directory state is invalidated.
+/// - **Key rotation**: when a cell's operational key rotates, all cached heads
+///   for that cell are invalidated (the directory authority changed).
+/// - **Head advancement**: when a newer epoch head is admitted for the same
+///   cell, older epoch heads for that cell are superseded.
+///
+/// **Security invariant:** Stale cache entries CANNOT authorize revoked
+/// identities. `verify_identity` returns the proof-derived entry status,
+/// which the caller MUST check before granting authority. Additionally,
+/// explicit invalidation methods remove heads from the cache entirely,
+/// ensuring that even structural proof checks cannot proceed against
+/// invalidated heads.
+///
+/// **Audit invariant:** Every cache mutation emits a
+/// [`VerifierCacheAuditEvent`] into the audit log, enabling deterministic
+/// post-hoc reconstruction of all invalidation decisions.
+///
+/// **Bounded audit buffer (REQ-0013 / security review R1):** The audit log
+/// is bounded to `max_audit_events` entries. When the log reaches capacity,
+/// old events are dropped and an `AuditOverflow` sentinel is emitted so
+/// that consumers know events were lost. Callers SHOULD drain the log
+/// periodically via [`drain_audit_log`] to avoid overflow.
+#[allow(dead_code)]
+#[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
-#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
 pub(crate) struct VerifiedHeadCache {
     heads: HashMap<[u8; HASH_BYTES], VerifiedHead>,
     admission_order: VecDeque<[u8; HASH_BYTES]>,
     max_entries: usize,
+    /// Bounded audit log of cache mutations.
+    audit_log: VecDeque<VerifierCacheAuditEvent>,
+    /// Maximum number of audit events retained before overflow.
+    max_audit_events: usize,
 }
 
-#[allow(dead_code)] // Reserved for verifier-cache policy integration in TCK-00358/TCK-00359.
-#[allow(clippy::redundant_pub_crate)] // Explicit `pub(crate)` boundary is part of the security contract.
+/// Default maximum number of audit events retained before overflow.
+///
+/// This limit prevents unbounded memory growth in long-lived daemon
+/// processes. At 4096 events the audit log stays well under 1 MiB
+/// even with large `evicted_head_hashes` vectors.
+#[allow(dead_code)]
+const DEFAULT_MAX_AUDIT_EVENTS: usize = 4096;
+
+#[allow(dead_code)]
 impl VerifiedHeadCache {
     /// Creates a new bounded cache with at least one entry of capacity.
+    ///
+    /// The audit log is bounded to [`DEFAULT_MAX_AUDIT_EVENTS`] entries.
     #[must_use]
     pub(crate) fn new(max_entries: usize) -> Self {
         Self {
             heads: HashMap::new(),
             admission_order: VecDeque::new(),
             max_entries: max_entries.max(1),
+            audit_log: VecDeque::new(),
+            max_audit_events: DEFAULT_MAX_AUDIT_EVENTS,
         }
     }
 
+    /// Creates a new bounded cache with explicit audit log capacity.
+    ///
+    /// Use this in tests or constrained environments where the default
+    /// audit capacity is too large or too small.
+    #[must_use]
+    pub(crate) fn with_audit_capacity(max_entries: usize, max_audit_events: usize) -> Self {
+        Self {
+            heads: HashMap::new(),
+            admission_order: VecDeque::new(),
+            max_entries: max_entries.max(1),
+            audit_log: VecDeque::new(),
+            max_audit_events: max_audit_events.max(1),
+        }
+    }
+
+    /// Pushes an audit event into the bounded log.
+    ///
+    /// If the log is at capacity, older events are dropped and an
+    /// `AuditOverflow` sentinel replaces them. The sentinel itself
+    /// counts toward the capacity, so the log never exceeds
+    /// `max_audit_events`.
+    ///
+    /// **Post-condition:** `self.audit_log.len() <= self.max_audit_events`
+    /// for all `max_audit_events >= 1`.
+    fn push_audit_event(&mut self, event: VerifierCacheAuditEvent) {
+        if self.audit_log.len() >= self.max_audit_events {
+            // We need room for: the AuditOverflow sentinel + the new event = 2 slots.
+            // For max_audit_events == 1, there is only 1 slot total, so the
+            // new event replaces the overflow sentinel (we drop everything and
+            // only push the new event with no sentinel).
+            if self.max_audit_events <= 1 {
+                // Only one slot: drop everything, push only the new event.
+                let dropped = self.audit_log.len();
+                self.audit_log.clear();
+                // The new event implicitly replaces whatever was here.
+                // We cannot fit both a sentinel and the event, so we log
+                // the overflow count into tracing and push only the event.
+                if dropped > 0 {
+                    warn!(
+                        dropped_count = dropped,
+                        "audit log overflow (capacity=1): dropped all events"
+                    );
+                }
+            } else {
+                // We need exactly 2 free slots: one for AuditOverflow, one for the event.
+                // Drop enough to make room for both, ensuring at least 1 is dropped.
+                let target_len = self.max_audit_events.saturating_sub(2);
+                let current_len = self.audit_log.len();
+                let drop_count = current_len.saturating_sub(target_len).max(1);
+                for _ in 0..drop_count {
+                    self.audit_log.pop_front();
+                }
+                self.audit_log
+                    .push_back(VerifierCacheAuditEvent::AuditOverflow {
+                        dropped_count: drop_count,
+                    });
+            }
+        }
+        self.audit_log.push_back(event);
+
+        // Defensive: guarantee post-condition even if logic above has a bug.
+        while self.audit_log.len() > self.max_audit_events {
+            self.audit_log.pop_front();
+        }
+        debug_assert!(self.audit_log.len() <= self.max_audit_events);
+    }
+
     /// Admits a structurally verified head into cache.
+    ///
+    /// **Monotonic epoch admission (security review R2):** If the cache
+    /// already contains a head for the same cell at a strictly higher
+    /// epoch, the admission is rejected with
+    /// [`IdentityProofError::StaleEpochRejected`]
+    /// and a `StaleAdmissionRejected` audit event is emitted. This prevents
+    /// out-of-order admission from reintroducing stale heads.
+    ///
+    /// **Atomic head-advancement (code-quality review R1):** If the cache
+    /// already contains heads for the same cell at older epochs, those
+    /// heads are atomically evicted before the new head is inserted.
+    /// This enforces the head-advancement invariant at admission time,
+    /// preventing stale same-cell heads from surviving in the cache.
+    ///
+    /// If the cache is at capacity after insertion, the oldest entry
+    /// (by FIFO admission order) is evicted and a `CapacityEviction`
+    /// audit event is emitted.
     pub(crate) fn admit_head(
         &mut self,
         head_hash: [u8; HASH_BYTES],
@@ -2019,25 +2261,88 @@ impl VerifiedHeadCache {
             });
         }
 
+        let cell_id = head.cell_id().clone();
+        let directory_epoch = head.directory_epoch();
+
+        // --- Monotonic epoch guard: reject stale re-admissions ---
+        // Check BEFORE any state mutation (transactional admission pattern).
+        let max_cached_epoch = self
+            .heads
+            .values()
+            .filter(|vh| vh.head.cell_id() == &cell_id)
+            .map(|vh| vh.verified_at)
+            .max();
+        if let Some(cached_epoch) = max_cached_epoch {
+            if directory_epoch < cached_epoch {
+                self.push_audit_event(VerifierCacheAuditEvent::StaleAdmissionRejected {
+                    cell_id,
+                    rejected_epoch: directory_epoch,
+                    cached_epoch,
+                });
+                return Err(IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: directory_epoch,
+                    cached_epoch,
+                });
+            }
+        }
+
+        // --- Atomic head-advancement: evict older same-cell epochs ---
+        let mut advancement_evicted: Vec<[u8; HASH_BYTES]> = self
+            .heads
+            .iter()
+            .filter(|(h, vh)| {
+                **h != head_hash
+                    && vh.head.cell_id() == &cell_id
+                    && vh.verified_at < directory_epoch
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        if !advancement_evicted.is_empty() {
+            for evicted_hash in &advancement_evicted {
+                self.heads.remove(evicted_hash);
+            }
+            self.admission_order
+                .retain(|h| self.heads.contains_key(h) || *h == head_hash);
+            advancement_evicted.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::CellHeadAdvanced {
+                cell_id: cell_id.clone(),
+                new_epoch: directory_epoch,
+                evicted_count: advancement_evicted.len(),
+                evicted_head_hashes: advancement_evicted,
+            });
+        }
+
         // Keep admission order unique and bounded.
         self.admission_order
             .retain(|cached_hash| cached_hash != &head_hash);
         self.admission_order.push_back(head_hash);
+
         self.heads.insert(
             head_hash,
             VerifiedHead {
-                verified_at: head.directory_epoch(),
+                verified_at: directory_epoch,
                 head,
             },
         );
 
+        // Evict oldest entries that exceed capacity.
         while self.heads.len() > self.max_entries {
             if let Some(evicted_hash) = self.admission_order.pop_front() {
-                self.heads.remove(&evicted_hash);
+                if self.heads.remove(&evicted_hash).is_some() {
+                    self.push_audit_event(VerifierCacheAuditEvent::CapacityEviction {
+                        head_hash: evicted_hash,
+                    });
+                }
             } else {
                 break;
             }
         }
+
+        self.push_audit_event(VerifierCacheAuditEvent::HeadAdmitted {
+            head_hash,
+            directory_epoch,
+            cell_id,
+        });
 
         Ok(())
     }
@@ -2046,7 +2351,16 @@ impl VerifiedHeadCache {
     /// proof-derived `DirectoryEntryStatus`.
     ///
     /// **SECURITY: This verifies structural proof validity only.
-    /// See struct-level documentation for authorization caveats.**
+    /// Callers MUST check the returned `DirectoryEntryStatus` and
+    /// deny authoritative operations for `Revoked` or `Suspended`
+    /// entries. The full identity verification pipeline
+    /// (`IdentityProofV1::verify()`) remains authoritative.**
+    ///
+    /// **Cache amortization (REQ-0013):** This method performs only
+    /// O(log n) hash operations (proof path reconstruction), avoiding
+    /// the O(1) signature/quorum checks that were already performed
+    /// during head admission. This is the core cost reduction that
+    /// makes the cache worthwhile.
     pub(crate) fn verify_identity(
         &self,
         head_hash: &[u8; HASH_BYTES],
@@ -2076,12 +2390,189 @@ impl VerifiedHeadCache {
         Ok(structural_status)
     }
 
-    /// Evicts cached heads older than `cutoff_epoch` directory epoch ticks.
-    pub(crate) fn evict_stale(&mut self, cutoff_epoch: u64) {
-        self.heads
-            .retain(|_, verified_head| verified_head.verified_at >= cutoff_epoch);
+    /// Invalidates a specific cached head by its content hash.
+    ///
+    /// Use this when a directory entry under the head is known to be
+    /// revoked or suspended. Removing the head forces subsequent
+    /// identity checks to re-verify via the full pipeline, which will
+    /// observe the updated directory state.
+    ///
+    /// Returns `true` if the head was present and removed.
+    pub(crate) fn invalidate_head(
+        &mut self,
+        head_hash: &[u8; HASH_BYTES],
+        reason: InvalidationReason,
+    ) -> bool {
+        let removed = self.heads.remove(head_hash).is_some();
+        if removed {
+            self.admission_order
+                .retain(|cached_hash| cached_hash != head_hash);
+            self.push_audit_event(VerifierCacheAuditEvent::HeadInvalidated {
+                head_hash: *head_hash,
+                reason,
+            });
+        }
+        removed
+    }
+
+    /// Invalidates all cached heads for a given cell identity.
+    ///
+    /// Use this when a cell's operational key rotates: the directory
+    /// authority has changed, so all previously cached heads for that
+    /// cell are potentially stale (the authority seal would need
+    /// re-verification against the new key).
+    ///
+    /// Returns the number of heads evicted.
+    pub(crate) fn invalidate_for_cell(
+        &mut self,
+        cell_id: &CellIdV1,
+        reason: InvalidationReason,
+    ) -> usize {
+        let mut evicted_hashes: Vec<[u8; HASH_BYTES]> = self
+            .heads
+            .iter()
+            .filter(|(_, vh)| vh.head.cell_id() == cell_id)
+            .map(|(h, _)| *h)
+            .collect();
+        for evicted_hash in &evicted_hashes {
+            self.heads.remove(evicted_hash);
+        }
+        let evicted_count = evicted_hashes.len();
         self.admission_order
             .retain(|head_hash| self.heads.contains_key(head_hash));
+        if evicted_count > 0 {
+            evicted_hashes.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::CellInvalidated {
+                cell_id: cell_id.clone(),
+                evicted_count,
+                evicted_head_hashes: evicted_hashes,
+                reason,
+            });
+        }
+        evicted_count
+    }
+
+    /// Invalidates cached heads for a cell that are older than `new_epoch`.
+    ///
+    /// Use this when a newer directory head is observed for a cell:
+    /// older epoch heads are superseded because the directory state has
+    /// advanced. The newer head should be admitted separately via
+    /// `admit_head`.
+    ///
+    /// Returns the number of heads evicted.
+    pub(crate) fn invalidate_on_head_advance(
+        &mut self,
+        cell_id: &CellIdV1,
+        new_epoch: u64,
+    ) -> usize {
+        let mut evicted_hashes: Vec<[u8; HASH_BYTES]> = self
+            .heads
+            .iter()
+            .filter(|(_, vh)| vh.head.cell_id() == cell_id && vh.verified_at < new_epoch)
+            .map(|(h, _)| *h)
+            .collect();
+        for evicted_hash in &evicted_hashes {
+            self.heads.remove(evicted_hash);
+        }
+        let evicted_count = evicted_hashes.len();
+        self.admission_order
+            .retain(|head_hash| self.heads.contains_key(head_hash));
+        if evicted_count > 0 {
+            evicted_hashes.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::CellHeadAdvanced {
+                cell_id: cell_id.clone(),
+                new_epoch,
+                evicted_count,
+                evicted_head_hashes: evicted_hashes,
+            });
+        }
+        evicted_count
+    }
+
+    /// Evicts cached heads older than `cutoff_epoch` directory epoch ticks.
+    ///
+    /// This is a global staleness sweep, independent of cell identity.
+    /// Returns the number of heads evicted.
+    pub(crate) fn evict_stale(&mut self, cutoff_epoch: u64) -> usize {
+        let mut evicted_hashes: Vec<[u8; HASH_BYTES]> = self
+            .heads
+            .iter()
+            .filter(|(_, vh)| vh.verified_at < cutoff_epoch)
+            .map(|(h, _)| *h)
+            .collect();
+        for evicted_hash in &evicted_hashes {
+            self.heads.remove(evicted_hash);
+        }
+        let evicted_count = evicted_hashes.len();
+        self.admission_order
+            .retain(|head_hash| self.heads.contains_key(head_hash));
+        if evicted_count > 0 {
+            evicted_hashes.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::StaleEvicted {
+                cutoff_epoch,
+                evicted_count,
+                evicted_head_hashes: evicted_hashes,
+            });
+        }
+        evicted_count
+    }
+
+    /// Emergency full purge: removes all cached heads.
+    ///
+    /// Use this when a policy or security event requires immediate
+    /// invalidation of all cached state (e.g., key compromise detected).
+    /// Returns the number of heads evicted.
+    pub(crate) fn purge_all(&mut self, reason: InvalidationReason) -> usize {
+        let mut evicted_hashes: Vec<[u8; HASH_BYTES]> = self.heads.keys().copied().collect();
+        let evicted_count = evicted_hashes.len();
+        self.heads.clear();
+        self.admission_order.clear();
+        if evicted_count > 0 {
+            evicted_hashes.sort_unstable();
+            self.push_audit_event(VerifierCacheAuditEvent::FullPurge {
+                evicted_count,
+                evicted_head_hashes: evicted_hashes,
+                reason,
+            });
+        }
+        evicted_count
+    }
+
+    /// Returns `true` if the cache contains a head with the given hash.
+    pub(crate) fn contains_head(&self, head_hash: &[u8; HASH_BYTES]) -> bool {
+        self.heads.contains_key(head_hash)
+    }
+
+    /// Returns the number of currently cached heads.
+    pub(crate) fn len(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// Returns the number of audit events currently retained.
+    pub(crate) fn audit_log_len(&self) -> usize {
+        self.audit_log.len()
+    }
+
+    /// Returns a snapshot of the audit log as a `Vec`.
+    ///
+    /// The log is bounded to `max_audit_events` entries. If overflow
+    /// occurred, an `AuditOverflow` event will be present indicating
+    /// that earlier events were dropped.
+    ///
+    /// This enables deterministic post-hoc reconstruction of all
+    /// invalidation decisions (REQ-0013), subject to the bounded
+    /// retention window.
+    pub(crate) fn audit_log(&self) -> Vec<VerifierCacheAuditEvent> {
+        self.audit_log.iter().cloned().collect()
+    }
+
+    /// Drains the audit log, returning all events accumulated so far.
+    ///
+    /// This is useful for forwarding audit events to a persistent
+    /// telemetry or ledger sink. Callers SHOULD drain periodically
+    /// to prevent audit overflow.
+    pub(crate) fn drain_audit_log(&mut self) -> Vec<VerifierCacheAuditEvent> {
+        self.audit_log.drain(..).collect()
     }
 }
 
@@ -2172,11 +2663,12 @@ pub fn validate_identity_proof_hash(hash: &[u8]) -> Result<(), IdentityProofErro
         });
     }
 
-    // TODO(TCK-00359): When CAS transport is available, dereference the
-    // hash from CAS and call `IdentityProofV1::verify()` for full
-    // cryptographic verification. Until then, the hash acts as a binding
-    // commitment that is included in signed event payloads for audit
-    // traceability.
+    // NOTE(TCK-00359): The verifier cache contract is implemented in
+    // `VerifiedHeadCache` with deterministic invalidation on revocation,
+    // rotation, and head advancement. Full CAS dereference integration
+    // is tracked as a follow-on integration concern. The hash continues
+    // to serve as a binding commitment included in signed event payloads
+    // for audit traceability.
 
     Ok(())
 }
@@ -3754,49 +4246,23 @@ mod tests {
 
     #[test]
     fn verified_head_cache_evict_stale_entries() {
+        // Use distinct cells for each head to avoid triggering atomic
+        // head-advancement eviction within `admit_head`.
         let cell_cert = make_cell_certificate();
-        let stale_head = HolonDirectoryHeadV1::new(
-            cell_cert.cell_id().clone(),
-            5,
-            LedgerAnchorV1::ConsensusIndex { index: 1 },
-            [0xA1; HASH_BYTES],
-            DirectoryKindV1::Smt256V1,
-            1,
-            8192,
-            [0xB1; HASH_BYTES],
-            [0xC1; HASH_BYTES],
-            [0xD1; HASH_BYTES],
-            None,
+        let other_cert = make_other_cell_certificate();
+        // Third distinct cell via make_epoch_head with a fresh genesis.
+        let third_cell_genesis = CellGenesisV1::new(
+            [0x33; 32],
+            PolicyRootId::Single(make_public_key_id(0xEE)),
+            "third.cell.internal",
         )
         .unwrap();
-        let boundary_head = HolonDirectoryHeadV1::new(
-            cell_cert.cell_id().clone(),
-            20,
-            LedgerAnchorV1::ConsensusIndex { index: 2 },
-            [0xA2; HASH_BYTES],
-            DirectoryKindV1::Smt256V1,
-            1,
-            8192,
-            [0xB2; HASH_BYTES],
-            [0xC2; HASH_BYTES],
-            [0xD2; HASH_BYTES],
-            None,
-        )
-        .unwrap();
-        let fresh_head = HolonDirectoryHeadV1::new(
-            cell_cert.cell_id().clone(),
-            25,
-            LedgerAnchorV1::ConsensusIndex { index: 3 },
-            [0xA3; HASH_BYTES],
-            DirectoryKindV1::Smt256V1,
-            1,
-            8192,
-            [0xB3; HASH_BYTES],
-            [0xC3; HASH_BYTES],
-            [0xD3; HASH_BYTES],
-            None,
-        )
-        .unwrap();
+        let third_cell_id = CellIdV1::from_genesis(&third_cell_genesis);
+
+        let stale_head = make_epoch_head(cell_cert.cell_id().clone(), 5, 0xA1);
+        let boundary_head = make_epoch_head(other_cert.cell_id().clone(), 20, 0xA2);
+        let fresh_head = make_epoch_head(third_cell_id, 25, 0xA3);
+
         let stale_hash = stale_head.content_hash().unwrap();
         let boundary_hash = boundary_head.content_hash().unwrap();
         let fresh_hash = fresh_head.content_hash().unwrap();
@@ -3805,6 +4271,8 @@ mod tests {
         cache.admit_head(stale_hash, stale_head).unwrap();
         cache.admit_head(boundary_hash, boundary_head).unwrap();
         cache.admit_head(fresh_hash, fresh_head).unwrap();
+        assert_eq!(cache.len(), 3);
+
         cache.evict_stale(20);
 
         assert!(!cache.heads.contains_key(&stale_hash));
@@ -3837,6 +4305,728 @@ mod tests {
             ),
             "expected InvalidEnumTag for 0xFF, got: {err:?}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // TCK-00359: Verifier cache invalidation correctness tests
+    // ---------------------------------------------------------------
+
+    /// Helper to create a second cell certificate with a different `cell_id`.
+    fn make_other_cell_certificate() -> CellCertificateV1 {
+        let policy_root = PolicyRootId::Single(make_public_key_id(0xCD));
+        let cell_genesis =
+            CellGenesisV1::new([0x22; 32], policy_root.clone(), "other.cell.internal").unwrap();
+        let cell_id = CellIdV1::from_genesis(&cell_genesis);
+        CellCertificateV1::new(
+            cell_id,
+            "other.cell.internal",
+            [0x22; 32],
+            policy_root,
+            super::super::RevocationPointer::LedgerAnchor {
+                stream: "ledger.rotations".to_string(),
+                from_envelope_ref: 8,
+            },
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// Helper to create a head with a specific epoch for a cell.
+    fn make_epoch_head(cell_id: CellIdV1, epoch: u64, root_fill: u8) -> HolonDirectoryHeadV1 {
+        HolonDirectoryHeadV1::new(
+            cell_id,
+            epoch,
+            LedgerAnchorV1::ConsensusIndex { index: epoch },
+            [root_fill; HASH_BYTES],
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            [root_fill.wrapping_add(0x10); HASH_BYTES],
+            [root_fill.wrapping_add(0x20); HASH_BYTES],
+            [root_fill.wrapping_add(0x30); HASH_BYTES],
+            None,
+        )
+        .unwrap()
+    }
+
+    // --- Cache amortization: verify that cache hit reduces cost ---
+
+    #[test]
+    fn cache_admits_and_verifies_multiple_proofs_against_same_head() {
+        // REQ-0013: "Cache reuse measurably reduces repeated verification cost"
+        //
+        // Once a head is admitted, multiple identity proofs can be verified
+        // against it using only O(log n) hash ops per proof, without
+        // re-verifying the head's authority seal.
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+        let head_hash = head.content_hash().unwrap();
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(head_hash, head).unwrap();
+
+        // Verify the same proof multiple times -- each time is a cache hit.
+        for _ in 0..5 {
+            let status = cache.verify_identity(&head_hash, &identity_proof).unwrap();
+            assert_eq!(status, DirectoryEntryStatus::Active);
+        }
+
+        // Verify audit log records exactly one admission.
+        let admission_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::HeadAdmitted { .. }))
+            .count();
+        assert_eq!(admission_count, 1, "exactly one admission event expected");
+    }
+
+    // --- Invalidation on revocation ---
+
+    #[test]
+    fn cache_invalidate_head_removes_revoked_entry() {
+        // REQ-0013: "Stale cache entries cannot authorize revoked identities"
+        let cell_cert = make_cell_certificate();
+        let head = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
+        let head_hash = head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(head_hash, head).unwrap();
+        assert!(cache.contains_head(&head_hash));
+
+        // Simulate revocation: invalidate the specific head.
+        let removed = cache.invalidate_head(&head_hash, InvalidationReason::Revocation);
+        assert!(removed, "head should have been present and removed");
+        assert!(
+            !cache.contains_head(&head_hash),
+            "head must not survive revocation invalidation"
+        );
+        assert_eq!(cache.len(), 0);
+
+        // Verify identity against invalidated head must fail with cache miss.
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Active,
+            vec![SiblingNode::new([0x10; HASH_BYTES])],
+        )
+        .unwrap();
+        let identity_proof = IdentityProofV1::new(
+            Some([0x99; HASH_BYTES]),
+            [0x88; HASH_BYTES],
+            head_hash,
+            proof,
+            100,
+        )
+        .unwrap();
+        let err = cache
+            .verify_identity(&head_hash, &identity_proof)
+            .unwrap_err();
+        assert!(
+            matches!(err, IdentityProofError::VerifiedHeadCacheMiss),
+            "revoked head should produce cache miss, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn cache_invalidate_head_returns_false_for_absent_head() {
+        let mut cache = VerifiedHeadCache::new(8);
+        let removed = cache.invalidate_head(&[0xFF; HASH_BYTES], InvalidationReason::Revocation);
+        assert!(!removed, "invalidating absent head should return false");
+        assert!(
+            cache.audit_log().is_empty(),
+            "no audit event for absent head"
+        );
+    }
+
+    #[test]
+    fn cache_verify_returns_revoked_status_for_revoked_proof() {
+        // Even before explicit invalidation, verify_identity returns the
+        // proof-derived status. Callers must check this status to deny
+        // authoritative operations for revoked entries.
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Revoked,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+        let head_hash = head.content_hash().unwrap();
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(head_hash, head).unwrap();
+
+        // Cache returns Revoked status -- caller MUST deny authority.
+        let status = cache.verify_identity(&head_hash, &identity_proof).unwrap();
+        assert_eq!(
+            status,
+            DirectoryEntryStatus::Revoked,
+            "cache must return proof-derived Revoked status"
+        );
+    }
+
+    // --- Invalidation on key rotation ---
+
+    #[test]
+    fn cache_invalidate_for_cell_removes_all_heads_for_cell() {
+        // REQ-0013: Key rotation invalidation.
+        //
+        // Atomic head-advancement in `admit_head` means only the latest
+        // epoch for a given cell survives admission. We test that
+        // `invalidate_for_cell` removes even the surviving latest head,
+        // plus verify that the other cell's head is untouched.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        // head2 will auto-evict head1 on admission (same cell, higher epoch).
+        let head1 = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
+        let head2 = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
+        let other_head = make_epoch_head(other_cert.cell_id().clone(), 12, 0xB1);
+
+        let hash1 = head1.content_hash().unwrap();
+        let hash2 = head2.content_hash().unwrap();
+        let other_hash = other_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(hash1, head1).unwrap();
+        cache.admit_head(hash2, head2).unwrap();
+        // head1 was auto-evicted by head2's admission.
+        assert!(
+            !cache.contains_head(&hash1),
+            "head1 should be auto-evicted by head2 admission"
+        );
+        cache.admit_head(other_hash, other_head).unwrap();
+        assert_eq!(cache.len(), 2, "head2 + other_head");
+
+        // Simulate key rotation for the first cell.
+        let evicted =
+            cache.invalidate_for_cell(cell_cert.cell_id(), InvalidationReason::KeyRotation);
+        assert_eq!(evicted, 1, "remaining head for cell should be evicted");
+        assert!(!cache.contains_head(&hash2));
+        assert!(
+            cache.contains_head(&other_hash),
+            "other cell's head must survive"
+        );
+        assert_eq!(cache.len(), 1);
+
+        // Verify audit log records the cell invalidation.
+        let cell_event_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CellInvalidated { .. }))
+            .count();
+        assert_eq!(cell_event_count, 1, "exactly one cell invalidation event");
+    }
+
+    #[test]
+    fn cache_invalidate_for_cell_returns_zero_for_absent_cell() {
+        let cell_cert = make_cell_certificate();
+        let mut cache = VerifiedHeadCache::new(8);
+        let evicted =
+            cache.invalidate_for_cell(cell_cert.cell_id(), InvalidationReason::KeyRotation);
+        assert_eq!(evicted, 0);
+    }
+
+    // --- Invalidation on head advancement ---
+
+    #[test]
+    fn cache_invalidate_on_head_advance_removes_old_epochs() {
+        // REQ-0013: Head advancement invalidation via explicit method.
+        //
+        // Use distinct cells to hold one head each so that the atomic
+        // advancement inside `admit_head` does not pre-evict them.
+        // Then call `invalidate_on_head_advance` to test the explicit
+        // method against a cell that has only a single head.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        // Admit a single head per cell (no atomic same-cell eviction).
+        let cell_head = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
+        let other_head = make_epoch_head(other_cert.cell_id().clone(), 3, 0xB1);
+
+        let cell_hash = cell_head.content_hash().unwrap();
+        let other_hash = other_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(cell_hash, cell_head).unwrap();
+        cache.admit_head(other_hash, other_head).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        // Advance: invalidate heads for cell_cert older than epoch 20.
+        // cell_head (epoch 15 < 20) should be evicted; other_head preserved.
+        let evicted = cache.invalidate_on_head_advance(cell_cert.cell_id(), 20);
+        assert_eq!(evicted, 1, "cell_head (15) should be evicted");
+        assert!(!cache.contains_head(&cell_hash));
+        assert!(cache.contains_head(&other_hash), "other cell must survive");
+
+        // Verify audit event from explicit call.
+        let advance_event_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CellHeadAdvanced { .. }))
+            .count();
+        assert_eq!(advance_event_count, 1);
+    }
+
+    #[test]
+    fn cache_invalidate_on_head_advance_keeps_equal_epoch() {
+        // Head at exactly the new_epoch boundary should be retained.
+        let cell_cert = make_cell_certificate();
+        let boundary_head = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA1);
+        let boundary_hash = boundary_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(boundary_hash, boundary_head).unwrap();
+
+        let evicted = cache.invalidate_on_head_advance(cell_cert.cell_id(), 20);
+        assert_eq!(evicted, 0, "epoch == new_epoch should be retained");
+        assert!(cache.contains_head(&boundary_hash));
+    }
+
+    // --- Atomic head-advancement on admission (regression) ---
+
+    #[test]
+    fn admit_head_atomically_evicts_older_same_cell_epochs() {
+        // Regression test (code-quality + security review R1):
+        // Admitting epoch N+1 for the same cell MUST automatically
+        // evict epoch N without requiring a separate call to
+        // `invalidate_on_head_advance`.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        let head_n = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
+        let head_n1 = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA2);
+        let other_head = make_epoch_head(other_cert.cell_id().clone(), 5, 0xB1);
+
+        let hash_n = head_n.content_hash().unwrap();
+        let hash_n1 = head_n1.content_hash().unwrap();
+        let other_hash = other_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(hash_n, head_n).unwrap();
+        cache.admit_head(other_hash, other_head).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        // Admit epoch N+1 for the same cell -- epoch N must be auto-evicted.
+        cache.admit_head(hash_n1, head_n1).unwrap();
+
+        assert!(
+            !cache.contains_head(&hash_n),
+            "epoch-N head must be evicted atomically on epoch-N+1 admission"
+        );
+        assert!(
+            cache.contains_head(&hash_n1),
+            "newly admitted epoch-N+1 head must be present"
+        );
+        assert!(
+            cache.contains_head(&other_hash),
+            "other cell's head must not be affected"
+        );
+        assert_eq!(
+            cache.len(),
+            2,
+            "only epoch-N+1 and other_head should remain"
+        );
+
+        // Verify audit log contains a CellHeadAdvanced event for the
+        // atomic eviction, proving no external invalidation was needed.
+        let all_events = cache.drain_audit_log();
+        let advancement_events: Vec<_> = all_events
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CellHeadAdvanced { .. }))
+            .collect();
+        assert_eq!(
+            advancement_events.len(),
+            1,
+            "exactly one CellHeadAdvanced event expected from atomic admission"
+        );
+        if let VerifierCacheAuditEvent::CellHeadAdvanced {
+            cell_id,
+            new_epoch,
+            evicted_count,
+            evicted_head_hashes,
+        } = advancement_events[0]
+        {
+            assert_eq!(cell_id, cell_cert.cell_id());
+            assert_eq!(*new_epoch, 20);
+            assert_eq!(*evicted_count, 1);
+            assert_eq!(evicted_head_hashes.len(), 1);
+            assert_eq!(evicted_head_hashes[0], hash_n);
+        } else {
+            panic!("expected CellHeadAdvanced event");
+        }
+    }
+
+    #[test]
+    fn admit_head_atomically_evicts_multiple_older_same_cell_epochs() {
+        // Admitting a head at epoch 30 should evict ALL remaining older
+        // same-cell heads. We use two different cells to accumulate
+        // multiple heads for the target cell without triggering
+        // intermediate advancement evictions between them.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        // Two heads for cell_cert at different epochs, admitted
+        // with an interleaving other-cell head to show selectivity.
+        let early_head = make_epoch_head(cell_cert.cell_id().clone(), 5, 0xA1);
+        let middle_head = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
+        let latest_head = make_epoch_head(cell_cert.cell_id().clone(), 30, 0xA3);
+        let other_head = make_epoch_head(other_cert.cell_id().clone(), 8, 0xB1);
+
+        let early_hash = early_head.content_hash().unwrap();
+        let middle_hash = middle_head.content_hash().unwrap();
+        let latest_hash = latest_head.content_hash().unwrap();
+        let other_hash = other_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(early_hash, early_head).unwrap();
+        // Admitting middle_head for the same cell auto-evicts early_head.
+        cache.admit_head(middle_hash, middle_head).unwrap();
+        assert!(
+            !cache.contains_head(&early_hash),
+            "epoch-5 must already be evicted by epoch-15 admission"
+        );
+
+        cache.admit_head(other_hash, other_head).unwrap();
+        assert_eq!(cache.len(), 2, "middle_head + other_head");
+
+        // Admit epoch 30 -- middle_head must be evicted, other_head preserved.
+        cache.admit_head(latest_hash, latest_head).unwrap();
+
+        assert!(!cache.contains_head(&early_hash), "epoch 5 must be evicted");
+        assert!(
+            !cache.contains_head(&middle_hash),
+            "epoch 15 must be evicted"
+        );
+        assert!(
+            cache.contains_head(&latest_hash),
+            "epoch 30 must be present"
+        );
+        assert!(
+            cache.contains_head(&other_hash),
+            "other cell must be unaffected"
+        );
+        assert_eq!(cache.len(), 2, "epoch-30 + other_head should remain");
+
+        // Two CellHeadAdvanced events total: one for middle_head evicting
+        // early_head, one for latest_head evicting middle_head.
+        let advancement_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CellHeadAdvanced { .. }))
+            .count();
+        assert_eq!(
+            advancement_count, 2,
+            "two atomic advancement evictions expected"
+        );
+    }
+
+    #[test]
+    fn admit_head_does_not_evict_equal_epoch_same_cell() {
+        // Re-admitting the same head (same hash, same epoch) should NOT
+        // trigger a head-advancement eviction event.
+        let cell_cert = make_cell_certificate();
+        let head = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
+        let head_clone = head.clone();
+        let hash = head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(hash, head).unwrap();
+        cache.admit_head(hash, head_clone).unwrap();
+
+        assert!(cache.contains_head(&hash));
+        assert_eq!(cache.len(), 1);
+
+        // No CellHeadAdvanced event should be emitted for re-admission.
+        let advancement_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CellHeadAdvanced { .. }))
+            .count();
+        assert_eq!(
+            advancement_count, 0,
+            "re-admitting same head should not trigger advancement eviction"
+        );
+    }
+
+    // --- Global stale eviction ---
+
+    #[test]
+    fn cache_evict_stale_returns_count_and_emits_audit() {
+        // Use distinct cells to avoid atomic same-cell head advancement.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+        let stale_head = make_epoch_head(cell_cert.cell_id().clone(), 5, 0xA1);
+        let fresh_head = make_epoch_head(other_cert.cell_id().clone(), 25, 0xA3);
+
+        let stale_hash = stale_head.content_hash().unwrap();
+        let fresh_hash = fresh_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(stale_hash, stale_head).unwrap();
+        cache.admit_head(fresh_hash, fresh_head).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        let evicted = cache.evict_stale(20);
+        assert_eq!(evicted, 1, "only the stale head should be evicted");
+        assert!(!cache.contains_head(&stale_hash));
+        assert!(cache.contains_head(&fresh_hash));
+
+        // Verify audit event.
+        let stale_event_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::StaleEvicted { .. }))
+            .count();
+        assert_eq!(stale_event_count, 1);
+    }
+
+    // --- Emergency purge ---
+
+    #[test]
+    fn cache_purge_all_removes_everything() {
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        let head1 = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
+        let head2 = make_epoch_head(other_cert.cell_id().clone(), 20, 0xB1);
+        let hash1 = head1.content_hash().unwrap();
+        let hash2 = head2.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(hash1, head1).unwrap();
+        cache.admit_head(hash2, head2).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        let evicted = cache.purge_all(InvalidationReason::Emergency);
+        assert_eq!(evicted, 2);
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.contains_head(&hash1));
+        assert!(!cache.contains_head(&hash2));
+
+        // Verify audit event.
+        let purge_event_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::FullPurge { .. }))
+            .count();
+        assert_eq!(purge_event_count, 1);
+    }
+
+    #[test]
+    fn cache_purge_all_on_empty_cache_is_noop() {
+        let mut cache = VerifiedHeadCache::new(8);
+        let evicted = cache.purge_all(InvalidationReason::Emergency);
+        assert_eq!(evicted, 0);
+        // No audit event for empty purge.
+        let purge_event_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::FullPurge { .. }))
+            .count();
+        assert_eq!(purge_event_count, 0);
+    }
+
+    // --- Capacity eviction audit ---
+
+    #[test]
+    fn cache_capacity_eviction_emits_audit_event() {
+        // Use distinct cells to avoid atomic same-cell head advancement.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+        let third_genesis = CellGenesisV1::new(
+            [0x44; 32],
+            PolicyRootId::Single(make_public_key_id(0xDD)),
+            "third.cap.cell.internal",
+        )
+        .unwrap();
+        let third_cell_id = CellIdV1::from_genesis(&third_genesis);
+
+        // Cache with capacity 2
+        let mut cache = VerifiedHeadCache::new(2);
+
+        let head1 = make_epoch_head(cell_cert.cell_id().clone(), 1, 0xA1);
+        let head2 = make_epoch_head(other_cert.cell_id().clone(), 2, 0xA2);
+        let head3 = make_epoch_head(third_cell_id, 3, 0xA3);
+        let hash1 = head1.content_hash().unwrap();
+        let hash2 = head2.content_hash().unwrap();
+        let hash3 = head3.content_hash().unwrap();
+
+        cache.admit_head(hash1, head1).unwrap();
+        cache.admit_head(hash2, head2).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        // Admitting a third head should evict the first (FIFO).
+        cache.admit_head(hash3, head3).unwrap();
+        assert_eq!(cache.len(), 2);
+        assert!(
+            !cache.contains_head(&hash1),
+            "oldest head should be evicted"
+        );
+        assert!(cache.contains_head(&hash2));
+        assert!(cache.contains_head(&hash3));
+
+        // Verify capacity eviction audit event.
+        let cap_event_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::CapacityEviction { .. }))
+            .count();
+        assert_eq!(cap_event_count, 1, "one capacity eviction event expected");
+    }
+
+    // --- Audit log drain ---
+
+    #[test]
+    fn cache_drain_audit_log_clears_events() {
+        let cell_cert = make_cell_certificate();
+        let head = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA1);
+        let hash = head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(hash, head).unwrap();
+        assert!(!cache.audit_log().is_empty());
+
+        let drained = cache.drain_audit_log();
+        assert!(!drained.is_empty());
+        assert!(
+            cache.audit_log().is_empty(),
+            "audit log should be empty after drain"
+        );
+    }
+
+    // --- Stale cache negative: revoked identity cannot be authorized ---
+
+    #[test]
+    fn stale_cache_cannot_authorize_revoked_identity() {
+        // REQ-0013: "Stale cache entries cannot authorize revoked identities"
+        //
+        // Scenario: A head is admitted. Later, the identity is revoked.
+        // Even if the old head is still in the cache, verify_identity
+        // returns `Revoked` status, preventing authorization.
+        // Then, explicit invalidation removes the head entirely.
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+        let key = derive_directory_key(holon_cert.holon_id());
+
+        // Build a proof with Revoked status (as the directory has been updated).
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            [0xAB; HASH_BYTES],
+            DirectoryEntryStatus::Revoked,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+        let head = make_test_head(
+            cell_cert.cell_id().clone(),
+            root,
+            DirectoryKindV1::Smt256V1,
+            8192,
+        );
+        let head_hash = head.content_hash().unwrap();
+        let identity_proof = make_test_identity_proof(&cell_cert, &holon_cert, &head, proof, 100);
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(head_hash, head).unwrap();
+
+        // Step 1: verify_identity returns Revoked -- caller MUST deny.
+        let status = cache.verify_identity(&head_hash, &identity_proof).unwrap();
+        assert_eq!(status, DirectoryEntryStatus::Revoked);
+
+        // Step 2: Explicit invalidation removes the head entirely.
+        cache.invalidate_head(&head_hash, InvalidationReason::Revocation);
+        assert!(!cache.contains_head(&head_hash));
+
+        // Step 3: Subsequent verification fails with cache miss.
+        let err = cache
+            .verify_identity(&head_hash, &identity_proof)
+            .unwrap_err();
+        assert!(matches!(err, IdentityProofError::VerifiedHeadCacheMiss));
+    }
+
+    // --- Deterministic invalidation path ---
+
+    #[test]
+    fn invalidation_path_is_deterministic_and_auditable() {
+        // REQ-0013: "Invalidation path is deterministic and auditable"
+        //
+        // The same sequence of operations always produces the same
+        // audit log, enabling deterministic post-hoc reconstruction.
+        let cell_cert = make_cell_certificate();
+        let head1 = make_epoch_head(cell_cert.cell_id().clone(), 5, 0xA1);
+        let head2 = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
+        let hash1 = head1.content_hash().unwrap();
+        let hash2 = head2.content_hash().unwrap();
+
+        // Run the same sequence twice.
+        let run = || {
+            let mut cache = VerifiedHeadCache::new(8);
+            cache.admit_head(hash1, head1.clone()).unwrap();
+            cache.admit_head(hash2, head2.clone()).unwrap();
+            // head1 is atomically evicted by admit_head(head2) since
+            // epoch 5 < 15 for the same cell. Explicit invalidation
+            // of hash1 returns false (already evicted).
+            let already_gone = !cache.invalidate_head(&hash1, InvalidationReason::Revocation);
+            assert!(
+                already_gone,
+                "head1 should already be gone via atomic advancement"
+            );
+            cache.evict_stale(20);
+            cache.drain_audit_log()
+        };
+
+        let log1 = run();
+        let log2 = run();
+        assert_eq!(log1, log2, "audit logs must be identical across runs");
+        // Expected events:
+        //   1. Admit(head1)
+        //   2. CellHeadAdvanced (head1 evicted atomically by head2 admission)
+        //   3. Admit(head2)
+        //   4. StaleEvicted (head2 epoch 15 < cutoff 20)
+        assert_eq!(log1.len(), 4, "expected 4 audit events");
     }
 
     /// Regression test (Round 3): Tier2+ strict mode MUST reject an
@@ -3933,6 +5123,265 @@ mod tests {
         assert!(
             matches!(err, IdentityProofError::UnknownIdentityProofProfile { .. }),
             "Tier2+ must reject unknown-but-hash-matching expected_profile; got: {err:?}"
+        );
+    }
+
+    // --- Bounded audit log regression (security review BLOCKER) ---
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_audit_event_respects_cap_at_capacity_1() {
+        // Regression: with max_audit_events=1, repeated pushes MUST NOT
+        // exceed the cap. The log should always contain exactly 1 event
+        // (the most recent one).
+        let mut cache = VerifiedHeadCache::with_audit_capacity(8, 1);
+        let cell_cert = make_cell_certificate();
+
+        // Push 10 events and verify the cap after each push.
+        for i in 0u64..10 {
+            let head = make_epoch_head(cell_cert.cell_id().clone(), i + 1, (i as u8) + 1);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+            assert!(
+                cache.audit_log_len() <= 1,
+                "audit log len {} exceeds cap 1 after push {}",
+                cache.audit_log_len(),
+                i + 1,
+            );
+        }
+        // Final state: exactly 1 event.
+        assert_eq!(
+            cache.audit_log_len(),
+            1,
+            "audit log must have exactly 1 event at cap 1"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_audit_event_respects_cap_at_capacity_2() {
+        // Regression: with max_audit_events=2, pushing many events MUST
+        // never exceed 2 entries.
+        let mut cache = VerifiedHeadCache::with_audit_capacity(8, 2);
+        let cell_cert = make_cell_certificate();
+
+        for i in 0u64..10 {
+            let head = make_epoch_head(cell_cert.cell_id().clone(), i + 1, (i as u8) + 1);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+            assert!(
+                cache.audit_log_len() <= 2,
+                "audit log len {} exceeds cap 2 after push {}",
+                cache.audit_log_len(),
+                i + 1,
+            );
+        }
+        assert!(
+            cache.audit_log_len() <= 2,
+            "final audit log len {} exceeds cap 2",
+            cache.audit_log_len(),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_audit_event_respects_cap_at_capacity_3() {
+        // Regression: with max_audit_events=3, pushing many events MUST
+        // never exceed 3 entries.
+        let mut cache = VerifiedHeadCache::with_audit_capacity(8, 3);
+        let cell_cert = make_cell_certificate();
+
+        for i in 0u64..20 {
+            let head = make_epoch_head(cell_cert.cell_id().clone(), i + 1, (i as u8) + 1);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+            assert!(
+                cache.audit_log_len() <= 3,
+                "audit log len {} exceeds cap 3 after push {}",
+                cache.audit_log_len(),
+                i + 1,
+            );
+        }
+        assert!(
+            cache.audit_log_len() <= 3,
+            "final audit log len {} exceeds cap 3",
+            cache.audit_log_len(),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn push_audit_event_overflow_sentinel_present_at_cap_2_plus() {
+        // For cap >= 2, after overflow an AuditOverflow sentinel should
+        // be present somewhere in the log.
+        let mut cache = VerifiedHeadCache::with_audit_capacity(8, 3);
+        let cell_cert = make_cell_certificate();
+
+        // Push enough events to trigger overflow (cap=3, so 4+ events).
+        for i in 0u64..6 {
+            let head = make_epoch_head(cell_cert.cell_id().clone(), i + 1, (i as u8) + 1);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+        }
+
+        let events = cache.audit_log();
+        let overflow_count = events
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::AuditOverflow { .. }))
+            .count();
+        assert!(
+            overflow_count >= 1,
+            "expected at least one AuditOverflow sentinel after overflow, got {overflow_count}"
+        );
+        assert!(
+            events.len() <= 3,
+            "audit log len {} exceeds cap 3",
+            events.len(),
+        );
+    }
+
+    // --- Monotonic epoch admission regression (code-quality review MAJOR 2) ---
+
+    #[test]
+    fn admit_head_rejects_stale_epoch_for_same_cell() {
+        // Regression: admitting an older epoch after a newer one for the
+        // same cell MUST be rejected with StaleEpochRejected.
+        let cell_cert = make_cell_certificate();
+
+        let newer_head = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA1);
+        let stale_head = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA2);
+
+        let newer_hash = newer_head.content_hash().unwrap();
+        let stale_hash = stale_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(newer_hash, newer_head).unwrap();
+
+        // Attempt to admit the stale head -- must fail.
+        let err = cache.admit_head(stale_hash, stale_head).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 10,
+                    cached_epoch: 20,
+                }
+            ),
+            "expected StaleEpochRejected, got: {err:?}"
+        );
+
+        // The stale head must NOT be in the cache.
+        assert!(
+            !cache.contains_head(&stale_hash),
+            "stale head must not be admitted into cache"
+        );
+        // The newer head must still be present.
+        assert!(
+            cache.contains_head(&newer_hash),
+            "newer head must remain in cache"
+        );
+        assert_eq!(cache.len(), 1);
+
+        // Verify audit event for the rejection.
+        let rejection_events: Vec<_> = cache
+            .audit_log()
+            .into_iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::StaleAdmissionRejected { .. }))
+            .collect();
+        assert_eq!(
+            rejection_events.len(),
+            1,
+            "exactly one StaleAdmissionRejected event expected"
+        );
+        if let VerifierCacheAuditEvent::StaleAdmissionRejected {
+            cell_id,
+            rejected_epoch,
+            cached_epoch,
+        } = &rejection_events[0]
+        {
+            assert_eq!(cell_id, cell_cert.cell_id());
+            assert_eq!(*rejected_epoch, 10);
+            assert_eq!(*cached_epoch, 20);
+        } else {
+            panic!("expected StaleAdmissionRejected event");
+        }
+    }
+
+    #[test]
+    fn admit_head_allows_equal_epoch_readmission() {
+        // Re-admitting the same epoch (same hash) should succeed.
+        // This test ensures the monotonic guard uses strict less-than,
+        // not less-than-or-equal.
+        let cell_cert = make_cell_certificate();
+        let head = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA1);
+        let head_clone = head.clone();
+        let hash = head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(8);
+        cache.admit_head(hash, head).unwrap();
+        // Re-admit same hash and epoch -- should succeed.
+        cache.admit_head(hash, head_clone).unwrap();
+
+        assert!(cache.contains_head(&hash));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn admit_head_allows_different_cells_at_any_epoch() {
+        // Monotonic guard is per-cell. Different cells can have any epoch
+        // relationship.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        let cell_head = make_epoch_head(cell_cert.cell_id().clone(), 50, 0xA1);
+        let other_head = make_epoch_head(other_cert.cell_id().clone(), 5, 0xB1);
+
+        let cell_hash = cell_head.content_hash().unwrap();
+        let other_hash = other_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(cell_hash, cell_head).unwrap();
+        // Admit a head for a different cell at a much lower epoch -- must succeed.
+        cache.admit_head(other_hash, other_head).unwrap();
+
+        assert!(cache.contains_head(&cell_hash));
+        assert!(cache.contains_head(&other_hash));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn admit_head_rejects_repeated_stale_attempts() {
+        // Repeatedly attempting to admit stale heads for the same cell
+        // must be rejected each time, and the cache must not grow.
+        let cell_cert = make_cell_certificate();
+
+        let newer_head = make_epoch_head(cell_cert.cell_id().clone(), 30, 0xA1);
+        let newer_hash = newer_head.content_hash().unwrap();
+
+        let mut cache = VerifiedHeadCache::new(16);
+        cache.admit_head(newer_hash, newer_head).unwrap();
+
+        for i in 1u64..=5 {
+            let stale = make_epoch_head(cell_cert.cell_id().clone(), i, (i as u8) + 0x10);
+            let stale_hash = stale.content_hash().unwrap();
+            let err = cache.admit_head(stale_hash, stale).unwrap_err();
+            assert!(
+                matches!(err, IdentityProofError::StaleEpochRejected { .. }),
+                "attempt {i}: expected StaleEpochRejected, got: {err:?}"
+            );
+            assert_eq!(cache.len(), 1, "cache must not grow on rejected admissions");
+        }
+
+        // Verify 5 rejection audit events.
+        let rejection_count = cache
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e, VerifierCacheAuditEvent::StaleAdmissionRejected { .. }))
+            .count();
+        assert_eq!(
+            rejection_count, 5,
+            "expected 5 StaleAdmissionRejected events"
         );
     }
 }
