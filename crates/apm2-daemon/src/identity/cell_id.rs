@@ -17,13 +17,16 @@
 //! ```
 
 use super::canonical_digest_id_kit::{
-    CanonicalDigestIdKit, impl_digest_id_fmt, impl_version_tagged_digest_id,
+    IdentityWireKernel, impl_digest_id_fmt, impl_version_tagged_digest_id,
 };
-use super::{BINARY_LEN, HASH_LEN, KeyIdError, KeySetIdV1, PublicKeyIdV1};
+use super::{
+    BINARY_LEN, HASH_LEN, IdentityDerivationSemantics, IdentityParseState,
+    IdentityResolutionSemantics, IdentitySemanticCompleteness, IdentitySpec, IdentityTagSemantics,
+    IdentityTextTagPolicy, IdentityWireFormSemantics, KeyIdError, KeySetIdV1, PublicKeyIdV1,
+};
 
 /// Canonical text prefix for `CellIdV1`.
 const PREFIX: &str = "cell:v1:blake3:";
-const CODEC: CanonicalDigestIdKit = CanonicalDigestIdKit::new(PREFIX);
 
 /// Domain separator for `CellIdV1` derivation (HSI 1.7.3).
 const DOMAIN_SEPARATION: &[u8] = b"apm2:cell_id:v1\n";
@@ -33,6 +36,33 @@ const GENESIS_DOMAIN_SEPARATION: &[u8] = b"apm2:cell_genesis:v1\0";
 
 /// Version tag byte for V1 binary form.
 const VERSION_TAG_V1: u8 = 0x01;
+
+const fn validate_cell_version_tag(tag: u8) -> Result<IdentitySemanticCompleteness, KeyIdError> {
+    if tag == VERSION_TAG_V1 {
+        Ok(IdentitySemanticCompleteness::Resolved)
+    } else {
+        Err(KeyIdError::UnknownVersionTag { tag })
+    }
+}
+
+const CELL_ID_SPEC: IdentitySpec = IdentitySpec {
+    text_prefix: PREFIX,
+    wire_form: IdentityWireFormSemantics::Tagged33Only,
+    tag_semantics: IdentityTagSemantics::FixedVersionTag {
+        tag: VERSION_TAG_V1,
+    },
+    derivation_semantics: IdentityDerivationSemantics::DomainSeparatedDigest {
+        domain_separator: "apm2:cell_id:v1\\n + ledger_genesis_hash + genesis_policy_root_id",
+    },
+    resolution_semantics: IdentityResolutionSemantics::SelfContained,
+    text_tag_policy: IdentityTextTagPolicy::FixedTag {
+        tag: VERSION_TAG_V1,
+    },
+    unresolved_compat_tag: None,
+    validate_tag: validate_cell_version_tag,
+};
+
+const WIRE_KERNEL: IdentityWireKernel = IdentityWireKernel::new(&CELL_ID_SPEC);
 
 /// Maximum trust-domain length (bytes).
 ///
@@ -62,8 +92,9 @@ impl PolicyRootId {
     /// Validate internal invariants for fail-closed construction.
     fn validate(&self) -> Result<(), KeyIdError> {
         if let Self::Quorum(id) = self {
-            // KeySetId parsed from text carries an unknown-tag sentinel. For
-            // genesis commitments we require explicit mode tag in binary form.
+            // Digest-first KeySet IDs parsed from text/hash-only forms are
+            // explicitly unresolved. For genesis commitments we require an
+            // explicit resolved mode tag.
             if id.set_tag().is_none() {
                 return Err(KeyIdError::InvalidDescriptor {
                     reason: "quorum policy root must include known set tag".to_string(),
@@ -167,7 +198,29 @@ impl CellIdV1 {
         Self { binary }
     }
 
-    impl_version_tagged_digest_id!(CODEC, VERSION_TAG_V1, cell_hash);
+    /// Parse from canonical text and return explicit parse state metadata.
+    pub fn parse_text_with_state(input: &str) -> Result<(Self, IdentityParseState), KeyIdError> {
+        let parsed = WIRE_KERNEL.parse_text(input)?;
+        Ok((
+            Self {
+                binary: parsed.binary,
+            },
+            parsed.state,
+        ))
+    }
+
+    /// Parse from binary and return explicit parse state metadata.
+    pub fn from_binary_with_state(bytes: &[u8]) -> Result<(Self, IdentityParseState), KeyIdError> {
+        let parsed = WIRE_KERNEL.parse_binary(bytes)?;
+        Ok((
+            Self {
+                binary: parsed.binary,
+            },
+            parsed.state,
+        ))
+    }
+
+    impl_version_tagged_digest_id!(WIRE_KERNEL, VERSION_TAG_V1, cell_hash);
 }
 
 impl_digest_id_fmt!(CellIdV1, "CellIdV1");
@@ -208,7 +261,9 @@ fn validate_trust_domain(value: &str) -> Result<(), KeyIdError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{AlgorithmTag, KeySetIdV1, SetTag};
+    use crate::identity::{
+        AlgorithmTag, IdentityParseProvenance, IdentitySemanticCompleteness, KeySetIdV1, SetTag,
+    };
 
     fn make_public_key_id(fill: u8) -> PublicKeyIdV1 {
         PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[fill; 32])
@@ -335,6 +390,27 @@ mod tests {
         let text = id.to_text();
         let parsed = CellIdV1::parse_text(&text).unwrap();
         assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn parse_state_from_text_is_resolved() {
+        let id = CellIdV1::from_genesis(&make_genesis_single());
+        let (parsed, state) = CellIdV1::parse_text_with_state(&id.to_text()).unwrap();
+        assert_eq!(parsed, id);
+        assert_eq!(state.provenance(), IdentityParseProvenance::FromText);
+        assert_eq!(state.completeness(), IdentitySemanticCompleteness::Resolved);
+    }
+
+    #[test]
+    fn parse_state_from_tagged_binary_is_resolved() {
+        let id = CellIdV1::from_genesis(&make_genesis_single());
+        let (parsed, state) = CellIdV1::from_binary_with_state(&id.to_binary()).unwrap();
+        assert_eq!(parsed, id);
+        assert_eq!(
+            state.provenance(),
+            IdentityParseProvenance::FromTaggedBinary
+        );
+        assert_eq!(state.completeness(), IdentitySemanticCompleteness::Resolved);
     }
 
     #[test]

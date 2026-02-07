@@ -22,7 +22,8 @@
 //! | 0x01 | Multisig   |
 //! | 0x02 | Threshold  |
 //!
-//! Unknown tags are rejected (fail-closed).
+//! Unknown tags are rejected (fail-closed). A legacy compatibility tag `0x00`
+//! is accepted only to represent explicitly unresolved mode semantics.
 //!
 //! # Merkle Root Derivation (RFC-0020 `KeySetDescriptorV1`)
 //!
@@ -54,12 +55,16 @@
 
 use std::fmt;
 
-use super::canonical_digest_id_kit::{CanonicalDigestIdKit, impl_digest_id_fmt};
-use super::{AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1};
+use super::canonical_digest_id_kit::{IdentityWireKernel, IdentityWireParse, impl_digest_id_fmt};
+use super::{
+    AlgorithmTag, BINARY_LEN, HASH_LEN, IdentityDerivationSemantics, IdentityParseState,
+    IdentityResolutionSemantics, IdentitySemanticCompleteness, IdentitySpec, IdentityTagSemantics,
+    IdentityTextTagPolicy, IdentityWireFormSemantics, IdentityWireVariant, KeyIdError,
+    PublicKeyIdV1,
+};
 
 /// Prefix for `KeySetIdV1` text form (RFC-0020 canonical grammar).
 const PREFIX: &str = "kset:v1:blake3:";
-const CODEC: CanonicalDigestIdKit = CanonicalDigestIdKit::new(PREFIX);
 
 /// Domain separation string for BLAKE3 keyset hashing.
 const DOMAIN_SEPARATION: &[u8] = b"apm2:keyset_id:v1\0";
@@ -78,8 +83,37 @@ const MAX_KEYSET_MEMBERS: usize = 256;
 /// inputs reaching the allocation/hash path.
 const MAX_ALGORITHM_TOKEN_LEN: usize = 32;
 
-/// Sentinel value for "set tag unknown" (text-parsed IDs).
-const UNKNOWN_SET_TAG_SENTINEL: u8 = 0x00;
+/// Compatibility tag used when set-mode semantics are unresolved.
+const UNRESOLVED_COMPAT_TAG: u8 = 0x00;
+
+const fn validate_keyset_tag(tag: u8) -> Result<IdentitySemanticCompleteness, KeyIdError> {
+    match tag {
+        0x01 | 0x02 => Ok(IdentitySemanticCompleteness::Resolved),
+        UNRESOLVED_COMPAT_TAG => Ok(IdentitySemanticCompleteness::Unresolved),
+        other => Err(KeyIdError::UnknownSetTag { tag: other }),
+    }
+}
+
+const KEYSET_ID_SPEC: IdentitySpec = IdentitySpec {
+    text_prefix: PREFIX,
+    wire_form: IdentityWireFormSemantics::Tagged33AndHash32,
+    tag_semantics: IdentityTagSemantics::SetMode {
+        text_omits_mode: true,
+        unresolved_compat_tag: Some(UNRESOLVED_COMPAT_TAG),
+    },
+    derivation_semantics: IdentityDerivationSemantics::DescriptorDigest {
+        domain_separator: "apm2:keyset_id:v1\\0 + canonical_bytes(KeySetDescriptorV1)",
+        descriptor: "KeySetDescriptorV1",
+    },
+    resolution_semantics: IdentityResolutionSemantics::DigestFirstResolver {
+        contract: "KeySetDigestResolver::resolve_by_digest",
+    },
+    text_tag_policy: IdentityTextTagPolicy::Omitted,
+    unresolved_compat_tag: Some(UNRESOLVED_COMPAT_TAG),
+    validate_tag: validate_keyset_tag,
+};
+
+const WIRE_KERNEL: IdentityWireKernel = IdentityWireKernel::new(&KEYSET_ID_SPEC);
 
 /// Known key-set mode tags.
 ///
@@ -127,8 +161,10 @@ impl fmt::Display for SetTag {
 
 /// A canonical identifier for a set of public keys (RFC-0020 section 1.7.2a).
 ///
-/// Instances contain exactly 32 bytes of BLAKE3 merkle root and an
-/// **optional** set tag. The type is cheaply cloneable (33 bytes inline).
+/// Instances contain exactly 32 bytes of BLAKE3 merkle root and an explicit
+/// semantic completeness state (`resolved` or `unresolved`).
+///
+/// `set_tag` is `Some` only when semantics are resolved.
 ///
 /// # Tag Semantics
 ///
@@ -174,12 +210,30 @@ impl fmt::Display for SetTag {
 /// ```
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeySetIdV1 {
-    /// Storage: `tag_or_sentinel` (1 byte) + `merkle_root` (32 bytes).
-    ///
-    /// When constructed from binary or descriptor, byte 0 is a valid
-    /// [`SetTag`] value (0x01 or 0x02). When parsed from text, byte 0 is
-    /// 0x00 (sentinel for "tag unknown").
+    /// Storage wire image (`tag_or_compat + merkle_root`).
     binary: [u8; BINARY_LEN],
+    /// Explicit set-mode semantics (`None` = unresolved digest-first state).
+    set_tag: Option<SetTag>,
+    /// Explicit semantic completeness state.
+    completeness: IdentitySemanticCompleteness,
+}
+
+/// Resolved set-mode semantics loaded via digest-first resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedKeySetSemantics {
+    /// Merkle root digest the resolver claims to resolve.
+    pub merkle_root: [u8; HASH_LEN],
+    /// Resolved set mode.
+    pub set_tag: SetTag,
+}
+
+/// Digest-first resolver contract for IDs whose text omits mode semantics.
+pub trait KeySetDigestResolver {
+    /// Resolve set semantics by digest.
+    fn resolve_by_digest(
+        &self,
+        merkle_root: &[u8; HASH_LEN],
+    ) -> Result<ResolvedKeySetSemantics, KeyIdError>;
 }
 
 impl KeySetIdV1 {
@@ -353,7 +407,11 @@ impl KeySetIdV1 {
         let mut binary = [0u8; BINARY_LEN];
         binary[0] = set_tag.to_byte();
         binary[1..].copy_from_slice(root.as_bytes());
-        Ok(Self { binary })
+        Ok(Self {
+            binary,
+            set_tag: Some(set_tag),
+            completeness: IdentitySemanticCompleteness::Resolved,
+        })
     }
 
     /// Parse a `KeySetIdV1` from its canonical text form.
@@ -376,9 +434,14 @@ impl KeySetIdV1 {
     /// [`from_descriptor`](KeySetIdV1::from_descriptor) which do carry the
     /// tag.
     pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
-        let hash = CODEC.parse_text_hash(input)?;
-        let binary = CanonicalDigestIdKit::binary_from_tag_and_hash(UNKNOWN_SET_TAG_SENTINEL, hash);
-        Ok(Self { binary })
+        Self::parse_text_with_state(input).map(|(id, _)| id)
+    }
+
+    /// Parse from canonical text and return explicit parse-state metadata.
+    pub fn parse_text_with_state(input: &str) -> Result<(Self, IdentityParseState), KeyIdError> {
+        let parsed = WIRE_KERNEL.parse_text(input)?;
+        let id = Self::from_wire_parse(parsed);
+        Ok((id, parsed.state))
     }
 
     /// Construct from binary form.
@@ -388,29 +451,17 @@ impl KeySetIdV1 {
     /// - 32 bytes: `merkle_root` only (tag unknown; stored with sentinel)
     ///
     /// For 33-byte inputs, set tags must be known (`0x01`, `0x02`) except for
-    /// the reserved sentinel `0x00`, which represents "tag unknown" and is
-    /// used by text-parsed IDs.
+    /// the reserved compatibility tag `0x00`, which maps to explicit
+    /// `IdentitySemanticCompleteness::Unresolved`.
     pub fn from_binary(bytes: &[u8]) -> Result<Self, KeyIdError> {
-        match bytes.len() {
-            HASH_LEN => {
-                let mut hash = [0u8; HASH_LEN];
-                hash.copy_from_slice(bytes);
-                let binary =
-                    CanonicalDigestIdKit::binary_from_tag_and_hash(UNKNOWN_SET_TAG_SENTINEL, hash);
-                Ok(Self { binary })
-            },
-            BINARY_LEN => {
-                let binary = CODEC.parse_binary_exact(bytes, |tag| {
-                    if tag == UNKNOWN_SET_TAG_SENTINEL {
-                        Ok(())
-                    } else {
-                        SetTag::from_byte(tag).map(|_| ())
-                    }
-                })?;
-                Ok(Self { binary })
-            },
-            _ => Err(KeyIdError::InvalidBinaryLength { got: bytes.len() }),
-        }
+        Self::from_binary_with_state(bytes).map(|(id, _)| id)
+    }
+
+    /// Parse from binary and return explicit parse-state metadata.
+    pub fn from_binary_with_state(bytes: &[u8]) -> Result<(Self, IdentityParseState), KeyIdError> {
+        let parsed = WIRE_KERNEL.parse_binary(bytes)?;
+        let id = Self::from_wire_parse(parsed);
+        Ok((id, parsed.state))
     }
 
     /// Return the canonical text form: `kset:v1:blake3:<64-hex>`.
@@ -421,7 +472,7 @@ impl KeySetIdV1 {
     /// form is a content-addressed hash reference; mode resolution requires
     /// a CAS lookup of the full descriptor.
     pub fn to_text(&self) -> String {
-        CODEC.to_text(self.merkle_root())
+        WIRE_KERNEL.to_text(self.merkle_root())
     }
 
     /// Return the raw binary form (33 bytes).
@@ -437,8 +488,49 @@ impl KeySetIdV1 {
     /// Returns `None` when parsed from text via
     /// [`parse_text`](Self::parse_text), because the text form
     /// `kset:v1:blake3:<hex>` does not encode the mode.
-    pub fn set_tag(&self) -> Option<SetTag> {
-        SetTag::from_byte(self.binary[0]).ok()
+    pub const fn set_tag(&self) -> Option<SetTag> {
+        self.set_tag
+    }
+
+    /// Return semantic completeness for this identity value.
+    pub const fn semantic_completeness(&self) -> IdentitySemanticCompleteness {
+        self.completeness
+    }
+
+    /// Return whether mode semantics are fully resolved.
+    pub const fn is_resolved(&self) -> bool {
+        matches!(self.completeness, IdentitySemanticCompleteness::Resolved)
+    }
+
+    /// Return resolved set-tag semantics or fail closed if unresolved.
+    pub fn resolved_set_tag(&self) -> Result<SetTag, KeyIdError> {
+        self.set_tag.ok_or(KeyIdError::ResolutionRequired {
+            identity: "KeySetIdV1",
+        })
+    }
+
+    /// Resolve digest-first semantics with a fail-closed resolver contract.
+    pub fn resolve_with<R: KeySetDigestResolver>(&self, resolver: &R) -> Result<Self, KeyIdError> {
+        if self.is_resolved() {
+            return Ok(self.clone());
+        }
+
+        let expected = *self.merkle_root();
+        let resolution = resolver.resolve_by_digest(&expected)?;
+        if resolution.merkle_root != expected {
+            return Err(KeyIdError::ResolutionDigestMismatch {
+                expected,
+                got: resolution.merkle_root,
+            });
+        }
+
+        let binary =
+            IdentityWireKernel::binary_from_tag_and_hash(resolution.set_tag.to_byte(), expected);
+        Ok(Self {
+            binary,
+            set_tag: Some(resolution.set_tag),
+            completeness: IdentitySemanticCompleteness::Resolved,
+        })
     }
 
     /// Return the 32-byte BLAKE3 merkle root.
@@ -453,6 +545,28 @@ impl KeySetIdV1 {
     pub const fn as_bytes(&self) -> &[u8; BINARY_LEN] {
         &self.binary
     }
+
+    fn from_wire_parse(parsed: IdentityWireParse) -> Self {
+        let set_tag = match parsed.wire_variant {
+            IdentityWireVariant::Hash32 => None,
+            IdentityWireVariant::Tagged33 => {
+                if matches!(
+                    parsed.state.completeness(),
+                    IdentitySemanticCompleteness::Resolved
+                ) {
+                    SetTag::from_byte(parsed.binary[0]).ok()
+                } else {
+                    None
+                }
+            },
+        };
+
+        Self {
+            binary: parsed.binary,
+            set_tag,
+            completeness: parsed.state.completeness(),
+        }
+    }
 }
 
 impl_digest_id_fmt!(KeySetIdV1, "KeySetIdV1");
@@ -460,7 +574,10 @@ impl_digest_id_fmt!(KeySetIdV1, "KeySetIdV1");
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{AlgorithmTag, PublicKeyIdV1};
+    use crate::identity::{
+        AlgorithmTag, IdentityParseProvenance, IdentitySemanticCompleteness, PublicKeyIdV1,
+        ResolvedKeySetSemantics,
+    };
 
     /// Helper: create a test key set with two Ed25519 members.
     fn make_test_keyset() -> KeySetIdV1 {
@@ -813,6 +930,156 @@ mod tests {
         let parsed = KeySetIdV1::parse_text(&text).unwrap();
         assert_eq!(parsed.set_tag(), None, "text-parsed IDs must have no tag");
         assert_eq!(id.set_tag(), Some(SetTag::Multisig));
+    }
+
+    #[test]
+    fn parse_text_state_is_explicitly_unresolved() {
+        let text = make_test_keyset().to_text();
+        let (parsed, state) = KeySetIdV1::parse_text_with_state(&text).unwrap();
+        assert_eq!(state.provenance(), IdentityParseProvenance::FromText);
+        assert_eq!(
+            state.completeness(),
+            IdentitySemanticCompleteness::Unresolved
+        );
+        assert_eq!(parsed.semantic_completeness(), state.completeness());
+        assert_eq!(parsed.set_tag(), None);
+    }
+
+    #[test]
+    fn parse_binary_state_is_resolved_for_tagged33() {
+        let tagged = make_test_keyset().to_binary();
+        let (parsed, state) = KeySetIdV1::from_binary_with_state(&tagged).unwrap();
+        assert_eq!(
+            state.provenance(),
+            IdentityParseProvenance::FromTaggedBinary
+        );
+        assert_eq!(state.completeness(), IdentitySemanticCompleteness::Resolved);
+        assert_eq!(parsed.semantic_completeness(), state.completeness());
+        assert_eq!(parsed.set_tag(), Some(SetTag::Multisig));
+    }
+
+    #[test]
+    fn parse_binary_state_is_unresolved_for_hash32() {
+        let tagged = make_test_keyset();
+        let (parsed, state) = KeySetIdV1::from_binary_with_state(tagged.merkle_root()).unwrap();
+        assert_eq!(
+            state.provenance(),
+            IdentityParseProvenance::FromHashOnlyBinary
+        );
+        assert_eq!(
+            state.completeness(),
+            IdentitySemanticCompleteness::Unresolved
+        );
+        assert_eq!(parsed.semantic_completeness(), state.completeness());
+        assert_eq!(parsed.set_tag(), None);
+    }
+
+    struct MatchingResolver(SetTag);
+
+    impl KeySetDigestResolver for MatchingResolver {
+        fn resolve_by_digest(
+            &self,
+            merkle_root: &[u8; HASH_LEN],
+        ) -> Result<ResolvedKeySetSemantics, KeyIdError> {
+            Ok(ResolvedKeySetSemantics {
+                merkle_root: *merkle_root,
+                set_tag: self.0,
+            })
+        }
+    }
+
+    struct MissingResolver;
+
+    impl KeySetDigestResolver for MissingResolver {
+        fn resolve_by_digest(
+            &self,
+            _merkle_root: &[u8; HASH_LEN],
+        ) -> Result<ResolvedKeySetSemantics, KeyIdError> {
+            Err(KeyIdError::InvalidDescriptor {
+                reason: "missing keyset descriptor".to_string(),
+            })
+        }
+    }
+
+    struct MalformedResolver;
+
+    impl KeySetDigestResolver for MalformedResolver {
+        fn resolve_by_digest(
+            &self,
+            _merkle_root: &[u8; HASH_LEN],
+        ) -> Result<ResolvedKeySetSemantics, KeyIdError> {
+            Err(KeyIdError::InvalidDescriptor {
+                reason: "malformed keyset descriptor".to_string(),
+            })
+        }
+    }
+
+    struct StaleResolver;
+
+    impl KeySetDigestResolver for StaleResolver {
+        fn resolve_by_digest(
+            &self,
+            _merkle_root: &[u8; HASH_LEN],
+        ) -> Result<ResolvedKeySetSemantics, KeyIdError> {
+            Ok(ResolvedKeySetSemantics {
+                merkle_root: [0xFF; HASH_LEN],
+                set_tag: SetTag::Threshold,
+            })
+        }
+    }
+
+    struct PanicResolver;
+
+    impl KeySetDigestResolver for PanicResolver {
+        fn resolve_by_digest(
+            &self,
+            _merkle_root: &[u8; HASH_LEN],
+        ) -> Result<ResolvedKeySetSemantics, KeyIdError> {
+            panic!("resolver must not run for already-resolved IDs")
+        }
+    }
+
+    #[test]
+    fn digest_first_resolver_resolves_unresolved_id() {
+        let unresolved = KeySetIdV1::parse_text(&make_test_keyset().to_text()).unwrap();
+        assert!(!unresolved.is_resolved());
+
+        let resolved = unresolved
+            .resolve_with(&MatchingResolver(SetTag::Threshold))
+            .unwrap();
+        assert!(resolved.is_resolved());
+        assert_eq!(resolved.set_tag(), Some(SetTag::Threshold));
+        assert_eq!(resolved.merkle_root(), unresolved.merkle_root());
+    }
+
+    #[test]
+    fn digest_first_resolver_missing_descriptor_fails_closed() {
+        let unresolved = KeySetIdV1::parse_text(&make_test_keyset().to_text()).unwrap();
+        let err = unresolved.resolve_with(&MissingResolver).unwrap_err();
+        assert!(matches!(err, KeyIdError::InvalidDescriptor { .. }));
+        assert_eq!(unresolved.set_tag(), None);
+        assert!(!unresolved.is_resolved());
+    }
+
+    #[test]
+    fn digest_first_resolver_malformed_descriptor_fails_closed() {
+        let unresolved = KeySetIdV1::parse_text(&make_test_keyset().to_text()).unwrap();
+        let err = unresolved.resolve_with(&MalformedResolver).unwrap_err();
+        assert!(matches!(err, KeyIdError::InvalidDescriptor { .. }));
+    }
+
+    #[test]
+    fn digest_first_resolver_stale_digest_fails_closed() {
+        let unresolved = KeySetIdV1::parse_text(&make_test_keyset().to_text()).unwrap();
+        let err = unresolved.resolve_with(&StaleResolver).unwrap_err();
+        assert!(matches!(err, KeyIdError::ResolutionDigestMismatch { .. }));
+    }
+
+    #[test]
+    fn digest_first_resolver_not_called_for_resolved_id() {
+        let resolved = make_test_keyset();
+        let again = resolved.resolve_with(&PanicResolver).unwrap();
+        assert_eq!(again, resolved);
     }
 
     // --- Descriptor validation tests ---

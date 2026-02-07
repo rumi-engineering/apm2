@@ -16,6 +16,9 @@ use xshell::{Shell, cmd};
 use crate::reviewer_state::{ReviewerSpawner, select_review_model};
 use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_ticket_branch};
 
+const PUSH_STATUS_PROJECTION_NOTICE: &str =
+    "    [TCK-00411] Projection-only: xtask does not create commit statuses directly.";
+
 /// Push branch and create PR.
 ///
 /// This function:
@@ -312,16 +315,15 @@ fn create_pr(sh: &Shell, branch_name: &str, ticket_id: &str) -> Result<String> {
 /// Trigger AI reviews for the PR.
 ///
 /// This function:
-/// 1. Creates PENDING status checks for both reviews (blocks merge until
-///    complete)
+/// 1. Records projection-only pending status intent for both reviews
 /// 2. Spawns background processes to run security review (Codex) and code
 ///    quality review (Codex) using the prompts from `documents/reviews/`
 /// 3. Writes reviewer state to `~/.apm2/reviewer_state.json` for health
 ///    monitoring
 /// 4. Redirects reviewer output to log files for mtime-based activity detection
 ///
-/// The AI reviewers are responsible for updating their status to
-/// success/failure.
+/// Authoritative review statuses are produced by projection/review-gate paths,
+/// not by direct xtask status writes.
 ///
 /// # Arguments
 ///
@@ -357,9 +359,8 @@ fn trigger_ai_reviews(
         println!("  Warning: Code quality review prompt not found at {code_quality_prompt_path}");
     }
 
-    // Create PENDING status checks BEFORE spawning reviewers
-    // This ensures GitHub knows to wait for these checks before allowing merge
-    println!("  Creating pending status checks...");
+    // Record projection-only review status intent before spawning reviewers.
+    println!("  Recording projection-only review status intent...");
 
     // Get owner/repo from git remote
     let remote_url = cmd!(sh, "git remote get-url origin")
@@ -441,7 +442,7 @@ fn parse_owner_repo(remote_url: &str) -> &str {
     }
 }
 
-/// Log that pending status checks would have been created (writes are removed).
+/// Log projection-only pending status intent (direct writes removed).
 ///
 /// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
@@ -463,26 +464,19 @@ fn create_pending_statuses(
     // check_status_write_allowed always returns Removed as of TCK-00297.
     match check_status_write_allowed() {
         StatusWriteDecision::Removed => {
-            println!(
-                "    [TCK-00297] GitHub status writes removed. Would have created pending statuses on {owner_repo}@{head_sha}:"
-            );
+            println!("{PUSH_STATUS_PROJECTION_NOTICE}");
+            println!("    Target commit: {owner_repo}@{head_sha}");
             println!("      - ai-review/security  = pending (Waiting for security review)");
             println!("      - ai-review/code-quality = pending (Waiting for code quality review)");
             crate::util::print_status_writes_removed_notice();
         },
-        // Legacy variants preserved for backwards compatibility but never returned.
-        StatusWriteDecision::SkipHefProjection => {
-            println!("    [HEF] Skipping pending status creation (USE_HEF_PROJECTION=true)");
-        },
-        StatusWriteDecision::EmitReceiptOnly => {
-            println!("    [TCK-00297] Status writes removed (emit-receipt-only path disabled).");
-        },
-        StatusWriteDecision::BlockStrictMode => {
-            println!("    [STRICT] Status writes blocked.");
-        },
-        StatusWriteDecision::Proceed => {
-            // TCK-00297: Even if somehow reached, do not write.
-            println!("    [TCK-00297] GitHub status writes removed. Pending statuses not created.");
+        // Legacy variants are inert after TCK-00297; keep projection-only output.
+        legacy_decision => {
+            println!("{PUSH_STATUS_PROJECTION_NOTICE}");
+            println!(
+                "    [TCK-00297] Ignoring legacy status decision: {legacy_decision:?}. \
+                 No status write performed."
+            );
         },
     }
 }
@@ -779,5 +773,17 @@ ticket_meta:
         unsafe {
             std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
         }
+    }
+
+    #[test]
+    fn test_push_status_projection_notice_mentions_projection_only() {
+        assert!(
+            PUSH_STATUS_PROJECTION_NOTICE.contains("Projection-only"),
+            "Push status notice must explicitly state projection-only semantics"
+        );
+        assert!(
+            PUSH_STATUS_PROJECTION_NOTICE.contains("does not create commit statuses directly"),
+            "Push status notice must state direct status creation is disabled"
+        );
     }
 }

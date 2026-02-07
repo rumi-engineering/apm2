@@ -31,15 +31,44 @@
 
 use std::fmt;
 
-use super::canonical_digest_id_kit::{CanonicalDigestIdKit, impl_digest_id_fmt};
-use super::{BINARY_LEN, HASH_LEN, KeyIdError};
+use super::canonical_digest_id_kit::{IdentityWireKernel, impl_digest_id_fmt};
+use super::{
+    BINARY_LEN, HASH_LEN, IdentityDerivationSemantics, IdentityParseState,
+    IdentityResolutionSemantics, IdentitySemanticCompleteness, IdentitySpec, IdentityTagSemantics,
+    IdentityTextTagPolicy, IdentityWireFormSemantics, KeyIdError,
+};
 
 /// Prefix for `PublicKeyIdV1` text form (RFC-0020 canonical grammar).
 const PREFIX: &str = "pkid:v1:ed25519:blake3:";
-const CODEC: CanonicalDigestIdKit = CanonicalDigestIdKit::new(PREFIX);
 
 /// Domain separation string for BLAKE3 key hashing.
 const DOMAIN_SEPARATION: &[u8] = b"apm2:pkid:v1\0";
+
+fn validate_public_key_tag(tag: u8) -> Result<IdentitySemanticCompleteness, KeyIdError> {
+    match AlgorithmTag::from_byte(tag) {
+        Ok(_) => Ok(IdentitySemanticCompleteness::Resolved),
+        Err(err) => Err(err),
+    }
+}
+
+const PUBLIC_KEY_ID_SPEC: IdentitySpec = IdentitySpec {
+    text_prefix: PREFIX,
+    wire_form: IdentityWireFormSemantics::Tagged33Only,
+    tag_semantics: IdentityTagSemantics::AlgorithmRegistry {
+        registry: "AlgorithmTag",
+    },
+    derivation_semantics: IdentityDerivationSemantics::DomainSeparatedDigest {
+        domain_separator: "apm2:pkid:v1\\0 + algorithm + '\\n' + key_bytes",
+    },
+    resolution_semantics: IdentityResolutionSemantics::SelfContained,
+    text_tag_policy: IdentityTextTagPolicy::FixedTag {
+        tag: AlgorithmTag::Ed25519 as u8,
+    },
+    unresolved_compat_tag: None,
+    validate_tag: validate_public_key_tag,
+};
+
+const WIRE_KERNEL: IdentityWireKernel = IdentityWireKernel::new(&PUBLIC_KEY_ID_SPEC);
 
 /// Known algorithm tag values.
 ///
@@ -150,22 +179,41 @@ impl PublicKeyIdV1 {
     /// - Known algorithm tag (fail-closed)
     /// - Exactly 64 hex characters (32 bytes)
     pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
-        let binary = CODEC.parse_text_binary_with_tag(input, AlgorithmTag::Ed25519.to_byte())?;
-        Ok(Self { binary })
+        Self::parse_text_with_state(input).map(|(id, _)| id)
+    }
+
+    /// Parse from canonical text and return explicit parse state metadata.
+    pub fn parse_text_with_state(input: &str) -> Result<(Self, IdentityParseState), KeyIdError> {
+        let parsed = WIRE_KERNEL.parse_text(input)?;
+        Ok((
+            Self {
+                binary: parsed.binary,
+            },
+            parsed.state,
+        ))
     }
 
     /// Construct from raw binary form (1-byte tag + 32-byte hash).
     ///
     /// Validates the algorithm tag (fail-closed) and exact length.
     pub fn from_binary(bytes: &[u8]) -> Result<Self, KeyIdError> {
-        let binary =
-            CODEC.parse_binary_exact(bytes, |tag| AlgorithmTag::from_byte(tag).map(|_| ()))?;
-        Ok(Self { binary })
+        Self::from_binary_with_state(bytes).map(|(id, _)| id)
+    }
+
+    /// Parse from binary and return explicit parse state metadata.
+    pub fn from_binary_with_state(bytes: &[u8]) -> Result<(Self, IdentityParseState), KeyIdError> {
+        let parsed = WIRE_KERNEL.parse_binary(bytes)?;
+        Ok((
+            Self {
+                binary: parsed.binary,
+            },
+            parsed.state,
+        ))
     }
 
     /// Return the canonical text form: `pkid:v1:ed25519:blake3:<64-hex>`.
     pub fn to_text(&self) -> String {
-        CODEC.to_text(self.key_hash())
+        WIRE_KERNEL.to_text(self.key_hash())
     }
 
     /// Return the raw binary form (33 bytes).
@@ -198,6 +246,7 @@ impl_digest_id_fmt!(PublicKeyIdV1, "PublicKeyIdV1");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{IdentityParseProvenance, IdentitySemanticCompleteness};
 
     /// Helper: create a known Ed25519 key ID for testing.
     fn make_test_id() -> PublicKeyIdV1 {
@@ -219,6 +268,27 @@ mod tests {
         let binary = id.to_binary();
         let from_bin = PublicKeyIdV1::from_binary(&binary).unwrap();
         assert_eq!(id, from_bin);
+    }
+
+    #[test]
+    fn parse_state_from_text_is_resolved() {
+        let id = make_test_id();
+        let (parsed, state) = PublicKeyIdV1::parse_text_with_state(&id.to_text()).unwrap();
+        assert_eq!(state.provenance(), IdentityParseProvenance::FromText);
+        assert_eq!(state.completeness(), IdentitySemanticCompleteness::Resolved);
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn parse_state_from_tagged_binary_is_resolved() {
+        let id = make_test_id();
+        let (parsed, state) = PublicKeyIdV1::from_binary_with_state(&id.to_binary()).unwrap();
+        assert_eq!(
+            state.provenance(),
+            IdentityParseProvenance::FromTaggedBinary
+        );
+        assert_eq!(state.completeness(), IdentitySemanticCompleteness::Resolved);
+        assert_eq!(parsed, id);
     }
 
     #[test]

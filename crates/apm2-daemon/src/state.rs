@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use apm2_core::config::{AdapterRotationConfig, AdapterRotationStrategyConfig, EcosystemConfig};
-use apm2_core::credentials::CredentialStore;
+use apm2_core::credentials::{AuthMethod, CredentialProfile, CredentialStore, ProfileId, Provider};
 use apm2_core::fac::{
     AdapterSelectionPolicy, AdapterSelectionStrategy, CLAUDE_CODE_PROFILE_ID,
     GEMINI_CLI_PROFILE_ID, LOCAL_INFERENCE_PROFILE_ID, ProfileWeight, all_builtin_profiles,
@@ -28,6 +28,7 @@ use apm2_core::schema_registry::InMemorySchemaRegistry;
 use apm2_core::supervisor::Supervisor;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::RwLock;
 
 use crate::cas::{DurableCas, DurableCasConfig, DurableCasError};
@@ -39,8 +40,11 @@ use crate::episode::handlers::{
 };
 use crate::episode::{
     CapabilityManifest, EpisodeRuntime, EpisodeRuntimeConfig, InMemorySessionRegistry,
-    PersistentRegistryError, PersistentSessionRegistry, SharedToolBroker, ToolBrokerConfig,
-    new_shared_broker_with_cas,
+    PersistentRegistryError, PersistentSessionRegistry, SessionBrokerRegistry,
+    SharedSessionBrokerRegistry, ToolBrokerConfig,
+};
+use crate::evidence::keychain::{
+    GitHubCredentialStore, KeychainError, MAX_SSH_AUTH_SOCK_LEN, MAX_TOKEN_SIZE, SshCredentialStore,
 };
 use crate::gate::{GateOrchestrator, GateOrchestratorEvent, MergeExecutor, SessionTerminatedInfo};
 use crate::governance::{
@@ -165,6 +169,199 @@ fn build_adapter_selection_policy(
     }
 
     Ok((policy, available_profile_hashes))
+}
+
+const GITHUB_PROFILE_PREFIX: &str = "github-installation:";
+const SSH_PROFILE_PREFIX: &str = "ssh-session:";
+
+#[derive(Clone)]
+struct CredentialStoreGitHubAdapter {
+    store: Arc<CredentialStore>,
+}
+
+impl CredentialStoreGitHubAdapter {
+    const fn new(store: Arc<CredentialStore>) -> Self {
+        Self { store }
+    }
+
+    fn profile_id(installation_id: &str) -> ProfileId {
+        ProfileId::new(format!("{GITHUB_PROFILE_PREFIX}{installation_id}"))
+    }
+}
+
+impl GitHubCredentialStore for CredentialStoreGitHubAdapter {
+    fn store_token(&self, installation_id: &str, token: &str) -> Result<(), KeychainError> {
+        if token.len() > MAX_TOKEN_SIZE {
+            return Err(KeychainError::TokenTooLarge {
+                size: token.len(),
+                max: MAX_TOKEN_SIZE,
+            });
+        }
+
+        let profile = CredentialProfile::new(
+            Self::profile_id(installation_id),
+            Provider::Custom,
+            AuthMethod::ApiKey {
+                key: SecretString::from(token.to_string()),
+            },
+        );
+
+        self.store.store(profile).map_err(|e| match e {
+            apm2_core::credentials::CredentialStoreError::NotFound(_) => KeychainError::NotFound {
+                key_id: installation_id.to_string(),
+            },
+            apm2_core::credentials::CredentialStoreError::LockPoisoned => {
+                KeychainError::LockPoisoned
+            },
+            apm2_core::credentials::CredentialStoreError::Keyring(msg)
+            | apm2_core::credentials::CredentialStoreError::Serialization(msg) => {
+                KeychainError::Keychain(msg)
+            },
+        })
+    }
+
+    fn get_token(&self, installation_id: &str) -> Result<String, KeychainError> {
+        let profile = self
+            .store
+            .get(&Self::profile_id(installation_id))
+            .map_err(|e| match e {
+                apm2_core::credentials::CredentialStoreError::NotFound(_) => {
+                    KeychainError::NotFound {
+                        key_id: installation_id.to_string(),
+                    }
+                },
+                apm2_core::credentials::CredentialStoreError::LockPoisoned => {
+                    KeychainError::LockPoisoned
+                },
+                apm2_core::credentials::CredentialStoreError::Keyring(msg)
+                | apm2_core::credentials::CredentialStoreError::Serialization(msg) => {
+                    KeychainError::Keychain(msg)
+                },
+            })?;
+
+        let token = match profile.auth {
+            AuthMethod::ApiKey { key } => key.expose_secret().to_string(),
+            AuthMethod::OAuth { access_token, .. } => access_token.expose_secret().to_string(),
+            AuthMethod::SessionToken { token, .. } => token.expose_secret().to_string(),
+        };
+        Ok(token)
+    }
+
+    fn delete_token(&self, installation_id: &str) -> Result<(), KeychainError> {
+        match self.store.remove(&Self::profile_id(installation_id)) {
+            Ok(()) | Err(apm2_core::credentials::CredentialStoreError::NotFound(_)) => Ok(()),
+            Err(apm2_core::credentials::CredentialStoreError::LockPoisoned) => {
+                Err(KeychainError::LockPoisoned)
+            },
+            Err(
+                apm2_core::credentials::CredentialStoreError::Keyring(msg)
+                | apm2_core::credentials::CredentialStoreError::Serialization(msg),
+            ) => Err(KeychainError::Keychain(msg)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CredentialStoreSshAdapter {
+    store: Arc<CredentialStore>,
+}
+
+impl CredentialStoreSshAdapter {
+    const fn new(store: Arc<CredentialStore>) -> Self {
+        Self { store }
+    }
+
+    fn profile_id(session_id: &str) -> ProfileId {
+        ProfileId::new(format!("{SSH_PROFILE_PREFIX}{session_id}"))
+    }
+}
+
+impl SshCredentialStore for CredentialStoreSshAdapter {
+    fn store_ssh_auth_sock(
+        &self,
+        session_id: &str,
+        auth_sock_path: &str,
+    ) -> Result<(), KeychainError> {
+        if auth_sock_path.len() > MAX_SSH_AUTH_SOCK_LEN {
+            return Err(KeychainError::SshAuthSockTooLong {
+                len: auth_sock_path.len(),
+                max: MAX_SSH_AUTH_SOCK_LEN,
+            });
+        }
+
+        let profile = CredentialProfile::new(
+            Self::profile_id(session_id),
+            Provider::Custom,
+            AuthMethod::SessionToken {
+                token: SecretString::from(auth_sock_path.to_string()),
+                cookie_jar: None,
+                expires_at: None,
+            },
+        );
+
+        self.store.store(profile).map_err(|e| match e {
+            apm2_core::credentials::CredentialStoreError::NotFound(_) => KeychainError::NotFound {
+                key_id: session_id.to_string(),
+            },
+            apm2_core::credentials::CredentialStoreError::LockPoisoned => {
+                KeychainError::LockPoisoned
+            },
+            apm2_core::credentials::CredentialStoreError::Keyring(msg)
+            | apm2_core::credentials::CredentialStoreError::Serialization(msg) => {
+                KeychainError::Keychain(msg)
+            },
+        })
+    }
+
+    fn get_ssh_auth_sock(&self, session_id: &str) -> Result<String, KeychainError> {
+        let profile = self
+            .store
+            .get(&Self::profile_id(session_id))
+            .map_err(|e| match e {
+                apm2_core::credentials::CredentialStoreError::NotFound(_) => {
+                    KeychainError::NotFound {
+                        key_id: session_id.to_string(),
+                    }
+                },
+                apm2_core::credentials::CredentialStoreError::LockPoisoned => {
+                    KeychainError::LockPoisoned
+                },
+                apm2_core::credentials::CredentialStoreError::Keyring(msg)
+                | apm2_core::credentials::CredentialStoreError::Serialization(msg) => {
+                    KeychainError::Keychain(msg)
+                },
+            })?;
+
+        let path = match profile.auth {
+            AuthMethod::SessionToken { token, .. } => token.expose_secret().to_string(),
+            AuthMethod::ApiKey { key } => key.expose_secret().to_string(),
+            AuthMethod::OAuth { access_token, .. } => access_token.expose_secret().to_string(),
+        };
+        Ok(path)
+    }
+
+    fn clear_ssh_auth_sock(&self, session_id: &str) -> Result<(), KeychainError> {
+        match self.store.remove(&Self::profile_id(session_id)) {
+            Ok(()) | Err(apm2_core::credentials::CredentialStoreError::NotFound(_)) => Ok(()),
+            Err(apm2_core::credentials::CredentialStoreError::LockPoisoned) => {
+                Err(KeychainError::LockPoisoned)
+            },
+            Err(
+                apm2_core::credentials::CredentialStoreError::Keyring(msg)
+                | apm2_core::credentials::CredentialStoreError::Serialization(msg),
+            ) => Err(KeychainError::Keychain(msg)),
+        }
+    }
+
+    fn is_ssh_agent_available(&self) -> bool {
+        self.get_daemon_ssh_auth_sock().is_some()
+    }
+
+    fn get_daemon_ssh_auth_sock(&self) -> Option<String> {
+        std::env::var("SSH_AUTH_SOCK")
+            .ok()
+            .filter(|path| std::path::Path::new(path).exists())
+    }
 }
 
 #[cfg(not(test))]
@@ -656,7 +853,10 @@ impl DispatcherState {
             )
             // TCK-00352: Wire V1 manifest store into production path
             .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
-            // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
+            // TCK-00399: Wire adapter registry for agent CLI process spawning.
+            // CAS is intentionally not wired in this constructor: fail-closed
+            // publish/ingest handlers require explicit CAS configuration via
+            // with_persistence_and_cas().
             .with_adapter_registry(adapter_registry)
             .with_cas(cas)
             .with_adapter_selection_policy(
@@ -856,10 +1056,6 @@ impl DispatcherState {
         let evidence_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
             Arc::clone(&durable_cas) as Arc<dyn apm2_core::evidence::ContentAddressedStore>;
 
-        // TCK-00316: Create ToolBroker with CAS
-        let broker: SharedToolBroker<StubManifestLoader> =
-            new_shared_broker_with_cas(ToolBrokerConfig::default(), Arc::clone(&cas));
-
         // TCK-00289: Create shared HolonicClock
         let clock =
             Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
@@ -966,6 +1162,14 @@ impl DispatcherState {
 
         // TCK-00343: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
+        let broker_github_store: Arc<dyn GitHubCredentialStore> = Arc::new(
+            CredentialStoreGitHubAdapter::new(Arc::clone(&credential_store)),
+        );
+        let broker_ssh_store: Arc<dyn SshCredentialStore> = Arc::new(
+            CredentialStoreSshAdapter::new(Arc::clone(&credential_store)),
+        );
+        let session_broker_registry: SharedSessionBrokerRegistry<StubManifestLoader> =
+            Arc::new(SessionBrokerRegistry::new());
 
         // TCK-00352: Create shared V1 manifest store for scope enforcement
         let v1_manifest_store = Arc::new(V1ManifestStore::new());
@@ -986,6 +1190,11 @@ impl DispatcherState {
             Arc::clone(&subscription_registry),
         )
         .with_credential_store(credential_store)
+        .with_session_broker_registry(Arc::clone(&session_broker_registry))
+        .with_broker_config(ToolBrokerConfig::default())
+        .with_broker_cas(Arc::clone(&cas))
+        .with_broker_github_store(Arc::clone(&broker_github_store))
+        .with_broker_ssh_store(Arc::clone(&broker_ssh_store))
         // TCK-00408: Wire CAS into privileged dispatcher for fail-closed
         // ingest/publish validation. Uses the core evidence trait impl.
         .with_cas(Arc::clone(&evidence_cas))
@@ -1051,7 +1260,7 @@ impl DispatcherState {
                 .with_ledger(event_emitter)
                 .with_cas(cas)
                 .with_clock(clock)
-                .with_broker(broker)
+                .with_session_brokers(session_broker_registry)
                 .with_episode_runtime(episode_runtime)
                 .with_telemetry_store(telemetry_store)
                 .with_preactuation_gate(preactuation_gate)

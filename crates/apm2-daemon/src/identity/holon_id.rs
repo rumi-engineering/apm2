@@ -21,14 +21,17 @@
 use std::fmt;
 
 use super::canonical_digest_id_kit::{
-    CanonicalDigestIdKit, impl_digest_id_fmt, impl_version_tagged_digest_id,
+    IdentityWireKernel, impl_digest_id_fmt, impl_version_tagged_digest_id,
 };
 use super::cell_id::CellIdV1;
-use super::{AlgorithmTag, BINARY_LEN, HASH_LEN, KeyIdError, PublicKeyIdV1};
+use super::{
+    AlgorithmTag, BINARY_LEN, HASH_LEN, IdentityDerivationSemantics, IdentityParseState,
+    IdentityResolutionSemantics, IdentitySemanticCompleteness, IdentitySpec, IdentityTagSemantics,
+    IdentityTextTagPolicy, IdentityWireFormSemantics, KeyIdError, PublicKeyIdV1,
+};
 
 /// Canonical text prefix for `HolonIdV1`.
 const PREFIX: &str = "holon:v1:blake3:";
-const CODEC: CanonicalDigestIdKit = CanonicalDigestIdKit::new(PREFIX);
 
 /// Domain separator for `HolonIdV1` derivation (HSI 1.7.4).
 const DOMAIN_SEPARATION: &[u8] = b"apm2:holon_id:v1\0";
@@ -38,6 +41,33 @@ const GENESIS_DOMAIN_SEPARATION: &[u8] = b"apm2:holon_genesis:v1\0";
 
 /// Version tag byte for V1 binary form.
 const VERSION_TAG_V1: u8 = 0x01;
+
+const fn validate_holon_version_tag(tag: u8) -> Result<IdentitySemanticCompleteness, KeyIdError> {
+    if tag == VERSION_TAG_V1 {
+        Ok(IdentitySemanticCompleteness::Resolved)
+    } else {
+        Err(KeyIdError::UnknownVersionTag { tag })
+    }
+}
+
+const HOLON_ID_SPEC: IdentitySpec = IdentitySpec {
+    text_prefix: PREFIX,
+    wire_form: IdentityWireFormSemantics::Tagged33Only,
+    tag_semantics: IdentityTagSemantics::FixedVersionTag {
+        tag: VERSION_TAG_V1,
+    },
+    derivation_semantics: IdentityDerivationSemantics::DomainSeparatedDigest {
+        domain_separator: "apm2:holon_id:v1\\0 + cell_id_hash + holon_genesis_public_key_id",
+    },
+    resolution_semantics: IdentityResolutionSemantics::SelfContained,
+    text_tag_policy: IdentityTextTagPolicy::FixedTag {
+        tag: VERSION_TAG_V1,
+    },
+    unresolved_compat_tag: None,
+    validate_tag: validate_holon_version_tag,
+};
+
+const WIRE_KERNEL: IdentityWireKernel = IdentityWireKernel::new(&HOLON_ID_SPEC);
 
 /// Presence bitmap bit: optional `purpose` is present.
 const PURPOSE_PRESENT_BIT: u8 = 0b0000_0001;
@@ -267,7 +297,29 @@ impl HolonIdV1 {
         Self { binary }
     }
 
-    impl_version_tagged_digest_id!(CODEC, VERSION_TAG_V1, holon_hash);
+    /// Parse from canonical text and return explicit parse state metadata.
+    pub fn parse_text_with_state(input: &str) -> Result<(Self, IdentityParseState), KeyIdError> {
+        let parsed = WIRE_KERNEL.parse_text(input)?;
+        Ok((
+            Self {
+                binary: parsed.binary,
+            },
+            parsed.state,
+        ))
+    }
+
+    /// Parse from binary and return explicit parse state metadata.
+    pub fn from_binary_with_state(bytes: &[u8]) -> Result<(Self, IdentityParseState), KeyIdError> {
+        let parsed = WIRE_KERNEL.parse_binary(bytes)?;
+        Ok((
+            Self {
+                binary: parsed.binary,
+            },
+            parsed.state,
+        ))
+    }
+
+    impl_version_tagged_digest_id!(WIRE_KERNEL, VERSION_TAG_V1, holon_hash);
 }
 
 impl_digest_id_fmt!(HolonIdV1, "HolonIdV1");
@@ -335,7 +387,9 @@ fn validate_created_anchor(anchor: &str) -> Result<(), KeyIdError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{CellGenesisV1, PolicyRootId};
+    use crate::identity::{
+        CellGenesisV1, IdentityParseProvenance, IdentitySemanticCompleteness, PolicyRootId,
+    };
 
     fn make_public_key_bytes(fill: u8) -> Vec<u8> {
         vec![fill; 32]
@@ -502,6 +556,27 @@ mod tests {
         let text = id.to_text();
         let parsed = HolonIdV1::parse_text(&text).unwrap();
         assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn parse_state_from_text_is_resolved() {
+        let id = HolonIdV1::from_genesis(&make_holon_genesis());
+        let (parsed, state) = HolonIdV1::parse_text_with_state(&id.to_text()).unwrap();
+        assert_eq!(parsed, id);
+        assert_eq!(state.provenance(), IdentityParseProvenance::FromText);
+        assert_eq!(state.completeness(), IdentitySemanticCompleteness::Resolved);
+    }
+
+    #[test]
+    fn parse_state_from_tagged_binary_is_resolved() {
+        let id = HolonIdV1::from_genesis(&make_holon_genesis());
+        let (parsed, state) = HolonIdV1::from_binary_with_state(&id.to_binary()).unwrap();
+        assert_eq!(parsed, id);
+        assert_eq!(
+            state.provenance(),
+            IdentityParseProvenance::FromTaggedBinary
+        );
+        assert_eq!(state.completeness(), IdentitySemanticCompleteness::Resolved);
     }
 
     #[test]

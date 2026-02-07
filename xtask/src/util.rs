@@ -196,23 +196,8 @@ pub fn use_hef_projection() -> bool {
 }
 
 // =============================================================================
-// Status Write Gating (TCK-00296 + TCK-00324)
+// Status Write Contract (TCK-00297)
 // =============================================================================
-
-/// Name of the environment variable enabling strict mode.
-///
-/// Per TCK-00296, strict mode enforces fail-closed behavior for GitHub status
-/// writes. When enabled, status writes require explicit opt-in via
-/// `XTASK_ALLOW_STATUS_WRITES=true`.
-pub const XTASK_STRICT_MODE_ENV: &str = "XTASK_STRICT_MODE";
-
-/// Name of the environment variable allowing status writes in strict mode.
-///
-/// Per TCK-00296, this flag must be explicitly set to "true" to allow GitHub
-/// status writes when `XTASK_STRICT_MODE=true`. This is the "dev flag" that
-/// enables development workflows while maintaining fail-closed security
-/// posture.
-pub const XTASK_ALLOW_STATUS_WRITES_ENV: &str = "XTASK_ALLOW_STATUS_WRITES";
 
 // =============================================================================
 // Cutover Policy Propagation (TCK-00408)
@@ -355,48 +340,16 @@ pub fn allow_github_write_from_env() -> bool {
         .unwrap_or(false)
 }
 
-/// Checks if strict mode is enabled.
-///
-/// Returns `true` if the `XTASK_STRICT_MODE` environment variable is set to
-/// "true" (case-insensitive).
-///
-/// Per TCK-00296:
-/// - Default is `false` (non-strict mode) to preserve existing dev workflows.
-/// - When `true`, status writes are blocked unless `XTASK_ALLOW_STATUS_WRITES`
-///   is explicitly set.
-pub fn is_strict_mode() -> bool {
-    std::env::var(XTASK_STRICT_MODE_ENV)
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false)
-}
-
-/// Checks if status writes are explicitly allowed.
-///
-/// Returns `true` if the `XTASK_ALLOW_STATUS_WRITES` environment variable is
-/// set to "true" (case-insensitive).
-///
-/// Per TCK-00296, this flag is only meaningful in strict mode. It provides
-/// explicit opt-in for development workflows.
-pub fn allow_status_writes() -> bool {
-    std::env::var(XTASK_ALLOW_STATUS_WRITES_ENV)
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false)
-}
-
 /// Result of checking whether status writes should proceed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusWriteDecision {
-    /// Proceed with the status write (may include warning).
+    /// Legacy placeholder variant retained for compatibility.
     Proceed,
-    /// Skip the status write (`USE_HEF_PROJECTION=true`).
+    /// Legacy placeholder variant retained for compatibility.
     SkipHefProjection,
-    /// Block the status write (strict mode without allow flag).
+    /// Legacy placeholder variant retained for compatibility.
     BlockStrictMode,
-    /// Emit receipt only, do NOT write directly to GitHub (TCK-00324).
-    ///
-    /// When this is returned, xtask should emit an internal receipt and
-    /// return without performing the direct GitHub API call. The projection
-    /// worker will handle the actual write.
+    /// Legacy placeholder variant retained for compatibility.
     EmitReceiptOnly,
     /// Status writes permanently removed (TCK-00297, Stage X3).
     ///
@@ -418,8 +371,8 @@ pub enum StatusWriteDecision {
 /// non-authoritative development scaffolding and must not write GitHub
 /// statuses.
 ///
-/// The previous gating logic (TCK-00296 strict mode, TCK-00309 HEF projection,
-/// TCK-00324 cutover stage 1) is superseded by this unconditional removal.
+/// Legacy status-write gates (HEF/cutover/strict-era controls) are superseded
+/// by this unconditional removal.
 ///
 /// # Returns
 ///
@@ -442,8 +395,7 @@ pub enum StatusWriteDecision {
 pub const fn check_status_write_allowed() -> StatusWriteDecision {
     // TCK-00297 (Stage X3): Direct GitHub status writes are permanently removed.
     // Replacement paths (daemon projection, FAC v0 harness) are live.
-    // All previous gating logic (strict mode, HEF projection flag, cutover) is
-    // superseded.
+    // Legacy gating logic is superseded.
     StatusWriteDecision::Removed
 }
 
@@ -471,20 +423,18 @@ pub const fn check_status_write_with_flags(
     _allow_github_write_flag: bool,
 ) -> StatusWriteDecision {
     // TCK-00297 (Stage X3): Direct GitHub status writes are permanently removed.
-    // All previous gating logic (HEF projection, cutover, strict mode) is
-    // superseded.
+    // Legacy gating logic is superseded.
     StatusWriteDecision::Removed
 }
 
 /// Warning message printed when status writes are attempted.
 ///
 /// Per TCK-00297 (Stage X3), direct GitHub status writes are permanently
-/// removed. This message replaces the previous non-strict mode warning
-/// from TCK-00296.
+/// removed.
 pub const STATUS_WRITES_REMOVED_NOTICE: &str = r"
   [TCK-00297] Direct GitHub status writes have been permanently removed.
   Replacement paths: daemon projection (HEF), FAC v0 harness.
-  The previous XTASK_STRICT_MODE / XTASK_ALLOW_STATUS_WRITES flags are no longer used.
+  Status semantics are projection-only in xtask review/push flows.
 ";
 
 /// Prints notice that status writes have been removed.
@@ -984,62 +934,6 @@ mod tests {
     }
 
     // =============================================================================
-    // Status Write Gating Tests (TCK-00296)
-    // =============================================================================
-
-    #[test]
-    #[serial]
-    #[allow(unsafe_code)]
-    fn test_is_strict_mode_env_var() {
-        // SERIAL TEST: Modifies environment variables
-
-        // 1. Default (unset) -> false
-        unsafe { std::env::remove_var(XTASK_STRICT_MODE_ENV) };
-        assert!(!is_strict_mode(), "Default should be false");
-
-        // 2. "TRUE" -> true
-        unsafe { std::env::set_var(XTASK_STRICT_MODE_ENV, "TRUE") };
-        assert!(is_strict_mode(), "TRUE should be true");
-
-        // 3. "true" -> true
-        unsafe { std::env::set_var(XTASK_STRICT_MODE_ENV, "true") };
-        assert!(is_strict_mode(), "true should be true");
-
-        // 4. "false" -> false
-        unsafe { std::env::set_var(XTASK_STRICT_MODE_ENV, "false") };
-        assert!(!is_strict_mode(), "false should be false");
-
-        // Cleanup
-        unsafe { std::env::remove_var(XTASK_STRICT_MODE_ENV) };
-    }
-
-    #[test]
-    #[serial]
-    #[allow(unsafe_code)]
-    fn test_allow_status_writes_env_var() {
-        // SERIAL TEST: Modifies environment variables
-
-        // 1. Default (unset) -> false
-        unsafe { std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV) };
-        assert!(!allow_status_writes(), "Default should be false");
-
-        // 2. "TRUE" -> true
-        unsafe { std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "TRUE") };
-        assert!(allow_status_writes(), "TRUE should be true");
-
-        // 3. "true" -> true
-        unsafe { std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true") };
-        assert!(allow_status_writes(), "true should be true");
-
-        // 4. "false" -> false
-        unsafe { std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "false") };
-        assert!(!allow_status_writes(), "false should be false");
-
-        // Cleanup
-        unsafe { std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV) };
-    }
-
-    // =============================================================================
     // Status Write Removal Tests (TCK-00297, Stage X3)
     // =============================================================================
 
@@ -1056,8 +950,6 @@ mod tests {
         // 1. Default (no env vars set) -> Removed
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
-            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
         }
         assert_eq!(
             check_status_write_allowed(),
@@ -1075,57 +967,33 @@ mod tests {
             "HEF projection flag must not override Removed (TCK-00297)"
         );
 
-        // 3. Strict mode enabled -> still Removed (not BlockStrictMode)
+        // 3. HEF projection disabled again -> still Removed
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
-            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
         }
         assert_eq!(
             check_status_write_allowed(),
             StatusWriteDecision::Removed,
-            "Strict mode must not override Removed (TCK-00297)"
+            "Status write decision must remain Removed when legacy flags are unset"
         );
 
-        // 4. Strict mode + allow flag -> still Removed (not Proceed)
-        unsafe {
-            std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
-            std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true");
-        }
-        assert_eq!(
-            check_status_write_allowed(),
-            StatusWriteDecision::Removed,
-            "Strict mode + allow flag must not override Removed (TCK-00297)"
-        );
-
-        // 5. Non-strict mode + allow flag -> still Removed (not Proceed)
-        unsafe {
-            std::env::set_var(XTASK_STRICT_MODE_ENV, "false");
-            std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true");
-        }
-        assert_eq!(
-            check_status_write_allowed(),
-            StatusWriteDecision::Removed,
-            "Non-strict mode + allow must not override Removed (TCK-00297)"
-        );
-
-        // 6. All flags set -> still Removed
+        // 4. Legacy cutover flags set -> still Removed
         unsafe {
             std::env::set_var(USE_HEF_PROJECTION_ENV, "true");
-            std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
-            std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true");
+            std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
+            std::env::set_var(XTASK_ALLOW_GITHUB_WRITE_ENV, "true");
         }
         assert_eq!(
             check_status_write_allowed(),
             StatusWriteDecision::Removed,
-            "All flags set must still return Removed (TCK-00297)"
+            "All legacy flags set must still return Removed (TCK-00297)"
         );
 
         // Cleanup
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
-            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+            std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
         }
     }
 
@@ -1344,7 +1212,6 @@ mod tests {
         // TCK-00324 emit-receipt-only mode -> still Removed (TCK-00297)
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
             std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
             std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
         }
@@ -1358,7 +1225,6 @@ mod tests {
         // Cleanup
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
             std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
             std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
         }
@@ -1371,7 +1237,6 @@ mod tests {
         // TCK-00324 allow-github-write override -> still Removed (TCK-00297)
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
             std::env::set_var(XTASK_EMIT_RECEIPT_ONLY_ENV, "true");
             std::env::set_var(XTASK_ALLOW_GITHUB_WRITE_ENV, "true");
         }
@@ -1385,7 +1250,6 @@ mod tests {
         // Cleanup
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
             std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
             std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
         }
@@ -1398,7 +1262,6 @@ mod tests {
         // TCK-00297: CLI flags must not override Removed
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
             std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
             std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
         }
@@ -1427,7 +1290,6 @@ mod tests {
         // Cleanup
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
             std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
             std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV);
         }

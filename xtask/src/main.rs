@@ -30,7 +30,7 @@
 //! - `security-review-exec deny [TCK-XXXXX] --reason <reason>` - Deny PR with
 //!   reason
 //! - `aat <PR_URL>` - Run Agent Acceptance Testing on a PR
-//! - `aat <PR_URL> --dry-run` - Preview AAT without setting status
+//! - `aat <PR_URL> --dry-run` - Preview AAT without emitting status intent
 //! - `lint` - Check for anti-patterns (`temp_dir`, shell interpolation)
 //! - `lint --fix` - Check for anti-patterns (fix flag placeholder)
 //! - `capabilities` - Generate capability manifest for the binary
@@ -112,7 +112,7 @@ enum Commands {
         ///
         /// When enabled, xtask emits a projection request receipt and
         /// relies on the projection worker to perform the actual GitHub
-        /// API writes (status checks, comments).
+        /// API writes (for example PR comments).
         ///
         /// Also enabled via `XTASK_EMIT_RECEIPT_ONLY=true` environment
         /// variable.
@@ -197,12 +197,13 @@ enum Commands {
     /// testing. Parses the PR description, runs anti-gaming analysis,
     /// generates hypotheses, and produces an evidence bundle.
     ///
-    /// Sets the `aat/acceptance` status check based on the verdict.
+    /// Records `aat/acceptance` status intent (projection-only) based on the
+    /// verdict.
     Aat {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
 
-        /// Preview without setting status check or writing evidence
+        /// Preview without emitting status intent or writing evidence
         #[arg(long)]
         dry_run: bool,
 
@@ -261,9 +262,10 @@ enum Commands {
 /// Security review exec subcommands.
 #[derive(Subcommand)]
 enum SecurityReviewExecCommands {
-    /// Approve the PR (set ai-review/security to success).
+    /// Approve the PR (projection-only status semantics).
     ///
-    /// Posts an approval comment and updates the status check.
+    /// Posts (or projects) an approval comment and records security verdict
+    /// intent for projection/review-gate handling.
     /// If no ticket ID is provided, uses the current branch.
     Approve {
         /// Ticket ID (e.g., TCK-00049). If omitted, uses current branch.
@@ -283,9 +285,10 @@ enum SecurityReviewExecCommands {
         #[arg(long)]
         emit_internal: bool,
     },
-    /// Deny the PR (set ai-review/security to failure).
+    /// Deny the PR (projection-only status semantics).
     ///
-    /// Posts a denial comment with the reason and updates the status check.
+    /// Posts (or projects) a denial comment with the reason and records
+    /// security verdict intent for projection/review-gate handling.
     /// If no ticket ID is provided, uses the current branch.
     Deny {
         /// Ticket ID (e.g., TCK-00049). If omitted, uses current branch.
@@ -321,8 +324,8 @@ enum ReviewCommands {
     /// Run security review using Codex.
     ///
     /// Reads `SECURITY_REVIEW_PROMPT.md`, runs the review,
-    /// posts findings as a PR comment, and updates the
-    /// ai-review/security status check.
+    /// posts findings as a PR comment, and emits projection-only status intent
+    /// (no direct status write).
     Security {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
@@ -352,8 +355,8 @@ enum ReviewCommands {
     /// Run code quality review using Codex.
     ///
     /// Reads `CODE_QUALITY_PROMPT.md`, runs the review,
-    /// posts findings as a PR comment, and updates the
-    /// ai-review/code-quality status check.
+    /// posts findings as a PR comment, and emits projection-only status intent
+    /// (no direct status write).
     Quality {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
@@ -378,8 +381,8 @@ enum ReviewCommands {
 
     /// Run UAT (User Acceptance Testing) sign-off.
     ///
-    /// Posts an approval comment and updates the
-    /// ai-review/uat status check to success.
+    /// Posts an approval comment and records projection-only status intent for
+    /// ai-review/uat.
     Uat {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,

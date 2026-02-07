@@ -135,6 +135,12 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - ENFORCE BY: CI lint (grep) that rejects orphaned TODOs.
 - PROVENANCE: Prevents "temporary" hacks from becoming permanent load-bearing tech debt.
 
+[INVARIANT: INV-2627] Identity Boundaries Use Shared Spec-Driven Contracts.
+- REJECT IF: canonical identity parse/encode paths implement ad-hoc wire/tag handling instead of the shared identity abstraction (`IdentitySpec` + `IdentityWireKernel`) without an explicit documented waiver.
+- REJECT IF: digest-first identity forms silently coerce unresolved semantics into resolved semantics.
+- ENFORCE BY: define all four semantic axes (`wire_form`, `tag_semantics`, `derivation_semantics`, `resolution_semantics`) per identity type; use fail-closed resolver contracts where text omits semantics; preserve canonical text/binary acceptance boundaries.
+- PROVENANCE: RFC-0020 REQ-0007/REQ-0008 boundary determinism and fail-closed identity semantics.
+
 ## Anti-Patterns (Lessons Learned)
 
 ### ANTI-1

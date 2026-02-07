@@ -35,6 +35,8 @@
 //! - AD-TOOL-002: Capability manifests as sealed references
 //! - CTR-1303: Bounded collections with MAX_* constants
 
+use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use apm2_core::context::ContextPackManifest;
@@ -217,6 +219,10 @@ pub const NO_POLICY_RULE_ID: &str = "NO_POLICY_CONFIGURED";
 /// Rationale for deny-by-default when no policy is configured.
 pub const NO_POLICY_RATIONALE: &str = "POLICY_MISSING";
 
+const ROLE_ALLOWLIST_POLICY_VERSION: &str = "1.0.0";
+const ROLE_ALLOWLIST_RULE_PREFIX: &str = "ALLOW_ROLE_TOOL";
+const ROLE_ALLOWLIST_DENY_ALL_RULE_ID: &str = "DENY_ALL_TOOLS";
+
 /// Policy engine wrapper for the tool broker (TCK-00292).
 ///
 /// Integrates the real `PolicyEngine` from `apm2-core` and implements
@@ -276,6 +282,49 @@ impl BrokerPolicyEngine {
         }
     }
 
+    /// Creates a deny-by-default policy engine from a role tool allowlist.
+    ///
+    /// The resulting policy has one allow rule per unique tool pattern and a
+    /// default deny fallback. Empty allowlists produce an explicit deny-all
+    /// policy (still with default deny).
+    pub fn from_tool_allowlist(
+        policy_name: &str,
+        tool_allowlist: &[ToolClass],
+    ) -> Result<Self, BrokerError> {
+        let mut patterns = BTreeSet::new();
+        for tool in tool_allowlist {
+            patterns.insert(tool_class_to_policy_pattern(*tool));
+        }
+
+        let mut rules_yaml = String::new();
+        for (idx, pattern) in patterns.iter().enumerate() {
+            write!(
+                rules_yaml,
+                "    - id: \"{ROLE_ALLOWLIST_RULE_PREFIX}-{idx:04}\"\n      type: tool_allow\n      tool: \"{pattern}\"\n      decision: allow\n"
+            )
+            .expect("writing to String is infallible");
+        }
+
+        // Policy parser requires at least one rule. When the role allowlist is
+        // empty, emit an explicit deny-all rule.
+        if patterns.is_empty() {
+            write!(
+                rules_yaml,
+                "    - id: \"{ROLE_ALLOWLIST_DENY_ALL_RULE_ID}\"\n      type: tool_deny\n      tool: \"*\"\n      decision: deny\n"
+            )
+            .expect("writing to String is infallible");
+        }
+
+        let policy_yaml = format!(
+            "policy:\n  version: \"{ROLE_ALLOWLIST_POLICY_VERSION}\"\n  name: \"{policy_name}\"\n  rules:\n{rules_yaml}  default_decision: deny\n"
+        );
+
+        let loaded = LoadedPolicy::from_yaml(&policy_yaml).map_err(|e| BrokerError::Internal {
+            message: format!("failed to build role allowlist policy: {e}"),
+        })?;
+        Ok(Self::from_policy(&loaded))
+    }
+
     /// Returns `true` if a policy is configured.
     #[must_use]
     pub const fn has_policy(&self) -> bool {
@@ -323,6 +372,20 @@ impl BrokerPolicyEngine {
     #[must_use]
     pub const fn policy_hash(&self) -> Hash {
         self.policy_hash
+    }
+}
+
+const fn tool_class_to_policy_pattern(tool: ToolClass) -> &'static str {
+    match tool {
+        ToolClass::Read => "fs.read",
+        ToolClass::Write => "fs.write",
+        ToolClass::Execute | ToolClass::Network => "shell.exec",
+        ToolClass::Git => "git.*",
+        ToolClass::Inference => "inference",
+        ToolClass::Artifact => "artifact.fetch",
+        ToolClass::ListFiles => "fs.list_files",
+        ToolClass::Search => "fs.search",
+        _ => "*",
     }
 }
 
@@ -763,6 +826,23 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// Sets the policy engine from an Arc-wrapped loaded policy (TCK-00292).
     pub fn set_policy_arc(&mut self, policy: Arc<LoadedPolicy>) {
         self.policy = BrokerPolicyEngine::from_arc(policy);
+    }
+
+    /// Sets a deny-by-default policy derived from role tool allowlist entries.
+    ///
+    /// This is used in production session bootstrap to ensure policy checks
+    /// enforce the role-scoped tool surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Internal`] if policy materialization fails.
+    pub fn set_policy_from_tool_allowlist(
+        &mut self,
+        policy_name: &str,
+        tool_allowlist: &[ToolClass],
+    ) -> Result<(), BrokerError> {
+        self.policy = BrokerPolicyEngine::from_tool_allowlist(policy_name, tool_allowlist)?;
+        Ok(())
     }
 
     /// Creates a builder-style broker with a policy configured (TCK-00292).
@@ -1629,6 +1709,80 @@ impl<L: ManifestLoader> std::fmt::Debug for ToolBroker<L> {
 
 /// Shared reference to a tool broker.
 pub type SharedToolBroker<L = super::capability::StubManifestLoader> = Arc<ToolBroker<L>>;
+
+/// Thread-safe registry of per-session brokers.
+///
+/// Stores one initialized broker per session to prevent cross-session
+/// capability and policy leakage.
+#[derive(Debug)]
+pub struct SessionBrokerRegistry<L: ManifestLoader = super::capability::StubManifestLoader> {
+    brokers: std::sync::RwLock<HashMap<String, SharedToolBroker<L>>>,
+}
+
+impl<L: ManifestLoader> Default for SessionBrokerRegistry<L> {
+    fn default() -> Self {
+        Self {
+            brokers: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl<L: ManifestLoader> SessionBrokerRegistry<L> {
+    /// Creates an empty session broker registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers (or replaces) a session broker.
+    pub fn register(&self, session_id: impl Into<String>, broker: SharedToolBroker<L>) {
+        let mut guard = self.brokers.write().expect("lock poisoned");
+        guard.insert(session_id.into(), broker);
+    }
+
+    /// Looks up a broker by session ID.
+    #[must_use]
+    pub fn get(&self, session_id: &str) -> Option<SharedToolBroker<L>> {
+        let guard = self.brokers.read().expect("lock poisoned");
+        guard.get(session_id).cloned()
+    }
+
+    /// Removes a session broker.
+    pub fn remove(&self, session_id: &str) {
+        let mut guard = self.brokers.write().expect("lock poisoned");
+        guard.remove(session_id);
+    }
+
+    /// Removes and returns a session broker.
+    #[must_use]
+    pub fn remove_and_return(&self, session_id: &str) -> Option<SharedToolBroker<L>> {
+        let mut guard = self.brokers.write().expect("lock poisoned");
+        guard.remove(session_id)
+    }
+
+    /// Restores a previously removed session broker.
+    pub fn restore(&self, session_id: impl Into<String>, broker: SharedToolBroker<L>) {
+        let mut guard = self.brokers.write().expect("lock poisoned");
+        guard.insert(session_id.into(), broker);
+    }
+
+    /// Returns the number of registered brokers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let guard = self.brokers.read().expect("lock poisoned");
+        guard.len()
+    }
+
+    /// Returns whether the registry is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Shared reference to a per-session broker registry.
+pub type SharedSessionBrokerRegistry<L = super::capability::StubManifestLoader> =
+    Arc<SessionBrokerRegistry<L>>;
 
 /// Creates a new shared tool broker.
 ///
@@ -3791,6 +3945,64 @@ mod tests {
                 panic!("Request should be denied when no policy is configured");
             },
         }
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_from_tool_allowlist() {
+        let policy =
+            BrokerPolicyEngine::from_tool_allowlist("session-allowlist", &[ToolClass::Read])
+                .expect("allowlist policy should build");
+
+        let read_request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
+        let write_request = make_request("req-write", ToolClass::Write, Some("/workspace/file.rs"));
+
+        assert!(
+            matches!(policy.evaluate(&read_request), PolicyDecision::Allow { .. }),
+            "Read should be allowed by allowlist-derived policy"
+        );
+        assert!(
+            matches!(policy.evaluate(&write_request), PolicyDecision::Deny { .. }),
+            "Write should be denied when absent from allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_empty_allowlist_builds_deny_all() {
+        let policy = BrokerPolicyEngine::from_tool_allowlist("session-empty", &[])
+            .expect("empty allowlist policy should build");
+
+        assert!(
+            policy.has_policy(),
+            "empty allowlist should still load policy"
+        );
+
+        let read_request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
+        assert!(
+            matches!(policy.evaluate(&read_request), PolicyDecision::Deny { .. }),
+            "Empty allowlist must deny all tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_broker_registry_roundtrip() {
+        let registry: SessionBrokerRegistry<StubManifestLoader> = SessionBrokerRegistry::new();
+        let broker: SharedToolBroker<StubManifestLoader> =
+            Arc::new(ToolBroker::new(test_config_without_policy()));
+
+        assert!(registry.is_empty());
+        registry.register("S-REG-1", Arc::clone(&broker));
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("S-REG-1").is_some());
+
+        let removed = registry.remove_and_return("S-REG-1");
+        assert!(removed.is_some());
+        assert!(registry.get("S-REG-1").is_none());
+
+        registry.restore("S-REG-1", removed.expect("removed broker should exist"));
+        assert!(registry.get("S-REG-1").is_some());
+
+        registry.remove("S-REG-1");
+        assert!(registry.is_empty());
     }
 
     #[tokio::test]

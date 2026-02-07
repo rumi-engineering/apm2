@@ -18,8 +18,19 @@ fuzz_target!(|data: &[u8]| {
         // The parser must never panic, regardless of input.
         // It should always return Ok or Err.
         let _ = apm2_daemon::identity::PublicKeyIdV1::parse_text(s);
+        let _ = apm2_daemon::identity::PublicKeyIdV1::parse_text_with_state(s);
     }
 
     // Also test with raw bytes via from_binary
     let _ = apm2_daemon::identity::PublicKeyIdV1::from_binary(data);
+    let _ = apm2_daemon::identity::PublicKeyIdV1::from_binary_with_state(data);
+
+    // Exercise explicit tagged-33 parsing path with arbitrary hash payload.
+    if data.len() >= 32 {
+        let mut binary = [0u8; 33];
+        binary[0] = 0x01; // Ed25519 tag
+        binary[1..].copy_from_slice(&data[..32]);
+        let _ = apm2_daemon::identity::PublicKeyIdV1::from_binary(&binary);
+        let _ = apm2_daemon::identity::PublicKeyIdV1::from_binary_with_state(&binary);
+    }
 });

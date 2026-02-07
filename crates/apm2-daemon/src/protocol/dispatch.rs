@@ -37,7 +37,7 @@ use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
-    AdapterSelectionPolicy, AttestationLevel, AttestationRequirements,
+    AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, CHANGESET_PUBLISHED_PREFIX,
     REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, SelectionDecision,
     builtin_profiles, validate_receipt_attestation,
 };
@@ -136,8 +136,10 @@ use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
     EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
-    TerminationClass, validate_custody_domain_overlap,
+    SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass, ToolBroker, ToolBrokerConfig,
+    validate_custody_domain_overlap,
 };
+use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 use crate::governance::GovernanceFreshnessMonitor;
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
@@ -947,8 +949,7 @@ pub const STOP_FLAGS_MUTATED_WORK_ID: &str = "daemon.stop_flags";
 /// This prefix is used when emitting changeset publication events to the
 /// ledger, enabling gate orchestration (TCK-00388) to bind gate leases
 /// to published changesets.
-pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] =
-    b"apm2.event.changeset_published_ledger:";
+pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] = CHANGESET_PUBLISHED_PREFIX;
 
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
 // to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
@@ -4639,6 +4640,24 @@ pub struct PrivilegedDispatcher {
     /// shared with `SessionDispatcher` for counter updates and queries.
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
 
+    /// Per-session tool broker registry (TCK-00401).
+    ///
+    /// When configured, `SpawnEpisode` initializes a broker scoped to the
+    /// session capability manifest and registers it here. `RequestTool`
+    /// resolves brokers by session ID.
+    session_broker_registry:
+        Option<SharedSessionBrokerRegistry<crate::episode::capability::StubManifestLoader>>,
+
+    /// Configuration template for per-session broker construction.
+    broker_config: ToolBrokerConfig,
+
+    /// CAS backend for broker context artifact retrieval and firewall init.
+    broker_cas: Option<Arc<dyn crate::episode::executor::ContentAddressedStore>>,
+
+    /// Optional credential stores wired into per-session brokers.
+    broker_github_store: Option<Arc<dyn GitHubCredentialStore>>,
+    broker_ssh_store: Option<Arc<dyn SshCredentialStore>>,
+
     /// Content-addressed store for `ChangeSet` bundle persistence (TCK-00394).
     ///
     /// When present, `PublishChangeSet` stores the canonical bundle bytes in
@@ -4836,6 +4855,11 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            session_broker_registry: None,
+            broker_config: ToolBrokerConfig::default(),
+            broker_cas: None,
+            broker_github_store: None,
+            broker_ssh_store: None,
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -4902,6 +4926,11 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            session_broker_registry: None,
+            broker_config: ToolBrokerConfig::default(),
+            broker_cas: None,
+            broker_github_store: None,
+            broker_ssh_store: None,
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -4987,6 +5016,11 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            session_broker_registry: None,
+            broker_config: ToolBrokerConfig::default(),
+            broker_cas: None,
+            broker_github_store: None,
+            broker_ssh_store: None,
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -5049,6 +5083,11 @@ impl PrivilegedDispatcher {
             consensus_state: None,
             credential_store: None,
             telemetry_store: None,
+            session_broker_registry: None,
+            broker_config: ToolBrokerConfig::default(),
+            broker_cas: None,
+            broker_github_store: None,
+            broker_ssh_store: None,
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -5099,6 +5138,47 @@ impl PrivilegedDispatcher {
         store: Arc<crate::session::SessionTelemetryStore>,
     ) -> Self {
         self.telemetry_store = Some(store);
+        self
+    }
+
+    /// Sets the per-session broker registry (TCK-00401).
+    #[must_use]
+    pub fn with_session_broker_registry(
+        mut self,
+        registry: SharedSessionBrokerRegistry<crate::episode::capability::StubManifestLoader>,
+    ) -> Self {
+        self.session_broker_registry = Some(registry);
+        self
+    }
+
+    /// Sets the per-session broker configuration template.
+    #[must_use]
+    pub const fn with_broker_config(mut self, config: ToolBrokerConfig) -> Self {
+        self.broker_config = config;
+        self
+    }
+
+    /// Sets the CAS backend used by per-session brokers.
+    #[must_use]
+    pub fn with_broker_cas(
+        mut self,
+        cas: Arc<dyn crate::episode::executor::ContentAddressedStore>,
+    ) -> Self {
+        self.broker_cas = Some(cas);
+        self
+    }
+
+    /// Sets the GitHub credential store used by per-session brokers.
+    #[must_use]
+    pub fn with_broker_github_store(mut self, store: Arc<dyn GitHubCredentialStore>) -> Self {
+        self.broker_github_store = Some(store);
+        self
+    }
+
+    /// Sets the SSH credential store used by per-session brokers.
+    #[must_use]
+    pub fn with_broker_ssh_store(mut self, store: Arc<dyn SshCredentialStore>) -> Self {
+        self.broker_ssh_store = Some(store);
         self
     }
 
@@ -5889,6 +5969,78 @@ impl PrivilegedDispatcher {
         }))
     }
 
+    /// Builds and initializes a per-session tool broker from manifest and
+    /// role-scoped allowlist policy (TCK-00401).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when broker policy or manifest initialization
+    /// fails, or when async runtime is unavailable in production.
+    fn build_session_broker(
+        &self,
+        session_id: &str,
+        manifest: &CapabilityManifest,
+    ) -> Result<SharedToolBroker<crate::episode::capability::StubManifestLoader>, String> {
+        let mut broker = match (&self.broker_github_store, &self.broker_ssh_store) {
+            (Some(github), Some(ssh)) => ToolBroker::with_credential_stores(
+                self.broker_config.clone(),
+                Arc::clone(github),
+                Arc::clone(ssh),
+            ),
+            (Some(github), None) => {
+                ToolBroker::with_github_store(self.broker_config.clone(), Arc::clone(github))
+            },
+            (None, Some(ssh)) => {
+                ToolBroker::with_ssh_store(self.broker_config.clone(), Arc::clone(ssh))
+            },
+            (None, None) => ToolBroker::new(self.broker_config.clone()),
+        };
+
+        if let Some(ref cas) = self.broker_cas {
+            broker = broker.with_cas(Arc::clone(cas));
+        }
+
+        broker
+            .set_policy_from_tool_allowlist(
+                &format!("session-role-allowlist-{session_id}"),
+                manifest.tool_allowlist(),
+            )
+            .map_err(|e| format!("policy initialization failed: {e}"))?;
+
+        let broker = Arc::new(broker);
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    broker
+                        .initialize_with_manifest(manifest.clone())
+                        .await
+                        .map_err(|e| format!("broker initialization failed: {e}"))
+                })
+            })?;
+        } else {
+            #[cfg(test)]
+            {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("failed to build test runtime for broker init: {e}"))?;
+                rt.block_on(async {
+                    broker
+                        .initialize_with_manifest(manifest.clone())
+                        .await
+                        .map_err(|e| format!("broker initialization failed: {e}"))
+                })?;
+            }
+            #[cfg(not(test))]
+            {
+                return Err("broker initialization failed: no async runtime available".to_string());
+            }
+        }
+
+        Ok(broker)
+    }
+
     /// Rolls back a partially-completed spawn registration.
     ///
     /// Removes the newly-registered session, cleans up its telemetry/stop
@@ -5903,12 +6055,17 @@ impl PrivilegedDispatcher {
     ///
     /// All rollback operations are explicitly error-checked; none are
     /// silently discarded via `let _ = ...`.
+    #[allow(clippy::too_many_arguments)]
     fn rollback_spawn(
         &self,
         session_id: &str,
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
         evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        evicted_brokers: &[(
+            String,
+            SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+        )],
         evicted_stop_conditions: &[(String, crate::episode::envelope::StopConditions)],
         remove_manifest: bool,
     ) -> Option<String> {
@@ -5959,10 +6116,22 @@ impl PrivilegedDispatcher {
             store.remove(session_id);
         }
 
+        // 3a-iii. TCK-00401: Remove per-session broker on rollback.
+        if let Some(ref store) = self.session_broker_registry {
+            store.remove(session_id);
+        }
+
         // 3b. Restore evicted manifests so capacity is not permanently lost.
         for (sid, manifest) in evicted_manifests {
             self.manifest_store
                 .restore(sid, std::sync::Arc::clone(manifest));
+        }
+
+        // 3c. Restore evicted per-session brokers.
+        if let Some(ref store) = self.session_broker_registry {
+            for (sid, broker) in evicted_brokers {
+                store.restore(sid, Arc::clone(broker));
+            }
         }
 
         // 4. Re-register evicted sessions to restore capacity.
@@ -6029,6 +6198,7 @@ impl PrivilegedDispatcher {
     /// * `context` — Human-readable label for log messages identifying the
     ///   failure site (e.g. "peer credentials failure").
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn rollback_spawn_with_episode_stop(
         &self,
         episode_id_opt: Option<&EpisodeId>,
@@ -6036,6 +6206,10 @@ impl PrivilegedDispatcher {
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
         evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        evicted_brokers: &[(
+            String,
+            SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+        )],
         evicted_stop_conditions: &[(String, crate::episode::envelope::StopConditions)],
         timestamp_ns: u64,
         context: &str,
@@ -6068,6 +6242,7 @@ impl PrivilegedDispatcher {
             evicted_sessions,
             evicted_telemetry,
             evicted_manifests,
+            evicted_brokers,
             evicted_stop_conditions,
             true,
         );
@@ -6908,7 +7083,26 @@ impl PrivilegedDispatcher {
                 })
                 .collect();
 
-        // Step 2c: Capture and remove stop conditions for evicted sessions.
+        // Step 2c: Capture and remove per-session brokers for evicted sessions.
+        // Restored during rollback to keep broker/session stores converged.
+        let evicted_brokers: Vec<(
+            String,
+            SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+        )> = self
+            .session_broker_registry
+            .as_ref()
+            .map_or_else(Vec::new, |store| {
+                evicted_sessions
+                    .iter()
+                    .filter_map(|s| {
+                        store
+                            .remove_and_return(&s.session_id)
+                            .map(|b| (s.session_id.clone(), b))
+                    })
+                    .collect()
+            });
+
+        // Step 2d: Capture and remove stop conditions for evicted sessions.
         // These are restored if a later spawn step fails (atomic rollback).
         let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> = self
             .stop_conditions_store
@@ -6945,6 +7139,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     false,
                 );
@@ -6979,6 +7174,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     false,
                 );
@@ -7029,6 +7225,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     false,
                 );
@@ -7062,6 +7259,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     false,
                 );
@@ -7112,6 +7310,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_brokers,
                         &evicted_stop_conditions,
                         false,
                     );
@@ -7149,6 +7348,45 @@ impl PrivilegedDispatcher {
 
         self.manifest_store.register(&session_id, manifest.clone());
 
+        // TCK-00401: Build and register per-session broker in production path.
+        //
+        // This enforces session-scoped capability/policy isolation and ensures
+        // broker validator/policy are initialized before session spawn commits.
+        if let Some(ref broker_store) = self.session_broker_registry {
+            match self.build_session_broker(&session_id, &manifest) {
+                Ok(broker) => broker_store.register(&session_id, broker),
+                Err(e) => {
+                    let rollback_warn = self.rollback_spawn(
+                        &session_id,
+                        &evicted_sessions,
+                        &evicted_telemetry,
+                        &evicted_manifests,
+                        &evicted_brokers,
+                        &evicted_stop_conditions,
+                        true,
+                    );
+                    if let Some(ref rw) = rollback_warn {
+                        warn!(rollback_errors = %rw, "Partial rollback failure during broker initialization");
+                    }
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "SpawnEpisode rejected: per-session broker initialization failed"
+                    );
+                    let msg = rollback_warn.map_or_else(
+                        || format!("per-session broker initialization failed: {e}"),
+                        |rw| format!(
+                            "per-session broker initialization failed: {e} (rollback partial failure: {rw})"
+                        ),
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        msg,
+                    ));
+                },
+            }
+        }
+
         // TCK-00352 Security Review MAJOR 2: Mint and register V1 manifest
         // in the shared store so that SessionDispatcher can enforce V1 scope
         // checks (risk tier ceiling, host restrictions, envelope binding)
@@ -7171,6 +7409,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     true,
                 );
@@ -7202,6 +7441,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     true,
                 );
@@ -7276,6 +7516,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_brokers,
                         &evicted_stop_conditions,
                         true,
                     );
@@ -7339,6 +7580,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     true,
                 );
@@ -7417,6 +7659,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_brokers,
                         &evicted_stop_conditions,
                         true,
                     );
@@ -7463,6 +7706,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     true,
                 );
@@ -7505,6 +7749,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     timestamp_ns,
                     "update_episode_id failure",
@@ -7551,6 +7796,7 @@ impl PrivilegedDispatcher {
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 timestamp_ns,
                 "peer credentials failure",
@@ -7585,6 +7831,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     timestamp_ns,
                     "missing adapter registry",
@@ -7723,6 +7970,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_brokers,
                     &evicted_stop_conditions,
                     timestamp_ns,
                     "adapter spawn failure",
@@ -7786,6 +8034,7 @@ impl PrivilegedDispatcher {
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 timestamp_ns,
                 "event emission failure",
@@ -8535,6 +8784,12 @@ impl PrivilegedDispatcher {
         // either granting or denying based on an expired session's policy.
         if let Some(ref v1_store) = self.v1_manifest_store {
             v1_store.remove(&request.session_id);
+        }
+
+        // TCK-00401: Remove per-session broker on EndSession to prevent stale
+        // capability/policy state from being reused by retained tokens.
+        if let Some(ref broker_store) = self.session_broker_registry {
+            broker_store.remove(&request.session_id);
         }
 
         // TCK-00351 BLOCKER-2: `episode_count` is defined as completed
@@ -9954,26 +10209,37 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // Deserialize and validate the ChangeSetBundleV1
         let bundle: apm2_core::fac::ChangeSetBundleV1 =
-            serde_json::from_slice(&request.bundle_bytes).map_err(|e| {
-                ProtocolError::Serialization {
-                    reason: format!("invalid ChangeSetBundleV1 JSON: {e}"),
-                }
-            })?;
+            match serde_json::from_slice(&request.bundle_bytes) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("invalid ChangeSetBundleV1 JSON: {e}"),
+                    ));
+                },
+            };
 
-        // Validate bundle fields
-        if bundle.changeset_id.is_empty() {
+        // Recompute digest from canonical bundle fields and reject caller-provided
+        // digest mismatches before any side effects.
+        let computed_changeset_digest = bundle.compute_digest();
+        let provided_changeset_digest = bundle.changeset_digest();
+        if computed_changeset_digest != provided_changeset_digest {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                "changeset_id is empty in bundle",
+                format!(
+                    "changeset_digest mismatch: expected {}, got {}",
+                    hex::encode(computed_changeset_digest),
+                    hex::encode(provided_changeset_digest)
+                ),
             ));
         }
 
-        if bundle.file_manifest.is_empty() {
+        // Full bundle validation is mandatory and fail-closed.
+        if let Err(e) = bundle.validate() {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                "file_manifest is empty in bundle (at least one FileChange required)",
+                format!("invalid ChangeSetBundleV1: {e}"),
             ));
         }
 
@@ -9984,6 +10250,26 @@ impl PrivilegedDispatcher {
                 "content-addressed store not configured on daemon",
             ));
         };
+
+        let changeset_digest_hex = hex::encode(computed_changeset_digest);
+        if let Some((event_id, persisted_cas_hash)) =
+            self.find_changeset_published_replay(&request.work_id, &changeset_digest_hex)
+        {
+            debug!(
+                work_id = %request.work_id,
+                changeset_digest = %changeset_digest_hex,
+                event_id = %event_id,
+                "Idempotent: returning existing ChangeSetPublished event"
+            );
+            return Ok(PrivilegedResponse::PublishChangeSet(
+                PublishChangeSetResponse {
+                    changeset_digest: changeset_digest_hex,
+                    cas_hash: persisted_cas_hash,
+                    work_id: request.work_id,
+                    event_id,
+                },
+            ));
+        }
 
         // --- State Mutation Phase ---
 
@@ -10000,43 +10286,7 @@ impl PrivilegedDispatcher {
         };
 
         let cas_hash = store_result.hash;
-        let changeset_digest = bundle.changeset_digest();
-
-        // Idempotency check: if the CAS returned is_new=false, the same
-        // bundle was already stored. Check if a ChangeSetPublished event
-        // already exists for this work_id with the same digest.
-        if !store_result.is_new {
-            let existing_events = self.event_emitter.get_events_by_work_id(&request.work_id);
-            for event in &existing_events {
-                if event.event_type == "changeset_published" {
-                    // Parse the payload to check if the digest matches
-                    if let Ok(payload_json) =
-                        serde_json::from_slice::<serde_json::Value>(&event.payload)
-                    {
-                        if let Some(existing_digest) = payload_json
-                            .get("changeset_digest")
-                            .and_then(|v| v.as_str())
-                        {
-                            if existing_digest == hex::encode(changeset_digest) {
-                                debug!(
-                                    work_id = %request.work_id,
-                                    changeset_digest = %hex::encode(changeset_digest),
-                                    "Idempotent: returning existing ChangeSetPublished event"
-                                );
-                                return Ok(PrivilegedResponse::PublishChangeSet(
-                                    PublishChangeSetResponse {
-                                        changeset_digest: hex::encode(changeset_digest),
-                                        cas_hash: hex::encode(cas_hash),
-                                        work_id: request.work_id,
-                                        event_id: event.event_id.clone(),
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let cas_hash_hex = hex::encode(cas_hash);
 
         // Get HTF-compliant timestamp
         let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -10053,13 +10303,27 @@ impl PrivilegedDispatcher {
         // Emit ChangeSetPublished ledger event
         let signed_event = match self.event_emitter.emit_changeset_published(
             &request.work_id,
-            &changeset_digest,
+            &computed_changeset_digest,
             &cas_hash,
             &actor_id,
             timestamp_ns,
         ) {
             Ok(event) => event,
             Err(e) => {
+                // Race-safe idempotency fallback: if another writer persisted the
+                // same semantic event concurrently, replay the persisted binding.
+                if let Some((event_id, persisted_cas_hash)) =
+                    self.find_changeset_published_replay(&request.work_id, &changeset_digest_hex)
+                {
+                    return Ok(PrivilegedResponse::PublishChangeSet(
+                        PublishChangeSetResponse {
+                            changeset_digest: changeset_digest_hex,
+                            cas_hash: persisted_cas_hash,
+                            work_id: request.work_id,
+                            event_id,
+                        },
+                    ));
+                }
                 warn!(error = %e, "ChangeSetPublished event emission failed");
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -10071,19 +10335,44 @@ impl PrivilegedDispatcher {
         info!(
             event_id = %signed_event.event_id,
             work_id = %request.work_id,
-            changeset_digest = %hex::encode(changeset_digest),
-            cas_hash = %hex::encode(cas_hash),
+            changeset_digest = %changeset_digest_hex,
+            cas_hash = %cas_hash_hex,
             "ChangeSetPublished: bundle stored in CAS and event emitted to ledger"
         );
 
         Ok(PrivilegedResponse::PublishChangeSet(
             PublishChangeSetResponse {
-                changeset_digest: hex::encode(changeset_digest),
-                cas_hash: hex::encode(cas_hash),
+                changeset_digest: changeset_digest_hex,
+                cas_hash: cas_hash_hex,
                 work_id: request.work_id,
                 event_id: signed_event.event_id,
             },
         ))
+    }
+
+    /// Returns persisted replay bindings for a semantically matching
+    /// `changeset_published` event.
+    ///
+    /// Matching key: `(work_id, changeset_digest)`. Response values are the
+    /// authoritative persisted `event_id` and `cas_hash`.
+    fn find_changeset_published_replay(
+        &self,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<(String, String)> {
+        self.event_emitter
+            .get_events_by_work_id(work_id)
+            .into_iter()
+            .filter(|event| event.event_type == "changeset_published")
+            .find_map(|event| {
+                let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+                let persisted_digest = payload.get("changeset_digest")?.as_str()?;
+                if persisted_digest != changeset_digest_hex {
+                    return None;
+                }
+                let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
+                Some((event.event_id, persisted_cas_hash))
+            })
     }
 
     // =========================================================================
@@ -16152,6 +16441,10 @@ mod tests {
                 Vec::new();
             let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let no_evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             let no_evicted_stop_conditions: Vec<(
                 String,
                 crate::episode::envelope::StopConditions,
@@ -16161,6 +16454,7 @@ mod tests {
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
                 &no_evicted_manifests,
+                &no_evicted_brokers,
                 &no_evicted_stop_conditions,
                 true,
             );
@@ -16421,6 +16715,10 @@ mod tests {
             let evicted_sessions = vec![evicted_session_state];
             let evicted_telem: Vec<(String, Arc<crate::session::SessionTelemetry>)> = Vec::new();
             let evicted_manifests = vec![("S-ROLLBACK-M".to_string(), evicted_manifest)];
+            let evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> =
                 Vec::new();
 
@@ -16429,6 +16727,7 @@ mod tests {
                 &evicted_sessions,
                 &evicted_telem,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 true,
             );
@@ -16572,6 +16871,10 @@ mod tests {
                 Vec::new();
             let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let no_evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             let no_evicted_stop_conditions: Vec<(
                 String,
                 crate::episode::envelope::StopConditions,
@@ -16583,6 +16886,7 @@ mod tests {
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
                 &no_evicted_manifests,
+                &no_evicted_brokers,
                 &no_evicted_stop_conditions,
                 999_000,
                 "test context",
@@ -16683,6 +16987,10 @@ mod tests {
                         .map(|m| (s.session_id.clone(), m))
                 })
                 .collect();
+            let evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             assert_eq!(evicted_telemetry.len(), 1);
             assert_eq!(evicted_manifests.len(), 1);
             let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> =
@@ -16700,6 +17008,7 @@ mod tests {
                 &evicted,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 999_000,
                 "test eviction restore",
@@ -16837,11 +17146,16 @@ mod tests {
             // Simulate spawn failure rollback.
             let evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let evicted_brokers: Vec<(
+                String,
+                SharedToolBroker<crate::episode::capability::StubManifestLoader>,
+            )> = Vec::new();
             let result = dispatcher.rollback_spawn(
                 "S-NEW-STOP",
                 &evicted,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_brokers,
                 &evicted_stop_conditions,
                 false,
             );
@@ -19169,30 +19483,57 @@ mod tests {
     // ========================================================================
     mod publish_changeset {
         use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::{ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo};
 
         use super::*;
 
+        fn make_valid_bundle(changeset_id: &str) -> ChangeSetBundleV1 {
+            ChangeSetBundleV1::builder()
+                .changeset_id(changeset_id)
+                .base(GitObjectRef {
+                    algo: HashAlgo::Sha1,
+                    object_kind: "commit".to_string(),
+                    object_id: "a".repeat(40),
+                })
+                .diff_hash([0x42; 32])
+                .file_manifest(vec![FileChange {
+                    path: "src/main.rs".to_string(),
+                    change_kind: ChangeKind::Modify,
+                    old_path: None,
+                }])
+                .binary_detected(false)
+                .build()
+                .expect("bundle should build")
+        }
+
         /// Helper to create a valid `ChangeSetBundleV1` JSON payload.
         fn make_bundle_json(changeset_id: &str) -> Vec<u8> {
-            let bundle_json = serde_json::json!({
-                "schema": "apm2.changeset_bundle.v1",
-                "schema_version": "1.0.0",
-                "changeset_id": changeset_id,
-                "base": {
-                    "algo": "sha1",
-                    "object_kind": "commit",
-                    "object_id": "abc123def456"
-                },
-                "changeset_digest": "0000000000000000000000000000000000000000000000000000000000000000",
-                "diff_format": "git_unified_diff",
-                "diff_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            serde_json::to_vec(&make_valid_bundle(changeset_id)).unwrap()
+        }
+
+        /// Helper to create a semantically equivalent payload with different
+        /// JSON formatting and key order.
+        fn make_noncanonical_bundle_json(changeset_id: &str) -> Vec<u8> {
+            let bundle = make_valid_bundle(changeset_id);
+            let noncanonical = serde_json::json!({
+                "binary_detected": bundle.binary_detected,
                 "file_manifest": [{
-                    "path": "src/main.rs",
-                    "change_kind": "MODIFY"
+                    "change_kind": "MODIFY",
+                    "path": "src/main.rs"
                 }],
-                "binary_detected": false
+                "diff_hash": hex::encode(bundle.diff_hash),
+                "diff_format": bundle.diff_format,
+                "changeset_digest": hex::encode(bundle.changeset_digest),
+                "base": {
+                    "object_id": bundle.base.object_id,
+                    "object_kind": bundle.base.object_kind,
+                    "algo": "sha1"
+                },
+                "changeset_id": bundle.changeset_id,
+                "schema_version": bundle.schema_version,
+                "schema": bundle.schema
             });
-            serde_json::to_vec(&bundle_json).unwrap()
+            serde_json::to_vec_pretty(&noncanonical).unwrap()
         }
 
         /// Helper to build a dispatcher with CAS and a privileged context.
@@ -19398,6 +19739,100 @@ mod tests {
         }
 
         #[test]
+        fn test_publish_changeset_semantic_idempotent_noncanonical_json() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let canonical_bundle = make_bundle_json("cs-semantic-idempotent");
+            let noncanonical_bundle = make_noncanonical_bundle_json("cs-semantic-idempotent");
+
+            let response1 = dispatcher
+                .dispatch(
+                    &encode_publish_changeset_request(&PublishChangeSetRequest {
+                        work_id: work_id.clone(),
+                        bundle_bytes: canonical_bundle,
+                    }),
+                    &ctx,
+                )
+                .unwrap();
+            let (digest1, cas_hash1, event_id1) = match response1 {
+                PrivilegedResponse::PublishChangeSet(resp) => {
+                    (resp.changeset_digest, resp.cas_hash, resp.event_id)
+                },
+                other => panic!("Expected first PublishChangeSet response, got: {other:?}"),
+            };
+
+            let response2 = dispatcher
+                .dispatch(
+                    &encode_publish_changeset_request(&PublishChangeSetRequest {
+                        work_id: work_id.clone(),
+                        bundle_bytes: noncanonical_bundle,
+                    }),
+                    &ctx,
+                )
+                .unwrap();
+            let (digest2, cas_hash2, event_id2) = match response2 {
+                PrivilegedResponse::PublishChangeSet(resp) => {
+                    (resp.changeset_digest, resp.cas_hash, resp.event_id)
+                },
+                other => panic!("Expected second PublishChangeSet response, got: {other:?}"),
+            };
+
+            assert_eq!(digest1, digest2, "semantic duplicate must reuse digest");
+            assert_eq!(
+                event_id1, event_id2,
+                "semantic duplicate must replay event_id"
+            );
+            assert_eq!(
+                cas_hash1, cas_hash2,
+                "semantic duplicate must replay bound CAS hash"
+            );
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let changeset_count = events
+                .iter()
+                .filter(|e| e.event_type == "changeset_published")
+                .count();
+            assert_eq!(
+                changeset_count, 1,
+                "semantic duplicate must not create duplicate changeset events"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_rejects_digest_mismatch() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let work_id = claim_work(&dispatcher, &ctx);
+
+            let mut bundle = make_valid_bundle("cs-digest-mismatch");
+            bundle.changeset_digest = [0xAB; 32];
+            let request = PublishChangeSetRequest {
+                work_id,
+                bundle_bytes: serde_json::to_vec(&bundle).unwrap(),
+            };
+
+            let response = dispatcher
+                .dispatch(&encode_publish_changeset_request(&request), &ctx)
+                .unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("changeset_digest mismatch"),
+                        "Expected digest mismatch rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected digest mismatch rejection, got: {other:?}"),
+            }
+        }
+
+        #[test]
         fn test_publish_changeset_rejects_unknown_work_id() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
@@ -19464,13 +19899,22 @@ mod tests {
                 bundle_bytes: b"not valid json".to_vec(),
             };
             let frame = encode_publish_changeset_request(&request);
-            let response = dispatcher.dispatch(&frame, &ctx);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
-            // Should return a ProtocolError (serialization) since the JSON is invalid
-            assert!(
-                response.is_err(),
-                "Should return protocol error for invalid JSON"
-            );
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("invalid ChangeSetBundleV1 JSON"),
+                        "Expected invalid JSON rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected invalid JSON error, got: {other:?}"),
+            }
         }
 
         #[test]
@@ -19479,23 +19923,19 @@ mod tests {
             let ctx = privileged_ctx();
             let work_id = claim_work(&dispatcher, &ctx);
 
-            // Bundle with empty file_manifest
-            let bundle_json = serde_json::json!({
-                "schema": "apm2.changeset_bundle.v1",
-                "schema_version": "1.0.0",
-                "changeset_id": "cs-empty-manifest",
-                "base": {
-                    "algo": "sha1",
-                    "object_kind": "commit",
-                    "object_id": "abc123def456"
-                },
-                "changeset_digest": "0000000000000000000000000000000000000000000000000000000000000000",
-                "diff_format": "git_unified_diff",
-                "diff_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-                "file_manifest": [],
-                "binary_detected": false
-            });
-            let bundle_bytes = serde_json::to_vec(&bundle_json).unwrap();
+            let bundle = ChangeSetBundleV1::builder()
+                .changeset_id("cs-empty-manifest")
+                .base(GitObjectRef {
+                    algo: HashAlgo::Sha1,
+                    object_kind: "commit".to_string(),
+                    object_id: "a".repeat(40),
+                })
+                .diff_hash([0x42; 32])
+                .file_manifest(vec![])
+                .binary_detected(false)
+                .build()
+                .expect("bundle should build");
+            let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
 
             let request = PublishChangeSetRequest {
                 work_id,
@@ -19504,10 +19944,20 @@ mod tests {
             let frame = encode_publish_changeset_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
-            assert!(
-                matches!(response, PrivilegedResponse::Error(_)),
-                "Should reject empty file_manifest"
-            );
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("file_manifest"),
+                        "Expected bundle validation rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected file_manifest rejection, got: {other:?}"),
+            }
         }
 
         #[test]
@@ -19576,7 +20026,7 @@ mod tests {
         /// the work claim owner must be denied.
         #[test]
         fn test_publish_changeset_rejects_ownership_mismatch() {
-            let (dispatcher, _cas) = make_dispatcher_with_cas();
+            let (dispatcher, cas) = make_dispatcher_with_cas();
             let owner_ctx = privileged_ctx(); // uid=1000, gid=1000
 
             // Claim work as the owner
@@ -19590,8 +20040,9 @@ mod tests {
             }));
 
             let bundle_bytes = make_bundle_json("cs-ownership-test");
+            let expected_hash = *blake3::hash(&bundle_bytes).as_bytes();
             let request = PublishChangeSetRequest {
-                work_id,
+                work_id: work_id.clone(),
                 bundle_bytes,
             };
             let frame = encode_publish_changeset_request(&request);
@@ -19614,6 +20065,23 @@ mod tests {
                     panic!("Expected PermissionDenied error for ownership mismatch, got: {other:?}")
                 },
             }
+
+            // Ownership rejection must occur before CAS mutation or event emission.
+            assert!(
+                !cas.exists(&expected_hash)
+                    .expect("CAS exists check should succeed"),
+                "ownership mismatch must not write bundle to CAS"
+            );
+            let changeset_events = dispatcher
+                .event_emitter
+                .get_events_by_work_id(&work_id)
+                .into_iter()
+                .filter(|event| event.event_type == "changeset_published")
+                .count();
+            assert_eq!(
+                changeset_events, 0,
+                "ownership mismatch must not emit changeset_published events"
+            );
         }
     }
 
