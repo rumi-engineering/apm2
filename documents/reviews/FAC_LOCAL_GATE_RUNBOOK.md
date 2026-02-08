@@ -13,16 +13,19 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
   - Linux with cgroup v2 mounted at `/sys/fs/cgroup`
   - `systemd-run` available for transient bounded scopes
   - Rust toolchain baseline `nightly-2025-12-01`
-  - `cargo-nextest`, `protoc`, and GitHub Actions runner service installed
+  - `cargo-nextest`, `cargo-deny`, `cargo-audit`, `cargo-llvm-cov`, `protoc`, `rg`, `jq`, and GitHub Actions runner service installed
   - Parallel job execution requires multiple runner agents registered on this machine with the same labels (one runner process executes one job at a time).
 
 ## Blocking Guard Checks
 - `Bounded CI Suite`
-  - Command: `./scripts/ci/run_bounded_tests.sh --timeout-seconds 1800 --kill-after-seconds 30 --memory-max 64G --pids-max 8192 --cpu-quota 1600% -- ./scripts/ci/run_local_ci_orchestrator.sh`
+  - Command: `./scripts/ci/run_bounded_tests.sh --timeout-seconds 4800 --kill-after-seconds 30 --memory-max 64G --pids-max 8192 --cpu-quota 1600% -- ./scripts/ci/run_local_ci_orchestrator.sh`
   - The full local suite runs in one transient user unit/cgroup boundary.
-- `Build All Targets` (inside orchestrator)
-  - Command: `cargo build --workspace --all-features --all-targets --locked`
-  - Uses per-run target path `target/ci/target-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}` for parallel-worktree safety.
+- Restored check surface (none removed), executed inside orchestrator:
+  - `rustfmt`, `proto-verify`, `clippy`, `doc`
+  - `workspace-integrity-snapshot`, `bounded-test-runner`, `workspace-integrity-guard`, `bounded-doctests`, `test-vectors`
+  - `msrv`, `cargo-deny`, `cargo-audit`, `coverage`, `release-build`
+  - `safety-proof-coverage`, `legacy-ipc-guard`, `evidence-refs-lint`, `test-refs-lint`, `proto-enum-drift`, `review-artifact-lint`, `status-write-command-lint`, `test-safety-guard`, `guardrail-fixtures`
+  - `workspace-integrity-guard` verifies the snapshot after the single `bounded-test-runner` execution (no duplicate `nextest` run).
 
 ## Operational Procedure
 1. Confirm `fac-ovh` resolves to this host and runner service:
@@ -33,8 +36,9 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
 4. Verify `CI Success` job logs show:
    - `Preflight passed: systemd-run --user is functional.`
    - `Starting bounded command in transient user unit`
+   - `=== CI Summary ===` and PASS/FAIL rows for the full restored check list
    - `Bounded command completed successfully.`
-   - In uploaded `ci-orchestrator-logs-*` artifact, `build_all_targets.log` ends with `Finished \`dev\` profile`.
+   - If coverage runs, `target/ci/lcov.info` exists and Codecov upload step executes (non-blocking).
 5. On failures, inspect job logs and corresponding guard script output.
 6. If test-safety false positives occur, add minimal scoped entries to `scripts/ci/test_safety_allowlist.txt`.
 

@@ -44,12 +44,12 @@ pub fn run(
         TrustedReviewerConfig::load(Path::new(reviewers_path))?.to_allowlist_map()?;
 
     let pr_head_sha = fetch_pr_head_sha(&sh, &owner_repo, pr_number)?;
-    if let Some(expected) = expected_head_sha
-        && !expected.eq_ignore_ascii_case(&pr_head_sha)
-    {
-        bail!(
-            "Provided head SHA mismatch for PR #{pr_number}: expected {expected}, actual {pr_head_sha}"
-        );
+    if let Some(expected) = expected_head_sha {
+        if !expected.eq_ignore_ascii_case(&pr_head_sha) {
+            bail!(
+                "Provided head SHA mismatch for PR #{pr_number}: expected {expected}, actual {pr_head_sha}"
+            );
+        }
     }
 
     let statuses = fetch_commit_statuses(&sh, &owner_repo, &pr_head_sha)?;

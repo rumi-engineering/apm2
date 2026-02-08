@@ -45,7 +45,7 @@ jobs:
       - name: Run bounded local CI suite
         run: |
           ./scripts/ci/run_bounded_tests.sh \
-            --timeout-seconds 1800 \
+            --timeout-seconds 4800 \
             --kill-after-seconds 30 \
             --memory-max 64G \
             --pids-max 8192 \
@@ -60,3 +60,11 @@ jobs:
           path: target/ci/orchestrator_logs/
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Upload coverage
+        if: always() && hashFiles('target/ci/lcov.info') != ''
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
+        with:
+          files: target/ci/lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
