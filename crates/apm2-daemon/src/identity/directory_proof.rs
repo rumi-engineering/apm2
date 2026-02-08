@@ -2142,6 +2142,15 @@ pub struct VerifiedHeadCache {
     /// Upper bound on `max_seen_epochs` entries. Larger than `max_entries`
     /// so that epoch history survives capacity eviction of heads.
     max_hwm_entries: usize,
+    /// Global high-water-mark floor for cells not found in `max_seen_epochs`.
+    ///
+    /// When an entry is evicted from the `max_seen_epochs` map due to capacity
+    /// overflow, this field is updated to `max(self.global_hwm_floor,
+    /// evicted_epoch)`. Any cell not found in the HWM map is checked
+    /// against this floor instead of defaulting to epoch 0, preventing
+    /// stale readmission after cross-cell churn forces eviction of a cell's
+    /// HWM entry.
+    global_hwm_floor: u64,
     /// Bounded audit log of cache mutations.
     audit_log: VecDeque<VerifierCacheAuditEvent>,
     /// Maximum number of audit events retained before overflow.
@@ -2180,6 +2189,7 @@ impl VerifiedHeadCache {
             max_entries: capped,
             max_seen_epochs: HashMap::new(),
             max_hwm_entries: hwm_capacity(capped),
+            global_hwm_floor: 0,
             audit_log: VecDeque::new(),
             max_audit_events: DEFAULT_MAX_AUDIT_EVENTS,
         }
@@ -2198,6 +2208,7 @@ impl VerifiedHeadCache {
             max_entries: capped,
             max_seen_epochs: HashMap::new(),
             max_hwm_entries: hwm_capacity(capped),
+            global_hwm_floor: 0,
             audit_log: VecDeque::new(),
             max_audit_events: max_audit_events.max(1),
         }
@@ -2295,7 +2306,17 @@ impl VerifiedHeadCache {
         // The HWM map may have evicted a cell's entry due to capacity, but
         // the live cache may still hold a head for that cell at a higher
         // epoch. Both sources must be consulted to prevent rollback.
-        let hwm_epoch = self.max_seen_epochs.get(&cell_id).copied().unwrap_or(0);
+        //
+        // When a cell is not found in the HWM map we fall back to
+        // `global_hwm_floor` (the max epoch ever evicted from the HWM
+        // map) instead of 0. This is fail-closed: after cross-cell churn
+        // evicts a cell's HWM entry, the floor prevents re-admission at
+        // any epoch below the highest epoch that was evicted.
+        let hwm_epoch = self
+            .max_seen_epochs
+            .get(&cell_id)
+            .copied()
+            .unwrap_or(self.global_hwm_floor);
         let live_epoch = self
             .heads
             .values()
@@ -2380,14 +2401,18 @@ impl VerifiedHeadCache {
             // Collect the set of cell IDs that are still live in the cache.
             let live_cells: std::collections::HashSet<&CellIdV1> =
                 self.heads.values().map(|vh| vh.head.cell_id()).collect();
-            if let Some(min_cell) = self
+            // Find the non-live cell with the lowest epoch to evict.
+            if let Some((min_cell, evicted_epoch)) = self
                 .max_seen_epochs
                 .iter()
                 .filter(|(c, _)| !live_cells.contains(c))
                 .min_by_key(|(_, e)| **e)
-                .map(|(c, _)| c.clone())
+                .map(|(c, e)| (c.clone(), *e))
             {
                 self.max_seen_epochs.remove(&min_cell);
+                // Raise the global floor so that any cell whose HWM was
+                // evicted cannot be re-admitted below this threshold.
+                self.global_hwm_floor = self.global_hwm_floor.max(evicted_epoch);
             }
         }
 
@@ -5684,6 +5709,76 @@ mod tests {
                 }
             ),
             "expected StaleEpochRejected for other@3 vs other@5, got: {err3:?}"
+        );
+    }
+
+    #[test]
+    fn stale_epoch_rejected_after_hwm_overflow_churn() {
+        // Regression test: cross-cell churn that overflows the HWM map must
+        // not allow stale re-admission for cells whose entries were evicted.
+        //
+        // With max_entries=1 the HWM capacity is hwm_capacity(1) = 16.
+        // We admit a target cell at epoch 20, then churn 20+ distinct other
+        // cells to force the target cell's HWM entry to be evicted. Finally,
+        // we attempt to readmit the target cell at epoch 10 — this MUST fail
+        // because the global_hwm_floor remembers the evicted epoch.
+
+        let target_genesis = CellGenesisV1::new(
+            [0xF0; 32],
+            PolicyRootId::Single(make_public_key_id(0xF0)),
+            "target.cell.internal",
+        )
+        .unwrap();
+        let target_cell_id = CellIdV1::from_genesis(&target_genesis);
+
+        let mut cache = VerifiedHeadCache::new(1);
+
+        // 1. Admit target cell at epoch 20.
+        // Note: root_fill values must avoid wrapping any of the derived
+        // hash fields (root_fill + 0x10/0x20/0x30) to 0x00, since
+        // HolonDirectoryHeadV1 rejects all-zero seal/policy hashes.
+        let target_head = make_epoch_head(target_cell_id.clone(), 20, 0x50);
+        let target_hash = target_head.content_hash().unwrap();
+        cache.admit_head(target_hash, target_head).unwrap();
+
+        // 2. Churn 20+ distinct cells to overflow the HWM map (capacity=16). Each new
+        //    cell evicts the target's live head (max_entries=1) and eventually
+        //    overflows the HWM map, forcing eviction of the target cell's HWM entry.
+        for i in 0u8..25 {
+            // Offset 0x30 keeps all derived fill+0x10/0x20/0x30 values
+            // safely away from wrapping to zero.
+            let fill = i.wrapping_add(0x30);
+            let churn_genesis = CellGenesisV1::new(
+                [fill; 32],
+                PolicyRootId::Single(make_public_key_id(fill)),
+                "churn.cell.internal",
+            )
+            .unwrap();
+            let churn_cell_id = CellIdV1::from_genesis(&churn_genesis);
+            let churn_head = make_epoch_head(churn_cell_id, u64::from(i) + 1, fill);
+            let churn_hash = churn_head.content_hash().unwrap();
+            cache.admit_head(churn_hash, churn_head).unwrap();
+        }
+
+        // Sanity: the target cell should NOT be in the HWM map anymore.
+        assert!(
+            !cache.contains_head(&target_hash),
+            "target head must have been evicted from live cache"
+        );
+
+        // 3. Attempt to readmit target cell at stale epoch 10 — must FAIL.
+        let stale_head = make_epoch_head(target_cell_id, 10, 0x51);
+        let stale_hash = stale_head.content_hash().unwrap();
+        let err = cache.admit_head(stale_hash, stale_head).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 10,
+                    ..
+                }
+            ),
+            "expected StaleEpochRejected for target@10 after HWM overflow churn, got: {err:?}"
         );
     }
 }

@@ -11,8 +11,8 @@
 use apm2_daemon::identity::{
     AlgorithmTag, CellGenesisV1, CellIdV1, DirectoryEntryStatus, DirectoryKindV1,
     DirectoryProofKindV1, DirectoryProofV1, HolonDirectoryHeadV1, HolonGenesisV1, HolonIdV1,
-    IdentityProofV1, LedgerAnchorV1, PolicyRootId, PublicKeyIdV1, SiblingNode, VerifiedHeadCache,
-    derive_directory_key,
+    IdentityProofProfileV1, IdentityProofV1, LedgerAnchorV1, PolicyRootId, PublicKeyIdV1,
+    SiblingNode, VerifiedHeadCache, derive_directory_key,
 };
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
@@ -105,7 +105,9 @@ fn build_fixture() -> ([u8; HASH_BYTES], HolonDirectoryHeadV1, IdentityProofV1) 
 
     let root = compute_root_from_proof(&proof);
 
-    let profile_hash = [0x60; HASH_BYTES];
+    let profile_hash = IdentityProofProfileV1::baseline_smt_10e12()
+        .content_hash()
+        .expect("baseline profile hash");
     let head = HolonDirectoryHeadV1::new(
         cell_id,
         12,
