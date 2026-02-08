@@ -761,6 +761,7 @@ fn run_single_review(
                         });
                     }
 
+                    let comment_permission_denied = detect_comment_permission_denied(&log_path);
                     emit_event(
                         event_ctx,
                         "run_crash",
@@ -768,15 +769,32 @@ fn run_single_review(
                         &current_head_sha,
                         serde_json::json!({
                             "exit_code": exit_code.unwrap_or(0),
-                            "signal": "invalid_completion",
+                            "signal": if comment_permission_denied { "auth_permission_denied" } else { "invalid_completion" },
                             "duration_secs": run_started.elapsed().as_secs(),
                             "restart_count": restart_count,
                             "completion_issue": if comment_id.is_none() { "comment_not_posted" } else { "unknown_verdict" },
                             "verdict": verdict,
+                            "reason": if comment_permission_denied { "comment_post_permission_denied" } else { "invalid_completion" },
                         }),
                     )?;
+                    if comment_permission_denied {
+                        remove_review_state_entry(&run_key)?;
+                        return Ok(SingleReviewResult {
+                            summary: SingleReviewSummary {
+                                review_type: review_type.to_string(),
+                                success: false,
+                                verdict: "UNKNOWN".to_string(),
+                                model: current_model.model,
+                                backend: current_model.backend.as_str().to_string(),
+                                duration_secs: review_started.elapsed().as_secs(),
+                                restart_count,
+                            },
+                            final_head_sha: current_head_sha,
+                        });
+                    }
                 } else {
                     let reason_is_http = detect_http_400_or_rate_limit(&log_path);
+                    let reason_is_auth = detect_comment_permission_denied(&log_path);
                     emit_event(
                         event_ctx,
                         "run_crash",
@@ -787,8 +805,24 @@ fn run_single_review(
                             "signal": exit_signal(status),
                             "duration_secs": run_started.elapsed().as_secs(),
                             "restart_count": restart_count,
+                            "reason": if reason_is_auth { "comment_post_permission_denied" } else if reason_is_http { "http_400_or_rate_limit" } else { "run_crash" },
                         }),
                     )?;
+                    if reason_is_auth {
+                        remove_review_state_entry(&run_key)?;
+                        return Ok(SingleReviewResult {
+                            summary: SingleReviewSummary {
+                                review_type: review_type.to_string(),
+                                success: false,
+                                verdict: "UNKNOWN".to_string(),
+                                model: current_model.model,
+                                backend: current_model.backend.as_str().to_string(),
+                                duration_secs: review_started.elapsed().as_secs(),
+                                restart_count,
+                            },
+                            final_head_sha: current_head_sha,
+                        });
+                    }
 
                     restart_count = restart_count.saturating_add(1);
                     if restart_count > MAX_RESTART_ATTEMPTS {
@@ -931,6 +965,36 @@ fn run_single_review(
                     }),
                 )?;
                 last_liveness_report = Instant::now();
+
+                if detect_comment_permission_denied(&log_path) {
+                    emit_event(
+                        event_ctx,
+                        "run_crash",
+                        review_type,
+                        &current_head_sha,
+                        serde_json::json!({
+                            "exit_code": -1,
+                            "signal": "auth_permission_denied",
+                            "duration_secs": run_started.elapsed().as_secs(),
+                            "restart_count": restart_count,
+                            "reason": "comment_post_permission_denied",
+                        }),
+                    )?;
+                    terminate_child(&mut child)?;
+                    remove_review_state_entry(&run_key)?;
+                    return Ok(SingleReviewResult {
+                        summary: SingleReviewSummary {
+                            review_type: review_type.to_string(),
+                            success: false,
+                            verdict: "UNKNOWN".to_string(),
+                            model: current_model.model,
+                            backend: current_model.backend.as_str().to_string(),
+                            duration_secs: review_started.elapsed().as_secs(),
+                            restart_count,
+                        },
+                        final_head_sha: current_head_sha,
+                    });
+                }
 
                 if detect_http_400_or_rate_limit(&log_path) {
                     emit_event(
@@ -1580,6 +1644,17 @@ fn detect_http_400_or_rate_limit(log_path: &Path) -> bool {
         || lower.contains("http 400")
 }
 
+fn detect_comment_permission_denied(log_path: &Path) -> bool {
+    let Ok(tail) = read_tail(log_path, 40) else {
+        return false;
+    };
+    let lower = tail.to_ascii_lowercase();
+    lower.contains("resource not accessible by personal access token (addcomment)")
+        || lower.contains("resource not accessible by personal access token")
+        || lower.contains("http 403 resource not accessible by personal access token")
+        || lower.contains("insufficient permissions")
+}
+
 fn read_tail(path: &Path, max_lines: usize) -> Result<String, String> {
     let file =
         File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
@@ -2197,6 +2272,22 @@ mod tests {
 
         fs::write(&path, r#"{"message":"normal progress"}"#).expect("write normal log");
         assert!(!detect_http_400_or_rate_limit(&path));
+    }
+
+    #[test]
+    fn test_detect_comment_permission_denied_markers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("review.log");
+
+        fs::write(
+            &path,
+            "GraphQL: Resource not accessible by personal access token (addComment)",
+        )
+        .expect("write denied log");
+        assert!(detect_comment_permission_denied(&path));
+
+        fs::write(&path, r#"{"message":"normal progress"}"#).expect("write normal log");
+        assert!(!detect_comment_permission_denied(&path));
     }
 
     #[test]
