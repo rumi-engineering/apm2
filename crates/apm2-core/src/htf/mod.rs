@@ -78,9 +78,9 @@ mod types;
 pub use canonical::{Canonicalizable, CanonicalizationError};
 pub use epoch_seal::{
     EpochSealAuditEvent, EpochSealError, EpochSealIssuanceError, EpochSealIssuer, EpochSealV1,
-    EpochSealVerdict, EpochSealVerificationError, EpochSealVerifier, MAX_SEAL_AUDIT_EVENTS,
-    MAX_SEAL_STRING_LENGTH, MAX_TRACKED_ISSUERS, SignatureVerificationError, SignatureVerifier,
-    is_seal_required_tier,
+    EpochSealVerdict, EpochSealVerificationError, EpochSealVerifier, MAX_EVICTION_HIGH_WATER_MARKS,
+    MAX_SEAL_AUDIT_EVENTS, MAX_SEAL_STRING_LENGTH, MAX_TRACKED_ISSUERS, SignatureVerificationError,
+    SignatureVerifier, is_seal_required_tier,
 };
 pub use freshness::{
     DEFAULT_TIER0_MAX_HEAD_AGE_TICKS, DEFAULT_TIER1_MAX_HEAD_AGE_TICKS,

@@ -1,13 +1,14 @@
 evidence_artifact:
   schema_version: "2026-01-23"
   id: "EVID-0019"
-  title: "Epoch seal monotonicity, equivocation, and fail-closed verification evidence"
+  title: "Epoch seal monotonicity, equivocation, fail-closed verification, and admission wiring evidence"
   category: "UNIT_TEST_RESULT"
   status: "PASS"
   description: |
     Evidence that EpochSealV1 construction, monotonicity enforcement,
-    equivocation detection, and fail-closed signature verification are
-    correctly implemented per RFC-0020 requirements.
+    equivocation detection, fail-closed signature verification, eviction
+    replay protection, bounded signature deserialization, and production
+    admission wiring are correctly implemented per RFC-0020 requirements.
 
     This artifact covers TCK-00365 epoch seal implementation:
     - Seal construction rejects invalid fields (zero epoch, empty issuer,
@@ -23,10 +24,16 @@ evidence_artifact:
     - Per-cell-id limits prevent single-cell capacity exhaustion
     - Tier2+ admissions fail-closed on missing seals via
       verify_with_policy()
+    - Eviction high-water marks prevent replay-after-eviction attacks
+    - Bounded signature deserialization rejects oversized payloads
+      before allocation (prevents memory exhaustion)
+    - Epoch seal verification is wired into the daemon ToolBroker
+      admission path for Tier2+ authority claims (fail-closed)
   requirement_ids:
     - "REQ-0019"
   source_refs:
     - "crates/apm2-core/src/htf/epoch_seal.rs"
+    - "crates/apm2-daemon/src/episode/broker.rs"
   artifacts:
     - type: "test_output"
       description: |
@@ -90,6 +97,40 @@ evidence_artifact:
         - verify_with_policy_accepts_valid_seal_at_tier2
         - verify_with_policy_rejects_rollback_at_tier3
       ref: "cargo test -p apm2-core epoch_seal::tests::verify_with_policy"
+    - type: "test_output"
+      description: |
+        Eviction high-water mark replay protection:
+        - eviction_replay_rejected_after_lru_eviction: verifies that a
+          replayed seal at the evicted epoch is rejected with
+          EvictionReplayRejected audit event.
+        - eviction_replay_accepted_with_higher_epoch: verifies that a
+          re-introduced key with epoch > evicted high-water is accepted.
+        - eviction_high_water_count_bounded: verifies the evicted
+          high-water map is bounded at MAX_EVICTION_HIGH_WATER_MARKS.
+        - verify_or_reject_maps_eviction_replay_error: verifies
+          verify_or_reject returns EvictionReplay error variant.
+      ref: "cargo test -p apm2-core epoch_seal::tests::eviction_replay"
+    - type: "test_output"
+      description: |
+        Bounded signature deserialization:
+        - signature_deser_rejects_oversized_payload: verifies that a
+          65-byte signature is rejected during deserialization before
+          unbounded Vec allocation.
+        - signature_deser_rejects_undersized_payload: verifies that a
+          63-byte signature is rejected.
+        - signature_deser_accepts_exact_size: verifies 64-byte roundtrip.
+        - signature_roundtrip_preserves_bytes: full seal roundtrip.
+      ref: "cargo test -p apm2-core epoch_seal::tests::signature_deser"
+    - type: "test_output"
+      description: |
+        Daemon admission wiring (ToolBroker integration):
+        - broker_epoch_seal_denies_tier2_without_seal: verifies that
+          Tier2+ tool requests are denied when no epoch seal is attached.
+        - broker_epoch_seal_allows_tier0_without_seal: verifies that
+          Tier0 tool requests pass without epoch seal.
+        - broker_epoch_seal_allows_tier1_without_seal: verifies that
+          Tier1 tool requests pass without epoch seal.
+      ref: "cargo test -p apm2-daemon broker::tests::broker_epoch_seal"
     - type: "test_output"
       description: |
         Full epoch seal test suite.

@@ -1,16 +1,19 @@
 evidence_artifact:
   schema_version: "2026-01-23"
   id: "EVID-0309"
-  title: "Epoch seal verifier DoS resilience and integrated policy enforcement evidence"
+  title: "Epoch seal verifier DoS resilience, eviction safety, and integrated policy enforcement evidence"
   category: "UNIT_TEST_RESULT"
   status: "PASS"
   description: |
     Evidence that the EpochSealVerifier is resilient to denial-of-service
-    attacks through LRU eviction and per-cell-id capacity limits, and that
-    tier-based seal-required policy is integrated into the verification path
-    so it cannot be accidentally omitted by callers.
+    attacks through LRU eviction and per-cell-id capacity limits, protects
+    against replay-after-eviction attacks via high-water marks, enforces
+    bounded signature deserialization, and that tier-based seal-required
+    policy is integrated into both the core verification path and the
+    daemon ToolBroker admission path so it cannot be accidentally omitted
+    by callers.
 
-    This artifact covers TCK-00365 round-4 security fixes:
+    This artifact covers TCK-00365 round-4+ security fixes:
     - LRU eviction: when the verifier reaches MAX_TRACKED_ISSUERS, the
       least recently used entry is evicted rather than rejecting new seals.
       This prevents an attacker from filling capacity with stale keys to
@@ -18,15 +21,29 @@ evidence_artifact:
     - Per-cell-id limit: MAX_ENTRIES_PER_CELL_ID prevents a single cell_id
       from exhausting the entire global capacity, ensuring fair sharing
       across cells.
+    - Eviction high-water marks: when a key is evicted, its last-known
+      epoch is persisted. Re-introduced keys must present an epoch strictly
+      greater than the evicted high-water mark. This prevents replay-after-
+      eviction attacks where an attacker forces eviction then replays an
+      older valid seal. The high-water map is bounded at
+      MAX_EVICTION_HIGH_WATER_MARKS.
+    - Bounded signature deserialization: a custom serde Visitor rejects
+      signature payloads exceeding 64 bytes during deserialization (before
+      allocation), preventing memory exhaustion via oversized inputs.
     - Integrated policy: verify_with_policy() combines the seal-required
       tier check with full verification in a single call, making it
       impossible to verify a seal without also checking the tier policy.
       This eliminates the class of bugs where a callsite omits the
       require_seal_for_tier() check.
+    - Daemon admission wiring: EpochSealVerifier is wired into the
+      ToolBroker.request_with_response() admission path. Tier2+ tool
+      requests are denied (fail-closed) when no valid epoch seal is
+      attached.
   requirement_ids:
     - "REQ-0019"
   source_refs:
     - "crates/apm2-core/src/htf/epoch_seal.rs"
+    - "crates/apm2-daemon/src/episode/broker.rs"
   artifacts:
     - type: "test_output"
       description: |
@@ -48,6 +65,22 @@ evidence_artifact:
       ref: "cargo test -p apm2-core epoch_seal::tests::verifier_per_cell_id"
     - type: "test_output"
       description: |
+        Eviction high-water mark replay protection:
+        - eviction_replay_rejected_after_lru_eviction
+        - eviction_replay_accepted_with_higher_epoch
+        - eviction_high_water_count_bounded
+        - verify_or_reject_maps_eviction_replay_error
+      ref: "cargo test -p apm2-core epoch_seal::tests::eviction_replay"
+    - type: "test_output"
+      description: |
+        Bounded signature deserialization:
+        - signature_deser_rejects_oversized_payload
+        - signature_deser_rejects_undersized_payload
+        - signature_deser_accepts_exact_size
+        - signature_roundtrip_preserves_bytes
+      ref: "cargo test -p apm2-core epoch_seal::tests::signature_deser"
+    - type: "test_output"
+      description: |
         Integrated tier-based policy enforcement:
         - verify_with_policy_rejects_missing_seal_at_tier2
         - verify_with_policy_rejects_missing_seal_at_tier3
@@ -56,3 +89,10 @@ evidence_artifact:
         - verify_with_policy_accepts_valid_seal_at_tier2
         - verify_with_policy_rejects_rollback_at_tier3
       ref: "cargo test -p apm2-core epoch_seal::tests::verify_with_policy"
+    - type: "test_output"
+      description: |
+        Daemon admission wiring (ToolBroker integration):
+        - broker_epoch_seal_denies_tier2_without_seal
+        - broker_epoch_seal_allows_tier0_without_seal
+        - broker_epoch_seal_allows_tier1_without_seal
+      ref: "cargo test -p apm2-daemon broker::tests::broker_epoch_seal"

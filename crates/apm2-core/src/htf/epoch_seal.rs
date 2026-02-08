@@ -100,7 +100,7 @@ impl std::error::Error for SignatureVerificationError {}
 /// [`EpochSealVerifier`] rejects ALL seals. This ensures that
 /// forgetting to wire a verifier results in denial rather than
 /// silent acceptance.
-pub trait SignatureVerifier: fmt::Debug {
+pub trait SignatureVerifier: fmt::Debug + Send + Sync {
     /// Verifies the cryptographic signature of an epoch seal.
     ///
     /// # Arguments
@@ -119,7 +119,8 @@ pub trait SignatureVerifier: fmt::Debug {
 // =============================================================================
 
 mod signature_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize, Serializer};
 
     use super::SIGNATURE_SIZE;
 
@@ -130,21 +131,72 @@ mod signature_serde {
         bytes.as_slice().serialize(serializer)
     }
 
+    /// Bounded deserializer for Ed25519 signatures.
+    ///
+    /// Uses a custom `Visitor` that rejects payloads exceeding
+    /// [`SIGNATURE_SIZE`] (64) bytes **during** deserialization, before
+    /// an unbounded `Vec<u8>` allocation can occur. This prevents
+    /// memory-exhaustion attacks via oversized signature fields.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; SIGNATURE_SIZE], D::Error>
     where
         D: Deserializer<'de>,
     {
-        let vec = Vec::<u8>::deserialize(deserializer)?;
-        if vec.len() != SIGNATURE_SIZE {
-            return Err(serde::de::Error::custom(format!(
-                "expected {} bytes for signature, got {}",
-                SIGNATURE_SIZE,
-                vec.len()
-            )));
+        struct BoundedSignatureVisitor;
+
+        impl<'de> Visitor<'de> for BoundedSignatureVisitor {
+            type Value = [u8; SIGNATURE_SIZE];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "a byte sequence of exactly {SIGNATURE_SIZE} bytes"
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut arr = [0u8; SIGNATURE_SIZE];
+                for (i, slot) in arr.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                }
+                // Reject oversized payloads: if there are more elements
+                // beyond SIGNATURE_SIZE, the input is invalid.
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::custom(format!(
+                        "signature too long: more than {SIGNATURE_SIZE} bytes"
+                    )));
+                }
+                Ok(arr)
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v.len() != SIGNATURE_SIZE {
+                    return Err(E::custom(format!(
+                        "expected {SIGNATURE_SIZE} bytes for signature, got {}",
+                        v.len()
+                    )));
+                }
+                let mut arr = [0u8; SIGNATURE_SIZE];
+                arr.copy_from_slice(v);
+                Ok(arr)
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_bytes(&v)
+            }
         }
-        let mut arr = [0u8; SIGNATURE_SIZE];
-        arr.copy_from_slice(&vec);
-        Ok(arr)
+
+        deserializer.deserialize_seq(BoundedSignatureVisitor)
     }
 }
 
@@ -791,6 +843,17 @@ pub enum EpochSealAuditEvent {
         /// Description of the validation failure.
         reason: String,
     },
+
+    /// Seal rejected: epoch is not strictly greater than evicted high-water
+    /// mark (replay-after-eviction attack).
+    EvictionReplayRejected {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// The rejected epoch number.
+        epoch_number: u64,
+        /// The evicted high-water epoch for this key.
+        evicted_high_water_epoch: u64,
+    },
 }
 
 impl EpochSealAuditEvent {
@@ -806,6 +869,7 @@ impl EpochSealAuditEvent {
             Self::SignatureRejected { .. } => "epoch_seal.signature_rejected",
             Self::NoSignatureVerifier { .. } => "epoch_seal.no_signature_verifier",
             Self::ValidationFailed { .. } => "epoch_seal.validation_failed",
+            Self::EvictionReplayRejected { .. } => "epoch_seal.eviction_replay_rejected",
         }
     }
 
@@ -867,6 +931,15 @@ impl EpochSealAuditEvent {
             } => {
                 hasher.update(issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
+            },
+            Self::EvictionReplayRejected {
+                issuer_cell_id,
+                epoch_number,
+                evicted_high_water_epoch,
+            } => {
+                hasher.update(issuer_cell_id.as_bytes());
+                hasher.update(&epoch_number.to_le_bytes());
+                hasher.update(&evicted_high_water_epoch.to_le_bytes());
             },
         }
         *hasher.finalize().as_bytes()
@@ -940,6 +1013,20 @@ pub enum EpochSealVerificationError {
         /// Description of the failure.
         reason: String,
     },
+
+    /// Seal epoch is not strictly greater than evicted high-water mark
+    /// (replay-after-eviction attack).
+    #[error(
+        "eviction replay: seal epoch {epoch_number} <= evicted high-water {evicted_high_water_epoch} for issuer {issuer_cell_id}"
+    )]
+    EvictionReplay {
+        /// The rejected epoch number.
+        epoch_number: u64,
+        /// The evicted high-water epoch.
+        evicted_high_water_epoch: u64,
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+    },
 }
 
 // =============================================================================
@@ -996,6 +1083,10 @@ struct CellState {
 // EpochSealVerifier
 // =============================================================================
 
+/// Maximum number of evicted high-water marks retained. Bounded to prevent
+/// unbounded memory growth if many keys are evicted over time.
+pub const MAX_EVICTION_HIGH_WATER_MARKS: usize = 4096;
+
 /// Verifies epoch seals for monotonicity, rollback rejection,
 /// equivocation detection, and signature authenticity.
 ///
@@ -1013,6 +1104,10 @@ struct CellState {
 ///    field difference is equivocation.
 /// 6. **Fail-closed**: Tier2+ admissions require a valid seal. When no
 ///    [`SignatureVerifier`] is configured, ALL seals are rejected.
+/// 7. **Eviction safety**: When an entry is evicted from the LRU cache, its
+///    high-water epoch is persisted. Re-introduced keys must present an epoch
+///    strictly greater than the evicted high-water mark. This prevents replay
+///    attacks that exploit LRU eviction to reset monotonic state.
 #[derive(Debug)]
 pub struct EpochSealVerifier {
     /// Per-cell epoch state, keyed on `(cell_id, htf_time_envelope_ref,
@@ -1026,6 +1121,14 @@ pub struct EpochSealVerifier {
 
     /// Monotonically increasing counter for LRU access ordering.
     access_counter: u64,
+
+    /// High-water epoch marks for evicted keys.
+    ///
+    /// When a key is evicted from `cells`, its last-known epoch is stored
+    /// here. On re-introduction, the seal's epoch must be strictly greater
+    /// than this high-water mark to prevent replay-after-eviction attacks.
+    /// This map is itself bounded by [`MAX_EVICTION_HIGH_WATER_MARKS`].
+    evicted_high_water: HashMap<MonotonicityKey, u64>,
 }
 
 impl Clone for EpochSealVerifier {
@@ -1036,6 +1139,7 @@ impl Clone for EpochSealVerifier {
             cells: self.cells.clone(),
             signature_verifier: None,
             access_counter: self.access_counter,
+            evicted_high_water: self.evicted_high_water.clone(),
         }
     }
 }
@@ -1055,6 +1159,7 @@ impl EpochSealVerifier {
             cells: HashMap::new(),
             signature_verifier: None,
             access_counter: 0,
+            evicted_high_water: HashMap::new(),
         }
     }
 
@@ -1065,6 +1170,7 @@ impl EpochSealVerifier {
             cells: HashMap::new(),
             signature_verifier: Some(signature_verifier),
             access_counter: 0,
+            evicted_high_water: HashMap::new(),
         }
     }
 
@@ -1098,6 +1204,9 @@ impl EpochSealVerifier {
     }
 
     /// Evicts the least recently used entry from the verifier state.
+    ///
+    /// The evicted key's epoch is persisted in [`evicted_high_water`] so
+    /// that replay-after-eviction attacks are detected on re-introduction.
     /// Returns `true` if an entry was evicted, `false` if the map is empty.
     fn evict_lru(&mut self) -> bool {
         if let Some(lru_key) = self
@@ -1106,7 +1215,9 @@ impl EpochSealVerifier {
             .min_by_key(|(_, state)| state.last_access)
             .map(|(key, _)| key.clone())
         {
-            self.cells.remove(&lru_key);
+            if let Some(state) = self.cells.remove(&lru_key) {
+                self.persist_eviction_high_water(&lru_key, state.epoch);
+            }
             true
         } else {
             false
@@ -1114,6 +1225,9 @@ impl EpochSealVerifier {
     }
 
     /// Evicts the least recently used entry for a specific `cell_id`.
+    ///
+    /// The evicted key's epoch is persisted in [`evicted_high_water`] so
+    /// that replay-after-eviction attacks are detected on re-introduction.
     /// Returns `true` if an entry was evicted.
     fn evict_lru_for_cell(&mut self, cell_id: &str) -> bool {
         if let Some(lru_key) = self
@@ -1123,11 +1237,44 @@ impl EpochSealVerifier {
             .min_by_key(|(_, state)| state.last_access)
             .map(|(key, _)| key.clone())
         {
-            self.cells.remove(&lru_key);
+            if let Some(state) = self.cells.remove(&lru_key) {
+                self.persist_eviction_high_water(&lru_key, state.epoch);
+            }
             true
         } else {
             false
         }
+    }
+
+    /// Persists a high-water epoch mark for an evicted key.
+    ///
+    /// If the high-water map is at capacity, the entry with the lowest
+    /// epoch is evicted to make room (the oldest high-water mark is the
+    /// least useful for replay protection).
+    fn persist_eviction_high_water(&mut self, key: &MonotonicityKey, epoch: u64) {
+        // Update existing entry to max (never decrease high-water mark).
+        let entry = self.evicted_high_water.entry(key.clone()).or_insert(0);
+        if epoch > *entry {
+            *entry = epoch;
+        }
+
+        // Bound the high-water map: evict the entry with the lowest epoch.
+        if self.evicted_high_water.len() > MAX_EVICTION_HIGH_WATER_MARKS {
+            if let Some(min_key) = self
+                .evicted_high_water
+                .iter()
+                .min_by_key(|(_, e)| **e)
+                .map(|(k, _)| k.clone())
+            {
+                self.evicted_high_water.remove(&min_key);
+            }
+        }
+    }
+
+    /// Returns the number of evicted high-water marks tracked.
+    #[must_use]
+    pub fn evicted_high_water_count(&self) -> usize {
+        self.evicted_high_water.len()
     }
 
     /// Returns the last accepted epoch for the given issuer cell ID.
@@ -1297,6 +1444,13 @@ impl EpochSealVerifier {
 
     /// Accepts the first seal from a new cell key, evicting the oldest
     /// entry if the global or per-cell-id capacity is reached.
+    ///
+    /// Before accepting, checks the evicted high-water mark for this key.
+    /// If the seal's epoch is not strictly greater than the evicted
+    /// high-water mark, the seal is rejected (fail-closed) to prevent
+    /// replay-after-eviction attacks. This check applies to Tier2+
+    /// admissions; Tier0/Tier1 seals with no high-water mark or passing
+    /// the check are accepted normally.
     fn accept_first_seal(
         &mut self,
         seal: &EpochSealV1,
@@ -1304,6 +1458,27 @@ impl EpochSealVerifier {
         risk_tier: RiskTier,
     ) -> EpochSealVerdict {
         let issuer = seal.issuer_cell_id();
+
+        // Check evicted high-water mark for replay-after-eviction.
+        // Fail-closed for Tier2+: reject if epoch <= evicted high-water.
+        if let Some(&hw_epoch) = self.evicted_high_water.get(key) {
+            if seal.epoch_number() <= hw_epoch {
+                return EpochSealVerdict {
+                    accepted: false,
+                    risk_tier,
+                    epoch_number: seal.epoch_number(),
+                    issuer_cell_id: issuer.to_string(),
+                    audit_event: EpochSealAuditEvent::EvictionReplayRejected {
+                        issuer_cell_id: issuer.to_string(),
+                        epoch_number: seal.epoch_number(),
+                        evicted_high_water_epoch: hw_epoch,
+                    },
+                };
+            }
+            // Seal passes high-water check: remove the high-water entry
+            // since this key is being re-introduced with a valid epoch.
+            self.evicted_high_water.remove(key);
+        }
 
         // Per-cell-id limit: prevent a single cell_id from exhausting
         // global capacity.
@@ -1395,6 +1570,15 @@ impl EpochSealVerifier {
                 EpochSealAuditEvent::NoSignatureVerifier { .. } => {
                     Err(EpochSealVerificationError::NoSignatureVerifier)
                 },
+                EpochSealAuditEvent::EvictionReplayRejected {
+                    epoch_number,
+                    evicted_high_water_epoch,
+                    issuer_cell_id,
+                } => Err(EpochSealVerificationError::EvictionReplay {
+                    epoch_number: *epoch_number,
+                    evicted_high_water_epoch: *evicted_high_water_epoch,
+                    issuer_cell_id: issuer_cell_id.clone(),
+                }),
                 _ => Err(EpochSealVerificationError::MissingSeal { risk_tier }),
             }
         }
@@ -1526,6 +1710,7 @@ pub const fn is_seal_required_tier(risk_tier: RiskTier) -> bool {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
 
@@ -3694,5 +3879,320 @@ mod tests {
             &seal.compute_content_hash(),
             "make_seal must produce a seal whose content_hash matches compute_content_hash"
         );
+    }
+
+    // =========================================================================
+    // Eviction high-water mark tests (replay-after-eviction defense)
+    // =========================================================================
+
+    #[test]
+    fn eviction_replay_rejected_after_lru_eviction() {
+        // Fill verifier to capacity, evict, then replay the evicted
+        // issuer with the same epoch. The replayed seal must be rejected.
+        let mut verifier = test_verifier();
+
+        // Accept seal at epoch 10 for a specific key.
+        let target_seal = make_seal_full(
+            10,
+            "evict-target",
+            test_root_hash(0x11),
+            "evict-cell",
+            1,
+            1,
+            test_anchor_hash(0xA1),
+            test_anchor_hash(0xB1),
+            test_anchor_hash(0xC1),
+        );
+        assert!(
+            verifier.verify(&target_seal, RiskTier::Tier2).accepted,
+            "target seal must be accepted initially"
+        );
+
+        // Fill remaining capacity to force LRU eviction of the target.
+        // Each new cell gets a unique (cell_id, htf_ref, quorum_anchor)
+        // key so they don't collide.
+        for i in 1..=MAX_TRACKED_ISSUERS {
+            let cell_id = format!("fill-cell-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x22),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash((i & 0xFF) as u8),
+                test_anchor_hash(((i >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xC2),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+
+        // The target should have been evicted (it was LRU).
+        // Now replay the same seal at epoch 10 — must be rejected.
+        let replay_seal = make_seal_full(
+            10,
+            "evict-target",
+            test_root_hash(0x11),
+            "evict-cell",
+            1,
+            1,
+            test_anchor_hash(0xA1),
+            test_anchor_hash(0xB1),
+            test_anchor_hash(0xC1),
+        );
+        let verdict = verifier.verify(&replay_seal, RiskTier::Tier2);
+        assert!(
+            !verdict.accepted,
+            "replay of evicted seal at same epoch must be rejected"
+        );
+        assert!(
+            matches!(
+                verdict.audit_event,
+                EpochSealAuditEvent::EvictionReplayRejected {
+                    epoch_number: 10,
+                    evicted_high_water_epoch: 10,
+                    ..
+                }
+            ),
+            "expected EvictionReplayRejected, got {:?}",
+            verdict.audit_event
+        );
+    }
+
+    #[test]
+    fn eviction_replay_accepted_with_higher_epoch() {
+        // Same setup as above, but replay with epoch > evicted high-water.
+        let mut verifier = test_verifier();
+
+        let target_seal = make_seal_full(
+            10,
+            "evict-target",
+            test_root_hash(0x11),
+            "evict-cell",
+            1,
+            1,
+            test_anchor_hash(0xA1),
+            test_anchor_hash(0xB1),
+            test_anchor_hash(0xC1),
+        );
+        assert!(verifier.verify(&target_seal, RiskTier::Tier2).accepted);
+
+        for i in 1..=MAX_TRACKED_ISSUERS {
+            let cell_id = format!("fill-cell-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x22),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash((i & 0xFF) as u8),
+                test_anchor_hash(((i >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xC2),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+
+        // Replay with epoch 11 (higher than evicted high-water 10).
+        let replay_seal = make_seal_full(
+            11,
+            "evict-target",
+            test_root_hash(0x33),
+            "evict-cell",
+            2,
+            2,
+            test_anchor_hash(0xA1),
+            test_anchor_hash(0xB1),
+            test_anchor_hash(0xC1),
+        );
+        let verdict = verifier.verify(&replay_seal, RiskTier::Tier2);
+        assert!(
+            verdict.accepted,
+            "replay with higher epoch than evicted high-water must be accepted"
+        );
+    }
+
+    #[test]
+    fn eviction_high_water_count_bounded() {
+        // Verify that the evicted high-water map doesn't grow unbounded.
+        let mut verifier = test_verifier();
+
+        // Create and evict many keys.
+        for i in 0..(MAX_EVICTION_HIGH_WATER_MARKS + 100) {
+            let cell_id = format!("hw-cell-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x11),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash((i & 0xFF) as u8),
+                test_anchor_hash(((i >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xC1),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+        // Force eviction of all by filling with new keys.
+        for i in 0..(MAX_TRACKED_ISSUERS + 100) {
+            let cell_id = format!("new-cell-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x22),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash(((i + 0x80) & 0xFF) as u8),
+                test_anchor_hash((((i + 0x80) >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xC2),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+
+        assert!(
+            verifier.evicted_high_water_count() <= MAX_EVICTION_HIGH_WATER_MARKS,
+            "evicted high-water map must be bounded at {}, got {}",
+            MAX_EVICTION_HIGH_WATER_MARKS,
+            verifier.evicted_high_water_count()
+        );
+    }
+
+    #[test]
+    fn verify_or_reject_maps_eviction_replay_error() {
+        let mut verifier = test_verifier();
+
+        let target_seal = make_seal_full(
+            5,
+            "evict-target",
+            test_root_hash(0x11),
+            "evict-cell",
+            1,
+            1,
+            test_anchor_hash(0xA1),
+            test_anchor_hash(0xB1),
+            test_anchor_hash(0xC1),
+        );
+        assert!(
+            verifier
+                .verify_or_reject(&target_seal, RiskTier::Tier2)
+                .is_ok()
+        );
+
+        // Evict by filling capacity.
+        for i in 1..=MAX_TRACKED_ISSUERS {
+            let cell_id = format!("fill-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x22),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash((i & 0xFF) as u8),
+                test_anchor_hash(((i >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xC2),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+
+        // Replay at same epoch — verify_or_reject returns EvictionReplay error.
+        let replay = make_seal_full(
+            5,
+            "evict-target",
+            test_root_hash(0x11),
+            "evict-cell",
+            1,
+            1,
+            test_anchor_hash(0xA1),
+            test_anchor_hash(0xB1),
+            test_anchor_hash(0xC1),
+        );
+        let err = verifier
+            .verify_or_reject(&replay, RiskTier::Tier2)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EpochSealVerificationError::EvictionReplay {
+                    epoch_number: 5,
+                    evicted_high_water_epoch: 5,
+                    ..
+                }
+            ),
+            "expected EvictionReplay error, got {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // Bounded signature deserialization tests
+    // =========================================================================
+
+    #[test]
+    fn signature_deser_rejects_oversized_payload() {
+        // Build a valid seal, serialize it, tamper with the signature
+        // to be oversized, then attempt deserialization.
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let mut value = serde_json::to_value(&seal).expect("serialize");
+
+        // Replace signature with 65 bytes (one over the limit).
+        let oversized: Vec<u8> = vec![0xAA; 65];
+        value["signature"] = serde_json::Value::Array(
+            oversized
+                .iter()
+                .map(|&b| serde_json::Value::Number(b.into()))
+                .collect(),
+        );
+
+        let result: Result<EpochSealV1, _> = serde_json::from_value(value);
+        assert!(
+            result.is_err(),
+            "deserialization must reject signature with 65 bytes"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("more than 64 bytes") || err_msg.contains("signature too long"),
+            "error should mention oversized signature, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn signature_deser_rejects_undersized_payload() {
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let mut value = serde_json::to_value(&seal).expect("serialize");
+
+        // Replace signature with 63 bytes (one under).
+        let undersized: Vec<u8> = vec![0xAA; 63];
+        value["signature"] = serde_json::Value::Array(
+            undersized
+                .iter()
+                .map(|&b| serde_json::Value::Number(b.into()))
+                .collect(),
+        );
+
+        let result: Result<EpochSealV1, _> = serde_json::from_value(value);
+        assert!(
+            result.is_err(),
+            "deserialization must reject signature with 63 bytes"
+        );
+    }
+
+    #[test]
+    fn signature_deser_accepts_exact_size() {
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let json = serde_json::to_string(&seal).expect("serialize");
+        let result: Result<EpochSealV1, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_ok(),
+            "deserialization must accept exact 64-byte signature"
+        );
+    }
+
+    #[test]
+    fn signature_roundtrip_preserves_bytes() {
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let json = serde_json::to_string(&seal).expect("serialize");
+        let roundtripped: EpochSealV1 = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(seal, roundtripped, "roundtrip must preserve all fields");
     }
 }
