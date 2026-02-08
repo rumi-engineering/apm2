@@ -9,7 +9,8 @@
 //! 1. Reads the appropriate review prompt
 //! 2. Runs the review (via AI tool or manual)
 //! 3. Posts a PR comment with findings
-//! 4. Logs projection-only status intent (direct status writes are removed)
+//! 4. The Review Gate Success workflow evaluates comment metadata for gate
+//!    decisions
 
 use std::path::Path;
 
@@ -18,10 +19,10 @@ use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{ReviewerSpawner, select_review_model};
 
-const REVIEW_STATUS_PROJECTION_NOTICE: &str =
-    "  [TCK-00411] Projection-only: xtask does not write review status checks directly.";
+const REVIEW_GATE_NOTICE: &str =
+    "  [TCK-00432] Review Gate: status authority is handled by the Review Gate Success workflow.";
 
-/// Review type determines which prompt and status check to use.
+/// Review type determines which prompt and review gate category to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewType {
     /// Security review using Codex and `SECURITY_REVIEW_PROMPT.md`
@@ -33,16 +34,6 @@ pub enum ReviewType {
 }
 
 impl ReviewType {
-    /// Get the status check context name for this review type.
-    #[allow(dead_code)]
-    pub const fn status_context(self) -> &'static str {
-        match self {
-            Self::Security => "ai-review/security",
-            Self::Quality => "ai-review/code-quality",
-            Self::Uat => "ai-review/uat",
-        }
-    }
-
     /// Get the display name for this review type.
     pub const fn display_name(self) -> &'static str {
         match self {
@@ -77,7 +68,8 @@ impl ReviewType {
 /// 2. Gets the HEAD SHA of the PR
 /// 3. Reads the security review prompt
 /// 4. Spawns Codex to run the review (if available)
-/// 5. The AI reviewer posts findings; status authority remains projection-only
+/// 5. The AI reviewer posts findings; the Review Gate Success workflow
+///    evaluates them
 ///
 /// # Arguments
 ///
@@ -116,7 +108,8 @@ pub fn run_security(
 /// 2. Gets the HEAD SHA of the PR
 /// 3. Reads the code quality review prompt
 /// 4. Spawns Codex to run the review (if available)
-/// 5. The AI reviewer posts findings; status authority remains projection-only
+/// 5. The AI reviewer posts findings; the Review Gate Success workflow
+///    evaluates them
 ///
 /// # Arguments
 ///
@@ -342,7 +335,7 @@ pub fn run_all(
 /// This is a manual sign-off that:
 /// 1. Parses the PR URL
 /// 2. Posts a UAT approval comment
-/// 3. Logs projection-only ai-review/uat status intent
+/// 3. The Review Gate Success workflow evaluates the UAT metadata
 ///
 /// # Arguments
 ///
@@ -482,41 +475,20 @@ fn run_review(
 
 /// Run UAT sign-off.
 ///
-/// # TCK-00297 (Stage X3): Status writes permanently removed
-///
-/// Direct GitHub status writes have been removed. This function logs what the
-/// UAT signoff would have been. The comment posting is still performed since
-/// comments are informational, not status writes.
+/// Direct GitHub status writes have been removed. The Review Gate Success
+/// workflow is now the sole authoritative AI review gate. The comment posting
+/// is still performed since comments are informational.
 fn run_uat_signoff(
     sh: &Shell,
     pr_url: &str,
     owner_repo: &str,
     head_sha: &str,
     emit_receipt_only: bool,
-    allow_github_write: bool,
+    _allow_github_write: bool,
 ) -> Result<()> {
-    use crate::util::{StatusWriteDecision, check_status_write_with_flags};
-
-    // TCK-00297 (Stage X3): Status writes are permanently removed.
-    // check_status_write_with_flags always returns Removed as of TCK-00297.
-    match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
-        StatusWriteDecision::Removed => {
-            println!("{REVIEW_STATUS_PROJECTION_NOTICE}");
-            println!("  Target commit: {owner_repo}@{head_sha}");
-            println!("    context: ai-review/uat");
-            println!("    state:   success");
-            println!("    desc:    UAT approved");
-            crate::util::print_status_writes_removed_notice();
-        },
-        // Legacy variants are inert after TCK-00297; keep projection-only output.
-        legacy_decision => {
-            println!("{REVIEW_STATUS_PROJECTION_NOTICE}");
-            println!(
-                "  [TCK-00297] Ignoring legacy status decision: {legacy_decision:?}. \
-                 No status write performed."
-            );
-        },
-    }
+    println!("{REVIEW_GATE_NOTICE}");
+    println!("  Target commit: {owner_repo}@{head_sha}");
+    println!("  UAT approval will be evaluated by the Review Gate Success workflow.");
 
     // Post UAT comment (informational, not a status write)
     println!("\nPosting UAT approval comment...");
@@ -555,7 +527,7 @@ fn run_uat_signoff(
     }
 
     println!("\nUAT review complete!");
-    println!("  [TCK-00297] Projection-only status intent logged. Comment posted only.");
+    println!("  Review Gate Success workflow will evaluate the review metadata.");
 
     Ok(())
 }
@@ -654,8 +626,7 @@ fn run_ai_review(
                 review_type.display_name().to_lowercase()
             );
             println!("\n  Note: Codex should have posted a comment with its findings.");
-            println!("  {REVIEW_STATUS_PROJECTION_NOTICE}");
-            println!("  Status authority is handled by projection/review-gate systems.");
+            println!("  {REVIEW_GATE_NOTICE}");
         },
         Ok(result) => {
             println!("  Warning: Codex exited with status: {}", result.status);
@@ -729,54 +700,6 @@ fn validate_expected_head_sha(expected_head_sha: &str) -> Result<()> {
         bail!("Invalid --expected-head-sha: expected a 40-hex SHA, got: {expected_head_sha}");
     }
     Ok(())
-}
-
-/// Log review status intent (direct status writes are removed).
-///
-/// # TCK-00297 (Stage X3): Status writes permanently removed
-///
-/// Per RFC-0018, direct GitHub status writes from xtask have been removed.
-/// This function logs projection-only status intent for diagnostic purposes.
-/// The `_sh` parameter is retained for call-site compatibility. The
-/// `emit_receipt_only` and `allow_github_write` parameters are retained for
-/// call-site compatibility with TCK-00324 callers but are ignored.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn update_status(
-    _sh: &Shell,
-    owner_repo: &str,
-    head_sha: &str,
-    review_type: ReviewType,
-    success: bool,
-    description: &str,
-    emit_receipt_only: bool,
-    allow_github_write: bool,
-) {
-    use crate::util::{StatusWriteDecision, check_status_write_with_flags};
-
-    let context = review_type.status_context();
-    let state = if success { "success" } else { "failure" };
-
-    // TCK-00297 (Stage X3): Status writes are permanently removed.
-    // check_status_write_with_flags always returns Removed as of TCK-00297.
-    match check_status_write_with_flags(emit_receipt_only, allow_github_write) {
-        StatusWriteDecision::Removed => {
-            println!("{REVIEW_STATUS_PROJECTION_NOTICE}");
-            println!("  Target commit: {owner_repo}@{head_sha}");
-            println!("    context: {context}");
-            println!("    state:   {state}");
-            println!("    desc:    {description}");
-            crate::util::print_status_writes_removed_notice();
-        },
-        // Legacy variants are inert after TCK-00297; keep projection-only output.
-        legacy_decision => {
-            println!("{REVIEW_STATUS_PROJECTION_NOTICE}");
-            println!(
-                "  [TCK-00297] Ignoring legacy status decision: {legacy_decision:?}. \
-                 No status write performed. Intended status: {context} = {state} - {description}"
-            );
-        },
-    }
 }
 
 #[cfg(test)]
@@ -951,16 +874,6 @@ mod tests {
     }
 
     #[test]
-    fn test_review_type_status_context() {
-        assert_eq!(ReviewType::Security.status_context(), "ai-review/security");
-        assert_eq!(
-            ReviewType::Quality.status_context(),
-            "ai-review/code-quality"
-        );
-        assert_eq!(ReviewType::Uat.status_context(), "ai-review/uat");
-    }
-
-    #[test]
     fn test_review_type_display_name() {
         assert_eq!(ReviewType::Security.display_name(), "Security");
         assert_eq!(ReviewType::Quality.display_name(), "Code Quality");
@@ -1005,15 +918,10 @@ mod tests {
     }
 
     #[test]
-    fn test_review_status_projection_notice_mentions_projection_only() {
+    fn test_review_gate_notice_mentions_review_gate() {
         assert!(
-            REVIEW_STATUS_PROJECTION_NOTICE.contains("Projection-only"),
-            "Review status notice must explicitly state projection-only semantics"
-        );
-        assert!(
-            REVIEW_STATUS_PROJECTION_NOTICE
-                .contains("does not write review status checks directly"),
-            "Review status notice must state direct status writes are disabled"
+            REVIEW_GATE_NOTICE.contains("Review Gate"),
+            "Review gate notice must reference the Review Gate Success workflow"
         );
     }
 }

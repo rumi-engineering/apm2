@@ -7,7 +7,7 @@ notes:
   - "All commands that can hang should use timeout wrappers."
   - "Commands labeled side_effect=true modify external state."
 
-commands[16]:
+commands[15]:
   - name: resolve_repo_root
     command: "timeout 10s git rev-parse --show-toplevel"
     purpose: "Discover repository root for asset invocation."
@@ -35,7 +35,7 @@ commands[16]:
 
   - name: commit_statuses
     command: "timeout 30s gh api repos/guardian-intelligence/apm2/commits/<HEAD_SHA>/status"
-    purpose: "Fetch ai-review/* status contexts for exact HEAD SHA binding."
+    purpose: "Fetch Review Gate Success status context for exact HEAD SHA binding."
     side_effect: false
 
   - name: launch_reviews
@@ -47,11 +47,6 @@ commands[16]:
     command: "timeout 30s bash <ROOT>/documents/skills/orchestrator-monitor/assets/check-review.sh <PR_NUMBER> <SCRATCHPAD_DIR>"
     purpose: "Check review process/log progress and verdict indicators."
     side_effect: false
-
-  - name: post_review_status
-    command: "timeout 30s bash <ROOT>/documents/skills/orchestrator-monitor/assets/post-review-status.sh <PR_NUMBER> <security|code-quality> <success|failure|pending> [DESCRIPTION]"
-    purpose: "Publish review verdict to GitHub commit status."
-    side_effect: true
 
   - name: enable_auto_merge
     command: "timeout 30s gh pr merge <PR_NUMBER> --repo guardian-intelligence/apm2 --auto --squash --delete-branch"
