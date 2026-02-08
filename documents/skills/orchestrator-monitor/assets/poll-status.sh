@@ -5,7 +5,7 @@
 # If no PR numbers given, auto-discovers open PRs on current repo.
 set -euo pipefail
 
-REPO="rumi-engineering/apm2"
+REPO="guardian-intelligence/apm2"
 SCRATCHPAD="${SCRATCHPAD:-/tmp/claude-1000/-home-ubuntu-Projects-apm2/*/scratchpad}"
 
 # Resolve scratchpad glob to actual path

@@ -393,7 +393,7 @@ fn ecosystem_config_divergence_watchdog_section() {
 
         [daemon.divergence_watchdog]
         enabled = true
-        github_owner = "rumi-engineering"
+        github_owner = "guardian-intelligence"
         github_repo = "apm2"
         trunk_branch = "main"
         github_api_url = "https://api.github.com"
@@ -405,7 +405,7 @@ fn ecosystem_config_divergence_watchdog_section() {
     assert!(config.daemon.divergence_watchdog.enabled);
     assert_eq!(
         config.daemon.divergence_watchdog.github_owner,
-        "rumi-engineering"
+        "guardian-intelligence"
     );
     assert_eq!(config.daemon.divergence_watchdog.github_repo, "apm2");
     assert_eq!(config.daemon.divergence_watchdog.trunk_branch, "main");
@@ -466,7 +466,7 @@ fn watchdog_enabled_without_ledger_db_fails_startup() {
 
         [daemon.divergence_watchdog]
         enabled = true
-        github_owner = "rumi-engineering"
+        github_owner = "guardian-intelligence"
         github_repo = "apm2"
     "#;
 
@@ -509,7 +509,7 @@ fn watchdog_enabled_with_ledger_db_passes_startup() {
 
         [daemon.divergence_watchdog]
         enabled = true
-        github_owner = "rumi-engineering"
+        github_owner = "guardian-intelligence"
         github_repo = "apm2"
     "#;
 

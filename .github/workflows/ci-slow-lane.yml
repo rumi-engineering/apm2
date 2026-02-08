@@ -1,17 +1,12 @@
-# Main CI workflow
-# Executes all gates locally on the OVH self-hosted runner and projects
-# a single required status context (`CI Success`) back to GitHub.
+# Slow-lane CI workflow
+# Runs heavyweight non-gating checks on the same self-hosted machine.
 
-name: CI
+name: CI Slow Lane
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-  # Required for GitHub merge queue: required checks must run on merge-group SHAs.
-  merge_group:
-    types: [checks_requested]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,12 +22,10 @@ permissions:
   contents: read
 
 jobs:
-  ci-success:
-    name: CI Success
-    # Trust boundary: fork PRs are not permitted on self-hosted infra.
-    if: github.event_name != 'issue_comment' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+  slow-lane-release-build:
+    name: Slow Lane Release Build
     runs-on: [self-hosted, linux, x64, fac-ovh]
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -51,39 +44,24 @@ jobs:
             echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
           fi
 
-      - name: Run bounded local CI suite
+      - name: Run slow-lane bounded CI suite
         run: |
-          PROFILE="github-deep"
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            PROFILE="github-pr-fast"
-          fi
-
-          echo "Using CI profile: ${PROFILE}"
           cargo run --locked --package apm2-cli -- ci run \
-            --profile "${PROFILE}" \
+            --profile github-slow-lane \
             --bounded-timeout-seconds 4800 \
             --bounded-kill-after-seconds 30 \
             --bounded-memory-max 64G \
             --bounded-pids-max 8192 \
             --bounded-cpu-quota 1600% \
             --heartbeat-seconds 1 \
-            --heavy-lane-tokens 4 \
             --log-mode dual \
             --artifacts-dir target/ci/runs
 
-      - name: Upload CI run artifacts
+      - name: Upload slow-lane CI artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-run-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ci-slow-lane-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/ci/runs/
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Upload coverage
-        if: always() && hashFiles('target/ci/lcov.info') != ''
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
-        with:
-          files: target/ci/lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}

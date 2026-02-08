@@ -19,7 +19,7 @@ commands[16]:
     side_effect: false
 
   - name: list_open_prs
-    command: "timeout 30s gh pr list --repo rumi-engineering/apm2 --state open --json number --jq '.[].number'"
+    command: "timeout 30s gh pr list --repo guardian-intelligence/apm2 --state open --json number --jq '.[].number'"
     purpose: "Discover open PR scope when user did not supply PR numbers."
     side_effect: false
 
@@ -29,12 +29,12 @@ commands[16]:
     side_effect: false
 
   - name: pr_state_json
-    command: "timeout 30s gh pr view <PR_NUMBER> --repo rumi-engineering/apm2 --json state,mergeable,headRefOid,isDraft,statusCheckRollup"
+    command: "timeout 30s gh pr view <PR_NUMBER> --repo guardian-intelligence/apm2 --json state,mergeable,headRefOid,isDraft,statusCheckRollup"
     purpose: "Fetch machine-readable PR state and CI rollup."
     side_effect: false
 
   - name: commit_statuses
-    command: "timeout 30s gh api repos/rumi-engineering/apm2/commits/<HEAD_SHA>/status"
+    command: "timeout 30s gh api repos/guardian-intelligence/apm2/commits/<HEAD_SHA>/status"
     purpose: "Fetch ai-review/* status contexts for exact HEAD SHA binding."
     side_effect: false
 
@@ -54,7 +54,7 @@ commands[16]:
     side_effect: true
 
   - name: enable_auto_merge
-    command: "timeout 30s gh pr merge <PR_NUMBER> --repo rumi-engineering/apm2 --auto --squash --delete-branch"
+    command: "timeout 30s gh pr merge <PR_NUMBER> --repo guardian-intelligence/apm2 --auto --squash --delete-branch"
     purpose: "Enable auto-merge after all merge gates pass."
     side_effect: true
 

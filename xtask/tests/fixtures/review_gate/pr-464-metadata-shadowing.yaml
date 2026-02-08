@@ -1,13 +1,6 @@
 name: "PR-464 metadata shadowing: denial reason embeds PASS marker before authoritative FAIL"
 pr_number: 464
 head_sha: "d991cab5eb86177d6304149c1c4f44f584a61122"
-statuses:
-  - context: "ai-review/security"
-    state: "failure"
-    created_at: "2026-02-07T04:00:00Z"
-  - context: "ai-review/code-quality"
-    state: "success"
-    created_at: "2026-02-07T04:01:00Z"
 comments:
   # Denial comment where the reason text contains a PASS marker (shadowing
   # attempt). The authoritative metadata at the end is FAIL. The gate must
@@ -68,6 +61,7 @@ comments:
       ```
 expected:
   overall_pass: false
+  overall_pending: false
   security_pass: false
   code_quality_pass: true
   security_reason_substrings:

@@ -1,13 +1,6 @@
 name: "PR-454 both categories pass with current head bindings"
 pr_number: 454
 head_sha: "9999999999999999999999999999999999999999"
-statuses:
-  - context: "ai-review/security"
-    state: "success"
-    created_at: "2026-02-09T16:30:00Z"
-  - context: "ai-review/code-quality"
-    state: "success"
-    created_at: "2026-02-09T16:31:00Z"
 comments:
   - id: 45401
     user_login: "apm2-security-bot"
@@ -55,5 +48,6 @@ comments:
       ```
 expected:
   overall_pass: true
+  overall_pending: false
   security_pass: true
   code_quality_pass: true

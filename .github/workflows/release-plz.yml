@@ -14,7 +14,7 @@ permissions:
 jobs:
   release-plz:
     name: Release-plz
-    runs-on: ubuntu-24.04
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

@@ -126,11 +126,37 @@ pub fn finish() -> Result<()> {
 /// details.
 pub fn review_security(
     pr_url: &str,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
 ) -> Result<()> {
-    review::run_security(pr_url, emit_internal, emit_receipt_only, allow_github_write)
+    review::run_security(
+        pr_url,
+        expected_head_sha,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
+}
+
+/// Run both security + code quality AI reviews for a PR.
+///
+/// Delegates to the review module for the actual implementation.
+pub fn review_all(
+    pr_url: &str,
+    expected_head_sha: Option<&str>,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    review::run_all(
+        pr_url,
+        expected_head_sha,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
 }
 
 /// Run a code quality review for a PR.
@@ -150,11 +176,18 @@ pub fn review_security(
 /// details.
 pub fn review_quality(
     pr_url: &str,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
 ) -> Result<()> {
-    review::run_quality(pr_url, emit_internal, emit_receipt_only, allow_github_write)
+    review::run_quality(
+        pr_url,
+        expected_head_sha,
+        emit_internal,
+        emit_receipt_only,
+        allow_github_write,
+    )
 }
 
 /// Run a UAT sign-off for a PR.

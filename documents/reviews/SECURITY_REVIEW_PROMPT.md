@@ -239,7 +239,14 @@ decision_tree:
           action: classify
           options[3]:
             - id: STRICTNESS_DECREASE
-              rule: "BLOCK unless valid, unexpired WVR-#### exists and is referenced."
+              rule: |
+                BLOCK unless valid, unexpired WVR-#### exists and is referenced.
+
+                Waiver validation:
+                - `waiver.references.commit_sha` MUST equal reviewed_sha; OR
+                - If the PR head includes a waiver-only commit that only changes
+                  `documents/work/waivers/`, `commit_sha` MAY equal the immediate
+                  parent of reviewed_sha (pre-waiver PR head).
             - id: STRICTNESS_INCREASE
               rule: "BLOCK unless bound RFC exists describing implementation as deterministic checks."
             - id: CLARIFICATION
@@ -326,13 +333,14 @@ decision_tree:
           content: "$MACHINE_READABLE_METADATA_BLOCK"
         - id: POST_AND_UPDATE
           action: command
+          note: |
+            Post findings as a PR comment only.
+            Do NOT call GitHub statuses/check-runs APIs directly.
+            The authoritative `Review Gate Success` status is produced by
+            the review-gate evaluator from the machine-readable metadata
+            block above.
           run: |
-            if [ "$verdict" == "PASS" ]; then
-              gh pr comment $PR_URL --body-file security_findings.md
-              cargo xtask security-review-exec approve $ticket_id
-            else
-              cat security_findings.md | cargo xtask security-review-exec deny $ticket_id --reason -
-            fi
+            gh pr comment $PR_URL --body-file security_findings.md
             rm security_findings.md
         - id: TERMINATE
           action: output
