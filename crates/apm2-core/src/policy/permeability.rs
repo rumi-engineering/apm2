@@ -728,7 +728,12 @@ pub struct PermeabilityReceipt {
     pub issued_at_ms: u64,
 
     /// Timestamp (millis since epoch) when this receipt expires.
-    /// `0` means no expiry.
+    ///
+    /// RFC-0020 mandates that authority-bearing receipts carry a non-zero
+    /// expiry.  `expires_at_ms == 0` is treated as "missing expiry" and is
+    /// **rejected** by [`PermeabilityReceipt::validate_admission`] with
+    /// [`PermeabilityError::MissingExpiry`].  The runtime enforces
+    /// `now_ms <= expires_at_ms` (fail-closed when the receipt has expired).
     pub expires_at_ms: u64,
 
     /// Whether this receipt has been revoked.
@@ -1324,8 +1329,8 @@ pub(crate) fn validate_delegation_chain_unchecked(
 /// receipt hash and that the bound authority is sufficient for the
 /// requested action.
 ///
-/// TODO(TCK-XXXX): wire into delegated spawn/actuation gates in the daemon
-/// layer so that consumption verification is enforced on all production paths.
+/// This function is called from the daemon's delegated spawn/actuation gate
+/// to enforce consumption verification on all production paths (REQ-0027).
 ///
 /// # Arguments
 ///

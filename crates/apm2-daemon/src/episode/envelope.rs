@@ -1557,6 +1557,54 @@ impl EpisodeEnvelopeV1 {
             Some(_) => Ok(()),
         }
     }
+
+    /// Validates that this envelope is well-formed for a delegated
+    /// spawn **and** that the bound permeability receipt passes full
+    /// consumption binding verification (REQ-0027).
+    ///
+    /// This is the production-grade delegated spawn gate. It performs:
+    /// 1. All base spawn checks
+    ///    ([`validate_for_spawn`](Self::validate_for_spawn))
+    /// 2. Presence/non-zero check on `permeability_receipt_hash`
+    /// 3. Receipt admission (structural, expiry, issuance-time checks)
+    /// 4. Hash binding: `receipt.content_hash() == permeability_receipt_hash`
+    /// 5. Authority subset: `required_authority` is a subset of the receipt's
+    ///    delegated authority
+    ///
+    /// # Arguments
+    ///
+    /// * `receipt` - The permeability receipt to validate against.
+    /// * `required_authority` - The minimum authority needed for this spawn.
+    /// * `now_ms` - Current time in milliseconds since epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeV1Error`] if any check fails (fail-closed).
+    pub fn validate_for_delegated_spawn_with_receipt(
+        &self,
+        receipt: &apm2_core::policy::permeability::PermeabilityReceipt,
+        required_authority: &apm2_core::policy::permeability::AuthorityVector,
+        now_ms: u64,
+    ) -> Result<(), EnvelopeV1Error> {
+        // First: all structural envelope checks (base spawn + hash presence).
+        self.validate_for_delegated_spawn()?;
+
+        // Second: full consumption binding verification (admission + hash
+        // match + authority subset).
+        let bound_hash = self
+            .permeability_receipt_hash
+            .as_ref()
+            .expect("validate_for_delegated_spawn ensures Some");
+        apm2_core::policy::permeability::validate_consumption_binding(
+            receipt,
+            bound_hash,
+            required_authority,
+            now_ms,
+        )
+        .map_err(EnvelopeV1Error::PermeabilityBindingFailure)?;
+
+        Ok(())
+    }
 }
 
 /// Receipt binding triplet extracted from an `EpisodeEnvelopeV1`.
@@ -1684,6 +1732,14 @@ pub enum EnvelopeV1Error {
         /// The field that mismatched.
         field: &'static str,
     },
+
+    /// Permeability consumption binding validation failed.
+    ///
+    /// The delegated spawn's permeability receipt did not pass full
+    /// consumption binding verification (admission, hash match, or
+    /// authority subset check). Fail-closed per REQ-0027.
+    #[error("permeability consumption binding failure: {0}")]
+    PermeabilityBindingFailure(apm2_core::policy::permeability::PermeabilityError),
 }
 
 /// Builder for [`EpisodeEnvelopeV1`].
@@ -1885,6 +1941,45 @@ pub fn validate_spawn_gate(
         env.validate_for_spawn()?;
     }
 
+    Ok(env)
+}
+
+/// Production-grade delegated spawn gate with full consumption binding
+/// verification.
+///
+/// This is the recommended entry-point for delegated spawn authorization.
+/// It performs all checks from [`validate_spawn_gate`] **plus** full
+/// [`validate_consumption_binding`](apm2_core::policy::permeability::validate_consumption_binding)
+/// verification of the permeability receipt.
+///
+/// # Fail-closed
+///
+/// Returns an error if:
+/// - The envelope is `None` (absent)
+/// - The envelope fails structural validation
+/// - `permeability_receipt_hash` is missing or zero
+/// - Receipt admission fails (expired, revoked, invalid issuance time, etc.)
+/// - Receipt hash does not match the envelope's `permeability_receipt_hash`
+/// - `required_authority` is not a subset of the receipt's delegated authority
+///
+/// # Arguments
+///
+/// * `envelope` - The V1 envelope, or `None` if absent
+/// * `receipt` - The permeability receipt to validate against
+/// * `required_authority` - Minimum authority needed for this spawn
+/// * `now_ms` - Current time in milliseconds since epoch
+///
+/// # Errors
+///
+/// Returns [`EnvelopeV1Error`] if any gate check fails.
+pub fn validate_delegated_spawn_gate<'a>(
+    envelope: Option<&'a EpisodeEnvelopeV1>,
+    receipt: &apm2_core::policy::permeability::PermeabilityReceipt,
+    required_authority: &apm2_core::policy::permeability::AuthorityVector,
+    now_ms: u64,
+) -> Result<&'a EpisodeEnvelopeV1, EnvelopeV1Error> {
+    let env = envelope.ok_or(EnvelopeV1Error::ZeroEnvelopeHash)?;
+    env.validate_for_delegated_spawn_with_receipt(receipt, required_authority, now_ms)?;
     Ok(env)
 }
 
@@ -3615,5 +3710,228 @@ mod tests {
 
         // Step 4: Verify against the original envelope (replay path)
         assert!(receipt_bindings.verify_against(&env).is_ok());
+    }
+
+    // =========================================================================
+    // Delegated Spawn Consumption Binding Tests (REQ-0027)
+    // =========================================================================
+
+    /// Helper: builds a valid permeability receipt and returns (receipt,
+    /// `receipt_hash`).
+    fn build_test_receipt(
+        expires_at_ms: u64,
+        issued_at_ms: u64,
+    ) -> (
+        apm2_core::policy::permeability::PermeabilityReceipt,
+        [u8; 32],
+    ) {
+        use apm2_core::policy::permeability::{
+            AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+            PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+        };
+
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Public,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("test-receipt", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(issued_at_ms)
+            .expires_at_ms(expires_at_ms)
+            .build()
+            .expect("valid receipt");
+        let hash = receipt.content_hash();
+        (receipt, hash)
+    }
+
+    #[test]
+    fn test_delegated_spawn_with_receipt_happy_path() {
+        use apm2_core::policy::permeability::AuthorityVector;
+
+        let (receipt, hash) = build_test_receipt(5_000_000, 1_000_000);
+        let required = AuthorityVector::bottom();
+
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-del-binding")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash(hash)
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        assert!(
+            env.validate_for_delegated_spawn_with_receipt(&receipt, &required, 2_000_000)
+                .is_ok(),
+            "valid receipt + matching hash + sufficient authority should pass"
+        );
+    }
+
+    #[test]
+    fn test_delegated_spawn_rejects_mismatched_receipt_hash() {
+        use apm2_core::policy::permeability::AuthorityVector;
+
+        let (receipt, _hash) = build_test_receipt(5_000_000, 1_000_000);
+        let required = AuthorityVector::bottom();
+
+        // Use a DIFFERENT hash in the envelope (not matching receipt)
+        let wrong_hash = [0xFF; 32];
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-del-wrong-hash")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash(wrong_hash)
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        let result = env.validate_for_delegated_spawn_with_receipt(&receipt, &required, 2_000_000);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::PermeabilityBindingFailure(_))),
+            "mismatched receipt hash must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_spawn_rejects_expired_receipt() {
+        use apm2_core::policy::permeability::AuthorityVector;
+
+        let (receipt, hash) = build_test_receipt(2_000_000, 1_000_000);
+        let required = AuthorityVector::bottom();
+
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-del-expired")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash(hash)
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        // now_ms = 3_000_000 > expires_at_ms = 2_000_000  =>  expired
+        let result = env.validate_for_delegated_spawn_with_receipt(&receipt, &required, 3_000_000);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::PermeabilityBindingFailure(_))),
+            "expired receipt must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_spawn_rejects_insufficient_authority() {
+        use apm2_core::policy::permeability::AuthorityVector;
+
+        let (receipt, hash) = build_test_receipt(5_000_000, 1_000_000);
+        // Required authority is top() — strictly wider than what the receipt
+        // delegated (which was meet(top, overlay) = overlay, which is narrower
+        // than top on several facets).
+        let required = AuthorityVector::top();
+
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-del-insufficient")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash(hash)
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        let result = env.validate_for_delegated_spawn_with_receipt(&receipt, &required, 2_000_000);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::PermeabilityBindingFailure(_))),
+            "authority exceeding delegation must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_spawn_gate_with_receipt_happy_path() {
+        use apm2_core::policy::permeability::AuthorityVector;
+
+        let (receipt, hash) = build_test_receipt(5_000_000, 1_000_000);
+        let required = AuthorityVector::bottom();
+
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-gate-binding")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash(hash)
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        let result = validate_delegated_spawn_gate(Some(&env), &receipt, &required, 2_000_000);
+        assert!(result.is_ok(), "gate should pass with valid binding");
+    }
+
+    #[test]
+    fn test_delegated_spawn_gate_rejects_absent_envelope() {
+        use apm2_core::policy::permeability::AuthorityVector;
+
+        let (receipt, _hash) = build_test_receipt(5_000_000, 1_000_000);
+        let required = AuthorityVector::bottom();
+
+        let result = validate_delegated_spawn_gate(None, &receipt, &required, 2_000_000);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::ZeroEnvelopeHash)),
+            "absent envelope must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_spawn_gate_rejects_wrong_hash() {
+        use apm2_core::policy::permeability::AuthorityVector;
+
+        let (receipt, _hash) = build_test_receipt(5_000_000, 1_000_000);
+        let required = AuthorityVector::bottom();
+
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-gate-wrong-hash")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash([0xFF; 32])
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        let result = validate_delegated_spawn_gate(Some(&env), &receipt, &required, 2_000_000);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::PermeabilityBindingFailure(_))),
+            "wrong hash must be rejected via gate, got: {result:?}"
+        );
     }
 }
