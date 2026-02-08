@@ -207,32 +207,46 @@ fn evaluate_category(
     let mut reasons = Vec::new();
 
     let artifacts = collect_category_artifacts(input, category);
-    if artifacts.is_empty() {
-        reasons.push(format!(
-            "No machine-readable review artifacts found for {}",
-            category.display_name()
-        ));
-    }
 
-    let latest_artifact = artifacts.last();
-    let (authoritative_verdict, authoritative_comment_id) = match latest_artifact {
-        Some(artifact) if artifact.rejection_reason.is_none() => {
-            (artifact.verdict, Some(artifact.comment_id))
+    // Authoritative selection is based on the newest VALID artifact, not the
+    // newest marker comment. This prevents stale/mismatched artifacts (e.g.,
+    // for an older head SHA) from overriding a valid current-head verdict.
+    let valid_artifacts = artifacts
+        .iter()
+        .filter(|artifact| artifact.rejection_reason.is_none())
+        .collect::<Vec<_>>();
+    let authoritative = valid_artifacts.last();
+
+    let (authoritative_verdict, authoritative_comment_id) = authoritative.map_or_else(
+        || {
+            // No valid artifacts for the current PR head. Surface the newest
+            // marker comment rejection (if any) to aid debugging, but treat
+            // this category as pending (no authoritative verdict).
+            let latest = artifacts.last();
+            match latest {
+                None => {
+                    reasons.push(format!(
+                        "No machine-readable review artifacts found for {}",
+                        category.display_name()
+                    ));
+                    (None, None)
+                },
+                Some(artifact) => {
+                    reasons.push(format!(
+                        "Newest {} artifact (comment #{}) rejected: {}",
+                        category.display_name(),
+                        artifact.comment_id,
+                        artifact
+                            .rejection_reason
+                            .as_deref()
+                            .unwrap_or("unknown rejection")
+                    ));
+                    (None, Some(artifact.comment_id))
+                },
+            }
         },
-        Some(artifact) => {
-            reasons.push(format!(
-                "Newest {} artifact (comment #{}) rejected: {}",
-                category.display_name(),
-                artifact.comment_id,
-                artifact
-                    .rejection_reason
-                    .as_deref()
-                    .unwrap_or("unknown rejection")
-            ));
-            (None, Some(artifact.comment_id))
-        },
-        None => (None, None),
-    };
+        |artifact| (artifact.verdict, Some(artifact.comment_id)),
+    );
 
     if let Some(verdict) = authoritative_verdict {
         if verdict == ReviewVerdict::Fail {
@@ -240,29 +254,26 @@ fn evaluate_category(
                 "Newest {} artifact verdict is FAIL",
                 category.display_name()
             ));
-        }
 
-        let valid_artifacts: Vec<&CategoryArtifact> = artifacts
-            .iter()
-            .filter(|artifact| artifact.rejection_reason.is_none())
-            .collect();
-
-        let has_pass = valid_artifacts
-            .iter()
-            .any(|artifact| artifact.verdict == Some(ReviewVerdict::Pass));
-        let has_fail = valid_artifacts
-            .iter()
-            .any(|artifact| artifact.verdict == Some(ReviewVerdict::Fail));
-        if has_pass && has_fail && verdict == ReviewVerdict::Fail {
-            reasons.push(format!(
-                "Conflicting PASS/FAIL artifacts for {}; newest valid artifact is FAIL",
-                category.display_name()
-            ));
+            let has_pass = valid_artifacts
+                .iter()
+                .any(|artifact| artifact.verdict == Some(ReviewVerdict::Pass));
+            let has_fail = valid_artifacts
+                .iter()
+                .any(|artifact| artifact.verdict == Some(ReviewVerdict::Fail));
+            if has_pass && has_fail {
+                reasons.push(format!(
+                    "Conflicting PASS/FAIL artifacts for {}; newest valid artifact is FAIL",
+                    category.display_name()
+                ));
+            }
         }
     }
 
+    let pass = authoritative_verdict == Some(ReviewVerdict::Pass);
+
     CategoryEvaluation {
-        pass: reasons.is_empty(),
+        pass,
         authoritative_verdict,
         authoritative_comment_id,
         reasons,
