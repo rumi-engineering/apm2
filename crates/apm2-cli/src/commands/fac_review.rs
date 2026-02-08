@@ -36,6 +36,7 @@ const STALL_THRESHOLD: Duration = Duration::from_secs(90);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOP_SLEEP: Duration = Duration::from_millis(1000);
 const COMMENT_CONFIRM_MAX_PAGES: usize = 20;
+const COMMENT_CONFIRM_MAX_ATTEMPTS: usize = 20;
 const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
 
 const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT.md";
@@ -202,6 +203,12 @@ enum SpawnMode {
 struct SingleReviewResult {
     summary: SingleReviewSummary,
     final_head_sha: String,
+}
+
+#[derive(Debug, Clone)]
+struct PostedReview {
+    id: u64,
+    verdict: Option<String>,
 }
 
 const MODEL_POOL: [ModelPoolEntry; 3] = [
@@ -602,6 +609,42 @@ fn run_single_review(
     let run_key = build_run_key(pr_number, review_type, &current_head_sha);
 
     'restart_loop: loop {
+        if let Some(posted_review) = confirm_review_posted(
+            owner_repo,
+            pr_number,
+            review_kind.marker(),
+            &current_head_sha,
+            expected_comment_author.as_deref(),
+        )? {
+            let completion_verdict = posted_review
+                .verdict
+                .clone()
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            emit_event(
+                event_ctx,
+                "run_deduplicated",
+                review_type,
+                &current_head_sha,
+                serde_json::json!({
+                    "reason": "review_comment_already_present",
+                    "comment_id": posted_review.id,
+                    "verdict": completion_verdict,
+                }),
+            )?;
+            return Ok(SingleReviewResult {
+                summary: SingleReviewSummary {
+                    review_type: review_type.to_string(),
+                    success: completion_verdict != "UNKNOWN",
+                    verdict: completion_verdict,
+                    model: current_model.model.clone(),
+                    backend: current_model.backend.as_str().to_string(),
+                    duration_secs: review_started.elapsed().as_secs(),
+                    restart_count,
+                },
+                final_head_sha: current_head_sha.clone(),
+            });
+        }
+
         let (owner, repo) = split_owner_repo(owner_repo)?;
         if matches!(spawn_mode, SpawnMode::Initial) {
             let prompt_content =
@@ -679,14 +722,19 @@ fn run_single_review(
                 let exit_code = status.code();
                 if status.success() {
                     let verdict = infer_verdict(review_kind, &last_message_path, &log_path)?;
-                    let comment_id = confirm_review_posted_with_retry(
+                    let posted_review = confirm_review_posted_with_retry(
                         owner_repo,
                         pr_number,
                         review_kind.marker(),
                         &current_head_sha,
                         expected_comment_author.as_deref(),
                     )?;
-                    let is_valid_completion = verdict != "UNKNOWN" && comment_id.is_some();
+                    let comment_id = posted_review.as_ref().map(|review| review.id);
+                    let completion_verdict = posted_review
+                        .as_ref()
+                        .and_then(|review| review.verdict.clone())
+                        .unwrap_or_else(|| verdict.clone());
+                    let is_valid_completion = comment_id.is_some();
 
                     if is_valid_completion {
                         emit_event(
@@ -697,7 +745,7 @@ fn run_single_review(
                             serde_json::json!({
                                 "exit_code": exit_code.unwrap_or(0),
                                 "duration_secs": run_started.elapsed().as_secs(),
-                                "verdict": verdict,
+                                "verdict": completion_verdict,
                             }),
                         )?;
 
@@ -709,7 +757,7 @@ fn run_single_review(
                                 &current_head_sha,
                                 serde_json::json!({
                                     "comment_id": comment_id,
-                                    "verdict": verdict,
+                                    "verdict": completion_verdict,
                                 }),
                             )?;
                         }
@@ -755,7 +803,7 @@ fn run_single_review(
                             summary: SingleReviewSummary {
                                 review_type: review_type.to_string(),
                                 success: true,
-                                verdict,
+                                verdict: completion_verdict,
                                 model: current_model.model,
                                 backend: current_model.backend.as_str().to_string(),
                                 duration_secs: review_started.elapsed().as_secs(),
@@ -776,8 +824,8 @@ fn run_single_review(
                             "signal": if comment_permission_denied { "auth_permission_denied" } else { "invalid_completion" },
                             "duration_secs": run_started.elapsed().as_secs(),
                             "restart_count": restart_count,
-                            "completion_issue": if comment_id.is_none() { "comment_not_posted" } else { "unknown_verdict" },
-                            "verdict": verdict,
+                            "completion_issue": "comment_not_posted",
+                            "verdict": completion_verdict,
                             "reason": if comment_permission_denied { "comment_post_permission_denied" } else { "invalid_completion" },
                         }),
                     )?;
@@ -970,6 +1018,58 @@ fn run_single_review(
                 )?;
                 last_liveness_report = Instant::now();
 
+                if let Some(posted_review) = confirm_review_posted(
+                    owner_repo,
+                    pr_number,
+                    review_kind.marker(),
+                    &current_head_sha,
+                    expected_comment_author.as_deref(),
+                )? {
+                    terminate_child(&mut child)?;
+                    let completion_verdict = posted_review.verdict.unwrap_or_else(|| {
+                        infer_verdict(review_kind, &last_message_path, &log_path)
+                            .unwrap_or_else(|_| "UNKNOWN".to_string())
+                    });
+                    if completion_verdict != "UNKNOWN" {
+                        emit_event(
+                            event_ctx,
+                            "run_complete",
+                            review_type,
+                            &current_head_sha,
+                            serde_json::json!({
+                                "exit_code": 0,
+                                "duration_secs": run_started.elapsed().as_secs(),
+                                "verdict": completion_verdict,
+                                "completion_mode": "live_comment_detected",
+                            }),
+                        )?;
+                        emit_event(
+                            event_ctx,
+                            "review_posted",
+                            review_type,
+                            &current_head_sha,
+                            serde_json::json!({
+                                "comment_id": posted_review.id,
+                                "verdict": completion_verdict,
+                                "completion_mode": "live_comment_detected",
+                            }),
+                        )?;
+                        remove_review_state_entry(&run_key)?;
+                        return Ok(SingleReviewResult {
+                            summary: SingleReviewSummary {
+                                review_type: review_type.to_string(),
+                                success: true,
+                                verdict: completion_verdict,
+                                model: current_model.model,
+                                backend: current_model.backend.as_str().to_string(),
+                                duration_secs: review_started.elapsed().as_secs(),
+                                restart_count,
+                            },
+                            final_head_sha: current_head_sha,
+                        });
+                    }
+                }
+
                 if detect_comment_permission_denied(&log_path) {
                     emit_event(
                         event_ctx,
@@ -998,60 +1098,6 @@ fn run_single_review(
                         },
                         final_head_sha: current_head_sha,
                     });
-                }
-
-                if detect_http_400_or_rate_limit(&log_path) {
-                    emit_event(
-                        event_ctx,
-                        "run_crash",
-                        review_type,
-                        &current_head_sha,
-                        serde_json::json!({
-                            "exit_code": -1,
-                            "signal": "provider_backpressure",
-                            "duration_secs": run_started.elapsed().as_secs(),
-                            "restart_count": restart_count,
-                            "reason": "http_400_or_rate_limit_live",
-                        }),
-                    )?;
-
-                    terminate_child(&mut child)?;
-                    restart_count = restart_count.saturating_add(1);
-                    if restart_count > MAX_RESTART_ATTEMPTS {
-                        remove_review_state_entry(&run_key)?;
-                        return Ok(SingleReviewResult {
-                            summary: SingleReviewSummary {
-                                review_type: review_type.to_string(),
-                                success: false,
-                                verdict: "UNKNOWN".to_string(),
-                                model: current_model.model,
-                                backend: current_model.backend.as_str().to_string(),
-                                duration_secs: review_started.elapsed().as_secs(),
-                                restart_count,
-                            },
-                            final_head_sha: current_head_sha,
-                        });
-                    }
-
-                    let fallback = select_cross_family_fallback(&current_model.model)
-                        .or_else(|| select_fallback_model(&current_model.model))
-                        .ok_or_else(|| {
-                            "no fallback model available after provider backpressure".to_string()
-                        })?;
-                    emit_event(
-                        event_ctx,
-                        "model_fallback",
-                        review_type,
-                        &current_head_sha,
-                        serde_json::json!({
-                            "from_model": current_model.model,
-                            "to_model": fallback.model,
-                            "reason": "http_400_or_rate_limit_live",
-                        }),
-                    )?;
-                    current_model = ensure_model_backend_available(fallback)?;
-                    spawn_mode = SpawnMode::Initial;
-                    continue 'restart_loop;
                 }
 
                 if last_progress_at.elapsed() >= STALL_THRESHOLD {
@@ -1593,7 +1639,7 @@ fn confirm_review_posted(
     marker: &str,
     head_sha: &str,
     expected_author_login: Option<&str>,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<PostedReview>, String> {
     let marker_lower = marker.to_ascii_lowercase();
     let head_sha_lower = head_sha.to_ascii_lowercase();
     let expected_author_lower = expected_author_login.map(str::to_ascii_lowercase);
@@ -1645,7 +1691,10 @@ fn confirm_review_posted(
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
             if id != 0 {
-                return Ok(Some(id));
+                return Ok(Some(PostedReview {
+                    id,
+                    verdict: extract_verdict_from_comment_body(body),
+                }));
             }
         }
     }
@@ -1658,20 +1707,19 @@ fn confirm_review_posted_with_retry(
     marker: &str,
     head_sha: &str,
     expected_author_login: Option<&str>,
-) -> Result<Option<u64>, String> {
-    const MAX_ATTEMPTS: usize = 5;
-    for attempt in 0..MAX_ATTEMPTS {
-        let maybe_id = confirm_review_posted(
+) -> Result<Option<PostedReview>, String> {
+    for attempt in 0..COMMENT_CONFIRM_MAX_ATTEMPTS {
+        let maybe_review = confirm_review_posted(
             owner_repo,
             pr_number,
             marker,
             head_sha,
             expected_author_login,
         )?;
-        if maybe_id.is_some() {
-            return Ok(maybe_id);
+        if maybe_review.is_some() {
+            return Ok(maybe_review);
         }
-        if attempt + 1 < MAX_ATTEMPTS {
+        if attempt + 1 < COMMENT_CONFIRM_MAX_ATTEMPTS {
             thread::sleep(Duration::from_secs(1));
         }
     }
@@ -1679,16 +1727,13 @@ fn confirm_review_posted_with_retry(
 }
 
 fn detect_http_400_or_rate_limit(log_path: &Path) -> bool {
-    let Ok(tail) = read_tail(log_path, 20) else {
+    let Ok(lines) = read_last_lines(log_path, COMMENT_PERMISSION_SCAN_LINES) else {
         return false;
     };
-    let lower = tail.to_ascii_lowercase();
-    lower.contains("rate limit")
-        || lower.contains("exhausted your capacity")
-        || lower.contains("quota will reset")
-        || lower.contains("modelnotfounderror")
-        || lower.contains("\"status\":400")
-        || lower.contains("http 400")
+    lines
+        .iter()
+        .rev()
+        .any(|line| line_indicates_provider_backpressure(line))
 }
 
 fn detect_comment_permission_denied(log_path: &Path) -> bool {
@@ -1702,33 +1747,126 @@ fn detect_comment_permission_denied(log_path: &Path) -> bool {
 }
 
 fn line_indicates_comment_permission_denied(line: &str) -> bool {
+    let Some(value) = parse_json_line(line) else {
+        return false;
+    };
+    let Some((command, exit_code, status, output)) = command_execution_context(&value) else {
+        return false;
+    };
+    let command_lower = command.to_ascii_lowercase();
+    if !command_targets_comment_api(&command_lower) {
+        return false;
+    }
+    if exit_code == 0 && !status.eq_ignore_ascii_case("failed") {
+        return false;
+    }
+
+    let lower = output.to_ascii_lowercase();
+    permission_marker_in_text(&lower)
+}
+
+fn line_indicates_provider_backpressure(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    let has_permission_marker = lower.contains("resource not accessible by personal access token")
+    if !provider_backpressure_marker_in_text(&lower) {
+        return false;
+    }
+
+    let Some(value) = parse_json_line(line) else {
+        return true;
+    };
+    let Some((command, exit_code, status, output)) = command_execution_context(&value) else {
+        return true;
+    };
+    let command_lower = command.to_ascii_lowercase();
+    if command_lower.contains("gh pr diff ")
+        || command_lower.contains("nl -ba ")
+        || command_lower.contains("sed -n ")
+        || command_lower.contains("cat ")
+    {
+        return false;
+    }
+    if exit_code == 0 && !status.eq_ignore_ascii_case("failed") {
+        return false;
+    }
+    provider_backpressure_marker_in_text(&output.to_ascii_lowercase())
+}
+
+fn parse_json_line(line: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(line).ok()
+}
+
+fn command_execution_context(value: &serde_json::Value) -> Option<(&str, i64, &str, &str)> {
+    let item = value.get("item")?;
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("command_execution") {
+        return None;
+    }
+
+    let command = item
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let exit_code = item
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let status = item
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let output = item
+        .get("aggregated_output")
+        .or_else(|| item.get("output"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    Some((command, exit_code, status, output))
+}
+
+fn permission_marker_in_text(lower: &str) -> bool {
+    lower.contains("resource not accessible by personal access token")
         || lower.contains("http 403 resource not accessible by personal access token")
-        || lower.contains("insufficient permissions");
-    if !has_permission_marker {
-        return false;
+        || lower.contains("insufficient permissions")
+}
+
+fn provider_backpressure_marker_in_text(lower: &str) -> bool {
+    lower.contains("rate limit")
+        || lower.contains("exhausted your capacity")
+        || lower.contains("quota will reset")
+        || lower.contains("modelnotfounderror")
+        || lower.contains("\"status\":400")
+        || lower.contains("http 400")
+}
+
+fn command_targets_comment_api(command_lower: &str) -> bool {
+    command_lower.contains("gh pr comment")
+        || (command_lower.contains("/issues/") && command_lower.contains("/comments"))
+        || command_lower.contains("addcomment")
+        || command_lower.contains("create-an-issue-comment")
+}
+
+fn extract_verdict_from_comment_body(body: &str) -> Option<String> {
+    let metadata_verdict = Regex::new("(?i)\"verdict\"\\s*:\\s*\"(pass|fail)\"")
+        .ok()
+        .and_then(|regex| regex.captures(body))
+        .and_then(|captures| {
+            captures
+                .get(1)
+                .map(|capture| capture.as_str().to_ascii_uppercase())
+        });
+    if metadata_verdict.is_some() {
+        return metadata_verdict;
     }
 
-    let is_diff_blob = lower.contains("\"aggregated_output\":\"diff --git")
-        || lower.contains("diff --git a/")
-        || lower.contains("gh pr diff ");
-    if is_diff_blob {
-        return false;
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("## security review: pass") || lower.contains("## code quality review: pass")
+    {
+        return Some("PASS".to_string());
     }
-
-    let has_output_context = lower.contains("\"output\":")
-        || lower.contains("\"aggregated_output\":")
-        || lower.contains("\"error\":")
-        || lower.contains("gh: resource not accessible by personal access token");
-    if !has_output_context {
-        return false;
+    if lower.contains("## security review: fail") || lower.contains("## code quality review: fail")
+    {
+        return Some("FAIL".to_string());
     }
-
-    lower.contains("gh pr comment")
-        || (lower.contains("/issues/") && lower.contains("/comments"))
-        || lower.contains("addcomment")
-        || lower.contains("create-an-issue-comment")
+    None
 }
 
 fn read_tail(path: &Path, max_lines: usize) -> Result<String, String> {
@@ -2364,7 +2502,7 @@ mod tests {
 
         fs::write(
             &path,
-            r#"{"type":"tool_result","output":"GraphQL: Resource not accessible by personal access token (addComment)"}"#,
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"gh pr comment https://github.com/guardian-intelligence/apm2/pull/508 --body-file review.md","status":"failed","exit_code":1,"aggregated_output":"GraphQL: Resource not accessible by personal access token (addComment)"}}"#,
         )
         .expect("write structured denied log");
         assert!(detect_comment_permission_denied(&path));
@@ -2393,10 +2531,64 @@ mod tests {
 
         fs::write(
             &path,
-            r#"{"type":"item.completed","item":{"command":"/bin/bash -lc 'gh pr comment https://github.com/guardian-intelligence/apm2/pull/508 --body-file review.md'","aggregated_output":"GraphQL: Resource not accessible by personal access token (addComment)"}}"#,
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"/bin/bash -lc 'gh pr comment https://github.com/guardian-intelligence/apm2/pull/508 --body-file review.md'","status":"failed","exit_code":1,"aggregated_output":"GraphQL: Resource not accessible by personal access token (addComment)"}}"#,
         )
         .expect("write comment denied log");
         assert!(detect_comment_permission_denied(&path));
+    }
+
+    #[test]
+    fn test_detect_comment_permission_denied_ignores_source_dump() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("review.log");
+
+        let line = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "nl -ba crates/apm2-cli/src/commands/fac_review.rs",
+                "status": "completed",
+                "exit_code": 0,
+                "aggregated_output": "2396: r#\"{\\\"type\\\":\\\"item.completed\\\",\\\"item\\\":{\\\"command\\\":\\\"/bin/bash -lc 'gh pr comment https://github.com/guardian-intelligence/apm2/pull/508 --body-file review.md'\\\",\\\"aggregated_output\\\":\\\"GraphQL: Resource not accessible by personal access token (addComment)\\\"}}\"#,"
+            }
+        })
+        .to_string();
+        fs::write(&path, line).expect("write source-dump denied marker log");
+        assert!(!detect_comment_permission_denied(&path));
+    }
+
+    #[test]
+    fn test_detect_http_400_or_rate_limit_ignores_source_dump() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("review.log");
+
+        let line = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "nl -ba crates/apm2-cli/src/commands/fac_review.rs",
+                "status": "completed",
+                "exit_code": 0,
+                "aggregated_output": "2344: r#\"{\\\"message\\\":\\\"You have exhausted your capacity on this model. Your quota will reset after 2s.\\\"}\"#,"
+            }
+        })
+        .to_string();
+        fs::write(&path, line).expect("write source-dump backpressure marker log");
+        assert!(!detect_http_400_or_rate_limit(&path));
+    }
+
+    #[test]
+    fn test_extract_verdict_from_comment_body_prefers_metadata() {
+        let body = r#"
+## Security Review: PASS
+
+<!-- apm2-review-metadata:v1:security -->
+```json
+{"verdict":"FAIL"}
+```
+"#;
+        let verdict = extract_verdict_from_comment_body(body).expect("verdict from metadata");
+        assert_eq!(verdict, "FAIL");
     }
 
     #[test]

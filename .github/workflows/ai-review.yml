@@ -18,7 +18,6 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  statuses: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -230,7 +229,48 @@ jobs:
           launch_review_async security
           launch_review_async quality
 
+          terminal_failure=0
           declare -A SEEN_ERROR_KEYS=()
+
+          review_state_for_type() {
+            local review_type="$1"
+            jq -r --arg head "${HEAD_SHA_LOWER}" --arg t "${review_type}" --argjson start_epoch "${DISPATCH_EPOCH}" '
+              ([.state_entries[]?
+                | select(
+                    .review_type == $t
+                    and (.alive // false)
+                    and ((.head_sha // "" | ascii_downcase) == $head)
+                  )
+              ] | first) as $active
+              | if $active != null then
+                  "alive:" + ($active.model // "n/a") + "/" + ($active.backend // "n/a")
+                  + ":r" + (($active.restart_count // 0) | tostring)
+                  + ":" + (($active.head_sha // "-") | tostring | .[0:7])
+                else
+                  ([.recent_events[]?
+                    | select(.review_type == $t)
+                    | select((.head_sha // "" | ascii_downcase) == $head)
+                    | select((((.ts // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // 0) >= $start_epoch)
+                  ] | sort_by(.seq // 0)) as $events
+                  | ($events | map(select(.event == "run_complete")) | last) as $done
+                  | ($events | map(select(.event == "run_start")) | last) as $start
+                  | ($events | map(select(.event == "run_crash")) | last) as $crash
+                  | if $done != null then
+                      "done:" + ($start.model // "n/a") + "/" + ($start.backend // "n/a")
+                      + ":r" + ((($done.restart_count // $start.restart_count // 0)) | tostring)
+                      + ":" + (($done.head_sha // "-") | tostring | .[0:7])
+                    elif $crash != null and (
+                      (($crash.restart_count // 0) >= 3)
+                      or (($crash.reason // "") == "comment_post_permission_denied")
+                    ) then
+                      "failed:" + (($crash.reason // "run_crash") | tostring)
+                    else
+                      "none"
+                    end
+                end
+            ' <<<"${STATUS_JSON}"
+          }
+
           for _ in $(seq 1 30); do
             NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             STATUS_JSON=$("${FAC_BIN[@]}" fac --json review status --pr "${PR_NUMBER}" 2>/dev/null || true)
@@ -241,39 +281,8 @@ jobs:
               continue
             fi
 
-            SEC_STATE=$(jq -r --arg head "${HEAD_SHA_LOWER}" '
-              ([.state_entries[]?
-                | select(
-                    .review_type == "security"
-                    and (.alive // false)
-                    and ((.head_sha // "" | ascii_downcase) == $head)
-                  )
-              ] | first) as $s
-              | if $s == null then
-                  "none"
-                else
-                  "alive:" + ($s.model // "n/a") + "/" + ($s.backend // "n/a")
-                  + ":r" + (($s.restart_count // 0) | tostring)
-                  + ":" + (($s.head_sha // "-") | tostring | .[0:7])
-                end
-            ' <<<"${STATUS_JSON}")
-
-            QUAL_STATE=$(jq -r --arg head "${HEAD_SHA_LOWER}" '
-              ([.state_entries[]?
-                | select(
-                    .review_type == "quality"
-                    and (.alive // false)
-                    and ((.head_sha // "" | ascii_downcase) == $head)
-                  )
-              ] | first) as $s
-              | if $s == null then
-                  "none"
-                else
-                  "alive:" + ($s.model // "n/a") + "/" + ($s.backend // "n/a")
-                  + ":r" + (($s.restart_count // 0) | tostring)
-                  + ":" + (($s.head_sha // "-") | tostring | .[0:7])
-                end
-            ' <<<"${STATUS_JSON}")
+            SEC_STATE=$(review_state_for_type security)
+            QUAL_STATE=$(review_state_for_type quality)
 
             LAST_EVENTS=$(jq -r --arg head "${HEAD_SHA_LOWER}" --argjson start_epoch "${DISPATCH_EPOCH}" '
               [.recent_events[]?
@@ -317,8 +326,30 @@ jobs:
                 )
             ' <<<"${STATUS_JSON}")
 
+            if jq -e --arg head "${HEAD_SHA_LOWER}" --argjson start_epoch "${DISPATCH_EPOCH}" '
+              [
+                .recent_events[]?
+                | select((.head_sha // "" | ascii_downcase) == $head)
+                | select((((.ts // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // 0) >= $start_epoch)
+                | select(
+                    .event == "run_crash"
+                    and (
+                      ((.restart_count // 0) >= 3)
+                      or ((.reason // "") == "comment_post_permission_denied")
+                    )
+                  )
+              ] | length > 0
+            ' <<<"${STATUS_JSON}" >/dev/null; then
+              terminal_failure=1
+            fi
+
             sleep 1
           done
+
+          if [[ "${terminal_failure}" -ne 0 ]]; then
+            echo "::error::Terminal FAC reviewer failure detected in projection window."
+            exit 1
+          fi
 
       # Review Gate Success status is posted exclusively by
       # .github/workflows/review-gate.yml (trusted base-branch evaluator).
