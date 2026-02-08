@@ -206,12 +206,23 @@ jobs:
 
             local ts
             ts=$(date -u +"%Y%m%dT%H%M%SZ")
-            local log_file="${DISPATCH_DIR}/pr${PR_NUMBER}-${review_type}-${HEAD_SHA:0:12}-${ts}.log"
-            nohup env GH_TOKEN="${GH_TOKEN}" \
-              "${FAC_BIN[@]}" fac review run "${PR_URL}" --type "${review_type}" --expected-head-sha "${HEAD_SHA}" \
-              >"${log_file}" 2>&1 < /dev/null &
-            local pid=$!
-            echo "dispatch review_type=${review_type} pid=${pid} log=${log_file}"
+            if command -v systemd-run >/dev/null 2>&1; then
+              local unit="apm2-review-pr${PR_NUMBER}-${review_type}-${HEAD_SHA:0:8}-${ts}"
+              systemd-run --user --collect \
+                --unit "${unit}" \
+                --property "WorkingDirectory=${PWD}" \
+                --setenv "GH_TOKEN=${GH_TOKEN}" \
+                "${FAC_BIN[@]}" fac review run "${PR_URL}" --type "${review_type}" --expected-head-sha "${HEAD_SHA}" \
+                >/dev/null
+              echo "dispatch review_type=${review_type} unit=${unit}"
+            else
+              local log_file="${DISPATCH_DIR}/pr${PR_NUMBER}-${review_type}-${HEAD_SHA:0:12}-${ts}.log"
+              nohup env GH_TOKEN="${GH_TOKEN}" \
+                "${FAC_BIN[@]}" fac review run "${PR_URL}" --type "${review_type}" --expected-head-sha "${HEAD_SHA}" \
+                >"${log_file}" 2>&1 < /dev/null &
+              local pid=$!
+              echo "dispatch review_type=${review_type} pid=${pid} log=${log_file}"
+            fi
           }
 
           launch_review_async security
@@ -273,7 +284,7 @@ jobs:
             if [[ "$(jq 'length' <<<"${NEW_ERRORS}")" -gt 0 ]]; then
               jq -r '
                 .[]
-                | "ERROR ts=\(.ts // \"-\") event=\(.event // \"-\") review=\(.review_type // \"-\") seq=\(.seq // 0) detail=\((.reason // .signal // .exit_code // .new_sha // \"-\") | tostring)"
+                | "ERROR ts=\(.ts // "-") event=\(.event // "-") review=\(.review_type // "-") seq=\(.seq // 0) detail=\((.reason // .signal // .exit_code // .new_sha // "-") | tostring)"
               ' <<<"${NEW_ERRORS}"
             fi
 

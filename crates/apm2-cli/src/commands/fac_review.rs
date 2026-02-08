@@ -198,21 +198,21 @@ struct SingleReviewResult {
 
 const MODEL_POOL: [ModelPoolEntry; 3] = [
     ModelPoolEntry {
-        model: "gemini-3.0-flash-preview",
+        model: "gemini-2.5-flash",
         backend: ReviewBackend::Gemini,
     },
     ModelPoolEntry {
-        model: "gemini-3.0-pro-preview",
+        model: "gemini-2.5-pro",
         backend: ReviewBackend::Gemini,
     },
     ModelPoolEntry {
-        model: "gpt-5.3-codex-xhigh",
+        model: "gpt-5.3-codex",
         backend: ReviewBackend::Codex,
     },
 ];
 
 fn default_model() -> String {
-    "gpt-5.3-codex-xhigh".to_string()
+    "gpt-5.3-codex".to_string()
 }
 
 fn now_iso8601_millis() -> String {
@@ -1696,17 +1696,17 @@ mod tests {
 
     #[test]
     fn test_select_fallback_model_cycles() {
-        let next = select_fallback_model("gemini-3.0-flash-preview")
-            .expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-3.0-pro-preview");
+        let next =
+            select_fallback_model("gemini-2.5-flash").expect("known model should produce fallback");
+        assert_eq!(next.model, "gemini-2.5-pro");
 
-        let next = select_fallback_model("gemini-3.0-pro-preview")
-            .expect("known model should produce fallback");
-        assert_eq!(next.model, "gpt-5.3-codex-xhigh");
+        let next =
+            select_fallback_model("gemini-2.5-pro").expect("known model should produce fallback");
+        assert_eq!(next.model, "gpt-5.3-codex");
 
-        let next = select_fallback_model("gpt-5.3-codex-xhigh")
-            .expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-3.0-flash-preview");
+        let next =
+            select_fallback_model("gpt-5.3-codex").expect("known model should produce fallback");
+        assert_eq!(next.model, "gemini-2.5-flash");
     }
 
     #[test]
@@ -1718,7 +1718,7 @@ mod tests {
     fn test_build_gemini_script_command_syntax() {
         let prompt = Path::new("/tmp/prompt.md");
         let log = Path::new("/tmp/review.log");
-        let cmd = build_gemini_script_command(prompt, log, "gemini-3.0-flash-preview");
+        let cmd = build_gemini_script_command(prompt, log, "gemini-2.5-flash");
         assert!(cmd.contains("script -q"));
         assert!(cmd.contains("gemini -m"));
         assert!(cmd.contains("-o stream-json"));
@@ -1734,7 +1734,7 @@ mod tests {
             ReviewBackend::Codex,
             prompt,
             log,
-            "gpt-5.3-codex-xhigh",
+            "gpt-5.3-codex",
             Some(capture),
         );
         assert!(codex.contains("codex exec"));
@@ -1745,7 +1745,7 @@ mod tests {
             ReviewBackend::Gemini,
             prompt,
             log,
-            "gemini-3.0-flash-preview",
+            "gemini-2.5-flash",
             None,
         );
         assert!(gemini.contains("gemini -m"));

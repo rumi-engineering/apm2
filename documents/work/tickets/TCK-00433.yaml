@@ -41,7 +41,7 @@ ticket_meta:
       - "Launch `security` and `quality` FAC reviewers in parallel from GitHub workflow execution."
       - "Emit one condensed reviewer-fleet status line per second in GitHub logs and print explicit error lines for crash/stall/fallback/SHA-update events."
       - "Use asynchronous workflow dispatch semantics: GitHub workflow launches detached FAC review processes and exits after a bounded 1Hz projection window."
-      - "Implement uniform random model selection across `gemini-3.0-flash-preview`, `gemini-3.0-pro-preview`, and `gpt-5.3-codex-xhigh`."
+      - "Implement uniform random model selection across environment-available models (`gemini-2.5-flash`, `gemini-2.5-pro`, and `gpt-5.3-codex`)."
       - "Implement backend-aware command dispatch for Codex and Gemini initial spawn and resume paths."
       - "Emit append-only review lifecycle telemetry to `~/.apm2/review_events.ndjson` with rotation at 10MB."
       - "Implement pulse files for SHA freshness (`review_pulse_security.json`, `review_pulse_quality.json`) and kill+resume on head movement."
