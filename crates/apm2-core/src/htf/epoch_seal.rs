@@ -34,6 +34,7 @@
 //! binds the seal to a specific artifact state.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,52 @@ const EPOCH_SEAL_AUDIT_DOMAIN: &[u8] = b"apm2:epoch_seal_v1:audit:v1\0";
 
 /// Signature byte length (Ed25519).
 const SIGNATURE_SIZE: usize = 64;
+
+// =============================================================================
+// SignatureVerifier trait (fail-closed signature verification)
+// =============================================================================
+
+/// Error returned by a [`SignatureVerifier`] implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureVerificationError {
+    /// Human-readable reason for rejection.
+    pub reason: String,
+}
+
+impl fmt::Display for SignatureVerificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "signature verification failed: {}", self.reason)
+    }
+}
+
+impl std::error::Error for SignatureVerificationError {}
+
+/// Trait for verifying epoch seal signatures.
+///
+/// Implementations should verify that:
+/// 1. The seal's issuer is a trusted/known issuer.
+/// 2. The signature over the seal's canonical content is valid for the issuer's
+///    public key.
+///
+/// # Fail-Closed Semantics
+///
+/// When no `SignatureVerifier` is configured, the
+/// [`EpochSealVerifier`] rejects ALL seals. This ensures that
+/// forgetting to wire a verifier results in denial rather than
+/// silent acceptance.
+pub trait SignatureVerifier: fmt::Debug {
+    /// Verifies the cryptographic signature of an epoch seal.
+    ///
+    /// # Arguments
+    ///
+    /// * `seal` - The epoch seal whose signature is to be verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignatureVerificationError`] if the signature is invalid,
+    /// the issuer is unknown, or verification otherwise fails.
+    fn verify_seal_signature(&self, seal: &EpochSealV1) -> Result<(), SignatureVerificationError>;
+}
 
 // =============================================================================
 // Custom serde for [u8; 64] (serde doesn't support arrays > 32)
@@ -204,6 +251,37 @@ impl EpochSealV1 {
     #[must_use]
     pub const fn content_hash(&self) -> &[u8; 32] {
         &self.content_hash
+    }
+
+    /// Validates that all constructor invariants hold on this seal.
+    ///
+    /// This is intended for use after deserialization, where the struct
+    /// may have been constructed without going through [`EpochSealV1::new`].
+    /// The verifier calls this before accepting any seal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EpochSealError`] if any invariant is violated.
+    pub fn validate(&self) -> Result<(), EpochSealError> {
+        if self.epoch_number == 0 {
+            return Err(EpochSealError::ZeroEpoch);
+        }
+        if self.sealed_root_hash == [0u8; 32] {
+            return Err(EpochSealError::ZeroRootHash);
+        }
+        if self.content_hash == [0u8; 32] {
+            return Err(EpochSealError::ZeroContentHash);
+        }
+        if self.issuer_cell_id.is_empty() {
+            return Err(EpochSealError::EmptyIssuerId);
+        }
+        if self.issuer_cell_id.len() > MAX_SEAL_STRING_LENGTH {
+            return Err(EpochSealError::IssuerIdTooLong {
+                length: self.issuer_cell_id.len(),
+                max: MAX_SEAL_STRING_LENGTH,
+            });
+        }
+        Ok(())
     }
 
     /// Computes the canonical BLAKE3 hash of this seal for verification.
@@ -451,6 +529,30 @@ pub enum EpochSealAuditEvent {
         /// Description of the validation failure.
         reason: String,
     },
+
+    /// Seal rejected: signature verification failed.
+    SignatureRejected {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// The epoch number of the rejected seal.
+        epoch_number: u64,
+        /// Reason for signature rejection.
+        reason: String,
+    },
+
+    /// Seal rejected: no signature verifier configured (fail-closed).
+    NoSignatureVerifier {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// The epoch number of the rejected seal.
+        epoch_number: u64,
+    },
+
+    /// Seal rejected: deserialization invariant validation failed.
+    ValidationFailed {
+        /// Description of the validation failure.
+        reason: String,
+    },
 }
 
 impl EpochSealAuditEvent {
@@ -463,6 +565,9 @@ impl EpochSealAuditEvent {
             Self::EquivocationDetected { .. } => "epoch_seal.equivocation_detected",
             Self::MissingSealDenied { .. } => "epoch_seal.missing_seal_denied",
             Self::InvalidSeal { .. } => "epoch_seal.invalid_seal",
+            Self::SignatureRejected { .. } => "epoch_seal.signature_rejected",
+            Self::NoSignatureVerifier { .. } => "epoch_seal.no_signature_verifier",
+            Self::ValidationFailed { .. } => "epoch_seal.validation_failed",
         }
     }
 
@@ -506,8 +611,24 @@ impl EpochSealAuditEvent {
             Self::MissingSealDenied { risk_tier } => {
                 hasher.update(&[*risk_tier as u8]);
             },
-            Self::InvalidSeal { reason } => {
+            Self::InvalidSeal { reason } | Self::ValidationFailed { reason } => {
                 hasher.update(reason.as_bytes());
+            },
+            Self::SignatureRejected {
+                issuer_cell_id,
+                epoch_number,
+                reason,
+            } => {
+                hasher.update(issuer_cell_id.as_bytes());
+                hasher.update(&epoch_number.to_le_bytes());
+                hasher.update(reason.as_bytes());
+            },
+            Self::NoSignatureVerifier {
+                issuer_cell_id,
+                epoch_number,
+            } => {
+                hasher.update(issuer_cell_id.as_bytes());
+                hasher.update(&epoch_number.to_le_bytes());
             },
         }
         *hasher.finalize().as_bytes()
@@ -561,6 +682,26 @@ pub enum EpochSealVerificationError {
         /// Maximum allowed.
         max: usize,
     },
+
+    /// Signature verification failed.
+    #[error("signature verification failed for issuer {issuer_cell_id}: {reason}")]
+    SignatureRejected {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// Reason for rejection.
+        reason: String,
+    },
+
+    /// No signature verifier configured (fail-closed).
+    #[error("no signature verifier configured (fail-closed): all seals rejected")]
+    NoSignatureVerifier,
+
+    /// Seal field validation failed (deserialization bypass).
+    #[error("seal validation failed: {reason}")]
+    ValidationFailed {
+        /// Description of the failure.
+        reason: String,
+    },
 }
 
 // =============================================================================
@@ -581,30 +722,77 @@ struct IssuerState {
 // EpochSealVerifier
 // =============================================================================
 
-/// Verifies epoch seals for monotonicity, rollback rejection, and
-/// equivocation detection.
+/// Verifies epoch seals for monotonicity, rollback rejection,
+/// equivocation detection, and signature authenticity.
 ///
 /// The verifier maintains per-issuer state mapping each issuer cell ID
 /// to its last accepted epoch and root hash. Verification enforces:
 ///
-/// 1. **Monotonicity**: `seal.epoch_number > state[issuer].last_epoch`
-/// 2. **Anti-equivocation**: If `seal.epoch_number ==
+/// 1. **Validation**: Seal fields satisfy constructor invariants.
+/// 2. **Signature**: Cryptographic authenticity via [`SignatureVerifier`].
+/// 3. **Monotonicity**: `seal.epoch_number > state[issuer].last_epoch`
+/// 4. **Anti-equivocation**: If `seal.epoch_number ==
 ///    state[issuer].last_epoch`, the root hashes must match (duplicate
 ///    acceptance is idempotent).
-/// 3. **Fail-closed**: Tier2+ admissions require a valid seal.
-#[derive(Debug, Clone)]
+/// 5. **Fail-closed**: Tier2+ admissions require a valid seal. When no
+///    [`SignatureVerifier`] is configured, ALL seals are rejected.
+#[derive(Debug)]
 pub struct EpochSealVerifier {
     /// Per-issuer epoch state.
     issuers: HashMap<String, IssuerState>,
+
+    /// Optional signature verifier. When `None`, all seals are rejected
+    /// (fail-closed). This ensures that the verifier cannot accept seals
+    /// without cryptographic authenticity checks.
+    signature_verifier: Option<Box<dyn SignatureVerifier>>,
+}
+
+impl Clone for EpochSealVerifier {
+    fn clone(&self) -> Self {
+        // The signature verifier is not cloneable; cloned verifiers
+        // start without a verifier (fail-closed).
+        Self {
+            issuers: self.issuers.clone(),
+            signature_verifier: None,
+        }
+    }
 }
 
 impl EpochSealVerifier {
-    /// Creates a new verifier with no tracked issuers.
+    /// Creates a new verifier with no tracked issuers and no signature
+    /// verifier.
+    ///
+    /// **WARNING**: Without a signature verifier, ALL seals will be
+    /// rejected (fail-closed). Use [`with_signature_verifier`] to
+    /// configure one.
+    ///
+    /// [`with_signature_verifier`]: EpochSealVerifier::with_signature_verifier
     #[must_use]
     pub fn new() -> Self {
         Self {
             issuers: HashMap::new(),
+            signature_verifier: None,
         }
+    }
+
+    /// Creates a new verifier with the given signature verifier.
+    #[must_use]
+    pub fn with_signature_verifier(signature_verifier: Box<dyn SignatureVerifier>) -> Self {
+        Self {
+            issuers: HashMap::new(),
+            signature_verifier: Some(signature_verifier),
+        }
+    }
+
+    /// Sets the signature verifier.
+    pub fn set_signature_verifier(&mut self, verifier: Box<dyn SignatureVerifier>) {
+        self.signature_verifier = Some(verifier);
+    }
+
+    /// Returns whether a signature verifier is configured.
+    #[must_use]
+    pub fn has_signature_verifier(&self) -> bool {
+        self.signature_verifier.is_some()
     }
 
     /// Returns the number of tracked issuers.
@@ -622,15 +810,81 @@ impl EpochSealVerifier {
 
     /// Verifies and accepts an epoch seal, updating internal state.
     ///
+    /// Verification order:
+    /// 1. Validate seal fields (deserialization invariants).
+    /// 2. Verify cryptographic signature (fail-closed when no verifier).
+    /// 3. Check monotonicity and equivocation.
+    ///
     /// # Returns
     ///
     /// An [`EpochSealVerdict`] describing the outcome.
     pub fn verify(&mut self, seal: &EpochSealV1, risk_tier: RiskTier) -> EpochSealVerdict {
-        let issuer = seal.issuer_cell_id();
+        // Step 1: Validate seal invariants (catches deserialization bypass).
+        if let Err(e) = seal.validate() {
+            return EpochSealVerdict {
+                accepted: false,
+                risk_tier,
+                epoch_number: seal.epoch_number,
+                issuer_cell_id: seal.issuer_cell_id.clone(),
+                audit_event: EpochSealAuditEvent::ValidationFailed {
+                    reason: e.to_string(),
+                },
+            };
+        }
 
+        // Step 2: Verify signature (fail-closed when no verifier).
+        if let Some(verdict) = self.verify_signature(seal, risk_tier) {
+            return verdict;
+        }
+
+        // Step 3: Monotonicity and equivocation checks.
+        self.verify_monotonicity(seal, risk_tier)
+    }
+
+    /// Verifies the seal's cryptographic signature. Returns `Some(verdict)`
+    /// on rejection, `None` on success.
+    #[allow(clippy::option_if_let_else)]
+    fn verify_signature(
+        &self,
+        seal: &EpochSealV1,
+        risk_tier: RiskTier,
+    ) -> Option<EpochSealVerdict> {
+        let issuer = seal.issuer_cell_id();
+        if let Some(verifier) = &self.signature_verifier {
+            verifier
+                .verify_seal_signature(seal)
+                .err()
+                .map(|e| EpochSealVerdict {
+                    accepted: false,
+                    risk_tier,
+                    epoch_number: seal.epoch_number(),
+                    issuer_cell_id: issuer.to_string(),
+                    audit_event: EpochSealAuditEvent::SignatureRejected {
+                        issuer_cell_id: issuer.to_string(),
+                        epoch_number: seal.epoch_number(),
+                        reason: e.reason,
+                    },
+                })
+        } else {
+            Some(EpochSealVerdict {
+                accepted: false,
+                risk_tier,
+                epoch_number: seal.epoch_number(),
+                issuer_cell_id: issuer.to_string(),
+                audit_event: EpochSealAuditEvent::NoSignatureVerifier {
+                    issuer_cell_id: issuer.to_string(),
+                    epoch_number: seal.epoch_number(),
+                },
+            })
+        }
+    }
+
+    /// Checks monotonicity and equivocation against per-issuer state,
+    /// updating state on acceptance.
+    fn verify_monotonicity(&mut self, seal: &EpochSealV1, risk_tier: RiskTier) -> EpochSealVerdict {
+        let issuer = seal.issuer_cell_id();
         if let Some(state) = self.issuers.get_mut(issuer) {
             if seal.epoch_number() < state.last_epoch {
-                // Rollback: epoch is less than last accepted.
                 return EpochSealVerdict {
                     accepted: false,
                     risk_tier,
@@ -643,43 +897,13 @@ impl EpochSealVerifier {
                     },
                 };
             }
-
             if seal.epoch_number() == state.last_epoch {
-                if seal.sealed_root_hash() != &state.last_root_hash {
-                    // Equivocation: same epoch, different root hash.
-                    return EpochSealVerdict {
-                        accepted: false,
-                        risk_tier,
-                        epoch_number: seal.epoch_number(),
-                        issuer_cell_id: issuer.to_string(),
-                        audit_event: EpochSealAuditEvent::EquivocationDetected {
-                            issuer_cell_id: issuer.to_string(),
-                            epoch_number: seal.epoch_number(),
-                            existing_root_hash: state.last_root_hash,
-                            conflicting_root_hash: *seal.sealed_root_hash(),
-                        },
-                    };
-                }
-
-                // Idempotent re-acceptance of same seal.
-                return EpochSealVerdict {
-                    accepted: true,
-                    risk_tier,
-                    epoch_number: seal.epoch_number(),
-                    issuer_cell_id: issuer.to_string(),
-                    audit_event: EpochSealAuditEvent::Accepted {
-                        issuer_cell_id: issuer.to_string(),
-                        epoch_number: seal.epoch_number(),
-                        previous_epoch: state.last_epoch,
-                    },
-                };
+                return verify_same_epoch(seal, state, risk_tier);
             }
-
             // Monotonically increasing: accept and update.
             let previous_epoch = state.last_epoch;
             state.last_epoch = seal.epoch_number();
             state.last_root_hash = *seal.sealed_root_hash();
-
             EpochSealVerdict {
                 accepted: true,
                 risk_tier,
@@ -692,41 +916,45 @@ impl EpochSealVerifier {
                 },
             }
         } else {
-            // First seal from this issuer.
-            if self.issuers.len() >= MAX_TRACKED_ISSUERS {
-                return EpochSealVerdict {
-                    accepted: false,
-                    risk_tier,
-                    epoch_number: seal.epoch_number(),
-                    issuer_cell_id: issuer.to_string(),
-                    audit_event: EpochSealAuditEvent::InvalidSeal {
-                        reason: format!(
-                            "too many tracked issuers: {} >= {MAX_TRACKED_ISSUERS}",
-                            self.issuers.len()
-                        ),
-                    },
-                };
-            }
+            self.accept_first_seal(seal, risk_tier)
+        }
+    }
 
-            self.issuers.insert(
-                issuer.to_string(),
-                IssuerState {
-                    last_epoch: seal.epoch_number(),
-                    last_root_hash: *seal.sealed_root_hash(),
-                },
-            );
-
-            EpochSealVerdict {
-                accepted: true,
+    /// Accepts the first seal from a new issuer, or rejects if too
+    /// many issuers are tracked.
+    fn accept_first_seal(&mut self, seal: &EpochSealV1, risk_tier: RiskTier) -> EpochSealVerdict {
+        let issuer = seal.issuer_cell_id();
+        if self.issuers.len() >= MAX_TRACKED_ISSUERS {
+            return EpochSealVerdict {
+                accepted: false,
                 risk_tier,
                 epoch_number: seal.epoch_number(),
                 issuer_cell_id: issuer.to_string(),
-                audit_event: EpochSealAuditEvent::Accepted {
-                    issuer_cell_id: issuer.to_string(),
-                    epoch_number: seal.epoch_number(),
-                    previous_epoch: 0,
+                audit_event: EpochSealAuditEvent::InvalidSeal {
+                    reason: format!(
+                        "too many tracked issuers: {} >= {MAX_TRACKED_ISSUERS}",
+                        self.issuers.len()
+                    ),
                 },
-            }
+            };
+        }
+        self.issuers.insert(
+            issuer.to_string(),
+            IssuerState {
+                last_epoch: seal.epoch_number(),
+                last_root_hash: *seal.sealed_root_hash(),
+            },
+        );
+        EpochSealVerdict {
+            accepted: true,
+            risk_tier,
+            epoch_number: seal.epoch_number(),
+            issuer_cell_id: issuer.to_string(),
+            audit_event: EpochSealAuditEvent::Accepted {
+                issuer_cell_id: issuer.to_string(),
+                epoch_number: seal.epoch_number(),
+                previous_epoch: 0,
+            },
         }
     }
 
@@ -771,6 +999,22 @@ impl EpochSealVerifier {
                         max: MAX_TRACKED_ISSUERS,
                     })
                 },
+                EpochSealAuditEvent::SignatureRejected {
+                    issuer_cell_id,
+                    reason,
+                    ..
+                } => Err(EpochSealVerificationError::SignatureRejected {
+                    issuer_cell_id: issuer_cell_id.clone(),
+                    reason: reason.clone(),
+                }),
+                EpochSealAuditEvent::NoSignatureVerifier { .. } => {
+                    Err(EpochSealVerificationError::NoSignatureVerifier)
+                },
+                EpochSealAuditEvent::ValidationFailed { reason } => {
+                    Err(EpochSealVerificationError::ValidationFailed {
+                        reason: reason.clone(),
+                    })
+                },
                 _ => Err(EpochSealVerificationError::MissingSeal { risk_tier }),
             }
         }
@@ -792,6 +1036,45 @@ impl EpochSealVerifier {
             Err(EpochSealVerificationError::MissingSeal { risk_tier })
         } else {
             Ok(())
+        }
+    }
+}
+
+/// Handles the same-epoch case: idempotent re-acceptance or equivocation
+/// detection. Free function to avoid borrow-checker conflicts within
+/// `verify_monotonicity`.
+fn verify_same_epoch(
+    seal: &EpochSealV1,
+    state: &IssuerState,
+    risk_tier: RiskTier,
+) -> EpochSealVerdict {
+    let issuer = seal.issuer_cell_id();
+    if seal.sealed_root_hash() == &state.last_root_hash {
+        // Idempotent re-acceptance of same seal.
+        EpochSealVerdict {
+            accepted: true,
+            risk_tier,
+            epoch_number: seal.epoch_number(),
+            issuer_cell_id: issuer.to_string(),
+            audit_event: EpochSealAuditEvent::Accepted {
+                issuer_cell_id: issuer.to_string(),
+                epoch_number: seal.epoch_number(),
+                previous_epoch: state.last_epoch,
+            },
+        }
+    } else {
+        // Equivocation: same epoch, different root hash.
+        EpochSealVerdict {
+            accepted: false,
+            risk_tier,
+            epoch_number: seal.epoch_number(),
+            issuer_cell_id: issuer.to_string(),
+            audit_event: EpochSealAuditEvent::EquivocationDetected {
+                issuer_cell_id: issuer.to_string(),
+                epoch_number: seal.epoch_number(),
+                existing_root_hash: state.last_root_hash,
+                conflicting_root_hash: *seal.sealed_root_hash(),
+            },
         }
     }
 }
@@ -842,6 +1125,49 @@ mod tests {
             test_content_hash(root_seed.wrapping_add(0x10)),
         )
         .expect("valid seal")
+    }
+
+    /// A test signature verifier that accepts all seals.
+    #[derive(Debug)]
+    struct AcceptAllVerifier;
+
+    impl SignatureVerifier for AcceptAllVerifier {
+        fn verify_seal_signature(
+            &self,
+            _seal: &EpochSealV1,
+        ) -> Result<(), SignatureVerificationError> {
+            Ok(())
+        }
+    }
+
+    /// A test signature verifier that rejects all seals.
+    #[derive(Debug)]
+    struct RejectAllVerifier {
+        reason: String,
+    }
+
+    impl RejectAllVerifier {
+        fn new(reason: &str) -> Self {
+            Self {
+                reason: reason.to_string(),
+            }
+        }
+    }
+
+    impl SignatureVerifier for RejectAllVerifier {
+        fn verify_seal_signature(
+            &self,
+            _seal: &EpochSealV1,
+        ) -> Result<(), SignatureVerificationError> {
+            Err(SignatureVerificationError {
+                reason: self.reason.clone(),
+            })
+        }
+    }
+
+    /// Creates a verifier with the accept-all test signature verifier.
+    fn test_verifier() -> EpochSealVerifier {
+        EpochSealVerifier::with_signature_verifier(Box::new(AcceptAllVerifier))
     }
 
     // =========================================================================
@@ -1039,7 +1365,7 @@ mod tests {
 
     #[test]
     fn verifier_accepts_first_seal() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
         let seal = make_seal(1, "cell-alpha", 0x11);
         let verdict = verifier.verify(&seal, RiskTier::Tier2);
 
@@ -1057,7 +1383,7 @@ mod tests {
 
     #[test]
     fn verifier_accepts_monotonic_sequence() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
         let seeds: [u8; 5] = [0x01, 0x02, 0x03, 0x04, 0x05];
 
         for (i, &seed) in seeds.iter().enumerate() {
@@ -1072,7 +1398,7 @@ mod tests {
 
     #[test]
     fn verifier_accepts_non_consecutive_monotonic() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
 
         let seal1 = make_seal(1, "cell-alpha", 0x11);
         assert!(verifier.verify(&seal1, RiskTier::Tier2).accepted);
@@ -1090,7 +1416,7 @@ mod tests {
 
     #[test]
     fn verifier_rejects_rollback() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
 
         let seal1 = make_seal(5, "cell-alpha", 0x11);
         assert!(verifier.verify(&seal1, RiskTier::Tier2).accepted);
@@ -1115,7 +1441,7 @@ mod tests {
 
     #[test]
     fn verifier_rejects_rollback_to_epoch_1() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
 
         let seal1 = make_seal(10, "cell-alpha", 0x11);
         assert!(verifier.verify(&seal1, RiskTier::Tier2).accepted);
@@ -1135,7 +1461,7 @@ mod tests {
 
     #[test]
     fn verifier_detects_equivocation() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
 
         let seal1 = make_seal(5, "cell-alpha", 0x11);
         assert!(verifier.verify(&seal1, RiskTier::Tier2).accepted);
@@ -1156,7 +1482,7 @@ mod tests {
 
     #[test]
     fn verifier_idempotent_same_seal() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
 
         let seal = make_seal(5, "cell-alpha", 0x11);
         assert!(verifier.verify(&seal, RiskTier::Tier2).accepted);
@@ -1180,7 +1506,7 @@ mod tests {
 
     #[test]
     fn verifier_tracks_multiple_issuers_independently() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
 
         let alpha_first = make_seal(1, "cell-alpha", 0x11);
         let beta_first = make_seal(1, "cell-beta", 0x22);
@@ -1211,7 +1537,7 @@ mod tests {
 
     #[test]
     fn verifier_unknown_issuer_returns_none() {
-        let verifier = EpochSealVerifier::new();
+        let verifier = test_verifier();
         assert_eq!(verifier.last_epoch_for("unknown"), None);
     }
 
@@ -1247,7 +1573,7 @@ mod tests {
 
     #[test]
     fn verify_or_reject_accepted() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
         let seal = make_seal(1, "cell-alpha", 0x11);
         let result = verifier.verify_or_reject(&seal, RiskTier::Tier2);
         assert!(result.is_ok());
@@ -1256,7 +1582,7 @@ mod tests {
 
     #[test]
     fn verify_or_reject_rollback_error() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
         let seal1 = make_seal(5, "cell-alpha", 0x11);
         verifier.verify(&seal1, RiskTier::Tier2);
 
@@ -1274,7 +1600,7 @@ mod tests {
 
     #[test]
     fn verify_or_reject_equivocation_error() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
         let seal1 = make_seal(5, "cell-alpha", 0x11);
         verifier.verify(&seal1, RiskTier::Tier2);
 
@@ -1504,7 +1830,7 @@ mod tests {
 
     #[test]
     fn verifier_rejects_when_max_issuers_reached() {
-        let mut verifier = EpochSealVerifier::new();
+        let mut verifier = test_verifier();
 
         // Fill up to the limit.
         for i in 0..MAX_TRACKED_ISSUERS {
@@ -1588,7 +1914,7 @@ mod tests {
                     return Ok(());
                 }
 
-                let mut verifier = EpochSealVerifier::new();
+                let mut verifier = test_verifier();
                 for (i, &epoch) in sorted.iter().enumerate() {
                     #[allow(clippy::cast_possible_truncation)]
                     let root_seed = ((i % 254) + 1) as u8;
@@ -1620,7 +1946,7 @@ mod tests {
                     return Ok(());
                 }
 
-                let mut verifier = EpochSealVerifier::new();
+                let mut verifier = test_verifier();
                 let seal1 = make_seal(accepted_epoch, "prop-issuer", 0x11);
                 verifier.verify(&seal1, RiskTier::Tier2);
 
@@ -1652,7 +1978,7 @@ mod tests {
                 let seal_b = EpochSealV1::new(epoch, root_b, "prop-issuer", sig, content_b)
                     .unwrap();
 
-                let mut verifier = EpochSealVerifier::new();
+                let mut verifier = test_verifier();
                 let v1 = verifier.verify(&seal_a, RiskTier::Tier2);
                 prop_assert!(v1.accepted);
 
@@ -1679,7 +2005,7 @@ mod tests {
                 let seal = EpochSealV1::new(epoch, root, "prop-issuer", sig, content)
                     .unwrap();
 
-                let mut verifier = EpochSealVerifier::new();
+                let mut verifier = test_verifier();
                 let v1 = verifier.verify(&seal, RiskTier::Tier2);
                 prop_assert!(v1.accepted);
 
@@ -1696,7 +2022,7 @@ mod tests {
                 epoch_a in 1u64..=1_000_000,
                 epoch_b in 1u64..=1_000_000,
             ) {
-                let mut verifier = EpochSealVerifier::new();
+                let mut verifier = test_verifier();
 
                 let seal_a = make_seal(epoch_a, "issuer-a", 0x11);
                 let seal_b = make_seal(epoch_b, "issuer-b", 0x22);
@@ -1711,5 +2037,250 @@ mod tests {
                 prop_assert_eq!(verifier.last_epoch_for("issuer-b"), Some(epoch_b));
             }
         }
+    }
+
+    // =========================================================================
+    // Signature Verification Tests (BLOCKER 1 regression)
+    // =========================================================================
+
+    #[test]
+    fn verifier_without_signature_verifier_rejects_all_seals() {
+        let mut verifier = EpochSealVerifier::new(); // No signature verifier
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+
+        assert!(
+            !verdict.accepted,
+            "seal must be rejected without signature verifier"
+        );
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::NoSignatureVerifier { .. }
+        ));
+    }
+
+    #[test]
+    fn verifier_without_signature_verifier_verify_or_reject_error() {
+        let mut verifier = EpochSealVerifier::new();
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let result = verifier.verify_or_reject(&seal, RiskTier::Tier2);
+        assert!(matches!(
+            result,
+            Err(EpochSealVerificationError::NoSignatureVerifier)
+        ));
+    }
+
+    #[test]
+    fn verifier_with_reject_all_rejects_forged_seal() {
+        let mut verifier = EpochSealVerifier::with_signature_verifier(Box::new(
+            RejectAllVerifier::new("forged signature"),
+        ));
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+
+        assert!(!verdict.accepted, "forged seal must be rejected");
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::SignatureRejected { ref reason, .. }
+            if reason == "forged signature"
+        ));
+    }
+
+    #[test]
+    fn verifier_with_reject_all_verify_or_reject_error() {
+        let mut verifier = EpochSealVerifier::with_signature_verifier(Box::new(
+            RejectAllVerifier::new("unknown issuer"),
+        ));
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let result = verifier.verify_or_reject(&seal, RiskTier::Tier2);
+        assert!(matches!(
+            result,
+            Err(EpochSealVerificationError::SignatureRejected {
+                ref reason,
+                ..
+            }) if reason == "unknown issuer"
+        ));
+    }
+
+    #[test]
+    fn verifier_with_accept_all_accepts_valid_seal() {
+        let mut verifier = test_verifier();
+        let seal = make_seal(1, "cell-alpha", 0x11);
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(verdict.accepted);
+    }
+
+    #[test]
+    fn set_signature_verifier_enables_acceptance() {
+        let mut verifier = EpochSealVerifier::new();
+        let seal = make_seal(1, "cell-alpha", 0x11);
+
+        // Without verifier: rejected.
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(!verdict.accepted);
+
+        // Set verifier: now accepted.
+        verifier.set_signature_verifier(Box::new(AcceptAllVerifier));
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(verdict.accepted);
+    }
+
+    #[test]
+    fn has_signature_verifier_reports_correctly() {
+        let verifier = EpochSealVerifier::new();
+        assert!(!verifier.has_signature_verifier());
+
+        let verifier = test_verifier();
+        assert!(verifier.has_signature_verifier());
+    }
+
+    // =========================================================================
+    // Deserialization Bypass / Validation Tests (BLOCKER 2 regression)
+    // =========================================================================
+
+    #[test]
+    fn validate_rejects_zero_epoch() {
+        // Manually construct a seal bypassing the constructor via serde.
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["epoch_number"] = serde_json::Value::from(0);
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            bad_seal.validate(),
+            Err(EpochSealError::ZeroEpoch)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_root_hash() {
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["sealed_root_hash"] = serde_json::to_value(vec![0u8; 32]).unwrap();
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            bad_seal.validate(),
+            Err(EpochSealError::ZeroRootHash)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_issuer() {
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["issuer_cell_id"] = serde_json::Value::from("");
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            bad_seal.validate(),
+            Err(EpochSealError::EmptyIssuerId)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_content_hash() {
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["content_hash"] = serde_json::to_value(vec![0u8; 32]).unwrap();
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            bad_seal.validate(),
+            Err(EpochSealError::ZeroContentHash)
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_deserialized_seal_with_zero_epoch() {
+        let mut verifier = test_verifier();
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["epoch_number"] = serde_json::Value::from(0);
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+
+        let verdict = verifier.verify(&bad_seal, RiskTier::Tier2);
+        assert!(
+            !verdict.accepted,
+            "seal with epoch=0 must be rejected by verifier"
+        );
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::ValidationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_deserialized_seal_with_empty_issuer() {
+        let mut verifier = test_verifier();
+        let valid_seal = make_seal(1, "cell-alpha", 0x11);
+        let mut json: serde_json::Value = serde_json::to_value(&valid_seal).unwrap();
+        json["issuer_cell_id"] = serde_json::Value::from("");
+        let bad_seal: EpochSealV1 = serde_json::from_value(json).unwrap();
+
+        let result = verifier.verify_or_reject(&bad_seal, RiskTier::Tier2);
+        assert!(matches!(
+            result,
+            Err(EpochSealVerificationError::ValidationFailed { .. })
+        ));
+    }
+
+    // =========================================================================
+    // New Error Display Tests
+    // =========================================================================
+
+    #[test]
+    fn new_error_variants_display() {
+        let err = EpochSealVerificationError::SignatureRejected {
+            issuer_cell_id: "cell-alpha".to_string(),
+            reason: "bad sig".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("signature verification failed"));
+        assert!(msg.contains("cell-alpha"));
+
+        let err = EpochSealVerificationError::NoSignatureVerifier;
+        let msg = err.to_string();
+        assert!(msg.contains("no signature verifier"));
+        assert!(msg.contains("fail-closed"));
+
+        let err = EpochSealVerificationError::ValidationFailed {
+            reason: "zero epoch".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("validation failed"));
+        assert!(msg.contains("zero epoch"));
+    }
+
+    #[test]
+    fn new_audit_event_kind_labels() {
+        assert_eq!(
+            EpochSealAuditEvent::SignatureRejected {
+                issuer_cell_id: "x".to_string(),
+                epoch_number: 1,
+                reason: "bad".to_string(),
+            }
+            .kind(),
+            "epoch_seal.signature_rejected"
+        );
+        assert_eq!(
+            EpochSealAuditEvent::NoSignatureVerifier {
+                issuer_cell_id: "x".to_string(),
+                epoch_number: 1,
+            }
+            .kind(),
+            "epoch_seal.no_signature_verifier"
+        );
+        assert_eq!(
+            EpochSealAuditEvent::ValidationFailed {
+                reason: "bad".to_string(),
+            }
+            .kind(),
+            "epoch_seal.validation_failed"
+        );
+    }
+
+    #[test]
+    fn signature_verification_error_display() {
+        let err = SignatureVerificationError {
+            reason: "invalid key".to_string(),
+        };
+        assert!(err.to_string().contains("invalid key"));
     }
 }
