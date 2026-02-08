@@ -978,10 +978,15 @@ async fn async_main(args: Args) -> Result<()> {
     // `notify_session_terminated` which delegates to the orchestrator. A
     // background task polls for gate timeouts periodically.
     let gate_signer = Arc::new(Signer::generate());
-    let gate_orchestrator = Arc::new(GateOrchestrator::new(
-        GateOrchestratorConfig::default(),
-        gate_signer,
-    ));
+    // Wire CAS into the gate orchestrator so it produces CAS-backed
+    // time_envelope_ref values compatible with HTF authority validation
+    // (TCK-00418). MemoryCas is sufficient here because the orchestrator
+    // only stores small ClockProfile + TimeEnvelope artifacts.
+    let gate_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
+        Arc::new(apm2_core::evidence::MemoryCas::default());
+    let gate_orchestrator = Arc::new(
+        GateOrchestrator::new(GateOrchestratorConfig::default(), gate_signer).with_cas(gate_cas),
+    );
 
     // Wire orchestrator into dispatcher state so session termination events
     // trigger autonomous gate lifecycle (Quality BLOCKER 1).

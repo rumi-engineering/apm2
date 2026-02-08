@@ -28,9 +28,14 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use apm2_core::crypto::{Signer, VerifyingKey};
+use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
     AatLeaseExtension, GateLease, GateLeaseBuilder, GateReceipt, GateReceiptBuilder,
     PolicyInheritanceValidator, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
+};
+use apm2_core::htf::{
+    BoundedWallInterval, Canonicalizable, ClockProfile, Hlc, LedgerTime, MonotonicReading,
+    MonotonicSource, TimeEnvelope, WallTimeSource,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -685,6 +690,14 @@ pub struct GateOrchestrator {
     /// Gate timeout as a `Duration` for monotonic comparison (Security BLOCKER
     /// 1).
     gate_timeout_duration: std::time::Duration,
+    /// Content-addressed store for HTF time authority artifacts.
+    ///
+    /// When present, `issue_gate_lease` creates a real `ClockProfile` +
+    /// `TimeEnvelope`, stores them in CAS, and uses the CAS hash as
+    /// `time_envelope_ref`. This ensures downstream consumers
+    /// (e.g. `validate_lease_time_authority`) can resolve and verify the
+    /// envelope via `decode_hash32_hex`.
+    cas: Option<Arc<dyn ContentAddressedStore>>,
 }
 
 impl GateOrchestrator {
@@ -701,6 +714,7 @@ impl GateOrchestrator {
             clock: Arc::new(SystemClock),
             seen_idempotency_keys: RwLock::new(std::collections::HashSet::new()),
             gate_timeout_duration,
+            cas: None,
         }
     }
 
@@ -722,7 +736,21 @@ impl GateOrchestrator {
             clock,
             seen_idempotency_keys: RwLock::new(std::collections::HashSet::new()),
             gate_timeout_duration,
+            cas: None,
         }
+    }
+
+    /// Attaches a content-addressed store for HTF time authority artifacts.
+    ///
+    /// When a CAS is attached, `issue_gate_lease` creates real `ClockProfile`
+    /// and `TimeEnvelope` artifacts, stores them in CAS, and uses the CAS
+    /// hash (hex-encoded) as `time_envelope_ref`. This makes the lease
+    /// compatible with `validate_lease_time_authority` which requires a
+    /// `decode_hash32_hex`-resolvable reference.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.cas = Some(cas);
+        self
     }
 
     /// Returns the current configuration.
@@ -1705,6 +1733,126 @@ impl GateOrchestrator {
             })
     }
 
+    /// Creates CAS-backed HTF time authority artifacts (`ClockProfile` +
+    /// `TimeEnvelope`) and returns the hex-encoded envelope hash suitable
+    /// for use as `time_envelope_ref`.
+    ///
+    /// # Security
+    ///
+    /// The returned string is a 64-character hex-encoded BLAKE3 hash of
+    /// the canonical `TimeEnvelope` JSON, stored in the CAS. Downstream
+    /// consumers (e.g. `validate_lease_time_authority`) resolve and verify
+    /// this hash through `decode_hash32_hex` -> CAS retrieval -> canonical
+    /// hash comparison.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GateOrchestratorError::LeaseIssuanceFailed`] if CAS is
+    /// not configured or if CAS storage fails.
+    fn create_cas_time_envelope_ref(
+        &self,
+        work_id: &str,
+        now_ms: u64,
+    ) -> Result<String, GateOrchestratorError> {
+        let cas = self
+            .cas
+            .as_ref()
+            .ok_or_else(|| GateOrchestratorError::LeaseIssuanceFailed {
+                work_id: work_id.to_string(),
+                gate_id: String::new(),
+                reason: "CAS not configured; cannot create CAS-backed time_envelope_ref"
+                    .to_string(),
+            })?;
+
+        // Build a ClockProfile with deterministic, production-appropriate defaults.
+        let clock_profile = ClockProfile {
+            attestation: None,
+            build_fingerprint: format!("apm2-daemon/{}", env!("CARGO_PKG_VERSION")),
+            hlc_enabled: true,
+            max_wall_uncertainty_ns: 10_000_000, // 10ms
+            monotonic_source: MonotonicSource::ClockMonotonic,
+            profile_policy_id: "gate-orchestrator-default".to_string(),
+            tick_rate_hz: 1_000_000_000, // 1GHz (nanosecond ticks)
+            wall_time_source: WallTimeSource::BestEffortNtp,
+        };
+
+        let profile_bytes = clock_profile.canonical_bytes().map_err(|e| {
+            GateOrchestratorError::LeaseIssuanceFailed {
+                work_id: work_id.to_string(),
+                gate_id: String::new(),
+                reason: format!("clock profile canonicalization failed: {e}"),
+            }
+        })?;
+        let profile_hash = clock_profile.canonical_hash().map_err(|e| {
+            GateOrchestratorError::LeaseIssuanceFailed {
+                work_id: work_id.to_string(),
+                gate_id: String::new(),
+                reason: format!("clock profile hash failed: {e}"),
+            }
+        })?;
+        cas.store(&profile_bytes)
+            .map_err(|e| GateOrchestratorError::LeaseIssuanceFailed {
+                work_id: work_id.to_string(),
+                gate_id: String::new(),
+                reason: format!("CAS store clock profile failed: {e}"),
+            })?;
+
+        // Build a TimeEnvelope referencing the stored ClockProfile.
+        // Use tick-based timestamps derived from now_ms (not wall-time).
+        let tick_value = now_ms.saturating_mul(1_000_000); // ms -> ns ticks
+        let envelope = TimeEnvelope {
+            clock_profile_hash: hex::encode(profile_hash),
+            hlc: Hlc {
+                logical: 0,
+                wall_ns: now_ms.saturating_mul(1_000_000), // ms -> ns
+            },
+            ledger_anchor: LedgerTime::new("gate-orchestrator", 0, now_ms),
+            mono: MonotonicReading {
+                end_tick: Some(tick_value.saturating_add(1_000_000_000)), // +1s
+                source: MonotonicSource::ClockMonotonic,
+                start_tick: tick_value,
+                tick_rate_hz: 1_000_000_000,
+            },
+            notes: Some(format!("gate-lease:{work_id}:{now_ms}")),
+            wall: BoundedWallInterval::new(
+                now_ms.saturating_mul(1_000_000),
+                now_ms.saturating_mul(1_000_000).saturating_add(10_000_000), // +10ms uncertainty
+                WallTimeSource::BestEffortNtp,
+                "best-effort",
+            )
+            .unwrap_or_else(|_| {
+                // Fallback: zero-width interval (should not happen with valid now_ms)
+                BoundedWallInterval::new(0, 0, WallTimeSource::None, "fallback")
+                    .expect("zero interval is always valid")
+            }),
+        };
+
+        let envelope_bytes =
+            envelope
+                .canonical_bytes()
+                .map_err(|e| GateOrchestratorError::LeaseIssuanceFailed {
+                    work_id: work_id.to_string(),
+                    gate_id: String::new(),
+                    reason: format!("time envelope canonicalization failed: {e}"),
+                })?;
+        let envelope_hash =
+            envelope
+                .canonical_hash()
+                .map_err(|e| GateOrchestratorError::LeaseIssuanceFailed {
+                    work_id: work_id.to_string(),
+                    gate_id: String::new(),
+                    reason: format!("time envelope hash failed: {e}"),
+                })?;
+        cas.store(&envelope_bytes)
+            .map_err(|e| GateOrchestratorError::LeaseIssuanceFailed {
+                work_id: work_id.to_string(),
+                gate_id: String::new(),
+                reason: format!("CAS store time envelope failed: {e}"),
+            })?;
+
+        Ok(hex::encode(envelope_hash))
+    }
+
     /// Issues a gate lease for a specific gate type.
     ///
     /// # Security
@@ -1712,6 +1860,8 @@ impl GateOrchestrator {
     /// - Uses domain-separated Ed25519 signatures (`GATE_LEASE_ISSUED:` prefix)
     /// - Binds the `changeset_digest` from the terminated session
     /// - Sets temporal bounds (`issued_at` to `issued_at` + timeout)
+    /// - `time_envelope_ref` is a CAS-backed hex-encoded hash when CAS is
+    ///   configured, ensuring downstream HTF authority validation succeeds.
     fn issue_gate_lease(
         &self,
         info: &SessionTerminatedInfo,
@@ -1726,7 +1876,15 @@ impl GateOrchestrator {
             now_ms
         );
         let executor_actor_id = format!("executor-{}-{}", gate_type.as_gate_id(), now_ms);
-        let time_envelope_ref = format!("htf:gate:{}:{}", info.work_id, now_ms);
+
+        // Produce a CAS-backed time_envelope_ref when CAS is available.
+        // Fall back to legacy format only when CAS is not configured (tests
+        // without CAS wiring).
+        let time_envelope_ref = if self.cas.is_some() {
+            self.create_cas_time_envelope_ref(&info.work_id, now_ms)?
+        } else {
+            format!("htf:gate:{}:{}", info.work_id, now_ms)
+        };
 
         let mut builder = GateLeaseBuilder::new(&lease_id, &info.work_id, gate_type.as_gate_id())
             .changeset_digest(info.changeset_digest)
@@ -1827,7 +1985,11 @@ impl GateOrchestrator {
         issued_at: u64,
         expires_at: u64,
     ) -> Result<GateLease, GateOrchestratorError> {
-        let time_envelope_ref = format!("htf:delegate:{}:{}", parent_lease.work_id, issued_at);
+        // Inherit the parent lease's time_envelope_ref directly. The parent's
+        // ref was already validated as CAS-backed during its issuance or
+        // upstream admission. Minting a new non-CAS string would break
+        // downstream `decode_hash32_hex` consumers.
+        let time_envelope_ref = &parent_lease.time_envelope_ref;
 
         let mut builder =
             GateLeaseBuilder::new(sublease_id, &parent_lease.work_id, &parent_lease.gate_id)
@@ -1837,7 +1999,7 @@ impl GateOrchestrator {
                 .expires_at(expires_at)
                 .policy_hash(parent_lease.policy_hash)
                 .issuer_actor_id(&self.config.issuer_actor_id)
-                .time_envelope_ref(&time_envelope_ref);
+                .time_envelope_ref(time_envelope_ref);
 
         // Propagate AAT extension from parent if present (must match exactly).
         if let Some(ref aat_ext) = parent_lease.aat_extension {
@@ -4250,6 +4412,11 @@ mod tests {
         assert_eq!(sublease.gate_id, "gate-quality");
         assert_eq!(sublease.changeset_digest, [0x42; 32]);
         assert_eq!(sublease.policy_hash, [0xAB; 32]);
+        // Sublease MUST inherit parent's time_envelope_ref (not mint a new one).
+        assert_eq!(
+            sublease.time_envelope_ref, parent.time_envelope_ref,
+            "sublease must inherit parent time_envelope_ref for CAS compatibility"
+        );
     }
 
     #[test]
@@ -4335,6 +4502,11 @@ mod tests {
         let sub_aat = sublease.aat_extension.unwrap();
         assert_eq!(sub_aat.view_commitment_hash, [0x33; 32]);
         assert_eq!(sub_aat.rcp_manifest_hash, [0x11; 32]);
+        // Sublease MUST inherit parent's time_envelope_ref.
+        assert_eq!(
+            sublease.time_envelope_ref, parent.time_envelope_ref,
+            "AAT sublease must inherit parent time_envelope_ref"
+        );
     }
 
     #[test]
@@ -4362,6 +4534,122 @@ mod tests {
         assert!(
             result.is_err(),
             "sublease issued before parent must be rejected through production path"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00418: CAS-backed time_envelope_ref integration tests
+    // =========================================================================
+
+    /// Verifies that when a CAS is configured, `issue_gate_lease` produces a
+    /// `time_envelope_ref` that is a valid 64-char hex string (32-byte hash)
+    /// resolvable from CAS, and that delegated subleases inherit it.
+    #[tokio::test]
+    async fn test_cas_backed_time_envelope_ref_in_gate_lease() {
+        use apm2_core::evidence::MemoryCas;
+
+        let cas = Arc::new(MemoryCas::default());
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), signer)
+            .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+        let info = test_session_info("work-cas-test");
+        let (_gate_types, _exec_signers, events) = orch.on_session_terminated(info).await.unwrap();
+
+        // Find a lease issuance event.
+        let lease_event = events
+            .iter()
+            .find(|e| matches!(e, GateOrchestratorEvent::GateLeaseIssued { .. }));
+        assert!(
+            lease_event.is_some(),
+            "should have at least one GateLeaseIssued event"
+        );
+
+        // Retrieve the actual lease from the orchestrator.
+        let lease = orch.gate_lease("work-cas-test", GateType::Quality).await;
+        assert!(lease.is_some(), "quality gate lease must exist");
+        let lease = lease.unwrap();
+
+        // time_envelope_ref MUST be a valid 64-char hex string.
+        assert_eq!(
+            lease.time_envelope_ref.len(),
+            64,
+            "time_envelope_ref must be 64-char hex (32-byte hash), got: {}",
+            lease.time_envelope_ref
+        );
+        let envelope_hash =
+            hex::decode(&lease.time_envelope_ref).expect("time_envelope_ref must be valid hex");
+        assert_eq!(envelope_hash.len(), 32);
+
+        // The hash MUST be resolvable from CAS.
+        let hash_array: [u8; 32] = envelope_hash.try_into().unwrap();
+        let envelope_bytes = cas.retrieve(&hash_array);
+        assert!(
+            envelope_bytes.is_ok(),
+            "time_envelope_ref must be resolvable from CAS"
+        );
+
+        // The CAS content MUST deserialize to a valid TimeEnvelope.
+        let envelope: TimeEnvelope = serde_json::from_slice(&envelope_bytes.unwrap())
+            .expect("CAS content must be a valid TimeEnvelope");
+
+        // The clock_profile_hash in the envelope MUST also be CAS-resolvable.
+        let profile_hash_bytes =
+            hex::decode(&envelope.clock_profile_hash).expect("clock_profile_hash must be hex");
+        let profile_hash_array: [u8; 32] = profile_hash_bytes.try_into().unwrap();
+        let profile_bytes = cas.retrieve(&profile_hash_array);
+        assert!(
+            profile_bytes.is_ok(),
+            "clock_profile_hash must be resolvable from CAS"
+        );
+        let _profile: ClockProfile = serde_json::from_slice(&profile_bytes.unwrap())
+            .expect("CAS content must be a valid ClockProfile");
+    }
+
+    /// Verifies that delegated subleases inherit the parent's CAS-backed
+    /// `time_envelope_ref` rather than minting a new legacy string.
+    #[tokio::test]
+    async fn test_delegated_sublease_inherits_cas_time_envelope_ref() {
+        use apm2_core::evidence::MemoryCas;
+
+        let cas = Arc::new(MemoryCas::default());
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), signer)
+            .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+        let info = test_session_info("work-delegate-cas");
+        let _ = orch.on_session_terminated(info).await.unwrap();
+
+        let parent_lease = orch
+            .gate_lease("work-delegate-cas", GateType::Quality)
+            .await
+            .expect("parent lease must exist");
+
+        let sublease = orch
+            .issue_delegated_sublease(
+                &parent_lease,
+                "sub-cas-001",
+                "child-executor",
+                parent_lease.issued_at + 100,
+                parent_lease.expires_at - 100,
+            )
+            .expect("delegated sublease should succeed");
+
+        // Sublease MUST have exactly the same time_envelope_ref as parent.
+        assert_eq!(
+            sublease.time_envelope_ref, parent_lease.time_envelope_ref,
+            "delegated sublease must inherit parent's CAS-backed time_envelope_ref"
+        );
+
+        // And it must still be a valid 64-char hex.
+        assert_eq!(sublease.time_envelope_ref.len(), 64);
+
+        // And resolvable from CAS.
+        let hash_bytes = hex::decode(&sublease.time_envelope_ref).unwrap();
+        let hash_array: [u8; 32] = hash_bytes.try_into().unwrap();
+        assert!(
+            cas.retrieve(&hash_array).is_ok(),
+            "sublease time_envelope_ref must be CAS-resolvable"
         );
     }
 }
