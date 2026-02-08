@@ -44,7 +44,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use apm2_core::context::firewall::FirewallViolationDefect;
-use apm2_core::htf::{TimeEnvelope, TimeEnvelopeRef};
+use apm2_core::htf::{EpochSealV1, TimeEnvelope, TimeEnvelopeRef};
 use prost::Message;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::{self, Visitor};
@@ -188,6 +188,14 @@ pub struct BrokerToolRequest {
 
     /// The risk tier of the current episode.
     pub risk_tier: RiskTier,
+
+    /// Optional epoch seal for admission validation (TCK-00365).
+    ///
+    /// When present, this seal is consumed by the `verify_epoch_seal` admission
+    /// step. Tier2+ requests require a valid epoch seal; Tier0/Tier1 pass
+    /// through without one. Providing a seal at any tier enables the verifier
+    /// to track monotonicity and detect equivocation.
+    pub epoch_seal: Option<EpochSealV1>,
 }
 
 /// Error type for request validation.
@@ -342,6 +350,7 @@ impl BrokerToolRequest {
             query: None,
             artifact_hash: None,
             risk_tier,
+            epoch_seal: None,
         }
     }
 
@@ -418,6 +427,17 @@ impl BrokerToolRequest {
     #[must_use]
     pub const fn with_artifact_hash(mut self, hash: Hash) -> Self {
         self.artifact_hash = Some(hash);
+        self
+    }
+
+    /// Sets the epoch seal for admission verification (TCK-00365).
+    ///
+    /// When set, the broker admission path will consume this seal during
+    /// `verify_epoch_seal`. Tier2+ requests require a valid seal; Tier0/Tier1
+    /// requests pass without one.
+    #[must_use]
+    pub fn with_epoch_seal(mut self, seal: EpochSealV1) -> Self {
+        self.epoch_seal = Some(seal);
         self
     }
 

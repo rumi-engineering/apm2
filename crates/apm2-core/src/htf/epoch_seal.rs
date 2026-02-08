@@ -3557,10 +3557,10 @@ mod tests {
     // BLOCKER 3: Integration evidence (end-to-end seal verification flow)
     // =========================================================================
 
-    // TODO(TCK-00365-WIRING): Wire EpochSealVerifier::verify_with_policy()
-    // into the daemon admission path. The verifier API is production-ready
-    // (including LRU eviction and integrated tier-based policy); daemon
-    // integration is deferred to a follow-up ticket.
+    // NOTE(TCK-00365): EpochSealVerifier::verify_with_policy() is now wired
+    // into the daemon ToolBroker admission path (broker.rs). The verifier API
+    // enforces monotonicity, anti-equivocation, and signature verification.
+    // Request-carried seals are consumed via BrokerToolRequest.epoch_seal.
 
     #[test]
     fn end_to_end_seal_issuance_and_verification_flow() {

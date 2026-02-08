@@ -125,11 +125,19 @@ evidence_artifact:
       description: |
         Daemon admission wiring (ToolBroker integration):
         - broker_epoch_seal_denies_tier2_without_seal: verifies that
-          Tier2+ tool requests are denied when no epoch seal is attached.
+          Tier2 tool requests are denied when no epoch seal is attached.
         - broker_epoch_seal_allows_tier0_without_seal: verifies that
           Tier0 tool requests pass without epoch seal.
         - broker_epoch_seal_allows_tier1_without_seal: verifies that
           Tier1 tool requests pass without epoch seal.
+        - broker_epoch_seal_valid_accepted: verifies that Tier2
+          requests with a valid request-carried seal are accepted.
+        - broker_epoch_seal_rollback_denied: verifies that a rollback
+          seal (lower epoch after higher) is denied at Tier2.
+        - broker_epoch_seal_missing_seal_denied_at_tier3: verifies
+          Tier3 without epoch seal is denied.
+        - broker_epoch_seal_rejected_by_signature_verifier: verifies
+          that seals rejected by the signature verifier are denied.
       ref: "cargo test -p apm2-daemon broker::tests::broker_epoch_seal"
     - type: "test_output"
       description: |
