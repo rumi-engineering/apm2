@@ -261,6 +261,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "apm2-lab"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "apm2-core",
+ "async-trait",
+ "clap",
+ "proptest",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

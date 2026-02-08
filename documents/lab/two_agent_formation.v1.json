@@ -1,0 +1,70 @@
+{
+  "kind": "apm2.lab.two_agent_formation",
+  "version": "v1",
+  "agents": {
+    "alpha": {
+      "domain": "analytical",
+      "description": "analytical decomposition and logical reasoning"
+    },
+    "beta": {
+      "domain": "creative",
+      "description": "creative synthesis and holistic integration"
+    }
+  },
+  "work_types": {
+    "analyze": {
+      "value": 1.0,
+      "skills": ["analytical"],
+      "description_template": "Decompose {topic} into sub-components"
+    },
+    "synthesize": {
+      "value": 1.0,
+      "skills": ["creative"],
+      "description_template": "Combine {elements} into a coherent whole"
+    },
+    "compound": {
+      "value": 4.0,
+      "skills": ["analytical", "creative"],
+      "description_template": "Analyze {topic}, then synthesize results into {output}"
+    }
+  },
+  "conditions": {
+    "control": {
+      "mix": {
+        "analyze": 0.5,
+        "synthesize": 0.5,
+        "compound": 0.0
+      },
+      "ticks": 30
+    },
+    "treatment": {
+      "mix": {
+        "analyze": 0.4,
+        "synthesize": 0.4,
+        "compound": 0.2
+      },
+      "ticks": 40
+    }
+  },
+  "budget_per_agent_tokens": 10000,
+  "model": "sonnet",
+  "formation_policy": {
+    "tau_compression_gain": 0.15,
+    "max_composite_size": 8,
+    "require_all_attestations": true
+  },
+  "audit_policy": {
+    "enabled": true,
+    "challenge_rate": 0.05
+  },
+  "scoring": {
+    "value_weight": 1.0,
+    "failure_penalty": 2.0,
+    "token_cost": 0.001
+  },
+  "outputs": {
+    "metrics_path": "out/lab_metrics.jsonl",
+    "summary_path": "out/lab_summary.json",
+    "ledger_path": "out/lab_ledger.jsonl"
+  }
+}
