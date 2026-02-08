@@ -2062,8 +2062,39 @@ fn run_inside_bounded_unit(args: &RunArgs, repo_root: &Path, max_parallel: usize
         .arg("--setenv")
         .arg(format!("{BOUNDED_ENTRY_TOKEN_ENV}={bounded_entry_token}"));
 
+    // Fail-closed runner environments can vary in whether `$CARGO_HOME/bin` is
+    // present on `PATH`. Since the CI suite relies on cargo subcommands like
+    // `cargo nextest` / `cargo deny` / `cargo audit` / `cargo llvm-cov`, we
+    // force-prepend `$CARGO_HOME/bin` (or `$HOME/.cargo/bin`) to the bounded
+    // unit's PATH to make tool discovery deterministic across runner instances.
+    let cargo_bin = std::env::var("CARGO_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|home| format!("{home}/bin"))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|home| format!("{home}/.cargo/bin"))
+        });
+    let path = std::env::var("PATH").unwrap_or_default();
+    let augmented_path = if let Some(cargo_bin) = cargo_bin {
+        let already_present = path.split(':').any(|segment| segment == cargo_bin.as_str());
+        if already_present {
+            path
+        } else if path.is_empty() {
+            cargo_bin
+        } else {
+            format!("{cargo_bin}:{path}")
+        }
+    } else {
+        path
+    };
+    if !augmented_path.is_empty() {
+        cmd.arg("--setenv").arg(format!("PATH={augmented_path}"));
+    }
+
     for key in [
-        "PATH",
         "HOME",
         "USER",
         "LOGNAME",
