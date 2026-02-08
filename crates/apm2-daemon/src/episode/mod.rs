@@ -147,6 +147,9 @@ pub mod workspace;
 // TCK-00351: Pre-actuation stop and budget proof obligations
 pub mod preactuation;
 
+// TCK-00376: No-bypass path ratchet enforcement
+pub mod path_ratchet;
+
 // TCK-00387: Crash recovery wiring
 pub mod crash_recovery;
 
@@ -224,6 +227,10 @@ pub use handlers::{
 };
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
+// Re-export path ratchet types (TCK-00376)
+pub use path_ratchet::{
+    EnforcementStatus, PathRatchet, PathRatchetError, PathRatchetInput, PathRatchetOutcome,
+};
 // Re-export pre-actuation types (TCK-00351)
 pub use preactuation::{
     BudgetStatus, DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS, MAX_REPLAY_ENTRIES, PreActuationDenial,

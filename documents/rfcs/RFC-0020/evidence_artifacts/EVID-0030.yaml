@@ -1,0 +1,94 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0030"
+  title: "No-bypass path ratchet enforcement evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that REQ-0030 acceptance criteria are enforced for no-bypass
+    path ratchet enforcement (TCK-00376).
+
+    The PathRatchet module ensures every tool actuation path passes through
+    all required enforcement components (broker, capability manifest,
+    context firewall, capsule admission) before execution is permitted.
+    No manifest-only or non-broker bypass paths exist.
+
+    Tier enforcement semantics:
+    - Tier0-1: Missing components produce warnings but allow actuation.
+    - Tier2+: Broker, capability, and context-firewall are mandatory
+      (fail-closed deny when unavailable or unchecked).
+    - Tier3+: Capsule containment is additionally mandatory (per REQ-0028).
+    - Tier2 capsule: Unavailable produces warning, not denial.
+    - All tiers: Broker authorization is always required.
+
+    Regression tests cover exhaustive tier/component combinations to
+    prevent bypass reintroduction.
+  requirement_ids:
+    - "REQ-0030"
+  source_refs:
+    - "crates/apm2-daemon/src/episode/path_ratchet.rs"
+    - "crates/apm2-daemon/src/episode/broker.rs"
+    - "documents/rfcs/RFC-0020/requirements/REQ-0030.yaml"
+  artifacts:
+    - type: "test_output"
+      description: |
+        PathRatchet unit tests (path_ratchet.rs, 22 tests):
+        Broker always required:
+        - test_actuation_without_broker_denied_tier0
+        - test_actuation_without_broker_denied_tier2
+        - test_actuation_without_broker_denied_tier4
+        Capability manifest enforcement:
+        - test_actuation_without_capability_denied_tier2
+        - test_actuation_without_capability_allowed_with_warning_tier0
+        Context firewall enforcement:
+        - test_actuation_without_context_firewall_denied_tier2
+        - test_actuation_without_context_firewall_denied_tier3
+        - test_actuation_without_context_firewall_allowed_with_warning_tier1
+        Capsule profile admission:
+        - test_actuation_without_capsule_profile_allowed_with_warning_tier2
+        - test_actuation_without_capsule_profile_denied_tier3
+        - test_actuation_without_capsule_profile_allowed_with_warning_tier0
+        All checks pass:
+        - test_all_checks_pass_tier0
+        - test_all_checks_pass_tier2
+        - test_all_checks_pass_tier3
+        - test_all_checks_pass_tier4
+        Component unavailable at mandatory tiers:
+        - test_all_components_unavailable_tier2_denied
+        - test_all_components_unavailable_tier0_allowed_with_warnings
+        - test_all_components_unavailable_tier1_allowed_with_warnings
+        Component not-checked at mandatory tiers:
+        - test_capability_available_but_not_checked_tier2_denied
+        - test_context_firewall_available_but_not_checked_tier3_denied
+        - test_capsule_available_but_not_checked_tier4_denied
+        Tier boundary:
+        - test_tier1_is_not_mandatory
+        - test_tier2_is_mandatory
+        Display and error formatting:
+        - test_error_display_formatting
+        - test_enforcement_status_display
+        Regression bypass prevention:
+        - test_regression_no_bypass_at_mandatory_tiers
+        - test_regression_broker_required_all_tiers
+        - test_regression_mandatory_enforcement_threshold
+      ref:
+        - "cargo test -p apm2-daemon episode::path_ratchet"
+    - type: "test_output"
+      description: |
+        Broker integration tests for path ratchet enforcement (broker.rs):
+        - test_path_ratchet_tier2_no_context_manifest_denied
+        - test_path_ratchet_tier3_no_context_manifest_terminates
+        - test_path_ratchet_tier4_no_context_manifest_terminates
+        - test_path_ratchet_tier0_no_context_manifest_allowed
+        - test_path_ratchet_tier1_no_context_manifest_allowed
+        - test_path_ratchet_tier2_with_context_manifest_allowed_capsule_unavailable
+        - test_path_ratchet_tier3_with_context_manifest_denied_capsule_unavailable
+        - test_path_ratchet_cache_hit_does_not_bypass_ratchet
+        - test_path_ratchet_regression_no_bypass_at_mandatory_tiers
+      ref:
+        - "cargo test -p apm2-daemon episode::broker::tests::test_path_ratchet"
+    - type: "test_output"
+      description: |
+        Full daemon regression suite covering REQ-0030 contract surfaces.
+      ref:
+        - "cargo test -p apm2-daemon"
