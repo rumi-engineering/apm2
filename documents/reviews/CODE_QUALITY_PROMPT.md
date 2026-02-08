@@ -204,6 +204,23 @@ decision_tree:
         MAJOR: "Missing tests, API issues, criteria not met."
         MINOR: "Non-idiomatic, missing docs."
         NIT: "Style, optional improvements."
+      waiver_policy:
+        purpose: "Incorporate explicit, approved waivers into severity and verdict computation (fail-closed)."
+        rules:
+          - |
+            If you identify a trust-boundary regression / strictness decrease in review gate provenance
+            (e.g., authoritative merge-required status and allowlisted artifacts produced from PR-branch mutable code),
+            you MUST check whether an APPROVED, unexpired `WVR-####` waiver exists and is valid for `reviewed_sha`.
+          - |
+            Waiver validity check (from `documents/reviews/REVIEW_GATE_WAIVER_FLOW.md`):
+            - `waiver.references.commit_sha` MUST equal `reviewed_sha`; OR
+            - If the PR head includes a waiver-only commit that only changes `documents/work/waivers/`,
+              `commit_sha` MAY equal the immediate parent of `reviewed_sha` (pre-waiver PR head).
+          - |
+            If a waiver is valid AND its scope covers the finding (by gate_ids / quality_dimension_ids),
+            record it under **WAIVED FINDINGS** and do NOT count it toward blocker/major severity_counts or verdict.
+          - |
+            If a waiver is missing/invalid/out-of-scope for the finding, classify it as a normal finding (usually BLOCKER).
       verdict_rules:
         PASS: "blocker_count == 0 AND major_count == 0"
         FAIL: "blocker_count > 0 OR major_count > 0"
@@ -242,6 +259,9 @@ decision_tree:
           - section: "MAJOR FINDINGS"
             format: "### **MAJOR FINDINGS**"
             content: "Numbered list of majors with same structure as blockers"
+          - section: "WAIVED FINDINGS"
+            format: "### **WAIVED FINDINGS**"
+            content: "Numbered list of waived items (with waiver id + why it is valid), each with the same structure as blockers"
           - section: "MINOR/NIT FINDINGS"
             format: "### **MINOR FINDINGS** / ### **NITS**"
             content: "Optional sections for lower-severity items"

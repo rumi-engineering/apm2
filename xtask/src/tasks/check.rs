@@ -822,7 +822,9 @@ fn is_review_completed_by_comment(
     head_sha: &str,
     reviewer_type: &str,
 ) -> bool {
-    const MAX_PAGES: u32 = 10;
+    // Align with `xtask review-gate` (MAX_COMMENT_PAGES) to avoid reviewer
+    // churn on high-comment PRs.
+    const MAX_PAGES: u32 = 50;
 
     let category = match reviewer_type {
         "security" => crate::tasks::review_gate::ReviewCategory::Security,
