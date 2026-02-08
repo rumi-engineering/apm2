@@ -665,6 +665,65 @@ pub enum PermeabilityError {
         "parent-authority continuity violation: child.parent_authority_hash does not match parent.delegated_hash"
     )]
     ParentAuthorityContinuity,
+
+    /// Policy root hash mismatch: the receipt was issued under a different
+    /// policy root than the one currently active.
+    ///
+    /// Receipts MUST be bound to a specific policy root to prevent
+    /// cross-policy replay attacks. Fail-closed.
+    #[error("policy root hash mismatch: receipt bound to {receipt_root}, expected {expected_root}")]
+    PolicyRootMismatch {
+        /// Policy root hash the receipt was issued under (hex).
+        receipt_root: String,
+        /// Expected policy root hash (hex).
+        expected_root: String,
+    },
+
+    /// Receipt is missing a required policy root hash binding.
+    ///
+    /// All receipts consumed on the production path MUST carry a non-zero
+    /// `policy_root_hash`. Fail-closed.
+    #[error("receipt is missing policy_root_hash binding (cryptographic provenance required)")]
+    MissingPolicyRootHash,
+
+    /// Scope binding violation: receipt actor identity does not match the
+    /// consuming envelope/session context.
+    #[error("scope binding violation: {reason}")]
+    ScopeBindingViolation {
+        /// Description of the scope mismatch.
+        reason: String,
+    },
+
+    /// Delegation chain proof is missing for a delegated receipt.
+    ///
+    /// Receipts with `delegation_depth > 0` MUST carry a
+    /// `delegation_chain_hash` proving the full chain has been validated.
+    /// Fail-closed.
+    #[error("delegation chain proof missing for receipt at depth {depth}")]
+    MissingDelegationChainProof {
+        /// The delegation depth of the receipt.
+        depth: u32,
+    },
+
+    /// Delegation chain hash mismatch: the supplied chain proof does not
+    /// match the expected value.
+    #[error("delegation chain hash mismatch: expected {expected}, got {actual}")]
+    DelegationChainHashMismatch {
+        /// Expected chain hash (hex).
+        expected: String,
+        /// Actual chain hash (hex).
+        actual: String,
+    },
+
+    /// Required authority exceeds what the envelope/policy state demands.
+    ///
+    /// The caller-supplied `required_authority` must not exceed the
+    /// authority ceiling derived from the envelope's policy state.
+    #[error("required authority exceeds envelope-derived ceiling: {reason}")]
+    AuthorityCeilingExceeded {
+        /// Description of which facet exceeded the ceiling.
+        reason: String,
+    },
 }
 
 // =============================================================================
@@ -738,6 +797,25 @@ pub struct PermeabilityReceipt {
 
     /// Whether this receipt has been revoked.
     pub revoked: bool,
+
+    /// BLAKE3 hash of the policy root this receipt was issued under.
+    ///
+    /// Binds the receipt to a specific policy configuration, preventing
+    /// cross-policy replay attacks. Consumption verification MUST check
+    /// that this matches the currently-active policy root. `None` indicates
+    /// no policy root binding (legacy receipts); the consumption path
+    /// rejects `None` with [`PermeabilityError::MissingPolicyRootHash`].
+    pub policy_root_hash: Option<[u8; 32]>,
+
+    /// BLAKE3 hash proving delegation chain continuity for delegated
+    /// receipts (`delegation_depth > 0`).
+    ///
+    /// This is computed as `BLAKE3(parent_receipt_hash ||
+    /// parent.delegated_hash)` and proves that the full delegation chain
+    /// has been validated without requiring the entire chain to be
+    /// presented at consumption time. Root receipts (`delegation_depth ==
+    /// 0`) leave this as `None`.
+    pub delegation_chain_hash: Option<[u8; 32]>,
 }
 
 impl PermeabilityReceipt {
@@ -782,6 +860,22 @@ impl PermeabilityReceipt {
         // Include revocation bit so a revoked receipt cannot be replayed
         // under the same hash as the non-revoked version.
         hasher.update(&[u8::from(self.revoked)]);
+
+        // Include policy root hash binding for cryptographic provenance.
+        if let Some(ref prh) = self.policy_root_hash {
+            hasher.update(&[1u8]); // presence marker
+            hasher.update(prh);
+        } else {
+            hasher.update(&[0u8]); // absence marker
+        }
+
+        // Include delegation chain hash for chain continuity proof.
+        if let Some(ref dch) = self.delegation_chain_hash {
+            hasher.update(&[1u8]); // presence marker
+            hasher.update(dch);
+        } else {
+            hasher.update(&[0u8]); // absence marker
+        }
 
         hasher.finalize().into()
     }
@@ -866,9 +960,18 @@ impl PermeabilityReceipt {
     ///
     /// Checks receipt ID, actor IDs, revocation, `issued_at_ms` (non-zero),
     /// delegation depth, parent linkage, meet correctness, strict-subset,
-    /// and authority hashes.  Does NOT check expiry or time-based freshness.
+    /// authority hashes, and delegation chain hash.  Does NOT check expiry
+    /// or time-based freshness.
     fn validate_structural(&self) -> Result<(), PermeabilityError> {
-        // Check receipt ID length
+        self.validate_identity_fields()?;
+        self.validate_delegation_linkage()?;
+        self.validate_meet_and_subset()?;
+        self.validate_authority_hashes()?;
+        self.validate_chain_hash_consistency()
+    }
+
+    /// Validates receipt ID, actor IDs, revocation, and issuance timestamp.
+    fn validate_identity_fields(&self) -> Result<(), PermeabilityError> {
         if self.receipt_id.is_empty() || self.receipt_id.len() > MAX_RECEIPT_ID_LENGTH {
             return Err(PermeabilityError::InvalidReceiptId {
                 actual: self.receipt_id.len(),
@@ -914,7 +1017,11 @@ impl PermeabilityReceipt {
                 reason: "issued_at_ms must be non-zero".to_string(),
             });
         }
+        Ok(())
+    }
 
+    /// Validates delegation depth and parent receipt hash linkage.
+    fn validate_delegation_linkage(&self) -> Result<(), PermeabilityError> {
         // Check delegation depth
         if self.delegation_depth > MAX_DELEGATION_DEPTH {
             return Err(PermeabilityError::DepthExceeded {
@@ -939,17 +1046,15 @@ impl PermeabilityReceipt {
                 ),
             });
         }
+        Ok(())
+    }
 
-        // Compute expected meet
+    /// Validates that `delegated == meet(parent, overlay)` and strict-subset.
+    fn validate_meet_and_subset(&self) -> Result<(), PermeabilityError> {
         let expected_meet = lattice_meet(&self.parent_authority, &self.overlay);
         if self.delegated != expected_meet {
             return Err(PermeabilityError::MeetMismatch);
         }
-
-        // RFC-0020 strict-subset delegation: delegated authority MUST be
-        // strictly less than parent authority — equal authority delegation
-        // is not permitted.  This prevents a delegate from obtaining the
-        // full authority of its parent.
         if !self.delegated.is_strict_subset_of(&self.parent_authority) {
             if self.delegated == self.parent_authority {
                 return Err(PermeabilityError::EqualAuthorityDelegation);
@@ -959,8 +1064,11 @@ impl PermeabilityReceipt {
         if !self.delegated.is_subset_of(&self.overlay) {
             return Err(PermeabilityError::OverlayWidening);
         }
+        Ok(())
+    }
 
-        // Verify authority hashes
+    /// Validates that authority hashes match recomputed values.
+    fn validate_authority_hashes(&self) -> Result<(), PermeabilityError> {
         let parent_hash = self.parent_authority.content_hash();
         if parent_hash != self.parent_authority_hash {
             return Err(PermeabilityError::HashMismatch {
@@ -984,9 +1092,69 @@ impl PermeabilityReceipt {
                 actual: hex::encode(self.delegated_hash),
             });
         }
+        Ok(())
+    }
+
+    /// Validates delegation chain hash consistency.
+    ///
+    /// Root receipts (depth 0) must NOT have a chain hash; non-root
+    /// receipts (depth > 0) MUST have one that matches
+    /// `BLAKE3(parent_receipt_hash || parent_authority_hash)`.
+    fn validate_chain_hash_consistency(&self) -> Result<(), PermeabilityError> {
+        if self.delegation_depth == 0 && self.delegation_chain_hash.is_some() {
+            return Err(PermeabilityError::ParentLinkageMismatch {
+                reason: "root receipt (depth 0) must not have delegation_chain_hash".to_string(),
+            });
+        }
+        if self.delegation_depth > 0 {
+            match (&self.delegation_chain_hash, &self.parent_receipt_hash) {
+                (None, _) => {
+                    return Err(PermeabilityError::MissingDelegationChainProof {
+                        depth: self.delegation_depth,
+                    });
+                },
+                (Some(chain_hash), Some(parent_hash)) => {
+                    let expected =
+                        compute_delegation_chain_hash(parent_hash, &self.parent_authority_hash);
+                    if *chain_hash != expected {
+                        return Err(PermeabilityError::DelegationChainHashMismatch {
+                            expected: hex::encode(expected),
+                            actual: hex::encode(chain_hash),
+                        });
+                    }
+                },
+                (Some(_), None) => {
+                    // This case is already caught by parent_receipt_hash
+                    // linkage check above, but we enforce it here
+                    // defensively.
+                    return Err(PermeabilityError::ParentLinkageMismatch {
+                        reason: "delegation_chain_hash present but parent_receipt_hash missing"
+                            .to_string(),
+                    });
+                },
+            }
+        }
 
         Ok(())
     }
+}
+
+/// Computes the delegation chain proof hash from the parent receipt hash
+/// and the parent's authority hash.
+///
+/// Formula: `BLAKE3(parent_receipt_hash || parent_authority_hash)`
+///
+/// This binds the chain proof to both the specific parent receipt and
+/// the authority it carried, preventing chain splicing attacks.
+#[must_use]
+pub fn compute_delegation_chain_hash(
+    parent_receipt_hash: &[u8; 32],
+    parent_authority_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(parent_receipt_hash);
+    hasher.update(parent_authority_hash);
+    hasher.finalize().into()
 }
 
 // =============================================================================
@@ -1007,6 +1175,7 @@ pub struct PermeabilityReceiptBuilder {
     delegate_actor_id: String,
     issued_at_ms: u64,
     expires_at_ms: u64,
+    policy_root_hash: Option<[u8; 32]>,
 }
 
 impl PermeabilityReceiptBuilder {
@@ -1027,6 +1196,7 @@ impl PermeabilityReceiptBuilder {
             delegate_actor_id: String::new(),
             issued_at_ms: 0,
             expires_at_ms: 0,
+            policy_root_hash: None,
         }
     }
 
@@ -1072,6 +1242,17 @@ impl PermeabilityReceiptBuilder {
         self
     }
 
+    /// Sets the policy root hash binding for cryptographic provenance.
+    ///
+    /// All receipts consumed on the production path MUST carry a non-zero
+    /// `policy_root_hash`. The consumption path rejects receipts without
+    /// this binding.
+    #[must_use]
+    pub const fn policy_root_hash(mut self, hash: [u8; 32]) -> Self {
+        self.policy_root_hash = Some(hash);
+        self
+    }
+
     /// Builds the receipt, computing the meet and all hashes.
     ///
     /// # Errors
@@ -1087,10 +1268,19 @@ impl PermeabilityReceiptBuilder {
         }
 
         let delegated = lattice_meet(&self.parent_authority, &self.overlay);
+        let parent_authority_hash = self.parent_authority.content_hash();
+
+        // Compute delegation chain hash for non-root receipts.
+        let delegation_chain_hash = if self.delegation_depth > 0 {
+            self.parent_receipt_hash
+                .map(|prh| compute_delegation_chain_hash(&prh, &parent_authority_hash))
+        } else {
+            None
+        };
 
         Ok(PermeabilityReceipt {
             receipt_id: self.receipt_id,
-            parent_authority_hash: self.parent_authority.content_hash(),
+            parent_authority_hash,
             overlay_hash: self.overlay.content_hash(),
             delegated_hash: delegated.content_hash(),
             parent_authority: self.parent_authority,
@@ -1103,6 +1293,8 @@ impl PermeabilityReceiptBuilder {
             issued_at_ms: self.issued_at_ms,
             expires_at_ms: self.expires_at_ms,
             revoked: false,
+            policy_root_hash: self.policy_root_hash,
+            delegation_chain_hash,
         })
     }
 }
@@ -1325,6 +1517,33 @@ pub(crate) fn validate_delegation_chain_unchecked(
 // Consumption Binding
 // =============================================================================
 
+/// Context for consumption binding verification.
+///
+/// Provides the envelope/session context needed to enforce scope bindings
+/// (BLOCKER 2) and authority ceiling derivation (MAJOR) at consumption time.
+#[derive(Debug, Clone)]
+pub struct ConsumptionContext<'a> {
+    /// The actor ID from the consuming envelope/session.
+    ///
+    /// Used to verify the receipt's `delegate_actor_id` matches the
+    /// entity attempting to consume the receipt.
+    pub actor_id: &'a str,
+
+    /// The policy root hash of the currently-active policy configuration.
+    ///
+    /// Used to verify the receipt was issued under the same policy root,
+    /// preventing cross-policy replay attacks.
+    pub policy_root_hash: &'a [u8; 32],
+
+    /// The authority ceiling derived from the envelope/policy state.
+    ///
+    /// Used to validate that the caller-supplied `required_authority`
+    /// does not exceed what the envelope/policy state demands.
+    /// If `None`, no ceiling validation is performed (caller assumes
+    /// responsibility).
+    pub authority_ceiling: Option<&'a AuthorityVector>,
+}
+
 /// Validates that an envelope or receipt properly binds a permeability
 /// receipt hash and that the bound authority is sufficient for the
 /// requested action.
@@ -1332,12 +1551,29 @@ pub(crate) fn validate_delegation_chain_unchecked(
 /// This function is called from the daemon's delegated spawn/actuation gate
 /// to enforce consumption verification on all production paths (REQ-0027).
 ///
+/// # Security Checks
+///
+/// 1. Receipt structural admission (expired, revoked, issuance-time, meet
+///    correctness, hash integrity)
+/// 2. Hash binding: `receipt.content_hash() == bound_hash`
+/// 3. **BLOCKER 1**: Policy root provenance — receipt's `policy_root_hash` must
+///    match the currently-active policy root
+/// 4. **BLOCKER 2**: Scope binding — receipt's `delegate_actor_id` must match
+///    the consuming envelope's actor ID
+/// 5. **BLOCKER 3**: Delegation chain continuity — receipts with
+///    `delegation_depth > 0` must carry a valid `delegation_chain_hash`
+/// 6. **MAJOR**: Authority ceiling — `required_authority` must not exceed the
+///    envelope-derived ceiling (when provided)
+/// 7. Authority subset: `required_authority` is a subset of the receipt's
+///    delegated authority
+///
 /// # Arguments
 ///
 /// * `receipt` - The permeability receipt to validate against.
 /// * `bound_hash` - The `permeability_receipt_hash` from the envelope.
 /// * `required_authority` - The minimum authority needed for the action.
 /// * `now_ms` - Current time in milliseconds since epoch for expiry checks.
+/// * `ctx` - Consumption context providing envelope/session bindings.
 ///
 /// # Errors
 ///
@@ -1348,6 +1584,7 @@ pub fn validate_consumption_binding(
     bound_hash: &[u8; 32],
     required_authority: &AuthorityVector,
     now_ms: u64,
+    ctx: Option<&ConsumptionContext<'_>>,
 ) -> Result<(), PermeabilityError> {
     // Validate the receipt itself
     receipt.validate_admission(now_ms)?;
@@ -1359,6 +1596,62 @@ pub fn validate_consumption_binding(
             expected: hex::encode(receipt_hash),
             actual: hex::encode(bound_hash),
         });
+    }
+
+    // BLOCKER 1: Cryptographic provenance — receipt MUST carry a non-zero
+    // policy_root_hash that matches the currently-active policy root.
+    match &receipt.policy_root_hash {
+        None => {
+            return Err(PermeabilityError::MissingPolicyRootHash);
+        },
+        Some(receipt_root) => {
+            if *receipt_root == [0u8; 32] {
+                return Err(PermeabilityError::MissingPolicyRootHash);
+            }
+            if let Some(ctx) = ctx {
+                if receipt_root != ctx.policy_root_hash {
+                    return Err(PermeabilityError::PolicyRootMismatch {
+                        receipt_root: hex::encode(receipt_root),
+                        expected_root: hex::encode(ctx.policy_root_hash),
+                    });
+                }
+            }
+        },
+    }
+
+    // BLOCKER 2: Scope binding — receipt's delegate_actor_id must match
+    // the consuming envelope/session's actor_id.
+    if let Some(ctx) = ctx {
+        if receipt.delegate_actor_id != ctx.actor_id {
+            return Err(PermeabilityError::ScopeBindingViolation {
+                reason: format!(
+                    "receipt delegate_actor_id '{}' does not match consuming actor_id '{}'",
+                    receipt.delegate_actor_id, ctx.actor_id
+                ),
+            });
+        }
+    }
+
+    // BLOCKER 3: Delegation chain continuity — receipts with
+    // delegation_depth > 0 MUST carry a valid delegation_chain_hash.
+    if receipt.delegation_depth > 0 && receipt.delegation_chain_hash.is_none() {
+        return Err(PermeabilityError::MissingDelegationChainProof {
+            depth: receipt.delegation_depth,
+        });
+    }
+
+    // MAJOR: Authority ceiling validation — required_authority must not
+    // exceed the envelope-derived ceiling when provided.
+    if let Some(ctx) = ctx {
+        if let Some(ceiling) = ctx.authority_ceiling {
+            if !required_authority.is_subset_of(ceiling) {
+                return Err(PermeabilityError::AuthorityCeilingExceeded {
+                    reason: "caller-supplied required_authority exceeds \
+                             envelope-derived authority ceiling"
+                        .to_string(),
+                });
+            }
+        }
     }
 
     // Verify the delegated authority is sufficient for the action
@@ -1753,6 +2046,8 @@ mod tests {
             issued_at_ms: 1_000_000,
             expires_at_ms: 2_000_000,
             revoked: false,
+            policy_root_hash: None,
+            delegation_chain_hash: None,
         };
         let result = receipt.validate_admission(1_500_000);
         assert!(result.is_err());
@@ -1889,6 +2184,8 @@ mod tests {
             issued_at_ms: 1_000_000,
             expires_at_ms: 2_000_000,
             revoked: false,
+            policy_root_hash: None,
+            delegation_chain_hash: None,
         };
         let result = receipt.validate_admission_unchecked();
         assert!(matches!(
@@ -1900,6 +2197,9 @@ mod tests {
     // =========================================================================
     // Consumption Binding Tests
     // =========================================================================
+
+    /// Test policy root hash used across consumption binding tests.
+    const TEST_POLICY_ROOT: [u8; 32] = [0xAA; 32];
 
     #[test]
     fn test_valid_consumption_binding() {
@@ -1917,6 +2217,7 @@ mod tests {
             .delegate_actor_id("bob")
             .issued_at_ms(1_000_000)
             .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
             .build()
             .unwrap();
 
@@ -1929,7 +2230,15 @@ mod tests {
             TaintCeiling::Attested,
             ClassificationLevel::Public,
         );
-        assert!(validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000).is_ok());
+        let ctx = ConsumptionContext {
+            actor_id: "bob",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+        };
+        assert!(
+            validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1941,12 +2250,15 @@ mod tests {
             .delegate_actor_id("bob")
             .issued_at_ms(1_000_000)
             .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
             .build()
             .unwrap();
 
         let wrong_hash = [0xAB; 32];
         let required = AuthorityVector::bottom();
-        let result = validate_consumption_binding(&receipt, &wrong_hash, &required, 2_000_000);
+        // Hash mismatch is checked before policy root, so ctx doesn't matter
+        let result =
+            validate_consumption_binding(&receipt, &wrong_hash, &required, 2_000_000, None);
         assert!(matches!(
             result,
             Err(PermeabilityError::HashMismatch { .. })
@@ -1976,14 +2288,226 @@ mod tests {
             .delegate_actor_id("bob")
             .issued_at_ms(1_000_000)
             .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
             .build()
             .unwrap();
 
         let bound_hash = receipt.content_hash();
         // Required authority exceeds what was delegated
         let required = AuthorityVector::top();
-        let result = validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000);
+        let ctx = ConsumptionContext {
+            actor_id: "bob",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+        };
+        let result =
+            validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
         assert!(matches!(result, Err(PermeabilityError::DelegationWidening)));
+    }
+
+    #[test]
+    fn test_consumption_binding_missing_policy_root_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        // Build receipt WITHOUT policy_root_hash
+        let receipt = PermeabilityReceiptBuilder::new("receipt-no-prh", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .build()
+            .unwrap();
+
+        let bound_hash = receipt.content_hash();
+        let required = AuthorityVector::bottom();
+        let result =
+            validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, None);
+        assert!(
+            matches!(result, Err(PermeabilityError::MissingPolicyRootHash)),
+            "receipt without policy_root_hash must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_consumption_binding_policy_root_mismatch_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("receipt-prh-mismatch", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        let bound_hash = receipt.content_hash();
+        let required = AuthorityVector::bottom();
+        let wrong_root = [0xBB; 32];
+        let ctx = ConsumptionContext {
+            actor_id: "bob",
+            policy_root_hash: &wrong_root,
+            authority_ceiling: None,
+        };
+        let result =
+            validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
+        assert!(
+            matches!(result, Err(PermeabilityError::PolicyRootMismatch { .. })),
+            "policy root mismatch must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_consumption_binding_scope_mismatch_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("receipt-scope", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        let bound_hash = receipt.content_hash();
+        let required = AuthorityVector::bottom();
+        // Actor ID "charlie" does not match delegate_actor_id "bob"
+        let ctx = ConsumptionContext {
+            actor_id: "charlie",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+        };
+        let result =
+            validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
+        assert!(
+            matches!(result, Err(PermeabilityError::ScopeBindingViolation { .. })),
+            "scope binding violation must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_consumption_binding_authority_ceiling_exceeded_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("receipt-ceiling", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        let bound_hash = receipt.content_hash();
+        // Required authority exceeds the ceiling
+        let required = AuthorityVector::top();
+        let low_ceiling = AuthorityVector::bottom();
+        let ctx = ConsumptionContext {
+            actor_id: "bob",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: Some(&low_ceiling),
+        };
+        let result =
+            validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
+        assert!(
+            matches!(
+                result,
+                Err(PermeabilityError::AuthorityCeilingExceeded { .. })
+            ),
+            "authority ceiling exceeded must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_consumption_binding_delegated_receipt_missing_chain_proof_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        // Build root receipt
+        let root = PermeabilityReceiptBuilder::new("root", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        // Build child receipt at depth 1 via builder (which auto-computes chain hash)
+        let child_overlay = AuthorityVector::new(
+            RiskLevel::Low,
+            CapabilityLevel::ReadOnly,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Public,
+        );
+        let mut child = PermeabilityReceiptBuilder::new("child", root.delegated, child_overlay)
+            .delegation_depth(1)
+            .parent_receipt_hash(root.content_hash())
+            .delegator_actor_id("bob")
+            .delegate_actor_id("charlie")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        // Deliberately remove the chain hash to simulate missing proof
+        child.delegation_chain_hash = None;
+        // Recompute bound hash with the modified receipt
+        let bound_hash = child.content_hash();
+        let required = AuthorityVector::bottom();
+        let ctx = ConsumptionContext {
+            actor_id: "charlie",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+        };
+        // Admission itself will catch this (MissingDelegationChainProof)
+        let result =
+            validate_consumption_binding(&child, &bound_hash, &required, 2_000_000, Some(&ctx));
+        assert!(
+            matches!(
+                result,
+                Err(PermeabilityError::MissingDelegationChainProof { .. })
+            ),
+            "delegated receipt without chain proof must be rejected, got: {result:?}"
+        );
     }
 
     // =========================================================================
@@ -2158,6 +2682,11 @@ mod tests {
             issued_at_ms: 1_000_000,
             expires_at_ms: 0,
             revoked: false,
+            policy_root_hash: None,
+            delegation_chain_hash: Some(compute_delegation_chain_hash(
+                &prev.content_hash(),
+                &prev.delegated.content_hash(),
+            )),
         };
         chain.push(receipt);
 
@@ -2192,6 +2721,11 @@ mod tests {
             delegate_actor_id: "level-6".to_string(),
             issued_at_ms: 1_000_000,
             expires_at_ms: 0,
+            policy_root_hash: None,
+            delegation_chain_hash: Some(compute_delegation_chain_hash(
+                &prev.content_hash(),
+                &prev.delegated.content_hash(),
+            )),
             revoked: false,
         };
         chain.push(receipt);

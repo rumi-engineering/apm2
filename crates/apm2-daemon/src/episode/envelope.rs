@@ -1568,7 +1568,11 @@ impl EpisodeEnvelopeV1 {
     /// 2. Presence/non-zero check on `permeability_receipt_hash`
     /// 3. Receipt admission (structural, expiry, issuance-time checks)
     /// 4. Hash binding: `receipt.content_hash() == permeability_receipt_hash`
-    /// 5. Authority subset: `required_authority` is a subset of the receipt's
+    /// 5. **BLOCKER 1**: Policy root provenance verification
+    /// 6. **BLOCKER 2**: Scope binding (actor identity match)
+    /// 7. **BLOCKER 3**: Delegation chain continuity for delegated receipts
+    /// 8. **MAJOR**: Authority ceiling validation against envelope state
+    /// 9. Authority subset: `required_authority` is a subset of the receipt's
     ///    delegated authority
     ///
     /// # Arguments
@@ -1590,20 +1594,88 @@ impl EpisodeEnvelopeV1 {
         self.validate_for_delegated_spawn()?;
 
         // Second: full consumption binding verification (admission + hash
-        // match + authority subset).
+        // match + authority subset + provenance + scope + chain + ceiling).
         let bound_hash = self
             .permeability_receipt_hash
             .as_ref()
             .expect("validate_for_delegated_spawn ensures Some");
+
+        // Derive policy root hash from the envelope's pinned snapshot.
+        // The policy_hash in the pinned snapshot IS the policy root.
+        let policy_root = self.derive_policy_root_hash();
+
+        // Derive authority ceiling from the envelope's risk tier.
+        let authority_ceiling = self.derive_authority_ceiling();
+
+        let ctx = apm2_core::policy::permeability::ConsumptionContext {
+            actor_id: self.inner.actor_id(),
+            policy_root_hash: &policy_root,
+            authority_ceiling: Some(&authority_ceiling),
+        };
+
         apm2_core::policy::permeability::validate_consumption_binding(
             receipt,
             bound_hash,
             required_authority,
             now_ms,
+            Some(&ctx),
         )
         .map_err(EnvelopeV1Error::PermeabilityBindingFailure)?;
 
         Ok(())
+    }
+
+    /// Derives the policy root hash from the envelope's pinned snapshot.
+    ///
+    /// Uses the `policy_hash` from the pinned snapshot if available,
+    /// otherwise falls back to hashing the envelope digest (ensuring
+    /// every envelope has a unique policy root binding).
+    fn derive_policy_root_hash(&self) -> [u8; 32] {
+        if let Some(ph) = self.inner.pinned_snapshot().policy_hash() {
+            if ph.len() == 32 {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(ph);
+                return hash;
+            }
+        }
+        // Fallback: hash the envelope digest itself to produce a
+        // deterministic policy root. This ensures fail-closed behavior
+        // even when no explicit policy_hash is set.
+        *blake3::hash(&self.inner.digest()).as_bytes()
+    }
+
+    /// Derives an authority ceiling from the envelope's risk tier.
+    ///
+    /// The risk tier constrains the maximum authority that can be
+    /// consumed in this envelope context. Higher tiers allow wider
+    /// authority ceilings.
+    const fn derive_authority_ceiling(&self) -> apm2_core::policy::permeability::AuthorityVector {
+        use apm2_core::policy::permeability::{
+            AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel, RiskLevel,
+            StopPredicateLevel, TaintCeiling,
+        };
+
+        match self.inner.risk_tier() {
+            RiskTier::Tier0 => AuthorityVector::new(
+                RiskLevel::Low,
+                CapabilityLevel::ReadOnly,
+                BudgetLevel::Capped(1_000_000),
+                StopPredicateLevel::Inherit,
+                TaintCeiling::Attested,
+                ClassificationLevel::Confidential,
+            ),
+            RiskTier::Tier1 => AuthorityVector::new(
+                RiskLevel::Med,
+                CapabilityLevel::ReadWrite,
+                BudgetLevel::Capped(10_000_000),
+                StopPredicateLevel::Extend,
+                TaintCeiling::Untrusted,
+                ClassificationLevel::Secret,
+            ),
+            // Tier2+ get full authority ceiling — the receipt's
+            // delegated authority is the binding constraint.
+            RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4 => AuthorityVector::top(),
+        }
     }
 }
 
@@ -3772,8 +3844,15 @@ mod tests {
     // Delegated Spawn Consumption Binding Tests (REQ-0027)
     // =========================================================================
 
+    /// Test policy root hash used across delegated spawn binding tests.
+    const TEST_POLICY_ROOT: [u8; 32] = [0xEE; 32];
+
     /// Helper: builds a valid permeability receipt and returns (receipt,
     /// `receipt_hash`).
+    ///
+    /// The receipt's `delegate_actor_id` is set to "agent" and its
+    /// `policy_root_hash` is set to `TEST_POLICY_ROOT` so that scope
+    /// and provenance bindings match the test envelopes.
     fn build_test_receipt(
         expires_at_ms: u64,
         issued_at_ms: u64,
@@ -3797,13 +3876,21 @@ mod tests {
         );
         let receipt = PermeabilityReceiptBuilder::new("test-receipt", parent, overlay)
             .delegator_actor_id("alice")
-            .delegate_actor_id("bob")
+            .delegate_actor_id("agent")
             .issued_at_ms(issued_at_ms)
             .expires_at_ms(expires_at_ms)
+            .policy_root_hash(TEST_POLICY_ROOT)
             .build()
             .expect("valid receipt");
         let hash = receipt.content_hash();
         (receipt, hash)
+    }
+
+    /// Helper: builds a pinned snapshot with the test policy root hash.
+    fn snapshot_with_policy_root() -> PinnedSnapshot {
+        PinnedSnapshot::builder()
+            .policy_hash(TEST_POLICY_ROOT)
+            .build()
     }
 
     #[test]
@@ -3820,7 +3907,7 @@ mod tests {
             .capability_manifest_hash([0xab; 32])
             .budget(EpisodeBudget::default())
             .stop_conditions(StopConditions::max_episodes(10))
-            .pinned_snapshot(PinnedSnapshot::empty())
+            .pinned_snapshot(snapshot_with_policy_root())
             .view_commitment_hash([0xcc; 32])
             .freshness_pinset_hash([0xdd; 32])
             .permeability_receipt_hash(hash)
@@ -3850,7 +3937,7 @@ mod tests {
             .capability_manifest_hash([0xab; 32])
             .budget(EpisodeBudget::default())
             .stop_conditions(StopConditions::max_episodes(10))
-            .pinned_snapshot(PinnedSnapshot::empty())
+            .pinned_snapshot(snapshot_with_policy_root())
             .view_commitment_hash([0xcc; 32])
             .freshness_pinset_hash([0xdd; 32])
             .permeability_receipt_hash(wrong_hash)
@@ -3878,7 +3965,7 @@ mod tests {
             .capability_manifest_hash([0xab; 32])
             .budget(EpisodeBudget::default())
             .stop_conditions(StopConditions::max_episodes(10))
-            .pinned_snapshot(PinnedSnapshot::empty())
+            .pinned_snapshot(snapshot_with_policy_root())
             .view_commitment_hash([0xcc; 32])
             .freshness_pinset_hash([0xdd; 32])
             .permeability_receipt_hash(hash)
@@ -3900,7 +3987,8 @@ mod tests {
         let (receipt, hash) = build_test_receipt(5_000_000, 1_000_000);
         // Required authority is top() — strictly wider than what the receipt
         // delegated (which was meet(top, overlay) = overlay, which is narrower
-        // than top on several facets).
+        // than top on several facets). At Tier2+ the ceiling is top() so this
+        // tests the receipt authority check, not the ceiling.
         let required = AuthorityVector::top();
 
         let env = EpisodeEnvelopeV1::builder()
@@ -3910,7 +3998,8 @@ mod tests {
             .capability_manifest_hash([0xab; 32])
             .budget(EpisodeBudget::default())
             .stop_conditions(StopConditions::max_episodes(10))
-            .pinned_snapshot(PinnedSnapshot::empty())
+            .pinned_snapshot(snapshot_with_policy_root())
+            .risk_tier(RiskTier::Tier2)
             .view_commitment_hash([0xcc; 32])
             .freshness_pinset_hash([0xdd; 32])
             .permeability_receipt_hash(hash)
@@ -3938,7 +4027,7 @@ mod tests {
             .capability_manifest_hash([0xab; 32])
             .budget(EpisodeBudget::default())
             .stop_conditions(StopConditions::max_episodes(10))
-            .pinned_snapshot(PinnedSnapshot::empty())
+            .pinned_snapshot(snapshot_with_policy_root())
             .view_commitment_hash([0xcc; 32])
             .freshness_pinset_hash([0xdd; 32])
             .permeability_receipt_hash(hash)
@@ -3977,7 +4066,7 @@ mod tests {
             .capability_manifest_hash([0xab; 32])
             .budget(EpisodeBudget::default())
             .stop_conditions(StopConditions::max_episodes(10))
-            .pinned_snapshot(PinnedSnapshot::empty())
+            .pinned_snapshot(snapshot_with_policy_root())
             .view_commitment_hash([0xcc; 32])
             .freshness_pinset_hash([0xdd; 32])
             .permeability_receipt_hash([0xFF; 32])
@@ -3988,6 +4077,105 @@ mod tests {
         assert!(
             matches!(result, Err(EnvelopeV1Error::PermeabilityBindingFailure(_))),
             "wrong hash must be rejected via gate, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_spawn_rejects_scope_mismatch() {
+        use apm2_core::policy::permeability::{
+            AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+            PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+        };
+
+        // Build a receipt delegated to "wrong-agent" instead of "agent"
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Public,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("test-scope", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("wrong-agent")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .expect("valid receipt");
+        let hash = receipt.content_hash();
+
+        let required = AuthorityVector::bottom();
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-scope-mismatch")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(snapshot_with_policy_root())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash(hash)
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        let result = env.validate_for_delegated_spawn_with_receipt(&receipt, &required, 2_000_000);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::PermeabilityBindingFailure(_))),
+            "scope mismatch (wrong actor) must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_spawn_rejects_policy_root_mismatch() {
+        use apm2_core::policy::permeability::{
+            AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+            PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+        };
+
+        // Build a receipt with a DIFFERENT policy root
+        let wrong_root = [0xFF; 32];
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Public,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("test-prh", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("agent")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(wrong_root)
+            .build()
+            .expect("valid receipt");
+        let hash = receipt.content_hash();
+
+        let required = AuthorityVector::bottom();
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-prh-mismatch")
+            .actor_id("agent")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(snapshot_with_policy_root())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash(hash)
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        let result = env.validate_for_delegated_spawn_with_receipt(&receipt, &required, 2_000_000);
+        assert!(
+            matches!(result, Err(EnvelopeV1Error::PermeabilityBindingFailure(_))),
+            "policy root mismatch must be rejected, got: {result:?}"
         );
     }
 }
