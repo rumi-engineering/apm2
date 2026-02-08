@@ -603,6 +603,20 @@ pub enum PermeabilityError {
         /// Maximum allowed.
         max: usize,
     },
+
+    /// Actor ID is empty.
+    #[error("actor ID must not be empty: {field}")]
+    EmptyActorId {
+        /// Name of the empty actor ID field.
+        field: String,
+    },
+
+    /// Parent receipt hash linkage is inconsistent with delegation depth.
+    #[error("parent receipt hash inconsistency: {reason}")]
+    ParentLinkageMismatch {
+        /// Description of the mismatch.
+        reason: String,
+    },
 }
 
 // =============================================================================
@@ -682,7 +696,19 @@ impl PermeabilityReceipt {
     #[must_use]
     pub fn content_hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(self.receipt_id.as_bytes());
+
+        // Length-prefix variable-length fields to prevent framing
+        // ambiguity: ("a","bc") vs ("ab","c") must produce different hashes.
+        // Field lengths are bounded by MAX_RECEIPT_ID_LENGTH (256) and
+        // MAX_ACTOR_ID_LENGTH (256), so casting to u32 is safe.
+        #[allow(clippy::cast_possible_truncation)]
+        let len_prefix = |h: &mut blake3::Hasher, b: &[u8]| {
+            h.update(&(b.len() as u32).to_le_bytes());
+            h.update(b);
+        };
+
+        len_prefix(&mut hasher, self.receipt_id.as_bytes());
+
         hasher.update(&self.parent_authority_hash);
         hasher.update(&self.overlay_hash);
         hasher.update(&self.delegated_hash);
@@ -693,10 +719,17 @@ impl PermeabilityReceipt {
         } else {
             hasher.update(&[0u8]); // absence marker
         }
-        hasher.update(self.delegator_actor_id.as_bytes());
-        hasher.update(self.delegate_actor_id.as_bytes());
+
+        len_prefix(&mut hasher, self.delegator_actor_id.as_bytes());
+        len_prefix(&mut hasher, self.delegate_actor_id.as_bytes());
+
         hasher.update(&self.issued_at_ms.to_be_bytes());
         hasher.update(&self.expires_at_ms.to_be_bytes());
+
+        // Include revocation bit so a revoked receipt cannot be replayed
+        // under the same hash as the non-revoked version.
+        hasher.update(&[u8::from(self.revoked)]);
+
         hasher.finalize().into()
     }
 
@@ -704,19 +737,20 @@ impl PermeabilityReceipt {
     ///
     /// Checks:
     /// 1. Receipt ID is non-empty and within length limits
-    /// 2. Actor IDs are within length limits
+    /// 2. Actor IDs are non-empty and within length limits
     /// 3. `delegated == meet(parent_authority, overlay)`
     /// 4. `delegated` is a subset of `parent_authority`
     /// 5. `delegated` is a subset of `overlay`
     /// 6. Authority hashes match computed values
     /// 7. Delegation depth is within limits
-    /// 8. Receipt is not revoked
-    /// 9. Receipt is not expired (if `now_ms > 0`)
+    /// 8. Parent receipt hash linkage matches delegation depth
+    /// 9. Receipt is not revoked
+    /// 10. Receipt is not expired
     ///
     /// # Arguments
     ///
-    /// * `now_ms` - Current time in milliseconds since epoch. Pass `0` to skip
-    ///   expiry checks.
+    /// * `now_ms` - Current time in milliseconds since epoch. Must be non-zero;
+    ///   freshness is always enforced.
     ///
     /// # Errors
     ///
@@ -730,7 +764,19 @@ impl PermeabilityReceipt {
             });
         }
 
-        // Check actor ID lengths
+        // Check actor IDs are non-empty (MAJOR 2 fix)
+        if self.delegator_actor_id.is_empty() {
+            return Err(PermeabilityError::EmptyActorId {
+                field: "delegator_actor_id".to_string(),
+            });
+        }
+        if self.delegate_actor_id.is_empty() {
+            return Err(PermeabilityError::EmptyActorId {
+                field: "delegate_actor_id".to_string(),
+            });
+        }
+
+        // Check actor ID max lengths
         if self.delegator_actor_id.len() > MAX_ACTOR_ID_LENGTH {
             return Err(PermeabilityError::ActorIdTooLong {
                 actual: self.delegator_actor_id.len(),
@@ -749,9 +795,19 @@ impl PermeabilityReceipt {
             return Err(PermeabilityError::Revoked);
         }
 
-        // Check expiry
-        if self.expires_at_ms > 0 && now_ms > 0 && now_ms > self.expires_at_ms {
-            return Err(PermeabilityError::Expired);
+        // Check expiry — always enforced (MAJOR 1 fix: no now_ms==0 bypass).
+        // If the receipt has an expiry window, the caller MUST provide a
+        // non-zero timestamp; otherwise the check cannot be meaningful and
+        // we fail closed.
+        if self.expires_at_ms > 0 {
+            if now_ms == 0 {
+                return Err(PermeabilityError::MissingBinding {
+                    field: "now_ms must be non-zero when receipt has expiry".to_string(),
+                });
+            }
+            if now_ms > self.expires_at_ms {
+                return Err(PermeabilityError::Expired);
+            }
         }
 
         // Check delegation depth
@@ -759,6 +815,23 @@ impl PermeabilityReceipt {
             return Err(PermeabilityError::DepthExceeded {
                 depth: self.delegation_depth,
                 max: MAX_DELEGATION_DEPTH,
+            });
+        }
+
+        // BLOCKER 3: Enforce parent receipt hash linkage consistency.
+        // Root receipts (depth 0) MUST NOT have a parent hash.
+        // Non-root receipts (depth > 0) MUST have a parent hash.
+        if self.delegation_depth == 0 && self.parent_receipt_hash.is_some() {
+            return Err(PermeabilityError::ParentLinkageMismatch {
+                reason: "root receipt (depth 0) must not have parent_receipt_hash".to_string(),
+            });
+        }
+        if self.delegation_depth > 0 && self.parent_receipt_hash.is_none() {
+            return Err(PermeabilityError::ParentLinkageMismatch {
+                reason: format!(
+                    "non-root receipt (depth {}) must have parent_receipt_hash",
+                    self.delegation_depth
+                ),
             });
         }
 
@@ -770,6 +843,124 @@ impl PermeabilityReceipt {
 
         // Verify subset relationships (redundant with meet check but
         // defense-in-depth)
+        if !self.delegated.is_subset_of(&self.parent_authority) {
+            return Err(PermeabilityError::DelegationWidening);
+        }
+        if !self.delegated.is_subset_of(&self.overlay) {
+            return Err(PermeabilityError::OverlayWidening);
+        }
+
+        // Verify authority hashes
+        let parent_hash = self.parent_authority.content_hash();
+        if parent_hash != self.parent_authority_hash {
+            return Err(PermeabilityError::HashMismatch {
+                expected: hex::encode(parent_hash),
+                actual: hex::encode(self.parent_authority_hash),
+            });
+        }
+
+        let overlay_hash = self.overlay.content_hash();
+        if overlay_hash != self.overlay_hash {
+            return Err(PermeabilityError::HashMismatch {
+                expected: hex::encode(overlay_hash),
+                actual: hex::encode(self.overlay_hash),
+            });
+        }
+
+        let delegated_hash = self.delegated.content_hash();
+        if delegated_hash != self.delegated_hash {
+            return Err(PermeabilityError::HashMismatch {
+                expected: hex::encode(delegated_hash),
+                actual: hex::encode(self.delegated_hash),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Validates this receipt for admission without freshness enforcement.
+    ///
+    /// This is identical to [`validate_admission`](Self::validate_admission)
+    /// except that expiry checks are skipped. This is intended **only** for
+    /// deterministic unit tests where a wall-clock timestamp is not available.
+    ///
+    /// # Safety
+    ///
+    /// Callers MUST NOT use this in production paths — expiry bypass
+    /// undermines time-bound authority.
+    #[cfg(test)]
+    pub(crate) fn validate_admission_unchecked(&self) -> Result<(), PermeabilityError> {
+        // Check receipt ID length
+        if self.receipt_id.is_empty() || self.receipt_id.len() > MAX_RECEIPT_ID_LENGTH {
+            return Err(PermeabilityError::InvalidReceiptId {
+                actual: self.receipt_id.len(),
+                max: MAX_RECEIPT_ID_LENGTH,
+            });
+        }
+
+        // Check actor IDs are non-empty
+        if self.delegator_actor_id.is_empty() {
+            return Err(PermeabilityError::EmptyActorId {
+                field: "delegator_actor_id".to_string(),
+            });
+        }
+        if self.delegate_actor_id.is_empty() {
+            return Err(PermeabilityError::EmptyActorId {
+                field: "delegate_actor_id".to_string(),
+            });
+        }
+
+        // Check actor ID max lengths
+        if self.delegator_actor_id.len() > MAX_ACTOR_ID_LENGTH {
+            return Err(PermeabilityError::ActorIdTooLong {
+                actual: self.delegator_actor_id.len(),
+                max: MAX_ACTOR_ID_LENGTH,
+            });
+        }
+        if self.delegate_actor_id.len() > MAX_ACTOR_ID_LENGTH {
+            return Err(PermeabilityError::ActorIdTooLong {
+                actual: self.delegate_actor_id.len(),
+                max: MAX_ACTOR_ID_LENGTH,
+            });
+        }
+
+        // Check revocation
+        if self.revoked {
+            return Err(PermeabilityError::Revoked);
+        }
+
+        // Skip expiry checks (test-only path)
+
+        // Check delegation depth
+        if self.delegation_depth > MAX_DELEGATION_DEPTH {
+            return Err(PermeabilityError::DepthExceeded {
+                depth: self.delegation_depth,
+                max: MAX_DELEGATION_DEPTH,
+            });
+        }
+
+        // Parent receipt hash linkage consistency
+        if self.delegation_depth == 0 && self.parent_receipt_hash.is_some() {
+            return Err(PermeabilityError::ParentLinkageMismatch {
+                reason: "root receipt (depth 0) must not have parent_receipt_hash".to_string(),
+            });
+        }
+        if self.delegation_depth > 0 && self.parent_receipt_hash.is_none() {
+            return Err(PermeabilityError::ParentLinkageMismatch {
+                reason: format!(
+                    "non-root receipt (depth {}) must have parent_receipt_hash",
+                    self.delegation_depth
+                ),
+            });
+        }
+
+        // Compute expected meet
+        let expected_meet = lattice_meet(&self.parent_authority, &self.overlay);
+        if self.delegated != expected_meet {
+            return Err(PermeabilityError::MeetMismatch);
+        }
+
+        // Verify subset relationships
         if !self.delegated.is_subset_of(&self.parent_authority) {
             return Err(PermeabilityError::DelegationWidening);
         }
@@ -939,7 +1130,7 @@ impl PermeabilityReceiptBuilder {
 /// # Arguments
 ///
 /// * `chain` - Delegation receipts in order from root (index 0) to leaf.
-/// * `now_ms` - Current time for expiry checks. Pass `0` to skip.
+/// * `now_ms` - Current time in milliseconds since epoch for expiry checks.
 ///
 /// # Errors
 ///
@@ -1011,6 +1202,68 @@ pub fn validate_delegation_chain(
     Ok(())
 }
 
+/// Test-only variant of [`validate_delegation_chain`] that skips freshness
+/// enforcement. See [`PermeabilityReceipt::validate_admission_unchecked`].
+#[cfg(test)]
+pub(crate) fn validate_delegation_chain_unchecked(
+    chain: &[PermeabilityReceipt],
+) -> Result<(), PermeabilityError> {
+    if chain.is_empty() {
+        return Err(PermeabilityError::MissingBinding {
+            field: "delegation chain is empty".to_string(),
+        });
+    }
+
+    let chain_depth = u32::try_from(chain.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    if chain_depth > MAX_DELEGATION_DEPTH {
+        return Err(PermeabilityError::DepthExceeded {
+            depth: chain_depth,
+            max: MAX_DELEGATION_DEPTH,
+        });
+    }
+
+    for receipt in chain {
+        receipt.validate_admission_unchecked()?;
+    }
+
+    for i in 1..chain.len() {
+        let parent = &chain[i - 1];
+        let child = &chain[i];
+
+        let parent_hash = parent.content_hash();
+        match child.parent_receipt_hash {
+            Some(ref linked_hash) if *linked_hash == parent_hash => {},
+            Some(ref linked_hash) => {
+                return Err(PermeabilityError::HashMismatch {
+                    expected: hex::encode(parent_hash),
+                    actual: hex::encode(linked_hash),
+                });
+            },
+            None => {
+                return Err(PermeabilityError::MissingBinding {
+                    field: format!("parent_receipt_hash at chain index {i}"),
+                });
+            },
+        }
+
+        if !child.delegated.is_subset_of(&parent.delegated) {
+            return Err(PermeabilityError::DelegationWidening);
+        }
+
+        if child.delegation_depth != parent.delegation_depth + 1 {
+            return Err(PermeabilityError::MissingBinding {
+                field: format!(
+                    "delegation_depth at chain index {i}: expected {}, got {}",
+                    parent.delegation_depth + 1,
+                    child.delegation_depth
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // Consumption Binding
 // =============================================================================
@@ -1024,7 +1277,7 @@ pub fn validate_delegation_chain(
 /// * `receipt` - The permeability receipt to validate against.
 /// * `bound_hash` - The `permeability_receipt_hash` from the envelope.
 /// * `required_authority` - The minimum authority needed for the action.
-/// * `now_ms` - Current time for expiry checks. Pass `0` to skip.
+/// * `now_ms` - Current time in milliseconds since epoch for expiry checks.
 ///
 /// # Errors
 ///
@@ -1528,7 +1781,7 @@ mod tests {
         // Tamper with the parent authority hash
         receipt.parent_authority_hash = [0xFF; 32];
 
-        let result = receipt.validate_admission(0);
+        let result = receipt.validate_admission_unchecked();
         assert!(matches!(
             result,
             Err(PermeabilityError::HashMismatch { .. })
@@ -1555,7 +1808,7 @@ mod tests {
             expires_at_ms: 0,
             revoked: false,
         };
-        let result = receipt.validate_admission(0);
+        let result = receipt.validate_admission_unchecked();
         assert!(matches!(
             result,
             Err(PermeabilityError::InvalidReceiptId { .. })
@@ -1581,6 +1834,7 @@ mod tests {
             .delegator_actor_id("alice")
             .delegate_actor_id("bob")
             .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
             .build()
             .unwrap();
 
@@ -1593,7 +1847,7 @@ mod tests {
             TaintCeiling::Attested,
             ClassificationLevel::Public,
         );
-        assert!(validate_consumption_binding(&receipt, &bound_hash, &required, 0).is_ok());
+        assert!(validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000).is_ok());
     }
 
     #[test]
@@ -1604,12 +1858,13 @@ mod tests {
             .delegator_actor_id("alice")
             .delegate_actor_id("bob")
             .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
             .build()
             .unwrap();
 
         let wrong_hash = [0xAB; 32];
         let required = AuthorityVector::bottom();
-        let result = validate_consumption_binding(&receipt, &wrong_hash, &required, 0);
+        let result = validate_consumption_binding(&receipt, &wrong_hash, &required, 2_000_000);
         assert!(matches!(
             result,
             Err(PermeabilityError::HashMismatch { .. })
@@ -1638,13 +1893,14 @@ mod tests {
             .delegator_actor_id("alice")
             .delegate_actor_id("bob")
             .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
             .build()
             .unwrap();
 
         let bound_hash = receipt.content_hash();
         // Required authority exceeds what was delegated
         let required = AuthorityVector::top();
-        let result = validate_consumption_binding(&receipt, &bound_hash, &required, 0);
+        let result = validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000);
         assert!(matches!(result, Err(PermeabilityError::DelegationWidening)));
     }
 
@@ -1688,7 +1944,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(validate_delegation_chain(&[root, child], 0).is_ok());
+        assert!(validate_delegation_chain_unchecked(&[root, child]).is_ok());
     }
 
     // =========================================================================
@@ -1773,7 +2029,7 @@ mod tests {
     #[test]
     fn test_depth_4_chain_valid_when_narrowing() {
         let chain = build_chain(4);
-        assert!(validate_delegation_chain(&chain, 0).is_ok());
+        assert!(validate_delegation_chain_unchecked(&chain).is_ok());
 
         // Verify authority monotonically decreases
         for i in 1..chain.len() {
@@ -1787,7 +2043,7 @@ mod tests {
     #[test]
     fn test_depth_5_chain_valid_when_narrowing() {
         let chain = build_chain(5);
-        assert!(validate_delegation_chain(&chain, 0).is_ok());
+        assert!(validate_delegation_chain_unchecked(&chain).is_ok());
     }
 
     #[test]
@@ -1827,7 +2083,7 @@ mod tests {
         };
         chain.push(receipt);
 
-        let result = validate_delegation_chain(&chain, 0);
+        let result = validate_delegation_chain_unchecked(&chain);
         assert!(
             result.is_err(),
             "depth-4 laundering attempt must be rejected"
@@ -1862,7 +2118,7 @@ mod tests {
         };
         chain.push(receipt);
 
-        let result = validate_delegation_chain(&chain, 0);
+        let result = validate_delegation_chain_unchecked(&chain);
         assert!(
             result.is_err(),
             "single-facet escalation at depth 6 must be rejected"
@@ -1912,9 +2168,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = validate_delegation_chain(&[root, child], 0);
+        // BLOCKER 3: child at depth 1 without parent_receipt_hash now fails
+        // at admission with ParentLinkageMismatch (before chain linkage check).
+        let result = validate_delegation_chain_unchecked(&[root, child]);
         assert!(
-            matches!(result, Err(PermeabilityError::MissingBinding { .. })),
+            matches!(result, Err(PermeabilityError::ParentLinkageMismatch { .. })),
             "chain with missing parent hash binding must be rejected"
         );
     }
@@ -1947,7 +2205,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = validate_delegation_chain(&[root, child], 0);
+        let result = validate_delegation_chain_unchecked(&[root, child]);
         assert!(
             matches!(result, Err(PermeabilityError::HashMismatch { .. })),
             "chain with incorrect parent hash must be rejected"
@@ -2082,7 +2340,7 @@ mod tests {
 
     #[test]
     fn test_empty_chain_rejected() {
-        let result = validate_delegation_chain(&[], 0);
+        let result = validate_delegation_chain_unchecked(&[]);
         assert!(matches!(
             result,
             Err(PermeabilityError::MissingBinding { .. })
@@ -2103,7 +2361,7 @@ mod tests {
         .build()
         .unwrap();
 
-        assert!(validate_delegation_chain(&[receipt], 0).is_ok());
+        assert!(validate_delegation_chain_unchecked(&[receipt]).is_ok());
     }
 
     #[test]
@@ -2148,6 +2406,229 @@ mod tests {
         );
         let m = lattice_meet(&a, &b);
         assert_eq!(m.budget, BudgetLevel::Capped(5000));
+    }
+
+    // =========================================================================
+    // Regression Tests: Review Finding Fixes
+    // =========================================================================
+
+    // -- BLOCKER 1: Revoked bit must be included in receipt content_hash --
+
+    #[test]
+    fn test_revoked_bit_changes_receipt_hash() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+        let mut receipt = PermeabilityReceiptBuilder::new("revoke-test", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        let hash_before = receipt.content_hash();
+        receipt.revoked = true;
+        let hash_after = receipt.content_hash();
+
+        assert_ne!(
+            hash_before, hash_after,
+            "toggling revoked MUST change the receipt content hash"
+        );
+    }
+
+    // -- BLOCKER 2: Length-prefixed framing prevents ambiguity --
+
+    #[test]
+    fn test_actor_id_framing_ambiguity_prevented() {
+        // ("a", "bc") vs ("ab", "c") must produce different hashes.
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+
+        let r1 = PermeabilityReceiptBuilder::new("framing-test", parent, overlay)
+            .delegator_actor_id("a")
+            .delegate_actor_id("bc")
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        let r2 = PermeabilityReceiptBuilder::new("framing-test", parent, overlay)
+            .delegator_actor_id("ab")
+            .delegate_actor_id("c")
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        assert_ne!(
+            r1.content_hash(),
+            r2.content_hash(),
+            "('a','bc') vs ('ab','c') MUST produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_receipt_id_framing_ambiguity_prevented() {
+        // receipt IDs "ab" vs "a" with different actor IDs should not collide.
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+
+        let r1 = PermeabilityReceiptBuilder::new("ab", parent, overlay)
+            .delegator_actor_id("x")
+            .delegate_actor_id("y")
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        let r2 = PermeabilityReceiptBuilder::new("a", parent, overlay)
+            .delegator_actor_id("bx")
+            .delegate_actor_id("y")
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        assert_ne!(
+            r1.content_hash(),
+            r2.content_hash(),
+            "different receipt_id + actor_id combinations MUST produce different hashes"
+        );
+    }
+
+    // -- BLOCKER 3: Parent receipt hash linkage enforcement --
+
+    #[test]
+    fn test_non_root_receipt_without_parent_hash_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+        let receipt = PermeabilityReceiptBuilder::new("no-parent", parent, overlay)
+            .delegation_depth(1)
+            // deliberately not setting parent_receipt_hash
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        let result = receipt.validate_admission_unchecked();
+        assert!(
+            matches!(result, Err(PermeabilityError::ParentLinkageMismatch { .. })),
+            "depth > 0 without parent_receipt_hash must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_root_receipt_with_parent_hash_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+        let receipt = PermeabilityReceiptBuilder::new("root-with-parent", parent, overlay)
+            .delegation_depth(0)
+            .parent_receipt_hash([0xAB; 32]) // root should not have parent hash
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        let result = receipt.validate_admission_unchecked();
+        assert!(
+            matches!(result, Err(PermeabilityError::ParentLinkageMismatch { .. })),
+            "depth 0 with parent_receipt_hash must be rejected"
+        );
+    }
+
+    // -- MAJOR 1: Freshness checks always enforced --
+
+    #[test]
+    fn test_now_ms_zero_with_expiry_rejected() {
+        // Previously, now_ms==0 silently skipped expiry. Now it must fail.
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+        let receipt = PermeabilityReceiptBuilder::new("freshness-test", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(2_000_000)
+            .build()
+            .unwrap();
+
+        let result = receipt.validate_admission(0);
+        assert!(
+            result.is_err(),
+            "now_ms=0 with non-zero expires_at_ms must be rejected (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_valid_timestamp_within_expiry_passes() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+        let receipt = PermeabilityReceiptBuilder::new("ts-test", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .build()
+            .unwrap();
+
+        assert!(
+            receipt.validate_admission(3_000_000).is_ok(),
+            "valid timestamp within expiry window must pass"
+        );
+    }
+
+    #[test]
+    fn test_no_expiry_receipt_with_zero_now_ms_passes() {
+        // Receipts with expires_at_ms == 0 (no expiry) should pass
+        // regardless of now_ms.
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+        let receipt = PermeabilityReceiptBuilder::new("no-exp", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            // expires_at_ms defaults to 0 = no expiry
+            .build()
+            .unwrap();
+
+        assert!(
+            receipt.validate_admission(0).is_ok(),
+            "no-expiry receipt with now_ms=0 must pass"
+        );
+    }
+
+    // -- MAJOR 2: Empty actor IDs rejected --
+
+    #[test]
+    fn test_empty_delegator_actor_id_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+        let receipt = PermeabilityReceiptBuilder::new("empty-delegator", parent, overlay)
+            // delegator_actor_id defaults to "" (empty)
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        let result = receipt.validate_admission_unchecked();
+        assert!(
+            matches!(result, Err(PermeabilityError::EmptyActorId { .. })),
+            "empty delegator_actor_id must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_empty_delegate_actor_id_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::top();
+        let receipt = PermeabilityReceiptBuilder::new("empty-delegate", parent, overlay)
+            .delegator_actor_id("alice")
+            // delegate_actor_id defaults to "" (empty)
+            .issued_at_ms(1_000_000)
+            .build()
+            .unwrap();
+
+        let result = receipt.validate_admission_unchecked();
+        assert!(
+            matches!(result, Err(PermeabilityError::EmptyActorId { .. })),
+            "empty delegate_actor_id must be rejected"
+        );
     }
 
     // =========================================================================
