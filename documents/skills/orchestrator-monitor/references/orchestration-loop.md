@@ -48,7 +48,7 @@ decision_tree:
             For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent.
             Inject references/common-review-findings.md and references/daemon-implementation-patterns.md in its context.
         - id: REVIEW_PROGRESS_ACTION
-          action: "For PRs with active reviews, run check_review_progress; when complete, post_review_status."
+          action: "For PRs with active reviews, run check_review_progress; the Review Gate Success workflow handles gate status."
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
       next: STALL_AND_BACKPRESSURE
@@ -130,6 +130,6 @@ decision_tree:
         - id: GATE_RULE
           action: |
             READY_TO_MERGE iff all are true on current HEAD SHA:
-            (1) CI checks pass, (2) ai-review/security=success, (3) ai-review/code-quality=success,
-            (4) PR mergeable state is not CONFLICTING, (5) PR is open and non-draft.
+            (1) CI checks pass, (2) Review Gate Success=success,
+            (3) PR mergeable state is not CONFLICTING, (4) PR is open and non-draft.
       next: HEARTBEAT_LOOP

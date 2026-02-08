@@ -71,32 +71,31 @@ done
 
 echo ""
 
-# --- Section 2: AI Review Statuses ---
-echo -e "${BOLD}--- AI Review Statuses ---${NC}"
-printf "%-6s %-22s %-10s %s\n" "PR" "Review" "State" "Description"
+# --- Section 2: Review Gate Status ---
+echo -e "${BOLD}--- Review Gate Status ---${NC}"
+printf "%-6s %-30s %-10s %s\n" "PR" "Check" "State" "Description"
 
 for pr in "${PRS[@]}"; do
   head=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq '.headRefOid' 2>/dev/null)
   state=$(gh pr view "$pr" --repo "$REPO" --json state --jq '.state' 2>/dev/null)
   [[ "$state" == "MERGED" ]] && { printf "%-6s %s\n" "#$pr" "(merged)"; continue; }
 
-  reviews=$(gh api "repos/$REPO/commits/$head/status" --jq '.statuses[] | select(.context | startswith("ai-review/")) | "\(.context)|\(.state)|\(.description)"' 2>/dev/null || true)
+  gate_status=$(gh api "repos/$REPO/commits/$head/status" --jq '.statuses[] | select(.context == "Review Gate Success") | "\(.context)|\(.state)|\(.description)"' 2>/dev/null || true)
 
-  if [[ -z "$reviews" ]]; then
-    printf "%-6s %s\n" "#$pr" "(no reviews posted)"
+  if [[ -z "$gate_status" ]]; then
+    printf "%-6s %s\n" "#$pr" "(no Review Gate status posted)"
   else
     while IFS='|' read -r ctx st desc; do
-      review_name="${ctx#ai-review/}"
       if [[ "$st" == "success" ]]; then
         st_color="${GREEN}$st${NC}"
       else
         st_color="${RED}$st${NC}"
       fi
-      printf "%-6s %-22s " "#$pr" "$review_name"
+      printf "%-6s %-30s " "#$pr" "$ctx"
       echo -en "$st_color"
       printf "%*s" $((10 - ${#st})) ""
       echo " $desc"
-    done <<< "$reviews"
+    done <<< "$gate_status"
   fi
 done
 

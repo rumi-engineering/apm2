@@ -812,7 +812,7 @@ fn remediate_reviewer(
 /// Check if a reviewer has already posted a machine-readable review artifact
 /// bound to `head_sha`.
 ///
-/// This deliberately does **not** rely on `ai-review/*` commit statuses. The
+/// This deliberately does **not** rely on legacy commit statuses. The
 /// authoritative signal is the comment artifact containing:
 /// - the category marker (security/code-quality)
 /// - the exact 40-hex head SHA

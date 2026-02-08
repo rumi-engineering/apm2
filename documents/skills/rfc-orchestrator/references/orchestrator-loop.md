@@ -393,7 +393,7 @@ procedures[3]:
 
       - id: VERIFY_POSTED
         command: "gh api repos/{owner}/{repo}/commits/{head_sha}/status"
-        expect: "ai-review/security and ai-review/quality contexts present"
+        expect: "Review Gate Success context present or pending review-gate evaluation"
 
   - id: DISPATCH_IMPLEMENTER
     purpose: "Dispatch a subagent to implement or fix a ticket. Worktree creation handled by subagent via /ticket -> xtask start-ticket."

@@ -12,10 +12,10 @@ decision_tree:
           action: command
           run: "gh pr view <BRANCH_NAME> --json url,headRefOid"
           capture_as: pr_meta
-        - id: CHECK_AI_STATUS
+        - id: CHECK_REVIEW_GATE_STATUS
           action: command
-          run: "gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/<headRefOid>/status --jq '.statuses[] | select(.context | startswith(\"ai-review/\")) | \"\(.context): \(.state)\"'"
-          capture_as: ai_status
+          run: "gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/<headRefOid>/status --jq '.statuses[] | select(.context == \"Review Gate Success\") | \"\(.context): \(.state)\"'"
+          capture_as: review_gate_status
         - id: LOAD_REVIEWER_STATE
           action: command
           run: "python3 - <<'PY'\nimport json, os, time\nfrom pathlib import Path\np = Path.home() / '.apm2' / 'reviewer_state.json'\nif p.exists():\n    data = json.loads(p.read_text())\n    for k,v in (data.get('reviewers') or {}).items():\n        print(f\"{k}\tpid={v.get('pid')}\tstarted_at={v.get('started_at')}\tlog_file={v.get('log_file')}\tpr_url={v.get('pr_url')}\")\nPY"
@@ -38,7 +38,7 @@ decision_tree:
           action: "If output_files available, read last 80 lines for progress indicators."
           capture_as: reviewer_output_tail
         - id: ENFORCE_15M_DEADLINE
-          action: "Verify `now - started_at < 900s`. If breach (per `ai_status`), restart reviews."
+          action: "Verify `now - started_at < 900s`. If breach (per `review_gate_status`), restart reviews."
         - id: RESTART_IF_UNHEALTHY
           action: "If STALE/DEAD, trigger `cargo xtask review <TYPE> <PR_URL>`. Stage-2 demotion (TCK-00419): projection-only by default; direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle state."
         - id: ESCALATE_IF_REVIEWS_NOT_RUNNING
