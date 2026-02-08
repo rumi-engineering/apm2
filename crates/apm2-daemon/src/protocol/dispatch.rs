@@ -4566,6 +4566,14 @@ pub struct PrivilegedDispatcher {
     /// Ledger event emitter for signed event persistence (TCK-00253).
     event_emitter: Arc<dyn LedgerEventEmitter>,
 
+    /// Shared projection-backed work authority (TCK-00415).
+    ///
+    /// Instantiated once and reused across requests so that the internal
+    /// event-count cache is effective. Without sharing, each request would
+    /// create a fresh `ProjectionWorkAuthority` with an empty cache,
+    /// forcing a full O(N) ledger replay every time.
+    work_authority: Arc<ProjectionWorkAuthority>,
+
     /// Episode runtime for lifecycle management (TCK-00256).
     episode_runtime: Arc<EpisodeRuntime>,
 
@@ -4892,11 +4900,16 @@ impl PrivilegedDispatcher {
         // TCK-00303: Create subscription registry for HEF resource governance
         let subscription_registry = Arc::new(SubscriptionRegistry::with_defaults());
 
+        // TCK-00415: Create shared event emitter and work authority.
+        let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+        let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
+
         Self {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
             work_registry: Arc::new(StubWorkRegistry::default()),
-            event_emitter: Arc::new(StubLedgerEventEmitter::new()),
+            event_emitter,
+            work_authority,
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
@@ -4964,11 +4977,16 @@ impl PrivilegedDispatcher {
         // TCK-00303: Create subscription registry for HEF resource governance
         let subscription_registry = Arc::new(SubscriptionRegistry::with_defaults());
 
+        // TCK-00415: Create shared event emitter and work authority.
+        let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+        let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
+
         Self {
             decode_config,
             policy_resolver: Arc::new(StubPolicyResolver),
             work_registry: Arc::new(StubWorkRegistry::default()),
-            event_emitter: Arc::new(StubLedgerEventEmitter::new()),
+            event_emitter,
+            work_authority,
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
@@ -5056,11 +5074,15 @@ impl PrivilegedDispatcher {
         manifest_loader: Arc<dyn ManifestLoader>,
         subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
+        // TCK-00415: Shared work authority over the provided emitter.
+        let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
+
         Self {
             decode_config,
             policy_resolver,
             work_registry,
             event_emitter,
+            work_authority,
             episode_runtime,
             session_registry,
             lease_validator,
@@ -5123,11 +5145,16 @@ impl PrivilegedDispatcher {
         clock: Arc<HolonicClock>,
         subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
+        // TCK-00415: Create shared event emitter and work authority.
+        let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+        let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
+
         Self {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
             work_registry: Arc::new(StubWorkRegistry::default()),
-            event_emitter: Arc::new(StubLedgerEventEmitter::new()),
+            event_emitter,
+            work_authority,
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry,
             lease_validator: Arc::new(StubLeaseValidator::new()),
@@ -5396,6 +5423,15 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn event_emitter(&self) -> &Arc<dyn LedgerEventEmitter> {
         &self.event_emitter
+    }
+
+    /// Returns a reference to the shared work authority (TCK-00415).
+    ///
+    /// The `ProjectionWorkAuthority` is instantiated once during dispatcher
+    /// construction and shared across all work-related request handlers.
+    #[must_use]
+    pub const fn work_authority(&self) -> &Arc<ProjectionWorkAuthority> {
+        &self.work_authority
     }
 
     /// Records a successful governance probe when monitoring is wired.
@@ -8594,8 +8630,13 @@ impl PrivilegedDispatcher {
         }
     }
 
-    fn projection_work_authority(&self) -> ProjectionWorkAuthority {
-        ProjectionWorkAuthority::new(Arc::clone(&self.event_emitter))
+    /// Returns the shared projection-backed work authority (TCK-00415).
+    ///
+    /// The authority is instantiated once during dispatcher construction and
+    /// reused across requests. Its internal event-count cache avoids
+    /// redundant O(N) full-ledger replays.
+    fn projection_work_authority(&self) -> &ProjectionWorkAuthority {
+        &self.work_authority
     }
 
     fn authority_status_to_work_status_response(

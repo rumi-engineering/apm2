@@ -572,3 +572,204 @@ fn test_work_list_bounded_by_max_rows() {
         other => panic!("Expected WorkList response, got: {other:?}"),
     }
 }
+
+/// IT-00415-05: Shared authority cache prevents redundant rebuilds.
+///
+/// Regression test for MAJOR/BLOCKER: per-request `ProjectionWorkAuthority`
+/// instantiation. The shared instance must reuse its cache so that the
+/// second call with unchanged event count does NOT trigger a full replay.
+#[test]
+fn test_shared_authority_cache_reuse() {
+    let emitter = Arc::new(apm2_daemon::protocol::StubLedgerEventEmitter::new());
+    let authority =
+        ProjectionWorkAuthority::new(Arc::clone(&emitter) as Arc<dyn LedgerEventEmitter>);
+
+    // Emit one work item.
+    emit_transition(
+        emitter.as_ref(),
+        "W-CACHE-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:cache",
+        7_000_000_000,
+    );
+
+    // First call: triggers rebuild.
+    let first = authority
+        .list_all(MAX_WORK_LIST_ROWS, "")
+        .expect("first authority query should succeed");
+    assert_eq!(first.len(), 1, "first call must return one work item");
+
+    // Second call with same event count: must NOT error and must reuse
+    // cache. If a new ProjectionWorkAuthority were created per-request,
+    // the cache would always be empty and this would re-verify signatures.
+    let second = authority
+        .list_all(MAX_WORK_LIST_ROWS, "")
+        .expect("second authority query should reuse cache");
+    assert_eq!(second.len(), 1, "cached call must return same result");
+    assert_eq!(
+        first[0].work_id, second[0].work_id,
+        "cached result must match initial query"
+    );
+}
+
+/// IT-00415-06: Dispatcher uses shared authority across requests.
+///
+/// Regression test proving the dispatcher's `projection_work_authority()`
+/// returns a shared instance rather than creating one per-request.
+#[test]
+fn test_dispatcher_shared_work_authority() {
+    let dispatcher = PrivilegedDispatcher::new();
+    let ctx = privileged_ctx();
+
+    emit_transition(
+        dispatcher.event_emitter().as_ref(),
+        "W-SHARED-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:shared",
+        8_000_000_000,
+    );
+
+    // First dispatch triggers rebuild.
+    let request = WorkStatusRequest {
+        work_id: "W-SHARED-001".to_string(),
+    };
+    let frame = encode_work_status_request(&request);
+    let r1 = dispatcher.dispatch(&frame, &ctx).unwrap();
+    match &r1 {
+        PrivilegedResponse::WorkStatus(s) => assert_eq!(s.status, "CLAIMED"),
+        other => panic!("Expected WorkStatus, got: {other:?}"),
+    }
+
+    // Second dispatch must succeed with cached projection (no new
+    // ProjectionWorkAuthority allocation). If per-request, the cache
+    // fields would never be reused.
+    let r2 = dispatcher.dispatch(&frame, &ctx).unwrap();
+    match &r2 {
+        PrivilegedResponse::WorkStatus(s) => assert_eq!(s.status, "CLAIMED"),
+        other => panic!("Expected WorkStatus on cached call, got: {other:?}"),
+    }
+}
+
+/// IT-00415-07: Projection survives key rotation (trust-on-persist).
+///
+/// Regression test for BLOCKER 1: restart invalidates prior event
+/// signature verification. After removing signature re-verification from
+/// projection rebuild, events persisted with one signing key must still
+/// be projectable after constructing a new authority (simulating restart
+/// with a new key).
+#[test]
+fn test_projection_survives_key_rotation() {
+    let emitter = Arc::new(apm2_daemon::protocol::StubLedgerEventEmitter::new());
+
+    // Emit events with the emitter's current signing key.
+    emit_transition(
+        emitter.as_ref(),
+        "W-KEYROT-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:keyrot",
+        9_000_000_000,
+    );
+
+    // Create a FRESH authority (simulating restart where the signing key
+    // would be regenerated). Under the old verify_signed_events approach,
+    // this would fail because the new key cannot verify signatures made
+    // with the old key.
+    let fresh_authority =
+        ProjectionWorkAuthority::new(Arc::clone(&emitter) as Arc<dyn LedgerEventEmitter>);
+
+    let result = fresh_authority
+        .list_all(MAX_WORK_LIST_ROWS, "")
+        .expect("projection must succeed after simulated key rotation");
+    assert_eq!(
+        result.len(),
+        1,
+        "trust-on-persist model must project events regardless of current key"
+    );
+    assert_eq!(result[0].work_id, "W-KEYROT-001");
+    assert_eq!(result[0].state.as_str(), "CLAIMED");
+}
+
+/// IT-00415-08: Session events with spoofed work event names are filtered.
+///
+/// Regression test for BLOCKER 2: namespace collision attack. Session
+/// `EmitEvent` could inject events with `event_type = "work_transitioned"`
+/// that would be picked up by projection rebuild. The domain-prefix
+/// filtering must reject these because session event payloads have a
+/// different structural shape (they contain `session_id` instead of
+/// `work_id`).
+#[test]
+fn test_session_spoofed_work_events_filtered() {
+    let emitter = Arc::new(apm2_daemon::protocol::StubLedgerEventEmitter::new());
+
+    // Emit a genuine work transition.
+    emit_transition(
+        emitter.as_ref(),
+        "W-SPOOF-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:spoof-test",
+        10_000_000_000,
+    );
+
+    // Simulate a session-originated event with spoofed event_type
+    // "work_transitioned". Session events use emit_session_event which
+    // wraps the payload with session_id, not work_id.
+    emitter
+        .emit_session_event(
+            "session-malicious",
+            "work_transitioned",
+            b"malicious payload",
+            "attacker",
+            10_000_000_100,
+        )
+        .expect("session event should persist");
+
+    // Build authority from all events. The spoofed session event must NOT
+    // affect the work projection.
+    let authority =
+        ProjectionWorkAuthority::new(Arc::clone(&emitter) as Arc<dyn LedgerEventEmitter>);
+    let items = authority
+        .list_all(MAX_WORK_LIST_ROWS, "")
+        .expect("projection should succeed despite spoofed events");
+
+    // Only the genuine work event should appear.
+    assert_eq!(
+        items.len(),
+        1,
+        "spoofed session events must not appear in work projection"
+    );
+    assert_eq!(items[0].work_id, "W-SPOOF-001");
+
+    // Also verify that the raw ledger contains both events.
+    let all_events = emitter.get_all_events();
+    assert!(
+        all_events.len() >= 2,
+        "ledger should contain both genuine and spoofed events"
+    );
+
+    // The filter_work_domain_events (invoked inside refresh_projection)
+    // removes the spoofed session event before translate_signed_events
+    // processes the events. Verify this by checking the authority result
+    // is consistent even with the spoofed event in the ledger.
+    let authority2 =
+        ProjectionWorkAuthority::new(Arc::clone(&emitter) as Arc<dyn LedgerEventEmitter>);
+    let items2 = authority2
+        .list_all(MAX_WORK_LIST_ROWS, "")
+        .expect("fresh authority must also filter spoofed events");
+    assert_eq!(
+        items2.len(),
+        1,
+        "fresh authority must filter spoofed session events"
+    );
+}

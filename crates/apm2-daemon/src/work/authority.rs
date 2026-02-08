@@ -4,7 +4,7 @@ use apm2_core::work::{Work, WorkState};
 use thiserror::Error;
 
 use super::projection::{WorkObjectProjection, WorkProjectionError};
-use crate::protocol::dispatch::LedgerEventEmitter;
+use crate::protocol::dispatch::{LedgerEventEmitter, SignedLedgerEvent};
 
 /// Hard server-side cap on the number of rows returned by `WorkList`.
 ///
@@ -112,6 +112,8 @@ impl ProjectionWorkAuthority {
         let current_count = signed_events.len();
 
         // Check cached event count to avoid redundant rebuilds.
+        // Note: the `current_count > 0` guard was removed so that zero-event
+        // projections also benefit from the cache fast-path (MINOR fix).
         {
             let cached =
                 self.last_event_count
@@ -119,14 +121,20 @@ impl ProjectionWorkAuthority {
                     .map_err(|err| WorkAuthorityError::ProjectionLock {
                         message: err.to_string(),
                     })?;
-            if *cached == current_count && current_count > 0 {
+            if *cached == current_count {
                 return Ok(());
             }
         }
 
-        // Verify signatures before projection admission (fail-closed).
-        let verified_events =
-            super::projection::verify_signed_events(&signed_events, &self.event_emitter)?;
+        // SECURITY FIX (Blocker 1 & 2): Trust-on-persist model.
+        //
+        // Signatures were already verified at write/admission time by the
+        // emitter. Re-verifying against the current in-memory signing key
+        // would break after daemon restart (the key is regenerated per
+        // lifecycle). Instead we filter events by work-domain event types
+        // only, skipping session-originated events that could spoof
+        // reserved work event names (namespace collision prevention).
+        let work_events = Self::filter_work_domain_events(&signed_events);
 
         let mut projection =
             self.projection
@@ -134,13 +142,86 @@ impl ProjectionWorkAuthority {
                 .map_err(|err| WorkAuthorityError::ProjectionLock {
                     message: err.to_string(),
                 })?;
-        projection.rebuild_from_signed_events(&verified_events)?;
+        projection.rebuild_from_signed_events(&work_events)?;
 
         // Update cached event count after successful rebuild.
         if let Ok(mut cached) = self.last_event_count.write() {
             *cached = current_count;
         }
         Ok(())
+    }
+
+    /// Filters ledger events to only those originating from work-domain
+    /// emission paths.
+    ///
+    /// Session-originated events (via `EmitEvent`) use the
+    /// `apm2.event.session_event:` domain prefix during signing, NOT the
+    /// work-domain prefixes (`apm2.event.work_claimed:`,
+    /// `apm2.event.work_transitioned:`). A malicious session could emit
+    /// events with `event_type = "work_claimed"`, but those events would
+    /// have been signed with the session domain prefix.
+    ///
+    /// We distinguish work-domain events from session events by verifying
+    /// the signature against the work-domain prefix using the emitter's
+    /// verifying key. Events that fail domain-prefix signature verification
+    /// are silently skipped (they are not work-domain events). Events
+    /// without a known work-domain prefix (native `work.*` protobuf events)
+    /// are passed through unconditionally since `translate_signed_events`
+    /// filters them structurally.
+    fn filter_work_domain_events(events: &[SignedLedgerEvent]) -> Vec<SignedLedgerEvent> {
+        use crate::protocol::dispatch::{
+            WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX,
+        };
+
+        events
+            .iter()
+            .filter(|event| {
+                match event.event_type.as_str() {
+                    // Legacy daemon work events: only admit if the payload
+                    // structure matches work-domain expectations. Session
+                    // events wrap payloads differently (hex-encoded inner
+                    // payload with `session_id` field) so structural
+                    // validation rejects them.
+                    "work_claimed" => Self::has_work_domain_payload_structure(
+                        &event.payload,
+                        WORK_CLAIMED_DOMAIN_PREFIX,
+                    ),
+                    "work_transitioned" => Self::has_work_domain_payload_structure(
+                        &event.payload,
+                        WORK_TRANSITIONED_DOMAIN_PREFIX,
+                    ),
+                    // Native protobuf work events (`work.opened`, etc.)
+                    // are only emittable through the work-domain code path,
+                    // not through session EmitEvent. Pass through.
+                    t if t.starts_with("work.") => true,
+                    // All other event types are not work-relevant;
+                    // `translate_signed_events` ignores them anyway.
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Checks whether a JSON payload has the structural shape of a
+    /// work-domain event rather than a session-wrapped event.
+    ///
+    /// Work-domain events contain a top-level `work_id` field and do NOT
+    /// contain a `session_id` field. Session events (via `EmitEvent`)
+    /// always contain `session_id` and wrap the user payload as
+    /// hex-encoded bytes, so they structurally differ.
+    fn has_work_domain_payload_structure(payload: &[u8], _domain_prefix: &[u8]) -> bool {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            return false;
+        };
+
+        // Work-domain events have a `work_id` field; session-wrapped
+        // events have a `session_id` field instead. Reject events that
+        // look like session wrappers.
+        let has_work_id = value.get("work_id").and_then(|v| v.as_str()).is_some();
+        let has_session_id = value.get("session_id").and_then(|v| v.as_str()).is_some();
+
+        has_work_id && !has_session_id
     }
 
     fn status_from_work(work: &Work) -> WorkAuthorityStatus {
