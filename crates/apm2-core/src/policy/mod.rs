@@ -98,7 +98,7 @@ pub use parser::{
 pub use schema::{BudgetType, Decision, Policy, PolicyDocument, PolicyVersion, Rule, RuleType};
 pub use taint::{
     BoundaryPolicy, ConfidentialityLevel, DataLabel, DeclassificationPolicy,
-    DeclassificationReceipt, DualLatticePolicy, RfcConfidentialityLevel, TaintError, TaintLevel,
-    propagate_classification, propagate_taint,
+    DeclassificationReceipt, DualLatticePolicy, RfcConfidentialityLevel, SignatureVerifier,
+    TaintError, TaintLevel, propagate_classification, propagate_taint,
 };
 pub use validator::{ValidatedPolicy, validate_policy};

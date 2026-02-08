@@ -32,16 +32,26 @@
 //!
 //! # Runtime Integration
 //!
-//! **Note**: This module provides the dual-lattice policy primitives (types,
-//! propagation, declassification). Integration with the daemon runtime
-//! (injecting labels into work-object flows, wiring boundary checks into
-//! protocol dispatch, persisting receipts to the ledger) is planned for a
-//! follow-on ticket. Until then the API is library-only and must be called
+//! **Architecture note**: This module is the *policy primitive library*. It
+//! provides types, lattice operations, declassification receipt issuance, and
+//! boundary-crossing enforcement as pure functions / methods with no I/O.
+//!
+//! Runtime integration -- injecting labels into work-object flows, wiring
+//! boundary checks into protocol dispatch, persisting receipts to the ledger,
+//! and plugging in concrete [`SignatureVerifier`] implementations backed by
+//! the daemon's key material -- is handled by the daemon-layer wiring tickets:
+//!
+//! - `TCK-00420`: Wire taint labels into work-object instruction flow
+//! - `TCK-00421`: Boundary check hooks in protocol dispatch
+//! - `TCK-00422`: Ledger persistence for declassification receipts
+//!
+//! Until those tickets land, the API is library-only and must be called
 //! explicitly by consumers.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 // =============================================================================
@@ -116,6 +126,20 @@ pub enum TaintError {
         /// The boundary identifier.
         boundary: String,
         /// Why the crossing was denied.
+        reason: String,
+    },
+
+    /// Authority signature verification failed on a declassification receipt.
+    #[error("authority signature verification failed: {reason}")]
+    SignatureVerificationFailed {
+        /// Why the signature check failed.
+        reason: String,
+    },
+
+    /// A receipt field exceeds its maximum allowed size at consumption time.
+    #[error("receipt field size exceeded: {reason}")]
+    ReceiptFieldSizeExceeded {
+        /// Which field and its actual/allowed sizes.
         reason: String,
     },
 }
@@ -654,6 +678,35 @@ impl BoundaryPolicy {
 }
 
 // =============================================================================
+// SignatureVerifier trait
+// =============================================================================
+
+/// Trait for verifying authority signatures on declassification receipts.
+///
+/// Implementors bind the receipt to a cryptographic identity, ensuring that
+/// only an authorized principal can produce a valid receipt.
+///
+/// The trait is object-safe so that callers can pass `&dyn SignatureVerifier`
+/// at boundary-crossing time without monomorphization.
+///
+/// # Fail-Closed Semantics
+///
+/// When no verifier is available (i.e., `None` is passed to
+/// [`DualLatticePolicy::propagate_with_declassification`]), the receipt is
+/// **rejected** -- fail-closed.
+// TODO(TCK-00422): Wire concrete Ed25519/HSM SignatureVerifier into daemon
+// actuation path
+pub trait SignatureVerifier: fmt::Debug + Send + Sync {
+    /// Verify that `signature` is a valid signature by `authority_id` over
+    /// `message`.
+    ///
+    /// Returns `true` if and only if the signature is valid for the given
+    /// authority and message. Returns `false` for any error, unknown
+    /// authority, or invalid signature (fail-closed).
+    fn verify(&self, authority_id: &str, message: &[u8], signature: &[u8]) -> bool;
+}
+
+// =============================================================================
 // DeclassificationReceipt
 // =============================================================================
 
@@ -666,14 +719,18 @@ impl BoundaryPolicy {
 /// 3. An authority binding (who authorized the declassification).
 /// 4. A boundary binding (which boundary the receipt applies to).
 /// 5. The receipt is content-addressed (BLAKE3 hash) for tamper evidence.
+/// 6. A cryptographic authority signature over the content hash, verified via
+///    [`SignatureVerifier`] at consumption time.
 ///
 /// # Security Properties
 ///
 /// - Receipts are immutable once created.
 /// - The policy reference must name a real, active declassification rule.
 /// - The `authority_id` binds the receipt to the principal that authorized the
-///   declassification. Full cryptographic signature verification is a future
-///   concern (separate ticket).
+///   declassification.
+/// - The `authority_signature` is verified via a caller-supplied
+///   [`SignatureVerifier`] during
+///   [`DualLatticePolicy::propagate_with_declassification`].
 /// - The `boundary_id` scopes the receipt to a specific boundary crossing.
 ///   [`DualLatticePolicy::propagate_with_declassification`] validates that the
 ///   receipt's boundary matches the boundary being crossed.
@@ -691,14 +748,20 @@ pub struct DeclassificationReceipt {
     /// Human-readable justification for audit trail.
     justification: String,
     /// Identifier of the authority (principal) that authorized the
-    /// declassification. Structural binding only; cryptographic signature
-    /// verification is a future concern.
+    /// declassification.
     authority_id: String,
     /// Identifier of the boundary this receipt is scoped to. The receipt is
     /// only valid when crossing this specific boundary.
     boundary_id: String,
     /// BLAKE3 hash of the receipt content for tamper evidence.
     content_hash: [u8; 32],
+    /// Cryptographic signature by the authority over the content hash.
+    ///
+    /// Verified at consumption time via a caller-supplied
+    /// [`SignatureVerifier`]. Receipts without a valid signature are
+    /// rejected (fail-closed).
+    #[serde(default)]
+    authority_signature: Vec<u8>,
 }
 
 impl DeclassificationReceipt {
@@ -752,6 +815,12 @@ impl DeclassificationReceipt {
             let _ = write!(acc, "{b:02x}");
             acc
         })
+    }
+
+    /// Returns the authority signature bytes.
+    #[must_use]
+    pub fn authority_signature(&self) -> &[u8] {
+        &self.authority_signature
     }
 }
 
@@ -894,6 +963,7 @@ impl DualLatticePolicy {
     /// Returns [`TaintError::BoundaryCrossingDenied`] if no boundary with
     /// the given ID is configured (fail-closed), or the specific taint/
     /// confidentiality violation error if the label fails the check.
+    // TODO(TCK-00421): Wire into daemon protocol dispatch boundary hooks
     pub fn check_boundary(&self, boundary_id: &str, label: &DataLabel) -> Result<(), TaintError> {
         let boundary = self
             .boundaries
@@ -916,6 +986,7 @@ impl DualLatticePolicy {
     ///
     /// Returns the appropriate [`TaintError`] variant if the label
     /// violates the tier's policy.
+    // TODO(TCK-00421): Wire into daemon actuator dispatch path
     pub fn check_actuator_tier(&self, tier: u8, label: &DataLabel) -> Result<(), TaintError> {
         // Find all boundary policies for this tier; data must satisfy all.
         let tier_boundaries: Vec<&BoundaryPolicy> = self
@@ -942,8 +1013,12 @@ impl DualLatticePolicy {
     ///
     /// The caller must specify which policy rule authorizes the downgrade,
     /// the `authority_id` of the principal requesting the declassification,
-    /// and the `boundary_id` that the receipt will be scoped to. The receipt
-    /// is only valid at the named boundary.
+    /// the `boundary_id` that the receipt will be scoped to, and the
+    /// `authority_signature` (the authority's cryptographic signature over
+    /// the receipt's content hash).
+    ///
+    /// The signature is stored opaquely and verified at consumption time
+    /// via a caller-supplied [`SignatureVerifier`].
     ///
     /// # Errors
     ///
@@ -951,6 +1026,8 @@ impl DualLatticePolicy {
     /// is found or the requested range is not covered.
     /// Returns [`TaintError::InvalidPolicyRef`] if the justification,
     /// authority, or boundary identifiers are invalid.
+    // TODO(TCK-00422): Wire into daemon actuation path
+    #[allow(clippy::too_many_arguments)] // All params are semantically distinct security inputs
     pub fn declassify(
         &self,
         from: ConfidentialityLevel,
@@ -959,6 +1036,7 @@ impl DualLatticePolicy {
         justification: &str,
         authority_id: &str,
         boundary_id: &str,
+        authority_signature: &[u8],
     ) -> Result<DeclassificationReceipt, TaintError> {
         // Validate inputs.
         if from.ordinal() <= to.ordinal() {
@@ -1046,6 +1124,7 @@ impl DualLatticePolicy {
             authority_id: authority_id.to_string(),
             boundary_id: boundary_id.to_string(),
             content_hash,
+            authority_signature: authority_signature.to_vec(),
         })
     }
 
@@ -1097,7 +1176,84 @@ impl DualLatticePolicy {
             receipt.boundary_id(),
         );
         // Constant-time comparison to avoid timing side-channels.
-        expected == *receipt.content_hash()
+        // Uses `subtle::ConstantTimeEq` so that comparison time is
+        // independent of which byte differs.
+        bool::from(expected.ct_eq(receipt.content_hash()))
+    }
+
+    /// Validate that all variable-length receipt fields are within the
+    /// configured `MAX_*` size limits. This catches oversized receipts
+    /// that may have been injected via deserialization.
+    fn validate_receipt_field_sizes(receipt: &DeclassificationReceipt) -> Result<(), TaintError> {
+        if receipt.policy_ref().len() > MAX_POLICY_REF_LEN {
+            return Err(TaintError::ReceiptFieldSizeExceeded {
+                reason: format!(
+                    "policy_ref length {} exceeds maximum {MAX_POLICY_REF_LEN}",
+                    receipt.policy_ref().len()
+                ),
+            });
+        }
+        if receipt.justification().len() > MAX_JUSTIFICATION_LEN {
+            return Err(TaintError::ReceiptFieldSizeExceeded {
+                reason: format!(
+                    "justification length {} exceeds maximum {MAX_JUSTIFICATION_LEN}",
+                    receipt.justification().len()
+                ),
+            });
+        }
+        if receipt.authority_id().len() > MAX_AUTHORITY_ID_LEN {
+            return Err(TaintError::ReceiptFieldSizeExceeded {
+                reason: format!(
+                    "authority_id length {} exceeds maximum {MAX_AUTHORITY_ID_LEN}",
+                    receipt.authority_id().len()
+                ),
+            });
+        }
+        if receipt.boundary_id().len() > MAX_BOUNDARY_ID_LEN {
+            return Err(TaintError::ReceiptFieldSizeExceeded {
+                reason: format!(
+                    "boundary_id length {} exceeds maximum {MAX_BOUNDARY_ID_LEN}",
+                    receipt.boundary_id().len()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Verify the receipt's authority signature using the supplied verifier.
+    ///
+    /// # Fail-Closed Behavior
+    ///
+    /// If `verifier` is `None`, the receipt is **rejected**. An attacker
+    /// cannot bypass signature verification by omitting the verifier.
+    fn verify_authority_signature(
+        receipt: &DeclassificationReceipt,
+        verifier: Option<&dyn SignatureVerifier>,
+    ) -> Result<(), TaintError> {
+        let verifier = verifier.ok_or_else(|| TaintError::SignatureVerificationFailed {
+            reason: "no signature verifier provided (fail-closed)".to_string(),
+        })?;
+
+        if receipt.authority_signature().is_empty() {
+            return Err(TaintError::SignatureVerificationFailed {
+                reason: "receipt has empty authority_signature".to_string(),
+            });
+        }
+
+        if !verifier.verify(
+            receipt.authority_id(),
+            receipt.content_hash(),
+            receipt.authority_signature(),
+        ) {
+            return Err(TaintError::SignatureVerificationFailed {
+                reason: format!(
+                    "authority '{}' signature over content hash is invalid",
+                    receipt.authority_id()
+                ),
+            });
+        }
+
+        Ok(())
     }
 
     /// Propagate a label through a boundary crossing **without** implicit
@@ -1116,6 +1272,7 @@ impl DualLatticePolicy {
     ///   ceiling.
     /// - [`TaintError::ConfidentialityFloorViolation`] if confidentiality
     ///   exceeds the boundary clearance (requires explicit declassification).
+    // TODO(TCK-00420): Wire into work-object instruction flow
     pub fn propagate_through_boundary(
         &self,
         boundary_id: &str,
@@ -1158,32 +1315,43 @@ impl DualLatticePolicy {
     /// declassification receipt.
     ///
     /// The receipt must:
-    /// 1. Have a valid content hash (recomputed and verified against the
+    /// 1. Have field sizes within the configured `MAX_*` limits (re-validated
+    ///    at consumption time to reject oversized deserialized receipts).
+    /// 2. Have a valid content hash (recomputed and verified against the
     ///    receipt's claimed hash to detect forged/tampered receipts).
-    /// 2. Reference a `policy_ref` that maps to an active declassification rule
+    /// 3. Have a valid authority signature verified via the supplied
+    ///    [`SignatureVerifier`]. If `verifier` is `None`, the receipt is
+    ///    **rejected** (fail-closed).
+    /// 4. Reference a `policy_ref` that maps to an active declassification rule
     ///    authorizing the `from_level -> to_level` transition.
-    /// 3. Be scoped to the same `boundary_id` being crossed.
-    /// 4. Declassify from at least `label.confidentiality` down to at most
+    /// 5. Be scoped to the same `boundary_id` being crossed.
+    /// 6. Declassify from at least `label.confidentiality` down to at most
     ///    `boundary.max_confidentiality`.
     ///
     /// If the label already fits within the boundary clearance the receipt
-    /// is still fully validated (hash, `policy_ref`, boundary binding) but
-    /// the label passes through unchanged.
+    /// is still fully validated (size limits, hash, signature, `policy_ref`,
+    /// boundary binding) but the label passes through unchanged.
     ///
     /// # Errors
     ///
+    /// - [`TaintError::ReceiptFieldSizeExceeded`] if any receipt field exceeds
+    ///   its maximum allowed size.
     /// - [`TaintError::BoundaryCrossingDenied`] if the boundary is unknown
     ///   (fail-closed), the receipt content hash is invalid, the receipt's
     ///   `policy_ref` does not map to an active rule authorizing the
     ///   transition, the receipt is not scoped to this boundary, or the receipt
     ///   does not cover the required downgrade range.
+    /// - [`TaintError::SignatureVerificationFailed`] if the authority signature
+    ///   is invalid or no verifier is provided (fail-closed).
     /// - [`TaintError::TaintCeilingExceeded`] if taint exceeds the boundary
     ///   ceiling.
+    // TODO(TCK-00422): Wire into daemon actuation path
     pub fn propagate_with_declassification(
         &self,
         boundary_id: &str,
         label: &DataLabel,
         receipt: &DeclassificationReceipt,
+        verifier: Option<&dyn SignatureVerifier>,
     ) -> Result<DataLabel, TaintError> {
         let boundary = self
             .boundaries
@@ -1194,7 +1362,12 @@ impl DualLatticePolicy {
                 reason: "no boundary policy configured (fail-closed)".to_string(),
             })?;
 
-        // ---- Receipt integrity verification (BLOCKER fix) ----
+        // ---- Receipt field-size validation (MAJOR fix) ----
+        // Re-validate field sizes at consumption time to reject oversized
+        // receipts that may have been crafted via deserialization.
+        Self::validate_receipt_field_sizes(receipt)?;
+
+        // ---- Receipt integrity verification ----
         // 1. Recompute the content hash and verify it matches the receipt's claimed
         //    hash. This rejects forged or deserialized receipts whose fields have been
         //    tampered with.
@@ -1205,6 +1378,11 @@ impl DualLatticePolicy {
                     .to_string(),
             });
         }
+
+        // ---- Authority signature verification (BLOCKER fix) ----
+        // Verify the receipt's authority signature using the caller-supplied
+        // verifier. If no verifier is provided, fail-closed.
+        Self::verify_authority_signature(receipt, verifier)?;
 
         // 2. Verify that the receipt's policy_ref maps to an active declassification
         //    rule that authorizes the from -> to transition. This prevents attackers
@@ -1317,6 +1495,28 @@ impl Default for DualLatticePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Test helpers
+    // =========================================================================
+
+    /// A test signature verifier that accepts any signature whose first byte
+    /// matches 0xAA (our "valid" marker) and rejects everything else.
+    #[derive(Debug)]
+    struct TestVerifier;
+
+    impl SignatureVerifier for TestVerifier {
+        fn verify(&self, _authority_id: &str, _message: &[u8], signature: &[u8]) -> bool {
+            // Accept signatures that start with 0xAA as "valid".
+            signature.first() == Some(&0xAA)
+        }
+    }
+
+    /// A dummy "valid" signature for test receipts.
+    const VALID_TEST_SIG: &[u8] = &[0xAA, 0x01, 0x02, 0x03];
+
+    /// A dummy "invalid" signature for test receipts.
+    const INVALID_TEST_SIG: &[u8] = &[0xBB, 0x01, 0x02, 0x03];
 
     // =========================================================================
     // TaintLevel lattice tests
@@ -1897,6 +2097,7 @@ mod tests {
                 "Approved by security review SR-2026-042",
                 "security-officer-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
@@ -1924,6 +2125,7 @@ mod tests {
                 "same justification",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
         let r2 = policy
@@ -1934,6 +2136,7 @@ mod tests {
                 "same justification",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
         assert_eq!(r1.content_hash(), r2.content_hash());
@@ -1950,6 +2153,7 @@ mod tests {
                 "justification A",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
         let r2 = policy
@@ -1960,6 +2164,7 @@ mod tests {
                 "justification B",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
         assert_ne!(r1.content_hash(), r2.content_hash());
@@ -1976,6 +2181,7 @@ mod tests {
                 "same justification",
                 "authority-A",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
         let r2 = policy
@@ -1986,6 +2192,7 @@ mod tests {
                 "same justification",
                 "authority-B",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
         assert_ne!(r1.content_hash(), r2.content_hash());
@@ -2002,6 +2209,7 @@ mod tests {
                 "same justification",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
         let r2 = policy
@@ -2012,6 +2220,7 @@ mod tests {
                 "same justification",
                 "authority-1",
                 "tier3-actuator",
+                VALID_TEST_SIG,
             )
             .unwrap();
         assert_ne!(r1.content_hash(), r2.content_hash());
@@ -2028,6 +2237,7 @@ mod tests {
                 "trying to leak",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -2044,6 +2254,7 @@ mod tests {
                 "no such rule",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -2060,6 +2271,7 @@ mod tests {
                 "upgrade attempt",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -2076,6 +2288,7 @@ mod tests {
                 "no-op attempt",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -2092,6 +2305,7 @@ mod tests {
                 "missing ref",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
@@ -2109,6 +2323,7 @@ mod tests {
                 &long_just,
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
@@ -2125,6 +2340,7 @@ mod tests {
                 "valid justification",
                 "",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
@@ -2141,6 +2357,7 @@ mod tests {
                 "valid justification",
                 "authority-1",
                 "",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
@@ -2158,6 +2375,7 @@ mod tests {
                 "valid justification",
                 &long_auth,
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
@@ -2175,6 +2393,7 @@ mod tests {
                 "valid justification",
                 "authority-1",
                 &long_bnd,
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
@@ -2193,6 +2412,7 @@ mod tests {
                 "step 1",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
         assert_eq!(r1.to_level(), ConfidentialityLevel::Internal);
@@ -2205,6 +2425,7 @@ mod tests {
                 "step 2",
                 "authority-1",
                 "tier4-actuator",
+                VALID_TEST_SIG,
             )
             .unwrap();
         assert_eq!(r2.to_level(), ConfidentialityLevel::Public);
@@ -2245,11 +2466,12 @@ mod tests {
                 "Approved for external release",
                 "security-officer-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
         let result = policy
-            .propagate_with_declassification("external-api", &label, &receipt)
+            .propagate_with_declassification("external-api", &label, &receipt, Some(&TestVerifier))
             .unwrap();
         assert_eq!(result.taint, TaintLevel::Untainted);
         assert_eq!(result.confidentiality, ConfidentialityLevel::Internal);
@@ -2270,11 +2492,12 @@ mod tests {
                 "wrong boundary",
                 "security-officer-1",
                 "tier3-actuator",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
         let err = policy
-            .propagate_with_declassification("external-api", &label, &receipt)
+            .propagate_with_declassification("external-api", &label, &receipt, Some(&TestVerifier))
             .unwrap_err();
         assert!(
             matches!(err, TaintError::BoundaryCrossingDenied { .. }),
@@ -2298,11 +2521,12 @@ mod tests {
                 "not needed but valid",
                 "security-officer-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
         let result = policy
-            .propagate_with_declassification("external-api", &label, &receipt)
+            .propagate_with_declassification("external-api", &label, &receipt, Some(&TestVerifier))
             .unwrap();
         assert_eq!(result, label);
     }
@@ -2323,11 +2547,17 @@ mod tests {
                 "insufficient downgrade",
                 "security-officer-1",
                 "tier4-actuator",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
         let err = policy
-            .propagate_with_declassification("tier4-actuator", &label, &receipt)
+            .propagate_with_declassification(
+                "tier4-actuator",
+                &label,
+                &receipt,
+                Some(&TestVerifier),
+            )
             .unwrap_err();
         assert!(
             matches!(err, TaintError::BoundaryCrossingDenied { .. }),
@@ -2438,6 +2668,7 @@ mod tests {
                 "trying to skip levels",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -2454,6 +2685,7 @@ mod tests {
                 "reverse declassification attempt",
                 "authority-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -2482,6 +2714,7 @@ mod tests {
                 "no rules exist",
                 "authority-1",
                 "some-boundary",
+                VALID_TEST_SIG,
             )
             .unwrap_err();
         assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
@@ -2660,6 +2893,7 @@ mod tests {
                 "legitimate",
                 "security-officer-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
@@ -2676,7 +2910,7 @@ mod tests {
         let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
 
         let err = policy
-            .propagate_with_declassification("external-api", &label, &forged)
+            .propagate_with_declassification("external-api", &label, &forged, Some(&TestVerifier))
             .unwrap_err();
         assert!(
             matches!(err, TaintError::BoundaryCrossingDenied { .. }),
@@ -2703,6 +2937,7 @@ mod tests {
                 "legitimate",
                 "security-officer-1",
                 "external-api",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
@@ -2719,7 +2954,7 @@ mod tests {
         let tampered: DeclassificationReceipt = serde_json::from_value(tampered_json).unwrap();
 
         let err = policy
-            .propagate_with_declassification("external-api", &label, &tampered)
+            .propagate_with_declassification("external-api", &label, &tampered, Some(&TestVerifier))
             .unwrap_err();
         assert!(
             matches!(err, TaintError::BoundaryCrossingDenied { .. }),
@@ -2752,11 +2987,12 @@ mod tests {
             "authority_id": "attacker",
             "boundary_id": "external-api",
             "content_hash": hash,
+            "authority_signature": VALID_TEST_SIG,
         });
         let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
 
         let err = policy
-            .propagate_with_declassification("external-api", &label, &forged)
+            .propagate_with_declassification("external-api", &label, &forged, Some(&TestVerifier))
             .unwrap_err();
         assert!(
             matches!(err, TaintError::BoundaryCrossingDenied { .. }),
@@ -2793,15 +3029,295 @@ mod tests {
             "authority_id": "attacker",
             "boundary_id": "external-api",
             "content_hash": hash,
+            "authority_signature": VALID_TEST_SIG,
         });
         let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
 
         let err = policy
-            .propagate_with_declassification("external-api", &label, &forged)
+            .propagate_with_declassification("external-api", &label, &forged, Some(&TestVerifier))
             .unwrap_err();
         assert!(
             matches!(err, TaintError::BoundaryCrossingDenied { .. }),
             "unauthorized level transition must be rejected, got {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER: Authority signature verification tests
+    // =========================================================================
+
+    #[test]
+    fn signature_rejected_when_no_verifier_provided() {
+        // Fail-closed: if no verifier is supplied, receipts must be rejected.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid request",
+                "security-officer-1",
+                "external-api",
+                VALID_TEST_SIG,
+            )
+            .unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &receipt, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::SignatureVerificationFailed { .. }),
+            "must reject when no verifier is provided (fail-closed), got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("no signature verifier provided"),
+            "error should mention missing verifier, got: {err}"
+        );
+    }
+
+    #[test]
+    fn signature_rejected_when_empty() {
+        // Empty signature must be rejected even with a verifier.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid request",
+                "security-officer-1",
+                "external-api",
+                &[], // empty signature
+            )
+            .unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &receipt, Some(&TestVerifier))
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::SignatureVerificationFailed { .. }),
+            "must reject empty signature, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("empty authority_signature"),
+            "error should mention empty signature, got: {err}"
+        );
+    }
+
+    #[test]
+    fn signature_rejected_when_invalid() {
+        // Invalid signature (wrong first byte) must be rejected.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid request",
+                "security-officer-1",
+                "external-api",
+                INVALID_TEST_SIG,
+            )
+            .unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &receipt, Some(&TestVerifier))
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::SignatureVerificationFailed { .. }),
+            "must reject invalid signature, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("signature over content hash is invalid"),
+            "error should mention invalid signature, got: {err}"
+        );
+    }
+
+    #[test]
+    fn signature_accepted_when_valid() {
+        // Valid signature (correct first byte) must be accepted.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "approved release",
+                "security-officer-1",
+                "external-api",
+                VALID_TEST_SIG,
+            )
+            .unwrap();
+
+        let result = policy
+            .propagate_with_declassification("external-api", &label, &receipt, Some(&TestVerifier))
+            .unwrap();
+        assert_eq!(result.confidentiality, ConfidentialityLevel::Internal);
+    }
+
+    // =========================================================================
+    // MAJOR: Receipt field size validation at consumption time tests
+    // =========================================================================
+
+    #[test]
+    fn oversized_policy_ref_rejected_at_consumption() {
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Create a receipt with an oversized policy_ref via deserialization.
+        let legit = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid",
+                "authority-1",
+                "external-api",
+                VALID_TEST_SIG,
+            )
+            .unwrap();
+
+        let oversized_ref = "X".repeat(MAX_POLICY_REF_LEN + 1);
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "policy_ref": oversized_ref,
+            "justification": legit.justification(),
+            "authority_id": legit.authority_id(),
+            "boundary_id": legit.boundary_id(),
+            "content_hash": legit.content_hash(),
+            "authority_signature": VALID_TEST_SIG,
+        });
+        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &forged, Some(&TestVerifier))
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::ReceiptFieldSizeExceeded { .. }),
+            "oversized policy_ref must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_justification_rejected_at_consumption() {
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let legit = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid",
+                "authority-1",
+                "external-api",
+                VALID_TEST_SIG,
+            )
+            .unwrap();
+
+        let oversized_just = "Y".repeat(MAX_JUSTIFICATION_LEN + 1);
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "policy_ref": legit.policy_ref(),
+            "justification": oversized_just,
+            "authority_id": legit.authority_id(),
+            "boundary_id": legit.boundary_id(),
+            "content_hash": legit.content_hash(),
+            "authority_signature": VALID_TEST_SIG,
+        });
+        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &forged, Some(&TestVerifier))
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::ReceiptFieldSizeExceeded { .. }),
+            "oversized justification must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_authority_id_rejected_at_consumption() {
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let legit = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid",
+                "authority-1",
+                "external-api",
+                VALID_TEST_SIG,
+            )
+            .unwrap();
+
+        let oversized_auth = "Z".repeat(MAX_AUTHORITY_ID_LEN + 1);
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "policy_ref": legit.policy_ref(),
+            "justification": legit.justification(),
+            "authority_id": oversized_auth,
+            "boundary_id": legit.boundary_id(),
+            "content_hash": legit.content_hash(),
+            "authority_signature": VALID_TEST_SIG,
+        });
+        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &forged, Some(&TestVerifier))
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::ReceiptFieldSizeExceeded { .. }),
+            "oversized authority_id must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_boundary_id_rejected_at_consumption() {
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let legit = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid",
+                "authority-1",
+                "external-api",
+                VALID_TEST_SIG,
+            )
+            .unwrap();
+
+        let oversized_bnd = "W".repeat(MAX_BOUNDARY_ID_LEN + 1);
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "policy_ref": legit.policy_ref(),
+            "justification": legit.justification(),
+            "authority_id": legit.authority_id(),
+            "boundary_id": oversized_bnd,
+            "content_hash": legit.content_hash(),
+            "authority_signature": VALID_TEST_SIG,
+        });
+        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &forged, Some(&TestVerifier))
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::ReceiptFieldSizeExceeded { .. }),
+            "oversized boundary_id must be rejected, got {err:?}"
         );
     }
 
@@ -2839,6 +3355,7 @@ mod tests {
                 "same-justification",
                 "ab",
                 "cd",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
@@ -2850,6 +3367,7 @@ mod tests {
                 "same-justification",
                 "abc",
                 "d",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
@@ -2898,6 +3416,7 @@ mod tests {
                 "JUST",
                 "auth",
                 "boundary",
+                VALID_TEST_SIG,
             )
             .unwrap();
         let r2 = policy
@@ -2908,6 +3427,7 @@ mod tests {
                 "UST",
                 "auth",
                 "boundary",
+                VALID_TEST_SIG,
             )
             .unwrap();
 
