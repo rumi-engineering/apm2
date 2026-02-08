@@ -33,7 +33,8 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
 4. Verify `CI Success` job logs show:
    - `Preflight passed: systemd-run --user is functional.`
    - `Starting bounded command in transient user unit`
-   - `END   [build_all_targets] PASS`
+   - `Bounded command completed successfully.`
+   - In uploaded `ci-orchestrator-logs-*` artifact, `build_all_targets.log` ends with `Finished \`dev\` profile`.
 5. On failures, inspect job logs and corresponding guard script output.
 6. If test-safety false positives occur, add minimal scoped entries to `scripts/ci/test_safety_allowlist.txt`.
 
