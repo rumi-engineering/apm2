@@ -117,20 +117,6 @@ jobs:
             '[.reviewers.code_quality[].github_logins[] | ascii_downcase] | index($login|ascii_downcase) != null' \
             /tmp/trusted-reviewers-base.json >/dev/null
 
-      - name: Post pending review gate status (early)
-        if: steps.pr.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          sha="${{ steps.pr.outputs.head_sha }}"
-
-          gh api --method POST "/repos/${{ github.repository }}/statuses/${sha}" \
-            -f state="pending" \
-            -f context="Review Gate Success" \
-            -f description="Waiting for AI reviews"
-
       - name: Delete prior code quality review artifacts for this head (dedupe)
         if: steps.pr.outputs.skip != 'true'
         env:
@@ -173,58 +159,7 @@ jobs:
           cargo xtask review quality "${{ steps.pr.outputs.pr_url }}" \
             --expected-head-sha "${{ steps.pr.outputs.head_sha }}"
 
-      - name: Evaluate and post review gate status
-        if: steps.pr.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
-          EXPECTED_HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
-
-          CURRENT_HEAD_SHA=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.head.sha')
-          if [[ "$CURRENT_HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]]; then
-            echo "PR head moved during review: expected $EXPECTED_HEAD_SHA, current $CURRENT_HEAD_SHA"
-            echo "Skipping gate evaluation/status post; push-triggered workflows will run on the new head."
-            exit 0
-          fi
-
-          set +e
-          cargo xtask review-gate \
-            --repo "${{ github.repository }}" \
-            --pr-number "${PR_NUMBER}" \
-            --head-sha "${EXPECTED_HEAD_SHA}" \
-            --trusted-reviewers "/tmp/trusted-reviewers-base.json" \
-            | tee /tmp/review-gate-evaluation.json
-          code=${PIPESTATUS[0]}
-          set -e
-
-          qual_verdict=$(jq -r '.code_quality.authoritative_verdict // empty' /tmp/review-gate-evaluation.json || true)
-          if [[ -z "${qual_verdict}" ]]; then
-            echo "::error::Code quality review did not produce an authoritative artifact for head ${EXPECTED_HEAD_SHA}."
-            echo "::error::Review-gate evaluation summary:"
-            cat /tmp/review-gate-evaluation.json || true
-            code=1
-          fi
-
-          if [ "$code" -eq 0 ]; then
-            state="success"
-            description="Review gate passed"
-            exit_code=0
-          elif [ "$code" -eq 2 ]; then
-            state="pending"
-            description="Waiting for AI reviews"
-            exit_code=0
-          else
-            state="failure"
-            description="Review gate failed"
-            exit_code=1
-          fi
-
-          gh api --method POST "/repos/${{ github.repository }}/statuses/${EXPECTED_HEAD_SHA}" \
-            -f state="${state}" \
-            -f context="Review Gate Success" \
-            -f description="${description}"
-
-          exit "$exit_code"
+      # Review Gate Success status is posted exclusively by
+      # .github/workflows/review-gate.yml (trusted base-branch evaluator).
+      # This workflow only posts the review comment; the review-gate workflow
+      # re-evaluates on the issue_comment trigger and projects the status.
