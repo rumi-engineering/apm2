@@ -24,16 +24,21 @@
 //!
 //! # Tier Enforcement
 //!
-//! - **Tier2+**: All enforcement components are **mandatory**. If any component
-//!   is unavailable (e.g., no context manifest loaded, no capsule profile), the
+//! - **Tier2+**: Broker, capability, and context-firewall enforcement are
+//!   **mandatory**. If any of these components is unavailable or unchecked, the
 //!   ratchet returns a deny-default decision. This is fail-closed behavior.
+//! - **Tier3+**: Capsule containment is **mandatory** in addition to all Tier2
+//!   requirements. Per REQ-0028, Tier3+ actuation must execute within admitted
+//!   capsule profiles.
 //! - **Tier0-1**: Enforcement components are **recommended** but not mandatory.
 //!   Missing components produce warnings but do not block actuation.
+//! - **Tier2 capsule**: Capsule unavailable produces a warning, not denial.
 //!
 //! # Security Properties
 //!
 //! - [INV-RATCHET-001] No actuation path bypasses broker and policy checks
 //! - [INV-RATCHET-002] Unavailable enforcement dependency causes deny at Tier2+
+//!   (capsule at Tier3+ per REQ-0028)
 //! - [INV-RATCHET-003] Regression tests prevent bypass reintroduction
 //!
 //! # Contract References
@@ -54,9 +59,15 @@ use super::envelope::RiskTier;
 /// Maximum length for a denial reason string (`DoS` bound).
 const MAX_DENIAL_REASON_LEN: usize = 1024;
 
-/// The tier threshold at which all enforcement components become mandatory.
-/// Tier2 (value 2) and above require all components.
+/// The tier threshold at which broker, capability, and context-firewall
+/// enforcement components become mandatory.
+/// Tier2 (value 2) and above require these components.
 const MANDATORY_ENFORCEMENT_TIER: u8 = 2;
+
+/// The tier threshold at which capsule containment becomes mandatory.
+/// Per REQ-0028, Tier3+ actuation MUST execute within admitted capsule
+/// profiles. Tier2 produces a warning but does not deny.
+const CAPSULE_MANDATORY_ENFORCEMENT_TIER: u8 = 3;
 
 // =============================================================================
 // EnforcementStatus
@@ -190,9 +201,36 @@ impl fmt::Display for PathRatchetError {
                 write!(
                     f,
                     "path ratchet denied: capsule profile not present at tier {risk_tier} \
-                     (mandatory for tier >= {MANDATORY_ENFORCEMENT_TIER})"
+                     (mandatory for tier >= {CAPSULE_MANDATORY_ENFORCEMENT_TIER})"
                 )
             },
+        }
+    }
+}
+
+impl PathRatchetError {
+    /// Returns `true` if this error is a context-firewall denial
+    /// (either missing manifest or unchecked status for the context
+    /// firewall component).
+    #[must_use]
+    pub fn is_context_firewall_denial(&self) -> bool {
+        match self {
+            Self::ContextFirewallMissing { .. } => true,
+            Self::ComponentNotChecked { component, .. } => *component == "context_firewall",
+            _ => false,
+        }
+    }
+
+    /// Returns the risk tier associated with this error, if applicable.
+    #[must_use]
+    pub const fn risk_tier(&self) -> Option<u8> {
+        match self {
+            Self::ComponentUnavailable { risk_tier, .. }
+            | Self::ComponentNotChecked { risk_tier, .. }
+            | Self::CapabilityManifestMissing { risk_tier }
+            | Self::ContextFirewallMissing { risk_tier }
+            | Self::CapsuleProfileMissing { risk_tier } => Some(*risk_tier),
+            Self::BrokerNotInitialized => None,
         }
     }
 }
@@ -311,7 +349,8 @@ impl PathRatchet {
     /// # Tier Behavior
     ///
     /// - **Tier0-1**: Missing components produce warnings but allow actuation.
-    /// - **Tier2+**: Missing components produce a deny decision.
+    /// - **Tier2+**: Missing broker/capability/context-firewall produces deny.
+    /// - **Tier3+**: Missing capsule profile also produces deny (REQ-0028).
     ///
     /// # All Tiers
     ///
@@ -320,6 +359,7 @@ impl PathRatchet {
     pub fn enforce(&self, input: &PathRatchetInput) -> PathRatchetOutcome {
         let tier_value = input.risk_tier.tier();
         let is_mandatory = tier_value >= MANDATORY_ENFORCEMENT_TIER;
+        let capsule_mandatory = tier_value >= CAPSULE_MANDATORY_ENFORCEMENT_TIER;
 
         // Broker is ALWAYS required (all tiers)
         if !input.broker_checked {
@@ -364,16 +404,16 @@ impl PathRatchet {
             };
         }
 
-        // Capsule admission check
+        // Capsule admission check — mandatory at Tier3+ per REQ-0028
         if input.capsule_admission_status.is_unavailable() {
-            if is_mandatory {
+            if capsule_mandatory {
                 return PathRatchetOutcome::Denied {
                     error: PathRatchetError::CapsuleProfileMissing {
                         risk_tier: tier_value,
                     },
                 };
             }
-        } else if !input.capsule_admission_status.is_checked() && is_mandatory {
+        } else if !input.capsule_admission_status.is_checked() && capsule_mandatory {
             return PathRatchetOutcome::Denied {
                 error: PathRatchetError::ComponentNotChecked {
                     component: "capsule_admission",
@@ -382,10 +422,12 @@ impl PathRatchet {
             };
         }
 
-        // For Tier0-1, collect warnings for unavailable components
-        if !is_mandatory {
-            let mut warnings = Vec::new();
+        // For tiers below mandatory threshold, collect warnings for unavailable
+        // components. Also collect capsule warnings for Tier2 (below capsule
+        // threshold but above the base mandatory threshold).
+        let mut warnings = Vec::new();
 
+        if !is_mandatory {
             if input.capability_status.is_unavailable() {
                 let mut msg = format!(
                     "capability manifest unavailable at tier {tier_value}; \
@@ -402,22 +444,23 @@ impl PathRatchet {
                 msg.truncate(MAX_DENIAL_REASON_LEN);
                 warnings.push(msg);
             }
-            if input.capsule_admission_status.is_unavailable() {
-                let mut msg = format!(
-                    "capsule profile unavailable at tier {tier_value}; \
-                     enforcement is optional but recommended"
-                );
-                msg.truncate(MAX_DENIAL_REASON_LEN);
-                warnings.push(msg);
-            }
-
-            if warnings.is_empty() {
-                return PathRatchetOutcome::Allowed;
-            }
-            return PathRatchetOutcome::AllowedWithWarnings { warnings };
         }
 
-        PathRatchetOutcome::Allowed
+        // Capsule warning for tiers below capsule threshold (Tier0-2)
+        if !capsule_mandatory && input.capsule_admission_status.is_unavailable() {
+            let mut msg = format!(
+                "capsule profile unavailable at tier {tier_value}; \
+                 enforcement is optional but recommended (mandatory at tier >= {CAPSULE_MANDATORY_ENFORCEMENT_TIER})"
+            );
+            msg.truncate(MAX_DENIAL_REASON_LEN);
+            warnings.push(msg);
+        }
+
+        if warnings.is_empty() {
+            PathRatchetOutcome::Allowed
+        } else {
+            PathRatchetOutcome::AllowedWithWarnings { warnings }
+        }
     }
 }
 
@@ -616,8 +659,10 @@ mod tests {
     // Capsule Profile Admission
     // =========================================================================
 
+    /// Per REQ-0028, capsule is mandatory at Tier3+, not Tier2.
+    /// Tier2 with capsule unavailable should be allowed with a warning.
     #[test]
-    fn test_actuation_without_capsule_profile_denied_tier2() {
+    fn test_actuation_without_capsule_profile_allowed_with_warning_tier2() {
         let r = ratchet();
         let input = PathRatchetInput {
             risk_tier: RiskTier::Tier2,
@@ -627,11 +672,43 @@ mod tests {
             capsule_admission_status: EnforcementStatus::Unavailable,
         };
         let outcome = r.enforce(&input);
-        assert!(outcome.is_denied());
+        assert!(
+            outcome.is_allowed(),
+            "Tier2 capsule unavailable should be allowed with warning, got: {outcome:?}"
+        );
+        assert!(matches!(
+            outcome,
+            PathRatchetOutcome::AllowedWithWarnings { .. }
+        ));
+        if let PathRatchetOutcome::AllowedWithWarnings { warnings } = &outcome {
+            assert!(
+                warnings.iter().any(|w| w.contains("capsule")),
+                "warning must mention capsule: {warnings:?}"
+            );
+        }
+    }
+
+    /// Per REQ-0028, capsule is mandatory at Tier3+. Tier3 with capsule
+    /// unavailable must be denied (fail-closed).
+    #[test]
+    fn test_actuation_without_capsule_profile_denied_tier3() {
+        let r = ratchet();
+        let input = PathRatchetInput {
+            risk_tier: RiskTier::Tier3,
+            broker_checked: true,
+            capability_status: EnforcementStatus::Checked,
+            context_firewall_status: EnforcementStatus::Checked,
+            capsule_admission_status: EnforcementStatus::Unavailable,
+        };
+        let outcome = r.enforce(&input);
+        assert!(
+            outcome.is_denied(),
+            "Tier3 capsule unavailable must be denied"
+        );
         assert!(matches!(
             outcome,
             PathRatchetOutcome::Denied {
-                error: PathRatchetError::CapsuleProfileMissing { risk_tier: 2 },
+                error: PathRatchetError::CapsuleProfileMissing { risk_tier: 3 },
             }
         ));
     }
@@ -904,15 +981,16 @@ mod tests {
     // =========================================================================
 
     /// Regression test: Verify that EVERY combination of tier >= 2 with a
-    /// single missing enforcement component is denied. This prevents future
-    /// code changes from accidentally re-introducing bypass paths.
+    /// single missing enforcement component is denied (capsule at Tier3+).
+    /// This prevents future code changes from accidentally re-introducing
+    /// bypass paths.
     #[test]
     fn test_regression_no_bypass_at_mandatory_tiers() {
         let r = ratchet();
         let mandatory_tiers = [RiskTier::Tier2, RiskTier::Tier3, RiskTier::Tier4];
 
         for tier in mandatory_tiers {
-            // Missing capability
+            // Missing capability — denied at Tier2+
             let input = PathRatchetInput {
                 risk_tier: tier,
                 broker_checked: true,
@@ -925,7 +1003,7 @@ mod tests {
                 "tier {tier:?} with missing capability must be denied"
             );
 
-            // Missing context firewall
+            // Missing context firewall — denied at Tier2+
             let input = PathRatchetInput {
                 risk_tier: tier,
                 broker_checked: true,
@@ -938,7 +1016,7 @@ mod tests {
                 "tier {tier:?} with missing context firewall must be denied"
             );
 
-            // Missing capsule admission
+            // Missing capsule admission — denied at Tier3+ only (REQ-0028)
             let input = PathRatchetInput {
                 risk_tier: tier,
                 broker_checked: true,
@@ -946,12 +1024,19 @@ mod tests {
                 context_firewall_status: EnforcementStatus::Checked,
                 capsule_admission_status: EnforcementStatus::Unavailable,
             };
-            assert!(
-                r.enforce(&input).is_denied(),
-                "tier {tier:?} with missing capsule admission must be denied"
-            );
+            if tier.tier() >= 3 {
+                assert!(
+                    r.enforce(&input).is_denied(),
+                    "tier {tier:?} with missing capsule admission must be denied (Tier3+)"
+                );
+            } else {
+                assert!(
+                    r.enforce(&input).is_allowed(),
+                    "tier {tier:?} with missing capsule should be allowed with warning (Tier2)"
+                );
+            }
 
-            // Missing broker
+            // Missing broker — denied at ALL tiers
             let input = PathRatchetInput {
                 risk_tier: tier,
                 broker_checked: false,
@@ -995,13 +1080,18 @@ mod tests {
         }
     }
 
-    /// Regression test: Verify that the mandatory enforcement tier threshold
-    /// is exactly 2. This constant must not be changed without security review.
+    /// Regression test: Verify that the mandatory enforcement tier thresholds
+    /// are correct. These constants must not be changed without security
+    /// review.
     #[test]
     fn test_regression_mandatory_enforcement_threshold() {
         assert_eq!(
             MANDATORY_ENFORCEMENT_TIER, 2,
             "MANDATORY_ENFORCEMENT_TIER must be 2 (Tier2+)"
+        );
+        assert_eq!(
+            CAPSULE_MANDATORY_ENFORCEMENT_TIER, 3,
+            "CAPSULE_MANDATORY_ENFORCEMENT_TIER must be 3 (Tier3+, per REQ-0028)"
         );
     }
 }

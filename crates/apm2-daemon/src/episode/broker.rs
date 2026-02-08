@@ -2364,8 +2364,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             // Capsule admission: not yet wired into the broker at runtime
             // (library-only in AdmissionGate, validated in TCK-00374 unit tests).
             // Marked as Unavailable because no runtime capsule admission gate
-            // check is performed here. At Tier0-1 this produces a warning; at
-            // Tier2+ the ratchet will deny (fail-closed).
+            // check is performed here. At Tier0-2 this produces a warning; at
+            // Tier3+ the ratchet will deny (fail-closed, per REQ-0028).
             //
             // TODO(TCK-00374): When capsule runtime wiring lands, replace this
             // with an actual capsule presence check on the request.
@@ -2382,8 +2382,62 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             let outcome = self.path_ratchet.enforce(&ratchet_input);
             match outcome {
                 PathRatchetOutcome::Denied { error } => {
+                    let tier_value = request.risk_tier.tier();
+
+                    // REQ-0029: Tier3+ context-firewall denials MUST terminate
+                    // with mandatory defect emission, not just deny.
+                    if error.is_context_firewall_denial() && tier_value >= 3 {
+                        warn!(
+                            risk_tier = tier_value,
+                            error = %error,
+                            "path ratchet: Tier3+ context-firewall violation → TERMINATE"
+                        );
+
+                        // Emit defect for audit trail (same pattern as existing
+                        // Tier3 context-firewall violations in the broker).
+                        defects.push(FirewallViolationDefect {
+                            violation_type: apm2_core::context::firewall::FirewallViolationType::AllowlistDenied,
+                            risk_tier: tier_value,
+                            rule_id: "PATH_RATCHET_CONTEXT_FIREWALL".to_string(),
+                            manifest_id: "<no_manifest>".to_string(),
+                            path: request
+                                .path
+                                .as_ref()
+                                .map_or_else(
+                                    || "<no_path>".to_string(),
+                                    |p| p.to_string_lossy().to_string(),
+                                ),
+                            reason: error.to_string(),
+                            mandatory_termination: true,
+                        });
+
+                        if let Some(ref metrics) = self.metrics {
+                            let latency = start_time.elapsed().as_secs_f64();
+                            metrics
+                                .daemon_metrics()
+                                .context_firewall_denied("PATH_RATCHET_CONTEXT_MISSING");
+                            metrics
+                                .daemon_metrics()
+                                .session_terminated("PATH_RATCHET_CONTEXT_MISSING");
+                            metrics.daemon_metrics().record_tool_mediation_latency(
+                                tool_id,
+                                "terminate",
+                                latency,
+                            );
+                        }
+                        respond!(ToolDecision::Terminate {
+                            request_id: request.request_id.clone(),
+                            termination_info: Box::new(SessionTerminationInfo::new(
+                                request.episode_id.to_string(),
+                                "PATH_RATCHET_CONTEXT_MISSING",
+                                "FAILURE",
+                            )),
+                            refinement_event: None,
+                        });
+                    }
+
                     warn!(
-                        risk_tier = request.risk_tier.tier(),
+                        risk_tier = tier_value,
                         error = %error,
                         "path ratchet denied actuation"
                     );
@@ -4100,10 +4154,11 @@ mod tests {
     }
 
     /// TCK-00376 regression: Tier3 request for a tool class not covered by
-    /// context firewall (e.g., Network) MUST be denied because no per-request
-    /// firewall check executed.
+    /// context firewall (e.g., Network) MUST be terminated because no per-
+    /// request firewall check executed. Per REQ-0029, Tier3+ context-firewall
+    /// violations produce Terminate + defect.
     #[tokio::test]
-    async fn test_context_firewall_uncovered_tool_class_tier3_denied() {
+    async fn test_context_firewall_uncovered_tool_class_tier3_terminates() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = CapabilityManifest::builder("test-manifest")
@@ -4126,23 +4181,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Tier3 network request: firewall present but not checked → ratchet denies
+        // Tier3 network request: firewall present but not checked → ratchet terminates
         let request = make_tiered_request("req-net-t3", ToolClass::Network, None, RiskTier::Tier3);
-        let decision = broker
-            .request(&request, timestamp_ns(0), None)
+        let response = broker
+            .request_with_response(&request, timestamp_ns(0), None)
             .await
             .unwrap();
         assert!(
-            decision.is_denied(),
-            "Tier3 network request with context manifest but no firewall check must be denied, got: {decision:?}"
+            response.decision.is_terminate(),
+            "Tier3 network request with unchecked firewall must terminate (REQ-0029), got: {:?}",
+            response.decision
         );
-        if let ToolDecision::Deny { rule_id, .. } = &decision {
-            assert_eq!(
-                rule_id.as_deref(),
-                Some("PATH_RATCHET"),
-                "denial must come from PATH_RATCHET"
-            );
-        }
+        assert!(
+            !response.defects.is_empty(),
+            "Tier3+ context-firewall ratchet denial MUST emit a defect"
+        );
+        assert_eq!(response.defects[0].risk_tier, 3);
+        assert!(response.defects[0].mandatory_termination);
     }
 
     // =========================================================================
@@ -6277,9 +6332,9 @@ policy:
     }
 
     /// TCK-00376 regression: Tier3 read request without context manifest
-    /// MUST be denied by the path ratchet.
+    /// MUST be TERMINATED (not just denied) per REQ-0029.
     #[tokio::test]
-    async fn test_path_ratchet_tier3_no_context_manifest_denied() {
+    async fn test_path_ratchet_tier3_no_context_manifest_terminates() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
@@ -6295,23 +6350,34 @@ policy:
             Some("/workspace/file.rs"),
             RiskTier::Tier3,
         );
-        let decision = broker
-            .request(&request, timestamp_ns(0), None)
+        let response = broker
+            .request_with_response(&request, timestamp_ns(0), None)
             .await
             .unwrap();
+        let decision = &response.decision;
+        let defects = &response.defects;
+
         assert!(
-            decision.is_denied(),
-            "Tier3 without context manifest must be denied, got: {decision:?}"
+            decision.is_terminate(),
+            "Tier3 without context manifest must terminate (REQ-0029), got: {decision:?}"
         );
-        if let ToolDecision::Deny { rule_id, .. } = &decision {
-            assert_eq!(rule_id.as_deref(), Some("PATH_RATCHET"));
-        }
+
+        // Must emit at least one defect for audit trail
+        assert!(
+            !defects.is_empty(),
+            "Tier3+ context-firewall ratchet denial MUST emit a defect"
+        );
+        assert_eq!(defects[0].risk_tier, 3);
+        assert!(
+            defects[0].mandatory_termination,
+            "defect must flag mandatory termination"
+        );
     }
 
     /// TCK-00376 regression: Tier4 execute request without context manifest
-    /// MUST be denied by the path ratchet.
+    /// MUST be TERMINATED (not just denied) per REQ-0029.
     #[tokio::test]
-    async fn test_path_ratchet_tier4_no_context_manifest_denied() {
+    async fn test_path_ratchet_tier4_no_context_manifest_terminates() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = CapabilityManifest::builder("test-manifest")
@@ -6326,13 +6392,18 @@ policy:
         let mut request =
             make_tiered_request("req-ratchet-3", ToolClass::Execute, None, RiskTier::Tier4);
         request = request.with_shell_command("ls -la");
-        let decision = broker
-            .request(&request, timestamp_ns(0), None)
+        let response = broker
+            .request_with_response(&request, timestamp_ns(0), None)
             .await
             .unwrap();
         assert!(
-            decision.is_denied(),
-            "Tier4 without context manifest must be denied, got: {decision:?}"
+            response.decision.is_terminate(),
+            "Tier4 without context manifest must terminate (REQ-0029), got: {:?}",
+            response.decision
+        );
+        assert!(
+            !response.defects.is_empty(),
+            "Tier4+ context-firewall ratchet denial MUST emit a defect"
         );
     }
 
@@ -6406,11 +6477,12 @@ policy:
     }
 
     /// TCK-00376 regression: Tier2 request WITH context manifest loaded
-    /// but without runtime capsule wiring MUST be denied. Capsule admission
-    /// is currently reported as Unavailable (not yet wired into the broker),
-    /// so Tier2+ requests are fail-closed until capsule runtime lands.
+    /// but without runtime capsule wiring is ALLOWED (with warnings).
+    /// Per REQ-0028, capsule containment is mandatory at Tier3+, not Tier2.
+    /// Capsule admission is reported as Unavailable (not yet wired), but
+    /// Tier2 only gets a warning.
     #[tokio::test]
-    async fn test_path_ratchet_tier2_with_context_manifest_denied_capsule_unavailable() {
+    async fn test_path_ratchet_tier2_with_context_manifest_allowed_capsule_unavailable() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = CapabilityManifest::builder("test-manifest")
@@ -6446,11 +6518,58 @@ policy:
             .request(&request, timestamp_ns(0), None)
             .await
             .unwrap();
-        // Capsule admission is Unavailable (not wired at runtime), so Tier2+
-        // is denied by the path ratchet (fail-closed).
+        // Per REQ-0028: capsule mandatory at Tier3+, so Tier2 is allowed
+        assert!(
+            decision.is_allowed(),
+            "Tier2 with capsule unavailable should be allowed (REQ-0028: capsule mandatory at Tier3+), got: {decision:?}"
+        );
+    }
+
+    /// TCK-00376 regression: Tier3 request WITH context manifest loaded
+    /// but without runtime capsule wiring MUST be denied (capsule fail-closed).
+    /// Per REQ-0028, capsule containment is mandatory at Tier3+.
+    #[tokio::test]
+    async fn test_path_ratchet_tier3_with_context_manifest_denied_capsule_unavailable() {
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(vec![ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Load a context manifest (with write_allowlist)
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/file.rs", [0x42; 32])],
+            vec![PathBuf::from("/workspace")],
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        let request = make_tiered_request(
+            "req-ratchet-7",
+            ToolClass::Write,
+            Some("/workspace/file.rs"),
+            RiskTier::Tier3,
+        );
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+        // Capsule admission is Unavailable (not wired at runtime), so Tier3+
+        // is denied by the path ratchet (fail-closed, REQ-0028).
         assert!(
             decision.is_denied(),
-            "Tier2 with capsule unavailable must be denied by path ratchet, got: {decision:?}"
+            "Tier3 with capsule unavailable must be denied by path ratchet, got: {decision:?}"
         );
         if let ToolDecision::Deny {
             rule_id, reason, ..
@@ -6469,8 +6588,9 @@ policy:
     ///
     /// Scenario: Prime the dedupe cache at Tier0 (allowed with warnings), then
     /// issue a Tier2 request with the same dedupe key. The Tier2 request must
-    /// be denied by the path ratchet (capsule unavailable), NOT returned as a
-    /// cache hit. This verifies the ratchet runs before cache lookup.
+    /// be denied by the path ratchet (context firewall unavailable), NOT
+    /// returned as a cache hit. This verifies the ratchet runs before cache
+    /// lookup.
     #[tokio::test]
     async fn test_path_ratchet_cache_hit_does_not_bypass_ratchet() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
@@ -6546,7 +6666,8 @@ policy:
 
     /// TCK-00376 regression: Comprehensive bypass prevention test.
     /// Tests that EVERY combination of (Tier2, Tier3, Tier4) without context
-    /// manifest is denied. Prevents accidental bypass reintroduction.
+    /// manifest is blocked. Tier2 is denied; Tier3+ is terminated (REQ-0029).
+    /// Prevents accidental bypass reintroduction.
     #[tokio::test]
     async fn test_path_ratchet_regression_no_bypass_at_mandatory_tiers() {
         for tier in [RiskTier::Tier2, RiskTier::Tier3, RiskTier::Tier4] {
@@ -6576,10 +6697,20 @@ policy:
                 .request(&request, timestamp_ns(0), None)
                 .await
                 .unwrap();
-            assert!(
-                decision.is_denied(),
-                "tier {tier:?} without context manifest must be denied by path ratchet, got: {decision:?}"
-            );
+
+            if tier.tier() >= 3 {
+                // Tier3+: context-firewall missing → Terminate (REQ-0029)
+                assert!(
+                    decision.is_terminate(),
+                    "tier {tier:?} without context manifest must terminate (REQ-0029), got: {decision:?}"
+                );
+            } else {
+                // Tier2: context-firewall missing → Deny
+                assert!(
+                    decision.is_denied(),
+                    "tier {tier:?} without context manifest must be denied by path ratchet, got: {decision:?}"
+                );
+            }
         }
     }
 }
