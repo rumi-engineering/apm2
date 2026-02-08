@@ -1,7 +1,7 @@
 //! FAC review orchestration commands.
 //!
 //! This module provides VPS-oriented, FAC-first review execution with:
-//! - Sequential security/quality orchestration
+//! - Security/quality orchestration (parallel when `--type all`)
 //! - Multi-model backend dispatch (Codex + Gemini)
 //! - NDJSON lifecycle telemetry under `~/.apm2/review_events.ndjson`
 //! - Pulse-file based SHA freshness checks and resume flow
@@ -14,12 +14,14 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::ValueEnum;
+use fs2::FileExt;
 use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -116,6 +118,10 @@ struct ReviewStateEntry {
     prompt_file: Option<PathBuf>,
     #[serde(default)]
     last_message_file: Option<PathBuf>,
+    #[serde(default = "default_review_type")]
+    review_type: String,
+    #[serde(default)]
+    pr_number: u32,
     pr_url: String,
     head_sha: String,
     #[serde(default)]
@@ -167,7 +173,7 @@ struct ReviewRunSummary {
 #[derive(Debug, Clone)]
 struct ExecutionContext {
     pr_number: u32,
-    seq: u64,
+    seq: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +219,10 @@ const MODEL_POOL: [ModelPoolEntry; 3] = [
 
 fn default_model() -> String {
     "gpt-5.3-codex".to_string()
+}
+
+fn default_review_type() -> String {
+    "unknown".to_string()
 }
 
 fn now_iso8601_millis() -> String {
@@ -368,7 +378,7 @@ fn run_review_inner(
     expected_head_sha: Option<&str>,
 ) -> Result<ReviewRunSummary, String> {
     let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
-    let mut current_head_sha = fetch_pr_head_sha(&owner_repo, pr_number)?;
+    let current_head_sha = fetch_pr_head_sha(&owner_repo, pr_number)?;
     let initial_head_sha = current_head_sha.clone();
     if let Some(expected) = expected_head_sha {
         validate_expected_head_sha(expected)?;
@@ -379,43 +389,99 @@ fn run_review_inner(
         }
     }
 
-    let mut event_ctx = ExecutionContext { pr_number, seq: 0 };
+    let event_ctx = ExecutionContext {
+        pr_number,
+        seq: Arc::new(AtomicU64::new(0)),
+    };
     let total_started = Instant::now();
     let mut security_summary = None;
     let mut quality_summary = None;
+    let mut final_heads = vec![initial_head_sha.clone()];
 
-    if matches!(review_type, ReviewRunType::Security | ReviewRunType::All) {
-        let selected = select_review_model_random();
-        let result = run_single_review(
-            pr_url,
-            &owner_repo,
-            pr_number,
-            ReviewKind::Security,
-            current_head_sha.clone(),
-            selected,
-            &mut event_ctx,
-        )?;
-        current_head_sha.clone_from(&result.final_head_sha);
-        security_summary = Some(result.summary);
+    match review_type {
+        ReviewRunType::Security => {
+            let selected = select_review_model_random();
+            let result = run_single_review(
+                pr_url,
+                &owner_repo,
+                pr_number,
+                ReviewKind::Security,
+                current_head_sha,
+                selected,
+                &event_ctx,
+            )?;
+            final_heads.push(result.final_head_sha.clone());
+            security_summary = Some(result.summary);
+        },
+        ReviewRunType::Quality => {
+            let selected = select_review_model_random();
+            let result = run_single_review(
+                pr_url,
+                &owner_repo,
+                pr_number,
+                ReviewKind::Quality,
+                current_head_sha,
+                selected,
+                &event_ctx,
+            )?;
+            final_heads.push(result.final_head_sha.clone());
+            quality_summary = Some(result.summary);
+        },
+        ReviewRunType::All => {
+            let sec_pr_url = pr_url.to_string();
+            let sec_owner_repo = owner_repo.clone();
+            let sec_head = current_head_sha.clone();
+            let sec_ctx = event_ctx.clone();
+            let sec_model = select_review_model_random();
+            let sec_handle = thread::spawn(move || {
+                run_single_review(
+                    &sec_pr_url,
+                    &sec_owner_repo,
+                    pr_number,
+                    ReviewKind::Security,
+                    sec_head,
+                    sec_model,
+                    &sec_ctx,
+                )
+            });
+
+            let qual_pr_url = pr_url.to_string();
+            let qual_owner_repo = owner_repo.clone();
+            let qual_head = current_head_sha;
+            let qual_ctx = event_ctx.clone();
+            let qual_model = select_review_model_random();
+            let qual_handle = thread::spawn(move || {
+                run_single_review(
+                    &qual_pr_url,
+                    &qual_owner_repo,
+                    pr_number,
+                    ReviewKind::Quality,
+                    qual_head,
+                    qual_model,
+                    &qual_ctx,
+                )
+            });
+
+            let sec_result = sec_handle
+                .join()
+                .map_err(|_| "security review worker panicked".to_string())??;
+            let qual_result = qual_handle
+                .join()
+                .map_err(|_| "quality review worker panicked".to_string())??;
+            final_heads.push(sec_result.final_head_sha.clone());
+            final_heads.push(qual_result.final_head_sha.clone());
+            security_summary = Some(sec_result.summary);
+            quality_summary = Some(qual_result.summary);
+        },
     }
 
-    if matches!(review_type, ReviewRunType::Quality | ReviewRunType::All) {
-        let selected = select_review_model_random();
-        let result = run_single_review(
-            pr_url,
-            &owner_repo,
-            pr_number,
-            ReviewKind::Quality,
-            current_head_sha.clone(),
-            selected,
-            &mut event_ctx,
-        )?;
-        current_head_sha.clone_from(&result.final_head_sha);
-        quality_summary = Some(result.summary);
-    }
+    let current_head_sha = fetch_pr_head_sha(&owner_repo, pr_number)
+        .ok()
+        .or_else(|| final_heads.into_iter().last())
+        .unwrap_or_else(|| initial_head_sha.clone());
 
     emit_event(
-        &mut event_ctx,
+        &event_ctx,
         "sequence_done",
         "all",
         &current_head_sha,
@@ -448,7 +514,7 @@ fn run_single_review(
     review_kind: ReviewKind,
     initial_head_sha: String,
     initial_model: ReviewModelSelection,
-    event_ctx: &mut ExecutionContext,
+    event_ctx: &ExecutionContext,
 ) -> Result<SingleReviewResult, String> {
     let repo_root = resolve_repo_root()?;
     let prompt_template = repo_root.join(review_kind.prompt_path());
@@ -487,15 +553,50 @@ fn run_single_review(
         .keep()
         .map_err(|err| format!("failed to persist last-message tempfile: {err}"))?;
 
-    let mut state = ReviewStateFile::load()?;
-
     let mut current_head_sha = initial_head_sha;
     let mut current_model = ensure_model_backend_available(initial_model)?;
     let mut spawn_mode = SpawnMode::Initial;
     let mut restart_count: u32 = 0;
     let review_started = Instant::now();
+    let review_type = review_kind.as_str();
 
-    write_pulse_file(review_kind.as_str(), &current_head_sha)?;
+    let Some(_lease) = try_acquire_review_lease(owner_repo, pr_number, review_type)? else {
+        let existing = find_active_review_entry(pr_number, review_type, Some(&current_head_sha))?;
+        emit_event(
+            event_ctx,
+            "run_deduplicated",
+            review_type,
+            &current_head_sha,
+            serde_json::json!({
+                "reason": "active_review_for_same_type",
+                "existing_pid": existing.as_ref().map(|entry| entry.pid),
+                "existing_sha": existing.as_ref().map(|entry| entry.head_sha.clone()),
+            }),
+        )?;
+        let model = existing
+            .as_ref()
+            .map_or_else(|| current_model.model.clone(), |entry| entry.model.clone());
+        let backend = existing.as_ref().map_or_else(
+            || current_model.backend.as_str().to_string(),
+            |entry| entry.backend.as_str().to_string(),
+        );
+        let restart_count = existing.as_ref().map_or(0, |entry| entry.restart_count);
+        return Ok(SingleReviewResult {
+            summary: SingleReviewSummary {
+                review_type: review_type.to_string(),
+                success: true,
+                verdict: "DEDUPED".to_string(),
+                model,
+                backend,
+                duration_secs: review_started.elapsed().as_secs(),
+                restart_count,
+            },
+            final_head_sha: current_head_sha,
+        });
+    };
+
+    write_pulse_file(pr_number, review_type, &current_head_sha)?;
+    let run_key = build_run_key(pr_number, review_type, &current_head_sha);
 
     'restart_loop: loop {
         let (owner, repo) = split_owner_repo(owner_repo)?;
@@ -527,14 +628,16 @@ fn run_single_review(
             .spawn()
             .map_err(|err| format!("failed to spawn {} review: {err}", review_kind.display()))?;
 
-        state.reviewers.insert(
-            review_kind.as_str().to_string(),
+        upsert_review_state_entry(
+            &run_key,
             ReviewStateEntry {
                 pid: child.id(),
                 started_at: Utc::now(),
                 log_file: log_path.clone(),
                 prompt_file: Some(prompt_path.clone()),
                 last_message_file: Some(last_message_path.clone()),
+                review_type: review_type.to_string(),
+                pr_number,
                 pr_url: pr_url.to_string(),
                 head_sha: current_head_sha.clone(),
                 restart_count,
@@ -542,13 +645,12 @@ fn run_single_review(
                 backend: current_model.backend,
                 temp_files: Vec::new(),
             },
-        );
-        state.save()?;
+        )?;
 
         emit_event(
             event_ctx,
             "run_start",
-            review_kind.as_str(),
+            review_type,
             &current_head_sha,
             serde_json::json!({
                 "model": current_model.model,
@@ -586,7 +688,7 @@ fn run_single_review(
                         emit_event(
                             event_ctx,
                             "run_complete",
-                            review_kind.as_str(),
+                            review_type,
                             &current_head_sha,
                             serde_json::json!({
                                 "exit_code": exit_code.unwrap_or(0),
@@ -599,7 +701,7 @@ fn run_single_review(
                             emit_event(
                                 event_ctx,
                                 "review_posted",
-                                review_kind.as_str(),
+                                review_type,
                                 &current_head_sha,
                                 serde_json::json!({
                                     "comment_id": comment_id,
@@ -612,7 +714,7 @@ fn run_single_review(
                         emit_event(
                             event_ctx,
                             "pulse_check",
-                            review_kind.as_str(),
+                            review_type,
                             &current_head_sha,
                             serde_json::json!({
                                 "pulse_sha": latest_head,
@@ -624,7 +726,7 @@ fn run_single_review(
                             emit_event(
                                 event_ctx,
                                 "sha_update",
-                                review_kind.as_str(),
+                                review_type,
                                 &old_sha,
                                 serde_json::json!({
                                     "old_sha": old_sha,
@@ -632,7 +734,7 @@ fn run_single_review(
                                 }),
                             )?;
                             current_head_sha.clone_from(&latest_head);
-                            write_pulse_file(review_kind.as_str(), &current_head_sha)?;
+                            write_pulse_file(pr_number, review_type, &current_head_sha)?;
                             spawn_mode = SpawnMode::Resume {
                                 message: build_sha_update_message(
                                     pr_number,
@@ -643,12 +745,11 @@ fn run_single_review(
                             continue 'restart_loop;
                         }
 
-                        state.reviewers.remove(review_kind.as_str());
-                        state.save()?;
+                        remove_review_state_entry(&run_key)?;
 
                         return Ok(SingleReviewResult {
                             summary: SingleReviewSummary {
-                                review_type: review_kind.as_str().to_string(),
+                                review_type: review_type.to_string(),
                                 success: true,
                                 verdict,
                                 model: current_model.model,
@@ -663,7 +764,7 @@ fn run_single_review(
                     emit_event(
                         event_ctx,
                         "run_crash",
-                        review_kind.as_str(),
+                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "exit_code": exit_code.unwrap_or(0),
@@ -679,7 +780,7 @@ fn run_single_review(
                     emit_event(
                         event_ctx,
                         "run_crash",
-                        review_kind.as_str(),
+                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "exit_code": exit_code.unwrap_or(1),
@@ -691,11 +792,10 @@ fn run_single_review(
 
                     restart_count = restart_count.saturating_add(1);
                     if restart_count > MAX_RESTART_ATTEMPTS {
-                        state.reviewers.remove(review_kind.as_str());
-                        state.save()?;
+                        remove_review_state_entry(&run_key)?;
                         return Ok(SingleReviewResult {
                             summary: SingleReviewSummary {
-                                review_type: review_kind.as_str().to_string(),
+                                review_type: review_type.to_string(),
                                 success: false,
                                 verdict: "UNKNOWN".to_string(),
                                 model: current_model.model,
@@ -717,7 +817,7 @@ fn run_single_review(
                     emit_event(
                         event_ctx,
                         "model_fallback",
-                        review_kind.as_str(),
+                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "from_model": current_model.model,
@@ -733,11 +833,10 @@ fn run_single_review(
 
                 restart_count = restart_count.saturating_add(1);
                 if restart_count > MAX_RESTART_ATTEMPTS {
-                    state.reviewers.remove(review_kind.as_str());
-                    state.save()?;
+                    remove_review_state_entry(&run_key)?;
                     return Ok(SingleReviewResult {
                         summary: SingleReviewSummary {
-                            review_type: review_kind.as_str().to_string(),
+                            review_type: review_type.to_string(),
                             success: false,
                             verdict: "UNKNOWN".to_string(),
                             model: current_model.model,
@@ -760,7 +859,7 @@ fn run_single_review(
                 emit_event(
                     event_ctx,
                     "model_fallback",
-                    review_kind.as_str(),
+                    review_type,
                     &current_head_sha,
                     serde_json::json!({
                         "from_model": current_model.model,
@@ -781,7 +880,7 @@ fn run_single_review(
                 emit_event(
                     event_ctx,
                     "pulse_check",
-                    review_kind.as_str(),
+                    review_type,
                     &current_head_sha,
                     serde_json::json!({
                         "pulse_sha": latest_head,
@@ -794,7 +893,7 @@ fn run_single_review(
                     emit_event(
                         event_ctx,
                         "sha_update",
-                        review_kind.as_str(),
+                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "old_sha": current_head_sha,
@@ -804,7 +903,7 @@ fn run_single_review(
                     terminate_child(&mut child)?;
                     let old_sha = current_head_sha.clone();
                     current_head_sha.clone_from(&latest_head);
-                    write_pulse_file(review_kind.as_str(), &current_head_sha)?;
+                    write_pulse_file(pr_number, review_type, &current_head_sha)?;
                     spawn_mode = SpawnMode::Resume {
                         message: build_sha_update_message(pr_number, &old_sha, &latest_head),
                     };
@@ -823,7 +922,7 @@ fn run_single_review(
                 emit_event(
                     event_ctx,
                     "liveness_check",
-                    review_kind.as_str(),
+                    review_type,
                     &current_head_sha,
                     serde_json::json!({
                         "events_since_last": liveness.events_since_last,
@@ -837,7 +936,7 @@ fn run_single_review(
                     emit_event(
                         event_ctx,
                         "run_crash",
-                        review_kind.as_str(),
+                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "exit_code": -1,
@@ -851,11 +950,10 @@ fn run_single_review(
                     terminate_child(&mut child)?;
                     restart_count = restart_count.saturating_add(1);
                     if restart_count > MAX_RESTART_ATTEMPTS {
-                        state.reviewers.remove(review_kind.as_str());
-                        state.save()?;
+                        remove_review_state_entry(&run_key)?;
                         return Ok(SingleReviewResult {
                             summary: SingleReviewSummary {
-                                review_type: review_kind.as_str().to_string(),
+                                review_type: review_type.to_string(),
                                 success: false,
                                 verdict: "UNKNOWN".to_string(),
                                 model: current_model.model,
@@ -875,7 +973,7 @@ fn run_single_review(
                     emit_event(
                         event_ctx,
                         "model_fallback",
-                        review_kind.as_str(),
+                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "from_model": current_model.model,
@@ -892,7 +990,7 @@ fn run_single_review(
                     emit_event(
                         event_ctx,
                         "stall_detected",
-                        review_kind.as_str(),
+                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "stall_duration_secs": last_progress_at.elapsed().as_secs(),
@@ -904,11 +1002,10 @@ fn run_single_review(
 
                     restart_count = restart_count.saturating_add(1);
                     if restart_count > MAX_RESTART_ATTEMPTS {
-                        state.reviewers.remove(review_kind.as_str());
-                        state.save()?;
+                        remove_review_state_entry(&run_key)?;
                         return Ok(SingleReviewResult {
                             summary: SingleReviewSummary {
-                                review_type: review_kind.as_str().to_string(),
+                                review_type: review_type.to_string(),
                                 success: false,
                                 verdict: "UNKNOWN".to_string(),
                                 model: current_model.model,
@@ -925,7 +1022,7 @@ fn run_single_review(
                     emit_event(
                         event_ctx,
                         "model_fallback",
-                        review_kind.as_str(),
+                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "from_model": current_model.model,
@@ -964,7 +1061,7 @@ fn run_status_inner(
         (None, None) => None,
     };
 
-    let state = ReviewStateFile::load()?;
+    let state = with_review_state_shared(|state| Ok(state.clone()))?;
     let events = read_last_event_values(40)?;
 
     let filtered_state = state
@@ -972,12 +1069,25 @@ fn run_status_inner(
         .iter()
         .filter(|(_, entry)| {
             filter_pr.is_none_or(|number| {
-                parse_pr_url(&entry.pr_url).is_ok_and(|(_, pr_num)| pr_num == number)
+                if entry.pr_number > 0 {
+                    entry.pr_number == number
+                } else {
+                    parse_pr_url(&entry.pr_url).is_ok_and(|(_, pr_num)| pr_num == number)
+                }
             })
         })
-        .map(|(kind, entry)| {
+        .map(|(run_key, entry)| {
+            let entry_pr = if entry.pr_number > 0 {
+                entry.pr_number
+            } else {
+                parse_pr_url(&entry.pr_url)
+                    .map(|(_, pr_num)| pr_num)
+                    .unwrap_or(0)
+            };
             serde_json::json!({
-                "review_type": kind,
+                "run_key": run_key,
+                "review_type": entry.review_type,
+                "pr_number": entry_pr,
                 "pid": entry.pid,
                 "alive": is_process_alive(entry.pid),
                 "started_at": entry.started_at,
@@ -995,8 +1105,14 @@ fn run_status_inner(
         })
         .collect::<Vec<_>>();
 
-    let pulse_security = read_pulse_file("security")?;
-    let pulse_quality = read_pulse_file("quality")?;
+    let pulse_security = filter_pr
+        .map(|number| read_pulse_file(number, "security"))
+        .transpose()?
+        .flatten();
+    let pulse_quality = filter_pr
+        .map(|number| read_pulse_file(number, "quality"))
+        .transpose()?
+        .flatten();
 
     let filtered_events = events
         .into_iter()
@@ -1063,18 +1179,22 @@ fn run_status_inner(
         }
     }
     println!("  Pulse Files:");
-    println!(
-        "    security: {}",
-        pulse_security
-            .as_ref()
-            .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
-    );
-    println!(
-        "    quality:  {}",
-        pulse_quality
-            .as_ref()
-            .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
-    );
+    if filter_pr.is_none() {
+        println!("    (set --pr or --pr-url to inspect PR-scoped pulse files)");
+    } else {
+        println!(
+            "    security: {}",
+            pulse_security
+                .as_ref()
+                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
+        );
+        println!(
+            "    quality:  {}",
+            pulse_quality
+                .as_ref()
+                .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
+        );
+    }
 
     Ok(())
 }
@@ -1547,20 +1667,20 @@ fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
 }
 
 fn emit_event(
-    ctx: &mut ExecutionContext,
+    ctx: &ExecutionContext,
     event_name: &str,
     review_type: &str,
     head_sha: &str,
     extra: serde_json::Value,
 ) -> Result<(), String> {
-    ctx.seq = ctx.seq.saturating_add(1);
+    let seq = ctx.seq.fetch_add(1, Ordering::SeqCst).saturating_add(1);
     let mut envelope = serde_json::Map::new();
     envelope.insert("ts".to_string(), serde_json::json!(now_iso8601_millis()));
     envelope.insert("event".to_string(), serde_json::json!(event_name));
     envelope.insert("review_type".to_string(), serde_json::json!(review_type));
     envelope.insert("pr_number".to_string(), serde_json::json!(ctx.pr_number));
     envelope.insert("head_sha".to_string(), serde_json::json!(head_sha));
-    envelope.insert("seq".to_string(), serde_json::json!(ctx.seq));
+    envelope.insert("seq".to_string(), serde_json::json!(seq));
     if let serde_json::Value::Object(extra_fields) = extra {
         for (key, value) in extra_fields {
             envelope.insert(key, value);
@@ -1583,6 +1703,10 @@ fn review_state_path() -> Result<PathBuf, String> {
     Ok(apm2_home_dir()?.join("review_state.json"))
 }
 
+fn review_state_lock_path() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?.join("review_state.lock"))
+}
+
 fn review_events_rotated_path(events_path: &Path) -> Result<PathBuf, String> {
     let parent = events_path
         .parent()
@@ -1590,7 +1714,42 @@ fn review_events_rotated_path(events_path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join("review_events.ndjson.1"))
 }
 
-fn pulse_file_path(review_type: &str) -> Result<PathBuf, String> {
+fn review_events_lock_path() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?.join("review_events.ndjson.lock"))
+}
+
+fn review_locks_dir_path() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?.join("review_locks"))
+}
+
+fn review_lock_path(
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<PathBuf, String> {
+    let safe_repo = sanitize_for_path(owner_repo);
+    let safe_type = sanitize_for_path(review_type);
+    Ok(review_locks_dir_path()?.join(format!("{safe_repo}-pr{pr_number}-{safe_type}.lock")))
+}
+
+fn review_pulses_dir_path() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?.join("review_pulses"))
+}
+
+fn pulse_file_path(pr_number: u32, review_type: &str) -> Result<PathBuf, String> {
+    let suffix = match review_type {
+        "security" => "review_pulse_security.json",
+        "quality" => "review_pulse_quality.json",
+        other => {
+            return Err(format!(
+                "invalid pulse review type: {other} (expected security|quality)"
+            ));
+        },
+    };
+    Ok(review_pulses_dir_path()?.join(format!("pr{pr_number}_{suffix}")))
+}
+
+fn legacy_pulse_file_path(review_type: &str) -> Result<PathBuf, String> {
     let suffix = match review_type {
         "security" => "review_pulse_security.json",
         "quality" => "review_pulse_quality.json",
@@ -1624,6 +1783,17 @@ fn emit_review_event_to_path(events_path: &Path, event: &serde_json::Value) -> R
         .lock()
         .map_err(|_| "event file lock poisoned".to_string())?;
     ensure_parent_dir(events_path)?;
+    let lock_path = review_events_lock_path()?;
+    ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open event lock {}: {err}", lock_path.display()))?;
+    FileExt::lock_exclusive(&lock_file)
+        .map_err(|err| format!("failed to lock event stream {}: {err}", lock_path.display()))?;
 
     if let Ok(meta) = fs::metadata(events_path) {
         if meta.len() > EVENT_ROTATE_BYTES {
@@ -1646,11 +1816,12 @@ fn emit_review_event_to_path(events_path: &Path, event: &serde_json::Value) -> R
         .map_err(|err| format!("failed to write newline: {err}"))?;
     file.sync_all()
         .map_err(|err| format!("failed to sync {}: {err}", events_path.display()))?;
+    drop(lock_file);
     Ok(())
 }
 
-pub fn write_pulse_file(review_type: &str, head_sha: &str) -> Result<(), String> {
-    let path = pulse_file_path(review_type)?;
+pub fn write_pulse_file(pr_number: u32, review_type: &str, head_sha: &str) -> Result<(), String> {
+    let path = pulse_file_path(pr_number, review_type)?;
     write_pulse_file_to_path(&path, head_sha)
 }
 
@@ -1662,12 +1833,29 @@ fn write_pulse_file_to_path(path: &Path, head_sha: &str) -> Result<(), String> {
     };
     let content = serde_json::to_vec_pretty(&pulse)
         .map_err(|err| format!("failed to serialize pulse file: {err}"))?;
-    fs::write(path, content).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("pulse path has no parent: {}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to create pulse temp file: {err}"))?;
+    temp.write_all(&content)
+        .map_err(|err| format!("failed to write pulse temp file: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync pulse temp file: {err}"))?;
+    temp.persist(path)
+        .map_err(|err| format!("failed to persist {}: {err}", path.display()))?;
+    Ok(())
 }
 
-pub fn read_pulse_file(review_type: &str) -> Result<Option<PulseFile>, String> {
-    let path = pulse_file_path(review_type)?;
-    read_pulse_file_from_path(&path)
+pub fn read_pulse_file(pr_number: u32, review_type: &str) -> Result<Option<PulseFile>, String> {
+    let path = pulse_file_path(pr_number, review_type)?;
+    if let Some(pulse) = read_pulse_file_from_path(&path)? {
+        Ok(Some(pulse))
+    } else {
+        let legacy = legacy_pulse_file_path(review_type)?;
+        read_pulse_file_from_path(&legacy)
+    }
 }
 
 fn read_pulse_file_from_path(path: &Path) -> Result<Option<PulseFile>, String> {
@@ -1682,9 +1870,8 @@ fn read_pulse_file_from_path(path: &Path) -> Result<Option<PulseFile>, String> {
 }
 
 impl ReviewStateFile {
-    fn load() -> Result<Self, String> {
-        let path = review_state_path()?;
-        let content = match fs::read_to_string(&path) {
+    fn load_from_path(path: &Path) -> Result<Self, String> {
+        let content = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
@@ -1693,9 +1880,8 @@ impl ReviewStateFile {
             .map_err(|err| format!("failed to parse {}: {err}", path.display()))
     }
 
-    fn save(&self) -> Result<(), String> {
-        let path = review_state_path()?;
-        ensure_parent_dir(&path)?;
+    fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        ensure_parent_dir(path)?;
         let serialized = serde_json::to_vec_pretty(self)
             .map_err(|err| format!("failed to serialize review state: {err}"))?;
 
@@ -1709,10 +1895,143 @@ impl ReviewStateFile {
         temp.as_file()
             .sync_all()
             .map_err(|err| format!("failed to sync temp state file: {err}"))?;
-        temp.persist(&path)
+        temp.persist(path)
             .map_err(|err| format!("failed to persist {}: {err}", path.display()))?;
         Ok(())
     }
+}
+
+fn with_review_state_shared<T>(
+    operation: impl FnOnce(&ReviewStateFile) -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = review_state_lock_path()?;
+    let state_path = review_state_path()?;
+    ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open state lock {}: {err}", lock_path.display()))?;
+    FileExt::lock_shared(&lock_file)
+        .map_err(|err| format!("failed to lock state {}: {err}", lock_path.display()))?;
+    let state = ReviewStateFile::load_from_path(&state_path)?;
+    let result = operation(&state);
+    drop(lock_file);
+    result
+}
+
+fn with_review_state_exclusive<T>(
+    operation: impl FnOnce(&mut ReviewStateFile) -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = review_state_lock_path()?;
+    let state_path = review_state_path()?;
+    ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open state lock {}: {err}", lock_path.display()))?;
+    FileExt::lock_exclusive(&lock_file)
+        .map_err(|err| format!("failed to lock state {}: {err}", lock_path.display()))?;
+    let mut state = ReviewStateFile::load_from_path(&state_path)?;
+    let result = operation(&mut state)?;
+    state.save_to_path(&state_path)?;
+    drop(lock_file);
+    Ok(result)
+}
+
+fn build_run_key(pr_number: u32, review_type: &str, head_sha: &str) -> String {
+    let head = &head_sha[..head_sha.len().min(8)];
+    let ts = now_iso8601_millis().replace([':', '.'], "");
+    format!("pr{pr_number}-{review_type}-{head}-{ts}")
+}
+
+fn sanitize_for_path(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+fn try_acquire_review_lease(
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+) -> Result<Option<File>, String> {
+    let lock_path = review_lock_path(owner_repo, pr_number, review_type)?;
+    ensure_parent_dir(&lock_path)?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open review lock {}: {err}", lock_path.display()))?;
+    match FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => Ok(Some(lock_file)),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(err) => Err(format!(
+            "failed to acquire review lock {}: {err}",
+            lock_path.display()
+        )),
+    }
+}
+
+fn upsert_review_state_entry(run_key: &str, entry: ReviewStateEntry) -> Result<(), String> {
+    with_review_state_exclusive(|state| {
+        state.reviewers.insert(run_key.to_string(), entry);
+        Ok(())
+    })
+}
+
+fn remove_review_state_entry(run_key: &str) -> Result<(), String> {
+    with_review_state_exclusive(|state| {
+        state.reviewers.remove(run_key);
+        Ok(())
+    })
+}
+
+fn entry_pr_number(entry: &ReviewStateEntry) -> Option<u32> {
+    if entry.pr_number > 0 {
+        Some(entry.pr_number)
+    } else {
+        parse_pr_url(&entry.pr_url).ok().map(|(_, number)| number)
+    }
+}
+
+fn find_active_review_entry(
+    pr_number: u32,
+    review_type: &str,
+    head_sha: Option<&str>,
+) -> Result<Option<ReviewStateEntry>, String> {
+    with_review_state_shared(|state| {
+        let mut candidates = state
+            .reviewers
+            .values()
+            .filter(|entry| entry_pr_number(entry).is_some_and(|number| number == pr_number))
+            .filter(|entry| entry.review_type.eq_ignore_ascii_case(review_type))
+            .filter(|entry| is_process_alive(entry.pid))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(head) = head_sha {
+            candidates.retain(|entry| entry.head_sha.eq_ignore_ascii_case(head));
+        }
+        candidates.sort_by_key(|entry| entry.started_at);
+        Ok(candidates.pop())
+    })
 }
 
 fn read_last_event_values(max_lines: usize) -> Result<Vec<serde_json::Value>, String> {
@@ -1906,6 +2225,8 @@ mod tests {
         });
         let entry: ReviewStateEntry =
             serde_json::from_value(json).expect("deserialize review state entry");
+        assert_eq!(entry.review_type, default_review_type());
+        assert_eq!(entry.pr_number, 0);
         assert_eq!(entry.model, default_model());
         assert_eq!(entry.backend, ReviewBackend::Codex);
     }

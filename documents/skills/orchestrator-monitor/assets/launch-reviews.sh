@@ -6,7 +6,7 @@
 # Primary path:
 #   apm2 fac review run <PR_URL> --type all
 # Fallback path:
-#   direct codex/gemini sequential invocation when apm2 is unavailable.
+#   direct codex/gemini parallel invocation when apm2 is unavailable.
 
 set -euo pipefail
 
@@ -64,15 +64,23 @@ envsubst '${PR_URL}' < "${REPO_ROOT}/documents/reviews/SECURITY_REVIEW_PROMPT.md
 envsubst '${PR_URL}' < "${REPO_ROOT}/documents/reviews/CODE_QUALITY_PROMPT.md" > "$QUAL_PROMPT"
 
 if command -v codex >/dev/null 2>&1; then
-  codex exec --model gpt-5.3-codex-xhigh --dangerously-bypass-approvals-and-sandbox --json - < "$SEC_PROMPT"
-  codex exec --model gpt-5.3-codex-xhigh --dangerously-bypass-approvals-and-sandbox --json - < "$QUAL_PROMPT"
-  exit 0
+  codex exec --model gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox --json - < "$SEC_PROMPT" &
+  sec_pid=$!
+  codex exec --model gpt-5.3-codex --dangerously-bypass-approvals-and-sandbox --json - < "$QUAL_PROMPT" &
+  qual_pid=$!
+  wait "$sec_pid"
+  wait "$qual_pid"
+  exit $?
 fi
 
 if command -v gemini >/dev/null 2>&1; then
-  gemini -m gemini-3.0-flash-preview -y -o stream-json -p "$(cat "$SEC_PROMPT")"
-  gemini -m gemini-3.0-flash-preview -y -o stream-json -p "$(cat "$QUAL_PROMPT")"
-  exit 0
+  gemini -m gemini-2.5-flash -y -o stream-json -p "$(cat "$SEC_PROMPT")" &
+  sec_pid=$!
+  gemini -m gemini-2.5-flash -y -o stream-json -p "$(cat "$QUAL_PROMPT")" &
+  qual_pid=$!
+  wait "$sec_pid"
+  wait "$qual_pid"
+  exit $?
 fi
 
 echo "ERROR: no usable review executor found (apm2, cargo, codex, gemini)."

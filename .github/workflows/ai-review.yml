@@ -192,6 +192,15 @@ jobs:
 
           launch_review_async() {
             local review_type="$1"
+            if command -v systemctl >/dev/null 2>&1; then
+              local active_units
+              active_units=$(systemctl --user list-units --type=service --state=running --plain --no-legend "apm2-review-pr${PR_NUMBER}-${review_type}-*.service" 2>/dev/null || true)
+              if [[ -n "${active_units//[[:space:]]/}" ]]; then
+                echo "dispatch review_type=${review_type} skipped=active-unit"
+                return 0
+              fi
+            fi
+
             local active_count
             active_count=$(jq -r --arg t "${review_type}" '
               [.state_entries[]? | select(.review_type == $t and (.alive // false))] | length

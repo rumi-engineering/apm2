@@ -16,7 +16,7 @@
 //!   context
 //! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
 //!   anchor
-//! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (sequential,
+//! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
 //!   multi-model)
 //! - `apm2 fac review status` - Show FAC review state and recent events
 //! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
@@ -154,7 +154,7 @@ pub enum FacSubcommand {
     /// Run and observe FAC review orchestration for pull requests.
     ///
     /// Provides VPS-oriented review execution and observability with
-    /// sequential `security -> quality` orchestration, model fallback, and
+    /// parallel `security + quality` orchestration, model fallback, and
     /// NDJSON telemetry under `~/.apm2`.
     Review(ReviewArgs),
 }

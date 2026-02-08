@@ -94,9 +94,9 @@ runtime_review_protocol:
   observability_surfaces:
     - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
     - "~/.apm2/review_state.json (active review process/model/backend state)"
-    - "~/.apm2/review_pulse_security.json and ~/.apm2/review_pulse_quality.json (HEAD SHA pulse files)"
+    - "~/.apm2/review_pulses/pr<PR>_review_pulse_{security|quality}.json (PR-scoped HEAD SHA pulse files)"
   required_semantics:
-    - "Review runs execute sequentially: security first, then quality."
+    - "Review runs execute security and quality in parallel when `--type all` is used."
     - "Mid-review SHA movement uses kill+resume flow with backend-native session resume."
     - "Stalls and crashes emit structured events and trigger bounded model fallback."
 
