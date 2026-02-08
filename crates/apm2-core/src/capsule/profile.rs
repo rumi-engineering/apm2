@@ -18,9 +18,11 @@
 //! TCK-00376 landed no-bypass path ratchet enforcement in the daemon
 //! broker (`PathRatchet`). The ratchet verifies that broker, capability,
 //! context firewall, and capsule admission checks have all been performed
-//! before allowing tool actuation at Tier2+. Capsule admission is
-//! currently validated in unit tests; runtime capsule wiring will follow
-//! in a future ticket.
+//! before allowing tool actuation at Tier2+. **Note**: Capsule admission
+//! is not yet wired at runtime; the ratchet reports it as `Unavailable`
+//! and denies Tier2+ until a future ticket integrates
+//! `AdmissionGate::check` into the broker path. Capsule admission logic
+//! is validated in unit tests only.
 
 use std::collections::BTreeSet;
 
@@ -1140,9 +1142,10 @@ impl AdmissionGate {
     ///
     /// TCK-00376 landed the `PathRatchet` in the daemon broker which tracks
     /// capsule admission status as one of the mandatory enforcement
-    /// components at Tier2+. The `AdmissionGate::check` is validated in
-    /// unit tests; full runtime spawn-path wiring follows in a future
-    /// ticket.
+    /// components at Tier2+. **Note**: Capsule admission is not yet wired
+    /// at runtime; the ratchet reports it as `Unavailable` and denies
+    /// Tier2+ until a future ticket integrates this gate into the broker
+    /// path. The `AdmissionGate::check` is validated in unit tests only.
     ///
     /// # Errors
     ///

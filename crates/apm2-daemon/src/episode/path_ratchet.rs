@@ -16,7 +16,11 @@
 //! 3. **Context firewall**: A `ContextPackManifest` must be loaded for firewall
 //!    enforcement.
 //! 4. **Capsule profile admission**: The `AdmissionGate` must admit the capsule
-//!    profile (Tier3+).
+//!    profile (Tier3+). **Note**: Runtime capsule admission is not yet wired
+//!    into the broker; it is currently reported as `Unavailable`. The
+//!    `AdmissionGate` itself is validated in TCK-00374 unit tests. When runtime
+//!    wiring lands, the broker will set this to `Checked`/`Unavailable` based
+//!    on actual capsule presence.
 //!
 //! # Tier Enforcement
 //!

@@ -20,7 +20,10 @@
 //! - **TCK-00376** (landed): No-bypass path ratchet -- the `PathRatchet` in the
 //!   daemon broker enforces that all enforcement components (broker,
 //!   capability, context firewall, capsule admission) are checked before tool
-//!   actuation at Tier2+. Missing components cause deny-default.
+//!   actuation at Tier2+. Missing components cause deny-default. **Note**:
+//!   Capsule admission is not yet wired at runtime; the ratchet reports it as
+//!   `Unavailable` and denies Tier2+ until a future ticket integrates
+//!   `AdmissionGate::check` into the broker path.
 //!
 //! # Security Model
 //!
