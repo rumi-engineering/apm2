@@ -775,6 +775,35 @@ ticket_meta:
     }
 
     #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_stage2_default_is_emit_only() {
+        use crate::util::{
+            CutoverPolicy, XTASK_CUTOVER_POLICY_ENV, XTASK_EMIT_RECEIPT_ONLY_ENV,
+            effective_cutover_policy_with_flag,
+        };
+
+        // TCK-00419: Stage-2 default cutover policy is EmitOnly when no explicit
+        // override is present.
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+
+        let policy = effective_cutover_policy_with_flag(false);
+        assert_eq!(
+            policy,
+            CutoverPolicy::EmitOnly,
+            "Stage-2 (TCK-00419): default cutover policy must be EmitOnly"
+        );
+
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+    }
+
+    #[test]
     fn test_push_status_projection_notice_mentions_projection_only() {
         assert!(
             PUSH_STATUS_PROJECTION_NOTICE.contains("Projection-only"),

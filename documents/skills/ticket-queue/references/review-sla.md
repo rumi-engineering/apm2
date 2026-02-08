@@ -40,9 +40,9 @@ decision_tree:
         - id: ENFORCE_15M_DEADLINE
           action: "Verify `now - started_at < 900s`. If breach (per `ai_status`), restart reviews."
         - id: RESTART_IF_UNHEALTHY
-          action: "If STALE/DEAD, trigger `cargo xtask review <TYPE> <PR_URL>`."
+          action: "If STALE/DEAD, trigger `cargo xtask review <TYPE> <PR_URL>`. Stage-2 demotion (TCK-00419): projection-only by default; direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle state."
         - id: ESCALATE_IF_REVIEWS_NOT_RUNNING
-          action: "If state empty AND pending, escalate to implementer. `cargo xtask push --force-review`."
+          action: "If state empty AND pending, escalate to implementer. `cargo xtask push --force-review`. Stage-2 demotion (TCK-00419): projection-only by default; direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle state."
         - id: LOOP_UNTIL_RESOLVED
           action: "Remediate until reviews finish."
       decisions[2]:
