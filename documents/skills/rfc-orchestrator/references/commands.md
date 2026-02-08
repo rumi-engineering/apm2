@@ -63,12 +63,12 @@ pr-comments-count:
 ## AI Reviews
 
 ```yaml
-check-ai-review-status:
+check-review-gate-status:
   command: |
     head_sha=$(gh pr view <BRANCH_NAME> --json headRefOid --jq .headRefOid)
     gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/$head_sha/status \
-      --jq '.statuses[] | select(.context | startswith("ai-review/")) | "\(.context): \(.state)"'
-  purpose: Check AI review commit statuses
+      --jq '.statuses[] | select(.context == "Review Gate Success") | "\(.context): \(.state)"'
+  purpose: Check Review Gate Success commit status
 
 trigger-security-review:
   command: cargo xtask review security <PR_URL>

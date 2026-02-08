@@ -66,40 +66,24 @@ rules:
 
 ---
 
-## Action 2: Update Status Check
+## Action 2: Review Gate Evaluation
 
 ```yaml
 status_decision:
+  NOTE: |
+    Direct status writes have been removed. The Review Gate Success workflow
+    (.github/workflows/review-gate.yml) evaluates machine-readable metadata
+    from PR comments via `cargo xtask review-gate` and posts the authoritative
+    "Review Gate Success" commit status.
+
   IF verdict == PASS:
-    state: success
-    description: "Code quality review passed"
+    effect: "Review Gate Success workflow will post success status"
 
   ELSE IF verdict == FAIL:
-    state: failure
-    description: "Code quality review found issues - see PR comments"
+    effect: "Review Gate Success workflow will post failure status"
 
   ELSE IF verdict == BLOCKED:
-    state: pending
-    description: "Code quality review blocked - see PR comments"
-
-command_templates:
-  success: |
-    gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" \
-      -f state="success" \
-      -f context="ai-review/code-quality" \
-      -f description="Code quality review passed"
-
-  failure: |
-    gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" \
-      -f state="failure" \
-      -f context="ai-review/code-quality" \
-      -f description="Code quality review found issues - see PR comments"
-
-  blocked: |
-    gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" \
-      -f state="pending" \
-      -f context="ai-review/code-quality" \
-      -f description="Code quality review blocked - see PR comments"
+    effect: "Review Gate Success workflow will remain in pending state"
 ```
 
 ---

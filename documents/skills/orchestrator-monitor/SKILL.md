@@ -101,7 +101,7 @@ invariants[13]:
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch per PR at any time."
-  - "No merge action without CI PASS and ai-review/security=success and ai-review/code-quality=success for current HEAD SHA."
+  - "No merge action without CI PASS and Review Gate Success=success for current HEAD SHA."
   - "Review prompt dispatch includes review_prompt_required_payload."
   - "Never use the same model family for both implementing and reviewing the same PR cycle."
   - "Fix subagents assume their branch is stale until proven current against origin/main."

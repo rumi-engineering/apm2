@@ -1,0 +1,61 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00432"
+    title: "Remove legacy ai-review/* status checks; unify on Review Gate Success"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0019"
+    requirements:
+      - requirement_id: "REQ-0006"
+        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0006.yaml#requirement"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+    responsibility_domains:
+      - "DOMAIN_BUILD_RELEASE"
+      - "DOMAIN_SECURITY"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00410"
+        reason: "Review Gate Success workflow was introduced in TCK-00410; this ticket removes the legacy checks it superseded."
+  scope:
+    in_scope:
+      - "Remove ai-review/security and ai-review/code-quality from .github/rulesets/protect-main.json required status checks."
+      - "Remove or disable .github/workflows/ai-review-code-quality.yml and .github/workflows/ai-review-security.yml standalone workflows."
+      - "Remove GitHub branch protection API required status checks for ai-review/* contexts."
+      - "Update all skill documents, orchestrator scripts, and xtask code that reference ai-review/* status checks."
+      - "Update review prompt templates and CI scripts that post to ai-review/* contexts."
+      - "Ensure Review Gate Success (driven by review-gate.yml + cargo xtask review-gate) is the sole authoritative AI review gate."
+    out_of_scope:
+      - "Changes to the review-gate.yml workflow or cargo xtask review-gate evaluator logic."
+      - "Changes to the review prompt protocols (SECURITY_REVIEW_PROMPT.md, CODE_QUALITY_PROMPT.md) beyond removing status-posting instructions."
+  plan:
+    steps:
+      - "Remove ai-review/security and ai-review/code-quality entries from .github/rulesets/protect-main.json."
+      - "Delete or disable .github/workflows/ai-review-code-quality.yml and .github/workflows/ai-review-security.yml."
+      - "Remove ai-review/* from GitHub branch protection required_status_checks via API."
+      - "Update xtask review/check tasks that reference ai-review status contexts."
+      - "Update orchestrator-monitor, ticket-queue, and rfc-orchestrator skill references."
+      - "Update CI fixture files and lint scripts."
+      - "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --no-deps && cargo test -p xtask."
+  definition_of_done:
+    criteria:
+      - "No references to ai-review/security or ai-review/code-quality remain in active code or CI configuration."
+      - "Review Gate Success is the only AI-review-related required status check on main."
+      - "All xtask tests pass."
+      - "CI Success and Review Gate Success remain functional on new PRs."
+  notes:
+    context: |
+      TCK-00410 introduced the Review Gate Success workflow that evaluates AI review
+      comments via machine-readable metadata blocks. The legacy ai-review/* status
+      checks were the previous mechanism where review agents posted statuses directly.
+      These are now redundant and create confusion (PRs show pending ai-review/* checks
+      that nothing sets). This ticket removes all vestiges of the old system.
+    security: |
+      Review Gate Success is fail-closed by design (exit code 2 = pending, non-zero = failure).
+      Removing ai-review/* checks does not weaken the gate; it eliminates dead required checks
+      that could block merges unnecessarily.

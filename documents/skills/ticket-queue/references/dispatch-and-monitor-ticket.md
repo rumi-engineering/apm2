@@ -36,22 +36,22 @@ decision_tree:
           action: command
           run: "gh pr view <derived_branch_name> --json state,reviewDecision,statusCheckRollup,headRefOid,url,comments || echo '{\"state\": \"PENDING_INITIALIZATION\"}'"
           capture_as: pr_status_json
-        - id: AI_REVIEW_STATUS_CHECK
+        - id: REVIEW_GATE_STATUS_CHECK
           action: command
           run: |
             head_oid=$(echo '<pr_status_json>' | jq -r '.headRefOid // empty')
             if [ -n "$head_oid" ]; then
-              gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/$head_oid/status --jq '.statuses[] | select(.context | startswith("ai-review/")) | "\(.context): \(.state)"'
+              gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/$head_oid/status --jq '.statuses[] | select(.context == "Review Gate Success") | "\(.context): \(.state)"'
             else
-              echo "AI reviews not yet triggered"
+              echo "Review gate not yet evaluated"
             fi
-          capture_as: ai_review_statuses
+          capture_as: review_gate_status
         - id: MONITOR_REVIEWER_FEEDBACK
           action: "Check `pr_status_json` for comments. Verify implementer log action."
         - id: VERIFY_REVIEWER_ALIGNMENT
           action: "Check `reviewer-state-show`. If `head_sha` mismatch or inactive, trigger reviews."
         - id: REVIEW_SLA_ENFORCEMENT
-          action: "If reviews pending (per `ai_review_statuses`), enforce 15m SLA via reviewer PIDs, logs."
+          action: "If reviews pending (per `review_gate_status`), enforce 15m SLA via reviewer PIDs, logs."
         - id: MERGE_WAIT
           action: "If CI/reviews pass, poll for merge."
         - id: RETURN_TO_LOOP
@@ -80,7 +80,7 @@ decision_tree:
           then:
             next_reference: references/escalate-to-implementer.md
         - id: REVIEWS_PENDING_OR_STUCK
-          if: "ai_review_statuses indicate pending OR reviewer unhealthy OR SLA risk"
+          if: "review_gate_status indicates pending OR reviewer unhealthy OR SLA risk"
           then:
             next_reference: references/review-sla.md
         - id: CONTINUE

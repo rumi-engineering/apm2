@@ -131,13 +131,13 @@ else
     log_pass "API prohibition correctly permits file without API calls"
 fi
 
-# Test 2c-iii: CODE_QUALITY_PROMPT.md with ONLY known-good lines -> MUST PASS
-# (known-good lines containing ai-review/code-quality are stripped before analysis)
+# Test 2c-iii: CODE_QUALITY_PROMPT.md with legacy ai-review/code-quality gh api -> MUST FAIL
+# (TCK-00432: ai-review/* allowlist removed; all gh api calls are now forbidden)
 cq_known_good="${FIXTURE_DIR}/review_cq_known_good_permitted.md"
 if detect_forbidden_api_usage "$cq_known_good" "CODE_QUALITY_PROMPT.md"; then
-    log_fail "API prohibition false positive on CODE_QUALITY_PROMPT.md with only known-good gh api"
+    log_pass "API prohibition correctly catches legacy ai-review/code-quality gh api calls"
 else
-    log_pass "API prohibition correctly permits CODE_QUALITY_PROMPT.md known-good gh api lines"
+    log_fail "API prohibition missed legacy ai-review/code-quality gh api calls (allowlist should be removed)"
 fi
 
 # Test 2c-iv: CODE_QUALITY_PROMPT.md with EXTRA gh api call beyond allowlist -> MUST FAIL

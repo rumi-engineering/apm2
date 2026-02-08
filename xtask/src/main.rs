@@ -147,8 +147,8 @@ enum Commands {
     /// and enforces a trusted reviewer allowlist.
     ///
     /// Notes:
-    /// - Direct `ai-review/*` commit statuses are not required and are no
-    ///   longer authoritative.
+    /// - Legacy `ai-review/*` commit statuses have been removed and are not
+    ///   authoritative.
     /// - The gate is **pending** until both categories have authoritative
     ///   verdicts for the current PR head SHA.
     /// - The gate **fails** only when an authoritative verdict is `FAIL`.
@@ -424,8 +424,8 @@ enum ReviewCommands {
 
     /// Run UAT (User Acceptance Testing) sign-off.
     ///
-    /// Posts an approval comment and records projection-only status intent for
-    /// ai-review/uat.
+    /// Posts an approval comment. The Review Gate Success workflow
+    /// evaluates comment metadata for gate decisions.
     Uat {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,

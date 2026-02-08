@@ -22,8 +22,8 @@
 # process substitution, base64 encoding, etc.).
 #
 # The hard security gate for review status integrity is the `Review Gate Success`
-# commit status context posted by authorized CI workflows (see
-# `.github/workflows/ai-review-*.yml`), which evaluate machine-readable comment
+# commit status context posted by the authorized CI workflow (see
+# `.github/workflows/review-gate.yml`), which evaluates machine-readable comment
 # artifacts via `cargo xtask review-gate`.
 #
 # Threat model: Review artifacts are authored by trusted CI processes
@@ -141,25 +141,6 @@ detect_forbidden_api_usage() {
     content="$(cat "$file")"
     local stripped
     stripped="$(strip_comments "$content")"
-
-    # KNOWN-GOOD LINE ALLOWLIST for CODE_QUALITY_PROMPT.md:
-    # Instead of exempting the entire file, strip only LOGICAL lines that
-    # match the one legitimate gh api usage pattern (writes ai-review/code-quality
-    # status).  We join backslash-continuation lines first so that multi-line
-    # gh api commands (where "gh api" and "ai-review/code-quality" are on
-    # separate continuation lines) are treated as a single logical line.
-    # Only logical lines containing BOTH the marker are stripped; all remaining
-    # content is then checked by every gate below.
-    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]]; then
-        # Join continuation lines (\ at EOL), then strip logical lines matching
-        # the known-good pattern, then output the rest.
-        stripped=$(echo "$stripped" | awk '
-            /\\$/ { buf = buf substr($0, 1, length($0)-1) " "; next }
-            { line = buf $0; buf = ""
-              if (line !~ /ai-review\/code-quality/) print line }
-            END { if (buf != "" && buf !~ /ai-review\/code-quality/) print buf }
-        ')
-    fi
 
     # Flatten to stream, lowercase
     local stream
@@ -389,21 +370,11 @@ while IFS= read -r review_file; do
     file_basename="$(basename "$review_file")"
     # Process with continuation-joining so multiline commands are caught
     while IFS=$'\t' read -r line_num logical_line; do
-        # KNOWN-GOOD LINE ALLOWLIST: For CODE_QUALITY_PROMPT.md, skip only
-        # lines that match the one legitimate gh api pattern (writes
-        # ai-review/code-quality status).  All other lines are checked.
-        skip_api_check=0
-        if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]] \
-           && [[ "$logical_line" == *"ai-review/code-quality"* ]]; then
-            skip_api_check=1
-        fi
-        if [[ $skip_api_check -eq 0 ]]; then
-            if detect_direct_status_write "$logical_line"; then
-                log_error "Forbidden direct GitHub API call in review artifact:"
-                log_error "  ${review_file}:${line_num}: ${logical_line}"
-                log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
-                VIOLATIONS=1
-            fi
+        if detect_direct_status_write "$logical_line"; then
+            log_error "Forbidden direct GitHub API call in review artifact:"
+            log_error "  ${review_file}:${line_num}: ${logical_line}"
+            log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
+            VIOLATIONS=1
         fi
         if detect_cross_category_exec "$logical_line" "$file_basename"; then
             log_error "Cross-category executor misuse:"

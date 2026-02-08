@@ -27,12 +27,6 @@
             "context": "CI Success"
           },
           {
-            "context": "ai-review/security"
-          },
-          {
-            "context": "ai-review/code-quality"
-          },
-          {
             "context": "Review Gate Success"
           }
         ],
