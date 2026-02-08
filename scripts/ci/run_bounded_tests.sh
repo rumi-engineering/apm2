@@ -207,21 +207,24 @@ log_info "CPUQuota: ${CPU_QUOTA}"
 log_info "Command: ${COMMAND[*]}"
 echo
 
-# Check for cgroup v2 support; fallback to timeout-only mode when allowed.
-if [[ ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
-    if [[ "${ALLOW_TIMEOUT_FALLBACK}" == "1" ]]; then
-        log_warn "cgroup v2 controllers file not found; skipping systemd-run, falling back to timeout."
-        set +e
-        run_with_timeout_fallback
-        fallback_status=$?
-        set -e
-        if [[ ${fallback_status} -eq 0 ]]; then
-            log_info "Fallback command completed successfully."
-            exit 0
-        fi
-        log_error "Fallback command failed with exit code ${fallback_status}."
-        exit 1
+# When timeout fallback is explicitly allowed, skip systemd-run entirely.
+# GitHub-hosted runners lack the D-Bus session and polkit policy that
+# systemd-run --user/--system requires, so attempting it wastes time and
+# introduces fragile set -e interactions.
+if [[ "${ALLOW_TIMEOUT_FALLBACK}" == "1" ]]; then
+    log_warn "APM2_CI_ALLOW_TIMEOUT_FALLBACK=1: skipping systemd-run, using GNU timeout."
+    run_with_timeout_fallback
+    fallback_status=$?
+    if [[ ${fallback_status} -eq 0 ]]; then
+        log_info "Fallback command completed successfully."
+        exit 0
     fi
+    log_error "Fallback command failed with exit code ${fallback_status}."
+    exit 1
+fi
+
+# Check for cgroup v2 support (fail-closed without fallback).
+if [[ ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
     log_error "cgroup v2 controllers file not found at /sys/fs/cgroup/cgroup.controllers (fail-closed)."
     exit 1
 fi
@@ -236,21 +239,7 @@ if [[ ${status} -eq 0 ]]; then
     exit 0
 fi
 
-if [[ "${ALLOW_TIMEOUT_FALLBACK}" == "1" ]]; then
-    log_warn "systemd-run execution failed with status ${status}; attempting timeout fallback."
-    set +e
-    run_with_timeout_fallback
-    fallback_status=$?
-    set -e
-    if [[ ${fallback_status} -eq 0 ]]; then
-        log_info "Fallback command completed successfully."
-        exit 0
-    fi
-    log_error "Fallback command failed with exit code ${fallback_status}."
-    exit 1
-fi
-
 log_error "systemd-run execution failed with exit code ${status}."
 log_error "Fail-closed: bounded execution requires systemd-run + cgroup enforcement."
-log_error "Use --allow-timeout-fallback only for local non-authoritative debugging."
+log_error "Set APM2_CI_ALLOW_TIMEOUT_FALLBACK=1 for timeout-only mode."
 exit 1
