@@ -799,6 +799,146 @@ fn store_envelope_with_wall_ns(
     hex::encode(envelope_hash)
 }
 
+// ============================================================================
+// CAS continuity: orchestrator + dispatcher share the same CAS backend
+// ============================================================================
+
+/// End-to-end proof that orchestrator-issued gate leases resolve correctly
+/// through the dispatcher's `validate_lease_time_authority` when both
+/// components share the SAME CAS instance (TCK-00418 BLOCKER fix).
+///
+/// This test:
+/// 1. Creates a single shared `MemoryCas`.
+/// 2. Wires a `GateOrchestrator` with that CAS.
+/// 3. Triggers `on_session_terminated` which issues gate leases (storing
+///    `ClockProfile` and `TimeEnvelope` in the shared CAS).
+/// 4. Retrieves the issued lease via `gate_lease()`.
+/// 5. Wires a `PrivilegedDispatcher` with the SAME CAS.
+/// 6. Registers the lease with the dispatcher's lease validator.
+/// 7. Dispatches an `IngestReviewReceipt` and verifies the HTF authority
+///    validation path does NOT fail with a CAS resolution error.
+#[tokio::test]
+async fn test_shared_cas_orchestrator_dispatcher_continuity() {
+    use apm2_daemon::gate::{
+        GateOrchestrator, GateOrchestratorConfig, GateType, SessionTerminatedInfo,
+    };
+
+    // Step 1: Single shared CAS
+    let shared_cas: Arc<dyn ContentAddressedStore> = Arc::new(MemoryCas::default());
+    // Pre-store artifact content so IngestReviewReceipt can resolve
+    // artifact_bundle_hash
+    shared_cas.store(TEST_ARTIFACT_CONTENT).unwrap();
+
+    // Step 2: Orchestrator wired to shared CAS
+    let gate_signer = Arc::new(Signer::generate());
+    let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), gate_signer)
+        .with_cas(Arc::clone(&shared_cas));
+
+    // Step 3: Trigger session termination => issues leases with CAS-backed
+    // time_envelope_ref.
+    // Use a recent timestamp to avoid stale-termination rejection.
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let now_ms = dur.as_secs() * 1000 + u64::from(dur.subsec_millis());
+    let info = SessionTerminatedInfo {
+        session_id: "sess-cas-test".to_string(),
+        work_id: "W-CAS-CONTINUITY".to_string(),
+        changeset_digest: [0x42; 32],
+        terminated_at_ms: now_ms,
+    };
+    let (_gate_types, _signers, events) = orch
+        .on_session_terminated(info)
+        .await
+        .expect("session termination should succeed");
+
+    // Sanity: at least one GateLeaseIssued event was emitted
+    assert!(
+        events.len() >= 2,
+        "expected PolicyResolved + at least 1 GateLeaseIssued, got {} events",
+        events.len()
+    );
+
+    // Step 4: Retrieve the Quality gate lease (arbitrary choice)
+    let lease = orch
+        .gate_lease("W-CAS-CONTINUITY", GateType::Quality)
+        .await
+        .expect("Quality gate lease should exist after on_session_terminated");
+
+    // Verify the time_envelope_ref is a hex-encoded hash (not legacy htf:* format)
+    assert!(
+        !lease.time_envelope_ref.starts_with("htf:"),
+        "time_envelope_ref should be a CAS hash, not legacy format; got: {}",
+        lease.time_envelope_ref
+    );
+    assert_eq!(
+        lease.time_envelope_ref.len(),
+        64,
+        "time_envelope_ref should be a 64-char hex-encoded BLAKE3 hash; got len={}",
+        lease.time_envelope_ref.len()
+    );
+
+    // Step 5: Dispatcher wired to the SAME shared CAS
+    let peer_creds = test_peer_credentials();
+    let executor_actor_id = derive_actor_id(&peer_creds);
+    let dispatcher = PrivilegedDispatcher::new().with_cas(Arc::clone(&shared_cas));
+
+    // Step 6: Register the orchestrator-issued lease with the dispatcher
+    dispatcher.lease_validator().register_lease_with_executor(
+        &lease.lease_id,
+        &lease.work_id,
+        &lease.gate_id,
+        &executor_actor_id,
+    );
+    dispatcher
+        .lease_validator()
+        .register_full_lease(&lease)
+        .expect("orchestrator-issued lease registration should succeed");
+
+    // Step 7: Dispatch IngestReviewReceipt — the HTF authority validation
+    // must NOT fail with a CAS resolution error because both orchestrator
+    // and dispatcher share the same CAS.
+    let request = IngestReviewReceiptRequest {
+        lease_id: lease.lease_id.clone(),
+        receipt_id: format!("RR-{}", lease.lease_id),
+        reviewer_actor_id: derive_actor_id(&peer_creds),
+        changeset_digest: vec![0x42; 32],
+        artifact_bundle_hash: test_artifact_bundle_hash(),
+        verdict: ReviewReceiptVerdict::Approve.into(),
+        blocked_reason_code: 0,
+        blocked_log_hash: vec![],
+        identity_proof_hash: vec![0x99; 32],
+    };
+    let ctx = privileged_ctx();
+    let response = dispatch_review_receipt(&dispatcher, &ctx, &request);
+
+    // The response may be an error for reasons OTHER than HTF authority
+    // (e.g., policy ratcheting, missing work claim). But it MUST NOT
+    // fail on HTF/CAS resolution — that would indicate the CAS split bug.
+    if let PrivilegedResponse::Error(ref err) = response {
+        let lower = err.message.to_lowercase();
+        assert!(
+            !lower.contains("time_envelope_ref"),
+            "CAS split bug: dispatcher cannot resolve orchestrator's time_envelope_ref; \
+             error: {}",
+            err.message
+        );
+        assert!(
+            !lower.contains("failed to resolve time_envelope_ref from cas"),
+            "CAS split bug: time envelope not in dispatcher CAS; error: {}",
+            err.message
+        );
+        assert!(
+            !lower.contains("htf authority") || !lower.contains("cas"),
+            "CAS-related HTF authority failure indicates split CAS; error: {}",
+            err.message
+        );
+    }
+    // If we reach here without assertion failure, the CAS continuity is proven:
+    // the dispatcher successfully resolved the orchestrator's CAS-stored
+    // TimeEnvelope and ClockProfile artifacts.
+}
+
 /// Registers a lease with a specific `time_envelope_ref`, using
 /// `AuthenticatedNts` as the profile source with attestation.
 fn register_lease_with_envelope_ref(

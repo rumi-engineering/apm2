@@ -978,12 +978,14 @@ async fn async_main(args: Args) -> Result<()> {
     // `notify_session_terminated` which delegates to the orchestrator. A
     // background task polls for gate timeouts periodically.
     let gate_signer = Arc::new(Signer::generate());
-    // Wire CAS into the gate orchestrator so it produces CAS-backed
-    // time_envelope_ref values compatible with HTF authority validation
-    // (TCK-00418). MemoryCas is sufficient here because the orchestrator
-    // only stores small ClockProfile + TimeEnvelope artifacts.
-    let gate_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
-        Arc::new(apm2_core::evidence::MemoryCas::default());
+    // TCK-00418: Share the dispatcher's evidence CAS with the gate
+    // orchestrator so that time_envelope_ref hashes stored during
+    // `issue_gate_lease` are resolvable by `validate_lease_time_authority`
+    // in the same PrivilegedDispatcher. Falls back to an in-memory CAS
+    // when no durable CAS is configured (non-persistent mode).
+    let gate_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> = dispatcher_state
+        .evidence_cas()
+        .unwrap_or_else(|| Arc::new(apm2_core::evidence::MemoryCas::default()));
     let gate_orchestrator = Arc::new(
         GateOrchestrator::new(GateOrchestratorConfig::default(), gate_signer).with_cas(gate_cas),
     );
