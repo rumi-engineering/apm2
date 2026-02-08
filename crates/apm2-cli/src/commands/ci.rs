@@ -2011,6 +2011,12 @@ fn run_inside_bounded_unit(args: &RunArgs, repo_root: &Path, max_parallel: usize
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("unix:path={xdg_runtime_dir}/bus"));
 
+    // systemd-run --user connects to the user bus using *its own* environment.
+    // Some CI runners sanitize service-level env vars before executing jobs,
+    // so we always provide these explicitly (preflight already does this).
+    cmd.env("XDG_RUNTIME_DIR", &xdg_runtime_dir)
+        .env("DBUS_SESSION_BUS_ADDRESS", &dbus_session_bus_address);
+
     cmd.arg("--user")
         .arg("--pipe")
         .arg("--quiet")
