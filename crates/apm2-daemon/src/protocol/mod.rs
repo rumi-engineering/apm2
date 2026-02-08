@@ -143,6 +143,8 @@ pub use dispatch::{
     // TCK-00253: Ledger event emitter types
     LedgerEventEmitter,
     LedgerEventError,
+    // TCK-00416: Lifecycle authority bindings
+    MAX_BINDING_VIOLATIONS,
     MAX_LEDGER_EVENTS,
     MAX_WORK_CLAIMS,
     // TCK-00253: Policy resolution and work claim types
@@ -152,16 +154,25 @@ pub use dispatch::{
     PrivilegedDispatcher,
     PrivilegedMessageType,
     PrivilegedResponse,
+    ReviewOutcomeBindings,
     SignedLedgerEvent,
     StubLedgerEventEmitter,
     StubPolicyResolver,
     StubWorkRegistry,
+    TransitionAuthorityBindings,
+    TransitionAuthorityError,
+    TypedBudgetBindings,
     WORK_CLAIMED_DOMAIN_PREFIX,
     WorkClaim,
     WorkRegistry,
     WorkRegistryError,
+    append_review_outcome_fields,
+    append_transition_authority_fields,
     // TCK-00253: Actor ID derivation
     derive_actor_id,
+    derive_claim_transition_authority_bindings,
+    derive_transition_authority_bindings,
+    emit_authority_binding_defect,
     // CTR-PROTO-012: Credential Management encoding (TCK-00343)
     encode_add_credential_request,
     // Request encoding helpers
@@ -193,6 +204,10 @@ pub use dispatch::{
     encode_work_status_request,
     generate_lease_id,
     generate_work_id,
+    store_authority_binding_artifacts,
+    typed_budgets_for_role,
+    validate_review_outcome_bindings,
+    validate_transition_authority_bindings,
 };
 #[allow(unused_imports)]
 pub use error::{

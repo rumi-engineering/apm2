@@ -34,7 +34,7 @@ use apm2_core::credentials::{
     AuthMethod, CredentialProfile as CoreCredentialProfile, CredentialStore, ProfileId, Provider,
 };
 use apm2_core::determinism::canonicalize_json;
-use apm2_core::events::{DefectRecorded, Validate};
+use apm2_core::events::{DefectRecorded, DefectSource, Validate};
 use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
     AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, CHANGESET_PUBLISHED_PREFIX,
@@ -272,6 +272,42 @@ pub struct WorkTransition<'a> {
     pub actor_id: &'a str,
     /// HTF-compliant timestamp in nanoseconds since epoch.
     pub timestamp_ns: u64,
+}
+
+/// Typed budget bindings required by lifecycle authority contracts (TCK-00416).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TypedBudgetBindings {
+    /// Maximum tokens permitted for the lifecycle step.
+    pub max_tokens: u64,
+    /// Maximum tool calls permitted for the lifecycle step.
+    pub max_tool_calls: u64,
+    /// Maximum wall-clock runtime in milliseconds for the lifecycle step.
+    pub max_wall_ms: u64,
+}
+
+/// Authority contract bound to authoritative lifecycle transitions (TCK-00416).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransitionAuthorityBindings {
+    /// Lease identifier delegating authority.
+    pub lease_id: String,
+    /// Actor identity bound to delegation.
+    pub actor_id: String,
+    /// Permeability receipt commitment hash.
+    pub permeability_receipt_hash: [u8; 32],
+    /// Capability manifest commitment hash.
+    pub capability_manifest_hash: [u8; 32],
+    /// Context pack commitment hash.
+    pub context_pack_hash: [u8; 32],
+    /// Stop-condition contract commitment hash.
+    pub stop_condition_hash: [u8; 32],
+    /// Canonical stop conditions used to derive `stop_condition_hash`.
+    pub stop_conditions: crate::episode::envelope::StopConditions,
+    /// Typed budget contract.
+    pub typed_budgets: TypedBudgetBindings,
+    /// Typed budget commitment hash.
+    pub typed_budget_hash: [u8; 32],
+    /// Policy resolution reference.
+    pub policy_resolved_ref: String,
 }
 
 /// Parameters for a stop-flag mutation audit event (TCK-00351).
@@ -1142,6 +1178,558 @@ pub fn build_session_started_payload(
         );
     }
     payload
+}
+
+/// Returns role-scoped typed budgets for lifecycle authority contracts.
+#[must_use]
+pub const fn typed_budgets_for_role(role: WorkRole) -> TypedBudgetBindings {
+    match role {
+        WorkRole::Implementer => TypedBudgetBindings {
+            max_tokens: 1_000_000,
+            max_tool_calls: 1_000,
+            max_wall_ms: 3_600_000,
+        },
+        WorkRole::GateExecutor => TypedBudgetBindings {
+            max_tokens: 500_000,
+            max_tool_calls: 500,
+            max_wall_ms: 1_800_000,
+        },
+        WorkRole::Reviewer => TypedBudgetBindings {
+            max_tokens: 350_000,
+            max_tool_calls: 350,
+            max_wall_ms: 1_200_000,
+        },
+        WorkRole::Coordinator => TypedBudgetBindings {
+            max_tokens: 250_000,
+            max_tool_calls: 250,
+            max_wall_ms: 900_000,
+        },
+        WorkRole::Unspecified => TypedBudgetBindings {
+            max_tokens: 0,
+            max_tool_calls: 0,
+            max_wall_ms: 0,
+        },
+    }
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let payload = value.to_string();
+    let canonical =
+        canonicalize_json(&payload).map_err(|e| format!("JCS canonicalization failed: {e}"))?;
+    Ok(canonical.into_bytes())
+}
+
+fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
+fn build_permeability_receipt_payload(
+    work_id: &str,
+    bindings: &TransitionAuthorityBindings,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "apm2.permeability_receipt.v1",
+        "work_id": work_id,
+        "lease_id": bindings.lease_id,
+        "actor_id": bindings.actor_id,
+        "policy_resolved_ref": bindings.policy_resolved_ref,
+        "capability_manifest_hash": hex::encode(bindings.capability_manifest_hash),
+        "context_pack_hash": hex::encode(bindings.context_pack_hash),
+    })
+}
+
+fn build_typed_budget_payload(budgets: &TypedBudgetBindings) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "apm2.typed_budget_contract.v1",
+        "max_tokens": budgets.max_tokens,
+        "max_tool_calls": budgets.max_tool_calls,
+        "max_wall_ms": budgets.max_wall_ms,
+    })
+}
+
+/// Derives lifecycle authority bindings for transition validation/emission.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_transition_authority_bindings(
+    work_id: &str,
+    lease_id: &str,
+    actor_id: &str,
+    role: WorkRole,
+    policy_resolved_ref: &str,
+    capability_manifest_hash: [u8; 32],
+    context_pack_hash: [u8; 32],
+    stop_conditions: crate::episode::envelope::StopConditions,
+) -> Result<TransitionAuthorityBindings, String> {
+    let typed_budgets = typed_budgets_for_role(role);
+    let typed_budget_payload = build_typed_budget_payload(&typed_budgets);
+    let typed_budget_hash = hash_bytes(&canonical_json_bytes(&typed_budget_payload)?);
+
+    let stop_condition_hash = hash_bytes(&stop_conditions.canonical_bytes());
+
+    let mut bindings = TransitionAuthorityBindings {
+        lease_id: lease_id.to_string(),
+        actor_id: actor_id.to_string(),
+        permeability_receipt_hash: [0u8; 32],
+        capability_manifest_hash,
+        context_pack_hash,
+        stop_condition_hash,
+        stop_conditions,
+        typed_budgets,
+        typed_budget_hash,
+        policy_resolved_ref: policy_resolved_ref.to_string(),
+    };
+
+    let permeability_payload = build_permeability_receipt_payload(work_id, &bindings);
+    bindings.permeability_receipt_hash = hash_bytes(&canonical_json_bytes(&permeability_payload)?);
+
+    Ok(bindings)
+}
+
+/// Derives claim-time authority bindings using fail-closed default stop policy.
+pub fn derive_claim_transition_authority_bindings(
+    claim: &WorkClaim,
+) -> Result<TransitionAuthorityBindings, String> {
+    let default_stop_conditions = crate::episode::envelope::StopConditions {
+        max_episodes: 1,
+        escalation_predicate: String::new(),
+        goal_predicate: String::new(),
+        failure_predicate: String::new(),
+    };
+
+    derive_transition_authority_bindings(
+        &claim.work_id,
+        &claim.lease_id,
+        &claim.actor_id,
+        claim.role,
+        &claim.policy_resolution.policy_resolved_ref,
+        claim.policy_resolution.capability_manifest_hash,
+        claim.policy_resolution.context_pack_hash,
+        default_stop_conditions,
+    )
+}
+
+/// Appends authority binding fields to a JSON event payload (TCK-00416).
+///
+/// Used by transition emitters to embed complete binding references into
+/// signed ledger events.
+pub fn append_transition_authority_fields(
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    bindings: &TransitionAuthorityBindings,
+) {
+    payload.insert(
+        "lease_id".to_string(),
+        serde_json::Value::String(bindings.lease_id.clone()),
+    );
+    payload.insert(
+        "permeability_receipt_hash".to_string(),
+        serde_json::Value::String(hex::encode(bindings.permeability_receipt_hash)),
+    );
+    payload.insert(
+        "capability_manifest_hash".to_string(),
+        serde_json::Value::String(hex::encode(bindings.capability_manifest_hash)),
+    );
+    payload.insert(
+        "context_pack_hash".to_string(),
+        serde_json::Value::String(hex::encode(bindings.context_pack_hash)),
+    );
+    payload.insert(
+        "stop_condition_hash".to_string(),
+        serde_json::Value::String(hex::encode(bindings.stop_condition_hash)),
+    );
+    payload.insert(
+        "typed_budgets".to_string(),
+        serde_json::to_value(&bindings.typed_budgets).expect("typed budgets serialize"),
+    );
+    payload.insert(
+        "typed_budget_hash".to_string(),
+        serde_json::Value::String(hex::encode(bindings.typed_budget_hash)),
+    );
+    payload.insert(
+        "policy_resolved_ref".to_string(),
+        serde_json::Value::String(bindings.policy_resolved_ref.clone()),
+    );
+}
+
+/// Maximum number of authority binding violations collected per validation
+/// invocation before short-circuiting (TCK-00416).
+///
+/// Per bounded-resource-growth policy, a single validation pass never
+/// allocates more than this many violation strings.
+pub const MAX_BINDING_VIOLATIONS: usize = 32;
+
+/// Structured error for authority binding validation failures (TCK-00416).
+///
+/// Captures all missing/invalid bindings in a single pass so the caller
+/// can emit a comprehensive defect record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionAuthorityError {
+    /// Human-readable summary of the rejection.
+    pub message: String,
+    /// Individual violation descriptions (bounded by
+    /// [`MAX_BINDING_VIOLATIONS`]).
+    pub violations: Vec<String>,
+}
+
+impl std::fmt::Display for TransitionAuthorityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for TransitionAuthorityError {}
+
+/// Validates that all required authority bindings are present and
+/// CAS-resolvable at transition time (TCK-00416, REQ-HEF-0013).
+///
+/// # Fail-Closed Semantics
+///
+/// Missing, empty, or CAS-unresolvable bindings are hard failures.
+/// Best-effort transition success is forbidden per the requirement.
+///
+/// # Arguments
+///
+/// * `bindings` - The authority bindings to validate.
+/// * `cas` - Content-addressed store for resolvability checks.
+///
+/// # Errors
+///
+/// Returns `TransitionAuthorityError` with all violations collected
+/// in a single pass (bounded by [`MAX_BINDING_VIOLATIONS`]).
+pub fn validate_transition_authority_bindings(
+    bindings: &TransitionAuthorityBindings,
+    cas: &dyn ContentAddressedStore,
+) -> Result<(), TransitionAuthorityError> {
+    let mut violations: Vec<String> = Vec::new();
+
+    // 1. Validate lease_id is non-empty
+    if bindings.lease_id.is_empty() {
+        violations.push("lease_id is empty".to_string());
+    }
+
+    // 2. Validate actor_id is non-empty
+    if bindings.actor_id.is_empty() {
+        violations.push("actor_id is empty".to_string());
+    }
+
+    // 3. Validate policy_resolved_ref is non-empty
+    if bindings.policy_resolved_ref.is_empty() {
+        violations.push("policy_resolved_ref is empty".to_string());
+    }
+
+    // 4. Validate permeability_receipt_hash is non-zero and CAS-resolvable
+    if bindings.permeability_receipt_hash == [0u8; 32] {
+        violations.push("permeability_receipt_hash is zero (unset)".to_string());
+    } else if violations.len() < MAX_BINDING_VIOLATIONS {
+        match cas.exists(&bindings.permeability_receipt_hash) {
+            Ok(true) => {},
+            Ok(false) => violations.push(format!(
+                "permeability_receipt_hash {} not resolvable in CAS",
+                hex::encode(bindings.permeability_receipt_hash)
+            )),
+            Err(e) => violations.push(format!("permeability_receipt_hash CAS lookup failed: {e}")),
+        }
+    }
+
+    // 5. Validate capability_manifest_hash is non-zero and CAS-resolvable
+    if bindings.capability_manifest_hash == [0u8; 32] {
+        violations.push("capability_manifest_hash is zero (unset)".to_string());
+    } else if violations.len() < MAX_BINDING_VIOLATIONS {
+        match cas.exists(&bindings.capability_manifest_hash) {
+            Ok(true) => {},
+            Ok(false) => violations.push(format!(
+                "capability_manifest_hash {} not resolvable in CAS",
+                hex::encode(bindings.capability_manifest_hash)
+            )),
+            Err(e) => violations.push(format!("capability_manifest_hash CAS lookup failed: {e}")),
+        }
+    }
+
+    // 6. Validate context_pack_hash is non-zero and CAS-resolvable
+    if bindings.context_pack_hash == [0u8; 32] {
+        violations.push("context_pack_hash is zero (unset)".to_string());
+    } else if violations.len() < MAX_BINDING_VIOLATIONS {
+        match cas.exists(&bindings.context_pack_hash) {
+            Ok(true) => {},
+            Ok(false) => violations.push(format!(
+                "context_pack_hash {} not resolvable in CAS",
+                hex::encode(bindings.context_pack_hash)
+            )),
+            Err(e) => violations.push(format!("context_pack_hash CAS lookup failed: {e}")),
+        }
+    }
+
+    // 7. Validate stop_condition_hash is non-zero and CAS-resolvable
+    if bindings.stop_condition_hash == [0u8; 32] {
+        violations.push("stop_condition_hash is zero (unset)".to_string());
+    } else if violations.len() < MAX_BINDING_VIOLATIONS {
+        match cas.exists(&bindings.stop_condition_hash) {
+            Ok(true) => {},
+            Ok(false) => violations.push(format!(
+                "stop_condition_hash {} not resolvable in CAS",
+                hex::encode(bindings.stop_condition_hash)
+            )),
+            Err(e) => violations.push(format!("stop_condition_hash CAS lookup failed: {e}")),
+        }
+    }
+
+    // 8. Validate typed_budget_hash is non-zero and CAS-resolvable
+    if bindings.typed_budget_hash == [0u8; 32] {
+        violations.push("typed_budget_hash is zero (unset)".to_string());
+    } else if violations.len() < MAX_BINDING_VIOLATIONS {
+        match cas.exists(&bindings.typed_budget_hash) {
+            Ok(true) => {},
+            Ok(false) => violations.push(format!(
+                "typed_budget_hash {} not resolvable in CAS",
+                hex::encode(bindings.typed_budget_hash)
+            )),
+            Err(e) => violations.push(format!("typed_budget_hash CAS lookup failed: {e}")),
+        }
+    }
+
+    // 9. Validate typed budgets have non-zero limits
+    if bindings.typed_budgets.max_tokens == 0
+        && bindings.typed_budgets.max_tool_calls == 0
+        && bindings.typed_budgets.max_wall_ms == 0
+    {
+        violations.push("typed_budgets has all-zero limits (Unspecified role budget)".to_string());
+    }
+
+    // 10. Re-derive hashes and verify they match (tamper detection)
+    let recomputed_stop_hash = hash_bytes(&bindings.stop_conditions.canonical_bytes());
+    if bindings.stop_condition_hash != [0u8; 32]
+        && bindings.stop_condition_hash != recomputed_stop_hash
+    {
+        violations.push(format!(
+            "stop_condition_hash mismatch: declared={} recomputed={}",
+            hex::encode(bindings.stop_condition_hash),
+            hex::encode(recomputed_stop_hash),
+        ));
+    }
+
+    if let Ok(budget_payload) =
+        canonical_json_bytes(&build_typed_budget_payload(&bindings.typed_budgets))
+    {
+        let recomputed_budget_hash = hash_bytes(&budget_payload);
+        if bindings.typed_budget_hash != [0u8; 32]
+            && bindings.typed_budget_hash != recomputed_budget_hash
+        {
+            violations.push(format!(
+                "typed_budget_hash mismatch: declared={} recomputed={}",
+                hex::encode(bindings.typed_budget_hash),
+                hex::encode(recomputed_budget_hash),
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        let count = violations.len();
+        Err(TransitionAuthorityError {
+            message: format!("authority binding validation failed with {count} violation(s)"),
+            violations,
+        })
+    }
+}
+
+/// Review/projection outcome bindings required by REQ-HEF-0013 (TCK-00416).
+///
+/// These bindings capture the evidence-index commitments that make review
+/// and projection outcomes replayable without ambient state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewOutcomeBindings {
+    /// BLAKE3 hash of the materialized workspace view at review time.
+    pub view_commitment_hash: [u8; 32],
+    /// BLAKE3 hash of the tool invocation log index.
+    pub tool_log_index_hash: [u8; 32],
+    /// BLAKE3 hash of the summary receipt artifact.
+    pub summary_receipt_hash: [u8; 32],
+}
+
+/// Validates that review/projection outcome bindings are present and
+/// CAS-resolvable (TCK-00416, REQ-HEF-0013).
+///
+/// # Fail-Closed Semantics
+///
+/// All three hashes must be non-zero and resolvable in the CAS at
+/// validation time. Deferred resolution is forbidden.
+pub fn validate_review_outcome_bindings(
+    bindings: &ReviewOutcomeBindings,
+    cas: &dyn ContentAddressedStore,
+) -> Result<(), TransitionAuthorityError> {
+    let mut violations: Vec<String> = Vec::new();
+
+    // 1. view_commitment_hash
+    if bindings.view_commitment_hash == [0u8; 32] {
+        violations.push("view_commitment_hash is zero (unset)".to_string());
+    } else {
+        match cas.exists(&bindings.view_commitment_hash) {
+            Ok(true) => {},
+            Ok(false) => violations.push(format!(
+                "view_commitment_hash {} not resolvable in CAS",
+                hex::encode(bindings.view_commitment_hash)
+            )),
+            Err(e) => violations.push(format!("view_commitment_hash CAS lookup failed: {e}")),
+        }
+    }
+
+    // 2. tool_log_index_hash
+    if bindings.tool_log_index_hash == [0u8; 32] {
+        violations.push("tool_log_index_hash is zero (unset)".to_string());
+    } else if violations.len() < MAX_BINDING_VIOLATIONS {
+        match cas.exists(&bindings.tool_log_index_hash) {
+            Ok(true) => {},
+            Ok(false) => violations.push(format!(
+                "tool_log_index_hash {} not resolvable in CAS",
+                hex::encode(bindings.tool_log_index_hash)
+            )),
+            Err(e) => violations.push(format!("tool_log_index_hash CAS lookup failed: {e}")),
+        }
+    }
+
+    // 3. summary_receipt_hash
+    if bindings.summary_receipt_hash == [0u8; 32] {
+        violations.push("summary_receipt_hash is zero (unset)".to_string());
+    } else if violations.len() < MAX_BINDING_VIOLATIONS {
+        match cas.exists(&bindings.summary_receipt_hash) {
+            Ok(true) => {},
+            Ok(false) => violations.push(format!(
+                "summary_receipt_hash {} not resolvable in CAS",
+                hex::encode(bindings.summary_receipt_hash)
+            )),
+            Err(e) => violations.push(format!("summary_receipt_hash CAS lookup failed: {e}")),
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        let count = violations.len();
+        Err(TransitionAuthorityError {
+            message: format!("review outcome binding validation failed with {count} violation(s)"),
+            violations,
+        })
+    }
+}
+
+/// Emits a structured defect event for authority binding violations
+/// (TCK-00416).
+///
+/// Per REQ-HEF-0013, missing/unresolved bindings produce hard failures WITH
+/// defect emission. This function builds and emits the `DefectRecorded` event.
+///
+/// # Arguments
+///
+/// * `emitter` - Ledger event emitter for defect persistence.
+/// * `work_id` - The work ID associated with the rejected transition.
+/// * `error` - The structured authority error with violation details.
+/// * `timestamp_ns` - HTF-compliant timestamp.
+pub fn emit_authority_binding_defect(
+    emitter: &dyn LedgerEventEmitter,
+    work_id: &str,
+    error: &TransitionAuthorityError,
+    timestamp_ns: u64,
+) {
+    let defect_id = format!("DEF-AUTH-{}", uuid::Uuid::new_v4());
+    let violations_summary = error
+        .violations
+        .iter()
+        .take(MAX_BINDING_VIOLATIONS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let cas_payload = serde_json::json!({
+        "schema": "apm2.authority_binding_defect.v1",
+        "work_id": work_id,
+        "violations": error.violations,
+        "message": error.message,
+    });
+    let cas_bytes = cas_payload.to_string().into_bytes();
+    let cas_hash = hash_bytes(&cas_bytes);
+
+    let defect = DefectRecorded {
+        defect_id: defect_id.clone(),
+        defect_type: "AUTHORITY_BINDING_VIOLATION".to_string(),
+        cas_hash: cas_hash.to_vec(),
+        source: DefectSource::SchemaReject as i32,
+        work_id: work_id.to_string(),
+        severity: "S1".to_string(),
+        detected_at: timestamp_ns,
+        time_envelope_ref: None,
+    };
+
+    if let Err(e) = emitter.emit_defect_recorded(&defect, timestamp_ns) {
+        // Defect emission failure is logged but does NOT suppress the
+        // original rejection (fail-closed).
+        warn!(
+            error = %e,
+            defect_id = %defect_id,
+            violations = %violations_summary,
+            "Failed to persist authority binding defect (rejection still enforced)"
+        );
+    }
+}
+
+/// Stores authority binding artifacts in CAS so they are resolvable
+/// at validation time (TCK-00416).
+///
+/// This must be called BEFORE `validate_transition_authority_bindings`
+/// to ensure CAS-resolvability. The function stores:
+/// - Permeability receipt payload
+/// - Stop conditions canonical bytes
+/// - Typed budget payload
+///
+/// # Arguments
+///
+/// * `work_id` - The work ID for permeability receipt context.
+/// * `bindings` - The bindings whose hash preimages should be stored.
+/// * `cas` - The content-addressed store.
+///
+/// # Errors
+///
+/// Returns an error message if any CAS store operation fails.
+pub fn store_authority_binding_artifacts(
+    work_id: &str,
+    bindings: &TransitionAuthorityBindings,
+    cas: &dyn ContentAddressedStore,
+) -> Result<(), String> {
+    // Store permeability receipt payload
+    let permeability_payload = build_permeability_receipt_payload(work_id, bindings);
+    let permeability_bytes = canonical_json_bytes(&permeability_payload)?;
+    cas.store(&permeability_bytes)
+        .map_err(|e| format!("CAS store permeability receipt failed: {e}"))?;
+
+    // Store stop conditions canonical bytes
+    let stop_bytes = bindings.stop_conditions.canonical_bytes();
+    cas.store(&stop_bytes)
+        .map_err(|e| format!("CAS store stop conditions failed: {e}"))?;
+
+    // Store typed budget payload
+    let budget_payload = build_typed_budget_payload(&bindings.typed_budgets);
+    let budget_bytes = canonical_json_bytes(&budget_payload)?;
+    cas.store(&budget_bytes)
+        .map_err(|e| format!("CAS store typed budget failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Appends review outcome binding fields to a JSON event payload (TCK-00416).
+pub fn append_review_outcome_fields(
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    bindings: &ReviewOutcomeBindings,
+) {
+    payload.insert(
+        "view_commitment_hash".to_string(),
+        serde_json::Value::String(hex::encode(bindings.view_commitment_hash)),
+    );
+    payload.insert(
+        "tool_log_index_hash".to_string(),
+        serde_json::Value::String(hex::encode(bindings.tool_log_index_hash)),
+    );
+    payload.insert(
+        "summary_receipt_hash".to_string(),
+        serde_json::Value::String(hex::encode(bindings.summary_receipt_hash)),
+    );
 }
 
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
