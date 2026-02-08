@@ -1740,6 +1740,16 @@ pub enum EnvelopeV1Error {
     /// authority subset check). Fail-closed per REQ-0027.
     #[error("permeability consumption binding failure: {0}")]
     PermeabilityBindingFailure(apm2_core::policy::permeability::PermeabilityError),
+
+    /// Delegated spawn attempted through the legacy gate without full
+    /// consumption binding verification.
+    ///
+    /// All delegated spawn authorization MUST use
+    /// [`validate_delegated_spawn_gate`] which enforces receipt
+    /// consumption binding. The legacy [`validate_spawn_gate`] does not
+    /// provide sufficient security for delegated mode. Fail-closed.
+    #[error("delegated spawn requires consumption binding; use validate_delegated_spawn_gate")]
+    DelegatedRequiresConsumptionBinding,
 }
 
 /// Builder for [`EpisodeEnvelopeV1`].
@@ -1909,17 +1919,27 @@ impl EpisodeEnvelopeV1Builder {
     }
 }
 
-/// Validates envelope bindings at the spawn/resume gate.
+/// Validates envelope bindings at the spawn/resume gate for
+/// **non-delegated** episodes only.
 ///
-/// This is the top-level enforcement point. Callers MUST invoke this
-/// before allowing a spawn or resume to proceed.
+/// This is the top-level enforcement point for standard (non-delegated)
+/// spawns. Callers MUST invoke this before allowing a spawn or resume to
+/// proceed.
+///
+/// # Delegated episodes
+///
+/// Delegated spawn authorization **must** use
+/// [`validate_delegated_spawn_gate`] instead, which enforces full
+/// consumption binding verification. Passing `is_delegated = true` to
+/// this function is a programming error and will return
+/// [`EnvelopeV1Error::DelegatedRequiresConsumptionBinding`].
 ///
 /// # Fail-closed
 ///
 /// Returns an error if:
+/// - `is_delegated` is `true` (must use [`validate_delegated_spawn_gate`])
 /// - The envelope is `None` (absent)
 /// - The envelope fails validation
-/// - For delegated episodes: `permeability_receipt_hash` is missing
 ///
 /// # Arguments
 ///
@@ -1933,22 +1953,24 @@ pub fn validate_spawn_gate(
     envelope: Option<&EpisodeEnvelopeV1>,
     is_delegated: bool,
 ) -> Result<&EpisodeEnvelopeV1, EnvelopeV1Error> {
-    let env = envelope.ok_or(EnvelopeV1Error::ZeroEnvelopeHash)?;
-
+    // Delegated spawns MUST go through validate_delegated_spawn_gate which
+    // enforces full consumption binding. Reject the legacy path outright.
     if is_delegated {
-        env.validate_for_delegated_spawn()?;
-    } else {
-        env.validate_for_spawn()?;
+        return Err(EnvelopeV1Error::DelegatedRequiresConsumptionBinding);
     }
 
+    let env = envelope.ok_or(EnvelopeV1Error::ZeroEnvelopeHash)?;
+    env.validate_for_spawn()?;
     Ok(env)
 }
 
 /// Production-grade delegated spawn gate with full consumption binding
 /// verification.
 ///
-/// This is the recommended entry-point for delegated spawn authorization.
-/// It performs all checks from [`validate_spawn_gate`] **plus** full
+/// This is the **only** valid entry-point for delegated spawn
+/// authorization. [`validate_spawn_gate`] rejects `is_delegated = true`
+/// outright, so all delegated paths must come through here. It performs
+/// structural envelope validation **plus** full
 /// [`validate_consumption_binding`](apm2_core::policy::permeability::validate_consumption_binding)
 /// verification of the permeability receipt.
 ///
@@ -3654,12 +3676,46 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_gate_rejects_delegated_without_permeability() {
+    fn test_spawn_gate_rejects_delegated_mode() {
+        // Even with a valid envelope, delegated mode MUST be rejected by
+        // the legacy gate — callers must use validate_delegated_spawn_gate.
         let env = minimal_v1_envelope();
         let result = validate_spawn_gate(Some(&env), true);
         assert!(
-            matches!(result, Err(EnvelopeV1Error::MissingPermeabilityReceiptHash)),
-            "expected MissingPermeabilityReceiptHash for delegated spawn, got: {result:?}"
+            matches!(
+                result,
+                Err(EnvelopeV1Error::DelegatedRequiresConsumptionBinding)
+            ),
+            "expected DelegatedRequiresConsumptionBinding for delegated spawn, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_spawn_gate_rejects_delegated_even_with_receipt_hash() {
+        // A delegated envelope with a permeability_receipt_hash must STILL
+        // be rejected by the legacy gate — only
+        // validate_delegated_spawn_gate may authorize delegated spawns.
+        let env = EpisodeEnvelopeV1::builder()
+            .episode_id("ep-del")
+            .actor_id("agent-del")
+            .lease_id("lease-del")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(10))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .view_commitment_hash([0xcc; 32])
+            .freshness_pinset_hash([0xdd; 32])
+            .permeability_receipt_hash([0xee; 32])
+            .build()
+            .expect("valid delegated V1 envelope");
+
+        let result = validate_spawn_gate(Some(&env), true);
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeV1Error::DelegatedRequiresConsumptionBinding)
+            ),
+            "expected DelegatedRequiresConsumptionBinding even with receipt hash, got: {result:?}"
         );
     }
 
