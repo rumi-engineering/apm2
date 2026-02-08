@@ -735,6 +735,25 @@ pub enum PermeabilityError {
         /// The delegation depth of the receipt.
         depth: u32,
     },
+
+    /// Chain commitment cryptographic verification failure.
+    ///
+    /// The receipt's `chain_commitment` does not match the expected value
+    /// recomputed from chain inputs. For root receipts (`delegation_depth
+    /// == 0`), the expected value is `BLAKE3(CHAIN_COMMIT_DOMAIN ||
+    /// receipt_content_hash)`. For delegated receipts, the expected value
+    /// is `BLAKE3(CHAIN_COMMIT_DOMAIN || parent_chain_commitment ||
+    /// receipt_content_hash)`.
+    ///
+    /// This prevents forged receipts that carry arbitrary non-zero
+    /// `chain_commitment` values without knowledge of the true chain.
+    #[error("chain commitment mismatch: expected {expected}, got {actual}")]
+    ChainCommitmentMismatch {
+        /// Expected chain commitment (hex).
+        expected: String,
+        /// Actual chain commitment (hex).
+        actual: String,
+    },
 }
 
 // =============================================================================
@@ -1650,6 +1669,21 @@ pub struct ConsumptionContext<'a> {
     /// If `None`, no ceiling validation is performed (caller assumes
     /// responsibility).
     pub authority_ceiling: Option<&'a AuthorityVector>,
+
+    /// The parent receipt's chain commitment for delegated receipt
+    /// verification.
+    ///
+    /// For delegated receipts (`delegation_depth > 0`), this is used to
+    /// cryptographically verify the receipt's `chain_commitment` against
+    /// the expected value `BLAKE3(CHAIN_COMMIT_DOMAIN ||
+    /// parent_chain_commitment || receipt_content_hash)`.
+    ///
+    /// For root receipts (`delegation_depth == 0`), this field is ignored
+    /// since root chain commitments are self-verifiable.
+    ///
+    /// When `None` for a delegated receipt, the receipt is rejected
+    /// (fail-closed) because the chain commitment cannot be verified.
+    pub parent_chain_commitment: Option<&'a [u8; 32]>,
 }
 
 /// Validates that an envelope or receipt properly binds a permeability
@@ -1687,6 +1721,7 @@ pub struct ConsumptionContext<'a> {
 ///
 /// Returns an error if the binding is invalid, the receipt has expired or
 /// been revoked, or the delegated authority is insufficient.
+#[allow(clippy::too_many_lines)]
 pub fn validate_consumption_binding(
     receipt: &PermeabilityReceipt,
     bound_hash: &[u8; 32],
@@ -1748,12 +1783,18 @@ pub fn validate_consumption_binding(
         });
     }
 
-    // BLOCKER 4: Chain commitment verification — delegated receipts
-    // (depth > 0) MUST carry a non-zero chain_commitment that binds
-    // the full chain of receipt content-hashes from root to current.
-    // This prevents fabricated parent linkage attacks where a non-root
-    // receipt carries self-consistent but fabricated parent data.
-    if receipt.delegation_depth > 0 {
+    // BLOCKER 4: Chain commitment cryptographic verification.
+    //
+    // All receipts MUST carry a chain_commitment. Root receipts (depth 0)
+    // use `BLAKE3(CHAIN_COMMIT_DOMAIN || receipt_content_hash)` and
+    // delegated receipts (depth > 0) use
+    // `BLAKE3(CHAIN_COMMIT_DOMAIN || parent_chain_commitment ||
+    // receipt_content_hash)`.
+    //
+    // The receipt_content_hash used here is computed with chain_commitment=None,
+    // matching the builder's computation order.
+    {
+        // Presence check first (applies to all depths).
         match &receipt.chain_commitment {
             None => {
                 return Err(PermeabilityError::MissingChainCommitment {
@@ -1765,11 +1806,55 @@ pub fn validate_consumption_binding(
                     depth: receipt.delegation_depth,
                 });
             },
-            Some(_) => {
-                // Non-zero chain_commitment present; the structural
-                // correctness is guaranteed by the builder at issuance
-                // time and bound into the receipt's content_hash.
-            },
+            Some(_) => {},
+        }
+
+        // Cryptographic verification: recompute the expected chain_commitment
+        // from chain inputs and compare against the stored value.
+        //
+        // To recompute, we need the receipt's content_hash as it was at
+        // build time (with chain_commitment = None).
+        let mut receipt_for_hash = receipt.clone();
+        receipt_for_hash.chain_commitment = None;
+        let receipt_hash_without_cc = receipt_for_hash.content_hash();
+
+        // SAFETY: presence is guaranteed by the match above (None/zero both
+        // return early). Use `ok_or` for a fail-closed fallback that
+        // satisfies clippy::missing_panics_doc.
+        let actual_cc =
+            receipt
+                .chain_commitment
+                .as_ref()
+                .ok_or(PermeabilityError::MissingChainCommitment {
+                    depth: receipt.delegation_depth,
+                })?;
+
+        if receipt.delegation_depth == 0 {
+            // Root receipt: expected = BLAKE3(CHAIN_COMMIT_DOMAIN || receipt_content_hash)
+            let expected = compute_root_chain_commitment(&receipt_hash_without_cc);
+            if *actual_cc != expected {
+                return Err(PermeabilityError::ChainCommitmentMismatch {
+                    expected: hex::encode(expected),
+                    actual: hex::encode(actual_cc),
+                });
+            }
+        } else {
+            // Delegated receipt: needs parent_chain_commitment from context.
+            // Fail-closed: if context is absent or parent_chain_commitment is
+            // not provided, we cannot verify — reject.
+            let parent_cc = ctx.and_then(|c| c.parent_chain_commitment).ok_or(
+                PermeabilityError::MissingChainCommitment {
+                    depth: receipt.delegation_depth,
+                },
+            )?;
+
+            let expected = compute_delegated_chain_commitment(parent_cc, &receipt_hash_without_cc);
+            if *actual_cc != expected {
+                return Err(PermeabilityError::ChainCommitmentMismatch {
+                    expected: hex::encode(expected),
+                    actual: hex::encode(actual_cc),
+                });
+            }
         }
     }
 
@@ -2369,6 +2454,7 @@ mod tests {
             actor_id: "bob",
             policy_root_hash: &TEST_POLICY_ROOT,
             authority_ceiling: None,
+            parent_chain_commitment: None,
         };
         assert!(
             validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx))
@@ -2434,6 +2520,7 @@ mod tests {
             actor_id: "bob",
             policy_root_hash: &TEST_POLICY_ROOT,
             authority_ceiling: None,
+            parent_chain_commitment: None,
         };
         let result =
             validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
@@ -2497,6 +2584,7 @@ mod tests {
             actor_id: "bob",
             policy_root_hash: &wrong_root,
             authority_ceiling: None,
+            parent_chain_commitment: None,
         };
         let result =
             validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
@@ -2533,6 +2621,7 @@ mod tests {
             actor_id: "charlie",
             policy_root_hash: &TEST_POLICY_ROOT,
             authority_ceiling: None,
+            parent_chain_commitment: None,
         };
         let result =
             validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
@@ -2570,6 +2659,7 @@ mod tests {
             actor_id: "bob",
             policy_root_hash: &TEST_POLICY_ROOT,
             authority_ceiling: Some(&low_ceiling),
+            parent_chain_commitment: None,
         };
         let result =
             validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
@@ -2636,6 +2726,7 @@ mod tests {
             actor_id: "charlie",
             policy_root_hash: &TEST_POLICY_ROOT,
             authority_ceiling: None,
+            parent_chain_commitment: None,
         };
         // Admission itself will catch this (MissingDelegationChainProof)
         let result =
@@ -3458,6 +3549,7 @@ mod tests {
             actor_id: "charlie",
             policy_root_hash: &TEST_POLICY_ROOT,
             authority_ceiling: None,
+            parent_chain_commitment: None,
         };
         let result = validate_consumption_binding(
             &fabricated,
@@ -3531,6 +3623,7 @@ mod tests {
             actor_id: "charlie",
             policy_root_hash: &TEST_POLICY_ROOT,
             authority_ceiling: None,
+            parent_chain_commitment: None,
         };
         let result =
             validate_consumption_binding(&child, &bound_hash, &required, 2_000_000, Some(&ctx));
@@ -3540,6 +3633,293 @@ mod tests {
                 Err(PermeabilityError::MissingChainCommitment { .. })
             ),
             "delegated receipt with zero chain_commitment must be rejected, got: {result:?}"
+        );
+    }
+
+    // -- Chain commitment cryptographic verification tests --
+
+    #[test]
+    fn test_root_chain_commitment_cryptographic_verification_passes() {
+        // A root receipt built by the builder should pass cryptographic
+        // chain_commitment verification.
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("root-cc-verify", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        assert!(
+            receipt.chain_commitment.is_some(),
+            "root receipt must have chain_commitment"
+        );
+
+        let bound_hash = receipt.content_hash();
+        let required = AuthorityVector::bottom();
+        let ctx = ConsumptionContext {
+            actor_id: "bob",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+            parent_chain_commitment: None,
+        };
+        assert!(
+            validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx))
+                .is_ok(),
+            "root receipt with valid chain_commitment must pass"
+        );
+    }
+
+    #[test]
+    fn test_root_chain_commitment_forged_value_rejected() {
+        // A root receipt with a forged (arbitrary non-zero) chain_commitment
+        // must be rejected by cryptographic verification.
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let mut receipt = PermeabilityReceiptBuilder::new("root-cc-forged", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        // Forge the chain_commitment to an arbitrary non-zero value
+        receipt.chain_commitment = Some([0xDE; 32]);
+        let bound_hash = receipt.content_hash();
+        let required = AuthorityVector::bottom();
+        let ctx = ConsumptionContext {
+            actor_id: "bob",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+            parent_chain_commitment: None,
+        };
+        let result =
+            validate_consumption_binding(&receipt, &bound_hash, &required, 2_000_000, Some(&ctx));
+        assert!(
+            matches!(
+                result,
+                Err(PermeabilityError::ChainCommitmentMismatch { .. })
+            ),
+            "root receipt with forged chain_commitment must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_chain_commitment_cryptographic_verification_passes() {
+        // A delegated receipt with proper parent_chain_commitment in context
+        // should pass cryptographic verification.
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(10000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let root = PermeabilityReceiptBuilder::new("root-for-delegated-cc", parent, overlay)
+            .delegation_depth(0)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        let root_cc = root
+            .chain_commitment
+            .expect("root must have chain_commitment");
+
+        let child_overlay = AuthorityVector::new(
+            RiskLevel::Low,
+            CapabilityLevel::ReadOnly,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Public,
+        );
+        let child =
+            PermeabilityReceiptBuilder::new("child-cc-verify", root.delegated, child_overlay)
+                .delegation_depth(1)
+                .parent_receipt_hash(root.content_hash())
+                .parent_chain_commitment(root_cc)
+                .delegator_actor_id("bob")
+                .delegate_actor_id("charlie")
+                .issued_at_ms(1_000_000)
+                .expires_at_ms(5_000_000)
+                .policy_root_hash(TEST_POLICY_ROOT)
+                .build()
+                .unwrap();
+
+        let bound_hash = child.content_hash();
+        let required = AuthorityVector::bottom();
+        let ctx = ConsumptionContext {
+            actor_id: "charlie",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+            parent_chain_commitment: Some(&root_cc),
+        };
+        assert!(
+            validate_consumption_binding(&child, &bound_hash, &required, 2_000_000, Some(&ctx))
+                .is_ok(),
+            "delegated receipt with valid chain_commitment and parent_chain_commitment must pass"
+        );
+    }
+
+    #[test]
+    fn test_delegated_chain_commitment_wrong_parent_cc_rejected() {
+        // A delegated receipt verified with the wrong parent_chain_commitment
+        // must be rejected.
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(10000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let root = PermeabilityReceiptBuilder::new("root-wrong-parent-cc", parent, overlay)
+            .delegation_depth(0)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        let root_cc = root
+            .chain_commitment
+            .expect("root must have chain_commitment");
+
+        let child_overlay = AuthorityVector::new(
+            RiskLevel::Low,
+            CapabilityLevel::ReadOnly,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Public,
+        );
+        let child =
+            PermeabilityReceiptBuilder::new("child-wrong-parent-cc", root.delegated, child_overlay)
+                .delegation_depth(1)
+                .parent_receipt_hash(root.content_hash())
+                .parent_chain_commitment(root_cc)
+                .delegator_actor_id("bob")
+                .delegate_actor_id("charlie")
+                .issued_at_ms(1_000_000)
+                .expires_at_ms(5_000_000)
+                .policy_root_hash(TEST_POLICY_ROOT)
+                .build()
+                .unwrap();
+
+        let bound_hash = child.content_hash();
+        let required = AuthorityVector::bottom();
+        // Provide a WRONG parent_chain_commitment
+        let wrong_parent_cc = [0xFF; 32];
+        let ctx = ConsumptionContext {
+            actor_id: "charlie",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+            parent_chain_commitment: Some(&wrong_parent_cc),
+        };
+        let result =
+            validate_consumption_binding(&child, &bound_hash, &required, 2_000_000, Some(&ctx));
+        assert!(
+            matches!(
+                result,
+                Err(PermeabilityError::ChainCommitmentMismatch { .. })
+            ),
+            "delegated receipt with wrong parent_chain_commitment must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_delegated_chain_commitment_no_parent_cc_in_context_rejected() {
+        // A delegated receipt verified without parent_chain_commitment in
+        // context must be rejected (fail-closed).
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(10000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let root = PermeabilityReceiptBuilder::new("root-no-ctx-cc", parent, overlay)
+            .delegation_depth(0)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .policy_root_hash(TEST_POLICY_ROOT)
+            .build()
+            .unwrap();
+
+        let root_cc = root
+            .chain_commitment
+            .expect("root must have chain_commitment");
+
+        let child_overlay = AuthorityVector::new(
+            RiskLevel::Low,
+            CapabilityLevel::ReadOnly,
+            BudgetLevel::Capped(100),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Public,
+        );
+        let child =
+            PermeabilityReceiptBuilder::new("child-no-ctx-cc", root.delegated, child_overlay)
+                .delegation_depth(1)
+                .parent_receipt_hash(root.content_hash())
+                .parent_chain_commitment(root_cc)
+                .delegator_actor_id("bob")
+                .delegate_actor_id("charlie")
+                .issued_at_ms(1_000_000)
+                .expires_at_ms(5_000_000)
+                .policy_root_hash(TEST_POLICY_ROOT)
+                .build()
+                .unwrap();
+
+        let bound_hash = child.content_hash();
+        let required = AuthorityVector::bottom();
+        // No parent_chain_commitment in context
+        let ctx = ConsumptionContext {
+            actor_id: "charlie",
+            policy_root_hash: &TEST_POLICY_ROOT,
+            authority_ceiling: None,
+            parent_chain_commitment: None,
+        };
+        let result =
+            validate_consumption_binding(&child, &bound_hash, &required, 2_000_000, Some(&ctx));
+        assert!(
+            matches!(
+                result,
+                Err(PermeabilityError::MissingChainCommitment { .. })
+            ),
+            "delegated receipt without parent_chain_commitment in context must be rejected, got: {result:?}"
         );
     }
 

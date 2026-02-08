@@ -1614,6 +1614,7 @@ impl EpisodeEnvelopeV1 {
             actor_id: self.inner.actor_id(),
             policy_root_hash: &policy_root,
             authority_ceiling: Some(&authority_ceiling),
+            parent_chain_commitment: None,
         };
 
         apm2_core::policy::permeability::validate_consumption_binding(
