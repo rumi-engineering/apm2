@@ -296,6 +296,14 @@ pub struct Work {
     ///
     /// A value of `None` indicates no PR has been associated yet.
     pub commit_sha: Option<String>,
+
+    /// Timestamp of the first claim transition (Unix nanos).
+    ///
+    /// Recorded when the work item first transitions from `Open` to `Claimed`.
+    /// Unlike `last_transition_at`, this field is immutable after being set
+    /// and accurately represents the moment of initial claim regardless of
+    /// subsequent state changes.
+    pub claimed_at: Option<u64>,
 }
 
 impl Work {
@@ -327,6 +335,7 @@ impl Work {
             abort_reason: None,
             pr_number: None,
             commit_sha: None,
+            claimed_at: None,
         }
     }
 

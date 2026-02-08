@@ -340,6 +340,7 @@ impl_bounded_decode_simple!(
     // TCK-00344: Status query endpoints
     WorkStatusRequest,
     WorkStatusResponse,
+    WorkListRequest,
     SessionStatusRequest,
     SessionStatusResponse,
     // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
@@ -425,6 +426,8 @@ impl_bounded_decode_with_repeated!(SubscribePulseResponse, accepted_patterns, re
 // CTR-PROTO-011: Process Management Endpoints (TCK-00342)
 impl_bounded_decode_with_repeated!(ListProcessesResponse, processes);
 impl_bounded_decode_with_repeated!(StreamLogsResponse, entries);
+// TCK-00415: Projection-backed work list
+impl_bounded_decode_with_repeated!(WorkListResponse, work_items);
 // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
 impl_bounded_decode_with_repeated!(ConsensusValidatorsResponse, validators);
 impl_bounded_decode_with_repeated!(ConsensusByzantineEvidenceResponse, evidence);

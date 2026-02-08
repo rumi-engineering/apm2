@@ -415,6 +415,24 @@ message WorkStatusResponse {
   optional uint64 claimed_at_ns = 8;
 }
 
+// IPC-PRIV-019: WorkList (TCK-00415)
+// List all work items known to projection authority.
+message WorkListRequest {
+  // If true, return only claimable work items.
+  bool claimable_only = 1;
+  // Maximum number of rows to return. Server enforces a hard cap of 500
+  // regardless of this value. 0 means use the server default (500).
+  uint32 limit = 2;
+  // Pagination cursor: work_id to start after (exclusive).
+  // Empty string means start from the beginning.
+  string cursor = 3;
+}
+
+message WorkListResponse {
+  // Projection-derived status rows ordered deterministically by work_id.
+  repeated WorkStatusResponse work_items = 1;
+}
+
 // =============================================================================
 // IPC-PRIV-017: PublishChangeSet (TCK-00394, RFC-0018)
 // =============================================================================

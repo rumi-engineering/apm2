@@ -1252,7 +1252,7 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     let json_array_byte: u8 = b'[';
     assert_eq!(json_array_byte, 91);
 
-    // Valid privileged message types are 1-26 (with gaps at 19-20)
+    // Valid privileged message types are 1-26 (with a gap at 20)
     // Tags 1-4: Original privileged endpoints
     assert!(PrivilegedMessageType::from_tag(1).is_some()); // ClaimWork
     assert!(PrivilegedMessageType::from_tag(2).is_some()); // SpawnEpisode
@@ -1278,7 +1278,8 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(PrivilegedMessageType::from_tag(17).is_some()); // IngestReviewReceipt
     // Tag 18: TCK-00351 UpdateStopFlags
     assert!(PrivilegedMessageType::from_tag(18).is_some()); // UpdateStopFlags
-    assert!(PrivilegedMessageType::from_tag(19).is_none()); // Invalid (gap)
+    // Tag 19: TCK-00415 WorkList
+    assert!(PrivilegedMessageType::from_tag(19).is_some()); // WorkList
     assert!(PrivilegedMessageType::from_tag(20).is_none()); // Invalid (gap)
     // Tags 21-26: Credential management (CTR-PROTO-012, TCK-00343)
     assert!(PrivilegedMessageType::from_tag(21).is_some()); // ListCredentials

@@ -6,7 +6,9 @@
 //! # Commands
 //!
 //! - `apm2 fac check` - Run deterministic local FAC gates with receipt pointers
-//! - `apm2 fac work status <work_id>` - Show work status from ledger
+//! - `apm2 fac work status <work_id>` - Show projection-backed work status via
+//!   daemon
+//! - `apm2 fac work list` - List projection-known work items via daemon
 //! - `apm2 fac episode inspect <episode_id>` - Show episode details and tool
 //!   log index
 //! - `apm2 fac receipt show <receipt_hash>` - Show receipt from CAS
@@ -17,9 +19,9 @@
 //!
 //! # Design
 //!
-//! These commands operate directly on ledger and CAS files, enabling debugging
-//! without requiring a running daemon. This supports crash-only recovery and
-//! deterministic context rebuild for FAC v0.
+//! Most commands operate directly on ledger and CAS files for crash-only
+//! debugging. Work lifecycle authority surfaces (`fac work status/list`) route
+//! through daemon operator IPC so runtime authority remains projection-backed.
 //!
 //! # Exit Codes (RFC-0018)
 //!
@@ -47,12 +49,14 @@ use apm2_core::fac::{
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::gate::GateType;
 use apm2_daemon::projection::GitHubAdapterConfig;
+use apm2_daemon::protocol::WorkRole;
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::exit_codes::codes as exit_codes;
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
+use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
 // Constants
@@ -111,10 +115,10 @@ pub enum FacSubcommand {
     /// workspace integrity) and emits receipt pointers for each gate.
     Check(CheckArgs),
 
-    /// Show work status from ledger.
+    /// Query projection-backed work authority via daemon operator IPC.
     ///
-    /// Displays the current status of a work item including claims, episodes,
-    /// and latest receipt hashes. Operates directly on ledger without daemon.
+    /// Displays work status or lists work items from runtime projection state.
+    /// This is the authoritative runtime surface for work lifecycle reads.
     Work(WorkArgs),
 
     /// Inspect episode details and tool log index.
@@ -185,8 +189,11 @@ pub struct WorkArgs {
 /// Work subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkSubcommand {
-    /// Show work status from ledger.
+    /// Show projection-backed work status from daemon authority.
     Status(WorkStatusArgs),
+
+    /// List projection-known work items from daemon authority.
+    List(WorkListArgs),
 }
 
 /// Arguments for `apm2 fac work status`.
@@ -194,10 +201,14 @@ pub enum WorkSubcommand {
 pub struct WorkStatusArgs {
     /// Work identifier to query.
     pub work_id: String,
+}
 
-    /// Maximum number of events to scan from the end of the ledger.
-    #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
-    pub limit: u64,
+/// Arguments for `apm2 fac work list`.
+#[derive(Debug, Args)]
+pub struct WorkListArgs {
+    /// Return only claimable work items.
+    #[arg(long, default_value_t = false)]
+    pub claimable_only: bool,
 }
 
 /// Arguments for `apm2 fac episode`.
@@ -473,7 +484,7 @@ pub struct FacCheckResponse {
 // =============================================================================
 
 /// Runs the FAC command, returning an appropriate exit code.
-pub fn run_fac(cmd: &FacCommand) -> u8 {
+pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
     let json_output = cmd.json;
     let ledger_path = resolve_ledger_path(cmd.ledger_path.as_deref());
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
@@ -482,7 +493,10 @@ pub fn run_fac(cmd: &FacCommand) -> u8 {
         FacSubcommand::Check(args) => run_check(args, json_output),
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
-                run_work_status(status_args, &ledger_path, json_output)
+                run_work_status(status_args, operator_socket, json_output)
+            },
+            WorkSubcommand::List(list_args) => {
+                run_work_list(list_args, operator_socket, json_output)
             },
         },
         FacSubcommand::Episode(args) => match &args.subcommand {
@@ -914,7 +928,7 @@ fn calculate_start_cursor(ledger: &Ledger, limit: u64) -> Result<u64, LedgerErro
 // =============================================================================
 
 /// Execute the work status command.
-fn run_work_status(args: &WorkStatusArgs, ledger_path: &Path, json_output: bool) -> u8 {
+fn run_work_status(args: &WorkStatusArgs, operator_socket: &Path, json_output: bool) -> u8 {
     // Validate work ID
     if args.work_id.is_empty() {
         return output_error(
@@ -925,145 +939,146 @@ fn run_work_status(args: &WorkStatusArgs, ledger_path: &Path, json_output: bool)
         );
     }
 
-    // Open ledger
-    let ledger = match open_ledger(ledger_path) {
-        Ok(l) => l,
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
         Err(e) => {
             return output_error(
                 json_output,
-                "ledger_error",
-                &format!("Failed to open ledger: {e}"),
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
                 exit_codes::GENERIC_ERROR,
             );
         },
     };
 
-    // Calculate start cursor based on limit
-    let mut cursor = match calculate_start_cursor(&ledger, args.limit) {
-        Ok(c) => c,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "ledger_error",
-                &format!("Failed to query ledger head: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_status(&args.work_id).await
+    });
 
-    // Scan ledger for work-related events
-    let mut response = WorkStatusResponse {
-        work_id: args.work_id.clone(),
-        status: "UNKNOWN".to_string(),
-        actor_id: None,
-        role: None,
-        latest_episode_id: None,
-        latest_receipt_hash: None,
-        event_count: 0,
-        latest_seq_id: None,
-    };
+    match result {
+        Ok(response) => {
+            let response = fac_work_status_from_daemon(response);
 
-    let batch_size = 1000u64;
-    let mut scanned_count = 0u64;
-
-    loop {
-        // Stop if we've scanned more than the limit (plus batch overhead)
-        if scanned_count >= args.limit + batch_size {
-            break;
-        }
-
-        let events = match ledger.read_from(cursor, batch_size) {
-            Ok(events) => events,
-            Err(e) => {
-                return output_error(
-                    json_output,
-                    "ledger_error",
-                    &format!("Failed to read ledger: {e}"),
-                    exit_codes::GENERIC_ERROR,
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
                 );
-            },
-        };
-
-        if events.is_empty() {
-            break;
-        }
-
-        for event in &events {
-            scanned_count += 1;
-            if let Some(work_info) = extract_work_info(event, &args.work_id) {
-                response.event_count += 1;
-                response.latest_seq_id = event.seq_id;
-
-                // Update status based on event type
-                match event.event_type.as_str() {
-                    "work_claimed" => {
-                        response.status = "CLAIMED".to_string();
-                        response.actor_id = work_info.actor_id;
-                        response.role = work_info.role;
-                    },
-                    "episode_spawned" => {
-                        response.status = "IN_PROGRESS".to_string();
-                        response.latest_episode_id = work_info.episode_id;
-                    },
-                    "session_terminated" => {
-                        response.status = "COMPLETED".to_string();
-                    },
-                    "gate_receipt" | "review_receipt" | "merge_receipt" => {
-                        if let Some(hash) = event.event_hash.as_ref() {
-                            response.latest_receipt_hash = Some(hex::encode(hash));
-                        }
-                    },
-                    _ => {},
+            } else {
+                println!("Work Status");
+                println!("  Work ID:            {}", response.work_id);
+                println!("  Status:             {}", response.status);
+                if let Some(actor) = &response.actor_id {
+                    println!("  Actor ID:           {actor}");
+                }
+                if let Some(role) = &response.role {
+                    println!("  Role:               {role}");
+                }
+                if let Some(session_id) = &response.latest_episode_id {
+                    println!("  Session ID:         {session_id}");
+                }
+                if let Some(lease_id) = &response.latest_receipt_hash {
+                    println!("  Lease ID:           {lease_id}");
                 }
             }
-        }
 
-        cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
     }
+}
 
-    if response.event_count == 0 {
-        return output_error(
-            json_output,
-            "not_found",
-            &format!("No events found for work_id: {}", args.work_id),
-            exit_codes::NOT_FOUND,
-        );
+/// Execute the work list command.
+fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_list(args.claimable_only).await
+    });
+
+    match result {
+        Ok(response) => {
+            let rows: Vec<WorkStatusResponse> = response
+                .work_items
+                .into_iter()
+                .map(fac_work_status_from_daemon)
+                .collect();
+
+            if json_output {
+                #[derive(Debug, Serialize)]
+                struct WorkListJson<'a> {
+                    claimable_only: bool,
+                    total: usize,
+                    items: &'a [WorkStatusResponse],
+                }
+
+                let output = WorkListJson {
+                    claimable_only: args.claimable_only,
+                    total: rows.len(),
+                    items: &rows,
+                };
+
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Work List");
+                println!("  Claimable Only: {}", args.claimable_only);
+                println!("  Total:          {}", rows.len());
+                for row in &rows {
+                    println!("  - {} [{}]", row.work_id, row.status);
+                }
+            }
+
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
     }
+}
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Work Status");
-        println!("  Work ID:            {}", response.work_id);
-        println!("  Status:             {}", response.status);
-        if let Some(actor) = &response.actor_id {
-            println!("  Actor ID:           {actor}");
-        }
-        if let Some(role) = &response.role {
-            println!("  Role:               {role}");
-        }
-        if let Some(episode) = &response.latest_episode_id {
-            println!("  Latest Episode:     {episode}");
-        }
-        if let Some(receipt) = &response.latest_receipt_hash {
-            println!("  Latest Receipt:     {receipt}");
-        }
-        println!("  Events Found:       {}", response.event_count);
-        if let Some(seq_id) = response.latest_seq_id {
-            println!("  Latest Seq ID:      {seq_id}");
-        }
+fn fac_work_status_from_daemon(
+    response: apm2_daemon::protocol::WorkStatusResponse,
+) -> WorkStatusResponse {
+    let role = response
+        .role
+        .and_then(|value| WorkRole::try_from(value).ok())
+        .map(|role| format!("{role:?}"));
+
+    WorkStatusResponse {
+        work_id: response.work_id,
+        status: response.status,
+        actor_id: response.actor_id,
+        role,
+        latest_episode_id: response.session_id,
+        latest_receipt_hash: response.lease_id,
+        event_count: 1,
+        latest_seq_id: None,
     }
-
-    exit_codes::SUCCESS
 }
 
 /// Extracted work information from an event.
 struct WorkInfo {
-    actor_id: Option<String>,
-    role: Option<String>,
     episode_id: Option<String>,
 }
 
@@ -1087,17 +1102,6 @@ fn extract_work_info(event: &EventRecord, work_id: &str) -> Option<WorkInfo> {
     }
 
     Some(WorkInfo {
-        actor_id: payload
-            .as_ref()
-            .and_then(|v| v.get("actor_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| (!event.actor_id.is_empty()).then(|| event.actor_id.clone())),
-        role: payload
-            .as_ref()
-            .and_then(|v| v.get("role"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
         episode_id: payload
             .as_ref()
             .and_then(|v| v.get("episode_id"))
@@ -2077,6 +2081,31 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
     exit_code
 }
 
+/// Output protocol errors in CLI-friendly format.
+fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
+    let exit_code = map_protocol_error(error);
+    let (code, message) = match error {
+        ProtocolClientError::DaemonNotRunning => (
+            "daemon_not_running".to_string(),
+            "Daemon is not running. Start with: apm2 daemon".to_string(),
+        ),
+        ProtocolClientError::ConnectionFailed(msg) => (
+            "connection_failed".to_string(),
+            format!("Failed to connect to daemon: {msg}"),
+        ),
+        ProtocolClientError::HandshakeFailed(msg) => (
+            "handshake_failed".to_string(),
+            format!("Protocol handshake failed: {msg}"),
+        ),
+        ProtocolClientError::DaemonError { code, message } => {
+            (format!("daemon_{}", code.to_lowercase()), message.clone())
+        },
+        other => ("protocol_error".to_string(), other.to_string()),
+    };
+
+    output_error(json_output, &code, &message, exit_code)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -2300,8 +2329,10 @@ mod tests {
         );
 
         let info = extract_work_info(&event, "work-123").expect("should extract");
-        assert_eq!(info.actor_id.as_deref(), Some("actor-1"));
-        assert_eq!(info.role.as_deref(), Some("implementer"));
+        assert!(
+            info.episode_id.is_none(),
+            "work_claimed payload has no episode_id"
+        );
     }
 
     #[test]
@@ -2317,8 +2348,10 @@ mod tests {
         );
 
         let info = extract_work_info(&event, "work-123").expect("should match via metadata");
-        assert_eq!(info.actor_id.as_deref(), Some("actor-from-row"));
-        assert_eq!(info.role.as_deref(), Some("implementer"));
+        assert!(
+            info.episode_id.is_none(),
+            "legacy work rows should not infer episode_id"
+        );
     }
 
     #[test]

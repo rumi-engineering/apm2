@@ -59,3 +59,4 @@ pub mod protocol;
 pub mod session;
 pub mod state;
 pub mod telemetry;
+pub mod work;

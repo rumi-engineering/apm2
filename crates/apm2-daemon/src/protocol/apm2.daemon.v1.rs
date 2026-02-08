@@ -474,6 +474,28 @@ pub struct WorkStatusResponse {
     #[prost(uint64, optional, tag = "8")]
     pub claimed_at_ns: ::core::option::Option<u64>,
 }
+/// IPC-PRIV-019: WorkList (TCK-00415)
+/// List all work items known to projection authority.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkListRequest {
+    /// If true, return only claimable work items.
+    #[prost(bool, tag = "1")]
+    pub claimable_only: bool,
+    /// Maximum number of rows to return. Server enforces a hard cap of 500
+    /// regardless of this value. 0 means use the server default (500).
+    #[prost(uint32, tag = "2")]
+    pub limit: u32,
+    /// Pagination cursor: work_id to start after (exclusive).
+    /// Empty string means start from the beginning.
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkListResponse {
+    /// Projection-derived status rows ordered deterministically by work_id.
+    #[prost(message, repeated, tag = "1")]
+    pub work_items: ::prost::alloc::vec::Vec<WorkStatusResponse>,
+}
 /// Request to publish a changeset bundle.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PublishChangeSetRequest {

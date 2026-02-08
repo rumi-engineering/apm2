@@ -2794,6 +2794,21 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
+        // TCK-00415 BLOCKER 2: Reject reserved work-domain event type names.
+        //
+        // Session EmitEvent must not allow event types that collide with
+        // the work-domain namespace. Without this guard, a session could
+        // inject `work_claimed` or `work_transitioned` events that would
+        // be picked up by projection rebuild, causing namespace confusion.
+        // Defense-in-depth: the projection also filters by payload
+        // structure, but rejecting at admission is fail-closed.
+        if request.event_type.starts_with("work_") || request.event_type.starts_with("work.") {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                "event_type uses reserved work-domain namespace prefix",
+            ));
+        }
+
         // INV-TCK-00290-002: Require ledger for event persistence (fail-closed)
         let Some(ref ledger) = self.ledger else {
             error!(

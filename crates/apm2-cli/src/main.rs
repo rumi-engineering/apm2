@@ -425,9 +425,10 @@ fn main() -> Result<()> {
             std::process::exit(i32::from(exit_code));
         },
         Commands::Fac(fac_cmd) => {
-            // FAC commands operate directly on ledger/CAS files (no daemon required).
+            // FAC commands are primarily ledger/CAS-driven; work lifecycle
+            // status/list subcommands route through operator IPC.
             // Exit codes per RFC-0018.
-            let exit_code = commands::fac::run_fac(&fac_cmd);
+            let exit_code = commands::fac::run_fac(&fac_cmd, &operator_socket);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Ci(ci_cmd) => {

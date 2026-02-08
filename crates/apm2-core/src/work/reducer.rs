@@ -305,6 +305,11 @@ impl WorkReducer {
         work.transition_count += 1;
         work.last_rationale_code = event.rationale_code;
 
+        // Record first claim timestamp (immutable once set).
+        if to_state == WorkState::Claimed && work.claimed_at.is_none() {
+            work.claimed_at = Some(timestamp);
+        }
+
         Ok(())
     }
 

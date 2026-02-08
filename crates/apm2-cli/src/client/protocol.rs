@@ -117,6 +117,8 @@ use apm2_daemon::protocol::{
     StreamLogsResponse,
     SwitchCredentialRequest,
     SwitchCredentialResponse,
+    WorkListRequest,
+    WorkListResponse,
     // Work types
     WorkRole,
     // TCK-00344: Work status messages
@@ -155,6 +157,7 @@ use apm2_daemon::protocol::{
     // TCK-00342: Log streaming encoding
     encode_stream_logs_request,
     encode_switch_credential_request,
+    encode_work_list_request,
     encode_work_status_request,
     parse_handshake_message,
     serialize_handshake_message,
@@ -1119,6 +1122,45 @@ impl OperatorClient {
         Self::decode_work_status_response(&response_frame)
     }
 
+    /// Lists projection-known work items (TCK-00415).
+    ///
+    /// # Arguments
+    ///
+    /// * `claimable_only` - If true, return only claimable work items
+    ///
+    /// # Returns
+    ///
+    /// Projection-backed work rows ordered deterministically by work ID.
+    pub async fn work_list(
+        &mut self,
+        claimable_only: bool,
+    ) -> Result<WorkListResponse, ProtocolClientError> {
+        let request = WorkListRequest {
+            claimable_only,
+            limit: 0,
+            cursor: String::new(),
+        };
+        let request_bytes = encode_work_list_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_work_list_response(&response_frame)
+    }
+
     // =========================================================================
     // TCK-00389: IngestReviewReceipt
     // =========================================================================
@@ -1616,6 +1658,37 @@ impl OperatorClient {
         }
 
         WorkStatusResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `WorkList` response (TCK-00415).
+    fn decode_work_list_response(frame: &Bytes) -> Result<WorkListResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::WorkList.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected WorkList response (tag {}), got tag {tag}",
+                PrivilegedMessageType::WorkList.tag()
+            )));
+        }
+
+        WorkListResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
