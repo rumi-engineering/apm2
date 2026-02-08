@@ -16,7 +16,9 @@ evidence_artifact:
     - Duplicate boundary/rule ID rejection at policy construction time
     - RFC/schema confidentiality taxonomy mapping (lossless roundtrip, fail-closed on unmapped)
 
-    148 unit tests + 26 proptest property-based tests covering lattice axioms.
+    141 unit tests + 26 proptest property-based tests covering lattice axioms.
+    Includes mandatory 32-byte BLAKE3 digest enforcement for effect-binding
+    hashes and expiry-based anti-replay eviction.
   requirement_ids:
     - "REQ-0032"
   source_refs:
@@ -24,7 +26,7 @@ evidence_artifact:
   artifacts:
     - type: "test_output"
       description: |
-        Taint propagation correctness tests (148 tests):
+        Taint propagation correctness tests (141 unit + 26 proptest):
         TaintLevel lattice:
         - taint_join_is_commutative: join(a,b) == join(b,a) for all pairs
         - taint_join_is_associative: join(join(a,b),c) == join(a,join(b,c)) for all triples

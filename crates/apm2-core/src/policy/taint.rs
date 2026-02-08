@@ -45,17 +45,20 @@
 //! the daemon's key material -- is handled by daemon-layer wiring in a
 //! follow-on ticket.
 //!
-//! TODO(RFC-0020): Wire taint labels into work-object instruction flow
-//! TODO(RFC-0020): Boundary check hooks in protocol dispatch
-//! TODO(RFC-0020): Ledger persistence for declassification receipts
-//!
 //! Until the daemon-layer wiring lands, the API is library-only and must be
 //! called explicitly by consumers.
 
-use std::collections::HashSet;
+// TODO(daemon-wiring): Wire DualLatticePolicy into daemon actuator/boundary
+// dispatch (tracked by TCK-00378-daemon). Specifically:
+//   - Wire taint labels into work-object instruction flow
+//   - Boundary check hooks in protocol dispatch
+//   - Ledger persistence for declassification receipts
+//   - Concrete SignatureVerifier backed by daemon key material
+
+use std::collections::HashMap;
 use std::fmt;
 
-use serde::de::Deserializer;
+use serde::de::{Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -92,6 +95,13 @@ const MAX_RECEIPT_ID_LEN: usize = 256;
 /// Maximum length for a payload hash or envelope hash in a receipt.
 const MAX_EFFECT_HASH_LEN: usize = 64;
 
+/// Required length for BLAKE3 digest bytes used in effect-binding hashes
+/// (`payload_hash` and `envelope_hash`). Both issuance and consumption
+/// enforce that these fields are exactly 32 bytes, preventing callers from
+/// supplying empty or malformed hashes that would weaken replay protection
+/// from effect-scoped to boundary-scoped.
+const BLAKE3_DIGEST_LEN: usize = 32;
+
 /// Maximum number of consumed receipt IDs tracked for anti-replay.
 /// Once this limit is reached, further declassification attempts are
 /// denied (fail-closed) to prevent unbounded memory growth.
@@ -107,54 +117,147 @@ const MAX_DESERIALIZE_STRING_LEN: usize = 2048;
 // Bounded deserialization helpers
 // =============================================================================
 
+/// A serde visitor that enforces a maximum string length DURING
+/// deserialization. For formats that report the string length before
+/// allocation (e.g., bincode, CBOR), the visitor can reject oversized
+/// payloads without allocating. For self-describing formats (JSON),
+/// the string is visited through `visit_str` / `visit_string` and
+/// checked immediately.
+struct BoundedStringVisitor {
+    max_len: usize,
+}
+
+impl Visitor<'_> for BoundedStringVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a string with at most {} bytes", self.max_len)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        if v.len() > self.max_len {
+            return Err(E::custom(format!(
+                "string field length {} exceeds maximum {}",
+                v.len(),
+                self.max_len,
+            )));
+        }
+        Ok(v.to_owned())
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        if v.len() > self.max_len {
+            return Err(E::custom(format!(
+                "string field length {} exceeds maximum {}",
+                v.len(),
+                self.max_len,
+            )));
+        }
+        Ok(v)
+    }
+}
+
 /// Serde deserializer that rejects strings exceeding
-/// [`MAX_DESERIALIZE_STRING_LEN`] during deserialization, preventing
-/// memory allocation of oversized payloads before the receipt is even
-/// fully constructed.
+/// [`MAX_DESERIALIZE_STRING_LEN`] during deserialization via a visitor,
+/// preventing memory allocation of oversized payloads before the receipt
+/// is even fully constructed.
 fn deserialize_bounded_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    if s.len() > MAX_DESERIALIZE_STRING_LEN {
-        return Err(serde::de::Error::custom(format!(
-            "string field length {} exceeds maximum {MAX_DESERIALIZE_STRING_LEN}",
-            s.len()
-        )));
+    deserializer.deserialize_string(BoundedStringVisitor {
+        max_len: MAX_DESERIALIZE_STRING_LEN,
+    })
+}
+
+/// A serde visitor that enforces a maximum byte-sequence length DURING
+/// deserialization. Checks length before accepting.
+struct BoundedBytesVisitor {
+    max_len: usize,
+    field_name: &'static str,
+}
+
+impl<'de> Visitor<'de> for BoundedBytesVisitor {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "a byte sequence ({}) with at most {} bytes",
+            self.field_name, self.max_len
+        )
     }
-    Ok(s)
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        // If the format provides a size hint, check it before allocating.
+        if let Some(size) = seq.size_hint() {
+            if size > self.max_len {
+                return Err(serde::de::Error::custom(format!(
+                    "{} field length {} exceeds maximum {}",
+                    self.field_name, size, self.max_len,
+                )));
+            }
+        }
+        let mut buf = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.max_len));
+        while let Some(byte) = seq.next_element::<u8>()? {
+            if buf.len() >= self.max_len {
+                return Err(serde::de::Error::custom(format!(
+                    "{} field length exceeds maximum {}",
+                    self.field_name, self.max_len,
+                )));
+            }
+            buf.push(byte);
+        }
+        Ok(buf)
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+        if v.len() > self.max_len {
+            return Err(E::custom(format!(
+                "{} field length {} exceeds maximum {}",
+                self.field_name,
+                v.len(),
+                self.max_len,
+            )));
+        }
+        Ok(v.to_vec())
+    }
+
+    fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+        if v.len() > self.max_len {
+            return Err(E::custom(format!(
+                "{} field length {} exceeds maximum {}",
+                self.field_name,
+                v.len(),
+                self.max_len,
+            )));
+        }
+        Ok(v)
+    }
 }
 
 /// Serde deserializer that rejects byte vectors exceeding
-/// [`MAX_EFFECT_HASH_LEN`] during deserialization.
+/// [`MAX_EFFECT_HASH_LEN`] during deserialization via a visitor.
 fn deserialize_bounded_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let v = Vec::<u8>::deserialize(deserializer)?;
-    if v.len() > MAX_EFFECT_HASH_LEN {
-        return Err(serde::de::Error::custom(format!(
-            "bytes field length {} exceeds maximum {MAX_EFFECT_HASH_LEN}",
-            v.len()
-        )));
-    }
-    Ok(v)
+    deserializer.deserialize_seq(BoundedBytesVisitor {
+        max_len: MAX_EFFECT_HASH_LEN,
+        field_name: "bytes",
+    })
 }
 
 /// Serde deserializer that rejects signature byte vectors exceeding
-/// [`MAX_SIGNATURE_SIZE`] during deserialization.
+/// [`MAX_SIGNATURE_SIZE`] during deserialization via a visitor.
 fn deserialize_bounded_signature<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let v = Vec::<u8>::deserialize(deserializer)?;
-    if v.len() > MAX_SIGNATURE_SIZE {
-        return Err(serde::de::Error::custom(format!(
-            "signature field length {} exceeds maximum {MAX_SIGNATURE_SIZE}",
-            v.len()
-        )));
-    }
-    Ok(v)
+    deserializer.deserialize_seq(BoundedBytesVisitor {
+        max_len: MAX_SIGNATURE_SIZE,
+        field_name: "signature",
+    })
 }
 
 // =============================================================================
@@ -273,6 +376,14 @@ pub enum TaintError {
     #[error("receipt effect binding mismatch: {reason}")]
     EffectBindingMismatch {
         /// Why the effect binding check failed.
+        reason: String,
+    },
+
+    /// An effect-binding hash (payload or envelope) has an invalid length.
+    /// Both fields must be exactly 32 bytes (BLAKE3 digest length).
+    #[error("invalid effect hash: {reason}")]
+    InvalidEffectHash {
+        /// Which field and its actual/required length.
         reason: String,
     },
 }
@@ -1119,10 +1230,12 @@ pub struct DualLatticePolicy {
     boundaries: Vec<BoundaryPolicy>,
     /// Declassification rules.
     declassification_rules: Vec<DeclassificationPolicy>,
-    /// Anti-replay set of consumed receipt IDs. A receipt can only be
-    /// consumed once; subsequent attempts are rejected. Bounded to
-    /// [`MAX_CONSUMED_RECEIPTS`] entries to prevent unbounded growth.
-    consumed_receipts: HashSet<String>,
+    /// Anti-replay map of consumed receipt IDs to their `expires_at_ms`
+    /// timestamps. A receipt can only be consumed once; subsequent
+    /// attempts are rejected. Bounded to [`MAX_CONSUMED_RECEIPTS`]
+    /// entries. Expired entries are evicted before checking capacity,
+    /// preventing indefinite growth as receipts age out.
+    consumed_receipts: HashMap<String, u64>,
 }
 
 impl DualLatticePolicy {
@@ -1163,7 +1276,7 @@ impl DualLatticePolicy {
         Ok(Self {
             boundaries,
             declassification_rules,
-            consumed_receipts: HashSet::new(),
+            consumed_receipts: HashMap::new(),
         })
     }
 
@@ -1174,7 +1287,7 @@ impl DualLatticePolicy {
         Self {
             boundaries: Vec::new(),
             declassification_rules: Vec::new(),
-            consumed_receipts: HashSet::new(),
+            consumed_receipts: HashMap::new(),
         }
     }
 
@@ -1253,8 +1366,8 @@ impl DualLatticePolicy {
                 reason: format!("justification exceeds maximum length of {MAX_JUSTIFICATION_LEN}"),
             });
         }
-        Self::validate_bytes_bounded(payload_hash, "payload_hash", MAX_EFFECT_HASH_LEN)?;
-        Self::validate_bytes_bounded(envelope_hash, "envelope_hash", MAX_EFFECT_HASH_LEN)?;
+        Self::validate_exact_hash(payload_hash, "payload_hash")?;
+        Self::validate_exact_hash(envelope_hash, "envelope_hash")?;
         Self::validate_bytes_bounded(
             authority_signature,
             "authority_signature",
@@ -1287,6 +1400,22 @@ impl DualLatticePolicy {
         if value.len() > max_len {
             return Err(TaintError::ReceiptFieldSizeExceeded {
                 reason: format!("{name} length {} exceeds maximum {max_len}", value.len()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate that an effect-binding hash is exactly [`BLAKE3_DIGEST_LEN`]
+    /// bytes. Rejects both empty and non-32-byte hashes, ensuring that
+    /// effect binding provides cryptographic strength rather than a trivial
+    /// empty match.
+    fn validate_exact_hash(value: &[u8], name: &str) -> Result<(), TaintError> {
+        if value.len() != BLAKE3_DIGEST_LEN {
+            return Err(TaintError::InvalidEffectHash {
+                reason: format!(
+                    "{name} must be exactly {BLAKE3_DIGEST_LEN} bytes (got {} bytes)",
+                    value.len()
+                ),
             });
         }
         Ok(())
@@ -1521,22 +1650,9 @@ impl DualLatticePolicy {
                 ),
             });
         }
-        if receipt.payload_hash().len() > MAX_EFFECT_HASH_LEN {
-            return Err(TaintError::ReceiptFieldSizeExceeded {
-                reason: format!(
-                    "payload_hash length {} exceeds maximum {MAX_EFFECT_HASH_LEN}",
-                    receipt.payload_hash().len()
-                ),
-            });
-        }
-        if receipt.envelope_hash().len() > MAX_EFFECT_HASH_LEN {
-            return Err(TaintError::ReceiptFieldSizeExceeded {
-                reason: format!(
-                    "envelope_hash length {} exceeds maximum {MAX_EFFECT_HASH_LEN}",
-                    receipt.envelope_hash().len()
-                ),
-            });
-        }
+        // Effect-binding hashes must be exactly BLAKE3_DIGEST_LEN bytes.
+        Self::validate_exact_hash(receipt.payload_hash(), "payload_hash")?;
+        Self::validate_exact_hash(receipt.envelope_hash(), "envelope_hash")?;
         if receipt.authority_signature().len() > MAX_SIGNATURE_SIZE {
             return Err(TaintError::ReceiptFieldSizeExceeded {
                 reason: format!(
@@ -1701,12 +1817,20 @@ impl DualLatticePolicy {
     }
 
     /// Verify that the receipt's effect-binding hashes match the expected
-    /// values. Uses constant-time comparison.
+    /// values. Validates exact 32-byte BLAKE3 digest length on both the
+    /// receipt's hashes and the expected hashes, then uses constant-time
+    /// comparison.
     fn verify_effect_binding(
         receipt: &DeclassificationReceipt,
         expected_payload_hash: &[u8],
         expected_envelope_hash: &[u8],
     ) -> Result<(), TaintError> {
+        // Enforce exact 32-byte length on the receipt's stored hashes.
+        Self::validate_exact_hash(receipt.payload_hash(), "receipt payload_hash")?;
+        Self::validate_exact_hash(receipt.envelope_hash(), "receipt envelope_hash")?;
+        // Enforce exact 32-byte length on the caller-supplied expected hashes.
+        Self::validate_exact_hash(expected_payload_hash, "expected payload_hash")?;
+        Self::validate_exact_hash(expected_envelope_hash, "expected envelope_hash")?;
         if !bool::from(receipt.payload_hash().ct_eq(expected_payload_hash)) {
             return Err(TaintError::EffectBindingMismatch {
                 reason: "receipt payload_hash does not match expected payload hash".to_string(),
@@ -1759,11 +1883,14 @@ impl DualLatticePolicy {
         Self::validate_receipt_at_consumption(receipt, boundary_id, verifier, now_ms)?;
 
         // ---- Anti-replay: one-time consumption check ----
-        if self.consumed_receipts.contains(receipt.receipt_id()) {
+        if self.consumed_receipts.contains_key(receipt.receipt_id()) {
             return Err(TaintError::ReceiptAlreadyConsumed {
                 receipt_id: receipt.receipt_id().to_string(),
             });
         }
+        // Evict expired entries before checking capacity, so that the
+        // anti-replay set does not fill up permanently with stale entries.
+        Self::evict_expired_receipts(&mut self.consumed_receipts, now_ms);
         if self.consumed_receipts.len() >= MAX_CONSUMED_RECEIPTS {
             return Err(TaintError::ConsumedReceiptSetFull {
                 capacity: MAX_CONSUMED_RECEIPTS,
@@ -1824,7 +1951,7 @@ impl DualLatticePolicy {
             .within_clearance(boundary.max_confidentiality())
         {
             self.consumed_receipts
-                .insert(receipt.receipt_id().to_string());
+                .insert(receipt.receipt_id().to_string(), receipt.expires_at_ms());
             return Ok(*label);
         }
 
@@ -1857,11 +1984,11 @@ impl DualLatticePolicy {
         }
 
         // ---- Mark receipt as consumed (anti-replay) ----
-        // Insert into the consumed set AFTER all validation passes but
+        // Insert into the consumed map AFTER all validation passes but
         // BEFORE returning success, so a failed validation does not
         // consume the receipt.
         self.consumed_receipts
-            .insert(receipt.receipt_id().to_string());
+            .insert(receipt.receipt_id().to_string(), receipt.expires_at_ms());
 
         // Apply the declassification: set confidentiality to the receipt's
         // target level.
@@ -1892,6 +2019,16 @@ impl DualLatticePolicy {
     #[must_use]
     pub fn consumed_receipt_count(&self) -> usize {
         self.consumed_receipts.len()
+    }
+
+    /// Evict consumed receipt entries whose `expires_at_ms` has passed.
+    ///
+    /// Called before checking capacity to ensure the anti-replay set does
+    /// not fill up permanently with stale entries. An expired receipt can
+    /// never be validly reused (the freshness check rejects it), so
+    /// removing it from the anti-replay map is safe.
+    fn evict_expired_receipts(map: &mut HashMap<String, u64>, now_ms: u64) {
+        map.retain(|_id, expires_at_ms| *expires_at_ms > now_ms);
     }
 }
 
@@ -5206,6 +5343,404 @@ mod tests {
             r1.content_hash(),
             r2.content_hash(),
             "different receipt_ids must produce different receipt hashes"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER: Mandatory 32-byte effect hash enforcement tests
+    // =========================================================================
+
+    #[test]
+    fn empty_payload_hash_rejected_at_issuance() {
+        let policy = test_policy();
+        let err = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "empty payload hash",
+                "authority-1",
+                "external-api",
+                &[], // empty payload hash
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::InvalidEffectHash { .. }),
+            "empty payload_hash must be rejected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("payload_hash"),
+            "error should mention payload_hash, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("32"),
+            "error should mention required 32-byte length, got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_envelope_hash_rejected_at_issuance() {
+        let policy = test_policy();
+        let err = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "empty envelope hash",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                &[], // empty envelope hash
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::InvalidEffectHash { .. }),
+            "empty envelope_hash must be rejected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("envelope_hash"),
+            "error should mention envelope_hash, got: {err}"
+        );
+    }
+
+    #[test]
+    fn short_payload_hash_rejected_at_issuance() {
+        let policy = test_policy();
+        // 16 bytes is too short (need exactly 32).
+        let short_hash = vec![0xAB; 16];
+        let err = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "short payload hash",
+                "authority-1",
+                "external-api",
+                &short_hash,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::InvalidEffectHash { .. }),
+            "short payload_hash must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn long_payload_hash_rejected_at_issuance() {
+        let policy = test_policy();
+        // 33 bytes is too long (need exactly 32).
+        let long_hash = vec![0xAB; 33];
+        let err = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "long payload hash",
+                "authority-1",
+                "external-api",
+                &long_hash,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::InvalidEffectHash { .. }),
+            "oversized payload_hash must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn exact_32_byte_hashes_accepted_at_issuance() {
+        let policy = test_policy();
+        let hash_32 = vec![0xCD; 32];
+        let result = policy.declassify(
+            ConfidentialityLevel::Secret,
+            ConfidentialityLevel::Internal,
+            &unique_receipt_id(),
+            "DECLASS-SECRET-TO-INTERNAL",
+            "exact 32-byte hashes",
+            "authority-1",
+            "external-api",
+            &hash_32,
+            &hash_32,
+            VALID_TEST_SIG,
+            TEST_ISSUED_AT_MS,
+            TEST_EXPIRES_AT_MS,
+        );
+        assert!(
+            result.is_ok(),
+            "exactly 32-byte hashes should be accepted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn empty_expected_hashes_rejected_at_consumption() {
+        // Even if the receipt has valid 32-byte hashes, the caller-supplied
+        // expected hashes must also be exactly 32 bytes.
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "valid",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        // Empty expected payload hash at consumption.
+        let err = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                &[], // empty expected payload hash
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::InvalidEffectHash { .. }),
+            "empty expected payload_hash must be rejected at consumption, got {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR: Anti-replay eviction tests
+    // =========================================================================
+
+    #[test]
+    fn anti_replay_evicts_expired_entries_before_capacity_check() {
+        // Fill the anti-replay map near capacity with receipts that will
+        // expire before the next consumption attempt, then verify that
+        // a new receipt can still be consumed after eviction.
+
+        // Use a small policy with matching boundary/rules.
+        let boundaries = vec![
+            BoundaryPolicy::new("b", TaintLevel::Toxic, ConfidentialityLevel::Secret, 0).unwrap(),
+        ];
+        let rules = vec![
+            DeclassificationPolicy::new(
+                "R",
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+            )
+            .unwrap(),
+        ];
+        let mut policy = DualLatticePolicy::new(boundaries, rules).unwrap();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Insert (MAX_CONSUMED_RECEIPTS - 1) entries manually with an
+        // expiry in the past relative to our next consumption timestamp.
+        let past_expiry_ms = 1_000_000u64;
+        for i in 0..MAX_CONSUMED_RECEIPTS - 1 {
+            policy
+                .consumed_receipts
+                .insert(format!("old-receipt-{i}"), past_expiry_ms);
+        }
+        assert_eq!(policy.consumed_receipt_count(), MAX_CONSUMED_RECEIPTS - 1);
+
+        // Create a fresh receipt with a future expiry.
+        let fresh_issued = 2_000_000u64;
+        let fresh_expires = fresh_issued + 3_600_000;
+        let fresh_now = fresh_issued + 1_800_000;
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+                &unique_receipt_id(),
+                "R",
+                "after eviction",
+                "auth-1",
+                "b",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                fresh_issued,
+                fresh_expires,
+            )
+            .unwrap();
+
+        // Consume at a time past the old entries' expiry but within the
+        // new receipt's validity window. Eviction should clear old entries.
+        let result = policy.propagate_with_declassification(
+            "b",
+            &label,
+            &receipt,
+            Some(&TestVerifier),
+            fresh_now,
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+        );
+        assert!(
+            result.is_ok(),
+            "consumption must succeed after evicting expired entries, got {result:?}"
+        );
+        // Old entries should be evicted; only the fresh one remains.
+        assert_eq!(
+            policy.consumed_receipt_count(),
+            1,
+            "expired entries should have been evicted"
+        );
+    }
+
+    #[test]
+    fn anti_replay_saturation_still_works_with_expiry_eviction() {
+        // Demonstrate that even after MAX_CONSUMED_RECEIPTS receipts have
+        // been consumed, the system continues to operate as long as old
+        // receipts have expired and been evicted.
+        let boundaries = vec![
+            BoundaryPolicy::new("b", TaintLevel::Toxic, ConfidentialityLevel::Secret, 0).unwrap(),
+        ];
+        let rules = vec![
+            DeclassificationPolicy::new(
+                "R",
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+            )
+            .unwrap(),
+        ];
+        let mut policy = DualLatticePolicy::new(boundaries, rules).unwrap();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Fill the map to exactly MAX_CONSUMED_RECEIPTS with expired entries.
+        let past_expiry_ms = 500_000u64;
+        for i in 0..MAX_CONSUMED_RECEIPTS {
+            policy
+                .consumed_receipts
+                .insert(format!("saturated-{i}"), past_expiry_ms);
+        }
+        assert_eq!(policy.consumed_receipt_count(), MAX_CONSUMED_RECEIPTS);
+
+        // Now try to consume a fresh receipt at a time past the old expiry.
+        let fresh_issued = 1_000_000u64;
+        let fresh_expires = fresh_issued + 3_600_000;
+        let fresh_now = fresh_issued + 1_800_000;
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+                &unique_receipt_id(),
+                "R",
+                "post-saturation",
+                "auth-1",
+                "b",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                fresh_issued,
+                fresh_expires,
+            )
+            .unwrap();
+
+        let result = policy.propagate_with_declassification(
+            "b",
+            &label,
+            &receipt,
+            Some(&TestVerifier),
+            fresh_now,
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+        );
+        assert!(
+            result.is_ok(),
+            "system must continue operating after evicting expired entries from \
+             a saturated anti-replay set, got {result:?}"
+        );
+        assert_eq!(
+            policy.consumed_receipt_count(),
+            1,
+            "all expired entries should have been evicted, leaving only the fresh one"
+        );
+    }
+
+    #[test]
+    fn anti_replay_capacity_exceeded_without_evictable_entries_fails() {
+        // If the anti-replay map is full and no entries are expired,
+        // the capacity check must still fail-closed.
+        let boundaries = vec![
+            BoundaryPolicy::new("b", TaintLevel::Toxic, ConfidentialityLevel::Secret, 0).unwrap(),
+        ];
+        let rules = vec![
+            DeclassificationPolicy::new(
+                "R",
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+            )
+            .unwrap(),
+        ];
+        let mut policy = DualLatticePolicy::new(boundaries, rules).unwrap();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Fill with entries that expire FAR in the future (not evictable).
+        let future_expiry_ms = u64::MAX;
+        for i in 0..MAX_CONSUMED_RECEIPTS {
+            policy
+                .consumed_receipts
+                .insert(format!("nonevictable-{i}"), future_expiry_ms);
+        }
+
+        let fresh_issued = 1_000_000u64;
+        let fresh_expires = fresh_issued + 3_600_000;
+        let fresh_now = fresh_issued + 1_800_000;
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+                &unique_receipt_id(),
+                "R",
+                "should fail",
+                "auth-1",
+                "b",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                fresh_issued,
+                fresh_expires,
+            )
+            .unwrap();
+
+        let err = policy
+            .propagate_with_declassification(
+                "b",
+                &label,
+                &receipt,
+                Some(&TestVerifier),
+                fresh_now,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::ConsumedReceiptSetFull { .. }),
+            "capacity must still be enforced when no entries are evictable, got {err:?}"
         );
     }
 }

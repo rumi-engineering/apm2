@@ -15,9 +15,15 @@ evidence_artifact:
     - Receipt field size bounds (MAX_SIGNATURE_SIZE, MAX_POLICY_REF_LEN, etc.)
     - Forged/tampered receipt detection via hash recomputation
     - Duplicate policy ID rejection at construction time
+    - Mandatory 32-byte BLAKE3 digest for payload_hash and envelope_hash
+      (empty/short/long hashes rejected at both issuance and consumption)
+    - Expiry-based eviction of consumed receipt anti-replay entries
+    - Bounded deserialization via proper serde visitors (pre-allocation size checks)
+    - Library-only module with explicit daemon-wiring TODO (TCK-00378-daemon)
 
     Covers declassification receipt issuance, verification, replay protection,
-    tamper detection, and adversarial resistance.
+    tamper detection, effect-binding hash enforcement, anti-replay eviction,
+    and adversarial resistance.
   requirement_ids:
     - "REQ-0032"
   source_refs:
@@ -71,4 +77,15 @@ evidence_artifact:
         Length-framed hash collision prevention:
         - hash_length_framing_prevents_field_boundary_collision: auth="ab"+bnd="cd" != auth="abc"+bnd="d"
         - hash_length_framing_prevents_rule_justification_collision: rule/justification split varies hash
+        Mandatory 32-byte BLAKE3 effect hash enforcement:
+        - empty_payload_hash_rejected_at_issuance: empty payload_hash rejected
+        - empty_envelope_hash_rejected_at_issuance: empty envelope_hash rejected
+        - short_payload_hash_rejected_at_issuance: 16-byte hash rejected (need 32)
+        - long_payload_hash_rejected_at_issuance: 33-byte hash rejected (need 32)
+        - exact_32_byte_hashes_accepted_at_issuance: exactly 32 bytes accepted
+        - empty_expected_hashes_rejected_at_consumption: empty expected hash rejected at consumption
+        Anti-replay eviction:
+        - anti_replay_evicts_expired_entries_before_capacity_check: expired entries evicted before cap
+        - anti_replay_saturation_still_works_with_expiry_eviction: full set recovers via eviction
+        - anti_replay_capacity_exceeded_without_evictable_entries_fails: fail-closed when non-evictable
       ref: "cargo test -p apm2-core taint"
