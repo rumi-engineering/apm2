@@ -66,6 +66,7 @@ use std::time::SystemTime;
 use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
+use apm2_core::tool::{self, tool_request as tool_req};
 use apm2_holon::defect::{
     DefectContext as HolonDefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType,
 };
@@ -2047,6 +2048,161 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .and_then(serde_json::Value::as_str)
             {
                 broker_request = broker_request.with_pattern(pattern);
+            }
+
+            // TCK-00377: Populate tool_kind from parsed arguments so broker
+            // precondition checks can execute. Build the proto-level
+            // tool_request::Tool variant, then convert to typed ToolKind.
+            let proto_tool: Option<tool_req::Tool> = match tool_class {
+                ToolClass::Read => {
+                    let path = args_value
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let offset = args_value
+                        .get("offset")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let limit = args_value
+                        .get("limit")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    Some(tool_req::Tool::FileRead(tool::FileRead {
+                        path,
+                        offset,
+                        limit,
+                    }))
+                },
+                ToolClass::Write => {
+                    let path = args_value
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    // Distinguish FileEdit from FileWrite by checking for
+                    // old_content/new_content fields (edit) vs content (write).
+                    let is_edit = args_value.get("old_content").is_some()
+                        && args_value.get("new_content").is_some();
+                    if path.is_empty() {
+                        None
+                    } else if is_edit {
+                        let old_content = args_value
+                            .get("old_content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let new_content = args_value
+                            .get("new_content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        Some(tool_req::Tool::FileEdit(tool::FileEdit {
+                            path,
+                            old_content,
+                            new_content,
+                        }))
+                    } else {
+                        let content = args_value
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .as_bytes()
+                            .to_vec();
+                        let create_only = args_value
+                            .get("create_only")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let append = args_value
+                            .get("append")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        Some(tool_req::Tool::FileWrite(tool::FileWrite {
+                            path,
+                            content,
+                            create_only,
+                            append,
+                        }))
+                    }
+                },
+                ToolClass::Execute => {
+                    let command = args_value
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let cwd = args_value
+                        .get("cwd")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let timeout_ms = args_value
+                        .get("timeout_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let network_access = args_value
+                        .get("network_access")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    Some(tool_req::Tool::ShellExec(tool::ShellExec {
+                        command,
+                        cwd,
+                        timeout_ms,
+                        network_access,
+                        env: Vec::new(),
+                    }))
+                },
+                ToolClass::Git => {
+                    let operation = args_value
+                        .get("operation")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let args = args_value
+                        .get("args")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(String::from)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let cwd = args_value
+                        .get("cwd")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    Some(tool_req::Tool::GitOp(tool::GitOperation {
+                        operation,
+                        args,
+                        cwd,
+                    }))
+                },
+                // Other tool classes (ListFiles, Search, Network, Inference,
+                // Artifact) are not in scope for TCK-00377 typed ToolKind
+                // hardening. tool_kind_from_proto returns MissingToolVariant
+                // for them, so we skip construction entirely.
+                _ => None,
+            };
+            if let Some(proto) = proto_tool {
+                match tool::tool_kind_from_proto(&proto) {
+                    Ok(tk) => {
+                        broker_request = broker_request.with_tool_kind(tk);
+                    },
+                    Err(e) => {
+                        // Validation failure in tool_kind conversion is logged
+                        // but not fatal — the broker's own defense-in-depth
+                        // checks will still run. This avoids breaking requests
+                        // that the proto-level validator already accepted.
+                        debug!(
+                            request_id = %request_id,
+                            error = %e,
+                            "TCK-00377: tool_kind_from_proto conversion failed, \
+                             broker will proceed without typed tool_kind"
+                        );
+                    },
+                }
             }
         }
 
@@ -7982,6 +8138,218 @@ mod tests {
             assert!(
                 v1_store.get("sess-cleanup").is_none(),
                 "V1 manifest should be removed after cleanup"
+            );
+        }
+    }
+
+    // ========================================================================
+    // TCK-00377: tool_kind population from session dispatch
+    // ========================================================================
+    mod tool_kind_population {
+        use apm2_core::tool::{self, tool_request as tool_req};
+
+        use super::*;
+
+        /// Verify that the proto construction + `tool_kind_from_proto`
+        /// conversion produces a populated `ToolKind` for each
+        /// supported `ToolClass`, and that `with_tool_kind` wires it
+        /// onto `BrokerToolRequest`.
+        ///
+        /// This confirms the session dispatch path will deliver a non-`None`
+        /// `tool_kind` to the broker for precondition enforcement.
+        #[test]
+        fn test_tool_kind_populated_for_file_read() {
+            let proto = tool_req::Tool::FileRead(tool::FileRead {
+                path: "/workspace/file.txt".to_string(),
+                offset: 0,
+                limit: 0,
+            });
+            let tk = tool::tool_kind_from_proto(&proto).expect("FileRead must convert");
+            assert!(
+                matches!(tk, tool::ToolKind::ReadFile { .. }),
+                "expected ReadFile, got: {tk:?}"
+            );
+
+            let request = BrokerToolRequest::new(
+                "req-tk-read",
+                crate::episode::EpisodeId::new("ep-tk-read").unwrap(),
+                ToolClass::Read,
+                crate::episode::decision::DedupeKey::new("dk"),
+                [0u8; 32],
+                crate::episode::envelope::RiskTier::Tier0,
+            )
+            .with_tool_kind(tk);
+            assert!(
+                request.tool_kind.is_some(),
+                "tool_kind must be populated after with_tool_kind"
+            );
+        }
+
+        #[test]
+        fn test_tool_kind_populated_for_file_write() {
+            let proto = tool_req::Tool::FileWrite(tool::FileWrite {
+                path: "/workspace/out.txt".to_string(),
+                content: b"hello".to_vec(),
+                create_only: true,
+                append: false,
+            });
+            let tk = tool::tool_kind_from_proto(&proto).expect("FileWrite must convert");
+            assert!(
+                matches!(tk, tool::ToolKind::WriteFile { .. }),
+                "expected WriteFile, got: {tk:?}"
+            );
+
+            // Verify the precondition was derived from create_only=true
+            if let tool::ToolKind::WriteFile { precondition, .. } = &tk {
+                assert_eq!(
+                    *precondition,
+                    Some(tool::IdempotencyPrecondition::FileNotExists),
+                    "create_only=true must produce FileNotExists precondition"
+                );
+            }
+        }
+
+        #[test]
+        fn test_tool_kind_populated_for_file_edit() {
+            let proto = tool_req::Tool::FileEdit(tool::FileEdit {
+                path: "/workspace/code.rs".to_string(),
+                old_content: "old".to_string(),
+                new_content: "new".to_string(),
+            });
+            let tk = tool::tool_kind_from_proto(&proto).expect("FileEdit must convert");
+            assert!(
+                matches!(tk, tool::ToolKind::EditFile { .. }),
+                "expected EditFile, got: {tk:?}"
+            );
+
+            // Verify the precondition was derived (EditFile always has FileExists)
+            if let tool::ToolKind::EditFile { precondition, .. } = &tk {
+                assert_eq!(
+                    *precondition,
+                    Some(tool::IdempotencyPrecondition::FileExists),
+                    "FileEdit must produce FileExists precondition"
+                );
+            }
+        }
+
+        #[test]
+        fn test_tool_kind_populated_for_git_op() {
+            let proto = tool_req::Tool::GitOp(tool::GitOperation {
+                operation: "STATUS".to_string(),
+                args: vec![],
+                cwd: "/workspace".to_string(),
+            });
+            let tk = tool::tool_kind_from_proto(&proto).expect("GitOp must convert");
+            assert!(
+                matches!(tk, tool::ToolKind::GitOp { .. }),
+                "expected GitOp, got: {tk:?}"
+            );
+        }
+
+        #[test]
+        fn test_tool_kind_populated_for_shell_exec() {
+            let proto = tool_req::Tool::ShellExec(tool::ShellExec {
+                command: "ls -la".to_string(),
+                cwd: "/workspace".to_string(),
+                timeout_ms: 5000,
+                network_access: false,
+                env: vec![],
+            });
+            let tk = tool::tool_kind_from_proto(&proto).expect("ShellExec must convert");
+            assert!(
+                matches!(tk, tool::ToolKind::ShellExec { .. }),
+                "expected ShellExec, got: {tk:?}"
+            );
+        }
+
+        /// Verify that the JSON-to-proto reconstruction matches what session
+        /// dispatch does: parse JSON args, build proto, convert to `ToolKind`.
+        /// This is the exact path that populates `broker_request.tool_kind`.
+        #[test]
+        fn test_session_dispatch_json_to_tool_kind_roundtrip() {
+            // Simulate a Write request with create_only=true (triggers precondition)
+            let args_json = serde_json::json!({
+                "path": "/workspace/new-file.txt",
+                "content": "file body",
+                "create_only": true,
+                "append": false,
+            });
+            let args_bytes = serde_json::to_vec(&args_json).unwrap();
+
+            // Parse exactly as session dispatch does
+            let args_value: serde_json::Value = serde_json::from_slice(&args_bytes).unwrap();
+
+            let path = args_value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let content = args_value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec();
+            let create_only = args_value
+                .get("create_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let append = args_value
+                .get("append")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+            let proto = tool_req::Tool::FileWrite(tool::FileWrite {
+                path,
+                content,
+                create_only,
+                append,
+            });
+
+            let tk = tool::tool_kind_from_proto(&proto)
+                .expect("JSON-constructed FileWrite proto must convert to ToolKind");
+
+            // Verify precondition is wired through
+            if let tool::ToolKind::WriteFile {
+                precondition,
+                create_only: co,
+                ..
+            } = &tk
+            {
+                assert!(co, "create_only must be true");
+                assert_eq!(
+                    *precondition,
+                    Some(tool::IdempotencyPrecondition::FileNotExists),
+                    "create_only=true must yield FileNotExists precondition"
+                );
+            } else {
+                panic!("expected WriteFile ToolKind, got: {tk:?}");
+            }
+
+            // Wire it onto a BrokerToolRequest and confirm it's populated
+            let request = BrokerToolRequest::new(
+                "req-roundtrip",
+                crate::episode::EpisodeId::new("ep-roundtrip").unwrap(),
+                ToolClass::Write,
+                crate::episode::decision::DedupeKey::new("dk"),
+                [0u8; 32],
+                crate::episode::envelope::RiskTier::Tier0,
+            )
+            .with_tool_kind(tk);
+
+            assert!(
+                request.tool_kind.is_some(),
+                "BrokerToolRequest.tool_kind must be Some after session dispatch wiring"
+            );
+            assert!(
+                matches!(
+                    request.tool_kind,
+                    Some(tool::ToolKind::WriteFile {
+                        precondition: Some(tool::IdempotencyPrecondition::FileNotExists),
+                        ..
+                    })
+                ),
+                "tool_kind must carry the FileNotExists precondition"
             );
         }
     }
