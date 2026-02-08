@@ -65,7 +65,7 @@ waiver:
     - "EVID-WVR-0001-COMMIT"
 
   references:
-    pr_url: "https://github.com/rumi-engineering/apm2/pull/255"
+    pr_url: "https://github.com/guardian-intelligence/apm2/pull/255"
     commit_sha: "96be98bd60a2aa221da71a130b6c55a25a29c8f4"
     commit_message: "chore(ci): remove gitleaks secret scan job"
     related_commit: "d685fb6"

@@ -1,5 +1,6 @@
 # Authoritative AI review gate workflow
-# Runs gate evaluation with trusted base-branch code.
+# Runs gate evaluation with trusted base-branch code and projects a single
+# status context (`Review Gate Success`) back to the PR head SHA.
 
 name: Review Gate
 
@@ -49,6 +50,8 @@ jobs:
     name: Review Gate
     needs: [pre-filter]
     runs-on: ubuntu-24.04
+    outputs:
+      exit_code: ${{ steps.eval.outputs.exit_code }}
     steps:
       # pull_request_target already executes in base-branch context, so this
       # checks out trusted evaluator code from the PR base branch.
@@ -64,6 +67,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           PR_NUMBER="${{ github.event.issue.number }}"
           BASE_REF=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.base.ref')
           echo "base_ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
@@ -89,6 +93,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
             echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
             echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
@@ -105,19 +110,29 @@ jobs:
 
       - name: Fetch trusted-reviewers from base branch
         run: |
+          set -euo pipefail
           git fetch origin "${{ steps.pr-ctx.outputs.base_ref }}" --depth=1
           git show "origin/${{ steps.pr-ctx.outputs.base_ref }}:.github/review-gate/trusted-reviewers.json" \
             > /tmp/trusted-reviewers-base.json
 
       - name: Evaluate review gate
+        id: eval
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
+          set +e
           cargo xtask review-gate \
             --repo "${{ github.repository }}" \
             --pr-number "${{ steps.pr-ctx.outputs.pr_number }}" \
             --head-sha "${{ steps.pr-ctx.outputs.head_sha }}" \
-            --trusted-reviewers "/tmp/trusted-reviewers-base.json"
+            --trusted-reviewers "/tmp/trusted-reviewers-base.json" \
+            | tee /tmp/review-gate-evaluation.json
+          code=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
 
   review-gate-success:
     name: Review Gate Success
@@ -125,27 +140,42 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: Check review gate result
+      - name: Determine projected status
         id: gate
         run: |
+          set -euo pipefail
+
           # If pre-filter was skipped (untrusted commenter), gate is not
           # applicable. Do NOT post any status — an untrusted actor must
           # never be able to write a passing required status.
           if [[ "${{ needs.pre-filter.result }}" == "skipped" ]]; then
-            echo "Pre-filter skipped (not a trusted actor or not a PR comment)"
             echo "should_post=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "should_post=true" >> "$GITHUB_OUTPUT"
-          if [[ "${{ needs.review-gate.result }}" != "success" ]]; then
-            echo "Review gate failed"
+
+          code="${{ needs.review-gate.outputs.exit_code }}"
+          if [[ -z "${code}" ]]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Review gate evaluation failed" >> "$GITHUB_OUTPUT"
+            echo "description=Review gate evaluator did not produce an exit code" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          echo "Review gate passed"
-          echo "state=success" >> "$GITHUB_OUTPUT"
-          echo "description=Review gate passed" >> "$GITHUB_OUTPUT"
+
+          if [[ "${code}" -eq 0 ]]; then
+            echo "state=success" >> "$GITHUB_OUTPUT"
+            echo "description=Review gate passed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${code}" -eq 2 ]]; then
+            echo "state=pending" >> "$GITHUB_OUTPUT"
+            echo "description=Waiting for AI reviews" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "state=failure" >> "$GITHUB_OUTPUT"
+          echo "description=Review gate failed" >> "$GITHUB_OUTPUT"
+          exit 1
 
       # Resolve the PR head SHA so we can post a commit status to it.
       # Only resolve when the gate actually ran (avoids API calls on
@@ -156,6 +186,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
             echo "sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
           else
@@ -176,6 +207,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           gh api --method POST "/repos/${{ github.repository }}/statuses/${{ steps.head.outputs.sha }}" \
             -f state="${{ steps.gate.outputs.state || 'failure' }}" \
             -f context="Review Gate Success" \

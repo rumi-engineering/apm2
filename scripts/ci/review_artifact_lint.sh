@@ -21,10 +21,10 @@
 # construction techniques (variable indirection, token splitting, eval,
 # process substitution, base64 encoding, etc.).
 #
-# The hard security gate for review status integrity is the Review Gate
-# GitHub Actions workflow (.github/workflows/review-gate.yml), which
-# validates that status checks are posted by authorized CI processes
-# regardless of how they are constructed.
+# The hard security gate for review status integrity is the `Review Gate Success`
+# commit status context posted by authorized CI workflows (see
+# `.github/workflows/ai-review-*.yml`), which evaluate machine-readable comment
+# artifacts via `cargo xtask review-gate`.
 #
 # Threat model: Review artifacts are authored by trusted CI processes
 # (codex reviewers, xtask commands) running in controlled environments.

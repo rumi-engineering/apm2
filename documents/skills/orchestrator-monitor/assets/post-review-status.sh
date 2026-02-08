@@ -47,7 +47,7 @@ echo "  Context: ${CONTEXT}"
 echo "  State: ${STATE}"
 echo "  Description: ${DESCRIPTION}"
 
-gh api --method POST "repos/rumi-engineering/apm2/statuses/${HEAD_SHA}" \
+gh api --method POST "repos/guardian-intelligence/apm2/statuses/${HEAD_SHA}" \
   -f state="$STATE" \
   -f context="$CONTEXT" \
   -f description="$DESCRIPTION"

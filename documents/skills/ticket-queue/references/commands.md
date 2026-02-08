@@ -24,6 +24,7 @@ commands[22]:
     purpose: "Query custom AI review statuses directly via GitHub API."
   - name: trigger-reviews
     command: "cargo xtask review security <PR_URL> & cargo xtask review quality <PR_URL> &"
+    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
     purpose: "Trigger AI reviews."
   - name: cleanup-branch
     command: "git checkout main && git pull && git branch -D <BRANCH_NAME>"

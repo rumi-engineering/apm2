@@ -22,24 +22,11 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Build binaries for all platforms
-  build:
-    name: Build (${{ matrix.target }})
+  # Build native Linux x86_64 artifacts on the fac-ovh host.
+  build-native:
+    name: Build (x86_64-unknown-linux-gnu)
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux x86_64
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
-            name: apm2-linux-x86_64
-          # Linux aarch64 (cross-compiled)
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04
-            name: apm2-linux-aarch64
-            cross: true
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -47,45 +34,82 @@ jobs:
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
         with:
           toolchain: nightly
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
         with:
-          key: release-${{ matrix.target }}
-
-      # Install cross for cross-compilation
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+          key: release-x86_64-unknown-linux-gnu
 
       - name: Build (native)
-        if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }} -p apm2-cli -p apm2-daemon
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} -p apm2-cli -p apm2-daemon
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p apm2-cli -p apm2-daemon
 
       - name: Package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/apm2 dist/${{ matrix.name }}
-          cp target/${{ matrix.target }}/release/apm2-daemon dist/${{ matrix.name }}-daemon
+          cp target/x86_64-unknown-linux-gnu/release/apm2 dist/apm2-linux-x86_64
+          cp target/x86_64-unknown-linux-gnu/release/apm2-daemon dist/apm2-linux-x86_64-daemon
           chmod +x dist/*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: binaries-${{ matrix.target }}
+          name: binaries-x86_64-unknown-linux-gnu
+          path: dist/
+          if-no-files-found: error
+
+  # Build Linux aarch64 via cross on a hosted runner with Docker.
+  build-aarch64:
+    name: Build (aarch64-unknown-linux-gnu)
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+        with:
+          toolchain: nightly
+          targets: aarch64-unknown-linux-gnu
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+        with:
+          key: release-aarch64-unknown-linux-gnu
+
+      - name: Validate cross runtime prerequisites
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::docker is required for cross builds but is not available"
+            exit 1
+          fi
+          docker --version
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        run: cross build --release --target aarch64-unknown-linux-gnu -p apm2-cli -p apm2-daemon
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-gnu/release/apm2 dist/apm2-linux-aarch64
+          cp target/aarch64-unknown-linux-gnu/release/apm2-daemon dist/apm2-linux-aarch64-daemon
+          chmod +x dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-aarch64-unknown-linux-gnu
           path: dist/
           if-no-files-found: error
 
   # Create rolling dev release
   release:
     name: Create Dev Release
-    needs: build
-    runs-on: ubuntu-24.04
+    needs: [build-native, build-aarch64]
+    runs-on: *primary_runner
     permissions:
       contents: write
     steps:

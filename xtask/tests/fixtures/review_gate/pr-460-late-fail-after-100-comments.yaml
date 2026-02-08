@@ -1,13 +1,6 @@
 name: "PR-460 decisive FAIL artifact after 100+ comments (pagination coverage)"
 pr_number: 460
 head_sha: "6060606060606060606060606060606060606060"
-statuses:
-  - context: "ai-review/security"
-    state: "failure"
-    created_at: "2026-02-11T12:00:00Z"
-  - context: "ai-review/code-quality"
-    state: "success"
-    created_at: "2026-02-11T12:01:00Z"
 comments:
   # Comment 1: early PASS artifact from trusted bot
   - id: 46001
@@ -181,6 +174,7 @@ comments:
       ```
 expected:
   overall_pass: false
+  overall_pending: false
   security_pass: false
   code_quality_pass: true
   security_reason_substrings:

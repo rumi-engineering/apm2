@@ -94,6 +94,7 @@ impl ReviewType {
 /// - The review prompt is missing
 pub fn run_security(
     pr_url: &str,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
@@ -101,6 +102,7 @@ pub fn run_security(
     run_review(
         pr_url,
         ReviewType::Security,
+        expected_head_sha,
         emit_internal,
         emit_receipt_only,
         allow_github_write,
@@ -131,6 +133,7 @@ pub fn run_security(
 /// - The review prompt is missing
 pub fn run_quality(
     pr_url: &str,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
@@ -138,10 +141,200 @@ pub fn run_quality(
     run_review(
         pr_url,
         ReviewType::Quality,
+        expected_head_sha,
         emit_internal,
         emit_receipt_only,
         allow_github_write,
     )
+}
+
+fn run_one_ai_review(
+    review_type: ReviewType,
+    pr_url: &str,
+    owner_repo: &str,
+    head_sha: &str,
+    repo_root: &str,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    let local_sh = Shell::new().context("Failed to create shell")?;
+    match review_type {
+        ReviewType::Security | ReviewType::Quality => run_ai_review(
+            &local_sh,
+            pr_url,
+            owner_repo,
+            head_sha,
+            repo_root,
+            review_type,
+            emit_receipt_only,
+            allow_github_write,
+        ),
+        ReviewType::Uat => unreachable!("AI review helper does not support UAT"),
+    }
+}
+
+/// Run both security + code quality AI reviews for a PR.
+///
+/// In CI, this is preferable to launching two separate processes because it
+/// resolves PR metadata once and can run the reviewers concurrently.
+///
+/// Notes:
+/// - When `emit_receipt_only` is active, this runs sequentially to avoid
+///   concurrent process-wide environment mutation.
+pub fn run_all(
+    pr_url: &str,
+    expected_head_sha: Option<&str>,
+    emit_internal: bool,
+    emit_receipt_only: bool,
+    allow_github_write: bool,
+) -> Result<()> {
+    let sh = Shell::new().context("Failed to create shell")?;
+
+    // TCK-00295: Check if internal emission is enabled (flag or env var)
+    let should_emit_internal = emit_internal || crate::util::emit_internal_from_env();
+    if should_emit_internal {
+        println!("  [TCK-00295] Internal receipt emission enabled");
+    }
+
+    println!("Running security + code quality reviews for: {pr_url}");
+
+    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
+    println!("  Repository: {owner_repo}");
+    println!("  PR Number: {pr_number}");
+
+    let head_sha = get_pr_head_sha(&sh, &owner_repo, pr_number)?;
+    if let Some(expected) = expected_head_sha {
+        validate_expected_head_sha(expected)?;
+        if !expected.eq_ignore_ascii_case(&head_sha) {
+            eprintln!(
+                "PR head moved; skipping review-all to avoid stale artifacts: expected {expected}, current {head_sha}"
+            );
+            return Ok(());
+        }
+    }
+    println!("  HEAD SHA: {head_sha}");
+
+    let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
+        .read()
+        .context("Failed to get repository root")?
+        .trim()
+        .to_string();
+
+    // When emit-only is active, we must export the cutover policy before any
+    // reviewer processes spawn. Running sequentially avoids concurrent env
+    // mutation in the current implementation.
+    if emit_receipt_only {
+        let policy = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
+        // SAFETY: single-threaded at this point; we intentionally avoid
+        // concurrent reviewer spawns in emit-only mode.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(crate::util::XTASK_CUTOVER_POLICY_ENV, policy.env_value());
+        }
+        eprintln!("  [TCK-00408] emit-receipt-only mode active — exported cutover policy to env.");
+    }
+
+    if emit_receipt_only {
+        // Sequential: avoids concurrent env var mutation.
+        let sec = run_one_ai_review(
+            ReviewType::Security,
+            pr_url,
+            &owner_repo,
+            &head_sha,
+            &repo_root,
+            emit_receipt_only,
+            allow_github_write,
+        );
+        if let Err(e) = sec {
+            eprintln!("  Warning: Security review failed to run: {e:#}");
+        }
+
+        let qual = run_one_ai_review(
+            ReviewType::Quality,
+            pr_url,
+            &owner_repo,
+            &head_sha,
+            &repo_root,
+            emit_receipt_only,
+            allow_github_write,
+        );
+        if let Err(e) = qual {
+            eprintln!("  Warning: Code quality review failed to run: {e:#}");
+        }
+    } else {
+        // Parallel: higher throughput on beefy self-hosted runners.
+        let pr_url_owned = pr_url.to_string();
+        let owner_repo_owned = owner_repo.clone();
+        let head_sha_owned = head_sha.clone();
+        let repo_root_owned = repo_root;
+
+        let sec_pr_url = pr_url_owned.clone();
+        let sec_owner_repo = owner_repo_owned.clone();
+        let sec_head_sha = head_sha_owned.clone();
+        let sec_repo_root = repo_root_owned.clone();
+
+        let sec = std::thread::spawn(move || {
+            run_one_ai_review(
+                ReviewType::Security,
+                &sec_pr_url,
+                &sec_owner_repo,
+                &sec_head_sha,
+                &sec_repo_root,
+                false,
+                allow_github_write,
+            )
+        });
+
+        let qual = std::thread::spawn(move || {
+            run_one_ai_review(
+                ReviewType::Quality,
+                &pr_url_owned,
+                &owner_repo_owned,
+                &head_sha_owned,
+                &repo_root_owned,
+                false,
+                allow_github_write,
+            )
+        });
+
+        let sec_res = sec
+            .join()
+            .map_err(|_| anyhow::anyhow!("Security review thread panicked"))?;
+        let qual_res = qual
+            .join()
+            .map_err(|_| anyhow::anyhow!("Quality review thread panicked"))?;
+
+        if let Err(e) = sec_res {
+            eprintln!("  Warning: Security review failed to run: {e:#}");
+        }
+        if let Err(e) = qual_res {
+            eprintln!("  Warning: Code quality review failed to run: {e:#}");
+        }
+    }
+
+    // TCK-00295: Optionally emit internal receipt (non-blocking)
+    if should_emit_internal {
+        println!("\n  [EMIT_INTERNAL] Attempting internal receipt emission...");
+        let payload = serde_json::json!({
+            "pr_url": pr_url,
+            "owner_repo": owner_repo,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "review_type": "all",
+            "status": "completed",
+            "non_authoritative": true,
+        });
+        let correlation_id = format!("review-all-{pr_number}-{head_sha}");
+        if let Err(e) = crate::util::try_emit_internal_receipt(
+            "review.all.completed",
+            payload.to_string().as_bytes(),
+            &correlation_id,
+        ) {
+            eprintln!("  [EMIT_INTERNAL] Warning: Failed to emit internal receipt: {e}");
+        }
+    }
+
+    Ok(())
 }
 
 /// Run a UAT (User Acceptance Testing) sign-off for a PR.
@@ -172,6 +365,7 @@ pub fn run_uat(
     run_review(
         pr_url,
         ReviewType::Uat,
+        None,
         emit_internal,
         emit_receipt_only,
         allow_github_write,
@@ -182,6 +376,7 @@ pub fn run_uat(
 fn run_review(
     pr_url: &str,
     review_type: ReviewType,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
@@ -207,6 +402,16 @@ fn run_review(
 
     // Get the HEAD SHA of the PR
     let head_sha = get_pr_head_sha(&sh, &owner_repo, pr_number)?;
+    if let Some(expected) = expected_head_sha {
+        validate_expected_head_sha(expected)?;
+        if !expected.eq_ignore_ascii_case(&head_sha) {
+            eprintln!(
+                "PR head moved; skipping {} review to avoid stale artifacts: expected {expected}, current {head_sha}",
+                review_type.display_name()
+            );
+            return Ok(());
+        }
+    }
     println!("  HEAD SHA: {head_sha}");
 
     // Get repository root for prompt files
@@ -360,7 +565,7 @@ fn run_uat_signoff(
 fn run_ai_review(
     sh: &Shell,
     pr_url: &str,
-    owner_repo: &str,
+    _owner_repo: &str,
     head_sha: &str,
     repo_root: &str,
     review_type: ReviewType,
@@ -430,17 +635,6 @@ fn run_ai_review(
         ReviewType::Uat => unreachable!("UAT is handled separately"),
     };
 
-    // Read the prompt and substitute additional variables (owner/repo)
-    let prompt_content =
-        std::fs::read_to_string(&full_prompt_path).context("Failed to read review prompt")?;
-
-    // Substitute all variables including owner/repo
-    let prompt = prompt_content
-        .replace("$PR_URL", pr_url)
-        .replace("$HEAD_SHA", head_sha)
-        .replace("{owner}", owner_repo.split('/').next().unwrap_or(""))
-        .replace("{repo}", owner_repo.split('/').nth(1).unwrap_or(""));
-
     println!("  Prompt loaded from: {full_prompt_path}");
 
     println!(
@@ -450,7 +644,7 @@ fn run_ai_review(
 
     // Use ReviewerSpawner for centralized spawn logic (synchronous mode)
     let spawner = ReviewerSpawner::new(reviewer_type_key, pr_url, head_sha)
-        .with_prompt_content(&prompt)
+        .with_prompt_file(Path::new(&full_prompt_path))?
         .with_model(select_review_model());
 
     match spawner.spawn_sync() {
@@ -527,6 +721,14 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
     }
 
     Ok(sha)
+}
+
+fn validate_expected_head_sha(expected_head_sha: &str) -> Result<()> {
+    let expected = expected_head_sha.trim();
+    if expected.len() != 40 || !expected.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!("Invalid --expected-head-sha: expected a 40-hex SHA, got: {expected_head_sha}");
+    }
+    Ok(())
 }
 
 /// Log review status intent (direct status writes are removed).
@@ -657,7 +859,7 @@ mod tests {
 
         // Test with a simple path (no log)
         let prompt_path = Path::new("/tmp/test_prompt.txt");
-        let shell_cmd = build_script_command(prompt_path, None, None);
+        let shell_cmd = build_script_command(prompt_path, None, None, None);
 
         // Verify command includes PTY allocation
         if cfg!(target_os = "macos") {
@@ -686,7 +888,7 @@ mod tests {
 
         // Test with a path containing spaces - must be properly quoted
         let special_path = Path::new("/tmp/test file.txt");
-        let special_cmd = build_script_command(special_path, None, None);
+        let special_cmd = build_script_command(special_path, None, None, None);
 
         // Verify the command is well-formed
         if cfg!(target_os = "macos") {

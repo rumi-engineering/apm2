@@ -156,6 +156,7 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         | "hsi.consensus.byzantine_evidence"
         | "hsi.consensus.metrics"
         | "hsi.work.status"
+        | "hsi.work.list"
         | "hsi.credential.list"
         | "hsi.pulse.subscribe"
         | "hsi.pulse.unsubscribe"
@@ -234,6 +235,7 @@ mod tests {
             "hsi.consensus.byzantine_evidence",
             "hsi.consensus.metrics",
             "hsi.work.status",
+            "hsi.work.list",
             "hsi.credential.list",
             "hsi.pulse.subscribe",
             "hsi.pulse.unsubscribe",
@@ -259,6 +261,7 @@ mod tests {
             "hsi.process.status",
             "hsi.consensus.status",
             "hsi.work.status",
+            "hsi.work.list",
             "hsi.telemetry.stream",
             "hsi.session.status",
         ];

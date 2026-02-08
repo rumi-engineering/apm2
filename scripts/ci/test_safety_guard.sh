@@ -105,6 +105,8 @@ declare -a RULE_IDS=(
     "TSG007"
     "TSG008"
     "TSG009"
+    "TSG010"
+    "TSG011"
 )
 
 declare -a RULE_PATTERNS=(
@@ -117,6 +119,8 @@ declare -a RULE_PATTERNS=(
     'git[[:space:]]+clean[[:space:]]+-fdx'
     'rm[[:space:]]+-[[:alnum:]-]*r[[:alnum:]-]*f[[:space:]]+("|'"'"')[[:space:]]*/[[:space:]]*("|'"'"')'
     'rm[[:space:]]+-[[:alnum:]-]*r[[:alnum:]-]*f[[:space:]]+("|'"'"')[[:space:]]*~[[:space:]]*("|'"'"')'
+    'Command::new\s*\(\s*(std::env::var|env::var)\s*\(\s*"(SHELL|COMSPEC)"'
+    '(libc::(execv|execve|execvp)|nix::unistd::(execv|execve|execvp))'
 )
 
 declare -a RULE_DESCRIPTIONS=(
@@ -129,6 +133,8 @@ declare -a RULE_DESCRIPTIONS=(
     "destructive git clean of entire working tree"
     "recursive delete targeting quoted root path"
     "recursive delete targeting quoted home path"
+    "shell execution via environment variable resolution"
+    "direct exec-family syscall in test code"
 )
 
 # Multiline rules that require rg -U (multiline mode).
