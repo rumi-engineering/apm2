@@ -2679,17 +2679,21 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         &self,
         tool_kind: &apm2_core::tool::ToolKind,
     ) -> Result<(), BrokerError> {
-        // Extract precondition if any.
-        let has_precondition = matches!(
-            tool_kind,
+        // Extract whether a precondition is declared.
+        let has_precondition = match tool_kind {
             apm2_core::tool::ToolKind::WriteFile {
                 precondition: Some(_),
                 ..
-            } | apm2_core::tool::ToolKind::EditFile {
+            }
+            | apm2_core::tool::ToolKind::EditFile {
                 precondition: Some(_),
                 ..
-            }
-        );
+            } => true,
+            // TCK-00377 MAJOR FIX: GitOp now carries preconditions for
+            // side-effectful operations.
+            apm2_core::tool::ToolKind::GitOp { preconditions, .. } => !preconditions.is_empty(),
+            _ => false,
+        };
 
         if !has_precondition {
             return Ok(());

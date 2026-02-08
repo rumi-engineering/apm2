@@ -2191,16 +2191,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         broker_request = broker_request.with_tool_kind(tk);
                     },
                     Err(e) => {
-                        // Validation failure in tool_kind conversion is logged
-                        // but not fatal — the broker's own defense-in-depth
-                        // checks will still run. This avoids breaking requests
-                        // that the proto-level validator already accepted.
-                        debug!(
+                        // TCK-00377 BLOCKER FIX: Fail-closed on tool_kind
+                        // conversion failure. If typed validation rejects the
+                        // request (shell metachar, bad git ref, path traversal),
+                        // the request MUST be denied — not forwarded without a
+                        // typed ToolKind. Log-and-continue was fail-open.
+                        warn!(
                             request_id = %request_id,
                             error = %e,
-                            "TCK-00377: tool_kind_from_proto conversion failed, \
-                             broker will proceed without typed tool_kind"
+                            "TCK-00377: tool_kind_from_proto conversion failed (fail-closed)"
                         );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("typed tool validation failed: {e} ({request_id})"),
+                        ));
                     },
                 }
             }
@@ -2792,6 +2796,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         "session terminated: {} ({})",
                         termination_info.rationale_code, request_id
                     ),
+                ))
+            },
+            Err(crate::episode::BrokerError::PreconditionFailed { ref reason }) => {
+                // TCK-00377 MAJOR FIX: Precondition failures are policy denials,
+                // not internal faults. Map to SessionErrorToolNotAllowed so
+                // callers receive deny semantics consistent with broker Deny
+                // decisions.
+                warn!(
+                    session_id = %session_id,
+                    tool_class = %tool_class,
+                    reason = %reason,
+                    "Broker precondition failed (deny)"
+                );
+                Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    format!("precondition failed: {reason}"),
                 ))
             },
             Err(e) => {

@@ -176,6 +176,12 @@ pub enum ToolKind {
         args: Vec<ValidatedArg>,
         /// Validated working directory path.
         cwd: Option<ValidatedPath>,
+        /// Preconditions for side-effectful git operations.
+        ///
+        /// Side-effectful operations (push, merge, rebase, checkout, etc.)
+        /// can declare preconditions such as `GitCleanWorkingTree` or
+        /// `GitRefAtCommit` that must hold before execution proceeds.
+        preconditions: Vec<IdempotencyPrecondition>,
     },
 
     /// Shell execution gated by bridge policy.
@@ -848,12 +854,16 @@ pub fn evaluate_preconditions(
         | ToolKind::EditFile {
             path, precondition, ..
         } => (precondition.as_ref(), Some(path.as_str()), None),
-        ToolKind::GitOp { cwd, .. } => {
-            // GitOp does not currently carry a precondition field, but
-            // we support `GitCleanWorkingTree` / `GitRefAtCommit` via
-            // the evaluator if the caller constructs one externally.
+        ToolKind::GitOp {
+            cwd, preconditions, ..
+        } => {
+            // TCK-00377 MAJOR FIX: GitOp now carries preconditions for
+            // side-effectful operations. Evaluate each one in order.
             let cwd_str = cwd.as_ref().map(ValidatedPath::as_str);
-            (None, None, cwd_str)
+            for precondition in preconditions {
+                evaluator.evaluate(precondition, None, cwd_str)?;
+            }
+            return Ok(());
         },
         ToolKind::ReadFile { .. } | ToolKind::ShellExec { .. } => {
             // Read-only and shell-exec operations do not carry
@@ -1233,10 +1243,31 @@ fn from_git_op(req: &GitOperation) -> Result<ToolKind, ToolKindError> {
         Some(ValidatedPath::new(&req.cwd)?)
     };
 
+    // TCK-00377 MAJOR FIX: Populate preconditions for side-effectful Git
+    // operations. Push, merge, rebase, and checkout require a clean working
+    // tree to prevent data loss from uncommitted changes.
+    let preconditions = if operation.is_side_effectful() {
+        match operation {
+            GitOpKind::Push
+            | GitOpKind::Merge
+            | GitOpKind::Rebase
+            | GitOpKind::Checkout
+            | GitOpKind::Reset => {
+                vec![IdempotencyPrecondition::GitCleanWorkingTree]
+            },
+            // Other side-effectful ops (commit, add, fetch, pull, clone, etc.)
+            // do not require a clean tree by default.
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
     Ok(ToolKind::GitOp {
         operation,
         args,
         cwd,
+        preconditions,
     })
 }
 
@@ -2909,6 +2940,127 @@ mod tests {
                 expected_hash: [0xABu8; 32],
             }),
         };
+        let err = evaluate_preconditions(&tool_kind, &evaluator).unwrap_err();
+        assert!(matches!(err, ToolKindError::PreconditionFailed { .. }));
+    }
+
+    // =========================================================================
+    // TCK-00377 MAJOR: Git precondition tests
+    // =========================================================================
+
+    #[test]
+    fn test_git_op_side_effectful_has_preconditions() {
+        // Side-effectful Git ops (push, merge, rebase, checkout, reset) must
+        // carry GitCleanWorkingTree preconditions.
+        for op in &["PUSH", "MERGE", "REBASE", "CHECKOUT", "RESET"] {
+            let tool = tool_request::Tool::GitOp(GitOperation {
+                operation: op.to_string(),
+                args: vec![],
+                cwd: "/workspace".to_string(),
+            });
+            let kind = tool_kind_from_proto(&tool).unwrap();
+            if let ToolKind::GitOp { preconditions, .. } = &kind {
+                assert!(
+                    !preconditions.is_empty(),
+                    "{op} must carry preconditions, got empty"
+                );
+                assert!(
+                    preconditions.contains(&IdempotencyPrecondition::GitCleanWorkingTree),
+                    "{op} must require GitCleanWorkingTree"
+                );
+            } else {
+                panic!("expected GitOp, got: {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_git_op_readonly_no_preconditions() {
+        // Read-only Git ops (diff, status, log, show) must NOT carry preconditions.
+        for op in &["DIFF", "STATUS", "LOG", "SHOW"] {
+            let tool = tool_request::Tool::GitOp(GitOperation {
+                operation: op.to_string(),
+                args: vec![],
+                cwd: "/workspace".to_string(),
+            });
+            let kind = tool_kind_from_proto(&tool).unwrap();
+            if let ToolKind::GitOp { preconditions, .. } = &kind {
+                assert!(
+                    preconditions.is_empty(),
+                    "{op} must NOT carry preconditions, got: {preconditions:?}"
+                );
+            } else {
+                panic!("expected GitOp, got: {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_git_op_precondition_evaluated() {
+        // GitOp with GitCleanWorkingTree precondition must be evaluated.
+        let evaluator = AlwaysFailedEvaluator;
+        let tool_kind = ToolKind::GitOp {
+            operation: GitOpKind::Push,
+            args: vec![],
+            cwd: Some(ValidatedPath::new("/workspace").unwrap()),
+            preconditions: vec![IdempotencyPrecondition::GitCleanWorkingTree],
+        };
+        let err = evaluate_preconditions(&tool_kind, &evaluator).unwrap_err();
+        assert!(
+            matches!(err, ToolKindError::PreconditionFailed { .. }),
+            "GitOp precondition must be enforced, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_git_op_precondition_satisfied() {
+        // GitOp with satisfied precondition must pass.
+        let evaluator = AlwaysSatisfiedEvaluator;
+        let tool_kind = ToolKind::GitOp {
+            operation: GitOpKind::Merge,
+            args: vec![],
+            cwd: Some(ValidatedPath::new("/workspace").unwrap()),
+            preconditions: vec![IdempotencyPrecondition::GitCleanWorkingTree],
+        };
+        assert!(
+            evaluate_preconditions(&tool_kind, &evaluator).is_ok(),
+            "satisfied GitOp precondition must pass"
+        );
+    }
+
+    #[test]
+    fn test_git_op_empty_preconditions_passes() {
+        // GitOp with empty preconditions (read-only ops) always passes.
+        let evaluator = AlwaysFailedEvaluator;
+        let tool_kind = ToolKind::GitOp {
+            operation: GitOpKind::Status,
+            args: vec![],
+            cwd: None,
+            preconditions: vec![],
+        };
+        assert!(
+            evaluate_preconditions(&tool_kind, &evaluator).is_ok(),
+            "GitOp with no preconditions must pass"
+        );
+    }
+
+    #[test]
+    fn test_git_op_multiple_preconditions_all_evaluated() {
+        // GitOp with multiple preconditions must evaluate ALL of them.
+        let evaluator = AlwaysFailedEvaluator;
+        let tool_kind = ToolKind::GitOp {
+            operation: GitOpKind::Push,
+            args: vec![],
+            cwd: Some(ValidatedPath::new("/workspace").unwrap()),
+            preconditions: vec![
+                IdempotencyPrecondition::GitCleanWorkingTree,
+                IdempotencyPrecondition::GitRefAtCommit {
+                    ref_name: "main".to_string(),
+                    expected_commit: "abc123".to_string(),
+                },
+            ],
+        };
+        // Should fail on the first precondition
         let err = evaluate_preconditions(&tool_kind, &evaluator).unwrap_err();
         assert!(matches!(err, ToolKindError::PreconditionFailed { .. }));
     }
