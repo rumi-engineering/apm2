@@ -102,6 +102,23 @@ pub enum FreshnessPolicyError {
         /// The tier with the zero threshold.
         tier: RiskTier,
     },
+
+    /// Threshold ordering violation: a higher risk tier has a more lenient
+    /// (larger) `max_head_age_ticks` than a lower risk tier. Thresholds
+    /// must be monotonically non-increasing from Tier0 to Tier4 so that
+    /// higher-risk operations are never granted more staleness tolerance
+    /// than lower-risk ones.
+    #[error(
+        "threshold ordering violation: tier {higher_tier} threshold exceeds tier {lower_tier} threshold"
+    )]
+    ThresholdOrderingViolation {
+        /// The lower-numbered tier (less strict) whose threshold is
+        /// exceeded by the higher tier.
+        lower_tier: u8,
+        /// The higher-numbered tier (should be stricter) whose threshold
+        /// is unexpectedly larger.
+        higher_tier: u8,
+    },
 }
 
 // =============================================================================
@@ -159,15 +176,55 @@ pub struct TierFreshnessConfig {
 /// # Invariants
 ///
 /// - Tier2+ MUST use [`StalenessAction::Deny`] and a positive threshold.
-/// - Thresholds decrease as tier increases (higher tiers are stricter).
+/// - Thresholds are monotonically non-increasing from Tier0 to Tier4 (higher
+///   risk tiers must have equal or lower thresholds).
 /// - A threshold of `0` disables staleness enforcement for that tier (only
 ///   valid for Tier0/Tier1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// All invariants are enforced at construction time ([`Self::new`]) and
+/// at deserialization time via [`TryFrom<RawFreshnessPolicyV1>`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "RawFreshnessPolicyV1")]
 pub struct FreshnessPolicyV1 {
     /// Per-tier configuration, indexed by tier ordinal (0 = Tier0, ..., 4 =
     /// Tier4).
     tiers: [TierFreshnessConfig; NUM_TIERS],
+}
+
+/// Raw wire representation of [`FreshnessPolicyV1`] used for
+/// serde (de)serialization. Invariants are enforced via the
+/// [`TryFrom`] conversion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawFreshnessPolicyV1 {
+    /// Per-tier configuration, indexed by tier ordinal.
+    tiers: [TierFreshnessConfig; NUM_TIERS],
+}
+
+impl From<FreshnessPolicyV1> for RawFreshnessPolicyV1 {
+    fn from(policy: FreshnessPolicyV1) -> Self {
+        Self {
+            tiers: policy.tiers,
+        }
+    }
+}
+
+impl TryFrom<RawFreshnessPolicyV1> for FreshnessPolicyV1 {
+    type Error = FreshnessPolicyError;
+
+    fn try_from(raw: RawFreshnessPolicyV1) -> Result<Self, Self::Error> {
+        Self::new(raw.tiers)
+    }
+}
+
+impl<'de> Deserialize<'de> for FreshnessPolicyV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawFreshnessPolicyV1::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Default for FreshnessPolicyV1 {
@@ -236,6 +293,36 @@ impl FreshnessPolicyV1 {
                 return Err(FreshnessPolicyError::AuthoritativeTierZeroThreshold { tier });
             }
         }
+
+        // Validate monotonic non-increasing threshold ordering.
+        //
+        // For each consecutive pair of tiers (i, i+1), the effective
+        // threshold at tier i+1 must be <= the effective threshold at
+        // tier i. A threshold of 0 means "no enforcement" (effectively
+        // infinite tolerance) for non-authoritative tiers, so it is
+        // treated as u64::MAX for ordering purposes. Authoritative tiers
+        // with threshold 0 are already rejected above.
+        for i in 0..(NUM_TIERS - 1) {
+            let eff_lower = if tiers[i].max_head_age_ticks == 0 {
+                u64::MAX // no enforcement = infinite tolerance
+            } else {
+                tiers[i].max_head_age_ticks
+            };
+            let eff_higher = if tiers[i + 1].max_head_age_ticks == 0 {
+                u64::MAX
+            } else {
+                tiers[i + 1].max_head_age_ticks
+            };
+            if eff_higher > eff_lower {
+                // SAFETY: i < NUM_TIERS (5), so these casts never truncate.
+                #[allow(clippy::cast_possible_truncation)]
+                return Err(FreshnessPolicyError::ThresholdOrderingViolation {
+                    lower_tier: i as u8,
+                    higher_tier: (i + 1) as u8,
+                });
+            }
+        }
+
         Ok(Self { tiers })
     }
 
@@ -1399,9 +1486,10 @@ mod tests {
     }
 
     #[test]
-    fn defense_in_depth_tier2_stale_forced_deny_at_eval() {
-        // Even if a policy is constructed via serde bypass (not through
-        // `new()`), the evaluator still forces Deny for Tier2+ stale.
+    fn defense_in_depth_tier2_invalid_action_rejected_at_deser() {
+        // Serde deserialization now validates invariants. A Tier2 with
+        // staleness_action = ALLOW must be rejected at deserialization
+        // time, not just at construction.
         let policy_json = serde_json::json!({
             "tiers": [
                 {"max_head_age_ticks": 0, "staleness_action": "ALLOW"},
@@ -1411,25 +1499,22 @@ mod tests {
                 {"max_head_age_ticks": 1_000, "staleness_action": "DENY"}
             ]
         });
-        let policy: FreshnessPolicyV1 = serde_json::from_value(policy_json).unwrap();
-        let eval = FreshnessPolicyEvaluator::new(policy);
-        // Tier2 stale with configured Allow -> evaluator forces Deny
-        let verdict = eval.evaluate(RiskTier::Tier2, 200_000, 0);
-        assert!(verdict.is_stale);
-        assert_eq!(verdict.action, StalenessAction::Deny);
-        assert!(matches!(
-            verdict.audit_event,
-            FreshnessAuditEvent::StaleDenied {
-                risk_tier: RiskTier::Tier2,
-                ..
-            }
-        ));
+        let result: Result<FreshnessPolicyV1, _> = serde_json::from_value(policy_json);
+        assert!(
+            result.is_err(),
+            "serde deserialization must reject Tier2 with non-Deny action"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Deny"),
+            "error should mention Deny requirement: {err_msg}"
+        );
     }
 
     #[test]
-    fn defense_in_depth_tier3_zero_threshold_denied_at_eval() {
-        // A Tier3 policy with zero threshold deserialized from JSON
-        // must still deny at evaluation time.
+    fn defense_in_depth_tier3_zero_threshold_rejected_at_deser() {
+        // A Tier3 policy with zero threshold must be rejected at
+        // deserialization time.
         let policy_json = serde_json::json!({
             "tiers": [
                 {"max_head_age_ticks": 0, "staleness_action": "ALLOW"},
@@ -1439,19 +1524,16 @@ mod tests {
                 {"max_head_age_ticks": 1_000, "staleness_action": "DENY"}
             ]
         });
-        let policy: FreshnessPolicyV1 = serde_json::from_value(policy_json).unwrap();
-        let eval = FreshnessPolicyEvaluator::new(policy);
-        // Tier3 zero threshold -> evaluator denies
-        let verdict = eval.evaluate(RiskTier::Tier3, 200_000, 0);
-        assert!(verdict.is_stale);
-        assert_eq!(verdict.action, StalenessAction::Deny);
-        assert!(matches!(
-            verdict.audit_event,
-            FreshnessAuditEvent::StaleDenied {
-                risk_tier: RiskTier::Tier3,
-                ..
-            }
-        ));
+        let result: Result<FreshnessPolicyV1, _> = serde_json::from_value(policy_json);
+        assert!(
+            result.is_err(),
+            "serde deserialization must reject Tier3 with zero threshold"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("positive"),
+            "error should mention positive threshold: {err_msg}"
+        );
     }
 
     #[test]
@@ -1773,6 +1855,261 @@ mod tests {
         assert!(
             result.is_err(),
             "nested TierFreshnessConfig should reject unknown fields"
+        );
+    }
+
+    // =========================================================================
+    // Threshold Ordering Violation Tests (monotonic non-increasing)
+    // =========================================================================
+
+    #[test]
+    fn threshold_inversion_tier3_exceeds_tier2_rejected() {
+        // Tier3 threshold (200_000) > Tier2 threshold (100_000) is invalid:
+        // a higher-risk tier must not be more lenient than a lower-risk tier.
+        let result = FreshnessPolicyV1::new([
+            TierFreshnessConfig {
+                max_head_age_ticks: 0,
+                staleness_action: StalenessAction::Allow,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000_000,
+                staleness_action: StalenessAction::Warn,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100_000,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 200_000, // INVALID: exceeds Tier2
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000,
+                staleness_action: StalenessAction::Deny,
+            },
+        ]);
+        assert!(matches!(
+            result,
+            Err(FreshnessPolicyError::ThresholdOrderingViolation {
+                lower_tier: 2,
+                higher_tier: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn threshold_inversion_tier4_exceeds_tier3_rejected() {
+        // Tier4 threshold (50_000) > Tier3 threshold (10_000) is invalid.
+        let result = FreshnessPolicyV1::new([
+            TierFreshnessConfig {
+                max_head_age_ticks: 0,
+                staleness_action: StalenessAction::Allow,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000_000,
+                staleness_action: StalenessAction::Warn,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100_000,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 10_000,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 50_000, // INVALID: exceeds Tier3
+                staleness_action: StalenessAction::Deny,
+            },
+        ]);
+        assert!(matches!(
+            result,
+            Err(FreshnessPolicyError::ThresholdOrderingViolation {
+                lower_tier: 3,
+                higher_tier: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn threshold_inversion_tier2_exceeds_tier1_rejected() {
+        // Tier2 threshold (2_000_000) > Tier1 threshold (1_000_000) is invalid.
+        let result = FreshnessPolicyV1::new([
+            TierFreshnessConfig {
+                max_head_age_ticks: 0,
+                staleness_action: StalenessAction::Allow,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000_000,
+                staleness_action: StalenessAction::Warn,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 2_000_000, // INVALID: exceeds Tier1
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 10_000,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000,
+                staleness_action: StalenessAction::Deny,
+            },
+        ]);
+        assert!(matches!(
+            result,
+            Err(FreshnessPolicyError::ThresholdOrderingViolation {
+                lower_tier: 1,
+                higher_tier: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn threshold_inversion_tier1_exceeds_tier0_with_enforcement_rejected() {
+        // Tier0 = 500 (non-zero = enforcement enabled), Tier1 = 1000 is
+        // invalid because the higher tier has a more lenient threshold.
+        let result = FreshnessPolicyV1::new([
+            TierFreshnessConfig {
+                max_head_age_ticks: 500,
+                staleness_action: StalenessAction::Allow,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000, // INVALID: exceeds Tier0
+                staleness_action: StalenessAction::Warn,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 200,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 50,
+                staleness_action: StalenessAction::Deny,
+            },
+        ]);
+        assert!(matches!(
+            result,
+            Err(FreshnessPolicyError::ThresholdOrderingViolation {
+                lower_tier: 0,
+                higher_tier: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn threshold_equal_across_tiers_accepted() {
+        // Equal thresholds across tiers are valid (non-increasing = equal
+        // is OK).
+        let result = FreshnessPolicyV1::new([
+            TierFreshnessConfig {
+                max_head_age_ticks: 0,
+                staleness_action: StalenessAction::Allow,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100,
+                staleness_action: StalenessAction::Warn,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100,
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 100,
+                staleness_action: StalenessAction::Deny,
+            },
+        ]);
+        assert!(result.is_ok(), "equal thresholds should be accepted");
+    }
+
+    #[test]
+    fn threshold_ordering_via_serde_deserialization_rejected() {
+        // Threshold ordering violations must be caught during serde
+        // deserialization, not just at construction time.
+        let json = serde_json::json!({
+            "tiers": [
+                {"max_head_age_ticks": 0, "staleness_action": "ALLOW"},
+                {"max_head_age_ticks": 1_000_000, "staleness_action": "WARN"},
+                {"max_head_age_ticks": 100_000, "staleness_action": "DENY"},
+                {"max_head_age_ticks": 200_000, "staleness_action": "DENY"},
+                {"max_head_age_ticks": 1_000, "staleness_action": "DENY"}
+            ]
+        });
+        let result: Result<FreshnessPolicyV1, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "serde must reject threshold ordering violation"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("threshold ordering violation"),
+            "error should describe the ordering violation: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn threshold_ordering_multiple_inversions_first_reported() {
+        // When multiple ordering violations exist, the first one (lowest
+        // tier pair) is reported.
+        let result = FreshnessPolicyV1::new([
+            TierFreshnessConfig {
+                max_head_age_ticks: 0,
+                staleness_action: StalenessAction::Allow,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 500,
+                staleness_action: StalenessAction::Warn,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 1_000, // inversion vs Tier1
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 2_000, // inversion vs Tier2
+                staleness_action: StalenessAction::Deny,
+            },
+            TierFreshnessConfig {
+                max_head_age_ticks: 3_000, // inversion vs Tier3
+                staleness_action: StalenessAction::Deny,
+            },
+        ]);
+        // The authoritative tier checks run first (Tier2+), and here
+        // all actions are Deny and thresholds are positive, so the
+        // ordering check finds the first violation at Tier1 -> Tier2.
+        assert!(matches!(
+            result,
+            Err(FreshnessPolicyError::ThresholdOrderingViolation {
+                lower_tier: 1,
+                higher_tier: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn threshold_ordering_error_display() {
+        let err = FreshnessPolicyError::ThresholdOrderingViolation {
+            lower_tier: 2,
+            higher_tier: 3,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("threshold ordering violation"),
+            "display should describe violation: {msg}"
+        );
+        assert!(
+            msg.contains('2'),
+            "display should mention lower tier: {msg}"
+        );
+        assert!(
+            msg.contains('3'),
+            "display should mention higher tier: {msg}"
         );
     }
 }
