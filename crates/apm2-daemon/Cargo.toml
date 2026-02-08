@@ -143,3 +143,8 @@ enum_variant_added = "allow"
 [[bench]]
 name = "latency_benchmarks"
 harness = false
+
+# Verifier cache amortization benchmark (TCK-00359)
+[[bench]]
+name = "verifier_cache_bench"
+harness = false
