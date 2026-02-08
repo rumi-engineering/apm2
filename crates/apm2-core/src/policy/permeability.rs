@@ -651,6 +651,20 @@ pub enum PermeabilityError {
         /// Child receipt's `expires_at_ms`.
         child_ms: u64,
     },
+
+    /// Issuance timestamp is invalid (zero or in the future).
+    #[error("invalid issuance timestamp: {reason}")]
+    InvalidIssuanceTime {
+        /// Description of the validation failure.
+        reason: String,
+    },
+
+    /// Child receipt's `parent_authority` does not match the parent's
+    /// `delegated` authority, breaking delegation chain continuity.
+    #[error(
+        "parent-authority continuity violation: child.parent_authority_hash does not match parent.delegated_hash"
+    )]
+    ParentAuthorityContinuity,
 }
 
 // =============================================================================
@@ -790,44 +804,8 @@ impl PermeabilityReceipt {
     ///
     /// Returns [`PermeabilityError`] if any admission check fails.
     pub fn validate_admission(&self, now_ms: u64) -> Result<(), PermeabilityError> {
-        // Check receipt ID length
-        if self.receipt_id.is_empty() || self.receipt_id.len() > MAX_RECEIPT_ID_LENGTH {
-            return Err(PermeabilityError::InvalidReceiptId {
-                actual: self.receipt_id.len(),
-                max: MAX_RECEIPT_ID_LENGTH,
-            });
-        }
-
-        // Check actor IDs are non-empty (MAJOR 2 fix)
-        if self.delegator_actor_id.is_empty() {
-            return Err(PermeabilityError::EmptyActorId {
-                field: "delegator_actor_id".to_string(),
-            });
-        }
-        if self.delegate_actor_id.is_empty() {
-            return Err(PermeabilityError::EmptyActorId {
-                field: "delegate_actor_id".to_string(),
-            });
-        }
-
-        // Check actor ID max lengths
-        if self.delegator_actor_id.len() > MAX_ACTOR_ID_LENGTH {
-            return Err(PermeabilityError::ActorIdTooLong {
-                actual: self.delegator_actor_id.len(),
-                max: MAX_ACTOR_ID_LENGTH,
-            });
-        }
-        if self.delegate_actor_id.len() > MAX_ACTOR_ID_LENGTH {
-            return Err(PermeabilityError::ActorIdTooLong {
-                actual: self.delegate_actor_id.len(),
-                max: MAX_ACTOR_ID_LENGTH,
-            });
-        }
-
-        // Check revocation
-        if self.revoked {
-            return Err(PermeabilityError::Revoked);
-        }
+        // Structural checks (shared with validate_admission_unchecked)
+        self.validate_structural()?;
 
         // RFC-0020 mandatory expiry binding: authority-bearing receipts MUST
         // have a non-zero expires_at_ms.  Receipts without expiry could be
@@ -848,73 +826,14 @@ impl PermeabilityReceipt {
             return Err(PermeabilityError::Expired);
         }
 
-        // Check delegation depth
-        if self.delegation_depth > MAX_DELEGATION_DEPTH {
-            return Err(PermeabilityError::DepthExceeded {
-                depth: self.delegation_depth,
-                max: MAX_DELEGATION_DEPTH,
-            });
-        }
-
-        // BLOCKER 3: Enforce parent receipt hash linkage consistency.
-        // Root receipts (depth 0) MUST NOT have a parent hash.
-        // Non-root receipts (depth > 0) MUST have a parent hash.
-        if self.delegation_depth == 0 && self.parent_receipt_hash.is_some() {
-            return Err(PermeabilityError::ParentLinkageMismatch {
-                reason: "root receipt (depth 0) must not have parent_receipt_hash".to_string(),
-            });
-        }
-        if self.delegation_depth > 0 && self.parent_receipt_hash.is_none() {
-            return Err(PermeabilityError::ParentLinkageMismatch {
+        // Validate issued_at_ms: must not be in the future.
+        // A future issuance timestamp indicates clock skew or forgery.
+        if self.issued_at_ms > now_ms {
+            return Err(PermeabilityError::InvalidIssuanceTime {
                 reason: format!(
-                    "non-root receipt (depth {}) must have parent_receipt_hash",
-                    self.delegation_depth
+                    "issued_at_ms ({}) is in the future (now_ms = {})",
+                    self.issued_at_ms, now_ms
                 ),
-            });
-        }
-
-        // Compute expected meet
-        let expected_meet = lattice_meet(&self.parent_authority, &self.overlay);
-        if self.delegated != expected_meet {
-            return Err(PermeabilityError::MeetMismatch);
-        }
-
-        // RFC-0020 strict-subset delegation: delegated authority MUST be
-        // strictly less than parent authority — equal authority delegation
-        // is not permitted.  This prevents a delegate from obtaining the
-        // full authority of its parent.
-        if !self.delegated.is_strict_subset_of(&self.parent_authority) {
-            if self.delegated == self.parent_authority {
-                return Err(PermeabilityError::EqualAuthorityDelegation);
-            }
-            return Err(PermeabilityError::DelegationWidening);
-        }
-        if !self.delegated.is_subset_of(&self.overlay) {
-            return Err(PermeabilityError::OverlayWidening);
-        }
-
-        // Verify authority hashes
-        let parent_hash = self.parent_authority.content_hash();
-        if parent_hash != self.parent_authority_hash {
-            return Err(PermeabilityError::HashMismatch {
-                expected: hex::encode(parent_hash),
-                actual: hex::encode(self.parent_authority_hash),
-            });
-        }
-
-        let overlay_hash = self.overlay.content_hash();
-        if overlay_hash != self.overlay_hash {
-            return Err(PermeabilityError::HashMismatch {
-                expected: hex::encode(overlay_hash),
-                actual: hex::encode(self.overlay_hash),
-            });
-        }
-
-        let delegated_hash = self.delegated.content_hash();
-        if delegated_hash != self.delegated_hash {
-            return Err(PermeabilityError::HashMismatch {
-                expected: hex::encode(delegated_hash),
-                actual: hex::encode(self.delegated_hash),
             });
         }
 
@@ -924,8 +843,9 @@ impl PermeabilityReceipt {
     /// Validates this receipt for admission without freshness enforcement.
     ///
     /// This is identical to [`validate_admission`](Self::validate_admission)
-    /// except that expiry checks are skipped. This is intended **only** for
-    /// deterministic unit tests where a wall-clock timestamp is not available.
+    /// except that expiry and time-based checks are skipped. This is intended
+    /// **only** for deterministic unit tests where a wall-clock timestamp is
+    /// not available.
     ///
     /// # Safety
     ///
@@ -933,6 +853,16 @@ impl PermeabilityReceipt {
     /// undermines time-bound authority.
     #[cfg(test)]
     pub(crate) fn validate_admission_unchecked(&self) -> Result<(), PermeabilityError> {
+        self.validate_structural()
+    }
+
+    /// Common structural validation shared between [`validate_admission`]
+    /// and [`validate_admission_unchecked`](Self::validate_admission_unchecked).
+    ///
+    /// Checks receipt ID, actor IDs, revocation, `issued_at_ms` (non-zero),
+    /// delegation depth, parent linkage, meet correctness, strict-subset,
+    /// and authority hashes.  Does NOT check expiry or time-based freshness.
+    fn validate_structural(&self) -> Result<(), PermeabilityError> {
         // Check receipt ID length
         if self.receipt_id.is_empty() || self.receipt_id.len() > MAX_RECEIPT_ID_LENGTH {
             return Err(PermeabilityError::InvalidReceiptId {
@@ -972,7 +902,13 @@ impl PermeabilityReceipt {
             return Err(PermeabilityError::Revoked);
         }
 
-        // Skip expiry checks (test-only path)
+        // Validate issued_at_ms: must be non-zero.
+        // A zero issuance timestamp indicates an unset/invalid receipt.
+        if self.issued_at_ms == 0 {
+            return Err(PermeabilityError::InvalidIssuanceTime {
+                reason: "issued_at_ms must be non-zero".to_string(),
+            });
+        }
 
         // Check delegation depth
         if self.delegation_depth > MAX_DELEGATION_DEPTH {
@@ -982,7 +918,9 @@ impl PermeabilityReceipt {
             });
         }
 
-        // Parent receipt hash linkage consistency
+        // Enforce parent receipt hash linkage consistency.
+        // Root receipts (depth 0) MUST NOT have a parent hash.
+        // Non-root receipts (depth > 0) MUST have a parent hash.
         if self.delegation_depth == 0 && self.parent_receipt_hash.is_some() {
             return Err(PermeabilityError::ParentLinkageMismatch {
                 reason: "root receipt (depth 0) must not have parent_receipt_hash".to_string(),
@@ -1003,7 +941,10 @@ impl PermeabilityReceipt {
             return Err(PermeabilityError::MeetMismatch);
         }
 
-        // RFC-0020 strict-subset delegation (same as validate_admission)
+        // RFC-0020 strict-subset delegation: delegated authority MUST be
+        // strictly less than parent authority — equal authority delegation
+        // is not permitted.  This prevents a delegate from obtaining the
+        // full authority of its parent.
         if !self.delegated.is_strict_subset_of(&self.parent_authority) {
             if self.delegated == self.parent_authority {
                 return Err(PermeabilityError::EqualAuthorityDelegation);
@@ -1244,9 +1185,18 @@ pub fn validate_delegation_chain(
             },
         }
 
-        // Verify monotonic non-widening: child's delegated authority must be
-        // a subset of parent's delegated authority
-        if !child.delegated.is_subset_of(&parent.delegated) {
+        // Parent-authority continuity: the child's parent_authority must
+        // be exactly the parent's delegated authority.  Without this check
+        // a child can forge parent_authority = top and set delegated ==
+        // parent.delegated, passing the subset check while bypassing
+        // strict-subset enforcement.
+        if child.parent_authority_hash != parent.delegated_hash {
+            return Err(PermeabilityError::ParentAuthorityContinuity);
+        }
+
+        // Strict-subset: child's delegated authority must be strictly less
+        // than parent's delegated authority (not merely <=).
+        if !child.delegated.is_strict_subset_of(&parent.delegated) {
             return Err(PermeabilityError::DelegationWidening);
         }
 
@@ -1334,7 +1284,13 @@ pub(crate) fn validate_delegation_chain_unchecked(
             },
         }
 
-        if !child.delegated.is_subset_of(&parent.delegated) {
+        // Parent-authority continuity (same as non-unchecked path)
+        if child.parent_authority_hash != parent.delegated_hash {
+            return Err(PermeabilityError::ParentAuthorityContinuity);
+        }
+
+        // Strict-subset (same as non-unchecked path)
+        if !child.delegated.is_strict_subset_of(&parent.delegated) {
             return Err(PermeabilityError::DelegationWidening);
         }
 
@@ -3111,6 +3067,198 @@ mod tests {
         assert!(
             matches!(result, Err(PermeabilityError::MissingExpiry)),
             "no-expiry child receipt must be rejected at admission, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER 1 Regression: Parent-authority continuity in chain validation
+    // =========================================================================
+
+    #[test]
+    fn test_chain_forged_parent_authority_rejected() {
+        // Regression: a child forges parent_authority = top (instead of the
+        // actual parent's delegated) and sets delegated == parent.delegated.
+        // Without the parent-authority continuity check, this passes chain
+        // validation because child.delegated <= parent.delegated is trivially
+        // true when they are equal.
+        let root_overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Capped(10_000),
+            StopPredicateLevel::Override,
+            TaintCeiling::Adversarial,
+            ClassificationLevel::TopSecret,
+        );
+        let root =
+            PermeabilityReceiptBuilder::new("root-cont", AuthorityVector::top(), root_overlay)
+                .delegation_depth(0)
+                .delegator_actor_id("root")
+                .delegate_actor_id("child")
+                .issued_at_ms(1_000_000)
+                .expires_at_ms(5_000_000)
+                .build()
+                .unwrap();
+
+        // Forge: child claims parent_authority = top, which lets it set
+        // delegated = root.delegated (passing its own admission meet check
+        // since meet(top, root.delegated) == root.delegated and root.delegated
+        // is a strict subset of top).
+        // The child's parent_authority_hash will be top.content_hash(), which
+        // differs from root.delegated_hash -> continuity check catches this.
+        let forged_child = PermeabilityReceiptBuilder::new(
+            "child-forged",
+            AuthorityVector::top(), // FORGED: should be root.delegated
+            root_overlay,           /* overlay == root_overlay so meet(top, root_overlay) ==
+                                     * root.delegated */
+        )
+        .delegation_depth(1)
+        .parent_receipt_hash(root.content_hash())
+        .delegator_actor_id("child")
+        .delegate_actor_id("grandchild")
+        .issued_at_ms(1_000_000)
+        .expires_at_ms(3_000_000)
+        .build()
+        .unwrap();
+
+        let result = validate_delegation_chain_unchecked(&[root, forged_child]);
+        assert!(
+            matches!(result, Err(PermeabilityError::ParentAuthorityContinuity)),
+            "forged parent_authority must be rejected by continuity check, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_chain_equal_authority_child_rejected() {
+        // Strict-subset enforcement in chain validation: even if the child
+        // correctly binds parent_authority = parent.delegated, if the child's
+        // own delegated == parent.delegated, the chain must reject it.
+        //
+        // NOTE: This scenario is actually caught at admission level by the
+        // EqualAuthorityDelegation check (since child.delegated ==
+        // child.parent_authority which is == parent.delegated). The chain-level
+        // strict-subset check provides defense-in-depth.
+        let root_overlay = AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Capped(10_000),
+            StopPredicateLevel::Override,
+            TaintCeiling::Adversarial,
+            ClassificationLevel::TopSecret,
+        );
+        let root = PermeabilityReceiptBuilder::new("root-eq", AuthorityVector::top(), root_overlay)
+            .delegation_depth(0)
+            .delegator_actor_id("root")
+            .delegate_actor_id("child")
+            .issued_at_ms(1_000_000)
+            .expires_at_ms(5_000_000)
+            .build()
+            .unwrap();
+
+        // Child with parent_authority = root.delegated, overlay = top =>
+        // meet(root.delegated, top) == root.delegated, so delegated ==
+        // parent_authority => EqualAuthorityDelegation at admission.
+        let child = PermeabilityReceiptBuilder::new(
+            "child-eq",
+            root.delegated,
+            AuthorityVector::top(), // overlay = top => meet = root.delegated
+        )
+        .delegation_depth(1)
+        .parent_receipt_hash(root.content_hash())
+        .delegator_actor_id("child")
+        .delegate_actor_id("grandchild")
+        .issued_at_ms(1_000_000)
+        .expires_at_ms(3_000_000)
+        .build()
+        .unwrap();
+
+        // Chain validation calls validate_admission_unchecked on each receipt,
+        // which rejects EqualAuthorityDelegation before reaching chain-level
+        // strict-subset.
+        let result = validate_delegation_chain_unchecked(&[root, child]);
+        assert!(
+            result.is_err(),
+            "equal-authority child in chain must be rejected, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR Regression: issued_at_ms validation
+    // =========================================================================
+
+    #[test]
+    fn test_issued_at_ms_zero_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("zero-iat", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(0) // zero => invalid
+            .expires_at_ms(5_000_000)
+            .build()
+            .unwrap();
+
+        let result = receipt.validate_admission(2_000_000);
+        assert!(
+            matches!(result, Err(PermeabilityError::InvalidIssuanceTime { .. })),
+            "zero issued_at_ms must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_issued_at_ms_future_rejected() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("future-iat", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(9_000_000) // future: greater than now_ms=2_000_000
+            .expires_at_ms(10_000_000)
+            .build()
+            .unwrap();
+
+        let result = receipt.validate_admission(2_000_000);
+        assert!(
+            matches!(result, Err(PermeabilityError::InvalidIssuanceTime { .. })),
+            "future issued_at_ms must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_issued_at_ms_valid_passes() {
+        let parent = AuthorityVector::top();
+        let overlay = AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(5000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        );
+        let receipt = PermeabilityReceiptBuilder::new("valid-iat", parent, overlay)
+            .delegator_actor_id("alice")
+            .delegate_actor_id("bob")
+            .issued_at_ms(1_000_000) // valid: <= now_ms=2_000_000
+            .expires_at_ms(5_000_000)
+            .build()
+            .unwrap();
+
+        assert!(
+            receipt.validate_admission(2_000_000).is_ok(),
+            "valid issued_at_ms must pass admission"
         );
     }
 
