@@ -62,8 +62,8 @@ waiver:
 
   references:
     pr_url: "https://github.com/guardian-intelligence/apm2/pull/502"
-    commit_sha: "47fb25b4bf45c6782e70f9f91a30a17f7c8eb77d"
-    commit_message: "reviews: remove gh api from RoleSpecs; clarify waiver sha"
+    commit_sha: "5703774652fd58ada2090730086c661aae0f260c"
+    commit_message: "review-gate: strict JSON stdout + fail-closed trust"
     related_ticket: "TCK-00410"
 
   approval:
