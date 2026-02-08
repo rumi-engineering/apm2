@@ -222,9 +222,9 @@ enum TaskKind {
     Builtin(BuiltinTask),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum BuiltinTask {
-    HostToolsCheck,
+    HostToolsCheck { required_tools: Vec<String> },
 }
 
 #[derive(Debug)]
@@ -505,7 +505,7 @@ fn run_explain(args: &ExplainArgs) -> u8 {
             println!("  deps: {}", task.deps.join(", "));
         }
         match &task.kind {
-            TaskKind::Builtin(BuiltinTask::HostToolsCheck) => {
+            TaskKind::Builtin(BuiltinTask::HostToolsCheck { .. }) => {
                 println!("  cmd: builtin::host_tools_check");
             },
             TaskKind::Command(spec) => {
@@ -1817,27 +1817,11 @@ fn parse_status_number(input: &str) -> Option<u64> {
 
 fn run_builtin_task(task: BuiltinTask, log: &mut File) -> i32 {
     match task {
-        BuiltinTask::HostToolsCheck => {
+        BuiltinTask::HostToolsCheck { required_tools } => {
             let mut missing = Vec::new();
-            let required = [
-                "cargo",
-                "rustc",
-                "git",
-                "protoc",
-                "rg",
-                "jq",
-                "timeout",
-                "systemd-run",
-                "rustup",
-                "cargo-nextest",
-                "cargo-deny",
-                "cargo-audit",
-                "cargo-llvm-cov",
-            ];
-
-            for tool in required {
+            for tool in &required_tools {
                 if find_in_path(tool).is_none() {
-                    missing.push(tool.to_string());
+                    missing.push(tool.clone());
                 }
             }
 
@@ -1849,6 +1833,21 @@ fn run_builtin_task(task: BuiltinTask, log: &mut File) -> i32 {
                     log,
                     "status=FAIL\nmissing_tools={}\nmessage=Provision runner host with required toolchain",
                     missing.join(",")
+                );
+                let _ = writeln!(
+                    log,
+                    "path={}",
+                    std::env::var("PATH").unwrap_or_else(|_| "<unset>".to_string())
+                );
+                let _ = writeln!(
+                    log,
+                    "cargo_home={}",
+                    std::env::var("CARGO_HOME").unwrap_or_else(|_| "<unset>".to_string())
+                );
+                let _ = writeln!(
+                    log,
+                    "home={}",
+                    std::env::var("HOME").unwrap_or_else(|_| "<unset>".to_string())
                 );
                 1
             }
@@ -2062,34 +2061,48 @@ fn run_inside_bounded_unit(args: &RunArgs, repo_root: &Path, max_parallel: usize
         .arg("--setenv")
         .arg(format!("{BOUNDED_ENTRY_TOKEN_ENV}={bounded_entry_token}"));
 
-    // Fail-closed runner environments can vary in whether `$CARGO_HOME/bin` is
-    // present on `PATH`. Since the CI suite relies on cargo subcommands like
-    // `cargo nextest` / `cargo deny` / `cargo audit` / `cargo llvm-cov`, we
-    // force-prepend `$CARGO_HOME/bin` (or `$HOME/.cargo/bin`) to the bounded
-    // unit's PATH to make tool discovery deterministic across runner instances.
-    let cargo_bin = std::env::var("CARGO_HOME")
+    // Fail-closed runner environments can vary in whether cargo-installed tools
+    // are discoverable on PATH within transient systemd user units.
+    // We explicitly prepend common locations:
+    // - `$CARGO_HOME/bin`
+    // - `$HOME/.cargo/bin`
+    // - `$HOME/.install-action/bin` (used by some GitHub Actions installers)
+    let home = std::env::var("HOME").ok().filter(|value| !value.is_empty());
+    let cargo_home = std::env::var("CARGO_HOME")
         .ok()
-        .filter(|value| !value.is_empty())
-        .map(|home| format!("{home}/bin"))
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(|home| format!("{home}/.cargo/bin"))
-        });
-    let path = std::env::var("PATH").unwrap_or_default();
-    let augmented_path = if let Some(cargo_bin) = cargo_bin {
-        let already_present = path.split(':').any(|segment| segment == cargo_bin.as_str());
-        if already_present {
-            path
-        } else if path.is_empty() {
-            cargo_bin
-        } else {
-            format!("{cargo_bin}:{path}")
+        .filter(|value| !value.is_empty());
+    let mut prepend = Vec::new();
+    if let Some(cargo_home) = &cargo_home {
+        let candidate = format!("{cargo_home}/bin");
+        if Path::new(&candidate).is_dir() {
+            prepend.push(candidate);
         }
-    } else {
-        path
-    };
+    }
+    if let Some(home) = &home {
+        let cargo_bin = format!("{home}/.cargo/bin");
+        if Path::new(&cargo_bin).is_dir() {
+            prepend.push(cargo_bin);
+        }
+        let install_action_bin = format!("{home}/.install-action/bin");
+        if Path::new(&install_action_bin).is_dir() {
+            prepend.push(install_action_bin);
+        }
+    }
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut segments = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in prepend {
+        if seen.insert(candidate.clone()) {
+            segments.push(candidate);
+        }
+    }
+    for segment in path.split(':').filter(|value| !value.is_empty()) {
+        if seen.insert(segment.to_string()) {
+            segments.push(segment.to_string());
+        }
+    }
+    let augmented_path = segments.join(":");
     if !augmented_path.is_empty() {
         cmd.arg("--setenv").arg(format!("PATH={augmented_path}"));
     }
@@ -2188,15 +2201,6 @@ fn resolve_repo_root() -> Result<PathBuf, String> {
 
 fn build_plan(profile: CiProfileArg, repo_root: &Path) -> Plan {
     let mut tasks = Vec::new();
-
-    tasks.push(TaskSpec {
-        id: "bootstrap".to_string(),
-        lane: "bootstrap".to_string(),
-        class: TaskClass::CheapParallel,
-        deps: Vec::new(),
-        declared_inputs: Vec::new(),
-        kind: TaskKind::Builtin(BuiltinTask::HostToolsCheck),
-    });
 
     let script = |relative: &str| -> String { repo_root.join(relative).display().to_string() };
     if !matches!(profile, CiProfileArg::GithubSlowLane) {
@@ -2465,7 +2469,79 @@ fn build_plan(profile: CiProfileArg, repo_root: &Path) -> Plan {
         ));
     }
 
+    let required_tools = required_tools_for_plan(&tasks);
+    tasks.insert(
+        0,
+        TaskSpec {
+            id: "bootstrap".to_string(),
+            lane: "bootstrap".to_string(),
+            class: TaskClass::CheapParallel,
+            deps: Vec::new(),
+            declared_inputs: Vec::new(),
+            kind: TaskKind::Builtin(BuiltinTask::HostToolsCheck { required_tools }),
+        },
+    );
+
     Plan { profile, tasks }
+}
+
+fn required_tools_for_plan(tasks: &[TaskSpec]) -> Vec<String> {
+    let mut required = BTreeSet::new();
+
+    // Baseline host toolchain required for *all* profiles.
+    for tool in [
+        "cargo",
+        "rustc",
+        "git",
+        "protoc",
+        "rg",
+        "jq",
+        "timeout",
+        "systemd-run",
+        "rustup",
+    ] {
+        required.insert(tool.to_string());
+    }
+
+    // Infer required cargo plugin binaries from the plan surface so we don't
+    // fail bootstrap due to tools that won't be invoked in the selected plan.
+    for task in tasks {
+        let TaskKind::Command(spec) = &task.kind else {
+            continue;
+        };
+        if spec.program != "cargo" {
+            continue;
+        }
+
+        let mut args = spec.args.iter().map(String::as_str);
+        let Some(mut subcommand) = args.next() else {
+            continue;
+        };
+        if subcommand.starts_with('+') {
+            subcommand = match args.next() {
+                Some(value) => value,
+                None => continue,
+            };
+        }
+
+        match subcommand {
+            "nextest" => {
+                required.insert("cargo-nextest".to_string());
+            },
+            "deny" => {
+                required.insert("cargo-deny".to_string());
+            },
+            "audit" => {
+                required.insert("cargo-audit".to_string());
+            },
+            "llvm-cov" => {
+                required.insert("cargo-llvm-cov".to_string());
+            },
+            _ => {},
+        }
+    }
+
+    required.into_iter().collect()
 }
 
 fn cargo_task(id: &str, lane: &str, args: Vec<&str>, deps: Vec<&str>) -> TaskSpec {
@@ -2531,9 +2607,7 @@ fn clone_task(task: &TaskSpec) -> TaskSpec {
         deps: task.deps.clone(),
         declared_inputs: task.declared_inputs.clone(),
         kind: match &task.kind {
-            TaskKind::Builtin(BuiltinTask::HostToolsCheck) => {
-                TaskKind::Builtin(BuiltinTask::HostToolsCheck)
-            },
+            TaskKind::Builtin(builtin) => TaskKind::Builtin(builtin.clone()),
             TaskKind::Command(spec) => TaskKind::Command(CommandSpec {
                 program: spec.program.clone(),
                 args: spec.args.clone(),
@@ -2803,11 +2877,13 @@ fn compute_task_digest(
     }
 
     let (program, args, env_fingerprint) = match &task.kind {
-        TaskKind::Builtin(_) => (
-            "builtin::host_tools_check".to_string(),
-            Vec::new(),
-            BTreeMap::new(),
-        ),
+        TaskKind::Builtin(builtin) => match builtin {
+            BuiltinTask::HostToolsCheck { required_tools } => (
+                "builtin::host_tools_check".to_string(),
+                required_tools.clone(),
+                BTreeMap::new(),
+            ),
+        },
         TaskKind::Command(spec) => (
             spec.program.clone(),
             spec.args.clone(),
@@ -3306,7 +3382,9 @@ mod tests {
                 class: TaskClass::CheapParallel,
                 deps: vec!["task-b".to_string()],
                 declared_inputs: Vec::new(),
-                kind: TaskKind::Builtin(BuiltinTask::HostToolsCheck),
+                kind: TaskKind::Builtin(BuiltinTask::HostToolsCheck {
+                    required_tools: vec!["cargo".to_string()],
+                }),
             }],
         };
 
@@ -3318,6 +3396,53 @@ mod tests {
     fn test_build_plan_has_bootstrap() {
         let plan = build_plan(CiProfileArg::GithubPrFast, Path::new("/tmp/repo"));
         assert!(plan.tasks.iter().any(|task| task.id == "bootstrap"));
+    }
+
+    #[test]
+    fn test_bootstrap_required_tools_are_profile_scoped() {
+        let plan = build_plan(CiProfileArg::GithubPrFast, Path::new("/tmp/repo"));
+        let bootstrap = plan
+            .tasks
+            .iter()
+            .find(|task| task.id == "bootstrap")
+            .expect("expected bootstrap task");
+        let TaskKind::Builtin(BuiltinTask::HostToolsCheck { required_tools }) = &bootstrap.kind
+        else {
+            panic!("bootstrap should be a HostToolsCheck builtin task");
+        };
+
+        assert!(
+            required_tools.iter().any(|tool| tool == "cargo-nextest"),
+            "github-pr-fast should require cargo-nextest"
+        );
+        for tool in ["cargo-deny", "cargo-audit", "cargo-llvm-cov"] {
+            assert!(
+                !required_tools.iter().any(|entry| entry == tool),
+                "github-pr-fast should not require {tool}",
+            );
+        }
+
+        let plan = build_plan(CiProfileArg::GithubDeep, Path::new("/tmp/repo"));
+        let bootstrap = plan
+            .tasks
+            .iter()
+            .find(|task| task.id == "bootstrap")
+            .expect("expected bootstrap task");
+        let TaskKind::Builtin(BuiltinTask::HostToolsCheck { required_tools }) = &bootstrap.kind
+        else {
+            panic!("bootstrap should be a HostToolsCheck builtin task");
+        };
+        for tool in [
+            "cargo-nextest",
+            "cargo-deny",
+            "cargo-audit",
+            "cargo-llvm-cov",
+        ] {
+            assert!(
+                required_tools.iter().any(|entry| entry == tool),
+                "github-deep should require {tool}",
+            );
+        }
     }
 
     #[test]
