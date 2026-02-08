@@ -70,10 +70,18 @@
 //! ```
 
 pub mod canonical;
+pub mod freshness;
 mod types;
 
 // Re-export all public types
 pub use canonical::{Canonicalizable, CanonicalizationError};
+pub use freshness::{
+    DEFAULT_TIER0_MAX_HEAD_AGE_TICKS, DEFAULT_TIER1_MAX_HEAD_AGE_TICKS,
+    DEFAULT_TIER2_MAX_HEAD_AGE_TICKS, DEFAULT_TIER3_MAX_HEAD_AGE_TICKS,
+    DEFAULT_TIER4_MAX_HEAD_AGE_TICKS, FreshnessAuditEvent, FreshnessEvaluationError,
+    FreshnessPolicyEvaluator, FreshnessPolicyV1, MAX_AUDIT_EVENTS, StalenessAction,
+    StalenessVerdict, TierFreshnessConfig,
+};
 pub use types::{
     BoundedWallInterval,
     BoundedWallIntervalError,
