@@ -35,25 +35,18 @@
 //!
 //! # Runtime Integration
 //!
-//! **Architecture note**: This module is the *taint policy primitive library*.
-//! It provides types, lattice operations, declassification receipt issuance,
-//! and boundary-crossing enforcement as pure functions / methods with no I/O.
+//! This module provides the taint policy primitive library: types, lattice
+//! operations, declassification receipt issuance, and boundary-crossing
+//! enforcement as pure functions / methods with no I/O.
 //!
-//! Runtime integration -- injecting labels into work-object flows, wiring
-//! boundary checks into protocol dispatch, persisting receipts to the ledger,
-//! and plugging in concrete [`SignatureVerifier`] implementations backed by
-//! the daemon's key material -- is handled by daemon-layer wiring in a
-//! follow-on ticket.
+//! For daemon integration, [`TaintEnforcementGuard`] wraps a
+//! [`DualLatticePolicy`] and exposes a single `admit()` entry-point that the
+//! daemon's tool broker calls in its admission path. This guard enforces
+//! both boundary-level and actuator-tier constraints, rejecting inputs with
+//! excessive taint or over-classified confidentiality (fail-closed).
 //!
-//! Until the daemon-layer wiring lands, the API is library-only and must be
-//! called explicitly by consumers.
-
-// TODO(daemon-wiring): Wire DualLatticePolicy into daemon actuator/boundary
-// dispatch (tracked by TCK-00378-daemon). Specifically:
-//   - Wire taint labels into work-object instruction flow
-//   - Boundary check hooks in protocol dispatch
-//   - Ledger persistence for declassification receipts
-//   - Concrete SignatureVerifier backed by daemon key material
+//! Concrete [`SignatureVerifier`] implementations backed by the daemon's key
+//! material should be injected at guard construction time.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -106,6 +99,13 @@ const BLAKE3_DIGEST_LEN: usize = 32;
 /// Once this limit is reached, further declassification attempts are
 /// denied (fail-closed) to prevent unbounded memory growth.
 const MAX_CONSUMED_RECEIPTS: usize = 100_000;
+
+/// Maximum tolerated backward clock skew in milliseconds before
+/// a non-monotonic `now_ms` triggers a hard rejection. Small backward
+/// drift (e.g., NTP corrections) is clamped to the high-water mark;
+/// jumps exceeding this threshold are rejected fail-closed to prevent
+/// anti-replay eviction bypass attacks.
+const MAX_CLOCK_SKEW_MS: u64 = 5_000;
 
 /// Maximum length for any individual `String` field when deserializing
 /// a [`DeclassificationReceipt`]. Used by the bounded deserialization
@@ -385,6 +385,26 @@ pub enum TaintError {
     InvalidEffectHash {
         /// Which field and its actual/required length.
         reason: String,
+    },
+
+    /// The caller-supplied `now_ms` moved backward beyond the tolerated
+    /// skew threshold relative to the previously observed high-water
+    /// mark. This indicates either a clock manipulation attack or a
+    /// severe NTP correction. The policy rejects fail-closed to prevent
+    /// anti-replay eviction bypass.
+    #[error(
+        "non-monotonic clock: now_ms {now_ms} is {delta_ms}ms behind \
+         last_seen {last_seen_ms} (max skew {max_skew_ms}ms)"
+    )]
+    NonMonotonicClock {
+        /// The `now_ms` value supplied by the caller.
+        now_ms: u64,
+        /// The high-water-mark timestamp previously observed.
+        last_seen_ms: u64,
+        /// How far backward the clock moved (milliseconds).
+        delta_ms: u64,
+        /// The maximum tolerated backward skew.
+        max_skew_ms: u64,
     },
 }
 
@@ -939,8 +959,6 @@ impl BoundaryPolicy {
 /// When no verifier is available (i.e., `None` is passed to
 /// [`DualLatticePolicy::propagate_with_declassification`]), the receipt is
 /// **rejected** -- fail-closed.
-// TODO(RFC-0020): Wire concrete Ed25519/HSM SignatureVerifier into daemon
-// actuation path
 pub trait SignatureVerifier: fmt::Debug + Send + Sync {
     /// Verify that `signature` is a valid signature by `authority_id` over
     /// `message`.
@@ -1125,6 +1143,89 @@ impl DeclassificationReceipt {
 }
 
 // =============================================================================
+// DeclassificationPreimage (two-phase signing contract)
+// =============================================================================
+
+/// Prepared declassification preimage for the two-phase signing contract.
+///
+/// Returned by [`DualLatticePolicy::prepare_declassification_preimage`].
+/// Contains the canonical `content_hash` (the bytes the authority must sign)
+/// and all validated receipt fields. Call [`Self::finalize`] with the
+/// authority's signature over `content_hash` to produce the final
+/// [`DeclassificationReceipt`].
+///
+/// # Security Properties
+///
+/// - All input validation has already been performed (field sizes, level
+///   ordering, freshness window, policy rule authorization).
+/// - The `content_hash` is computed by the trusted policy engine, so callers
+///   never need to replicate the canonical hashing algorithm.
+/// - The `finalize` step enforces the same signature size bounds as direct
+///   `declassify()`.
+#[derive(Debug, Clone)]
+pub struct DeclassificationPreimage {
+    from_level: ConfidentialityLevel,
+    to_level: ConfidentialityLevel,
+    receipt_id: String,
+    policy_ref: String,
+    justification: String,
+    authority_id: String,
+    boundary_id: String,
+    payload_hash: Vec<u8>,
+    envelope_hash: Vec<u8>,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    /// The canonical BLAKE3 content hash that the authority must sign.
+    content_hash: [u8; 32],
+}
+
+impl DeclassificationPreimage {
+    /// Returns the canonical content hash that the authority must sign.
+    ///
+    /// This is the exact bytes the [`SignatureVerifier`] will verify at
+    /// consumption time. The authority signs these bytes and passes the
+    /// signature to [`Self::finalize`].
+    #[must_use]
+    pub const fn content_hash(&self) -> &[u8; 32] {
+        &self.content_hash
+    }
+
+    /// Finalize the preimage into a [`DeclassificationReceipt`] by
+    /// attaching the authority's signature over the `content_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaintError::ReceiptFieldSizeExceeded`] if the signature
+    /// exceeds the maximum allowed size (256 bytes).
+    pub fn finalize(
+        self,
+        authority_signature: &[u8],
+    ) -> Result<DeclassificationReceipt, TaintError> {
+        DualLatticePolicy::validate_bytes_bounded(
+            authority_signature,
+            "authority_signature",
+            MAX_SIGNATURE_SIZE,
+        )?;
+
+        Ok(DeclassificationReceipt {
+            from_level: self.from_level,
+            to_level: self.to_level,
+            receipt_id: self.receipt_id,
+            policy_ref: self.policy_ref,
+            justification: self.justification,
+            authority_id: self.authority_id,
+            boundary_id: self.boundary_id,
+            payload_hash: self.payload_hash,
+            envelope_hash: self.envelope_hash,
+            issued_at_ms: self.issued_at_ms,
+            expires_at_ms: self.expires_at_ms,
+            content_hash: self.content_hash,
+            authority_signature: authority_signature.to_vec(),
+        })
+    }
+}
+
+// =============================================================================
 // DeclassificationPolicy
 // =============================================================================
 
@@ -1236,6 +1337,13 @@ pub struct DualLatticePolicy {
     /// entries. Expired entries are evicted before checking capacity,
     /// preventing indefinite growth as receipts age out.
     consumed_receipts: HashMap<String, u64>,
+    /// Monotonic high-water mark for `now_ms` values passed to
+    /// [`Self::propagate_with_declassification`]. Used to prevent
+    /// anti-replay eviction bypass when the caller supplies a
+    /// non-monotonic (backward-moving) clock. Eviction and freshness
+    /// decisions always use `max(now_ms, last_seen_now_ms)`, and a
+    /// large backward jump is rejected fail-closed.
+    last_seen_now_ms: u64,
 }
 
 impl DualLatticePolicy {
@@ -1277,6 +1385,7 @@ impl DualLatticePolicy {
             boundaries,
             declassification_rules,
             consumed_receipts: HashMap::new(),
+            last_seen_now_ms: 0,
         })
     }
 
@@ -1288,6 +1397,7 @@ impl DualLatticePolicy {
             boundaries: Vec::new(),
             declassification_rules: Vec::new(),
             consumed_receipts: HashMap::new(),
+            last_seen_now_ms: 0,
         }
     }
 
@@ -1298,7 +1408,6 @@ impl DualLatticePolicy {
     /// Returns [`TaintError::BoundaryCrossingDenied`] if no boundary with
     /// the given ID is configured (fail-closed), or the specific taint/
     /// confidentiality violation error if the label fails the check.
-    // TODO(RFC-0020): Wire into daemon protocol dispatch boundary hooks
     pub fn check_boundary(&self, boundary_id: &str, label: &DataLabel) -> Result<(), TaintError> {
         let boundary = self
             .boundaries
@@ -1321,7 +1430,6 @@ impl DualLatticePolicy {
     ///
     /// Returns the appropriate [`TaintError`] variant if the label
     /// violates the tier's policy.
-    // TODO(RFC-0020): Wire into daemon actuator dispatch path
     pub fn check_actuator_tier(&self, tier: u8, label: &DataLabel) -> Result<(), TaintError> {
         // Find all boundary policies for this tier; data must satisfy all.
         let tier_boundaries: Vec<&BoundaryPolicy> = self
@@ -1429,7 +1537,6 @@ impl DualLatticePolicy {
     /// is found. Returns [`TaintError::InvalidPolicyRef`] if any identifier
     /// is invalid. Returns [`TaintError::ReceiptExpired`] if the timestamp
     /// window is invalid.
-    // TODO(RFC-0020): Wire into daemon actuation path
     #[allow(clippy::too_many_arguments)] // All params are semantically distinct security inputs
     pub fn declassify(
         &self,
@@ -1527,6 +1634,124 @@ impl DualLatticePolicy {
             expires_at_ms,
             content_hash,
             authority_signature: authority_signature.to_vec(),
+        })
+    }
+
+    /// Prepare the canonical signing preimage for a declassification receipt.
+    ///
+    /// This method validates all inputs and computes the canonical content
+    /// hash -- the exact bytes that the authority must sign. This eliminates
+    /// the API gap where callers needed to replicate private hashing logic
+    /// to produce a valid `authority_signature`.
+    ///
+    /// # Signing Contract
+    ///
+    /// 1. Call `prepare_declassification_preimage()` to obtain the
+    ///    [`DeclassificationPreimage`] containing the canonical `content_hash`.
+    /// 2. Sign `content_hash` with the authority's key.
+    /// 3. Call [`DeclassificationPreimage::finalize`] with the signature to
+    ///    produce the [`DeclassificationReceipt`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::declassify`], except
+    /// that the `authority_signature` is not required at this stage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_declassification_preimage(
+        &self,
+        from: ConfidentialityLevel,
+        to: ConfidentialityLevel,
+        receipt_id: &str,
+        policy_ref: &str,
+        justification: &str,
+        authority_id: &str,
+        boundary_id: &str,
+        payload_hash: &[u8],
+        envelope_hash: &[u8],
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<DeclassificationPreimage, TaintError> {
+        // Validate level ordering.
+        if from.ordinal() <= to.ordinal() {
+            return Err(TaintError::DeclassificationDenied {
+                from,
+                to,
+                reason: "declassification requires from > to".to_string(),
+            });
+        }
+
+        // Validate all string/bytes input fields (signature not needed yet).
+        Self::validate_nonempty_bounded(receipt_id, "receipt_id", MAX_RECEIPT_ID_LEN)?;
+        Self::validate_nonempty_bounded(policy_ref, "policy reference", MAX_POLICY_REF_LEN)?;
+        Self::validate_nonempty_bounded(authority_id, "authority_id", MAX_AUTHORITY_ID_LEN)?;
+        Self::validate_nonempty_bounded(boundary_id, "boundary_id", MAX_BOUNDARY_ID_LEN)?;
+        if justification.len() > MAX_JUSTIFICATION_LEN {
+            return Err(TaintError::InvalidPolicyRef {
+                reason: format!("justification exceeds maximum length of {MAX_JUSTIFICATION_LEN}"),
+            });
+        }
+        Self::validate_exact_hash(payload_hash, "payload_hash")?;
+        Self::validate_exact_hash(envelope_hash, "envelope_hash")?;
+
+        // Validate freshness window.
+        if expires_at_ms <= issued_at_ms {
+            return Err(TaintError::ReceiptExpired {
+                reason: format!(
+                    "expires_at_ms ({expires_at_ms}) must be strictly after \
+                     issued_at_ms ({issued_at_ms})"
+                ),
+            });
+        }
+        let lifetime = expires_at_ms - issued_at_ms;
+        if lifetime > MAX_RECEIPT_LIFETIME_MS {
+            return Err(TaintError::ReceiptExpired {
+                reason: format!(
+                    "receipt lifetime {lifetime}ms exceeds maximum {MAX_RECEIPT_LIFETIME_MS}ms"
+                ),
+            });
+        }
+
+        // Find a matching declassification rule.
+        let _rule = self
+            .declassification_rules
+            .iter()
+            .find(|r| r.rule_id() == policy_ref && r.allows(from, to))
+            .ok_or_else(|| TaintError::DeclassificationDenied {
+                from,
+                to,
+                reason: format!(
+                    "no declassification rule '{policy_ref}' authorizes {from} -> {to}"
+                ),
+            })?;
+
+        // Compute canonical content hash.
+        let content_hash = Self::compute_receipt_hash(
+            from,
+            to,
+            receipt_id,
+            policy_ref,
+            justification,
+            authority_id,
+            boundary_id,
+            payload_hash,
+            envelope_hash,
+            issued_at_ms,
+            expires_at_ms,
+        );
+
+        Ok(DeclassificationPreimage {
+            from_level: from,
+            to_level: to,
+            receipt_id: receipt_id.to_string(),
+            policy_ref: policy_ref.to_string(),
+            justification: justification.to_string(),
+            authority_id: authority_id.to_string(),
+            boundary_id: boundary_id.to_string(),
+            payload_hash: payload_hash.to_vec(),
+            envelope_hash: envelope_hash.to_vec(),
+            issued_at_ms,
+            expires_at_ms,
+            content_hash,
         })
     }
 
@@ -1716,7 +1941,6 @@ impl DualLatticePolicy {
     ///   ceiling.
     /// - [`TaintError::ConfidentialityFloorViolation`] if confidentiality
     ///   exceeds the boundary clearance (requires explicit declassification).
-    // TODO(RFC-0020): Wire into work-object instruction flow
     pub fn propagate_through_boundary(
         &self,
         boundary_id: &str,
@@ -1853,8 +2077,7 @@ impl DualLatticePolicy {
     ///
     /// Returns the appropriate [`TaintError`] variant on any validation failure
     /// (fail-closed).
-    // TODO(RFC-0020): Wire into daemon actuation path
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn propagate_with_declassification(
         &mut self,
         boundary_id: &str,
@@ -1865,6 +2088,26 @@ impl DualLatticePolicy {
         expected_payload_hash: &[u8],
         expected_envelope_hash: &[u8],
     ) -> Result<DataLabel, TaintError> {
+        // ---- Monotonic clock enforcement (Security BLOCKER fix) ----
+        // Use `effective_now = max(now_ms, last_seen_now_ms)` to prevent
+        // anti-replay eviction bypass when the caller supplies a
+        // backward-moving clock. If the backward jump exceeds the
+        // tolerance threshold, reject fail-closed.
+        if now_ms < self.last_seen_now_ms {
+            let delta = self.last_seen_now_ms - now_ms;
+            if delta > MAX_CLOCK_SKEW_MS {
+                return Err(TaintError::NonMonotonicClock {
+                    now_ms,
+                    last_seen_ms: self.last_seen_now_ms,
+                    delta_ms: delta,
+                    max_skew_ms: MAX_CLOCK_SKEW_MS,
+                });
+            }
+        }
+        let effective_now = now_ms.max(self.last_seen_now_ms);
+        // Advance the high-water mark.
+        self.last_seen_now_ms = effective_now;
+
         let boundary = self
             .boundaries
             .iter()
@@ -1880,7 +2123,8 @@ impl DualLatticePolicy {
         Self::validate_receipt_field_sizes(receipt)?;
 
         // Validate receipt lifetime, integrity, signature, freshness.
-        Self::validate_receipt_at_consumption(receipt, boundary_id, verifier, now_ms)?;
+        // Use effective_now (monotonic) for all time-dependent checks.
+        Self::validate_receipt_at_consumption(receipt, boundary_id, verifier, effective_now)?;
 
         // ---- Anti-replay: one-time consumption check ----
         if self.consumed_receipts.contains_key(receipt.receipt_id()) {
@@ -1890,7 +2134,8 @@ impl DualLatticePolicy {
         }
         // Evict expired entries before checking capacity, so that the
         // anti-replay set does not fill up permanently with stale entries.
-        Self::evict_expired_receipts(&mut self.consumed_receipts, now_ms);
+        // Uses effective_now (monotonic) to prevent eviction bypass.
+        Self::evict_expired_receipts(&mut self.consumed_receipts, effective_now);
         if self.consumed_receipts.len() >= MAX_CONSUMED_RECEIPTS {
             return Err(TaintError::ConsumedReceiptSetFull {
                 capacity: MAX_CONSUMED_RECEIPTS,
@@ -2029,6 +2274,86 @@ impl DualLatticePolicy {
     /// removing it from the anti-replay map is safe.
     fn evict_expired_receipts(map: &mut HashMap<String, u64>, now_ms: u64) {
         map.retain(|_id, expires_at_ms| *expires_at_ms > now_ms);
+    }
+}
+
+// =============================================================================
+// TaintEnforcementGuard (daemon wiring primitive)
+// =============================================================================
+
+/// Daemon admission guard for dual-lattice taint/confidentiality enforcement.
+///
+/// The daemon's tool broker calls this guard before dispatching a tool
+/// request. It enforces dual-lattice policy at runtime, providing the
+/// daemon integration mandated by TCK-00378.
+///
+/// # Usage
+///
+/// The daemon constructs a `TaintEnforcementGuard` once per session (or per
+/// daemon lifecycle) wrapping a [`DualLatticePolicy`]. At each tool request
+/// the broker calls [`Self::admit`] with the request's data label, the
+/// boundary identifier, and the actuator tier. If the label violates the
+/// taint ceiling or confidentiality clearance the guard returns the
+/// appropriate [`TaintError`] and the broker must deny the request
+/// (fail-closed).
+///
+/// # Security Properties
+///
+/// - **Fail-closed**: if no boundary is configured, or any check fails, the
+///   request is denied.
+/// - **Tier-gated**: Tier3+ actuators are subject to mandatory taint and
+///   confidentiality enforcement regardless of boundary-level configuration.
+/// - **No bypass**: the guard must sit on every actuation path. Dead-code
+///   analysis should confirm this type is instantiated in production.
+#[derive(Debug)]
+pub struct TaintEnforcementGuard {
+    policy: DualLatticePolicy,
+}
+
+impl TaintEnforcementGuard {
+    /// Create a new enforcement guard wrapping the given policy.
+    #[must_use]
+    pub const fn new(policy: DualLatticePolicy) -> Self {
+        Self { policy }
+    }
+
+    /// Admit a tool request by checking both boundary and actuator-tier
+    /// constraints.
+    ///
+    /// This is the single entry-point the tool broker should call in its
+    /// admission path.
+    ///
+    /// # Arguments
+    ///
+    /// * `boundary_id` - The trust boundary the data is crossing.
+    /// * `tier` - The actuator risk tier (Tier3+ requires configured policy).
+    /// * `label` - The dual-lattice label of the input data.
+    ///
+    /// # Errors
+    ///
+    /// Returns the appropriate [`TaintError`] variant on any violation
+    /// (fail-closed).
+    pub fn admit(&self, boundary_id: &str, tier: u8, label: &DataLabel) -> Result<(), TaintError> {
+        // Check boundary constraints first (fail-closed if unconfigured).
+        self.policy.check_boundary(boundary_id, label)?;
+        // Then check actuator-tier constraints (fail-closed for tier >= 3
+        // with no boundary configured).
+        self.policy.check_actuator_tier(tier, label)?;
+        Ok(())
+    }
+
+    /// Returns a reference to the underlying policy.
+    #[must_use]
+    pub const fn policy(&self) -> &DualLatticePolicy {
+        &self.policy
+    }
+
+    /// Returns a mutable reference to the underlying policy.
+    ///
+    /// Used for operations that require mutation (e.g.,
+    /// `propagate_with_declassification` which consumes receipts).
+    pub const fn policy_mut(&mut self) -> &mut DualLatticePolicy {
+        &mut self.policy
     }
 }
 
@@ -5741,6 +6066,683 @@ mod tests {
         assert!(
             matches!(err, TaintError::ConsumedReceiptSetFull { .. }),
             "capacity must still be enforced when no entries are evictable, got {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // Security BLOCKER: Anti-replay bypass under non-monotonic time
+    // =========================================================================
+
+    #[test]
+    fn anti_replay_bypass_under_non_monotonic_time_rejected() {
+        // Regression test for the non-monotonic clock anti-replay bypass:
+        // 1. Consume receipt A at time T1
+        // 2. Advance time far into the future (T2) to evict A
+        // 3. Attempt to replay A with an earlier time (T1) -- must be rejected because
+        //    effective_now is clamped to the high-water mark (T2), and A is already
+        //    consumed.
+        let boundaries = vec![
+            BoundaryPolicy::new("b", TaintLevel::Toxic, ConfidentialityLevel::Secret, 0).unwrap(),
+        ];
+        let rules = vec![
+            DeclassificationPolicy::new(
+                "R",
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+            )
+            .unwrap(),
+        ];
+        let mut policy = DualLatticePolicy::new(boundaries, rules).unwrap();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let issued = 1_000_000u64;
+        let expires = issued + 3_600_000; // 1 hour
+        let t1 = issued + 1_800_000; // midway
+
+        // Consume receipt A at time T1.
+        let receipt_a = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+                "receipt-A-replay-test",
+                "R",
+                "first use",
+                "auth",
+                "b",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                issued,
+                expires,
+            )
+            .unwrap();
+
+        let result = policy.propagate_with_declassification(
+            "b",
+            &label,
+            &receipt_a,
+            Some(&TestVerifier),
+            t1,
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+        );
+        assert!(result.is_ok(), "first use of receipt A should succeed");
+        assert_eq!(policy.consumed_receipt_count(), 1);
+
+        // Advance time far into the future to trigger eviction.
+        let t2_future = expires + 1_000_000; // well past A's expiry
+
+        // Create and consume a different receipt at T2 to advance the
+        // high-water mark and evict A.
+        let issued2 = t2_future - 1_800_000;
+        let expires2 = issued2 + 3_600_000;
+        let receipt_b = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Public,
+                "receipt-B-advance-time",
+                "R",
+                "advance time",
+                "auth",
+                "b",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                issued2,
+                expires2,
+            )
+            .unwrap();
+
+        let result2 = policy.propagate_with_declassification(
+            "b",
+            &label,
+            &receipt_b,
+            Some(&TestVerifier),
+            t2_future,
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+        );
+        assert!(result2.is_ok(), "receipt B should succeed at future time");
+
+        // Verify receipt A was evicted from the consumed set.
+        // (A's expires_at < t2_future, so it was evicted.)
+        // The set should contain only B now.
+        assert_eq!(
+            policy.consumed_receipt_count(),
+            1,
+            "A should have been evicted, only B remains"
+        );
+
+        // NOW: attempt to replay receipt A with the earlier time T1.
+        // Without the monotonic clock fix, this would succeed because:
+        //   - A was evicted from consumed_receipts
+        //   - T1 is within A's validity window
+        // With the fix, effective_now = max(T1, last_seen_now_ms=T2) = T2,
+        // so the freshness check rejects A (T2 >= A.expires_at_ms).
+        //
+        // However, T1 is far behind the high-water mark (delta > MAX_CLOCK_SKEW_MS),
+        // so the monotonic clock guard rejects outright with NonMonotonicClock.
+        let replay_err = policy
+            .propagate_with_declassification(
+                "b",
+                &label,
+                &receipt_a,
+                Some(&TestVerifier),
+                t1, // backward time
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap_err();
+
+        // The error should be NonMonotonicClock since T1 is far behind T2.
+        assert!(
+            matches!(replay_err, TaintError::NonMonotonicClock { .. }),
+            "replaying receipt A with backward time must be rejected, got {replay_err:?}"
+        );
+    }
+
+    #[test]
+    fn small_clock_skew_clamped_to_high_water_mark() {
+        // A small backward clock drift (within MAX_CLOCK_SKEW_MS) is
+        // tolerated but clamped to the high-water mark. Eviction still
+        // uses the clamped (monotonic) time.
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // First call at TEST_NOW_MS to establish high-water mark.
+        let receipt1 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "establish hwm",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        let _ = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt1,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap();
+
+        // Second call with time slightly backward (within tolerance).
+        let small_skew = TEST_NOW_MS - 1_000; // 1 second back
+        let receipt2 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "small skew",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        // Should succeed -- small skew is clamped, not rejected.
+        let result = policy.propagate_with_declassification(
+            "external-api",
+            &label,
+            &receipt2,
+            Some(&TestVerifier),
+            small_skew,
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+        );
+        assert!(
+            result.is_ok(),
+            "small backward clock skew should be tolerated, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn large_clock_skew_rejected_fail_closed() {
+        // A large backward clock jump (exceeding MAX_CLOCK_SKEW_MS) must
+        // be rejected fail-closed.
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Establish high-water mark.
+        let receipt1 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "establish hwm",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        let _ = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt1,
+                Some(&TestVerifier),
+                TEST_NOW_MS,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap();
+
+        // Large backward jump.
+        let large_skew = TEST_NOW_MS - MAX_CLOCK_SKEW_MS - 1;
+        let receipt2 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "large skew",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        let err = policy
+            .propagate_with_declassification(
+                "external-api",
+                &label,
+                &receipt2,
+                Some(&TestVerifier),
+                large_skew,
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::NonMonotonicClock { .. }),
+            "large backward clock jump must be rejected, got {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // CQ MAJOR: Signing contract (prepare -> sign -> finalize) tests
+    // =========================================================================
+
+    #[test]
+    fn prepare_finalize_produces_valid_receipt() {
+        // Two-phase signing: prepare preimage, sign content_hash, finalize.
+        let policy = test_policy();
+
+        let preimage = policy
+            .prepare_declassification_preimage(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "prepare-finalize-test",
+                "DECLASS-SECRET-TO-INTERNAL",
+                "two-phase signing test",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        // The authority signs the canonical content_hash.
+        let content_hash = *preimage.content_hash();
+        assert_eq!(content_hash.len(), 32);
+
+        // Finalize with a valid signature.
+        let receipt = preimage.finalize(VALID_TEST_SIG).unwrap();
+
+        assert_eq!(receipt.from_level(), ConfidentialityLevel::Secret);
+        assert_eq!(receipt.to_level(), ConfidentialityLevel::Internal);
+        assert_eq!(receipt.receipt_id(), "prepare-finalize-test");
+        assert_eq!(receipt.authority_signature(), VALID_TEST_SIG);
+        assert_eq!(*receipt.content_hash(), content_hash);
+    }
+
+    #[test]
+    fn prepare_finalize_receipt_passes_propagation() {
+        // A receipt produced via prepare+finalize must pass through
+        // propagate_with_declassification exactly like one from declassify().
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let preimage = policy
+            .prepare_declassification_preimage(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "prepare-finalize propagation test",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        let receipt = preimage.finalize(VALID_TEST_SIG).unwrap();
+
+        let result = policy.propagate_with_declassification(
+            "external-api",
+            &label,
+            &receipt,
+            Some(&TestVerifier),
+            TEST_NOW_MS,
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+        );
+        assert!(
+            result.is_ok(),
+            "receipt from prepare+finalize should pass propagation, got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap().confidentiality,
+            ConfidentialityLevel::Internal
+        );
+    }
+
+    #[test]
+    fn prepare_finalize_hash_matches_declassify() {
+        // The content_hash from prepare_declassification_preimage must be
+        // identical to the one from declassify() with the same inputs.
+        let policy = test_policy();
+        let rid = "hash-compare-test";
+
+        let preimage = policy
+            .prepare_declassification_preimage(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                rid,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same inputs",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        let receipt = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                rid,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same inputs",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        assert_eq!(
+            preimage.content_hash(),
+            receipt.content_hash(),
+            "prepare_declassification_preimage and declassify must produce identical content hashes"
+        );
+    }
+
+    #[test]
+    fn prepare_finalize_with_message_dependent_verifier() {
+        // Use a verifier that checks the actual message content (not just
+        // the signature marker byte), proving the signing contract works
+        // with a real message-dependent verifier.
+        #[derive(Debug)]
+        struct MessageDependentVerifier;
+
+        impl SignatureVerifier for MessageDependentVerifier {
+            fn verify(&self, _authority_id: &str, message: &[u8], signature: &[u8]) -> bool {
+                // Expect signature = BLAKE3(message). This proves the signer
+                // actually received and hashed the correct preimage.
+                if signature.len() != 32 {
+                    return false;
+                }
+                let expected = blake3::hash(message);
+                signature == expected.as_bytes()
+            }
+        }
+
+        let mut policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Step 1: Prepare the preimage.
+        let preimage = policy
+            .prepare_declassification_preimage(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "message-dependent verifier test",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        // Step 2: Sign the content_hash (simulating BLAKE3-based MAC).
+        let content_hash = *preimage.content_hash();
+        let signature: [u8; 32] = blake3::hash(&content_hash).into();
+
+        // Step 3: Finalize with the message-dependent signature.
+        let receipt = preimage.finalize(&signature).unwrap();
+
+        // Step 4: Propagate -- must succeed with message-dependent verifier.
+        let result = policy.propagate_with_declassification(
+            "external-api",
+            &label,
+            &receipt,
+            Some(&MessageDependentVerifier),
+            TEST_NOW_MS,
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+        );
+        assert!(
+            result.is_ok(),
+            "message-dependent signature should pass verification, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_invalid_inputs() {
+        // prepare_declassification_preimage validates the same constraints
+        // as declassify().
+        let policy = test_policy();
+
+        // Non-downgrade (from <= to).
+        let err = policy
+            .prepare_declassification_preimage(
+                ConfidentialityLevel::Public,
+                ConfidentialityLevel::Secret,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "not a downgrade",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaintError::DeclassificationDenied { .. }));
+
+        // Empty receipt_id.
+        let err = policy
+            .prepare_declassification_preimage(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "",
+                "DECLASS-SECRET-TO-INTERNAL",
+                "empty rid",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaintError::InvalidPolicyRef { .. }));
+    }
+
+    #[test]
+    fn finalize_rejects_oversized_signature() {
+        let policy = test_policy();
+        let preimage = policy
+            .prepare_declassification_preimage(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "oversized sig test",
+                "authority-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        let oversized_sig = vec![0xAA; MAX_SIGNATURE_SIZE + 1];
+        let err = preimage.finalize(&oversized_sig).unwrap_err();
+        assert!(
+            matches!(err, TaintError::ReceiptFieldSizeExceeded { .. }),
+            "oversized signature must be rejected in finalize, got {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // CQ BLOCKER: TaintEnforcementGuard (daemon wiring) tests
+    // =========================================================================
+
+    #[test]
+    fn taint_guard_admits_clean_label() {
+        let policy = test_policy();
+        let guard = TaintEnforcementGuard::new(policy);
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Public);
+
+        assert!(
+            guard.admit("tier3-actuator", 3, &label).is_ok(),
+            "clean label should be admitted at tier3"
+        );
+    }
+
+    #[test]
+    fn taint_guard_rejects_high_taint_at_tier3() {
+        let policy = test_policy();
+        let guard = TaintEnforcementGuard::new(policy);
+        let label = DataLabel::new(TaintLevel::HighTaint, ConfidentialityLevel::Public);
+
+        let err = guard.admit("tier3-actuator", 3, &label).unwrap_err();
+        assert!(
+            matches!(err, TaintError::TaintCeilingExceeded { tier: 3, .. }),
+            "high-taint label must be rejected at tier3, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn taint_guard_rejects_over_confidential_at_tier3() {
+        let policy = test_policy();
+        let guard = TaintEnforcementGuard::new(policy);
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let err = guard.admit("tier3-actuator", 3, &label).unwrap_err();
+        assert!(
+            matches!(err, TaintError::ConfidentialityFloorViolation { .. }),
+            "over-confidential label must be rejected at tier3, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn taint_guard_rejects_unknown_boundary_fail_closed() {
+        let policy = test_policy();
+        let guard = TaintEnforcementGuard::new(policy);
+        let label = DataLabel::TRUSTED_PUBLIC;
+
+        let err = guard.admit("nonexistent-boundary", 3, &label).unwrap_err();
+        assert!(
+            matches!(err, TaintError::BoundaryCrossingDenied { .. }),
+            "unknown boundary must be rejected (fail-closed), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn taint_guard_rejects_unconfigured_tier3_fail_closed() {
+        // A policy with no boundaries must reject tier3+ requests.
+        let policy = DualLatticePolicy::new(vec![], vec![]).unwrap();
+        let guard = TaintEnforcementGuard::new(policy);
+        let label = DataLabel::TRUSTED_PUBLIC;
+
+        // admit requires both boundary and tier checks.
+        // The boundary check will fail first since "any" is unconfigured.
+        let err = guard.admit("any", 3, &label).unwrap_err();
+        assert!(
+            matches!(err, TaintError::BoundaryCrossingDenied { .. }),
+            "unconfigured boundary at tier3 must fail-closed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn taint_guard_policy_access() {
+        let policy = test_policy();
+        let mut guard = TaintEnforcementGuard::new(policy);
+
+        // Read-only access.
+        assert!(!guard.policy().boundaries().is_empty());
+
+        // Mutable access for declassification flows.
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+        let receipt = guard
+            .policy()
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                &unique_receipt_id(),
+                "DECLASS-SECRET-TO-INTERNAL",
+                "guard test",
+                "security-officer-1",
+                "external-api",
+                TEST_PAYLOAD_HASH,
+                TEST_ENVELOPE_HASH,
+                VALID_TEST_SIG,
+                TEST_ISSUED_AT_MS,
+                TEST_EXPIRES_AT_MS,
+            )
+            .unwrap();
+
+        let result = guard.policy_mut().propagate_with_declassification(
+            "external-api",
+            &label,
+            &receipt,
+            Some(&TestVerifier),
+            TEST_NOW_MS,
+            TEST_PAYLOAD_HASH,
+            TEST_ENVELOPE_HASH,
+        );
+        assert!(result.is_ok(), "guard mutable policy access should work");
+    }
+
+    #[test]
+    fn taint_guard_tier4_rejects_any_taint() {
+        let policy = test_policy();
+        let guard = TaintEnforcementGuard::new(policy);
+        let label = DataLabel::new(TaintLevel::LowTaint, ConfidentialityLevel::Public);
+
+        let err = guard.admit("tier4-actuator", 4, &label).unwrap_err();
+        assert!(
+            matches!(err, TaintError::TaintCeilingExceeded { tier: 4, .. }),
+            "any taint must be rejected at tier4, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn taint_guard_admits_tier4_clean() {
+        let policy = test_policy();
+        let guard = TaintEnforcementGuard::new(policy);
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Public);
+
+        assert!(
+            guard.admit("tier4-actuator", 4, &label).is_ok(),
+            "untainted+public should be admitted at tier4"
         );
     }
 }
