@@ -1,13 +1,6 @@
 name: "PR-443 untrusted reviewer identity is rejected"
 pr_number: 443
 head_sha: "3333333333333333333333333333333333333333"
-statuses:
-  - context: "ai-review/security"
-    state: "success"
-    created_at: "2026-02-03T11:10:00Z"
-  - context: "ai-review/code-quality"
-    state: "success"
-    created_at: "2026-02-03T11:11:00Z"
 comments:
   - id: 44301
     user_login: "rogue-reviewer-bot"
@@ -55,6 +48,7 @@ comments:
       ```
 expected:
   overall_pass: false
+  overall_pending: true
   security_pass: false
   code_quality_pass: true
   security_reason_substrings:

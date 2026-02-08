@@ -19,7 +19,7 @@ cas_path = "/var/lib/apm2/cas"
 # On divergence: emits DefectRecorded + InterventionFreeze to halt admissions.
 [daemon.divergence_watchdog]
 enabled = false
-github_owner = "rumi-engineering"
+github_owner = "guardian-intelligence"
 github_repo = "apm2"
 trunk_branch = "main"
 github_api_url = "https://api.github.com"

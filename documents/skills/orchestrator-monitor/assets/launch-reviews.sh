@@ -11,7 +11,7 @@ PR_NUMBER="${1:?Usage: launch-reviews.sh <PR_NUMBER> [SCRATCHPAD_DIR]}"
 SCRATCHPAD="${2:-/tmp/claude-1000/-home-ubuntu-Projects-apm2/scratchpad}"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo /home/ubuntu/Projects/apm2)"
 
-export PR_URL="https://github.com/rumi-engineering/apm2/pull/${PR_NUMBER}"
+export PR_URL="https://github.com/guardian-intelligence/apm2/pull/${PR_NUMBER}"
 
 mkdir -p "$SCRATCHPAD"
 

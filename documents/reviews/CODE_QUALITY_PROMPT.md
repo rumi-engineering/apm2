@@ -290,8 +290,8 @@ decision_tree:
           note: |
             Post findings as a PR comment only.
             Do NOT call GitHub statuses/check-runs APIs directly.
-            The authoritative ai-review/code-quality status is produced by
-            the review-gate workflow from the machine-readable metadata
+            The authoritative `Review Gate Success` status is produced by
+            the review-gate evaluator from the machine-readable metadata
             block above.
           run: |
             gh pr comment $PR_URL --body-file quality_findings.md

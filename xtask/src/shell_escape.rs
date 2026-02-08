@@ -21,7 +21,7 @@
 //! let quoted = quote_path(path);
 //! assert!(quoted.contains("'"));
 //!
-//! let cmd = build_script_command(path, None);
+//! let cmd = build_script_command(path, None, None, None);
 //! assert!(cmd.contains("script"));
 //! ```
 
@@ -114,27 +114,32 @@ fn escape_for_single_quote(s: &str) -> String {
 /// use xtask::shell_escape::build_script_command;
 ///
 /// // Without log capture
-/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), None, Some("gpt-5.3-codex"));
+/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), None, Some("gpt-5.3-codex"), None);
 /// assert!(cmd.contains("script -qec"));
 /// assert!(cmd.contains("--model gpt-5.3-codex"));
 ///
 /// // With log capture
 /// let log_path = Path::new("/tmp/review.log");
-/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), Some(log_path), None);
+/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), Some(log_path), None, None);
 /// assert!(cmd.contains("script -q"));
 /// ```
 pub fn build_script_command(
     prompt_path: &Path,
     log_path: Option<&Path>,
     model: Option<&str>,
+    output_last_message_path: Option<&Path>,
 ) -> String {
     let quoted_prompt = quote_path(prompt_path);
     let model_flag = model.map_or_else(String::new, |m| {
         let escaped_m = escape_for_single_quote(m);
         format!("--model {escaped_m} ")
     });
+    let output_last_message_flag = output_last_message_path.map_or_else(String::new, |path| {
+        let quoted_output_path = quote_path(path);
+        format!("--output-last-message {quoted_output_path} ")
+    });
     let inner_cmd = format!(
-        "codex exec {model_flag}--dangerously-bypass-approvals-and-sandbox < {quoted_prompt}"
+        "codex exec {model_flag}{output_last_message_flag}--dangerously-bypass-approvals-and-sandbox < {quoted_prompt}"
     );
     let escaped_inner = escape_for_single_quote(&inner_cmd);
 
@@ -191,11 +196,12 @@ pub fn build_script_command_with_cleanup(
     prompt_path: &Path,
     log_path: &Path,
     model: Option<&str>,
+    output_last_message_path: Option<&Path>,
 ) -> String {
     // Temp file cleanup is now handled via state tracking, not shell commands.
     // This function is kept for backward compatibility but now delegates to
     // build_script_command with log capture.
-    build_script_command(prompt_path, Some(log_path), model)
+    build_script_command(prompt_path, Some(log_path), model, output_last_message_path)
 }
 
 #[cfg(test)]
@@ -293,7 +299,9 @@ mod tests {
 
     #[test]
     fn test_quote_path_with_semicolon() {
-        let path = Path::new("/tmp/file;rm -rf /.txt");
+        // Use a harmless relative-path delete target so test_safety_guard does not
+        // flag this as a destructive root wipe pattern.
+        let path = Path::new("/tmp/file;rm -rf ./apm2_tsg_sentinel.txt");
         let quoted = quote_path(path);
         // Semicolons are command separators - must be escaped
         assert!(
@@ -342,7 +350,7 @@ mod tests {
     #[test]
     fn test_build_script_command_without_log() {
         let prompt = Path::new("/tmp/prompt.txt");
-        let cmd = build_script_command(prompt, None, None);
+        let cmd = build_script_command(prompt, None, None, None);
 
         // Verify command structure (platform-dependent)
         assert!(
@@ -371,7 +379,7 @@ mod tests {
     fn test_build_script_command_with_log() {
         let prompt = Path::new("/tmp/prompt.txt");
         let log = Path::new("/tmp/review.log");
-        let cmd = build_script_command(prompt, Some(log), None);
+        let cmd = build_script_command(prompt, Some(log), None, None);
 
         // Verify command structure
         assert!(
@@ -396,7 +404,7 @@ mod tests {
     fn test_build_script_command_with_model() {
         let prompt = Path::new("/tmp/prompt.txt");
         let model = "gpt-5.3-codex";
-        let cmd = build_script_command(prompt, None, Some(model));
+        let cmd = build_script_command(prompt, None, Some(model), None);
 
         assert!(
             cmd.contains("--model gpt-5.3-codex"),
@@ -410,14 +418,14 @@ mod tests {
         let log = Path::new("/tmp/log with spaces.log");
 
         // Without log
-        let cmd_no_log = build_script_command(prompt, None, None);
+        let cmd_no_log = build_script_command(prompt, None, None, None);
         assert!(
             cmd_no_log.contains('\''),
             "Prompt path with spaces should be quoted: {cmd_no_log}"
         );
 
         // With log
-        let cmd_with_log = build_script_command(prompt, Some(log), None);
+        let cmd_with_log = build_script_command(prompt, Some(log), None, None);
         assert!(
             cmd_with_log.contains('\''),
             "Paths with spaces should be quoted: {cmd_with_log}"
@@ -427,7 +435,7 @@ mod tests {
     #[test]
     fn test_build_script_command_handles_special_chars() {
         let prompt = Path::new("/tmp/prompt's$file.txt");
-        let cmd = build_script_command(prompt, None, None);
+        let cmd = build_script_command(prompt, None, None, None);
 
         // The command should be properly escaped
         assert!(
@@ -444,7 +452,7 @@ mod tests {
     fn test_build_script_command_with_cleanup() {
         let prompt = Path::new("/tmp/prompt.txt");
         let log = Path::new("/tmp/review.log");
-        let cmd = build_script_command_with_cleanup(prompt, log, None);
+        let cmd = build_script_command_with_cleanup(prompt, log, None, None);
 
         // Verify command structure - same as build_script_command with log
         assert!(
@@ -466,7 +474,7 @@ mod tests {
     fn test_build_script_command_with_cleanup_quotes_paths() {
         let prompt = Path::new("/tmp/prompt with spaces.txt");
         let log = Path::new("/tmp/log.txt");
-        let cmd = build_script_command_with_cleanup(prompt, log, None);
+        let cmd = build_script_command_with_cleanup(prompt, log, None, None);
 
         // Path with spaces should be quoted
         assert!(
@@ -483,7 +491,8 @@ mod tests {
     fn test_quote_path_is_shell_safe() {
         // These paths should all be made safe for shell execution
         let dangerous_paths = [
-            "/tmp/; rm -rf /",
+            // Avoid root-wipe patterns; still exercises separator + command injection.
+            "/tmp/; rm -rf ./apm2_tsg_sentinel",
             "/tmp/$(whoami)",
             "/tmp/`id`",
             "/tmp/${PATH}",
@@ -491,8 +500,8 @@ mod tests {
             "/tmp/file | cat /etc/passwd",
             "/tmp/file > /etc/passwd",
             "/tmp/file < /etc/passwd",
-            "/tmp/file && rm -rf /",
-            "/tmp/file || rm -rf /",
+            "/tmp/file && rm -rf ./apm2_tsg_sentinel",
+            "/tmp/file || rm -rf ./apm2_tsg_sentinel",
         ];
 
         for path_str in dangerous_paths {
@@ -514,7 +523,7 @@ mod tests {
         //   - Linux: script -qec 'codex exec ...' /dev/null
         //   - macOS: script -q /dev/null sh -c 'codex exec ...'
         let prompt = Path::new("/tmp/simple.txt");
-        let cmd = build_script_command(prompt, None, None);
+        let cmd = build_script_command(prompt, None, None, None);
         if cfg!(target_os = "macos") {
             assert!(cmd.starts_with("script -q /dev/null sh -c '"));
         } else {
@@ -526,12 +535,28 @@ mod tests {
         //   - Linux: script -q '<log_path>' -c 'codex exec ...'
         //   - macOS: script -q '<log_path>' sh -c 'codex exec ...'
         let log = Path::new("/tmp/log.txt");
-        let cmd = build_script_command(prompt, Some(log), None);
+        let cmd = build_script_command(prompt, Some(log), None, None);
         assert!(cmd.starts_with("script -q"));
         if cfg!(target_os = "macos") {
             assert!(cmd.contains("sh -c 'codex exec"));
         } else {
             assert!(cmd.contains("-c 'codex exec"));
         }
+    }
+
+    #[test]
+    fn test_build_script_command_with_output_last_message() {
+        let prompt = Path::new("/tmp/prompt.txt");
+        let output = Path::new("/tmp/last_message.txt");
+        let cmd = build_script_command(prompt, None, None, Some(output));
+
+        assert!(
+            cmd.contains("--output-last-message"),
+            "Command should include --output-last-message: {cmd}"
+        );
+        assert!(
+            cmd.contains("last_message.txt"),
+            "Command should include output path: {cmd}"
+        );
     }
 }

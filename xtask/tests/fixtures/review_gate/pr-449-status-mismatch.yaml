@@ -1,13 +1,6 @@
-name: "PR-449 status mismatch against authoritative artifact fails"
+name: "PR-449 authoritative PASS is accepted without commit statuses"
 pr_number: 449
 head_sha: "7777777777777777777777777777777777777777"
-statuses:
-  - context: "ai-review/security"
-    state: "failure"
-    created_at: "2026-02-07T09:20:00Z"
-  - context: "ai-review/code-quality"
-    state: "success"
-    created_at: "2026-02-07T09:21:00Z"
 comments:
   - id: 44901
     user_login: "apm2-security-bot"
@@ -54,8 +47,7 @@ comments:
       }
       ```
 expected:
-  overall_pass: false
-  security_pass: false
+  overall_pass: true
+  overall_pending: false
+  security_pass: true
   code_quality_pass: true
-  security_reason_substrings:
-    - "Status mismatch"

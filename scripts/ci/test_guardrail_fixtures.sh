@@ -162,7 +162,6 @@ if expect_fail env APM2_CI_ALLOW_TIMEOUT_FALLBACK=1 \
     "${REPO_ROOT}/scripts/ci/run_bounded_tests.sh" \
     --timeout-seconds 1 \
     --kill-after-seconds 1 \
-    --allow-timeout-fallback \
     -- bash -lc "sleep 3"; then
     log_pass "hung command terminated by watchdog timeout"
 else
@@ -173,7 +172,6 @@ if env APM2_CI_ALLOW_TIMEOUT_FALLBACK=1 \
     "${REPO_ROOT}/scripts/ci/run_bounded_tests.sh" \
     --timeout-seconds 5 \
     --kill-after-seconds 1 \
-    --allow-timeout-fallback \
     -- bash -lc "echo ok" >/dev/null 2>&1; then
     log_pass "bounded runner allows command completion within limits"
 else

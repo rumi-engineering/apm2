@@ -466,8 +466,7 @@ fn create_pending_statuses(
         StatusWriteDecision::Removed => {
             println!("{PUSH_STATUS_PROJECTION_NOTICE}");
             println!("    Target commit: {owner_repo}@{head_sha}");
-            println!("      - ai-review/security  = pending (Waiting for security review)");
-            println!("      - ai-review/code-quality = pending (Waiting for code quality review)");
+            println!("      - Review Gate Success = pending (Waiting for AI reviews)");
             crate::util::print_status_writes_removed_notice();
         },
         // Legacy variants are inert after TCK-00297; keep projection-only output.
@@ -577,7 +576,7 @@ mod tests {
 
         // Test with a simple path (no log)
         let prompt_path = Path::new("/tmp/test_prompt.txt");
-        let shell_cmd = build_script_command(prompt_path, None, None);
+        let shell_cmd = build_script_command(prompt_path, None, None, None);
 
         // Verify command includes PTY allocation
         if cfg!(target_os = "macos") {
@@ -606,7 +605,7 @@ mod tests {
 
         // Test with a path containing spaces - must be properly quoted
         let special_path = Path::new("/tmp/test file.txt");
-        let special_cmd = build_script_command(special_path, None, None);
+        let special_cmd = build_script_command(special_path, None, None, None);
 
         // Verify the command is well-formed
         if cfg!(target_os = "macos") {

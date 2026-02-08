@@ -31,7 +31,7 @@ jobs:
   check-comment:
     name: Check Comment
     if: github.event_name == 'issue_comment'
-    runs-on: ubuntu-24.04
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
     outputs:
       triggered: ${{ steps.check.outputs.triggered }}
       pr_number: ${{ github.event.issue.number }}
@@ -51,7 +51,7 @@ jobs:
 
   benchmark:
     name: Run Benchmarks
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     # Run if: manual trigger, release tag, or /benchmark comment
     if: |
       always() && (
@@ -80,28 +80,59 @@ jobs:
             });
             core.setOutput('ref', pr.data.head.ref);
             core.setOutput('sha', pr.data.head.sha);
+            const headRepo = pr.data.head.repo.full_name;
+            const baseRepo = `${context.repo.owner}/${context.repo.repo}`;
+            core.setOutput('head_repo', headRepo);
+            core.setOutput('same_repo', headRepo === baseRepo ? 'true' : 'false');
+
+      - name: Skip fork PR benchmark on self-hosted runners
+        if: github.event_name == 'issue_comment' && steps.pr-ref.outputs.same_repo != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const body = [
+              "## Benchmark Skipped",
+              "",
+              "Skipping `/benchmark` on self-hosted runner for fork PR head.",
+              "Reason: benchmark comment triggers may only execute self-hosted jobs when `head.repo.full_name == base repo`.",
+              "",
+              `Head repo: \`${{ steps.pr-ref.outputs.head_repo }}\``,
+              `Base repo: \`${context.repo.owner}/${context.repo.repo}\``
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ github.event.issue.number }},
+              body
+            });
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         with:
           ref: ${{ steps.pr-ref.outputs.ref || github.ref }}
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         with:
           toolchain: stable
 
       - name: Install protoc
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         with:
           cache-on-failure: true
 
       - name: Install critcmp
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         run: cargo install critcmp --locked
 
       - name: Restore baseline from cache
         id: cache-baseline
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
         with:
           path: target/criterion-baseline
@@ -110,11 +141,13 @@ jobs:
             bench-baseline-
 
       - name: Run current benchmarks
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         run: |
           cargo bench --package apm2-core -- --save-baseline current
 
       - name: Compare with baseline
         id: compare
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         run: |
           if [ -d "target/criterion-baseline" ]; then
             echo "Comparing with baseline..."
@@ -132,7 +165,7 @@ jobs:
           fi
 
       - name: Post PR comment with results
-        if: github.event_name == 'issue_comment'
+        if: github.event_name == 'issue_comment' && steps.pr-ref.outputs.same_repo == 'true'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
         with:
           script: |
@@ -159,6 +192,7 @@ jobs:
             });
 
       - name: Upload Criterion HTML report
+        if: github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: criterion-report-${{ github.sha }}
@@ -166,13 +200,13 @@ jobs:
           retention-days: 30
 
       - name: Save baseline for main
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true')
         run: |
           mkdir -p target/criterion-baseline
           cp -r target/criterion/* target/criterion-baseline/ 2>/dev/null || true
 
       - name: Update baseline cache
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name != 'issue_comment' || steps.pr-ref.outputs.same_repo == 'true')
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
         with:
           path: target/criterion-baseline
@@ -181,7 +215,7 @@ jobs:
   # Store historical data on releases
   store-history:
     name: Store Historical Data
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     needs: [benchmark]
     if: startsWith(github.ref, 'refs/tags/v')
     continue-on-error: true

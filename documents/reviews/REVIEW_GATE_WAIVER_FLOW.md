@@ -12,11 +12,22 @@ This document defines the only acceptable override path when `review-gate` block
 1. A waiver file in `documents/work/waivers/` named `WVR-XXXX.yaml`.
 2. Waiver links to:
    - Blocking PR number
-   - Exact head SHA
+   - Waived commit SHA (40-hex)
    - Blocking category (`security` and/or `code-quality`)
    - Justification and remediation ticket
    - Expiration timestamp
 3. PR body (or maintainer comment) references `WVR-XXXX`.
+
+## Waived Commit SHA Semantics
+`waiver.references.commit_sha` MUST be bound to the exact code state being risk-accepted.
+
+Two acceptable patterns exist:
+1. **Preferred (base-branch waiver)**: The waiver file exists on the PR base branch (e.g., `main`).
+   - `commit_sha` MUST equal the PR head SHA being waived.
+2. **PR-branch waiver (allowed, waiver-only head commit)**: The waiver file is added on the PR branch.
+   - The waiver MUST be introduced in a final, waiver-only commit that changes only waiver artifacts under `documents/work/waivers/`.
+   - `commit_sha` MUST equal the immediate parent of the waiver commit (the pre-waiver PR head).
+   - If any non-waiver changes are pushed after the waiver commit, the waiver is invalid and must be reissued.
 
 ## Approval Requirements
 1. Security-domain maintainer approval for security gate waivers.
