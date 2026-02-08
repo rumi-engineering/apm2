@@ -2216,6 +2216,10 @@ fn build_plan(profile: CiProfileArg, repo_root: &Path) -> Plan {
                 "scripts/lint/no_direct_status_write_commands.sh",
             ),
             (
+                "lifecycle_instruction_lint",
+                "scripts/lint/check_lifecycle_instruction_surface.sh",
+            ),
+            (
                 "safety_proof_coverage",
                 "scripts/ci/safety_proof_coverage.sh",
             ),

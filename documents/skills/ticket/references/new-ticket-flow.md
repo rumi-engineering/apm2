@@ -62,9 +62,11 @@ decision_tree:
         - id: VERIFY_AND_COMMIT
           action: command
           run: "cargo xtask commit \"Initial implementation of <TICKET_ID>\""
+          note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Use `apm2 fac check`/`apm2 fac work status` for ledger-authoritative lifecycle operations."
         - id: PUSH_CREATE_PR
           action: command
           run: "cargo xtask push"
+          note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Use `apm2 fac check`/`apm2 fac work status` for ledger-authoritative lifecycle operations."
         - id: FINISH
           action: "Task complete. The ticket-queue will monitor for review feedback."
       decisions: []

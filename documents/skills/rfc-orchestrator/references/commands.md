@@ -72,10 +72,12 @@ check-ai-review-status:
 
 trigger-security-review:
   command: cargo xtask review security <PR_URL>
+  note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
   purpose: Run security review (SYNCHRONOUS - no &)
 
 trigger-quality-review:
   command: cargo xtask review quality <PR_URL>
+  note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
   purpose: Run quality review (SYNCHRONOUS - no &)
 ```
 

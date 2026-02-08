@@ -21,12 +21,15 @@ commands[13]:
     purpose: "Fix linting issues and enforce quality standards before committing."
   - name: commit
     command: "cargo xtask commit \"<message>\""
+    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` and `apm2 fac work status` for ledger-authoritative lifecycle state."
     purpose: "Verify, sync with main, and commit."
   - name: push
     command: "cargo xtask push"
+    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` and `apm2 fac work status` for ledger-authoritative lifecycle state."
     purpose: "Push, create/update PR, run AI reviews, enable auto-merge."
   - name: push-force-review
     command: "cargo xtask push --force-review"
+    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` and `apm2 fac work status` for ledger-authoritative lifecycle state."
     purpose: "Force re-run reviews after addressing feedback."
   - name: fetch-latest-feedback
     command: "gh pr view <PR_URL> --json reviews,reviewThreads --jq '{latest_review: (.reviews[-1].body // \"N/A\"), unresolved_threads: [.reviewThreads[]? | select(.isResolved == false) | {path: .path, body: .comments[-1].body}]}'"
@@ -36,7 +39,9 @@ commands[13]:
     purpose: "Cleanup worktree and branch after PR merges."
   - name: security-review-approve
     command: "cargo xtask security-review-exec approve [TCK-XXXXX]"
+    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` for authoritative review gate evidence."
     purpose: "Approve PR after security review."
   - name: security-review-deny
     command: "cargo xtask security-review-exec deny [TCK-XXXXX] --reason <reason>"
+    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` for authoritative review gate evidence."
     purpose: "Deny PR with a reason after security review."
