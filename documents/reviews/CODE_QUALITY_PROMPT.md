@@ -304,7 +304,13 @@ decision_tree:
             REPO=$(echo "$PR_JSON" | jq -r '.repository.name')
             BOT_LOGIN=$(gh api user --jq '.login')
             MARKER="<!-- apm2-review-metadata:v1:code-quality -->"
-            HEAD_SHA="$reviewed_sha"
+            # Extract the reviewed HEAD SHA from the findings file itself to
+            # avoid relying on RoleSpec variable substitution in the shell.
+            HEAD_SHA=$(grep -Eoi '[0-9a-f]{40}' quality_findings.md | head -n 1)
+            if [[ -z "$HEAD_SHA" ]]; then
+              echo "::error::Could not extract reviewed head SHA from quality_findings.md"
+              exit 1
+            fi
 
             COMMENT_ID=$(gh api "/repos/${OWNER}/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" --paginate --jq \
               "[.[] | select(.user.login == \"$BOT_LOGIN\") | select((.body // \"\") | contains(\"$MARKER\")) | select((.body // \"\") | contains(\"$HEAD_SHA\"))] | sort_by(.updated_at) | last | .id // empty")
