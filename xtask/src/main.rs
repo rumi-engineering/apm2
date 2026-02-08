@@ -330,6 +330,11 @@ enum ReviewCommands {
     All {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
+        /// Expected PR head SHA (40-hex). If provided and the PR head has
+        /// moved, the review is skipped to avoid posting stale
+        /// artifacts.
+        #[arg(long)]
+        expected_head_sha: Option<String>,
         /// Emit internal receipts/events to daemon (TCK-00295).
         ///
         /// When enabled, xtask will attempt to emit internal receipts to the
@@ -357,6 +362,11 @@ enum ReviewCommands {
     Security {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
+        /// Expected PR head SHA (40-hex). If provided and the PR head has
+        /// moved, the review is skipped to avoid posting stale
+        /// artifacts.
+        #[arg(long)]
+        expected_head_sha: Option<String>,
         /// Emit internal receipts/events to daemon (TCK-00295).
         ///
         /// When enabled, xtask will attempt to emit internal receipts to the
@@ -388,6 +398,11 @@ enum ReviewCommands {
     Quality {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
+        /// Expected PR head SHA (40-hex). If provided and the PR head has
+        /// moved, the review is skipped to avoid posting stale
+        /// artifacts.
+        #[arg(long)]
+        expected_head_sha: Option<String>,
         /// Emit internal receipts/events to daemon (TCK-00295).
         ///
         /// When enabled, xtask will attempt to emit internal receipts to the
@@ -467,33 +482,39 @@ fn main() -> Result<()> {
         Commands::Review { review_type } => match review_type {
             ReviewCommands::All {
                 pr_url,
+                expected_head_sha,
                 emit_internal,
                 emit_receipt_only,
                 allow_github_write,
             } => tasks::review_all(
                 &pr_url,
+                expected_head_sha.as_deref(),
                 emit_internal,
                 emit_receipt_only,
                 allow_github_write,
             ),
             ReviewCommands::Security {
                 pr_url,
+                expected_head_sha,
                 emit_internal,
                 emit_receipt_only,
                 allow_github_write,
             } => tasks::review_security(
                 &pr_url,
+                expected_head_sha.as_deref(),
                 emit_internal,
                 emit_receipt_only,
                 allow_github_write,
             ),
             ReviewCommands::Quality {
                 pr_url,
+                expected_head_sha,
                 emit_internal,
                 emit_receipt_only,
                 allow_github_write,
             } => tasks::review_quality(
                 &pr_url,
+                expected_head_sha.as_deref(),
                 emit_internal,
                 emit_receipt_only,
                 allow_github_write,

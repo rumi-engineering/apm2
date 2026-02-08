@@ -122,10 +122,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api --method POST "/repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.head_sha }}" \
+          set -euo pipefail
+
+          sha="${{ steps.pr.outputs.head_sha }}"
+
+          gh api --method POST "/repos/${{ github.repository }}/statuses/${sha}" \
             -f state="pending" \
             -f context="Review Gate Success" \
             -f description="Waiting for AI reviews"
+
+          gh api --method POST "/repos/${{ github.repository }}/statuses/${sha}" \
+            -f state="pending" \
+            -f context="ai-review/security" \
+            -f description="Security review pending"
 
       - name: Run security review
         if: steps.pr.outputs.skip != 'true'
@@ -136,7 +145,8 @@ jobs:
             echo "::error::Missing required secret AUTO_APPROVE_PAT (authoritative reviewer identity token)."
             exit 1
           fi
-          cargo xtask review security "${{ steps.pr.outputs.pr_url }}"
+          cargo xtask review security "${{ steps.pr.outputs.pr_url }}" \
+            --expected-head-sha "${{ steps.pr.outputs.head_sha }}"
 
       - name: Evaluate and post review gate status
         if: steps.pr.outputs.skip != 'true'
@@ -165,6 +175,29 @@ jobs:
           code=${PIPESTATUS[0]}
           set -e
 
+          sec_verdict=$(jq -r '.security.authoritative_verdict // empty' /tmp/review-gate-evaluation.json || true)
+          if [[ -z "${sec_verdict}" ]]; then
+            echo "::error::Security review did not produce an authoritative artifact for head ${EXPECTED_HEAD_SHA}."
+            echo "::error::Review-gate evaluation summary:"
+            cat /tmp/review-gate-evaluation.json || true
+            code=1
+          fi
+
+          sec_state="pending"
+          sec_desc="Security review pending"
+          if [[ "${sec_verdict}" == "PASS" ]]; then
+            sec_state="success"
+            sec_desc="Security review passed"
+          elif [[ "${sec_verdict}" == "FAIL" ]]; then
+            sec_state="failure"
+            sec_desc="Security review failed"
+          fi
+
+          gh api --method POST "/repos/${{ github.repository }}/statuses/${EXPECTED_HEAD_SHA}" \
+            -f state="${sec_state}" \
+            -f context="ai-review/security" \
+            -f description="${sec_desc}"
+
           if [ "$code" -eq 0 ]; then
             state="success"
             description="Review gate passed"
@@ -174,16 +207,9 @@ jobs:
             description="Waiting for AI reviews"
             exit_code=0
           else
-            if jq -e '.security.authoritative_verdict == "FAIL" or .code_quality.authoritative_verdict == "FAIL"' \
-              /tmp/review-gate-evaluation.json >/dev/null 2>&1; then
-              state="failure"
-              description="Review gate failed"
-              exit_code=1
-            else
-              state="pending"
-              description="Waiting for AI reviews"
-              exit_code=0
-            fi
+            state="failure"
+            description="Review gate failed"
+            exit_code=1
           fi
 
           gh api --method POST "/repos/${{ github.repository }}/statuses/${EXPECTED_HEAD_SHA}" \

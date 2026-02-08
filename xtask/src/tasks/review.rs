@@ -94,6 +94,7 @@ impl ReviewType {
 /// - The review prompt is missing
 pub fn run_security(
     pr_url: &str,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
@@ -101,6 +102,7 @@ pub fn run_security(
     run_review(
         pr_url,
         ReviewType::Security,
+        expected_head_sha,
         emit_internal,
         emit_receipt_only,
         allow_github_write,
@@ -131,6 +133,7 @@ pub fn run_security(
 /// - The review prompt is missing
 pub fn run_quality(
     pr_url: &str,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
@@ -138,6 +141,7 @@ pub fn run_quality(
     run_review(
         pr_url,
         ReviewType::Quality,
+        expected_head_sha,
         emit_internal,
         emit_receipt_only,
         allow_github_write,
@@ -179,6 +183,7 @@ fn run_one_ai_review(
 ///   concurrent process-wide environment mutation.
 pub fn run_all(
     pr_url: &str,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
@@ -198,6 +203,15 @@ pub fn run_all(
     println!("  PR Number: {pr_number}");
 
     let head_sha = get_pr_head_sha(&sh, &owner_repo, pr_number)?;
+    if let Some(expected) = expected_head_sha {
+        validate_expected_head_sha(expected)?;
+        if !expected.eq_ignore_ascii_case(&head_sha) {
+            eprintln!(
+                "PR head moved; skipping review-all to avoid stale artifacts: expected {expected}, current {head_sha}"
+            );
+            return Ok(());
+        }
+    }
     println!("  HEAD SHA: {head_sha}");
 
     let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
@@ -351,6 +365,7 @@ pub fn run_uat(
     run_review(
         pr_url,
         ReviewType::Uat,
+        None,
         emit_internal,
         emit_receipt_only,
         allow_github_write,
@@ -361,6 +376,7 @@ pub fn run_uat(
 fn run_review(
     pr_url: &str,
     review_type: ReviewType,
+    expected_head_sha: Option<&str>,
     emit_internal: bool,
     emit_receipt_only: bool,
     allow_github_write: bool,
@@ -386,6 +402,16 @@ fn run_review(
 
     // Get the HEAD SHA of the PR
     let head_sha = get_pr_head_sha(&sh, &owner_repo, pr_number)?;
+    if let Some(expected) = expected_head_sha {
+        validate_expected_head_sha(expected)?;
+        if !expected.eq_ignore_ascii_case(&head_sha) {
+            eprintln!(
+                "PR head moved; skipping {} review to avoid stale artifacts: expected {expected}, current {head_sha}",
+                review_type.display_name()
+            );
+            return Ok(());
+        }
+    }
     println!("  HEAD SHA: {head_sha}");
 
     // Get repository root for prompt files
@@ -695,6 +721,14 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
     }
 
     Ok(sha)
+}
+
+fn validate_expected_head_sha(expected_head_sha: &str) -> Result<()> {
+    let expected = expected_head_sha.trim();
+    if expected.len() != 40 || !expected.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!("Invalid --expected-head-sha: expected a 40-hex SHA, got: {expected_head_sha}");
+    }
+    Ok(())
 }
 
 /// Log review status intent (direct status writes are removed).
