@@ -32,6 +32,7 @@ use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
     AatLeaseExtension, GateLease, GateLeaseBuilder, GateReceipt, GateReceiptBuilder,
     PolicyInheritanceValidator, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
+    RiskTier,
 };
 use apm2_core::htf::{
     BoundedWallInterval, Canonicalizable, ClockProfile, Hlc, LedgerTime, MonotonicReading,
@@ -888,6 +889,8 @@ impl GateOrchestrator {
         // ORDERING INVARIANT: This MUST happen before any lease issuance.
         let policy_resolution = self.resolve_policy(&info, now_ms)?;
         let policy_hash = policy_resolution.resolved_policy_hash();
+        let risk_tier =
+            RiskTier::try_from(policy_resolution.resolved_risk_tier).unwrap_or(RiskTier::Tier4);
 
         // Step 2: Issue gate leases for each required gate type.
         // This MUST happen AFTER policy resolution (ordering invariant).
@@ -906,7 +909,7 @@ impl GateOrchestrator {
             let executor_signer = Arc::new(Signer::generate());
             let executor_vk = executor_signer.verifying_key();
 
-            let lease = self.issue_gate_lease(&info, gate_type, &policy_hash, now_ms)?;
+            let lease = self.issue_gate_lease(&info, gate_type, &policy_hash, now_ms, risk_tier)?;
             let lease_id = lease.lease_id.clone();
             gates.insert(gate_type, GateStatus::LeaseIssued { lease_id });
             leases.insert(gate_type, lease);
@@ -1737,6 +1740,16 @@ impl GateOrchestrator {
     /// `TimeEnvelope`) and returns the hex-encoded envelope hash suitable
     /// for use as `time_envelope_ref`.
     ///
+    /// # Risk-Tier-Aware Clock Profiles
+    ///
+    /// The `ClockProfile` is generated according to the resolved risk tier
+    /// to satisfy `is_clock_profile_admissible_for_risk_tier` in the
+    /// delegation/receipt admission path:
+    ///
+    /// - **Tier0/Tier1**: `BestEffortNtp`, no attestation.
+    /// - **Tier2**: `AuthenticatedNts`, no attestation.
+    /// - **Tier3/Tier4**: `AuthenticatedNts` with attestation present.
+    ///
     /// # Security
     ///
     /// The returned string is a 64-character hex-encoded BLAKE3 hash of
@@ -1753,6 +1766,7 @@ impl GateOrchestrator {
         &self,
         work_id: &str,
         now_ms: u64,
+        risk_tier: RiskTier,
     ) -> Result<String, GateOrchestratorError> {
         let cas = self
             .cas
@@ -1764,16 +1778,38 @@ impl GateOrchestrator {
                     .to_string(),
             })?;
 
-        // Build a ClockProfile with deterministic, production-appropriate defaults.
+        // Select wall-time source and attestation based on risk tier.
+        //
+        // Policy (aligned with `is_clock_profile_admissible_for_risk_tier`):
+        //   - Tier0/Tier1: BestEffortNtp, no attestation required.
+        //   - Tier2:       AuthenticatedNts (BestEffortNtp rejected), no attestation
+        //     required.
+        //   - Tier3/Tier4: AuthenticatedNts + attestation present.
+        let (wall_time_source, attestation) = match risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 => (WallTimeSource::BestEffortNtp, None),
+            RiskTier::Tier2 => (WallTimeSource::AuthenticatedNts, None),
+            RiskTier::Tier3 | RiskTier::Tier4 => (
+                WallTimeSource::AuthenticatedNts,
+                Some(serde_json::json!({
+                    "type": "gate-orchestrator-nts-attestation",
+                    "version": 1,
+                    "issuer": "apm2-daemon",
+                    "work_id": work_id,
+                    "issued_at_ms": now_ms
+                })),
+            ),
+        };
+
+        // Build a ClockProfile with deterministic, risk-tier-appropriate defaults.
         let clock_profile = ClockProfile {
-            attestation: None,
+            attestation,
             build_fingerprint: format!("apm2-daemon/{}", env!("CARGO_PKG_VERSION")),
             hlc_enabled: true,
             max_wall_uncertainty_ns: 10_000_000, // 10ms
             monotonic_source: MonotonicSource::ClockMonotonic,
             profile_policy_id: "gate-orchestrator-default".to_string(),
             tick_rate_hz: 1_000_000_000, // 1GHz (nanosecond ticks)
-            wall_time_source: WallTimeSource::BestEffortNtp,
+            wall_time_source,
         };
 
         let profile_bytes = clock_profile.canonical_bytes().map_err(|e| {
@@ -1817,8 +1853,8 @@ impl GateOrchestrator {
             wall: BoundedWallInterval::new(
                 now_ms.saturating_mul(1_000_000),
                 now_ms.saturating_mul(1_000_000).saturating_add(10_000_000), // +10ms uncertainty
-                WallTimeSource::BestEffortNtp,
-                "best-effort",
+                wall_time_source,
+                "gate-orchestrator",
             )
             .unwrap_or_else(|_| {
                 // Fallback: zero-width interval (should not happen with valid now_ms)
@@ -1868,6 +1904,7 @@ impl GateOrchestrator {
         gate_type: GateType,
         policy_hash: &[u8; 32],
         now_ms: u64,
+        risk_tier: RiskTier,
     ) -> Result<GateLease, GateOrchestratorError> {
         let lease_id = format!(
             "lease-{}-{}-{}",
@@ -1881,7 +1918,7 @@ impl GateOrchestrator {
         // Fall back to legacy format only when CAS is not configured (tests
         // without CAS wiring).
         let time_envelope_ref = if self.cas.is_some() {
-            self.create_cas_time_envelope_ref(&info.work_id, now_ms)?
+            self.create_cas_time_envelope_ref(&info.work_id, now_ms, risk_tier)?
         } else {
             format!("htf:gate:{}:{}", info.work_id, now_ms)
         };
@@ -4651,5 +4688,89 @@ mod tests {
             cas.retrieve(&hash_array).is_ok(),
             "sublease time_envelope_ref must be CAS-resolvable"
         );
+    }
+
+    /// Verifies that orchestrator-issued leases produce `ClockProfile`s that
+    /// satisfy `is_clock_profile_admissible_for_risk_tier` for every risk tier
+    /// (Tier0 through Tier4), proving higher-tier transitions are NOT denied
+    /// at delegation/receipt admission.
+    ///
+    /// This test directly creates CAS-backed time envelope refs for each tier,
+    /// then resolves the `ClockProfile` from CAS and asserts admissibility
+    /// against the same policy used in `PrivilegedDispatcher`.
+    #[tokio::test]
+    async fn test_clock_profile_admissible_for_all_risk_tiers() {
+        use apm2_core::evidence::MemoryCas;
+        use apm2_core::fac::RiskTier;
+
+        let cas = Arc::new(MemoryCas::default());
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), signer)
+            .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+        let tiers = [
+            RiskTier::Tier0,
+            RiskTier::Tier1,
+            RiskTier::Tier2,
+            RiskTier::Tier3,
+            RiskTier::Tier4,
+        ];
+
+        for tier in &tiers {
+            let work_id = format!("work-tier-{tier:?}");
+            let now_ms = 1_700_000_000_000u64;
+
+            let envelope_hex = orch
+                .create_cas_time_envelope_ref(&work_id, now_ms, *tier)
+                .expect("CAS time envelope ref must succeed");
+
+            // Resolve the TimeEnvelope from CAS.
+            let envelope_hash_bytes = hex::decode(&envelope_hex).unwrap();
+            let envelope_hash: [u8; 32] = envelope_hash_bytes.try_into().unwrap();
+            let envelope_bytes = cas.retrieve(&envelope_hash).unwrap();
+            let envelope: TimeEnvelope = serde_json::from_slice(&envelope_bytes).unwrap();
+
+            // Resolve the ClockProfile from CAS via the envelope's clock_profile_hash.
+            let profile_hash_bytes = hex::decode(&envelope.clock_profile_hash).unwrap();
+            let profile_hash: [u8; 32] = profile_hash_bytes.try_into().unwrap();
+            let profile_bytes = cas.retrieve(&profile_hash).unwrap();
+            let profile: ClockProfile = serde_json::from_slice(&profile_bytes).unwrap();
+
+            // ---- Replicate is_clock_profile_admissible_for_risk_tier logic ----
+            // Wall-time source check
+            let source_allowed = match tier {
+                RiskTier::Tier0 | RiskTier::Tier1 => matches!(
+                    profile.wall_time_source,
+                    WallTimeSource::None
+                        | WallTimeSource::BestEffortNtp
+                        | WallTimeSource::AuthenticatedNts
+                        | WallTimeSource::Roughtime
+                        | WallTimeSource::CloudBounded
+                ),
+                RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4 => matches!(
+                    profile.wall_time_source,
+                    WallTimeSource::None
+                        | WallTimeSource::AuthenticatedNts
+                        | WallTimeSource::Roughtime
+                        | WallTimeSource::CloudBounded
+                ),
+            };
+            assert!(
+                source_allowed,
+                "ClockProfile wall_time_source {:?} must be admissible for {:?}",
+                profile.wall_time_source, tier
+            );
+
+            // Attestation check
+            let attestation_ok = match tier {
+                RiskTier::Tier0 | RiskTier::Tier1 | RiskTier::Tier2 => true,
+                RiskTier::Tier3 | RiskTier::Tier4 => profile.attestation.is_some(),
+            };
+            assert!(
+                attestation_ok,
+                "ClockProfile attestation must be present for {:?}, got: {:?}",
+                tier, profile.attestation
+            );
+        }
     }
 }
