@@ -13,9 +13,6 @@
 
 set -euo pipefail
 
-echo "INTENTIONAL CI FAILURE INJECTION: test_safety_guard" >&2
-exit 1
-
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
