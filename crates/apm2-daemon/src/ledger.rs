@@ -832,6 +832,34 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
     }
 
+    fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events
+             ORDER BY timestamp_ns ASC, rowid ASC",
+        ) else {
+            return Vec::new();
+        };
+
+        let rows = stmt.query_map([], |row| {
+            Ok(SignedLedgerEvent {
+                event_id: row.get(0)?,
+                event_type: row.get(1)?,
+                work_id: row.get(2)?,
+                actor_id: row.get(3)?,
+                payload: row.get(4)?,
+                signature: row.get(5)?,
+                timestamp_ns: row.get(6)?,
+            })
+        });
+
+        rows.map_or_else(|_| Vec::new(), |iter| iter.filter_map(Result::ok).collect())
+    }
+
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
         let conn = self.conn.lock().ok()?;
 

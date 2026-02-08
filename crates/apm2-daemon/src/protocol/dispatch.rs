@@ -120,6 +120,8 @@ use super::messages::{
     UnsubscribePulseResponse,
     UpdateStopFlagsRequest,
     UpdateStopFlagsResponse,
+    WorkListRequest,
+    WorkListResponse,
     WorkRole,
     WorkStatusRequest,
     WorkStatusResponse,
@@ -145,6 +147,9 @@ use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
 use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
 use crate::state::SharedState;
+use crate::work::authority::{
+    ProjectionWorkAuthority, WorkAuthority, WorkAuthorityError, WorkAuthorityStatus,
+};
 
 // ============================================================================
 // Ledger Event Emitter Interface (TCK-00253)
@@ -428,6 +433,15 @@ pub trait LedgerEventEmitter: Send + Sync {
 
     /// Queries events by work ID.
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent>;
+
+    /// Queries all persisted ledger events in deterministic replay order.
+    ///
+    /// Implementations must return events ordered by causal append ordering
+    /// (timestamp with row-order tie-breakers) so projection rebuilds converge
+    /// deterministically.
+    fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
+        Vec::new()
+    }
 
     /// Queries a signed event by `receipt_id` embedded in the payload.
     ///
@@ -1695,6 +1709,16 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        let (order, events) = &*guard;
+
+        order
+            .iter()
+            .filter_map(|event_id| events.get(event_id).cloned())
+            .collect()
     }
 
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
@@ -3563,6 +3587,8 @@ pub enum PrivilegedMessageType {
     IngestReviewReceipt = 17,
     /// `UpdateStopFlags` request (IPC-PRIV-018, TCK-00351)
     UpdateStopFlags     = 18,
+    /// `WorkList` request (IPC-PRIV-019, TCK-00415)
+    WorkList            = 19,
     // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
     /// `ListCredentials` request (IPC-PRIV-021)
     ListCredentials     = 21,
@@ -3620,6 +3646,8 @@ impl PrivilegedMessageType {
             17 => Some(Self::IngestReviewReceipt),
             // TCK-00351: stop flags update
             18 => Some(Self::UpdateStopFlags),
+            // TCK-00415: projection-backed work listing
+            19 => Some(Self::WorkList),
             // Credential management tags (21-26, TCK-00343)
             21 => Some(Self::ListCredentials),
             22 => Some(Self::AddCredential),
@@ -3672,6 +3700,7 @@ impl PrivilegedMessageType {
             Self::EndSession,
             Self::IngestReviewReceipt,
             Self::UpdateStopFlags,
+            Self::WorkList,
             Self::ListCredentials,
             Self::AddCredential,
             Self::RemoveCredential,
@@ -3717,6 +3746,7 @@ impl PrivilegedMessageType {
             | Self::EndSession
             | Self::IngestReviewReceipt
             | Self::UpdateStopFlags
+            | Self::WorkList
             | Self::ListCredentials
             | Self::AddCredential
             | Self::RemoveCredential
@@ -3758,6 +3788,7 @@ impl PrivilegedMessageType {
             Self::EndSession => "hsi.session.end",
             Self::IngestReviewReceipt => "hsi.review.ingest_receipt",
             Self::UpdateStopFlags => "hsi.stop.update_flags",
+            Self::WorkList => "hsi.work.list",
             Self::ListCredentials => "hsi.credential.list",
             Self::AddCredential => "hsi.credential.add",
             Self::RemoveCredential => "hsi.credential.remove",
@@ -3794,6 +3825,7 @@ impl PrivilegedMessageType {
             Self::EndSession => "END_SESSION",
             Self::IngestReviewReceipt => "INGEST_REVIEW_RECEIPT",
             Self::UpdateStopFlags => "UPDATE_STOP_FLAGS",
+            Self::WorkList => "WORK_LIST",
             Self::ListCredentials => "LIST_CREDENTIALS",
             Self::AddCredential => "ADD_CREDENTIAL",
             Self::RemoveCredential => "REMOVE_CREDENTIAL",
@@ -3830,6 +3862,7 @@ impl PrivilegedMessageType {
             Self::EndSession => "apm2.end_session_request.v1",
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_request.v1",
             Self::UpdateStopFlags => "apm2.update_stop_flags_request.v1",
+            Self::WorkList => "apm2.work_list_request.v1",
             Self::ListCredentials => "apm2.list_credentials_request.v1",
             Self::AddCredential => "apm2.add_credential_request.v1",
             Self::RemoveCredential => "apm2.remove_credential_request.v1",
@@ -3866,6 +3899,7 @@ impl PrivilegedMessageType {
             Self::EndSession => "apm2.end_session_response.v1",
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_response.v1",
             Self::UpdateStopFlags => "apm2.update_stop_flags_response.v1",
+            Self::WorkList => "apm2.work_list_response.v1",
             Self::ListCredentials => "apm2.list_credentials_response.v1",
             Self::AddCredential => "apm2.add_credential_response.v1",
             Self::RemoveCredential => "apm2.remove_credential_response.v1",
@@ -3913,6 +3947,8 @@ pub enum PrivilegedResponse {
     ReloadProcess(ReloadProcessResponse),
     /// Successful `WorkStatus` response (TCK-00344).
     WorkStatus(WorkStatusResponse),
+    /// Successful `WorkList` response (TCK-00415).
+    WorkList(WorkListResponse),
     /// Successful `EndSession` response (TCK-00395).
     EndSession(EndSessionResponse),
     /// Successful `IngestReviewReceipt` response (TCK-00389).
@@ -4026,6 +4062,10 @@ impl PrivilegedResponse {
             },
             Self::WorkStatus(resp) => {
                 buf.push(PrivilegedMessageType::WorkStatus.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::WorkList(resp) => {
+                buf.push(PrivilegedMessageType::WorkList.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::EndSession(resp) => {
@@ -5700,6 +5740,8 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::ConsensusMetrics => self.handle_consensus_metrics(payload),
             // TCK-00344: Work status query
             PrivilegedMessageType::WorkStatus => self.handle_work_status(payload, ctx),
+            // TCK-00415: Projection-backed work listing
+            PrivilegedMessageType::WorkList => self.handle_work_list(payload, ctx),
             // TCK-00395: EndSession for session termination with ledger event
             PrivilegedMessageType::EndSession => self.handle_end_session(payload, ctx),
             // TCK-00389: IngestReviewReceipt for external reviewer results
@@ -5752,6 +5794,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::ConsensusMetrics => "ConsensusMetrics",
                 // TCK-00344
                 PrivilegedMessageType::WorkStatus => "WorkStatus",
+                // TCK-00415
+                PrivilegedMessageType::WorkList => "WorkList",
                 // TCK-00395
                 PrivilegedMessageType::EndSession => "EndSession",
                 // TCK-00389
@@ -8440,14 +8484,11 @@ impl PrivilegedDispatcher {
         ))
     }
 
-    /// Handles `WorkStatus` requests (IPC-PRIV-005, TCK-00344).
+    /// Handles `WorkStatus` requests (IPC-PRIV-015, TCK-00344/TCK-00415).
     ///
-    /// Queries the status of a work item from the session registry.
-    ///
-    /// # Returns
-    ///
-    /// - Work status if found in session registry
-    /// - `WORK_NOT_FOUND` error if work ID is not found
+    /// Authority is projection-backed: lifecycle state is derived from ledger
+    /// projection only. Session/claim registries provide supplementary runtime
+    /// metadata (`session_id`, `lease_id`) and never determine lifecycle truth.
     fn handle_work_status(
         &self,
         payload: &[u8],
@@ -8475,49 +8516,110 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        debug!(work_id = %request.work_id, "Processing WorkStatus request");
+        debug!(
+            work_id = %request.work_id,
+            "Processing WorkStatus request via projection authority"
+        );
 
-        // Query session registry for work status
-        // Note: We search through sessions to find work associated with this work_id
-        // This is a basic implementation; a dedicated work registry would be more
-        // efficient
-        let session_state = self.find_session_by_work_id(&request.work_id);
+        let authority = self.projection_work_authority();
+        match authority.get_work_status(&request.work_id) {
+            Ok(status) => Ok(PrivilegedResponse::WorkStatus(
+                self.authority_status_to_work_status_response(&status),
+            )),
+            Err(error) => Ok(Self::map_work_authority_error(error)),
+        }
+    }
 
-        match session_state {
-            Some(session) => {
-                // Work found via session
-                let response = WorkStatusResponse {
-                    work_id: request.work_id,
-                    status: "SPAWNED".to_string(),
-                    actor_id: None, // Not tracked in session
-                    role: Some(session.role),
-                    session_id: Some(session.session_id),
-                    lease_id: None,   // Lease is redacted in SessionState
-                    created_at_ns: 0, // Not tracked
-                    claimed_at_ns: None,
-                };
-                Ok(PrivilegedResponse::WorkStatus(response))
-            },
-            None => {
-                // Check work claims for claimed but not yet spawned work
-                if let Some(claim) = self.work_registry.get_claim(&request.work_id) {
-                    let response = WorkStatusResponse {
-                        work_id: request.work_id,
-                        status: "CLAIMED".to_string(),
-                        actor_id: Some(claim.actor_id.clone()),
-                        role: Some(claim.role.into()),
-                        session_id: None,
-                        lease_id: Some(claim.lease_id),
-                        created_at_ns: 0,
-                        claimed_at_ns: None, // WorkClaim doesn't track timestamp
-                    };
-                    Ok(PrivilegedResponse::WorkStatus(response))
-                } else {
-                    Ok(PrivilegedResponse::error(
-                        PrivilegedErrorCode::WorkNotFound,
-                        format!("work item not found: {}", request.work_id),
-                    ))
+    /// Handles `WorkList` requests (IPC-PRIV-019, TCK-00415).
+    ///
+    /// Lists all work items known to projection authority.
+    fn handle_work_list(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            WorkListRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid WorkListRequest: {e}"),
                 }
+            })?;
+
+        debug!(
+            claimable_only = request.claimable_only,
+            "Processing WorkList request via projection authority"
+        );
+
+        let authority = self.projection_work_authority();
+        let statuses = if request.claimable_only {
+            authority.list_claimable()
+        } else {
+            authority.list_all()
+        };
+
+        match statuses {
+            Ok(statuses) => {
+                let work_items = statuses
+                    .iter()
+                    .map(|status| self.authority_status_to_work_status_response(status))
+                    .collect();
+
+                Ok(PrivilegedResponse::WorkList(WorkListResponse {
+                    work_items,
+                }))
+            },
+            Err(error) => Ok(Self::map_work_authority_error(error)),
+        }
+    }
+
+    fn projection_work_authority(&self) -> ProjectionWorkAuthority {
+        ProjectionWorkAuthority::new(Arc::clone(&self.event_emitter))
+    }
+
+    fn authority_status_to_work_status_response(
+        &self,
+        authority_status: &WorkAuthorityStatus,
+    ) -> WorkStatusResponse {
+        // Projection state is authoritative for lifecycle.
+        let mut response = WorkStatusResponse {
+            work_id: authority_status.work_id.clone(),
+            status: authority_status.state.as_str().to_string(),
+            actor_id: None,
+            role: None,
+            session_id: None,
+            lease_id: None,
+            created_at_ns: authority_status.created_at_ns,
+            claimed_at_ns: authority_status.claimed_at_ns,
+        };
+
+        // Supplement with claim metadata when available.
+        if let Some(claim) = self.work_registry.get_claim(&authority_status.work_id) {
+            response.actor_id = Some(claim.actor_id);
+            response.role = Some(claim.role.into());
+            response.lease_id = Some(claim.lease_id);
+        }
+
+        // Supplement with active session metadata when available.
+        if let Some(session) = self.find_session_by_work_id(&authority_status.work_id) {
+            response.session_id = Some(session.session_id);
+            response.role = Some(session.role);
+        }
+
+        response
+    }
+
+    fn map_work_authority_error(error: WorkAuthorityError) -> PrivilegedResponse {
+        match error {
+            WorkAuthorityError::WorkNotFound { work_id } => PrivilegedResponse::error(
+                PrivilegedErrorCode::WorkNotFound,
+                format!("work item not found: {work_id}"),
+            ),
+            other => {
+                warn!(error = %other, "projection-backed work authority failed closed");
+                PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("projection-backed work authority unavailable: {other}"),
+                )
             },
         }
     }
@@ -12225,6 +12327,14 @@ pub fn encode_work_status_request(request: &WorkStatusRequest) -> Bytes {
     Bytes::from(buf)
 }
 
+/// Encodes a `WorkList` request to bytes for sending (TCK-00415).
+#[must_use]
+pub fn encode_work_list_request(request: &WorkListRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::WorkList.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
 // =============================================================================
 // TCK-00394: ChangeSet Publishing Encoding (RFC-0018)
 // =============================================================================
@@ -15309,17 +15419,45 @@ mod tests {
             }))
         }
 
-        /// IT-00344-01: `WorkStatus` returns `SPAWNED` for a registered
-        /// session.
+        /// IT-00344-01: `WorkStatus` returns projection-backed state with
+        /// session metadata overlay.
         ///
         /// Verifies the end-to-end path:
+        /// 1. Emit projection-authoritative work transitions into the ledger
         /// 1. Register a session in the session registry
         /// 2. Send a `WorkStatus` request with matching `work_id`
-        /// 3. Receive a response with status `SPAWNED` and correct metadata
+        /// 3. Receive a response with lifecycle state from projection and
+        ///    runtime metadata from the session registry
         #[test]
         fn test_work_status_returns_spawned_for_session() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = privileged_ctx();
+
+            // Emit authoritative transitions used by projection.
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-WORK-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:test",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .expect("transition Open->Claimed should persist");
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-WORK-001",
+                    from_state: "Claimed",
+                    to_state: "InProgress",
+                    rationale_code: "start",
+                    previous_transition_count: 1,
+                    actor_id: "actor:test",
+                    timestamp_ns: 1_000_000_100,
+                })
+                .expect("transition Claimed->InProgress should persist");
 
             // Register a session associated with the work_id
             let session = SessionState {
@@ -15347,7 +15485,7 @@ mod tests {
             match response {
                 PrivilegedResponse::WorkStatus(resp) => {
                     assert_eq!(resp.work_id, "W-WORK-001");
-                    assert_eq!(resp.status, "SPAWNED");
+                    assert_eq!(resp.status, "IN_PROGRESS");
                     assert_eq!(resp.session_id, Some("S-WS-001".to_string()));
                     assert_eq!(resp.role, Some(WorkRole::Implementer.into()));
                 },
@@ -15361,6 +15499,20 @@ mod tests {
         fn test_work_status_returns_claimed_for_work_claim() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = privileged_ctx();
+
+            // Emit authoritative transition for projection state.
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-CLAIM-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:alice",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .expect("transition Open->Claimed should persist");
 
             // Register a work claim (no session spawned yet)
             let claim = WorkClaim {
@@ -15522,6 +15674,53 @@ mod tests {
             assert_eq!(encoded[0], 15u8, "WorkStatus tag value should be 15");
         }
 
+        /// IT-00415-01: `WorkList` returns projection-known work items.
+        #[test]
+        fn test_work_list_returns_projection_rows() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-LIST-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:one",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .expect("first transition should persist");
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-LIST-002",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:two",
+                    timestamp_ns: 1_000_000_100,
+                })
+                .expect("second transition should persist");
+
+            let request = WorkListRequest {
+                claimable_only: false,
+            };
+            let frame = encode_work_list_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::WorkList(resp) => {
+                    assert_eq!(resp.work_items.len(), 2, "expected two work rows");
+                    assert_eq!(resp.work_items[0].work_id, "W-LIST-001");
+                    assert_eq!(resp.work_items[1].work_id, "W-LIST-002");
+                },
+                other => panic!("Expected WorkList response, got: {other:?}"),
+            }
+        }
+
         /// IT-00344-08: Full `ClaimWork` -> `SpawnEpisode` -> `WorkStatus`
         /// flow.
         ///
@@ -15580,8 +15779,8 @@ mod tests {
                 PrivilegedResponse::WorkStatus(resp) => {
                     assert_eq!(resp.work_id, work_id);
                     assert_eq!(
-                        resp.status, "SPAWNED",
-                        "Work should be SPAWNED after episode creation"
+                        resp.status, "IN_PROGRESS",
+                        "Work should be IN_PROGRESS after episode creation"
                     );
                     assert!(
                         resp.session_id.is_some(),

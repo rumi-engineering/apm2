@@ -189,6 +189,7 @@ pub use dispatch::{
     encode_start_process_request,
     encode_stop_process_request,
     encode_switch_credential_request,
+    encode_work_list_request,
     encode_work_status_request,
     generate_lease_id,
     generate_work_id,
@@ -312,6 +313,8 @@ pub use messages::{
     UnsubscribePulseRequest,
     UnsubscribePulseResponse,
     ValidatorInfo,
+    WorkListRequest,
+    WorkListResponse,
     WorkRole,
     // TCK-00344: Status query messages
     WorkStatusRequest,

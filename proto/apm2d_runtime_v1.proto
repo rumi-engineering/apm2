@@ -415,6 +415,18 @@ message WorkStatusResponse {
   optional uint64 claimed_at_ns = 8;
 }
 
+// IPC-PRIV-019: WorkList (TCK-00415)
+// List all work items known to projection authority.
+message WorkListRequest {
+  // If true, return only claimable work items.
+  bool claimable_only = 1;
+}
+
+message WorkListResponse {
+  // Projection-derived status rows ordered deterministically by work_id.
+  repeated WorkStatusResponse work_items = 1;
+}
+
 // =============================================================================
 // IPC-PRIV-017: PublishChangeSet (TCK-00394, RFC-0018)
 // =============================================================================
