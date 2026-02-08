@@ -315,6 +315,125 @@ impl fmt::Display for ConfidentialityLevel {
 }
 
 // =============================================================================
+// RFC/Schema Confidentiality Taxonomy Mapping
+// =============================================================================
+
+/// Normative RFC/schema confidentiality levels.
+///
+/// The RFC and JSON schema use `PUBLIC`, `INTERNAL`, `CONFIDENTIAL`,
+/// `RESTRICTED` (4 levels). The internal engine uses 5 levels
+/// (`Public`..`TopSecret`). This enum provides the normative
+/// representation with fail-closed lossless mapping to/from
+/// [`ConfidentialityLevel`].
+///
+/// Mapping:
+/// - `PUBLIC`       <-> `Public`
+/// - `INTERNAL`     <-> `Internal`
+/// - `CONFIDENTIAL` <-> `Confidential`
+/// - `RESTRICTED`   <-> `Secret`
+///
+/// `TopSecret` has **no** RFC counterpart and is rejected (fail-closed)
+/// when mapping to the RFC taxonomy. Any unknown RFC string is also
+/// rejected (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RfcConfidentialityLevel {
+    /// Publicly releasable data. Maps to [`ConfidentialityLevel::Public`].
+    #[serde(rename = "PUBLIC")]
+    Public,
+    /// Internal-use-only data. Maps to [`ConfidentialityLevel::Internal`].
+    #[serde(rename = "INTERNAL")]
+    Internal,
+    /// Confidential data requiring access controls.
+    /// Maps to [`ConfidentialityLevel::Confidential`].
+    #[serde(rename = "CONFIDENTIAL")]
+    Confidential,
+    /// Restricted data with strict need-to-know.
+    /// Maps to [`ConfidentialityLevel::Secret`].
+    #[serde(rename = "RESTRICTED")]
+    Restricted,
+}
+
+impl RfcConfidentialityLevel {
+    /// All valid RFC level string representations.
+    const VALID_NAMES: &'static [&'static str] =
+        &["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"];
+}
+
+impl fmt::Display for RfcConfidentialityLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Public => write!(f, "PUBLIC"),
+            Self::Internal => write!(f, "INTERNAL"),
+            Self::Confidential => write!(f, "CONFIDENTIAL"),
+            Self::Restricted => write!(f, "RESTRICTED"),
+        }
+    }
+}
+
+impl ConfidentialityLevel {
+    /// Convert from the normative RFC/schema confidentiality level to the
+    /// internal engine level. This is a lossless mapping.
+    #[must_use]
+    pub const fn from_rfc_level(rfc: RfcConfidentialityLevel) -> Self {
+        match rfc {
+            RfcConfidentialityLevel::Public => Self::Public,
+            RfcConfidentialityLevel::Internal => Self::Internal,
+            RfcConfidentialityLevel::Confidential => Self::Confidential,
+            RfcConfidentialityLevel::Restricted => Self::Secret,
+        }
+    }
+
+    /// Convert from the internal engine level to the normative RFC/schema
+    /// confidentiality level.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaintError::InvalidPolicyRef`] if the internal level has
+    /// no RFC counterpart (fail-closed). Currently,
+    /// [`ConfidentialityLevel::TopSecret`] is the only unmapped level.
+    pub fn to_rfc_level(self) -> Result<RfcConfidentialityLevel, TaintError> {
+        match self {
+            Self::Public => Ok(RfcConfidentialityLevel::Public),
+            Self::Internal => Ok(RfcConfidentialityLevel::Internal),
+            Self::Confidential => Ok(RfcConfidentialityLevel::Confidential),
+            Self::Secret => Ok(RfcConfidentialityLevel::Restricted),
+            Self::TopSecret => Err(TaintError::InvalidPolicyRef {
+                reason: format!(
+                    "ConfidentialityLevel::TopSecret has no RFC counterpart \
+                     (valid RFC levels: {:?})",
+                    RfcConfidentialityLevel::VALID_NAMES
+                ),
+            }),
+        }
+    }
+
+    /// Parse from an RFC-level string (e.g., `"PUBLIC"`, `"RESTRICTED"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaintError::InvalidPolicyRef`] if the string does not match
+    /// any normative RFC level (fail-closed).
+    pub fn from_rfc_str(s: &str) -> Result<Self, TaintError> {
+        let rfc = match s {
+            "PUBLIC" => RfcConfidentialityLevel::Public,
+            "INTERNAL" => RfcConfidentialityLevel::Internal,
+            "CONFIDENTIAL" => RfcConfidentialityLevel::Confidential,
+            "RESTRICTED" => RfcConfidentialityLevel::Restricted,
+            _ => {
+                return Err(TaintError::InvalidPolicyRef {
+                    reason: format!(
+                        "unknown RFC confidentiality level '{s}' \
+                         (valid: {:?})",
+                        RfcConfidentialityLevel::VALID_NAMES
+                    ),
+                });
+            },
+        };
+        Ok(Self::from_rfc_level(rfc))
+    }
+}
+
+// =============================================================================
 // DataLabel
 // =============================================================================
 
@@ -905,17 +1024,19 @@ impl DualLatticePolicy {
                 ),
             })?;
 
-        // Compute content hash over ALL receipt fields, including authority
-        // and boundary bindings, to prevent replay across principals or
-        // boundaries.
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[from.ordinal()]);
-        hasher.update(&[to.ordinal()]);
-        hasher.update(rule.rule_id().as_bytes());
-        hasher.update(justification.as_bytes());
-        hasher.update(authority_id.as_bytes());
-        hasher.update(boundary_id.as_bytes());
-        let content_hash: [u8; 32] = hasher.finalize().into();
+        // Compute content hash over ALL receipt fields using length-prefixed
+        // canonical hashing. Each variable-length field is preceded by its
+        // length as a little-endian u64, preventing delimiter-boundary
+        // collision attacks where different field tuples share identical
+        // concatenated preimage bytes.
+        let content_hash = Self::compute_receipt_hash(
+            from,
+            to,
+            rule.rule_id(),
+            justification,
+            authority_id,
+            boundary_id,
+        );
 
         Ok(DeclassificationReceipt {
             from_level: from,
@@ -926,6 +1047,57 @@ impl DualLatticePolicy {
             boundary_id: boundary_id.to_string(),
             content_hash,
         })
+    }
+
+    /// Compute the canonical content hash for a declassification receipt.
+    ///
+    /// Uses domain-separated, length-prefixed hashing to prevent
+    /// delimiter-boundary collision attacks. Each variable-length field
+    /// is preceded by its byte length as a little-endian `u64`.
+    fn compute_receipt_hash(
+        from: ConfidentialityLevel,
+        to: ConfidentialityLevel,
+        rule_id: &str,
+        justification: &str,
+        authority_id: &str,
+        boundary_id: &str,
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        // Domain separation tag to bind this hash to receipt semantics.
+        hasher.update(b"apm2.declassification-receipt.v1");
+        // Fixed-length fields: from and to ordinals.
+        hasher.update(&[from.ordinal()]);
+        hasher.update(&[to.ordinal()]);
+        // Length-prefixed variable-length fields.
+        Self::hash_length_prefixed(&mut hasher, rule_id.as_bytes());
+        Self::hash_length_prefixed(&mut hasher, justification.as_bytes());
+        Self::hash_length_prefixed(&mut hasher, authority_id.as_bytes());
+        Self::hash_length_prefixed(&mut hasher, boundary_id.as_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Hash a byte slice with a length prefix (little-endian u64).
+    fn hash_length_prefixed(hasher: &mut blake3::Hasher, data: &[u8]) {
+        hasher.update(&(data.len() as u64).to_le_bytes());
+        hasher.update(data);
+    }
+
+    /// Verify a receipt's content hash by recomputing it from the receipt's
+    /// fields and comparing.
+    ///
+    /// Returns `true` if the hash matches, `false` if the receipt has been
+    /// tampered with or was constructed outside the trusted path.
+    fn verify_receipt_hash(receipt: &DeclassificationReceipt) -> bool {
+        let expected = Self::compute_receipt_hash(
+            receipt.from_level(),
+            receipt.to_level(),
+            receipt.policy_ref(),
+            receipt.justification(),
+            receipt.authority_id(),
+            receipt.boundary_id(),
+        );
+        // Constant-time comparison to avoid timing side-channels.
+        expected == *receipt.content_hash()
     }
 
     /// Propagate a label through a boundary crossing **without** implicit
@@ -986,19 +1158,25 @@ impl DualLatticePolicy {
     /// declassification receipt.
     ///
     /// The receipt must:
-    /// 1. Be scoped to the same `boundary_id` being crossed.
-    /// 2. Declassify from at least `label.confidentiality` down to at most
+    /// 1. Have a valid content hash (recomputed and verified against the
+    ///    receipt's claimed hash to detect forged/tampered receipts).
+    /// 2. Reference a `policy_ref` that maps to an active declassification rule
+    ///    authorizing the `from_level -> to_level` transition.
+    /// 3. Be scoped to the same `boundary_id` being crossed.
+    /// 4. Declassify from at least `label.confidentiality` down to at most
     ///    `boundary.max_confidentiality`.
     ///
     /// If the label already fits within the boundary clearance the receipt
-    /// is not consumed and the label passes through unchanged (but the
-    /// receipt is still validated for binding correctness).
+    /// is still fully validated (hash, `policy_ref`, boundary binding) but
+    /// the label passes through unchanged.
     ///
     /// # Errors
     ///
     /// - [`TaintError::BoundaryCrossingDenied`] if the boundary is unknown
-    ///   (fail-closed), or the receipt is not scoped to this boundary, or the
-    ///   receipt does not cover the required downgrade range.
+    ///   (fail-closed), the receipt content hash is invalid, the receipt's
+    ///   `policy_ref` does not map to an active rule authorizing the
+    ///   transition, the receipt is not scoped to this boundary, or the receipt
+    ///   does not cover the required downgrade range.
     /// - [`TaintError::TaintCeilingExceeded`] if taint exceeds the boundary
     ///   ceiling.
     pub fn propagate_with_declassification(
@@ -1015,6 +1193,41 @@ impl DualLatticePolicy {
                 boundary: boundary_id.to_string(),
                 reason: "no boundary policy configured (fail-closed)".to_string(),
             })?;
+
+        // ---- Receipt integrity verification (BLOCKER fix) ----
+        // 1. Recompute the content hash and verify it matches the receipt's claimed
+        //    hash. This rejects forged or deserialized receipts whose fields have been
+        //    tampered with.
+        if !Self::verify_receipt_hash(receipt) {
+            return Err(TaintError::BoundaryCrossingDenied {
+                boundary: boundary_id.to_string(),
+                reason: "receipt content hash verification failed (forged or tampered receipt)"
+                    .to_string(),
+            });
+        }
+
+        // 2. Verify that the receipt's policy_ref maps to an active declassification
+        //    rule that authorizes the from -> to transition. This prevents attackers
+        //    from crafting receipts referencing nonexistent or unauthorized policy
+        //    rules.
+        let has_authorizing_rule = self.declassification_rules.iter().any(|r| {
+            r.rule_id() == receipt.policy_ref()
+                && r.allows(receipt.from_level(), receipt.to_level())
+        });
+        if !has_authorizing_rule {
+            return Err(TaintError::BoundaryCrossingDenied {
+                boundary: boundary_id.to_string(),
+                reason: format!(
+                    "receipt policy_ref '{}' does not map to an active rule authorizing \
+                     {} -> {} (fail-closed)",
+                    receipt.policy_ref(),
+                    receipt.from_level(),
+                    receipt.to_level()
+                ),
+            });
+        }
+
+        // ---- Standard boundary checks ----
 
         // Taint is checked strictly: never auto-lowered.
         if !label.taint.within_ceiling(boundary.max_taint()) {
@@ -1037,6 +1250,7 @@ impl DualLatticePolicy {
         }
 
         // If confidentiality already fits, pass through unchanged.
+        // Note: receipt is still fully validated above even in this case.
         if label
             .confidentiality
             .within_clearance(boundary.max_confidentiality())
@@ -2423,6 +2637,417 @@ mod tests {
         assert_eq!(
             super::propagate_classification(&inputs),
             ConfidentialityLevel::TopSecret
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER: Forged receipt adversarial tests
+    // =========================================================================
+
+    #[test]
+    fn forged_receipt_wrong_content_hash_rejected() {
+        // An attacker crafts a receipt via deserialization with a wrong
+        // content hash. The propagation MUST reject it.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Create a legitimate receipt first, then forge the hash.
+        let legit = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "legitimate",
+                "security-officer-1",
+                "external-api",
+            )
+            .unwrap();
+
+        // Forge: construct via serde with a zeroed hash.
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "policy_ref": legit.policy_ref(),
+            "justification": "FORGED justification",
+            "authority_id": legit.authority_id(),
+            "boundary_id": legit.boundary_id(),
+            "content_hash": vec![0u8; 32],
+        });
+        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &forged)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::BoundaryCrossingDenied { .. }),
+            "forged receipt with wrong hash must be rejected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("hash verification failed"),
+            "error should mention hash verification, got: {err}"
+        );
+    }
+
+    #[test]
+    fn forged_receipt_tampered_fields_rejected() {
+        // Attacker takes a legitimate receipt, modifies the to_level to
+        // a more permissive value, but keeps the original hash.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        let legit = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "legitimate",
+                "security-officer-1",
+                "external-api",
+            )
+            .unwrap();
+
+        // Tamper: change to_level to Public but keep the old hash.
+        let tampered_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Public",
+            "policy_ref": legit.policy_ref(),
+            "justification": legit.justification(),
+            "authority_id": legit.authority_id(),
+            "boundary_id": legit.boundary_id(),
+            "content_hash": legit.content_hash(),
+        });
+        let tampered: DeclassificationReceipt = serde_json::from_value(tampered_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &tampered)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::BoundaryCrossingDenied { .. }),
+            "tampered receipt must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn forged_receipt_invalid_policy_ref_rejected() {
+        // Attacker constructs a receipt with a nonexistent policy_ref
+        // but correct hash. The policy_ref authorization check must reject.
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::Secret);
+
+        // Compute a valid hash for a nonexistent rule.
+        let hash = DualLatticePolicy::compute_receipt_hash(
+            ConfidentialityLevel::Secret,
+            ConfidentialityLevel::Internal,
+            "NONEXISTENT-RULE",
+            "trying to bypass",
+            "attacker",
+            "external-api",
+        );
+
+        let forged_json = serde_json::json!({
+            "from_level": "Secret",
+            "to_level": "Internal",
+            "policy_ref": "NONEXISTENT-RULE",
+            "justification": "trying to bypass",
+            "authority_id": "attacker",
+            "boundary_id": "external-api",
+            "content_hash": hash,
+        });
+        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &forged)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::BoundaryCrossingDenied { .. }),
+            "receipt with invalid policy_ref must be rejected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("does not map to an active rule"),
+            "error should mention active rule check, got: {err}"
+        );
+    }
+
+    #[test]
+    fn forged_receipt_unauthorized_level_transition_rejected() {
+        // Receipt references a real rule but the transition is not
+        // authorized by that rule (e.g., TopSecret -> Public via a
+        // rule that only allows Secret -> Internal).
+        let policy = test_policy();
+        let label = DataLabel::new(TaintLevel::Untainted, ConfidentialityLevel::TopSecret);
+
+        let hash = DualLatticePolicy::compute_receipt_hash(
+            ConfidentialityLevel::TopSecret,
+            ConfidentialityLevel::Public,
+            "DECLASS-SECRET-TO-INTERNAL",
+            "level skip",
+            "attacker",
+            "external-api",
+        );
+
+        let forged_json = serde_json::json!({
+            "from_level": "TopSecret",
+            "to_level": "Public",
+            "policy_ref": "DECLASS-SECRET-TO-INTERNAL",
+            "justification": "level skip",
+            "authority_id": "attacker",
+            "boundary_id": "external-api",
+            "content_hash": hash,
+        });
+        let forged: DeclassificationReceipt = serde_json::from_value(forged_json).unwrap();
+
+        let err = policy
+            .propagate_with_declassification("external-api", &label, &forged)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaintError::BoundaryCrossingDenied { .. }),
+            "unauthorized level transition must be rejected, got {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR 1: Length-framed hash collision boundary tests
+    // =========================================================================
+
+    #[test]
+    fn hash_length_framing_prevents_field_boundary_collision() {
+        // Without length framing, authority_id="ab" + boundary_id="cd"
+        // and authority_id="abc" + boundary_id="d" would produce the
+        // same hash. With length framing, they must differ.
+
+        // Set up a policy covering both boundaries for the test.
+        let boundaries = vec![
+            BoundaryPolicy::new("cd", TaintLevel::Toxic, ConfidentialityLevel::Internal, 0)
+                .unwrap(),
+            BoundaryPolicy::new("d", TaintLevel::Toxic, ConfidentialityLevel::Internal, 0).unwrap(),
+        ];
+        let declass_rules = vec![
+            DeclassificationPolicy::new(
+                "DECLASS-SECRET-TO-INTERNAL",
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+            )
+            .unwrap(),
+        ];
+        let extended_policy = DualLatticePolicy::new(boundaries, declass_rules);
+
+        let r1 = extended_policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same-justification",
+                "ab",
+                "cd",
+            )
+            .unwrap();
+
+        let r2 = extended_policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "DECLASS-SECRET-TO-INTERNAL",
+                "same-justification",
+                "abc",
+                "d",
+            )
+            .unwrap();
+
+        assert_ne!(
+            r1.content_hash(),
+            r2.content_hash(),
+            "different authority/boundary splits must produce different hashes \
+             (length framing prevents delimiter collision)"
+        );
+    }
+
+    #[test]
+    fn hash_length_framing_prevents_rule_justification_collision() {
+        // rule_id="RULE" + justification="JUST" vs
+        // rule_id="RULEJ" + justification="UST" must differ.
+        let boundaries = vec![
+            BoundaryPolicy::new(
+                "boundary",
+                TaintLevel::Toxic,
+                ConfidentialityLevel::Internal,
+                0,
+            )
+            .unwrap(),
+        ];
+        let declass_rules = vec![
+            DeclassificationPolicy::new(
+                "RULE",
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+            )
+            .unwrap(),
+            DeclassificationPolicy::new(
+                "RULEJ",
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+            )
+            .unwrap(),
+        ];
+        let policy = DualLatticePolicy::new(boundaries, declass_rules);
+
+        let r1 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "RULE",
+                "JUST",
+                "auth",
+                "boundary",
+            )
+            .unwrap();
+        let r2 = policy
+            .declassify(
+                ConfidentialityLevel::Secret,
+                ConfidentialityLevel::Internal,
+                "RULEJ",
+                "UST",
+                "auth",
+                "boundary",
+            )
+            .unwrap();
+
+        assert_ne!(
+            r1.content_hash(),
+            r2.content_hash(),
+            "different rule_id/justification splits must produce different hashes"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR 2: RFC taxonomy mapping tests
+    // =========================================================================
+
+    #[test]
+    fn rfc_from_level_roundtrip() {
+        // All RFC levels map to an internal level and back.
+        let rfc_levels = [
+            RfcConfidentialityLevel::Public,
+            RfcConfidentialityLevel::Internal,
+            RfcConfidentialityLevel::Confidential,
+            RfcConfidentialityLevel::Restricted,
+        ];
+        let expected_internal = [
+            ConfidentialityLevel::Public,
+            ConfidentialityLevel::Internal,
+            ConfidentialityLevel::Confidential,
+            ConfidentialityLevel::Secret,
+        ];
+
+        for (rfc, internal) in rfc_levels.iter().zip(expected_internal.iter()) {
+            let converted = ConfidentialityLevel::from_rfc_level(*rfc);
+            assert_eq!(
+                converted, *internal,
+                "from_rfc_level({rfc:?}) should produce {internal:?}"
+            );
+            let back = converted.to_rfc_level().unwrap();
+            assert_eq!(
+                back, *rfc,
+                "to_rfc_level({internal:?}) should produce {rfc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc_top_secret_has_no_mapping() {
+        // TopSecret must be rejected (fail-closed) with no RFC counterpart.
+        let err = ConfidentialityLevel::TopSecret.to_rfc_level().unwrap_err();
+        assert!(
+            matches!(err, TaintError::InvalidPolicyRef { .. }),
+            "TopSecret should fail to map to RFC level, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("no RFC counterpart"),
+            "error should mention no RFC counterpart, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rfc_from_str_valid_levels() {
+        assert_eq!(
+            ConfidentialityLevel::from_rfc_str("PUBLIC").unwrap(),
+            ConfidentialityLevel::Public
+        );
+        assert_eq!(
+            ConfidentialityLevel::from_rfc_str("INTERNAL").unwrap(),
+            ConfidentialityLevel::Internal
+        );
+        assert_eq!(
+            ConfidentialityLevel::from_rfc_str("CONFIDENTIAL").unwrap(),
+            ConfidentialityLevel::Confidential
+        );
+        assert_eq!(
+            ConfidentialityLevel::from_rfc_str("RESTRICTED").unwrap(),
+            ConfidentialityLevel::Secret
+        );
+    }
+
+    #[test]
+    fn rfc_from_str_unknown_rejected() {
+        // Unknown strings must be rejected (fail-closed).
+        let unknown = ["Secret", "TopSecret", "TOP_SECRET", "public", "UNKNOWN", ""];
+        for s in unknown {
+            let err = ConfidentialityLevel::from_rfc_str(s).unwrap_err();
+            assert!(
+                matches!(err, TaintError::InvalidPolicyRef { .. }),
+                "unknown RFC string '{s}' should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc_display() {
+        assert_eq!(RfcConfidentialityLevel::Public.to_string(), "PUBLIC");
+        assert_eq!(RfcConfidentialityLevel::Internal.to_string(), "INTERNAL");
+        assert_eq!(
+            RfcConfidentialityLevel::Confidential.to_string(),
+            "CONFIDENTIAL"
+        );
+        assert_eq!(
+            RfcConfidentialityLevel::Restricted.to_string(),
+            "RESTRICTED"
+        );
+    }
+
+    #[test]
+    fn rfc_serde_roundtrip() {
+        let levels = [
+            RfcConfidentialityLevel::Public,
+            RfcConfidentialityLevel::Internal,
+            RfcConfidentialityLevel::Confidential,
+            RfcConfidentialityLevel::Restricted,
+        ];
+        for level in levels {
+            let json = serde_json::to_string(&level).unwrap();
+            let parsed: RfcConfidentialityLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, level, "serde roundtrip failed for {level:?}");
+        }
+    }
+
+    #[test]
+    fn rfc_cross_layer_compatibility() {
+        // Ensure the RFC schema's 4 levels all map to valid internal levels
+        // and that internal levels 0-3 all map back to RFC levels.
+        for ordinal in 0..=3u8 {
+            let internal = ConfidentialityLevel::from_ordinal(ordinal).unwrap();
+            let rfc = internal.to_rfc_level().unwrap_or_else(|_| {
+                panic!("ordinal {ordinal} ({internal}) should have RFC mapping")
+            });
+            let back = ConfidentialityLevel::from_rfc_level(rfc);
+            assert_eq!(
+                back, internal,
+                "cross-layer roundtrip failed for ordinal {ordinal}"
+            );
+        }
+        // Ordinal 4 (TopSecret) must fail.
+        let top = ConfidentialityLevel::from_ordinal(4).unwrap();
+        assert!(
+            top.to_rfc_level().is_err(),
+            "ordinal 4 (TopSecret) must not map to RFC"
         );
     }
 }
