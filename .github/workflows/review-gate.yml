@@ -49,6 +49,8 @@ jobs:
     name: Review Gate
     needs: [pre-filter]
     runs-on: ubuntu-24.04
+    outputs:
+      gate_state: ${{ steps.evaluate.outputs.gate_state }}
     steps:
       # pull_request_target already executes in base-branch context, so this
       # checks out trusted evaluator code from the PR base branch.
@@ -110,14 +112,25 @@ jobs:
             > /tmp/trusted-reviewers-base.json
 
       - name: Evaluate review gate
+        id: evaluate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set +e
           cargo xtask review-gate \
             --repo "${{ github.repository }}" \
             --pr-number "${{ steps.pr-ctx.outputs.pr_number }}" \
             --head-sha "${{ steps.pr-ctx.outputs.head_sha }}" \
             --trusted-reviewers "/tmp/trusted-reviewers-base.json"
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "gate_state=success" >> "$GITHUB_OUTPUT"
+          elif [ "$code" -eq 2 ]; then
+            echo "gate_state=pending" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate_state=failure" >> "$GITHUB_OUTPUT"
+          fi
 
   review-gate-success:
     name: Review Gate Success
@@ -137,15 +150,32 @@ jobs:
             exit 0
           fi
           echo "should_post=true" >> "$GITHUB_OUTPUT"
-          if [[ "${{ needs.review-gate.result }}" != "success" ]]; then
-            echo "Review gate failed"
-            echo "state=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Review gate evaluation failed" >> "$GITHUB_OUTPUT"
-            exit 1
+
+          # Read gate_state from the review-gate job output.
+          # Default to failure if the output is empty or the job itself failed
+          # (fail-closed: unknown states are treated as failure).
+          GATE_STATE="${{ needs.review-gate.outputs.gate_state }}"
+          if [[ -z "$GATE_STATE" ]]; then
+            GATE_STATE="failure"
           fi
-          echo "Review gate passed"
-          echo "state=success" >> "$GITHUB_OUTPUT"
-          echo "description=Review gate passed" >> "$GITHUB_OUTPUT"
+
+          case "$GATE_STATE" in
+            success)
+              echo "Review gate passed"
+              echo "state=success" >> "$GITHUB_OUTPUT"
+              echo "description=Review gate passed" >> "$GITHUB_OUTPUT"
+              ;;
+            pending)
+              echo "Review gate pending — waiting for AI reviews"
+              echo "state=pending" >> "$GITHUB_OUTPUT"
+              echo "description=Waiting for AI reviews" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Review gate failed (state: $GATE_STATE)"
+              echo "state=failure" >> "$GITHUB_OUTPUT"
+              echo "description=Review gate evaluation failed" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
       # Resolve the PR head SHA so we can post a commit status to it.
       # Only resolve when the gate actually ran (avoids API calls on

@@ -77,5 +77,6 @@ comments:
       ```
 expected:
   overall_pass: true
+  overall_pending: false
   security_pass: true
   code_quality_pass: true

@@ -73,6 +73,9 @@ pub fn run(
     if evaluation.overall_pass {
         println!("Review gate: PASS");
         Ok(())
+    } else if evaluation.overall_pending {
+        println!("Review gate: PENDING (waiting for AI reviews)");
+        std::process::exit(2);
     } else {
         bail!("Review gate: FAIL");
     }
@@ -203,8 +206,21 @@ fn evaluate_gate(input: &GateEvaluationInput<'_>) -> GateEvaluation {
     let security = evaluate_category(input, ReviewCategory::Security);
     let code_quality = evaluate_category(input, ReviewCategory::CodeQuality);
 
+    let overall_pass = security.pass && code_quality.pass;
+
+    // Pending: gate didn't pass, at least one category has no authoritative
+    // verdict (review not yet submitted), and neither category has an
+    // authoritative FAIL (which would be a definitive rejection, not a
+    // "waiting" state).
+    let has_authoritative_fail = security.authoritative_verdict == Some(ReviewVerdict::Fail)
+        || code_quality.authoritative_verdict == Some(ReviewVerdict::Fail);
+    let has_missing_verdict =
+        security.authoritative_verdict.is_none() || code_quality.authoritative_verdict.is_none();
+    let overall_pending = !overall_pass && !has_authoritative_fail && has_missing_verdict;
+
     GateEvaluation {
-        overall_pass: security.pass && code_quality.pass,
+        overall_pass,
+        overall_pending,
         security,
         code_quality,
     }
@@ -828,6 +844,7 @@ struct GateEvaluationInput<'a> {
 #[derive(Debug, Serialize)]
 struct GateEvaluation {
     overall_pass: bool,
+    overall_pending: bool,
     security: CategoryEvaluation,
     code_quality: CategoryEvaluation,
 }
@@ -882,8 +899,10 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    #[allow(clippy::struct_excessive_bools)]
     struct FixtureExpected {
         overall_pass: bool,
+        overall_pending: bool,
         security_pass: bool,
         code_quality_pass: bool,
         #[serde(default)]
@@ -945,6 +964,11 @@ mod tests {
             assert_eq!(
                 evaluation.overall_pass, fixture.expected.overall_pass,
                 "Fixture `{}` overall gate mismatch",
+                fixture.name
+            );
+            assert_eq!(
+                evaluation.overall_pending, fixture.expected.overall_pending,
+                "Fixture `{}` overall pending mismatch",
                 fixture.name
             );
             assert_eq!(
