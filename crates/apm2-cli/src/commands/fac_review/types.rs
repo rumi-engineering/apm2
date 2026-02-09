@@ -155,6 +155,8 @@ pub struct SingleReviewSummary {
     pub backend: String,
     pub duration_secs: u64,
     pub restart_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,14 +201,6 @@ pub struct DispatchSummary {
     pub head_sha: String,
     pub dispatch_epoch: u64,
     pub results: Vec<DispatchReviewResult>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct RetriggerSummary {
-    pub workflow: String,
-    pub repo: String,
-    pub pr_number: u32,
-    pub dispatched_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

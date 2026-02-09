@@ -4,5 +4,5 @@
 
 ## Steps
 # The security review context is handled exclusively by the FAC.
-# See: apm2 fac review dispatch --type security
-apm2 fac review dispatch 123 --type security
+# See: apm2 fac restart --pr 123
+apm2 fac restart --pr 123

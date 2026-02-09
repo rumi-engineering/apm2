@@ -23,25 +23,18 @@
         };
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-
-        optionalCargoNextest =
-          if pkgs ? cargo-nextest then
-            [ pkgs.cargo-nextest ]
-          else
-            [ ];
       in
       {
         devShells.default = pkgs.mkShell {
-          packages =
-            [
-              rustToolchain
-              pkgs.protobuf
-              pkgs.git
-              pkgs.rsync
-              pkgs.ripgrep
-              pkgs.gh
-            ]
-            ++ optionalCargoNextest;
+          packages = [
+            rustToolchain
+            pkgs.protobuf
+            pkgs.git
+            pkgs.rsync
+            pkgs.ripgrep
+            pkgs.gh
+            pkgs.cargo-nextest
+          ];
 
           env = {
             PROTOC = "${pkgs.protobuf}/bin/protoc";

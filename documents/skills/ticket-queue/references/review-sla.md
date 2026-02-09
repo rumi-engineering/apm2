@@ -40,9 +40,9 @@ decision_tree:
         - id: ENFORCE_15M_DEADLINE
           action: "Verify `now - started_at < 900s`. If breach (per `review_gate_status`), restart reviews."
         - id: RESTART_IF_UNHEALTHY
-          action: "If STALE/DEAD, trigger `apm2 fac review dispatch <PR_URL> --type all`."
+          action: "If STALE/DEAD, trigger `apm2 fac restart --pr <PR_NUMBER>`."
         - id: ESCALATE_IF_REVIEWS_NOT_RUNNING
-          action: "If state empty AND pending, escalate to implementer. Run `apm2 fac review dispatch <PR_URL> --type all` to retrigger reviews."
+          action: "If state empty AND pending, escalate to implementer. Run `apm2 fac restart --pr <PR_NUMBER>` to restart reviews."
         - id: LOOP_UNTIL_RESOLVED
           action: "Remediate until reviews finish."
       decisions[2]:

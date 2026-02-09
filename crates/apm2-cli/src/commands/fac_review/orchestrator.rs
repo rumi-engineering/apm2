@@ -34,6 +34,29 @@ use super::types::{
     split_owner_repo, validate_expected_head_sha,
 };
 
+// ── Token usage extraction ───────────────────────────────────────────────────
+
+/// Extract total token usage from review agent output.
+///
+/// Scans log output for token usage patterns emitted by Codex CLI
+/// (`"total_tokens": NNN`) and Gemini CLI (similar structured output).
+/// Returns the last (most complete) match found.
+fn extract_token_usage(log_path: &std::path::Path) -> Option<u64> {
+    let content = fs::read_to_string(log_path).ok()?;
+    // Codex pattern: "total_tokens": 12345 or totalTokens: 12345
+    let re = regex::Regex::new(r#"(?:"total_tokens"|"totalTokens"|total_tokens)\s*[:=]\s*(\d+)"#)
+        .ok()?;
+    let mut last_match = None;
+    for cap in re.captures_iter(&content) {
+        if let Some(m) = cap.get(1) {
+            if let Ok(n) = m.as_str().parse::<u64>() {
+                last_match = Some(n);
+            }
+        }
+    }
+    last_match
+}
+
 // ── resolve_repo_root (kept here, used only by run_single_review) ───────────
 
 fn resolve_repo_root() -> Result<std::path::PathBuf, String> {
@@ -174,6 +197,8 @@ pub fn run_review_inner(
                 .as_ref()
                 .map_or_else(|| "SKIPPED".to_string(), |entry| entry.verdict.clone()),
             "total_secs": total_started.elapsed().as_secs(),
+            "security_tokens": security_summary.as_ref().and_then(|s| s.tokens_used),
+            "quality_tokens": quality_summary.as_ref().and_then(|s| s.tokens_used),
         }),
     )?;
 
@@ -274,6 +299,7 @@ fn run_single_review(
                 backend,
                 duration_secs: review_started.elapsed().as_secs(),
                 restart_count,
+                tokens_used: None,
             },
             final_head_sha: current_head_sha,
         });
@@ -313,6 +339,7 @@ fn run_single_review(
                     backend: current_model.backend.as_str().to_string(),
                     duration_secs: review_started.elapsed().as_secs(),
                     restart_count,
+                    tokens_used: None,
                 },
                 final_head_sha: current_head_sha.clone(),
             });
@@ -411,6 +438,7 @@ fn run_single_review(
                     let is_valid_completion = comment_id.is_some();
 
                     if is_valid_completion {
+                        let tokens = extract_token_usage(&log_path);
                         emit_event(
                             event_ctx,
                             "run_complete",
@@ -420,6 +448,7 @@ fn run_single_review(
                                 "exit_code": exit_code.unwrap_or(0),
                                 "duration_secs": run_started.elapsed().as_secs(),
                                 "verdict": completion_verdict,
+                                "tokens_used": tokens,
                             }),
                         )?;
 
@@ -472,6 +501,7 @@ fn run_single_review(
                         }
 
                         remove_review_state_entry(&run_key)?;
+                        let tokens = extract_token_usage(&log_path);
 
                         return Ok(SingleReviewResult {
                             summary: SingleReviewSummary {
@@ -482,6 +512,7 @@ fn run_single_review(
                                 backend: current_model.backend.as_str().to_string(),
                                 duration_secs: review_started.elapsed().as_secs(),
                                 restart_count,
+                                tokens_used: tokens,
                             },
                             final_head_sha: current_head_sha,
                         });
@@ -514,6 +545,7 @@ fn run_single_review(
                                 backend: current_model.backend.as_str().to_string(),
                                 duration_secs: review_started.elapsed().as_secs(),
                                 restart_count,
+                                tokens_used: extract_token_usage(&log_path),
                             },
                             final_head_sha: current_head_sha,
                         });
@@ -545,6 +577,7 @@ fn run_single_review(
                                 backend: current_model.backend.as_str().to_string(),
                                 duration_secs: review_started.elapsed().as_secs(),
                                 restart_count,
+                                tokens_used: extract_token_usage(&log_path),
                             },
                             final_head_sha: current_head_sha,
                         });
@@ -562,6 +595,7 @@ fn run_single_review(
                                 backend: current_model.backend.as_str().to_string(),
                                 duration_secs: review_started.elapsed().as_secs(),
                                 restart_count,
+                                tokens_used: extract_token_usage(&log_path),
                             },
                             final_head_sha: current_head_sha,
                         });
@@ -606,6 +640,7 @@ fn run_single_review(
                             backend: current_model.backend.as_str().to_string(),
                             duration_secs: review_started.elapsed().as_secs(),
                             restart_count,
+                            tokens_used: extract_token_usage(&log_path),
                         },
                         final_head_sha: current_head_sha,
                     });
@@ -711,6 +746,7 @@ fn run_single_review(
                             .unwrap_or_else(|_| "UNKNOWN".to_string())
                     });
                     if completion_verdict != "UNKNOWN" {
+                        let tokens = extract_token_usage(&log_path);
                         emit_event(
                             event_ctx,
                             "run_complete",
@@ -721,6 +757,7 @@ fn run_single_review(
                                 "duration_secs": run_started.elapsed().as_secs(),
                                 "verdict": completion_verdict,
                                 "completion_mode": "live_comment_detected",
+                                "tokens_used": tokens,
                             }),
                         )?;
                         emit_event(
@@ -744,6 +781,7 @@ fn run_single_review(
                                 backend: current_model.backend.as_str().to_string(),
                                 duration_secs: review_started.elapsed().as_secs(),
                                 restart_count,
+                                tokens_used: extract_token_usage(&log_path),
                             },
                             final_head_sha: current_head_sha,
                         });
@@ -775,6 +813,7 @@ fn run_single_review(
                             backend: current_model.backend.as_str().to_string(),
                             duration_secs: review_started.elapsed().as_secs(),
                             restart_count,
+                            tokens_used: extract_token_usage(&log_path),
                         },
                         final_head_sha: current_head_sha,
                     });
@@ -806,6 +845,7 @@ fn run_single_review(
                                 backend: current_model.backend.as_str().to_string(),
                                 duration_secs: review_started.elapsed().as_secs(),
                                 restart_count,
+                                tokens_used: extract_token_usage(&log_path),
                             },
                             final_head_sha: current_head_sha,
                         });

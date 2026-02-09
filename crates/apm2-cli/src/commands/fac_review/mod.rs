@@ -7,19 +7,25 @@
 //! - Pulse-file based SHA freshness checks and resume flow
 //! - Liveness-based stall detection and bounded model fallback
 //! - Idempotent detached dispatch + projection snapshots for GitHub surfaces
-//! - GitHub projection retrigger (`forge-admission-cycle.yml`) from local CLI
+//! - Intelligent pipeline restart (`apm2 fac restart`) with CI state analysis
 
 mod backend;
 mod barrier;
+mod ci_status;
 mod detection;
 mod dispatch;
 mod events;
 mod evidence;
+mod gate_cache;
+mod gates;
 mod liveness;
+mod logs;
 mod model_pool;
 mod orchestrator;
+mod pipeline;
 mod projection;
 mod push;
+mod restart;
 mod state;
 mod types;
 
@@ -42,8 +48,8 @@ use state::{is_process_alive, read_pulse_file, with_review_state_shared};
 // Re-export public API for use by `fac.rs`
 pub use types::ReviewRunType;
 use types::{
-    BarrierSummary, DispatchSummary, KickoffSummary, RetriggerSummary, ReviewKind,
-    TERMINATE_TIMEOUT, parse_pr_url, split_owner_repo, validate_expected_head_sha,
+    BarrierSummary, DispatchSummary, KickoffSummary, ReviewKind, TERMINATE_TIMEOUT, parse_pr_url,
+    validate_expected_head_sha,
 };
 
 use crate::exit_codes::codes as exit_codes;
@@ -114,8 +120,11 @@ pub fn run_review(
                 println!("  Head (final): {}", summary.final_head_sha);
                 println!("  Total secs:   {}", summary.total_secs);
                 if let Some(security) = &summary.security {
+                    let tok = security
+                        .tokens_used
+                        .map_or_else(String::new, |n| format!(", tokens={n}"));
                     println!(
-                        "  Security:     {} (verdict={}, model={}, backend={}, restarts={}, secs={})",
+                        "  Security:     {} (verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
                         if security.success { "PASS" } else { "FAIL" },
                         security.verdict,
                         security.model,
@@ -125,8 +134,11 @@ pub fn run_review(
                     );
                 }
                 if let Some(quality) = &summary.quality {
+                    let tok = quality
+                        .tokens_used
+                        .map_or_else(String::new, |n| format!(", tokens={n}"));
                     println!(
-                        "  Quality:      {} (verdict={}, model={}, backend={}, restarts={}, secs={})",
+                        "  Quality:      {} (verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
                         if quality.success { "PASS" } else { "FAIL" },
                         quality.verdict,
                         quality.model,
@@ -171,101 +183,6 @@ pub fn run_status(pr_number: Option<u32>, pr_url: Option<&str>, json_output: boo
             if json_output {
                 let payload = serde_json::json!({
                     "error": "fac_review_status_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_dispatch(
-    pr_url: &str,
-    review_type: ReviewRunType,
-    expected_head_sha: Option<&str>,
-    json_output: bool,
-) -> u8 {
-    match run_dispatch_inner(pr_url, review_type, expected_head_sha) {
-        Ok(summary) => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("FAC Review Dispatch");
-                println!("  PR:            {}", summary.pr_url);
-                println!("  PR Number:     {}", summary.pr_number);
-                println!("  Head SHA:      {}", summary.head_sha);
-                println!("  Dispatch Epoch {}", summary.dispatch_epoch);
-                for result in &summary.results {
-                    println!(
-                        "  - {}: {}{}{}{}",
-                        result.review_type,
-                        result.mode,
-                        result
-                            .unit
-                            .as_ref()
-                            .map_or_else(String::new, |value| format!(" unit={value}")),
-                        result
-                            .pid
-                            .map_or_else(String::new, |value| format!(" pid={value}")),
-                        result
-                            .log_file
-                            .as_ref()
-                            .map_or_else(String::new, |value| format!(" log={value}")),
-                    );
-                }
-            }
-            exit_codes::SUCCESS
-        },
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_dispatch_failed",
-                    "message": err,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-                );
-            } else {
-                eprintln!("ERROR: {err}");
-            }
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_retrigger(repo: &str, pr_number: u32, json_output: bool) -> u8 {
-    match run_retrigger_inner(repo, pr_number) {
-        Ok(summary) => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("FAC Review Retrigger");
-                println!("  Workflow:          {}", summary.workflow);
-                println!("  Repo:              {}", summary.repo);
-                println!("  PR Number:         {}", summary.pr_number);
-                println!("  Dispatched At:     {}", summary.dispatched_at);
-            }
-            exit_codes::SUCCESS
-        },
-        Err(err) => {
-            if json_output {
-                let payload = serde_json::json!({
-                    "error": "fac_review_retrigger_failed",
                     "message": err,
                 });
                 println!(
@@ -502,11 +419,47 @@ pub fn run_tail(lines: usize, follow: bool) -> u8 {
     }
 }
 
-pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, max_wait: u64) -> u8 {
-    push::run_push(repo, remote, branch, max_wait)
+pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
+    push::run_push(repo, remote, branch, ticket)
 }
 
-// ── Internal dispatch helper (shared with push) ─────────────────────────────
+pub fn run_restart(
+    repo: &str,
+    pr: Option<u32>,
+    pr_url: Option<&str>,
+    force: bool,
+    json_output: bool,
+) -> u8 {
+    restart::run_restart(repo, pr, pr_url, force, json_output)
+}
+
+pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
+    pipeline::run_pipeline(repo, pr_url, pr_number, sha)
+}
+
+pub fn run_logs(pr_number: Option<u32>, json_output: bool) -> u8 {
+    logs::run_logs(pr_number, json_output)
+}
+
+pub fn run_gates(
+    force: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    json_output: bool,
+) -> u8 {
+    gates::run_gates(
+        force,
+        timeout_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        json_output,
+    )
+}
+
+// ── Internal dispatch helper (shared with pipeline/restart) ─────────────────
 
 fn run_dispatch_inner(
     pr_url: &str,
@@ -555,46 +508,6 @@ fn run_dispatch_inner(
         dispatch_epoch,
         results,
     })
-}
-
-// ── Retrigger ───────────────────────────────────────────────────────────────
-
-fn run_retrigger_inner(repo: &str, pr_number: u32) -> Result<RetriggerSummary, String> {
-    if pr_number == 0 {
-        return Err("invalid PR number: must be > 0".to_string());
-    }
-    let _ = split_owner_repo(repo)?;
-
-    let args = build_retrigger_workflow_args(repo, pr_number);
-    let output = Command::new("gh")
-        .args(&args)
-        .output()
-        .map_err(|err| format!("failed to execute gh workflow run: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh workflow run failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    Ok(RetriggerSummary {
-        workflow: "forge-admission-cycle.yml".to_string(),
-        repo: repo.to_string(),
-        pr_number,
-        dispatched_at: types::now_iso8601_millis(),
-    })
-}
-
-fn build_retrigger_workflow_args(repo: &str, pr_number: u32) -> Vec<String> {
-    vec![
-        "workflow".to_string(),
-        "run".to_string(),
-        "forge-admission-cycle.yml".to_string(),
-        "--repo".to_string(),
-        repo.to_string(),
-        "-f".to_string(),
-        format!("pr_number={pr_number}"),
-    ]
 }
 
 // ── Kickoff ─────────────────────────────────────────────────────────────────
@@ -971,23 +884,6 @@ mod tests {
     #[test]
     fn test_select_fallback_model_unknown_returns_none() {
         assert!(select_fallback_model("unknown-model").is_none());
-    }
-
-    #[test]
-    fn test_build_retrigger_workflow_args() {
-        let args = super::build_retrigger_workflow_args("guardian-intelligence/apm2", 508);
-        assert_eq!(args[0], "workflow");
-        assert_eq!(args[1], "run");
-        assert!(args.contains(&"forge-admission-cycle.yml".to_string()));
-        assert!(args.contains(&"guardian-intelligence/apm2".to_string()));
-        assert!(args.contains(&"pr_number=508".to_string()));
-        assert!(!args.iter().any(|value| value.contains("mode=")));
-        assert!(!args.iter().any(|value| value.contains("review_type=")));
-        assert!(
-            !args
-                .iter()
-                .any(|value| value.contains("projection_seconds="))
-        );
     }
 
     #[test]

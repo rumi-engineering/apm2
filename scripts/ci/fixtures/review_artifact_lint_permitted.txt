@@ -10,7 +10,7 @@
 gh pr comment $PR_URL --body-file findings.md
 
 # Permitted: apm2 fac path for reviews
-apm2 fac review dispatch 123 --type security
+apm2 fac restart --pr 123
 
 # Permitted: reading a file (no API call)
 cat documents/reviews/SECURITY_REVIEW_PROMPT.md

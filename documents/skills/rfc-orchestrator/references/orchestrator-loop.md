@@ -385,9 +385,9 @@ procedures[3]:
         command: "gh pr view <branch_name> --json url --jq .url"
 
       - id: RUN_REVIEWS
-        action: "Run reviews SYNCHRONOUSLY (do NOT background)."
+        action: "Reviews are automatically dispatched in parallel after gates pass, but if you see a failure or need to manually dispatch reviewers you can run the below command."
         commands[1]:
-          - "apm2 fac review dispatch <pr_url> --type all"
+          - "apm2 fac restart --pr <PR_NUMBER>"
 
       - id: VERIFY_POSTED
         command: "gh api repos/{owner}/{repo}/commits/{head_sha}/status"

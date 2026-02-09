@@ -23,7 +23,7 @@ commands[22]:
     command: "gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/$(gh pr view <BRANCH_NAME> --json headRefOid --jq .headRefOid)/status --jq '.statuses[] | select(.context == \"Review Gate Success\") | \"\(.context): \(.state)\"'"
     purpose: "Query Review Gate Success status directly via GitHub API."
   - name: trigger-reviews
-    command: "apm2 fac review dispatch <PR_URL> --type all"
+    command: "apm2 fac restart --pr <PR_NUMBER>"
     purpose: "Trigger AI reviews."
   - name: cleanup-branch
     command: "git checkout main && git pull && git branch -D <BRANCH_NAME>"

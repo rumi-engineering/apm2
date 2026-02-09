@@ -22,7 +22,7 @@ decision_tree:
       purpose: "Run bounded, evidence-first orchestration ticks until stop condition."
       steps[4]:
         - id: SNAPSHOT
-          action: "Run poll_dashboard, then capture per-PR fac_review_status + fac_review_project as primary lifecycle signals; use pr_state_json + commit_statuses for metadata/projection cross-checks."
+          action: "Capture per-PR fac_review_status + fac_review_project as primary lifecycle signals; use pr_state_json + commit_statuses for metadata/projection cross-checks; use fac_review_tail for recent event stream."
         - id: CLASSIFY
           action: |
             For each PR, assign exactly one state:
@@ -41,14 +41,19 @@ decision_tree:
       steps[6]:
         - id: READY_TO_MERGE_ACTION
           action: "For READY_TO_MERGE PRs, run enable_auto_merge."
-        - id: REVIEW_LAUNCH_ACTION
-          action: "For REVIEW_MISSING PRs with available review slots, run launch_reviews and pass PR_URL into review prompts."
+        - id: REVIEW_MONITOR_ACTION
+          action: |
+            For REVIEW_MISSING PRs: reviews auto-start via the Forge Admission Cycle CI workflow on push.
+            Do NOT manually dispatch reviews. Instead, monitor with `apm2 fac review project --pr <N> --emit-errors`.
+            If reviews have not started within 2 minutes of the push, use `apm2 fac restart --pr <PR_NUMBER>` as recovery.
+            If restart also fails, use `gh workflow run forge-admission-cycle.yml` as last-resort fallback.
         - id: FIX_AGENT_ACTION
           action: |
             For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent.
             Inject references/common-review-findings.md and references/daemon-implementation-patterns.md in its context.
+            Fix agents should use `apm2 fac push` to push their changes — this auto-creates/updates the PR and triggers reviews.
         - id: REVIEW_PROGRESS_ACTION
-          action: "For PRs with active reviews, run check_review_progress and fac_review_project; the Forge Admission Cycle workflow remains the GitHub projection path."
+          action: "For PRs with active reviews, run fac_review_status and fac_review_project; the Forge Admission Cycle workflow remains the GitHub projection path."
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
       next: STALL_AND_BACKPRESSURE

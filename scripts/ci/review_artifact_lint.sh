@@ -86,7 +86,7 @@ check_dependencies
 # PROHIBIT all direct GitHub API calls in review artifacts.
 #
 # The approved paths are:
-#   - apm2 fac review dispatch — for triggering reviews
+#   - apm2 fac restart — for triggering reviews
 #   - apm2 fac review — for review operations
 #
 # KNOWN-GOOD LINE ALLOWLIST (replaces blanket file exemption):
@@ -163,7 +163,7 @@ detect_forbidden_api_usage() {
         log_error "Forbidden gh api call in review artifact:"
         log_error "  ${file}"
         log_error "  Review artifacts must not call gh api directly."
-        log_error "  Use 'apm2 fac review dispatch' instead."
+        log_error "  Use 'apm2 fac restart' instead."
         return 0
     fi
 
@@ -173,7 +173,7 @@ detect_forbidden_api_usage() {
             log_error "Forbidden curl-to-GitHub call in review artifact:"
             log_error "  ${file}"
             log_error "  Review artifacts must not call GitHub APIs via curl."
-            log_error "  Use 'apm2 fac review dispatch' instead."
+            log_error "  Use 'apm2 fac restart' instead."
             return 0
         fi
     fi
@@ -373,7 +373,7 @@ while IFS= read -r review_file; do
         if detect_direct_status_write "$logical_line"; then
             log_error "Forbidden direct GitHub API call in review artifact:"
             log_error "  ${review_file}:${line_num}: ${logical_line}"
-            log_error "  Use 'apm2 fac review dispatch' instead."
+            log_error "  Use 'apm2 fac restart' instead."
             VIOLATIONS=1
         fi
         if detect_cross_category_exec "$logical_line" "$file_basename"; then

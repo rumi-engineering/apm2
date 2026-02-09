@@ -31,9 +31,9 @@ commands[16]:
   - name: fac-project
     command: "apm2 fac review project --pr <PR_NUMBER> --head-sha <HEAD_SHA> --emit-errors"
     purpose: "Primary FAC projection snapshot for one-line health plus structured ERROR lines."
-  - name: fac-retrigger-cli
-    command: "apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER>"
-    purpose: "Projection-native retrigger path: dispatch Forge Admission Cycle workflow from apm2 CLI."
+  - name: fac-restart-cli
+    command: "apm2 fac restart --pr <PR_NUMBER>"
+    purpose: "Restart FAC review cycle from apm2 CLI."
   - name: fac-rerun-all
     command: "gh workflow run forge-admission-cycle.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
     purpose: "Fallback: retrigger Forge Admission Cycle for a PR."
@@ -43,9 +43,6 @@ commands[16]:
   - name: finish
     command: "git worktree remove <WORKTREE_PATH>"
     purpose: "Cleanup worktree after PR merges."
-  - name: dispatch-reviews
-    command: "apm2 fac review dispatch <PR_URL> --type all"
-    purpose: "Dispatch AI security and quality reviews for a PR."
-  - name: fac-dispatch-review
-    command: "apm2 fac review dispatch <PR_URL> --type <security|quality>"
-    purpose: "Dispatch a specific type of AI review for a PR."
+  - name: restart-reviews
+    command: "apm2 fac restart --pr <PR_NUMBER>"
+    purpose: "Restart AI security and quality reviews for a PR."

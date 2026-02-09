@@ -70,17 +70,9 @@ check-review-gate-status:
       --jq '.statuses[] | select(.context == "Review Gate Success") | "\(.context): \(.state)"'
   purpose: Check Review Gate Success commit status
 
-trigger-reviews:
-  command: apm2 fac review dispatch <PR_URL> --type all
-  purpose: Dispatch all AI reviews for a PR
-
-trigger-security-review:
-  command: apm2 fac review dispatch <PR_URL> --type security
-  purpose: Run security review
-
-trigger-quality-review:
-  command: apm2 fac review dispatch <PR_URL> --type quality
-  purpose: Run quality review
+restart-reviews:
+  command: apm2 fac restart --pr <PR_NUMBER>
+  purpose: Restart gates (including reviews) for a PR (handles both security and quality automatically)
 ```
 
 ## Process Management

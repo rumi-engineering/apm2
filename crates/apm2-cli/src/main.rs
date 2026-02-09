@@ -153,10 +153,6 @@ enum Commands {
     /// FAC commands (ledger/CAS oriented debug UX)
     Fac(commands::fac::FacCommand),
 
-    // === CI orchestration ===
-    /// CI commands (bounded orchestration and observability)
-    Ci(commands::ci::CiCommand),
-
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -429,11 +425,6 @@ fn main() -> Result<()> {
             // status/list subcommands route through operator IPC.
             // Exit codes per RFC-0018.
             let exit_code = commands::fac::run_fac(&fac_cmd, &operator_socket);
-            std::process::exit(i32::from(exit_code));
-        },
-        Commands::Ci(ci_cmd) => {
-            // CI commands use bounded user-scope orchestration and local task DAGs.
-            let exit_code = commands::ci::run_ci(&ci_cmd);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {

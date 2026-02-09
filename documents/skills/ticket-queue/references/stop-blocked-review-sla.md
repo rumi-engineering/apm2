@@ -11,7 +11,7 @@ decision_tree:
         - id: INCLUDE_EVIDENCE
           action: "Include: PR URL, SHA, reviewer_state summary, PIDs, log snippets."
         - id: SUGGEST_FALLBACK
-          action: "Rerun reviews: `apm2 fac review dispatch <PR_URL> --type all`."
+          action: "Rerun reviews: `apm2 fac restart --pr <PR_NUMBER>`."
         - id: NOTE_SEQUENTIAL_BLOCK
           action: "Sequential policy prevents progress."
         - id: STOP

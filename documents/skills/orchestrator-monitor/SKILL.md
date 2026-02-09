@@ -27,8 +27,12 @@ bootstrap:
     when: "FIRST — before invoking any `apm2 fac` command."
 
 notes:
-  - "Use `apm2 fac review` as the primary authority path for reviewer lifecycle actions (`dispatch`, `status`, `project`, `retrigger`)."
-  - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata, merge actions, and full comment-body retrieval)."
+  - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, and enables auto-merge. Reviews auto-start via CI."
+  - "Use `apm2 fac gates` to run all evidence gates locally with resource-bounded test execution. Results are cached per-SHA so `apm2 fac pipeline` skips already-validated gates."
+  - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
+  - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
+  - "Use `apm2 fac logs --pr <N>` to discover and display local pipeline/evidence/review log files. Add `--json` for machine-readable output."
+  - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata and full comment-body retrieval)."
 
 references[10]:
   - path: "@documents/theory/glossary/glossary.json"
@@ -48,9 +52,9 @@ references[10]:
   - path: "references/daemon-implementation-patterns.md"
     purpose: "Daemon-specific invariants and wiring rules for implementor agents."
   - path: "@documents/reviews/SECURITY_REVIEW_PROMPT.md"
-    purpose: "Security review prompt contract used by launch scripts."
+    purpose: "Security review prompt contract used by FAC review dispatch."
   - path: "@documents/reviews/CODE_QUALITY_PROMPT.md"
-    purpose: "Code-quality review prompt contract used by launch scripts."
+    purpose: "Code-quality review prompt contract used by FAC review dispatch."
 
 implementor_warm_handoff_required_reads[16]:
   - path: "@documents/theory/glossary/glossary.json"
@@ -98,13 +102,30 @@ review_prompt_required_payload[1]:
   - field: pr_url
     requirement: "Provide PR_URL to SECURITY_REVIEW_PROMPT and CODE_QUALITY_PROMPT; each prompt should resolve reviewed SHA from PR_URL."
 
+push_workflow:
+  canonical_command: "apm2 fac push --ticket <TICKET_YAML>"
+  behavior:
+    - "Pushes the current branch to remote."
+    - "Creates or updates the PR from ticket YAML metadata (title, body)."
+    - "Enables auto-merge (squash) and exits immediately."
+    - "The Forge Admission Cycle CI workflow auto-triggers on the new HEAD and dispatches reviews."
+  implication: "Agents MUST NOT manually dispatch reviews after pushing. Reviews start automatically via CI."
+
 runtime_review_protocol:
-  primary_entrypoint: "apm2 fac review dispatch <PR_URL> --type all"
-  recovery_entrypoint: "apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER>"
+  automatic_trigger: "Reviews are auto-dispatched by the `apm2 fac push` pipeline on every push. Agents do NOT need to manually trigger reviews after pushing."
+  manual_restart: "apm2 fac restart --pr <PR_NUMBER> (use ONLY when auto-dispatch has failed or for recovery)"
+  recovery_entrypoint: "apm2 fac restart --pr <PR_NUMBER>"
+  monitoring:
+    primary: "apm2 fac review project --pr <PR_NUMBER> --emit-errors (1Hz projection of review + CI gate states)"
+    secondary: "apm2 fac review status --pr <PR_NUMBER> (snapshot of reviewer process state)"
+    log_discovery: "apm2 fac logs --pr <PR_NUMBER> (lists all local log files for evidence gates, pipeline runs, review dispatch, and events)"
+    ci_status_comment: "PR comment with marker `apm2-ci-status:v1` containing YAML gate statuses (rustfmt, clippy, doc, test, security_review, quality_review)"
   observability_surfaces:
     - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
     - "~/.apm2/review_state.json (active review process/model/backend state)"
+    - "~/.apm2/pipeline_logs/pr<PR>-<SHA>.log (per-push pipeline stdout/stderr)"
     - "~/.apm2/review_pulses/pr<PR>_review_pulse_{security|quality}.json (PR-scoped HEAD SHA pulse files)"
+    - "PR comment `apm2-ci-status:v1` (machine-readable YAML with all gate statuses and token counts)"
   required_semantics:
     - "Review runs execute security and quality in parallel when `--type all` is used."
     - "Dispatch is idempotent start-or-join for duplicate PR/SHA requests."
@@ -125,7 +146,7 @@ invariants[14]:
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch per PR at any time."
-  - "Use `apm2 fac review retrigger` for review reruns; direct `gh workflow run forge-admission-cycle.yml` is fallback-only."
+  - "Use `apm2 fac restart` for review reruns; direct `gh workflow run forge-admission-cycle.yml` is fallback-only."
   - "No merge action without Forge Admission Cycle=success for current HEAD SHA."
   - "Review prompt dispatch includes review_prompt_required_payload."
   - "Never use the same model family for both implementing and reviewing the same PR cycle."
