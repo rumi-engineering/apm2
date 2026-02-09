@@ -123,6 +123,45 @@ pub enum SessionIdentityError {
         /// The risk tier with the invalid threshold.
         risk_tier: RiskTier,
     },
+
+    /// Freshness witness is missing for an authoritative (Tier2+)
+    /// non-denied response.
+    #[error("freshness witness is required for non-denied {risk_tier:?} response")]
+    MissingFreshnessWitness {
+        /// The risk tier that required a freshness witness.
+        risk_tier: RiskTier,
+    },
+
+    /// Freshness witness is the zero hash for an authoritative (Tier2+)
+    /// non-denied response.
+    #[error("freshness witness must be non-zero for non-denied {risk_tier:?} response")]
+    ZeroFreshnessWitness {
+        /// The risk tier that required a non-zero freshness witness.
+        risk_tier: RiskTier,
+    },
+
+    /// Policy pointer is missing for an authoritative (Tier2+)
+    /// non-denied response.
+    #[error("policy pointer is required for non-denied {risk_tier:?} response")]
+    MissingPolicyPointer {
+        /// The risk tier that required a policy pointer.
+        risk_tier: RiskTier,
+    },
+
+    /// Policy pointer is the zero hash for an authoritative (Tier2+)
+    /// non-denied response.
+    #[error("policy pointer must be non-zero for non-denied {risk_tier:?} response")]
+    ZeroPolicyPointer {
+        /// The risk tier that required a non-zero policy pointer.
+        risk_tier: RiskTier,
+    },
+
+    /// Response construction failed; receipt forced to denied.
+    #[error("response construction failed: {reason}")]
+    ResponseConstructionFailed {
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
 }
 
 // =============================================================================
@@ -347,8 +386,10 @@ impl SessionOpenResponse {
     /// # Errors
     ///
     /// Returns an error if required hashes are missing for the given
-    /// decision. For Tier2+ admitted/degraded sessions, `freshness_witness`
-    /// and `policy_pointer` must be provided.
+    /// decision. For non-denied responses:
+    /// - `cell_certificate_hash` and `directory_head_hash` must be non-zero.
+    /// - For Tier2+ (authoritative) tiers, `freshness_witness` and
+    ///   `policy_pointer` must be `Some(non-zero-hash)`.
     pub fn new(
         cell_certificate_hash: Hash,
         directory_head_hash: Hash,
@@ -357,13 +398,36 @@ impl SessionOpenResponse {
         freshness_witness: Option<Hash>,
         policy_pointer: Option<Hash>,
     ) -> Result<Self, SessionIdentityError> {
-        // For admitted sessions, both hashes must be present.
+        // For non-denied sessions, both certificate hashes must be present.
         if decision != FreshnessDecision::Denied {
             if cell_certificate_hash == [0u8; HASH_SIZE] {
                 return Err(SessionIdentityError::MissingCellCertificateHash);
             }
             if directory_head_hash == [0u8; HASH_SIZE] {
                 return Err(SessionIdentityError::MissingDirectoryHeadHash);
+            }
+
+            // Tier2+ (authoritative) non-denied responses require both
+            // freshness_witness and policy_pointer with non-zero hashes.
+            if FreshnessPolicy::is_authoritative_tier(risk_tier) {
+                match freshness_witness {
+                    None => {
+                        return Err(SessionIdentityError::MissingFreshnessWitness { risk_tier });
+                    },
+                    Some(h) if h == [0u8; HASH_SIZE] => {
+                        return Err(SessionIdentityError::ZeroFreshnessWitness { risk_tier });
+                    },
+                    _ => {},
+                }
+                match policy_pointer {
+                    None => {
+                        return Err(SessionIdentityError::MissingPolicyPointer { risk_tier });
+                    },
+                    Some(h) if h == [0u8; HASH_SIZE] => {
+                        return Err(SessionIdentityError::ZeroPolicyPointer { risk_tier });
+                    },
+                    _ => {},
+                }
             }
         }
         Ok(Self {
@@ -939,9 +1003,22 @@ pub fn process_session_open(
                     }
                 },
                 Err(e) => {
-                    // Response construction failed (missing hashes).
-                    let receipt =
-                        SessionOpenReceipt::from_outcome(request, None, &outcome, current_tick);
+                    // Response construction failed — force receipt to Denied.
+                    // Fail-closed: never emit a success-class receipt when
+                    // the response could not be constructed.
+                    let denied_outcome = FreshnessOutcome {
+                        decision: FreshnessDecision::Denied,
+                        risk_tier: outcome.risk_tier,
+                        age_ticks: outcome.age_ticks,
+                        max_staleness_ticks: outcome.max_staleness_ticks,
+                        defect: outcome.defect,
+                    };
+                    let receipt = SessionOpenReceipt::from_outcome(
+                        request,
+                        None,
+                        &denied_outcome,
+                        current_tick,
+                    );
                     SessionOpenResult {
                         response: Err(e),
                         receipt,
@@ -1058,11 +1135,12 @@ mod tests {
 
     #[test]
     fn response_rejects_zero_cell_cert_when_admitted() {
+        // Use Tier0 to isolate the cell-cert check from Tier2+ witness/policy checks.
         let result = SessionOpenResponse::new(
             zero_hash(),
             test_hash(0x02),
             FreshnessDecision::Admitted,
-            RiskTier::Tier2,
+            RiskTier::Tier0,
             None,
             None,
         );
@@ -1073,14 +1151,49 @@ mod tests {
     }
 
     #[test]
+    fn response_rejects_zero_cell_cert_when_admitted_tier2() {
+        // Tier2 with valid witness/policy still rejects zero cell cert.
+        let result = SessionOpenResponse::new(
+            zero_hash(),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::MissingCellCertificateHash
+        );
+    }
+
+    #[test]
     fn response_rejects_zero_dir_head_when_admitted() {
+        // Use Tier0 to isolate the dir-head check from Tier2+ witness/policy checks.
+        let result = SessionOpenResponse::new(
+            test_hash(0x01),
+            zero_hash(),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier0,
+            None,
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::MissingDirectoryHeadHash
+        );
+    }
+
+    #[test]
+    fn response_rejects_zero_dir_head_when_admitted_tier2() {
+        // Tier2 with valid witness/policy still rejects zero dir head.
         let result = SessionOpenResponse::new(
             test_hash(0x01),
             zero_hash(),
             FreshnessDecision::Admitted,
             RiskTier::Tier2,
-            None,
-            None,
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
         );
         assert_eq!(
             result.unwrap_err(),
@@ -1142,11 +1255,13 @@ mod tests {
 
     #[test]
     fn response_canonical_hash_differs_with_witness() {
+        // Use Tier0 (non-authoritative) to compare responses with/without witness
+        // since Tier2+ now requires witness + policy for non-denied.
         let r1 = SessionOpenResponse::new(
             test_hash(0x01),
             test_hash(0x02),
             FreshnessDecision::Admitted,
-            RiskTier::Tier2,
+            RiskTier::Tier0,
             None,
             None,
         )
@@ -1155,7 +1270,7 @@ mod tests {
             test_hash(0x01),
             test_hash(0x02),
             FreshnessDecision::Admitted,
-            RiskTier::Tier2,
+            RiskTier::Tier0,
             Some(test_hash(0xCC)),
             None,
         )
@@ -1736,7 +1851,9 @@ mod tests {
     }
 
     #[test]
-    fn process_admitted_with_zero_cell_cert_fails() {
+    fn process_admitted_with_zero_cell_cert_fails_receipt_denied() {
+        // When the evaluator admits but response construction fails,
+        // the receipt MUST be forced to Denied (fail-closed).
         let eval = default_evaluator();
         let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier2)
             .unwrap();
@@ -1747,15 +1864,15 @@ mod tests {
             100,
             zero_hash(),
             test_hash(0xBB),
-            None,
-            None,
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
         );
         assert!(matches!(
             result.response.unwrap_err(),
             SessionIdentityError::MissingCellCertificateHash
         ));
-        // Receipt still emitted even on response construction failure.
-        assert_eq!(result.receipt.decision(), FreshnessDecision::Admitted);
+        // Receipt forced to Denied on response construction failure (BLOCKER 2).
+        assert_eq!(result.receipt.decision(), FreshnessDecision::Denied);
     }
 
     #[test]
@@ -1795,5 +1912,296 @@ mod tests {
             max_staleness_ticks: 1000,
         };
         assert_eq!(d.risk_tier(), RiskTier::Tier4);
+    }
+
+    // =========================================================================
+    // BLOCKER 1: Tier2+ freshness_witness / policy_pointer enforcement
+    // =========================================================================
+
+    #[test]
+    fn tier2_admitted_rejects_missing_freshness_witness() {
+        let result = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            None,
+            Some(test_hash(0xDD)),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::MissingFreshnessWitness {
+                risk_tier: RiskTier::Tier2
+            }
+        );
+    }
+
+    #[test]
+    fn tier2_admitted_rejects_zero_freshness_witness() {
+        let result = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            Some(zero_hash()),
+            Some(test_hash(0xDD)),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::ZeroFreshnessWitness {
+                risk_tier: RiskTier::Tier2
+            }
+        );
+    }
+
+    #[test]
+    fn tier2_admitted_rejects_missing_policy_pointer() {
+        let result = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::MissingPolicyPointer {
+                risk_tier: RiskTier::Tier2
+            }
+        );
+    }
+
+    #[test]
+    fn tier2_admitted_rejects_zero_policy_pointer() {
+        let result = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            Some(zero_hash()),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::ZeroPolicyPointer {
+                risk_tier: RiskTier::Tier2
+            }
+        );
+    }
+
+    #[test]
+    fn tier3_degraded_rejects_missing_witness_and_policy() {
+        // Tier3 is authoritative, even degraded decisions need bindings.
+        // Note: Tier3 degraded is unusual but possible via direct response
+        // construction; the evaluator itself would deny Tier3 missing proofs.
+        let result = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Degraded,
+            RiskTier::Tier3,
+            None,
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::MissingFreshnessWitness {
+                risk_tier: RiskTier::Tier3
+            }
+        );
+    }
+
+    #[test]
+    fn tier4_admitted_rejects_zero_witness() {
+        let result = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier4,
+            Some(zero_hash()),
+            Some(test_hash(0xDD)),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionIdentityError::ZeroFreshnessWitness {
+                risk_tier: RiskTier::Tier4
+            }
+        );
+    }
+
+    #[test]
+    fn tier0_admitted_allows_missing_witness_and_policy() {
+        // Tier0 is non-authoritative; witness/policy not required.
+        let resp = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp.decision(), FreshnessDecision::Admitted);
+        assert!(resp.freshness_witness().is_none());
+        assert!(resp.policy_pointer().is_none());
+    }
+
+    #[test]
+    fn tier1_degraded_allows_missing_witness_and_policy() {
+        // Tier1 is non-authoritative; witness/policy not required.
+        let resp = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Degraded,
+            RiskTier::Tier1,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp.decision(), FreshnessDecision::Degraded);
+    }
+
+    #[test]
+    fn tier2_denied_allows_missing_witness_and_policy() {
+        // Denied responses skip all binding checks regardless of tier.
+        let resp = SessionOpenResponse::new(
+            zero_hash(),
+            zero_hash(),
+            FreshnessDecision::Denied,
+            RiskTier::Tier2,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp.decision(), FreshnessDecision::Denied);
+    }
+
+    #[test]
+    fn tier2_admitted_accepts_valid_bindings() {
+        // Happy path: Tier2 admitted with non-zero witness and policy.
+        let resp = SessionOpenResponse::new(
+            test_hash(0x01),
+            test_hash(0x02),
+            FreshnessDecision::Admitted,
+            RiskTier::Tier2,
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        )
+        .unwrap();
+        assert_eq!(resp.freshness_witness(), Some(&test_hash(0xCC)));
+        assert_eq!(resp.policy_pointer(), Some(&test_hash(0xDD)));
+    }
+
+    // =========================================================================
+    // BLOCKER 2: Receipt consistency on response construction failure
+    // =========================================================================
+
+    #[test]
+    fn process_response_construction_failure_forces_denied_receipt_tier2() {
+        // Evaluator admits (fresh Tier2 proof), but we supply zero cell cert
+        // to force response construction failure. Receipt MUST be Denied.
+        let eval = default_evaluator();
+        let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier2)
+            .unwrap();
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            100,
+            zero_hash(), // <-- forces response construction failure
+            test_hash(0xBB),
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        );
+        // Response is an error.
+        assert!(result.response.is_err());
+        // Receipt MUST be Denied even though evaluator would have admitted.
+        assert_eq!(
+            result.receipt.decision(),
+            FreshnessDecision::Denied,
+            "receipt must be denied when response construction fails"
+        );
+        // Response hash must be zero (no response constructed).
+        assert_eq!(result.receipt.response_hash(), &zero_hash());
+    }
+
+    #[test]
+    fn process_response_construction_failure_forces_denied_receipt_degraded() {
+        // Evaluator degrades (Tier0, missing proof), but we supply zero
+        // directory head to force response construction failure.
+        let eval = default_evaluator();
+        let req =
+            SessionOpenRequest::new(test_hash(0x01), zero_hash(), 0, RiskTier::Tier0).unwrap();
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            0,
+            test_hash(0xAA),
+            zero_hash(), // <-- forces response construction failure
+            None,
+            None,
+        );
+        // Response is an error.
+        assert!(result.response.is_err());
+        // Receipt MUST be Denied even though evaluator would have degraded.
+        assert_eq!(
+            result.receipt.decision(),
+            FreshnessDecision::Denied,
+            "receipt must be denied when response construction fails (degraded path)"
+        );
+    }
+
+    #[test]
+    fn process_response_construction_failure_missing_witness_forces_denied() {
+        // Evaluator admits Tier2, but no freshness witness provided.
+        // Response construction fails; receipt forced to Denied.
+        let eval = default_evaluator();
+        let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier2)
+            .unwrap();
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            100,
+            test_hash(0xAA),
+            test_hash(0xBB),
+            None, // <-- missing freshness witness for Tier2
+            Some(test_hash(0xDD)),
+        );
+        assert!(matches!(
+            result.response.unwrap_err(),
+            SessionIdentityError::MissingFreshnessWitness {
+                risk_tier: RiskTier::Tier2
+            }
+        ));
+        assert_eq!(
+            result.receipt.decision(),
+            FreshnessDecision::Denied,
+            "receipt forced to denied on missing Tier2 freshness witness"
+        );
+    }
+
+    #[test]
+    fn process_successful_response_receipt_matches_decision() {
+        // Verify that a successful admit produces a matching receipt decision.
+        let eval = default_evaluator();
+        let req = SessionOpenRequest::new(test_hash(0x01), test_hash(0x02), 100, RiskTier::Tier2)
+            .unwrap();
+        let result = process_session_open(
+            &eval,
+            &req,
+            200,
+            100,
+            test_hash(0xAA),
+            test_hash(0xBB),
+            Some(test_hash(0xCC)),
+            Some(test_hash(0xDD)),
+        );
+        let resp = result.response.unwrap();
+        assert_eq!(resp.decision(), FreshnessDecision::Admitted);
+        assert_eq!(result.receipt.decision(), FreshnessDecision::Admitted);
+        // Response hash must be non-zero (response was constructed).
+        assert_ne!(result.receipt.response_hash(), &zero_hash());
     }
 }
