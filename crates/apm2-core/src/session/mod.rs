@@ -81,6 +81,7 @@ pub mod crash;
 pub mod entropy;
 pub mod error;
 pub mod exit_handler;
+pub mod identity_proof;
 pub mod quarantine;
 pub mod recovery;
 pub mod reducer;
@@ -101,6 +102,13 @@ pub use entropy::{
 pub use error::{SessionError, StateName};
 pub use exit_handler::{
     ExitHandlerContext, ExitHandlerError, ExitHandlerResult, handle_exit_signal, release_lease_stub,
+};
+pub use identity_proof::{
+    DEFAULT_TIER0_MAX_STALENESS_TICKS, DEFAULT_TIER1_MAX_STALENESS_TICKS,
+    DEFAULT_TIER2_MAX_STALENESS_TICKS, DEFAULT_TIER3_MAX_STALENESS_TICKS,
+    DEFAULT_TIER4_MAX_STALENESS_TICKS, FreshnessDecision, FreshnessEvaluator, FreshnessOutcome,
+    FreshnessPolicy, SessionIdentityDefect, SessionIdentityError, SessionOpenReceipt,
+    SessionOpenRequest, SessionOpenResponse, SessionOpenResult, process_session_open,
 };
 pub use quarantine::{
     QuarantineConfig, QuarantineEvaluation, QuarantineInfo, QuarantineManager, QuarantineReason,
