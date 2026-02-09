@@ -865,12 +865,14 @@ impl DispatcherState {
             // TCK-00352: Wire V1 manifest store into production path
             .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
             // TCK-00399: Wire adapter registry for agent CLI process spawning.
-            // CAS is intentionally not wired in this constructor: fail-closed
+            // CAS is intentionally NOT wired here via .with_cas(): fail-closed
             // publish/ingest handlers require explicit CAS configuration via
             // with_persistence_and_cas(). The MemoryCas above is used only to
             // seed builtin adapter profiles at startup; it must NOT be wired
             // as the dispatcher CAS or PublishChangeSet will incorrectly
-            // succeed without durable storage (TCK-00412).
+            // succeed without durable storage (TCK-00412). Authority binding
+            // validation (TCK-00416) creates a per-request fallback MemoryCas
+            // when self.cas is None, so it works without wiring here.
             .with_adapter_registry(adapter_registry)
             .with_adapter_selection_policy(
                 adapter_selection_policy,

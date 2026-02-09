@@ -52,11 +52,12 @@
 //! operation and MUST NOT be carried forward into multi-tenant or cross-node
 //! federation without full RFC-0019 governance resolution.
 
-use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
 use tracing::warn;
 
 use crate::episode::capability::PolicyMintToken;
-use crate::protocol::dispatch::{PolicyResolution, PolicyResolutionError, PolicyResolver};
+use crate::protocol::dispatch::{
+    PolicyResolution, PolicyResolutionError, PolicyResolver, build_policy_context_pack,
+};
 use crate::protocol::messages::WorkRole;
 
 /// Resolves policy via governance integration.
@@ -123,22 +124,10 @@ impl PolicyResolver for GovernancePolicyResolver {
         let policy_hash = blake3::hash(format!("policy:{work_id}:{actor_id}").as_bytes());
         let manifest_hash = blake3::hash(format!("manifest:{work_id}:{actor_id}").as_bytes());
 
-        // Create and seal a context pack manifest
-        let content_hash = blake3::hash(format!("content:{work_id}:{actor_id}").as_bytes());
-        let context_pack = ContextPackManifestBuilder::new(
-            format!("manifest:{work_id}"),
-            format!("profile:{actor_id}"),
-        )
-        .add_entry(
-            ManifestEntryBuilder::new(
-                format!("/work/{work_id}/context.yaml"),
-                *content_hash.as_bytes(),
-            )
-            .stable_id("work-context")
-            .access_level(AccessLevel::Read)
-            .build(),
-        )
-        .build();
+        // Create and seal a context pack manifest.
+        // Uses the shared `build_policy_context_pack` helper so that
+        // `seed_policy_artifacts_in_cas` reproduces the same preimage.
+        let context_pack = build_policy_context_pack(work_id, actor_id);
 
         let context_pack_hash =
             context_pack

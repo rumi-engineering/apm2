@@ -11,7 +11,7 @@ rfc_evidence_artifact:
     commands:
       - id: "CMD-HEF-0014"
         shell: "bash"
-        command: "cargo test -p apm2-daemon --tests workobject_transition_authority_bindings -- --nocapture"
+        command: "cargo test -p apm2-daemon --test tck_00416_workobject_transition_authority_bindings -- --nocapture"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 1800

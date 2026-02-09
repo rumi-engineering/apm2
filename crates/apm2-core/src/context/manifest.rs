@@ -904,6 +904,79 @@ impl ContextPackManifest {
         self.manifest_hash
     }
 
+    /// Returns the canonical byte preimage whose BLAKE3 hash equals
+    /// [`manifest_hash()`](Self::manifest_hash).
+    ///
+    /// This is the concatenation of all length-prefixed fields that
+    /// `compute_manifest_hash` feeds into the hasher.  Storing these
+    /// bytes in CAS makes the seal hash CAS-resolvable (REQ-HEF-0013).
+    ///
+    /// # Invariant
+    ///
+    /// `blake3::hash(&self.canonical_seal_bytes()) == self.manifest_hash()`
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn canonical_seal_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Manifest ID (length-prefixed)
+        buf.extend_from_slice(&(self.manifest_id.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.manifest_id.as_bytes());
+
+        // Profile ID (length-prefixed)
+        buf.extend_from_slice(&(self.profile_id.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.profile_id.as_bytes());
+
+        // Entries
+        buf.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
+        for entry in &self.entries {
+            if let Some(ref stable_id) = entry.stable_id {
+                buf.push(1u8);
+                buf.extend_from_slice(&(stable_id.len() as u32).to_be_bytes());
+                buf.extend_from_slice(stable_id.as_bytes());
+            } else {
+                buf.push(0u8);
+            }
+            buf.extend_from_slice(&(entry.path.len() as u32).to_be_bytes());
+            buf.extend_from_slice(entry.path.as_bytes());
+            buf.extend_from_slice(&entry.content_hash);
+            buf.push(entry.access_level as u8);
+        }
+
+        // Tool allowlist — sorted for determinism
+        let mut sorted_tools: Vec<u8> = self.tool_allowlist.iter().map(ToolClass::value).collect();
+        sorted_tools.sort_unstable();
+        buf.extend_from_slice(&(sorted_tools.len() as u32).to_be_bytes());
+        for tool_value in &sorted_tools {
+            buf.push(*tool_value);
+        }
+
+        // Write allowlist — sorted for determinism
+        let mut sorted_write_paths: Vec<String> = self
+            .write_allowlist
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        sorted_write_paths.sort_unstable();
+        buf.extend_from_slice(&(sorted_write_paths.len() as u32).to_be_bytes());
+        for path in &sorted_write_paths {
+            buf.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            buf.extend_from_slice(path.as_bytes());
+        }
+
+        // Shell allowlist — sorted for determinism
+        let mut sorted_shell_patterns: Vec<&str> =
+            self.shell_allowlist.iter().map(String::as_str).collect();
+        sorted_shell_patterns.sort_unstable();
+        buf.extend_from_slice(&(sorted_shell_patterns.len() as u32).to_be_bytes());
+        for pattern in &sorted_shell_patterns {
+            buf.extend_from_slice(&(pattern.len() as u32).to_be_bytes());
+            buf.extend_from_slice(pattern.as_bytes());
+        }
+
+        buf
+    }
+
     /// Returns a slice of all entries.
     #[must_use]
     pub fn entries(&self) -> &[ManifestEntry] {
