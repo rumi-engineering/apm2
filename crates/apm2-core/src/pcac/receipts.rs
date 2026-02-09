@@ -20,6 +20,9 @@ use super::types::{
 };
 use crate::crypto::Hash;
 
+/// Zero hash constant for comparison.
+const ZERO_HASH: Hash = [0u8; 32];
+
 // =============================================================================
 // Common receipt metadata
 // =============================================================================
@@ -286,13 +289,22 @@ impl std::fmt::Display for LifecycleStage {
 // =============================================================================
 
 impl ReceiptDigestMeta {
-    /// Validate that `canonicalizer_id` is within length bounds.
+    /// Validate `canonicalizer_id` and `content_digest`.
+    ///
+    /// Checks:
+    /// - `canonicalizer_id` is non-empty and within length bounds.
+    /// - `content_digest` is non-zero.
     ///
     /// # Errors
     ///
-    /// Returns `PcacValidationError::StringTooLong` if `canonicalizer_id`
-    /// exceeds [`MAX_CANONICALIZER_ID_LENGTH`].
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
     pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.canonicalizer_id.is_empty() {
+            return Err(PcacValidationError::EmptyRequiredField {
+                field: "canonicalizer_id",
+            });
+        }
         if self.canonicalizer_id.len() > MAX_CANONICALIZER_ID_LENGTH {
             return Err(PcacValidationError::StringTooLong {
                 field: "canonicalizer_id",
@@ -300,61 +312,183 @@ impl ReceiptDigestMeta {
                 max: MAX_CANONICALIZER_ID_LENGTH,
             });
         }
+        if self.content_digest == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "content_digest",
+            });
+        }
         Ok(())
     }
 }
 
 impl ReceiptAuthentication {
-    /// Validate batched pointer auth constraints.
+    /// Validate receipt authentication shape constraints.
     ///
-    /// For `PointerBatched`, the Merkle inclusion proof must:
-    /// - contain at least one step (non-empty),
-    /// - not exceed [`MAX_MERKLE_PROOF_STEPS`].
+    /// All variants enforce non-zero hash checks for mandatory cryptographic
+    /// bindings. For `PointerBatched`, additionally:
+    /// - Merkle inclusion proof must contain at least one step (non-empty).
+    /// - Merkle inclusion proof must not exceed [`MAX_MERKLE_PROOF_STEPS`].
     ///
     /// # Errors
     ///
-    /// Returns `PcacValidationError` on violation.
+    /// Returns `PcacValidationError` on violation (fail-closed).
     pub fn validate(&self) -> Result<(), PcacValidationError> {
-        if let Self::PointerBatched {
-            merkle_inclusion_proof,
-            ..
-        } = self
-        {
-            if merkle_inclusion_proof.is_empty() {
-                return Err(PcacValidationError::EmptyMerkleProof);
-            }
-            if merkle_inclusion_proof.len() > MAX_MERKLE_PROOF_STEPS {
-                return Err(PcacValidationError::CollectionTooLarge {
-                    field: "merkle_inclusion_proof",
-                    count: merkle_inclusion_proof.len(),
-                    max: MAX_MERKLE_PROOF_STEPS,
-                });
-            }
+        match self {
+            Self::Direct {
+                authority_seal_hash,
+            } => {
+                if *authority_seal_hash == ZERO_HASH {
+                    return Err(PcacValidationError::ZeroHash {
+                        field: "authority_seal_hash",
+                    });
+                }
+            },
+            Self::PointerUnbatched {
+                receipt_hash,
+                authority_seal_hash,
+            } => {
+                if *receipt_hash == ZERO_HASH {
+                    return Err(PcacValidationError::ZeroHash {
+                        field: "receipt_hash",
+                    });
+                }
+                if *authority_seal_hash == ZERO_HASH {
+                    return Err(PcacValidationError::ZeroHash {
+                        field: "authority_seal_hash",
+                    });
+                }
+            },
+            Self::PointerBatched {
+                receipt_hash,
+                authority_seal_hash,
+                merkle_inclusion_proof,
+                receipt_batch_root_hash,
+            } => {
+                if *receipt_hash == ZERO_HASH {
+                    return Err(PcacValidationError::ZeroHash {
+                        field: "receipt_hash",
+                    });
+                }
+                if *authority_seal_hash == ZERO_HASH {
+                    return Err(PcacValidationError::ZeroHash {
+                        field: "authority_seal_hash",
+                    });
+                }
+                if *receipt_batch_root_hash == ZERO_HASH {
+                    return Err(PcacValidationError::ZeroHash {
+                        field: "receipt_batch_root_hash",
+                    });
+                }
+                if merkle_inclusion_proof.is_empty() {
+                    return Err(PcacValidationError::EmptyMerkleProof);
+                }
+                if merkle_inclusion_proof.len() > MAX_MERKLE_PROOF_STEPS {
+                    return Err(PcacValidationError::CollectionTooLarge {
+                        field: "merkle_inclusion_proof",
+                        count: merkle_inclusion_proof.len(),
+                        max: MAX_MERKLE_PROOF_STEPS,
+                    });
+                }
+            },
         }
         Ok(())
     }
 }
 
 impl AuthoritativeBindings {
-    /// Validate the embedded receipt authentication shape.
+    /// Validate all authoritative binding constraints.
+    ///
+    /// Checks:
+    /// - `episode_envelope_hash` is non-zero.
+    /// - `view_commitment_hash` is non-zero.
+    /// - `time_envelope_ref` is non-zero.
+    /// - Delegated-path binding coherence: `permeability_receipt_hash` and
+    ///   `delegation_chain_hash` must both be present or both absent.
+    /// - Delegated-path hashes, when present, must be non-zero.
+    /// - Embedded receipt authentication shape is valid.
     ///
     /// # Errors
     ///
-    /// Returns `PcacValidationError` if the authentication shape is invalid.
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
     pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.episode_envelope_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "episode_envelope_hash",
+            });
+        }
+        if self.view_commitment_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "view_commitment_hash",
+            });
+        }
+        if self.time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "time_envelope_ref",
+            });
+        }
+        // Delegated-path binding coherence: both must co-occur or both be absent.
+        match (&self.permeability_receipt_hash, &self.delegation_chain_hash) {
+            (Some(prh), Some(dch)) => {
+                if *prh == ZERO_HASH {
+                    return Err(PcacValidationError::ZeroHash {
+                        field: "permeability_receipt_hash",
+                    });
+                }
+                if *dch == ZERO_HASH {
+                    return Err(PcacValidationError::ZeroHash {
+                        field: "delegation_chain_hash",
+                    });
+                }
+            },
+            (None, None) => { /* valid: no delegated path */ },
+            _ => return Err(PcacValidationError::IncoherentDelegatedBindings),
+        }
         self.authentication.validate()
     }
 }
 
 impl AuthorityRevalidateReceiptV1 {
-    /// Validate the checkpoint string length.
+    /// Validate all boundary constraints on this revalidation receipt.
+    ///
+    /// Checks:
+    /// - Digest metadata is valid (non-empty canonicalizer, non-zero digest).
+    /// - `ajc_id` is non-zero.
+    /// - `time_envelope_ref` is non-zero.
+    /// - `ledger_anchor` is non-zero.
+    /// - `revocation_head_hash` is non-zero.
+    /// - `checkpoint` is non-empty and within length bounds.
+    /// - Authoritative bindings, when present, are valid.
     ///
     /// # Errors
     ///
-    /// Returns `PcacValidationError::StringTooLong` if `checkpoint`
-    /// exceeds [`MAX_CHECKPOINT_LENGTH`].
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
     pub fn validate(&self) -> Result<(), PcacValidationError> {
         self.digest_meta.validate()?;
+        if self.ajc_id == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
+        }
+        if self.time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "time_envelope_ref",
+            });
+        }
+        if self.ledger_anchor == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "ledger_anchor",
+            });
+        }
+        if self.revocation_head_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "revocation_head_hash",
+            });
+        }
+        if self.checkpoint.is_empty() {
+            return Err(PcacValidationError::EmptyRequiredField {
+                field: "checkpoint",
+            });
+        }
         if self.checkpoint.len() > MAX_CHECKPOINT_LENGTH {
             return Err(PcacValidationError::StringTooLong {
                 field: "checkpoint",
@@ -364,6 +498,124 @@ impl AuthorityRevalidateReceiptV1 {
         }
         if let Some(ref bindings) = self.authoritative_bindings {
             bindings.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl AuthorityJoinReceiptV1 {
+    /// Validate all boundary constraints on this join receipt.
+    ///
+    /// Checks:
+    /// - Digest metadata is valid (non-empty canonicalizer, non-zero digest).
+    /// - `ajc_id` is non-zero.
+    /// - `authority_join_hash` is non-zero.
+    /// - `time_envelope_ref` is non-zero.
+    /// - `ledger_anchor` is non-zero.
+    /// - Authoritative bindings, when present, are valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        self.digest_meta.validate()?;
+        if self.ajc_id == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
+        }
+        if self.authority_join_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "authority_join_hash",
+            });
+        }
+        if self.time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "time_envelope_ref",
+            });
+        }
+        if self.ledger_anchor == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "ledger_anchor",
+            });
+        }
+        if let Some(ref bindings) = self.authoritative_bindings {
+            bindings.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl AuthorityConsumeReceiptV1 {
+    /// Validate all boundary constraints on this consume receipt.
+    ///
+    /// Checks:
+    /// - Digest metadata is valid (non-empty canonicalizer, non-zero digest).
+    /// - `ajc_id` is non-zero.
+    /// - `intent_digest` is non-zero.
+    /// - `time_envelope_ref` is non-zero.
+    /// - `ledger_anchor` is non-zero.
+    /// - `effect_selector_digest` is non-zero.
+    /// - Authoritative bindings, when present, are valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        self.digest_meta.validate()?;
+        if self.ajc_id == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
+        }
+        if self.intent_digest == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "intent_digest",
+            });
+        }
+        if self.time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "time_envelope_ref",
+            });
+        }
+        if self.ledger_anchor == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "ledger_anchor",
+            });
+        }
+        if self.effect_selector_digest == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "effect_selector_digest",
+            });
+        }
+        if let Some(ref bindings) = self.authoritative_bindings {
+            bindings.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl AuthorityDenyReceiptV1 {
+    /// Validate all boundary constraints on this deny receipt.
+    ///
+    /// Checks:
+    /// - Digest metadata is valid (non-empty canonicalizer, non-zero digest).
+    /// - `time_envelope_ref` is non-zero.
+    /// - `ledger_anchor` is non-zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        self.digest_meta.validate()?;
+        if self.time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "time_envelope_ref",
+            });
+        }
+        if self.ledger_anchor == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "ledger_anchor",
+            });
         }
         Ok(())
     }

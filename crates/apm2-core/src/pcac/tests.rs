@@ -1185,4 +1185,793 @@ fn pcac_validation_error_display() {
         err.to_string(),
         "batched pointer auth has empty merkle inclusion proof"
     );
+
+    let err = types::PcacValidationError::IncoherentDelegatedBindings;
+    assert_eq!(
+        err.to_string(),
+        "delegated-path bindings incoherent: permeability_receipt_hash and delegation_chain_hash must co-occur"
+    );
+}
+
+// =============================================================================
+// Re-export compile tests (Quality BLOCKER 1)
+// =============================================================================
+
+#[test]
+#[allow(clippy::no_effect_underscore_binding)]
+fn risk_tier_and_determinism_class_reexported_from_pcac_module() {
+    // These must be accessible via the pcac module re-export.
+    // If this compiles, the re-exports are working.
+    let _tier: crate::pcac::RiskTier = crate::pcac::RiskTier::Tier1;
+    let _det: crate::pcac::DeterminismClass = crate::pcac::DeterminismClass::Deterministic;
+
+    // Verify downstream can construct a full AuthorityJoinInputV1 using module
+    // re-exports.
+    let _input = crate::pcac::AuthorityJoinInputV1 {
+        session_id: "session-001".to_string(),
+        holon_id: None,
+        intent_digest: test_hash(0x01),
+        capability_manifest_hash: test_hash(0x02),
+        scope_witness_hashes: vec![],
+        lease_id: "lease-001".to_string(),
+        permeability_receipt_hash: None,
+        identity_proof_hash: test_hash(0x03),
+        identity_evidence_level: crate::pcac::IdentityEvidenceLevel::Verified,
+        directory_head_hash: test_hash(0x04),
+        freshness_policy_hash: test_hash(0x05),
+        freshness_witness_tick: 1000,
+        stop_budget_profile_digest: test_hash(0x06),
+        pre_actuation_receipt_hashes: vec![],
+        risk_tier: crate::pcac::RiskTier::Tier1,
+        determinism_class: crate::pcac::DeterminismClass::Deterministic,
+        time_envelope_ref: test_hash(0x07),
+        as_of_ledger_anchor: test_hash(0x08),
+    };
+}
+
+// =============================================================================
+// Zero-hash rejection for ReceiptDigestMeta (Security MAJOR)
+// =============================================================================
+
+#[test]
+fn empty_canonicalizer_id_rejected() {
+    use super::receipts::*;
+
+    let meta = ReceiptDigestMeta {
+        canonicalizer_id: String::new(),
+        content_digest: test_hash(0xF0),
+    };
+    let err = meta.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::EmptyRequiredField { field } if field == "canonicalizer_id")
+    );
+}
+
+#[test]
+fn zero_content_digest_rejected() {
+    use super::receipts::*;
+
+    let meta = ReceiptDigestMeta {
+        canonicalizer_id: "apm2.canonicalizer.jcs".to_string(),
+        content_digest: zero_hash(),
+    };
+    let err = meta.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "content_digest")
+    );
+}
+
+// =============================================================================
+// Zero-hash rejection for ReceiptAuthentication (Security MAJOR)
+// =============================================================================
+
+#[test]
+fn zero_authority_seal_hash_in_direct_auth_rejected() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::Direct {
+        authority_seal_hash: zero_hash(),
+    };
+    let err = auth.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "authority_seal_hash")
+    );
+}
+
+#[test]
+fn zero_receipt_hash_in_unbatched_pointer_rejected() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::PointerUnbatched {
+        receipt_hash: zero_hash(),
+        authority_seal_hash: test_hash(0xE2),
+    };
+    let err = auth.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "receipt_hash")
+    );
+}
+
+#[test]
+fn zero_authority_seal_hash_in_unbatched_pointer_rejected() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::PointerUnbatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: zero_hash(),
+    };
+    let err = auth.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "authority_seal_hash")
+    );
+}
+
+#[test]
+fn zero_receipt_hash_in_batched_pointer_rejected() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::PointerBatched {
+        receipt_hash: zero_hash(),
+        authority_seal_hash: test_hash(0xE2),
+        merkle_inclusion_proof: vec![test_hash(0xE3)],
+        receipt_batch_root_hash: test_hash(0xE5),
+    };
+    let err = auth.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "receipt_hash")
+    );
+}
+
+#[test]
+fn zero_authority_seal_hash_in_batched_pointer_rejected() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::PointerBatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: zero_hash(),
+        merkle_inclusion_proof: vec![test_hash(0xE3)],
+        receipt_batch_root_hash: test_hash(0xE5),
+    };
+    let err = auth.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "authority_seal_hash")
+    );
+}
+
+#[test]
+fn zero_receipt_batch_root_hash_in_batched_pointer_rejected() {
+    use super::receipts::*;
+
+    let auth = ReceiptAuthentication::PointerBatched {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: test_hash(0xE2),
+        merkle_inclusion_proof: vec![test_hash(0xE3)],
+        receipt_batch_root_hash: zero_hash(),
+    };
+    let err = auth.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "receipt_batch_root_hash")
+    );
+}
+
+// =============================================================================
+// Zero-hash rejection for AuthoritativeBindings (Quality BLOCKER 2)
+// =============================================================================
+
+#[test]
+fn zero_episode_envelope_hash_in_bindings_rejected() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: zero_hash(),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: None,
+        delegation_chain_hash: None,
+    };
+    let err = bindings.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "episode_envelope_hash")
+    );
+}
+
+#[test]
+fn zero_view_commitment_hash_in_bindings_rejected() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: zero_hash(),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: None,
+        delegation_chain_hash: None,
+    };
+    let err = bindings.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "view_commitment_hash")
+    );
+}
+
+#[test]
+fn zero_time_envelope_ref_in_bindings_rejected() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: zero_hash(),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: None,
+        delegation_chain_hash: None,
+    };
+    let err = bindings.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "time_envelope_ref")
+    );
+}
+
+// =============================================================================
+// Delegated binding coherence tests (Security MAJOR)
+// =============================================================================
+
+#[test]
+fn delegated_bindings_both_present_passes() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: Some(test_hash(0x05)),
+        delegation_chain_hash: Some(test_hash(0x06)),
+    };
+    assert!(bindings.validate().is_ok());
+}
+
+#[test]
+fn delegated_bindings_both_absent_passes() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: None,
+        delegation_chain_hash: None,
+    };
+    assert!(bindings.validate().is_ok());
+}
+
+#[test]
+fn delegated_bindings_only_permeability_hash_rejected() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: Some(test_hash(0x05)),
+        delegation_chain_hash: None,
+    };
+    let err = bindings.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        types::PcacValidationError::IncoherentDelegatedBindings
+    ));
+}
+
+#[test]
+fn delegated_bindings_only_delegation_chain_hash_rejected() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: None,
+        delegation_chain_hash: Some(test_hash(0x06)),
+    };
+    let err = bindings.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        types::PcacValidationError::IncoherentDelegatedBindings
+    ));
+}
+
+#[test]
+fn delegated_bindings_zero_permeability_receipt_hash_rejected() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: Some(zero_hash()),
+        delegation_chain_hash: Some(test_hash(0x06)),
+    };
+    let err = bindings.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "permeability_receipt_hash")
+    );
+}
+
+#[test]
+fn delegated_bindings_zero_delegation_chain_hash_rejected() {
+    use super::receipts::*;
+
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: Some(test_hash(0x05)),
+        delegation_chain_hash: Some(zero_hash()),
+    };
+    let err = bindings.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "delegation_chain_hash")
+    );
+}
+
+// =============================================================================
+// Lifecycle receipt validate() tests (Security BLOCKER)
+// =============================================================================
+
+fn valid_digest_meta() -> ReceiptDigestMeta {
+    ReceiptDigestMeta {
+        canonicalizer_id: "apm2.canonicalizer.jcs".to_string(),
+        content_digest: test_hash(0xF0),
+    }
+}
+
+fn valid_bindings() -> AuthoritativeBindings {
+    AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0x01),
+        view_commitment_hash: test_hash(0x02),
+        time_envelope_ref: test_hash(0x03),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0x04),
+        },
+        permeability_receipt_hash: None,
+        delegation_chain_hash: None,
+    }
+}
+
+// --- AuthorityJoinReceiptV1 ---
+
+#[test]
+fn valid_join_receipt_passes_validation() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    assert!(receipt.validate().is_ok());
+}
+
+#[test]
+fn join_receipt_zero_ajc_id_rejected() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: zero_hash(),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
+}
+
+#[test]
+fn join_receipt_zero_authority_join_hash_rejected() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: zero_hash(),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "authority_join_hash")
+    );
+}
+
+#[test]
+fn join_receipt_zero_time_envelope_ref_rejected() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: zero_hash(),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "time_envelope_ref")
+    );
+}
+
+#[test]
+fn join_receipt_zero_ledger_anchor_rejected() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: zero_hash(),
+        joined_at_tick: 1000,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ledger_anchor")
+    );
+}
+
+#[test]
+fn join_receipt_propagates_binding_validation_errors() {
+    let mut bindings = valid_bindings();
+    bindings.episode_envelope_hash = zero_hash();
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: Some(bindings),
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "episode_envelope_hash")
+    );
+}
+
+// --- AuthorityConsumeReceiptV1 ---
+
+#[test]
+fn valid_consume_receipt_passes_validation() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    assert!(receipt.validate().is_ok());
+}
+
+#[test]
+fn consume_receipt_zero_ajc_id_rejected() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: zero_hash(),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
+}
+
+#[test]
+fn consume_receipt_zero_intent_digest_rejected() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: zero_hash(),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "intent_digest")
+    );
+}
+
+#[test]
+fn consume_receipt_zero_time_envelope_ref_rejected() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: zero_hash(),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "time_envelope_ref")
+    );
+}
+
+#[test]
+fn consume_receipt_zero_ledger_anchor_rejected() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: zero_hash(),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ledger_anchor")
+    );
+}
+
+#[test]
+fn consume_receipt_zero_effect_selector_digest_rejected() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: zero_hash(),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "effect_selector_digest")
+    );
+}
+
+#[test]
+fn consume_receipt_propagates_binding_validation_errors() {
+    let mut bindings = valid_bindings();
+    bindings.view_commitment_hash = zero_hash();
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: Some(bindings),
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "view_commitment_hash")
+    );
+}
+
+// --- AuthorityDenyReceiptV1 ---
+
+#[test]
+fn valid_deny_receipt_passes_validation() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Join,
+    };
+    assert!(receipt.validate().is_ok());
+}
+
+#[test]
+fn deny_receipt_zero_time_envelope_ref_rejected() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: None,
+        time_envelope_ref: zero_hash(),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Join,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "time_envelope_ref")
+    );
+}
+
+#[test]
+fn deny_receipt_zero_ledger_anchor_rejected() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: zero_hash(),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Join,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ledger_anchor")
+    );
+}
+
+#[test]
+fn deny_receipt_zero_content_digest_rejected() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: ReceiptDigestMeta {
+            canonicalizer_id: "apm2.canonicalizer.jcs".to_string(),
+            content_digest: zero_hash(),
+        },
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Join,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "content_digest")
+    );
+}
+
+// --- AuthorityRevalidateReceiptV1 zero-hash checks ---
+
+#[test]
+fn revalidate_receipt_zero_ajc_id_rejected() {
+    let receipt = AuthorityRevalidateReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: zero_hash(),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        revocation_head_hash: test_hash(0xCC),
+        revalidated_at_tick: 1200,
+        checkpoint: "before_broker".to_string(),
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
+}
+
+#[test]
+fn revalidate_receipt_zero_time_envelope_ref_rejected() {
+    let receipt = AuthorityRevalidateReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        time_envelope_ref: zero_hash(),
+        ledger_anchor: test_hash(0x08),
+        revocation_head_hash: test_hash(0xCC),
+        revalidated_at_tick: 1200,
+        checkpoint: "before_broker".to_string(),
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "time_envelope_ref")
+    );
+}
+
+#[test]
+fn revalidate_receipt_zero_ledger_anchor_rejected() {
+    let receipt = AuthorityRevalidateReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: zero_hash(),
+        revocation_head_hash: test_hash(0xCC),
+        revalidated_at_tick: 1200,
+        checkpoint: "before_broker".to_string(),
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ledger_anchor")
+    );
+}
+
+#[test]
+fn revalidate_receipt_zero_revocation_head_hash_rejected() {
+    let receipt = AuthorityRevalidateReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        revocation_head_hash: zero_hash(),
+        revalidated_at_tick: 1200,
+        checkpoint: "before_broker".to_string(),
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "revocation_head_hash")
+    );
+}
+
+#[test]
+fn revalidate_receipt_empty_checkpoint_rejected() {
+    let receipt = AuthorityRevalidateReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        revocation_head_hash: test_hash(0xCC),
+        revalidated_at_tick: 1200,
+        checkpoint: String::new(),
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::EmptyRequiredField { field } if field == "checkpoint")
+    );
+}
+
+#[test]
+fn valid_revalidate_receipt_passes_validation() {
+    let receipt = AuthorityRevalidateReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        revocation_head_hash: test_hash(0xCC),
+        revalidated_at_tick: 1200,
+        checkpoint: "before_broker".to_string(),
+        authoritative_bindings: Some(valid_bindings()),
+    };
+    assert!(receipt.validate().is_ok());
 }

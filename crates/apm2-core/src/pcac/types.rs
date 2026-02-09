@@ -215,6 +215,9 @@ pub enum PcacValidationError {
     },
     /// Merkle proof is empty in a batched pointer auth (must have >= 1 step).
     EmptyMerkleProof,
+    /// Delegated-path bindings are incoherent: both `permeability_receipt_hash`
+    /// and `delegation_chain_hash` must be present or both absent.
+    IncoherentDelegatedBindings,
 }
 
 impl std::fmt::Display for PcacValidationError {
@@ -240,6 +243,12 @@ impl std::fmt::Display for PcacValidationError {
             },
             Self::EmptyMerkleProof => {
                 write!(f, "batched pointer auth has empty merkle inclusion proof")
+            },
+            Self::IncoherentDelegatedBindings => {
+                write!(
+                    f,
+                    "delegated-path bindings incoherent: permeability_receipt_hash and delegation_chain_hash must co-occur"
+                )
             },
         }
     }
