@@ -47,8 +47,8 @@ mod types;
 mod tests;
 
 pub use auth_verifier::{
-    FactClass, MAX_REPLAY_LIFECYCLE_ENTRIES, ReplayLifecycleEntry, classify_fact,
-    validate_authoritative_bindings, validate_replay_lifecycle_order,
+    BindingExpectations, FactClass, MAX_REPLAY_LIFECYCLE_ENTRIES, ReplayLifecycleEntry,
+    classify_fact, validate_authoritative_bindings, validate_replay_lifecycle_order,
     verify_receipt_authentication,
 };
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
