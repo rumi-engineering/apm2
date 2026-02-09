@@ -86,8 +86,9 @@ impl AgentBackend for ClaudeBackend {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             return Err(anyhow!(
-                "claude CLI failed for role '{}' (status={}): stderr='{}' stdout='{}'",
+                "claude CLI failed for role '{}' session_id='{}' (status={}): stderr='{}' stdout='{}'",
                 turn.role_id,
+                turn.session_id,
                 output.status,
                 stderr.trim(),
                 stdout.trim()
