@@ -489,6 +489,37 @@ pub struct DispatcherState {
 }
 
 impl DispatcherState {
+    /// Builds a bootstrap sovereignty state for production dispatcher wiring.
+    ///
+    /// TODO(TCK-00427): replace this bootstrap state with a live sovereignty
+    /// provider backed by authenticated epoch/revocation sources.
+    fn bootstrap_sovereignty_state() -> Arc<crate::pcac::SovereigntyState> {
+        let signing_key_seed = *blake3::hash(uuid::Uuid::new_v4().as_bytes()).as_bytes();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&signing_key_seed);
+        // Use max tick to avoid immediate staleness until a live provider is
+        // wired. Verification remains fail-closed if state is absent.
+        let freshness_tick = u64::MAX;
+        let epoch_id = "bootstrap-sovereignty-epoch-v1";
+        let signature =
+            crate::pcac::SovereigntyChecker::sign_epoch(&signing_key, epoch_id, freshness_tick);
+
+        Arc::new(crate::pcac::SovereigntyState {
+            epoch: Some(apm2_core::pcac::SovereigntyEpoch {
+                epoch_id: epoch_id.to_string(),
+                freshness_tick,
+                signer_public_key: signing_key.verifying_key().to_bytes(),
+                signature,
+            }),
+            principal_id: "bootstrap-principal".to_string(),
+            revocation_head_known: true,
+            autonomy_ceiling: Some(apm2_core::pcac::AutonomyCeiling {
+                max_risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                policy_binding_hash: *blake3::hash(b"bootstrap-sovereignty-policy-v1").as_bytes(),
+            }),
+            active_freeze: apm2_core::pcac::FreezeAction::NoAction,
+        })
+    }
+
     /// Creates new dispatcher state with shared registries and stable secrets.
     ///
     /// # Arguments
@@ -946,6 +977,7 @@ impl DispatcherState {
         // daemon paths (not just tests).
         let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
         let sovereignty_checker = crate::pcac::SovereigntyChecker::new();
+        let sovereignty_state = Self::bootstrap_sovereignty_state();
         let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
             pcac_kernel,
             sovereignty_checker,
@@ -960,7 +992,8 @@ impl DispatcherState {
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
-                .with_pcac_lifecycle_gate(pcac_gate);
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_sovereignty_state(sovereignty_state);
 
         Ok(Self {
             privileged_dispatcher,
@@ -1289,6 +1322,7 @@ impl DispatcherState {
         // daemon paths (not just tests).
         let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
         let sovereignty_checker = crate::pcac::SovereigntyChecker::new();
+        let sovereignty_state = Self::bootstrap_sovereignty_state();
         let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
             pcac_kernel,
             sovereignty_checker,
@@ -1308,7 +1342,8 @@ impl DispatcherState {
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
-                .with_pcac_lifecycle_gate(pcac_gate);
+                .with_pcac_lifecycle_gate(pcac_gate)
+                .with_sovereignty_state(sovereignty_state);
 
         Ok(Self {
             privileged_dispatcher,
@@ -2157,6 +2192,59 @@ mod tests {
         assert!(
             receipt.budget_enforcement_deferred,
             "deferred budget enforcement marker must be bound in receipt"
+        );
+    }
+
+    #[test]
+    fn production_constructor_wires_sovereignty_state() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None)
+            .expect("test dispatcher state initialization must succeed");
+
+        assert!(
+            state
+                .session_dispatcher()
+                .sovereignty_state_for_test()
+                .is_some(),
+            "production constructor must wire sovereignty state for Tier2+ PCAC checks"
+        );
+    }
+
+    #[test]
+    fn persistent_constructor_wires_sovereignty_state() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
+        SqliteLedgerEventEmitter::init_schema(&conn).expect("ledger schema init should succeed");
+        SqliteWorkRegistry::init_schema(&conn).expect("work schema init should succeed");
+        let conn = Arc::new(Mutex::new(conn));
+        let cas_root = tempfile::tempdir().expect("temp CAS root should be created");
+        let cas_dir = cas_root.path().join("cas");
+        std::fs::create_dir(&cas_dir).expect("CAS dir should be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut perms = std::fs::metadata(&cas_dir)
+                .expect("CAS dir metadata should exist")
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&cas_dir, perms).expect("CAS dir permissions should be set");
+        }
+
+        let state = DispatcherState::with_persistence_and_cas(
+            session_registry,
+            None,
+            Arc::clone(&conn),
+            &cas_dir,
+        )
+        .expect("state with persistence+cas should be created");
+
+        assert!(
+            state
+                .session_dispatcher()
+                .sovereignty_state_for_test()
+                .is_some(),
+            "persistent constructor must wire sovereignty state for Tier2+ PCAC checks"
         );
     }
 

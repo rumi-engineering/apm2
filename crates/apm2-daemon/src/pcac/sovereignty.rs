@@ -19,9 +19,11 @@ use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityDenyV1, AuthorityJoinCertificateV1, AutonomyCeiling, FreezeAction,
     RiskTier, SovereigntyEpoch,
 };
-use subtle::ConstantTimeEq;
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 const ZERO_HASH: Hash = [0u8; 32];
+const ZERO_SIGNATURE: [u8; 64] = [0u8; 64];
+const EPOCH_DOMAIN_SEPARATOR: &[u8] = b"apm2-sovereignty-epoch-v1";
 
 /// Maximum allowed tick drift before a sovereignty epoch is considered stale.
 const DEFAULT_EPOCH_STALENESS_THRESHOLD: u64 = 100;
@@ -199,22 +201,29 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(freeze_action),
             })),
         }
     }
 
-    /// Computes the expected BLAKE3 keyed-hash signature for an epoch.
-    ///
-    /// Phase 1 HMAC-like: `BLAKE3(signer_public_key || epoch_id ||
-    /// freshness_tick)`. This is public so that epoch constructors can
-    /// produce valid signatures.
+    /// Builds the domain-separated signing payload for sovereignty epochs.
     #[must_use]
-    pub fn compute_epoch_signature(epoch: &SovereigntyEpoch) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&epoch.signer_public_key);
-        hasher.update(epoch.epoch_id.as_bytes());
-        hasher.update(&epoch.freshness_tick.to_le_bytes());
-        *hasher.finalize().as_bytes()
+    pub fn epoch_signing_message(epoch_id: &str, freshness_tick: u64) -> Vec<u8> {
+        let mut message = Vec::with_capacity(
+            EPOCH_DOMAIN_SEPARATOR.len() + epoch_id.len() + std::mem::size_of::<u64>(),
+        );
+        message.extend_from_slice(EPOCH_DOMAIN_SEPARATOR);
+        message.extend_from_slice(epoch_id.as_bytes());
+        message.extend_from_slice(&freshness_tick.to_le_bytes());
+        message
+    }
+
+    /// Signs a sovereignty epoch with Ed25519 and domain separation.
+    #[must_use]
+    pub fn sign_epoch(signing_key: &SigningKey, epoch_id: &str, freshness_tick: u64) -> [u8; 64] {
+        signing_key
+            .sign(&Self::epoch_signing_message(epoch_id, freshness_tick))
+            .to_bytes()
     }
 
     /// Checks sovereignty epoch freshness and cryptographic signature.
@@ -236,11 +245,12 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
             }));
         };
 
         // Zero signature is treated as unsigned/invalid.
-        if epoch.signature == ZERO_HASH {
+        if epoch.signature == ZERO_SIGNATURE {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: AuthorityDenyClass::SovereigntyUncertainty {
                     reason: "sovereignty epoch has zero signature".to_string(),
@@ -249,6 +259,7 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
             }));
         }
 
@@ -262,14 +273,31 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
             }));
         }
 
-        // MAJOR 1 FIX: Cryptographic signature verification using constant-time
-        // comparison (CTR-1909 / RSK-1909). Phase 1 uses BLAKE3 keyed-hash:
-        // BLAKE3(signer_public_key || epoch_id || freshness_tick).
-        let expected_signature = Self::compute_epoch_signature(epoch);
-        if epoch.signature.ct_eq(&expected_signature).unwrap_u8() != 1 {
+        // Verify Ed25519 signature over domain-separated message.
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&epoch.signer_public_key) else {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::SovereigntyUncertainty {
+                    reason: "sovereignty epoch signer public key is invalid".to_string(),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
+            }));
+        };
+
+        let signature = Signature::from_bytes(&epoch.signature);
+        let signing_message = Self::epoch_signing_message(&epoch.epoch_id, epoch.freshness_tick);
+
+        if verifying_key
+            .verify_strict(&signing_message, &signature)
+            .is_err()
+        {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: AuthorityDenyClass::SovereigntyUncertainty {
                     reason: "sovereignty epoch signature verification failed".to_string(),
@@ -278,6 +306,7 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
             }));
         }
 
@@ -295,6 +324,7 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
             }));
         }
 
@@ -318,6 +348,7 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::SoftFreeze),
             }));
         }
         Ok(())
@@ -341,6 +372,7 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(Self::evaluate_uncertainty_freeze(state)),
             }));
         };
 
@@ -355,6 +387,7 @@ impl SovereigntyChecker {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::SoftFreeze),
             }));
         }
 
@@ -421,8 +454,8 @@ mod tests {
         [byte; 32]
     }
 
-    fn zero_hash() -> Hash {
-        [0u8; 32]
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
     }
 
     fn tier2_cert() -> AuthorityJoinCertificateV1 {
@@ -446,22 +479,20 @@ mod tests {
         cert
     }
 
-    /// Builds a `SovereigntyEpoch` with a valid BLAKE3 keyed-hash signature.
-    fn signed_epoch(epoch_id: &str, freshness_tick: u64, signer_key: Hash) -> SovereigntyEpoch {
-        let mut epoch = SovereigntyEpoch {
+    /// Builds a `SovereigntyEpoch` with a valid Ed25519 signature.
+    fn signed_epoch(epoch_id: &str, freshness_tick: u64, key_seed: u8) -> SovereigntyEpoch {
+        let signing_key = signing_key(key_seed);
+        SovereigntyEpoch {
             epoch_id: epoch_id.to_string(),
             freshness_tick,
-            signer_public_key: signer_key,
-            // Placeholder — will be overwritten with the correct signature.
-            signature: [0u8; 32],
-        };
-        epoch.signature = SovereigntyChecker::compute_epoch_signature(&epoch);
-        epoch
+            signer_public_key: signing_key.verifying_key().to_bytes(),
+            signature: SovereigntyChecker::sign_epoch(&signing_key, epoch_id, freshness_tick),
+        }
     }
 
     fn valid_sovereignty_state() -> SovereigntyState {
         SovereigntyState {
-            epoch: Some(signed_epoch("epoch-001", 100, test_hash(0xCC))),
+            epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
             principal_id: "principal-001".to_string(),
             revocation_head_known: true,
             autonomy_ceiling: Some(AutonomyCeiling {
@@ -585,6 +616,11 @@ mod tests {
             ),
             "expected UnknownRevocationHead, got: {:?}",
             err.deny_class
+        );
+        assert_eq!(
+            err.containment_action,
+            Some(FreezeAction::SoftFreeze),
+            "unknown revocation head must carry containment signal"
         );
     }
 
@@ -788,6 +824,11 @@ mod tests {
             "expected SovereigntyUncertainty, got: {:?}",
             err.deny_class
         );
+        assert_eq!(
+            err.containment_action,
+            Some(FreezeAction::HardFreeze),
+            "missing epoch uncertainty must carry hard-freeze containment signal"
+        );
     }
 
     #[test]
@@ -799,7 +840,7 @@ mod tests {
             epoch_id: "epoch-bad".to_string(),
             freshness_tick: 100,
             signer_public_key: test_hash(0xCC),
-            signature: zero_hash(),
+            signature: ZERO_SIGNATURE,
         });
 
         let err = checker

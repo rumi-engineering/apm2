@@ -14,6 +14,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::Hash;
 
+mod signature_bytes_serde {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = <Vec<u8>>::deserialize(deserializer)?;
+        let len = bytes.len();
+        bytes
+            .try_into()
+            .map_err(|_| D::Error::invalid_length(len, &"exactly 64 bytes"))
+    }
+}
+
 // =============================================================================
 // Resource Limits
 // =============================================================================
@@ -590,12 +613,12 @@ pub struct AuthorityConsumedV1 {
 /// Tier2+ consume and revalidate check that the epoch is current (not stale)
 /// and that the signature cryptographically verifies against the signer key.
 ///
-/// # Signature Verification (Phase 1)
+/// # Signature Verification
 ///
-/// Phase 1 uses BLAKE3 keyed-hash (HMAC-like): `BLAKE3(signer_public_key ||
-/// epoch_id || freshness_tick)`. The signature field must match this
-/// computation; zero signatures and verification failures both produce
-/// `SovereigntyUncertainty` denials.
+/// Signatures are Ed25519 signatures over a domain-separated message:
+/// `b"apm2-sovereignty-epoch-v1" || epoch_id || freshness_tick`.
+/// The signature field stores raw 64-byte signature bytes. Zero signatures and
+/// verification failures both produce `SovereigntyUncertainty` denials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SovereigntyEpoch {
     /// Unique epoch identifier.
@@ -605,12 +628,12 @@ pub struct SovereigntyEpoch {
     pub freshness_tick: u64,
 
     /// Public key of the signer that produced this epoch's signature.
-    /// Used for BLAKE3 keyed-hash verification in Phase 1.
     pub signer_public_key: Hash,
 
     /// Cryptographic signature binding the epoch to the authority scope.
-    /// Must verify against `signer_public_key` via BLAKE3 keyed-hash.
-    pub signature: Hash,
+    /// Must verify against `signer_public_key` via Ed25519 verification.
+    #[serde(with = "signature_bytes_serde")]
+    pub signature: [u8; 64],
 }
 
 /// Freeze action emitted on sovereignty uncertainty conditions.

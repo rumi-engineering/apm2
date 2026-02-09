@@ -445,6 +445,7 @@ fn authority_deny_v1_display_without_ajc() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     assert_eq!(deny.to_string(), "authority denied: invalid session ID");
 }
@@ -459,6 +460,7 @@ fn authority_deny_v1_display_with_ajc() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let display = deny.to_string();
     assert!(display.contains("authority denied: authority already consumed"));
@@ -473,6 +475,7 @@ fn authority_deny_v1_is_error() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     // Verify it implements std::error::Error
     let err: &dyn std::error::Error = &deny;

@@ -19,21 +19,22 @@ fn zero_hash() -> Hash {
     [0u8; 32]
 }
 
-/// Builds a `SovereigntyEpoch` with a valid BLAKE3 keyed-hash signature.
+/// Builds a `SovereigntyEpoch` with a valid Ed25519 signature.
 fn signed_epoch(
     epoch_id: &str,
     freshness_tick: u64,
-    signer_key: Hash,
+    key_seed: u8,
 ) -> apm2_core::pcac::SovereigntyEpoch {
+    use ed25519_dalek::SigningKey;
+
     use super::sovereignty::SovereigntyChecker;
-    let mut epoch = apm2_core::pcac::SovereigntyEpoch {
+    let signing_key = SigningKey::from_bytes(&[key_seed; 32]);
+    apm2_core::pcac::SovereigntyEpoch {
         epoch_id: epoch_id.to_string(),
         freshness_tick,
-        signer_public_key: signer_key,
-        signature: [0u8; 32],
-    };
-    epoch.signature = SovereigntyChecker::compute_epoch_signature(&epoch);
-    epoch
+        signer_public_key: signing_key.verifying_key().to_bytes(),
+        signature: SovereigntyChecker::sign_epoch(&signing_key, epoch_id, freshness_tick),
+    }
 }
 
 fn valid_input() -> AuthorityJoinInputV1 {
@@ -499,7 +500,7 @@ fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
     input.risk_tier = RiskTier::Tier2Plus;
 
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, test_hash(0xCC))),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -537,7 +538,7 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_stale_epoch() {
     input.risk_tier = RiskTier::Tier2Plus;
 
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 10, test_hash(0xCC))), // Very stale
+        epoch: Some(signed_epoch("epoch-001", 10, 0xCC)), // Very stale
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -564,6 +565,11 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_stale_epoch() {
         ),
         "Tier2+ with stale epoch should be denied"
     );
+    assert_eq!(
+        err.containment_action,
+        Some(FreezeAction::HardFreeze),
+        "stale sovereignty epoch must carry containment signal"
+    );
 }
 
 #[test]
@@ -580,7 +586,7 @@ fn lifecycle_gate_with_sovereignty_denies_tier2_frozen() {
     input.risk_tier = RiskTier::Tier2Plus;
 
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, test_hash(0xCC))),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -649,6 +655,8 @@ fn lifecycle_gate_with_sovereignty_tier1_bypasses_bad_state() {
 /// was a fail-open path.
 #[test]
 fn lifecycle_gate_without_sovereignty_state_denies_tier2() {
+    use apm2_core::pcac::FreezeAction;
+
     use super::sovereignty::SovereigntyChecker;
 
     let kernel = Arc::new(InProcessKernel::new(100));
@@ -677,6 +685,11 @@ fn lifecycle_gate_without_sovereignty_state_denies_tier2() {
         ),
         "Tier2+ without sovereignty state must be DENIED (fail-closed), got: {:?}",
         err.deny_class
+    );
+    assert_eq!(
+        err.containment_action,
+        Some(FreezeAction::HardFreeze),
+        "missing sovereignty state must emit hard-freeze containment signal"
     );
 }
 
@@ -722,7 +735,7 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
 
     // Ceiling allows only Tier1, but request is Tier2Plus.
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, test_hash(0xCC))),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -748,6 +761,60 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
             AuthorityDenyClass::IncompatibleAutonomyCeiling { .. }
         ),
         "Tier2+ with ceiling at Tier1 should be denied"
+    );
+    assert_eq!(
+        err.containment_action,
+        Some(FreezeAction::SoftFreeze),
+        "incompatible autonomy ceiling must carry containment signal"
+    );
+}
+
+#[test]
+fn lifecycle_gate_sovereignty_uncertainty_carries_freeze_signal() {
+    use apm2_core::pcac::{AutonomyCeiling, FreezeAction};
+
+    use super::sovereignty::{SovereigntyChecker, SovereigntyState};
+
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let checker = SovereigntyChecker::new();
+    let gate = LifecycleGate::with_sovereignty_checker(kernel, checker);
+
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+
+    let sov_state = SovereigntyState {
+        epoch: None,
+        principal_id: "principal-001".to_string(),
+        revocation_head_known: true,
+        autonomy_ceiling: Some(AutonomyCeiling {
+            max_risk_tier: RiskTier::Tier2Plus,
+            policy_binding_hash: test_hash(0xDD),
+        }),
+        active_freeze: FreezeAction::NoAction,
+    };
+
+    let err = gate
+        .execute_with_sovereignty(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            Some(&sov_state),
+            100,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::SovereigntyUncertainty { .. }
+        ),
+        "missing epoch must fail closed with sovereignty uncertainty"
+    );
+    assert_eq!(
+        err.containment_action,
+        Some(FreezeAction::HardFreeze),
+        "sovereignty uncertainty must surface freeze containment action"
     );
 }
 
@@ -950,7 +1017,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
 
     // Sovereignty state with incompatible ceiling — will fail at consume stage.
     let sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, test_hash(0xCC))),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -983,7 +1050,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
     // Now fix sovereignty state and retry — if consume-set was mutated
     // prematurely, this would fail with AlreadyConsumed.
     let good_sov_state = SovereigntyState {
-        epoch: Some(signed_epoch("epoch-001", 100, test_hash(0xCC))),
+        epoch: Some(signed_epoch("epoch-001", 100, 0xCC)),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,
         autonomy_ceiling: Some(AutonomyCeiling {
@@ -1029,8 +1096,10 @@ fn epoch_with_invalid_signature_denied() {
         epoch: Some(SovereigntyEpoch {
             epoch_id: "epoch-001".to_string(),
             freshness_tick: 100,
-            signer_public_key: test_hash(0xCC),
-            signature: test_hash(0xAB), // Wrong signature
+            signer_public_key: ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32])
+                .verifying_key()
+                .to_bytes(),
+            signature: [0xAB; 64], // Wrong signature
         }),
         principal_id: "principal-001".to_string(),
         revocation_head_known: true,

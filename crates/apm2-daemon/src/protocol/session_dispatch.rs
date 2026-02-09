@@ -750,8 +750,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     ///
     /// When set alongside a PCAC lifecycle gate with a sovereignty checker,
     /// Tier2+ operations are validated against sovereignty state during
-    /// revalidate and consume stages. If absent, sovereignty checks are
-    /// skipped (Tier0/1 operations are unaffected).
+    /// revalidate and consume stages. If absent, Tier2+ fails closed with
+    /// `SovereigntyUncertainty` while Tier0/1 operations remain unaffected.
     sovereignty_state: Option<Arc<crate::pcac::SovereigntyState>>,
 }
 
@@ -1060,6 +1060,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         &self,
     ) -> Option<&Arc<crate::episode::preactuation::PreActuationGate>> {
         self.preactuation_gate.as_ref()
+    }
+
+    /// Returns the configured sovereignty state (tests only).
+    #[cfg(test)]
+    #[must_use]
+    pub const fn sovereignty_state_for_test(&self) -> Option<&Arc<crate::pcac::SovereigntyState>> {
+        self.sovereignty_state.as_ref()
     }
 
     /// Sets the stop authority for authoritative stop-state reads
@@ -2140,14 +2147,26 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     Some(receipts)
                 },
                 Err(deny) => {
+                    let containment_action = deny.containment_action;
                     warn!(
                         session_id = %token.session_id,
                         deny_class = %deny.deny_class,
+                        containment_action = ?containment_action,
+                        freeze_recommended = containment_action.is_some(),
                         "RequestTool denied by PCAC lifecycle gate"
+                    );
+                    let message = containment_action.map_or_else(
+                        || format!("PCAC authority denied: {}", deny.deny_class),
+                        |action| {
+                            format!(
+                                "PCAC authority denied: {} (containment_action: {action})",
+                                deny.deny_class
+                            )
+                        },
                     );
                     return Ok(SessionResponse::error(
                         SessionErrorCode::SessionErrorToolNotAllowed,
-                        format!("PCAC authority denied: {}", deny.deny_class),
+                        message,
                     ));
                 },
             }

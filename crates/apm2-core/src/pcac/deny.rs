@@ -311,6 +311,13 @@ pub struct AuthorityDenyV1 {
 
     /// Tick at denial time.
     pub denied_at_tick: u64,
+
+    /// Optional containment action recommended by the denial path.
+    ///
+    /// Used by sovereignty checks to surface freeze recommendations to caller
+    /// layers that perform containment actuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment_action: Option<super::types::FreezeAction>,
 }
 
 impl std::fmt::Display for AuthorityDenyV1 {
@@ -318,6 +325,9 @@ impl std::fmt::Display for AuthorityDenyV1 {
         write!(f, "authority denied: {}", self.deny_class)?;
         if let Some(ref ajc_id) = self.ajc_id {
             write!(f, " (ajc_id: {})", hex::encode(ajc_id))?;
+        }
+        if let Some(containment_action) = self.containment_action {
+            write!(f, " (containment: {containment_action})")?;
         }
         Ok(())
     }

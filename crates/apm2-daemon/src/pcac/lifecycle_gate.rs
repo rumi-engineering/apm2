@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex};
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, AuthorityJoinKernel, RiskTier,
+    AuthorityJoinInputV1, AuthorityJoinKernel, FreezeAction, RiskTier,
 };
+use tracing::warn;
 
 const ZERO_HASH: Hash = [0u8; 32];
 
@@ -81,6 +82,7 @@ impl InProcessKernel {
                 time_envelope_ref: ZERO_HASH,
                 ledger_anchor: ZERO_HASH,
                 denied_at_tick: 0,
+                containment_action: None,
             }));
         }
         Ok(())
@@ -205,6 +207,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: input.time_envelope_ref,
                 ledger_anchor: input.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
         if input.lease_id.is_empty() {
@@ -214,6 +217,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: input.time_envelope_ref,
                 ledger_anchor: input.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -239,6 +243,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: input.time_envelope_ref,
                 ledger_anchor: input.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -255,6 +260,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: input.time_envelope_ref,
                 ledger_anchor: input.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -302,6 +308,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -313,6 +320,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -327,6 +335,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -354,6 +363,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: cert.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -368,6 +378,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: cert.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -383,6 +394,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                     time_envelope_ref: current_time_envelope_ref,
                     ledger_anchor: cert.as_of_ledger_anchor,
                     denied_at_tick: tick,
+                    containment_action: None,
                 }));
             }
             consumed.insert(cert.ajc_id);
@@ -481,6 +493,19 @@ impl LifecycleGate {
         }
     }
 
+    fn emit_containment_marker(stage: &'static str, deny: &AuthorityDenyV1) {
+        if let Some(containment_action) = deny.containment_action {
+            warn!(
+                stage = stage,
+                deny_class = %deny.deny_class,
+                containment_action = %containment_action,
+                ajc_id = ?deny.ajc_id.map(hex::encode),
+                denied_at_tick = deny.denied_at_tick,
+                "sovereignty denial emitted containment recommendation"
+            );
+        }
+    }
+
     /// Executes the full PCAC lifecycle for a tool request.
     ///
     /// # Arguments
@@ -566,16 +591,19 @@ impl LifecycleGate {
         if Self::requires_sovereignty_check(&cert) {
             match (&self.sovereignty_checker, sovereignty_state) {
                 (Some(checker), Some(state)) => {
-                    checker.check_revalidate(
+                    if let Err(deny) = checker.check_revalidate(
                         &cert,
                         state,
                         current_tick,
                         current_time_envelope_ref,
                         current_ledger_anchor,
-                    )?;
+                    ) {
+                        Self::emit_containment_marker("revalidate", &deny);
+                        return Err(deny);
+                    }
                 },
                 (Some(_), None) => {
-                    return Err(Box::new(AuthorityDenyV1 {
+                    let deny = Box::new(AuthorityDenyV1 {
                         deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
                             reason: "sovereignty state not available for Tier2+ revalidation"
                                 .to_string(),
@@ -584,7 +612,10 @@ impl LifecycleGate {
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: current_ledger_anchor,
                         denied_at_tick: current_tick,
-                    }));
+                        containment_action: Some(FreezeAction::HardFreeze),
+                    });
+                    Self::emit_containment_marker("revalidate", &deny);
+                    return Err(deny);
                 },
                 (None, _) => {
                     // No sovereignty checker configured — sovereignty checks
@@ -600,16 +631,19 @@ impl LifecycleGate {
         if Self::requires_sovereignty_check(&cert) {
             match (&self.sovereignty_checker, sovereignty_state) {
                 (Some(checker), Some(state)) => {
-                    checker.check_consume(
+                    if let Err(deny) = checker.check_consume(
                         &cert,
                         state,
                         current_tick,
                         current_time_envelope_ref,
                         current_ledger_anchor,
-                    )?;
+                    ) {
+                        Self::emit_containment_marker("consume", &deny);
+                        return Err(deny);
+                    }
                 },
                 (Some(_), None) => {
-                    return Err(Box::new(AuthorityDenyV1 {
+                    let deny = Box::new(AuthorityDenyV1 {
                         deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
                             reason: "sovereignty state not available for Tier2+ consume"
                                 .to_string(),
@@ -618,7 +652,10 @@ impl LifecycleGate {
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: current_ledger_anchor,
                         denied_at_tick: current_tick,
-                    }));
+                        containment_action: Some(FreezeAction::HardFreeze),
+                    });
+                    Self::emit_containment_marker("consume", &deny);
+                    return Err(deny);
                 },
                 (None, _) => {},
             }
