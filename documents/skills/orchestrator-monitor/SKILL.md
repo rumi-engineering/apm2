@@ -21,6 +21,11 @@ protocol:
 variables:
   PR_SCOPE_OPTIONAL: "$1"
 
+bootstrap:
+  - step: "DISCOVER_CLI"
+    action: "Run `apm2 fac --help` and read the output to discover available subcommands. Then run `apm2 fac <subcommand> --help` for each subcommand you will use during this workflow. Do NOT assume subcommand names or flag syntax — use the help output as the authoritative reference."
+    when: "FIRST — before invoking any `apm2 fac` command."
+
 notes:
   - "Use `apm2 fac review` as the primary authority path for reviewer lifecycle actions (`dispatch`, `status`, `project`, `retrigger`)."
   - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata, merge actions, and full comment-body retrieval)."

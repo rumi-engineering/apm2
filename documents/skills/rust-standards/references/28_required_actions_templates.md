@@ -73,7 +73,7 @@ status_decision:
   NOTE: |
     Direct status writes have been removed. The Review Gate Success workflow
     (.github/workflows/review-gate.yml) evaluates machine-readable metadata
-    from PR comments via `cargo xtask review-gate` and posts the authoritative
+    from PR comments via the Forge Admission Cycle workflow and posts the authoritative
     "Review Gate Success" commit status.
 
   IF verdict == PASS:

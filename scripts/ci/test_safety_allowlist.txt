@@ -16,10 +16,3 @@
 
 # Security test fixture intentionally embeds a destructive shell payload string.
 TSG001|crates/apm2-daemon/tests/tck_00318_security.rs:19
-
-# Shell escape tests embed dangerous path strings as test data for verifying
-# that quote_path() properly neutralizes command injection vectors.
-TSG001|xtask/src/shell_escape.rs:296
-TSG001|xtask/src/shell_escape.rs:486
-TSG001|xtask/src/shell_escape.rs:494
-TSG001|xtask/src/shell_escape.rs:495

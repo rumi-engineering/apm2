@@ -27,7 +27,7 @@ decision_tree:
             Use TaskOutput to check reviewer subagent status (if managed via Task tool):
               TaskOutput(task_id=<SEC_TASK_ID>, block=false, timeout=5000)
               TaskOutput(task_id=<QUAL_TASK_ID>, block=false, timeout=5000)
-            Note: xtask reviews may run as direct processes; check reviewer_state for details.
+            Note: FAC reviews may run as direct processes; check reviewer_state for details.
           capture_as: reviewer_status
         - id: CHECK_REVIEWER_ACTIVITY
           action: |
@@ -40,9 +40,9 @@ decision_tree:
         - id: ENFORCE_15M_DEADLINE
           action: "Verify `now - started_at < 900s`. If breach (per `review_gate_status`), restart reviews."
         - id: RESTART_IF_UNHEALTHY
-          action: "If STALE/DEAD, trigger `cargo xtask review <TYPE> <PR_URL>`. Stage-2 demotion (TCK-00419): projection-only by default; direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle state."
+          action: "If STALE/DEAD, trigger `apm2 fac review dispatch <PR_URL> --type all`."
         - id: ESCALATE_IF_REVIEWS_NOT_RUNNING
-          action: "If state empty AND pending, escalate to implementer. `cargo xtask push --force-review`. Stage-2 demotion (TCK-00419): projection-only by default; direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle state."
+          action: "If state empty AND pending, escalate to implementer. Run `apm2 fac review dispatch <PR_URL> --type all` to retrigger reviews."
         - id: LOOP_UNTIL_RESOLVED
           action: "Remediate until reviews finish."
       decisions[2]:

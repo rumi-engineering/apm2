@@ -1,6 +1,3 @@
-[alias]
-xtask = "run --package xtask --"
-
 # Use mold linker for faster linking on Linux
 # mold is significantly faster than ld/gold for debug builds
 # If mold is not installed, comment out this section or install:

@@ -4,19 +4,19 @@
 #
 # NOTE: With the allowlist/prohibition approach (TCK-00409 hardening), "gh api"
 # calls are now forbidden at the per-line level.  The only permitted patterns are
-# non-API commands and the blessed xtask path.
+# non-API commands and the blessed apm2 fac path.
 
 # Permitted: plain comment (not a status write, not an API call)
 gh pr comment $PR_URL --body-file findings.md
 
-# Permitted: blessed xtask path for ai-review/security
-cargo xtask security-review-exec approve --context ai-review/security
+# Permitted: apm2 fac path for reviews
+apm2 fac review dispatch 123 --type security
 
 # Permitted: reading a file (no API call)
 cat documents/reviews/SECURITY_REVIEW_PROMPT.md
 
-# Permitted: cargo xtask review (generic review command)
-cargo xtask review --pr 123 --type code-quality
+# Permitted: apm2 fac review (generic review command)
+apm2 fac review --pr 123 --type code-quality
 
 # Permitted: echo/log statements mentioning status concepts (no API call)
-echo "Review status set via xtask"
+echo "Review status set via FAC"

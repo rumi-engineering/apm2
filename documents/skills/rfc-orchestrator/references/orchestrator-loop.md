@@ -23,7 +23,7 @@ decision_tree:
           implication: "NEVER cd into a worktree, NEVER create/delete worktrees yourself."
 
         - id: WORKTREE_DELEGATION
-          rule: "Subagent with /ticket TCK-XXXXX runs xtask start-ticket which creates the worktree."
+          rule: "Subagent with /ticket TCK-XXXXX finds or creates the worktree via git worktree."
           implication: "You don't manage worktrees; the ticket skill does."
 
         - id: ROGUE_REVIEWER_DETECTION
@@ -132,7 +132,7 @@ decision_tree:
       must_not[8]:
         - "Edit files directly (delegate to fix agents)"
         - "Create/delete branches (delegate to fix agents)"
-        - "Create/enter/delete worktrees (subagent handles via xtask start-ticket)"
+        - "Create/enter/delete worktrees (subagent handles via git worktree)"
         - "Merge PRs manually (rely on auto-merge + CI)"
         - "Run multiple subagents concurrently"
         - "Reuse an agent after it has pushed a commit (spawn fresh)"
@@ -386,17 +386,15 @@ procedures[3]:
 
       - id: RUN_REVIEWS
         action: "Run reviews SYNCHRONOUSLY (do NOT background)."
-        commands[2]:
-          - "cargo xtask review security <pr_url>"
-          - "cargo xtask review quality <pr_url>"
-        note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
+        commands[1]:
+          - "apm2 fac review dispatch <pr_url> --type all"
 
       - id: VERIFY_POSTED
         command: "gh api repos/{owner}/{repo}/commits/{head_sha}/status"
         expect: "Review Gate Success context present or pending review-gate evaluation"
 
   - id: DISPATCH_IMPLEMENTER
-    purpose: "Dispatch a subagent to implement or fix a ticket. Worktree creation handled by subagent via /ticket -> xtask start-ticket."
+    purpose: "Dispatch a subagent to implement or fix a ticket. Worktree creation handled by subagent via /ticket -> git worktree."
     inputs[2]:
       - ticket_id
       - reason (default: "implement ticket")
@@ -409,7 +407,7 @@ procedures[3]:
           Use Task tool with model=opus (REQUIRED).
           prompt: /ticket <ticket_id> + reason context
           run_in_background: false (SYNCHRONOUS)
-          The subagent will run xtask start-ticket which creates/updates worktree.
+          The subagent will find or create the worktree via git worktree.
 
           If handoff_context provided (context exhaustion recovery):
             prompt: |

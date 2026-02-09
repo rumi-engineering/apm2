@@ -1,18 +1,15 @@
 title: Dev Ticket Command Reference
 
-commands[18]:
-  - name: start-ticket-default
-    command: "cargo xtask start-ticket"
-    purpose: "Setup dev environment for next unblocked ticket. Expect an error for work already in progress."
-  - name: start-ticket-rfc
-    command: "cargo xtask start-ticket RFC-XXXX"
-    purpose: "Setup dev environment for next unblocked ticket in RFC. Expect an error for work already in progress."
-  - name: start-ticket-ticket
-    command: "cargo xtask start-ticket TCK-XXXXX"
-    purpose: "Setup dev environment for a specific ticket."
-  - name: start-ticket-print-path
-    command: "cargo xtask start-ticket [target] --print-path"
-    purpose: "Output only worktree path (use for cd)."
+commands[16]:
+  - name: find-worktree
+    command: "git worktree list | grep <TICKET_ID>"
+    purpose: "Find the worktree for your assigned ticket."
+  - name: enter-worktree
+    command: "cd $(git worktree list | grep <TICKET_ID> | awk '{print $1}')"
+    purpose: "Enter the worktree for your assigned ticket."
+  - name: create-worktree
+    command: "git worktree add /home/ubuntu/Projects/apm2-<TICKET_ID> -b ticket/<RFC_ID>/<TICKET_ID>"
+    purpose: "Create a new worktree and branch for a ticket."
   - name: format
     command: "cargo fmt --all --check"
     purpose: "Verify formatting across all workspace members before committing."
@@ -20,17 +17,11 @@ commands[18]:
     command: "cargo clippy --fix --allow-dirty --all-targets --all-features -- -D warnings"
     purpose: "Fix linting issues and enforce quality standards before committing."
   - name: commit
-    command: "cargo xtask commit \"<message>\""
-    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` and `apm2 fac work status` for ledger-authoritative lifecycle state."
-    purpose: "Verify, sync with main, and commit."
+    command: "cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && git add -A && git commit -m \"<message>\""
+    purpose: "Format, lint, and commit changes."
   - name: push
-    command: "cargo xtask push"
-    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` and `apm2 fac work status` for ledger-authoritative lifecycle state."
+    command: "apm2 fac push"
     purpose: "Push, create/update PR, run AI reviews, enable auto-merge."
-  - name: push-force-review
-    command: "cargo xtask push --force-review"
-    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` and `apm2 fac work status` for ledger-authoritative lifecycle state."
-    purpose: "Force re-run reviews after addressing feedback."
   - name: gate-status
     command: "gh api repos/guardian-intelligence/apm2/commits/<HEAD_SHA>/status --jq '.statuses[] | select(.context == \"Review Gate Success\") | \"\\(.context)=\\(.state): \\(.description)\"'"
     purpose: "Inspect required merge-gate status context bound to the exact commit SHA."
@@ -50,13 +41,11 @@ commands[18]:
     command: "gh pr view <PR_URL> --json reviews,reviewThreads --jq '{latest_review: (.reviews[-1].body // \"N/A\"), unresolved_threads: [.reviewThreads[]? | select(.isResolved == false) | {path: .path, body: .comments[-1].body}]}'"
     purpose: "Get full review/comment bodies from GitHub (fallback surface until FAC projection exposes full comment text)."
   - name: finish
-    command: "cargo xtask finish"
-    purpose: "Cleanup worktree and branch after PR merges."
-  - name: security-review-approve
-    command: "cargo xtask security-review-exec approve [TCK-XXXXX]"
-    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` for authoritative review gate evidence."
-    purpose: "Approve PR after security review."
-  - name: security-review-deny
-    command: "cargo xtask security-review-exec deny [TCK-XXXXX] --reason <reason>"
-    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` for authoritative review gate evidence."
-    purpose: "Deny PR with a reason after security review."
+    command: "git worktree remove <WORKTREE_PATH>"
+    purpose: "Cleanup worktree after PR merges."
+  - name: dispatch-reviews
+    command: "apm2 fac review dispatch <PR_URL> --type all"
+    purpose: "Dispatch AI security and quality reviews for a PR."
+  - name: fac-dispatch-review
+    command: "apm2 fac review dispatch <PR_URL> --type <security|quality>"
+    purpose: "Dispatch a specific type of AI review for a PR."

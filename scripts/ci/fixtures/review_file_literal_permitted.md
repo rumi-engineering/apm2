@@ -3,6 +3,6 @@
 # It should be PERMITTED by the primary gate check.
 
 ## Steps
-# The security review context is handled exclusively by the xtask.
-# See: cargo xtask security-review-exec approve
-cargo xtask security-review-exec approve
+# The security review context is handled exclusively by the FAC.
+# See: apm2 fac review dispatch --type security
+apm2 fac review dispatch 123 --type security

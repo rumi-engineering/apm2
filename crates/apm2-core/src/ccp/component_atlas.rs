@@ -113,8 +113,6 @@ pub enum ComponentType {
     Library,
     /// A binary crate.
     Binary,
-    /// An xtask crate (development tooling).
-    XTask,
     /// A skill (agent capability).
     Skill,
 }
@@ -313,12 +311,6 @@ fn discover_crates(repo_root: &Path) -> Result<Vec<PathBuf>, CcpError> {
         }
     }
 
-    // Also check for xtask
-    let xtask_cargo = repo_root.join("xtask/Cargo.toml");
-    if xtask_cargo.exists() {
-        crates.push(repo_root.join("xtask"));
-    }
-
     // Sort for determinism
     crates.sort();
     Ok(crates)
@@ -479,11 +471,6 @@ fn parse_agents_md(content: &str) -> ParsedAgentsMd {
 
 /// Determines the component type from the crate path and Cargo.toml.
 fn determine_component_type(crate_path: &Path) -> ComponentType {
-    // Check if it's xtask
-    if crate_path.file_name().is_some_and(|n| n == "xtask") {
-        return ComponentType::XTask;
-    }
-
     // Check Cargo.toml for binary targets
     let cargo_toml = crate_path.join("Cargo.toml");
     match read_file_bounded(&cargo_toml, MAX_CARGO_TOML_SIZE) {
@@ -523,7 +510,7 @@ fn extract_crate_name(crate_path: &Path) -> String {
 /// Builds a component atlas for the given repository.
 ///
 /// This function:
-/// 1. Discovers all crate directories in `crates/` and `xtask/`
+/// 1. Discovers all crate directories in `crates/`
 /// 2. For each crate, checks for AGENTS.md
 /// 3. If AGENTS.md exists, parses it for invariants/contracts/extension points
 /// 4. If AGENTS.md doesn't exist, creates a placeholder entry
@@ -951,7 +938,6 @@ Errors are returned, not thrown.
         fs::create_dir_all(root.join("crates/apm2-core/src")).unwrap();
         fs::create_dir_all(root.join("crates/apm2-daemon")).unwrap();
         fs::create_dir_all(root.join("crates/apm2-cli")).unwrap();
-        fs::create_dir_all(root.join("xtask")).unwrap();
 
         // Create Cargo.toml files
         fs::write(
@@ -969,7 +955,6 @@ Errors are returned, not thrown.
             "[package]\nname = \"apm2-cli\"\n[[bin]]\nname = \"apm2\"",
         )
         .unwrap();
-        fs::write(root.join("xtask/Cargo.toml"), "[package]\nname = \"xtask\"").unwrap();
 
         // Create AGENTS.md files
         fs::write(
@@ -1014,7 +999,7 @@ Errors are returned, not thrown.
         assert_eq!(atlas.schema_version, ComponentAtlas::SCHEMA_VERSION);
 
         // Verify all components discovered
-        assert_eq!(atlas.components.len(), 4);
+        assert_eq!(atlas.components.len(), 3);
 
         // Verify components are sorted by ID
         let ids: Vec<_> = atlas.components.iter().map(|c| &c.id).collect();
@@ -1042,10 +1027,6 @@ Errors are returned, not thrown.
         assert_eq!(daemon.id, "COMP-APM2_DAEMON");
         assert_eq!(daemon.component_type, ComponentType::Binary);
         assert_eq!(daemon.invariants.len(), 1);
-
-        let xtask = atlas.components.iter().find(|c| c.name == "xtask").unwrap();
-        assert_eq!(xtask.id, "COMP-XTASK");
-        assert_eq!(xtask.component_type, ComponentType::XTask);
 
         let cli = atlas
             .components

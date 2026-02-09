@@ -23,8 +23,7 @@ commands[22]:
     command: "gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/$(gh pr view <BRANCH_NAME> --json headRefOid --jq .headRefOid)/status --jq '.statuses[] | select(.context == \"Review Gate Success\") | \"\(.context): \(.state)\"'"
     purpose: "Query Review Gate Success status directly via GitHub API."
   - name: trigger-reviews
-    command: "cargo xtask review security <PR_URL> & cargo xtask review quality <PR_URL> &"
-    note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
+    command: "apm2 fac review dispatch <PR_URL> --type all"
     purpose: "Trigger AI reviews."
   - name: cleanup-branch
     command: "git checkout main && git pull && git branch -D <BRANCH_NAME>"

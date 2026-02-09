@@ -38,8 +38,8 @@ decision_tree:
           purpose: "Generate the next sequential ticket ID."
         - id: CREATE_WORKTREE
           action: command
-          run: "cargo xtask start-ticket <new_ticket_id> --dry-run"
-          purpose: "Preview worktree creation (will fail because ticket doesn't exist yet)."
+          run: "git worktree add /home/ubuntu/Projects/apm2-<new_ticket_id> -b ticket/<RFC_ID>/<new_ticket_id>"
+          purpose: "Create worktree and branch for the new ticket."
         - id: CREATE_TICKET_FILE
           action: |
             Create a minimal ticket YAML at documents/work/tickets/<new_ticket_id>.yaml:
@@ -74,7 +74,7 @@ decision_tree:
         - id: TICKET_EXISTS
           if: "Work is already covered by an existing ticket"
           then:
-            action: "Use the existing ticket instead. Run: cargo xtask start-ticket TCK-XXXXX"
+            action: "Use the existing ticket instead. Find its worktree via: git worktree list | grep TCK-XXXXX"
         - id: PROCEED_TO_IMPLEMENTATION
           if: "Ticket file created and validated"
           then:
@@ -93,5 +93,5 @@ example:
     - "Run list-ticket-ids to verify no existing ticket covers this"
     - "Generate new ticket ID: TCK-00279"
     - "Create minimal ticket YAML with title 'Fix README typo'"
-    - "Run cargo xtask start-ticket TCK-00279"
-    - "Make the fix, commit, push, create PR"
+    - "Create worktree: git worktree add /home/ubuntu/Projects/apm2-TCK-00279 -b ticket/TCK-00279"
+    - "Make the fix, commit, push via apm2 fac push"

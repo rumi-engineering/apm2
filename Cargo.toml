@@ -4,7 +4,7 @@ members = [
     "crates/apm2-core",
     "crates/apm2-daemon",
     "crates/apm2-cli",
-    "xtask", "crates/apm2-holon",
+    "crates/apm2-holon",
 ]
 exclude = ["fuzz"]
 
