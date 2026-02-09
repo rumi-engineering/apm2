@@ -244,13 +244,22 @@ impl ObservableSemantics {
     ///
     /// # Errors
     ///
-    /// Returns an error if the source state has too many transitions.
+    /// Returns an error if the source or target state does not exist, or if
+    /// the source state has too many transitions. Fail-closed: dangling
+    /// targets are rejected to prevent malformed LTS graphs.
     pub fn add_transition(
         &mut self,
         source: StateId,
         operation: HsiOperation,
         target: StateId,
     ) -> Result<(), BisimulationError> {
+        // Validate target state exists (fail-closed on dangling targets).
+        if !self.states.contains_key(&target) {
+            return Err(BisimulationError::InvalidComposition(format!(
+                "target state {target} does not exist (dangling transition from {source})"
+            )));
+        }
+
         let transitions = self.states.get_mut(&source).ok_or_else(|| {
             BisimulationError::InvalidComposition(format!("source state {source} does not exist"))
         })?;
@@ -263,6 +272,30 @@ impl ObservableSemantics {
         }
 
         transitions.push(Transition { operation, target });
+        Ok(())
+    }
+
+    /// Validates that all transitions in the graph point to existing states.
+    ///
+    /// This is a post-hoc integrity check that can be used to verify
+    /// deserialized or externally-constructed LTS graphs. Returns an error
+    /// on the first dangling transition found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any transition targets a non-existent state.
+    pub fn validate_graph_integrity(&self) -> Result<(), BisimulationError> {
+        for (&source, transitions) in &self.states {
+            for tr in transitions {
+                if !self.states.contains_key(&tr.target) {
+                    return Err(BisimulationError::InvalidComposition(format!(
+                        "dangling transition: state {source} -> state {} via {}, \
+                         but target state does not exist",
+                        tr.target, tr.operation
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -790,6 +823,28 @@ impl PromotionGate {
                 break;
             }
 
+            // Fail-closed: enforce that the composition's declared depth
+            // matches the expected depth for this position. A caller must
+            // not be able to present trivial depth-0 artifacts for higher
+            // depth slots.
+            if semantics.depth() != depth {
+                blocking_defects.push(BlockingDefect {
+                    depth,
+                    counterexample: Vec::new(),
+                    description: format!(
+                        "Depth mismatch: composition at position {i} has depth {} \
+                         but expected depth {depth}; evidence must match the \
+                         required depth",
+                        semantics.depth(),
+                    ),
+                });
+                depth_results.push(DepthCheckResult {
+                    depth,
+                    passed: false,
+                });
+                continue;
+            }
+
             let result = self.checker.check_depth(semantics, depth)?;
 
             depth_results.push(DepthCheckResult {
@@ -948,6 +1003,33 @@ mod tests {
         let mut semantics = ObservableSemantics::new(0);
         let result = semantics.add_transition(999, HsiOperation::Spawn { depth: 0 }, 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_observable_semantics_dangling_target_rejected() {
+        // BLOCKER 2 regression: transitions with non-existent target states
+        // must be rejected (fail-closed).
+        let mut semantics = ObservableSemantics::new(0);
+        // Target state 999 does not exist
+        let result = semantics.add_transition(0, HsiOperation::Spawn { depth: 0 }, 999);
+        assert!(result.is_err(), "Dangling target must be rejected");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target state 999 does not exist"),
+            "Error must identify dangling target: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_observable_semantics_validate_graph_integrity() {
+        let mut semantics = ObservableSemantics::new(0);
+        let s1 = semantics.add_state().unwrap();
+        semantics
+            .add_transition(0, HsiOperation::Spawn { depth: 0 }, s1)
+            .unwrap();
+        // Valid graph: all targets exist
+        assert!(semantics.validate_graph_integrity().is_ok());
     }
 
     #[test]
@@ -1449,9 +1531,12 @@ mod tests {
     fn test_promotion_gate_all_pass() {
         let gate = PromotionGate::new(3).unwrap();
 
-        // Build compositions that are trivially bisimilar (depth 0)
+        // Build compositions with correct depth binding. Each composition
+        // must have depth == position+1 and be bisimilar to its flattening.
+        // We use single-state LTS at the correct depth (no transitions =>
+        // flattened version is identical => bisimilar).
         let compositions: Vec<ObservableSemantics> =
-            (1..=3).map(|_| ObservableSemantics::new(0)).collect();
+            (1..=3).map(ObservableSemantics::new).collect();
 
         let result = gate.evaluate(&compositions).unwrap();
         assert!(result.allowed());
@@ -1461,14 +1546,43 @@ mod tests {
     }
 
     #[test]
+    fn test_promotion_gate_rejects_depth_zero_spoofing() {
+        // Regression test for BLOCKER 1: trivial depth-0 artifacts must
+        // NOT be accepted as evidence for higher-depth slots.
+        let gate = PromotionGate::new(3).unwrap();
+
+        let compositions: Vec<ObservableSemantics> =
+            (1..=3).map(|_| ObservableSemantics::new(0)).collect();
+
+        let result = gate.evaluate(&compositions).unwrap();
+        assert!(
+            !result.allowed(),
+            "Depth-0 artifacts must be rejected for depth 1..=3 slots"
+        );
+        // All three should fail with depth-mismatch defects
+        assert_eq!(
+            result.blocking_defects().len(),
+            3,
+            "All 3 depth-mismatched slots must produce blocking defects"
+        );
+        for defect in result.blocking_defects() {
+            assert!(
+                defect.description.contains("Depth mismatch"),
+                "Defect must describe depth mismatch: {}",
+                defect.description
+            );
+        }
+    }
+
+    #[test]
     fn test_promotion_gate_blocks_on_bisimulation_failure() {
         let gate = PromotionGate::new(3).unwrap();
 
-        // Provide 3 compositions (matching max_depth) where depths 2 and 3
-        // fail bisimulation because nested spawns differ from flattened.
+        // Provide 3 compositions with correct depth binding where depths 2
+        // and 3 fail bisimulation because nested spawns differ from flattened.
         let compositions = vec![
-            // Depth 1: trivially passes (depth 0 semantics)
-            ObservableSemantics::new(0),
+            // Depth 1: single-state at depth 1, bisimilar to its flattening
+            ObservableSemantics::new(1),
             // Depth 2: will fail because nested spawns differ from flattened
             build_linear_composition(2).unwrap(),
             // Depth 3: will also fail
@@ -1479,9 +1593,13 @@ mod tests {
         assert!(!result.allowed());
         assert!(!result.blocking_defects().is_empty());
 
-        // Verify blocking defects contain counterexamples
+        // Verify blocking defects contain counterexamples from bisimulation
+        // failures (not depth-mismatch defects).
         for defect in result.blocking_defects() {
-            assert!(!defect.counterexample.is_empty());
+            assert!(
+                !defect.counterexample.is_empty(),
+                "Bisimulation failure defects must have counterexamples"
+            );
             assert!(!defect.description.is_empty());
             let display = defect.to_string();
             assert!(display.contains("BLOCKING DEFECT"));
@@ -1638,12 +1756,13 @@ mod tests {
         // ticket. This test covers the gate's own blocking logic.
         let gate = PromotionGate::new(1).unwrap();
 
-        // Create a composition that is NOT bisimilar to its flattening
-        let mut nested = ObservableSemantics::new(5);
+        // Create a composition at the correct depth (1) that is NOT
+        // bisimilar to its flattening due to spawn-depth labels.
+        let mut nested = ObservableSemantics::new(1);
         let s1 = nested.add_state().unwrap();
         let s2 = nested.add_state().unwrap();
         nested
-            .add_transition(0, HsiOperation::Spawn { depth: 5 }, s1)
+            .add_transition(0, HsiOperation::Spawn { depth: 1 }, s1)
             .unwrap();
         nested
             .add_transition(
@@ -1666,6 +1785,52 @@ mod tests {
         assert!(
             !result.blocking_defects().is_empty(),
             "Blocking defects must be emitted"
+        );
+        // The defect should be a bisimulation failure (not depth mismatch)
+        assert!(
+            result.blocking_defects()[0]
+                .description
+                .contains("Bisimulation equivalence violated"),
+            "Defect should be from bisimulation check, not depth mismatch"
+        );
+    }
+
+    #[test]
+    fn test_gate_blocks_depth_mismatched_composition() {
+        // Regression: a depth-5 artifact at position 0 (expected depth 1)
+        // must be rejected with a depth-mismatch defect.
+        let gate = PromotionGate::new(1).unwrap();
+
+        let mut nested = ObservableSemantics::new(5);
+        let s1 = nested.add_state().unwrap();
+        let s2 = nested.add_state().unwrap();
+        nested
+            .add_transition(0, HsiOperation::Spawn { depth: 5 }, s1)
+            .unwrap();
+        nested
+            .add_transition(
+                s1,
+                HsiOperation::Execute {
+                    output_tag: "deep".to_string(),
+                },
+                s2,
+            )
+            .unwrap();
+
+        let compositions = vec![nested];
+        let result = gate.evaluate(&compositions).unwrap();
+
+        assert!(
+            !result.allowed(),
+            "Gate must block depth-mismatched compositions"
+        );
+        assert_eq!(result.blocking_defects().len(), 1);
+        assert!(
+            result.blocking_defects()[0]
+                .description
+                .contains("Depth mismatch"),
+            "Must report depth mismatch, got: {}",
+            result.blocking_defects()[0].description
         );
     }
 
