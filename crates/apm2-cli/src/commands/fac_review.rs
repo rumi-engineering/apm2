@@ -670,21 +670,28 @@ pub fn run_kickoff(
     event_path: &Path,
     event_name: &str,
     max_wait_seconds: u64,
+    public_projection_only: bool,
     json_output: bool,
 ) -> u8 {
-    if !json_output {
+    if !json_output && !public_projection_only {
         println!(
             "details=~/.apm2/review_events.ndjson state=~/.apm2/reviewer_state.json dispatch_logs=~/.apm2/review_dispatch/"
         );
     }
-    match run_kickoff_inner(repo, event_path, event_name, max_wait_seconds) {
+    match run_kickoff_inner(
+        repo,
+        event_path,
+        event_name,
+        max_wait_seconds,
+        public_projection_only,
+    ) {
         Ok(summary) => {
             if json_output {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
                 );
-            } else {
+            } else if !public_projection_only {
                 println!("FAC Kickoff");
                 println!("  Repo:              {}", summary.repo);
                 println!("  Event:             {}", summary.event_name);
@@ -874,6 +881,7 @@ fn run_kickoff_inner(
     event_path: &Path,
     event_name: &str,
     max_wait_seconds: u64,
+    public_projection_only: bool,
 ) -> Result<KickoffSummary, String> {
     if max_wait_seconds == 0 {
         return Err("max_wait_seconds must be greater than zero".to_string());
@@ -910,10 +918,17 @@ fn run_kickoff_inner(
         )?;
         println!("{}", projection.line);
         for error in &projection.errors {
-            println!(
-                "ERROR ts={} event={} review={} seq={} detail={}",
-                error.ts, error.event, error.review_type, error.seq, error.detail
-            );
+            if public_projection_only {
+                eprintln!(
+                    "ERROR ts={} event={} review={} seq={} detail={}",
+                    error.ts, error.event, error.review_type, error.seq, error.detail
+                );
+            } else {
+                println!(
+                    "ERROR ts={} event={} review={} seq={} detail={}",
+                    error.ts, error.event, error.review_type, error.seq, error.detail
+                );
+            }
         }
         after_seq = projection.last_seq;
 

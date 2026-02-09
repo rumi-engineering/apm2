@@ -149,7 +149,7 @@ jobs:
           : >"${private_log}"
           chmod 600 "${private_log}"
 
-          health_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z security=[^[:space:]]+ quality=[^[:space:]]+ events=.*$'
+          health_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z sha=[^[:space:]]+ current_head_sha=[^[:space:]]+ security=[^[:space:]]+ quality=[^[:space:]]+ events=.*$'
 
           set +e
           cargo run --locked --quiet -p apm2-cli -- fac kickoff \

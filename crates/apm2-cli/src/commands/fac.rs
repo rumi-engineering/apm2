@@ -369,6 +369,11 @@ pub struct KickoffArgs {
     /// Maximum seconds to wait for FAC terminal state.
     #[arg(long, default_value_t = 3600)]
     pub max_wait_seconds: u64,
+
+    /// Restrict stdout to 1Hz health projection lines only. All non-health
+    /// diagnostics are emitted to stderr for private runner logs.
+    #[arg(long, default_value_t = false)]
+    pub public_projection_only: bool,
 }
 
 /// Arguments for `apm2 fac review`.
@@ -720,6 +725,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             &args.event,
             &args.event_name,
             args.max_wait_seconds,
+            args.public_projection_only,
             json_output,
         ),
         FacSubcommand::Review(args) => match &args.subcommand {
