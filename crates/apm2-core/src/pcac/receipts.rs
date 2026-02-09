@@ -327,14 +327,11 @@ impl ReceiptDigestMeta {
         Ok(())
     }
 
-    /// Verify receipt digest against canonical bytes under an allowed
-    /// canonicalization regime.
+    /// Validate digest metadata under authoritative acceptance requirements.
     ///
-    /// # Errors
-    ///
-    /// Returns `PcacValidationError` if the canonicalizer is not allowlisted
-    /// or if the digest does not match the BLAKE3 hash of `canonical_bytes`.
-    pub fn verify_digest(&self, canonical_bytes: &[u8]) -> Result<(), PcacValidationError> {
+    /// This enforces canonicalizer allowlisting in addition to
+    /// [`Self::validate`].
+    fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
         self.validate()?;
         if !ALLOWED_CANONICALIZER_IDS
             .iter()
@@ -344,6 +341,18 @@ impl ReceiptDigestMeta {
                 id: self.canonicalizer_id.clone(),
             });
         }
+        Ok(())
+    }
+
+    /// Verify receipt digest against canonical bytes under an allowed
+    /// canonicalization regime.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` if the canonicalizer is not allowlisted
+    /// or if the digest does not match the BLAKE3 hash of `canonical_bytes`.
+    pub fn verify_digest(&self, canonical_bytes: &[u8]) -> Result<(), PcacValidationError> {
+        self.validate_authoritative()?;
 
         let computed = blake3::hash(canonical_bytes);
         if self.content_digest.ct_eq(computed.as_bytes()).unwrap_u8() != 1 {
@@ -351,6 +360,21 @@ impl ReceiptDigestMeta {
         }
         Ok(())
     }
+}
+
+/// Enforce coherence between duplicated top-level and authoritative HTF witness
+/// fields.
+fn validate_time_envelope_ref_coherence(
+    outer_time_envelope_ref: &Hash,
+    bindings: &AuthoritativeBindings,
+) -> Result<(), PcacValidationError> {
+    if outer_time_envelope_ref != &bindings.time_envelope_ref {
+        return Err(PcacValidationError::FieldCoherenceMismatch {
+            outer_field: "time_envelope_ref",
+            inner_field: "authoritative_bindings.time_envelope_ref",
+        });
+    }
+    Ok(())
 }
 
 impl ReceiptAuthentication {
@@ -544,6 +568,7 @@ impl AuthorityRevalidateReceiptV1 {
         }
         if let Some(ref bindings) = self.authoritative_bindings {
             bindings.validate()?;
+            validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
         }
         Ok(())
     }
@@ -560,12 +585,31 @@ impl AuthorityRevalidateReceiptV1 {
     /// validation error.
     pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
         self.validate()?;
+        self.digest_meta.validate_authoritative()?;
         let bindings = self.authoritative_bindings.as_ref().ok_or(
             PcacValidationError::MissingAuthoritativeBindings {
                 receipt_type: "authority_revalidate_receipt_v1",
             },
         )?;
         bindings.validate()?;
+        validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
+        Ok(())
+    }
+
+    /// Validate this receipt as authoritative and verify digest against
+    /// canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns any structural authoritative validation error from
+    /// [`Self::validate_authoritative`] or digest verification error from
+    /// [`ReceiptDigestMeta::verify_digest`].
+    pub fn validate_authoritative_with_digest(
+        &self,
+        canonical_bytes: &[u8],
+    ) -> Result<(), PcacValidationError> {
+        self.validate_authoritative()?;
+        self.digest_meta.verify_digest(canonical_bytes)?;
         Ok(())
     }
 }
@@ -613,6 +657,7 @@ impl AuthorityJoinReceiptV1 {
         }
         if let Some(ref bindings) = self.authoritative_bindings {
             bindings.validate()?;
+            validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
         }
         Ok(())
     }
@@ -629,12 +674,31 @@ impl AuthorityJoinReceiptV1 {
     /// validation error.
     pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
         self.validate()?;
+        self.digest_meta.validate_authoritative()?;
         let bindings = self.authoritative_bindings.as_ref().ok_or(
             PcacValidationError::MissingAuthoritativeBindings {
                 receipt_type: "authority_join_receipt_v1",
             },
         )?;
         bindings.validate()?;
+        validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
+        Ok(())
+    }
+
+    /// Validate this receipt as authoritative and verify digest against
+    /// canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns any structural authoritative validation error from
+    /// [`Self::validate_authoritative`] or digest verification error from
+    /// [`ReceiptDigestMeta::verify_digest`].
+    pub fn validate_authoritative_with_digest(
+        &self,
+        canonical_bytes: &[u8],
+    ) -> Result<(), PcacValidationError> {
+        self.validate_authoritative()?;
+        self.digest_meta.verify_digest(canonical_bytes)?;
         Ok(())
     }
 }
@@ -697,6 +761,7 @@ impl AuthorityConsumeReceiptV1 {
         }
         if let Some(ref bindings) = self.authoritative_bindings {
             bindings.validate()?;
+            validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
         }
         Ok(())
     }
@@ -713,12 +778,31 @@ impl AuthorityConsumeReceiptV1 {
     /// validation error.
     pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
         self.validate()?;
+        self.digest_meta.validate_authoritative()?;
         let bindings = self.authoritative_bindings.as_ref().ok_or(
             PcacValidationError::MissingAuthoritativeBindings {
                 receipt_type: "authority_consume_receipt_v1",
             },
         )?;
         bindings.validate()?;
+        validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
+        Ok(())
+    }
+
+    /// Validate this receipt as authoritative and verify digest against
+    /// canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns any structural authoritative validation error from
+    /// [`Self::validate_authoritative`] or digest verification error from
+    /// [`ReceiptDigestMeta::verify_digest`].
+    pub fn validate_authoritative_with_digest(
+        &self,
+        canonical_bytes: &[u8],
+    ) -> Result<(), PcacValidationError> {
+        self.validate_authoritative()?;
+        self.digest_meta.verify_digest(canonical_bytes)?;
         Ok(())
     }
 }
@@ -763,6 +847,7 @@ impl AuthorityDenyReceiptV1 {
         }
         if let Some(ref bindings) = self.authoritative_bindings {
             bindings.validate()?;
+            validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
         }
         Ok(())
     }
@@ -779,12 +864,31 @@ impl AuthorityDenyReceiptV1 {
     /// validation error.
     pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
         self.validate()?;
+        self.digest_meta.validate_authoritative()?;
         let bindings = self.authoritative_bindings.as_ref().ok_or(
             PcacValidationError::MissingAuthoritativeBindings {
                 receipt_type: "authority_deny_receipt_v1",
             },
         )?;
         bindings.validate()?;
+        validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
+        Ok(())
+    }
+
+    /// Validate this receipt as authoritative and verify digest against
+    /// canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns any structural authoritative validation error from
+    /// [`Self::validate_authoritative`] or digest verification error from
+    /// [`ReceiptDigestMeta::verify_digest`].
+    pub fn validate_authoritative_with_digest(
+        &self,
+        canonical_bytes: &[u8],
+    ) -> Result<(), PcacValidationError> {
+        self.validate_authoritative()?;
+        self.digest_meta.verify_digest(canonical_bytes)?;
         Ok(())
     }
 }

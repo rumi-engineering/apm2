@@ -218,6 +218,14 @@ pub enum PcacValidationError {
     /// Delegated-path bindings are incoherent: both `permeability_receipt_hash`
     /// and `delegation_chain_hash` must be present or both absent.
     IncoherentDelegatedBindings,
+    /// Two semantically duplicated fields diverge and violate binding
+    /// coherence.
+    FieldCoherenceMismatch {
+        /// Name of the outer (top-level) field.
+        outer_field: &'static str,
+        /// Name of the nested/coherent field that must match.
+        inner_field: &'static str,
+    },
     /// Authoritative bindings are required for trust-admission validation.
     MissingAuthoritativeBindings {
         /// Receipt type that is missing required authoritative bindings.
@@ -265,6 +273,15 @@ impl std::fmt::Display for PcacValidationError {
                 write!(
                     f,
                     "delegated-path bindings incoherent: permeability_receipt_hash and delegation_chain_hash must co-occur"
+                )
+            },
+            Self::FieldCoherenceMismatch {
+                outer_field,
+                inner_field,
+            } => {
+                write!(
+                    f,
+                    "field coherence mismatch: '{outer_field}' must equal '{inner_field}'"
                 )
             },
             Self::MissingAuthoritativeBindings { receipt_type } => {

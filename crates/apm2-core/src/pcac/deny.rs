@@ -348,6 +348,7 @@ impl AuthorityDenyV1 {
     ///   [`AuthorityDenyClass::validate`]).
     /// - `time_envelope_ref` is non-zero (replay-critical binding).
     /// - `ledger_anchor` is non-zero (replay-critical binding).
+    /// - `denied_at_tick` is strictly positive.
     /// - `ajc_id`, when present, is non-zero.
     ///
     /// # Errors
@@ -364,6 +365,11 @@ impl AuthorityDenyV1 {
         if self.ledger_anchor == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "ledger_anchor",
+            });
+        }
+        if self.denied_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "denied_at_tick",
             });
         }
         if let Some(ref ajc) = self.ajc_id {
