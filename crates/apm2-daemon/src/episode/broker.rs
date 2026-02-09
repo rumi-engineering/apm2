@@ -7779,8 +7779,8 @@ policy:
     /// TCK-00376 / TCK-00377 regression: Tier4 write request without context
     /// manifest MUST be TERMINATED (not just denied) per REQ-0029.
     /// NOTE: Originally tested Execute, but TCK-00377 unconditionally denies
-    /// raw Execute at Tier2+ via `TOOL_KIND_GUARD` before the path ratchet runs.
-    /// Using Write to exercise the path ratchet directly.
+    /// raw Execute at Tier2+ via `TOOL_KIND_GUARD` before the path ratchet
+    /// runs. Using Write to exercise the path ratchet directly.
     #[tokio::test]
     async fn test_path_ratchet_tier4_no_context_manifest_terminates() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
