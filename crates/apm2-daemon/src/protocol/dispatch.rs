@@ -149,7 +149,8 @@ use crate::metrics::SharedMetricsRegistry;
 use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
 use crate::state::SharedState;
 use crate::work::authority::{
-    ProjectionWorkAuthority, WorkAuthority, WorkAuthorityError, WorkAuthorityStatus,
+    AliasReconciliationGate, ProjectionAliasReconciliationGate, ProjectionWorkAuthority,
+    WorkAuthority, WorkAuthorityError, WorkAuthorityStatus, work_id_to_hash,
 };
 
 // ============================================================================
@@ -5903,6 +5904,24 @@ pub struct PrivilegedDispatcher {
     /// resolver returns a receipt, it is stored on the `WorkClaim` and
     /// subsequently enforced by the delegated spawn gate.
     permeability_receipt_resolver: Arc<dyn PermeabilityReceiptResolver>,
+
+    /// TCK-00420: Alias reconciliation gate for promotion gating.
+    ///
+    /// During `SpawnEpisode`, the dispatcher invokes this gate to verify that
+    /// alias/`work_id` projections are consistent before proceeding.
+    /// Infrastructure errors and unresolved defects both result in fail-closed
+    /// rejection (CTR-2617, INV-ALIAS-002).
+    ///
+    /// # Current Limitation
+    ///
+    /// The `ClaimWork` handler registers identity-mapped aliases
+    /// (`work_id -> work_id`) because the wire protocol does not carry a
+    /// separate `ticket_alias` field. Real `TCK-*` style aliases must be
+    /// registered by an operator layer or future policy resolver extension.
+    ///
+    /// TODO(TCK-00425): Wire real ticket aliases through policy resolution
+    /// so `ClaimWork` can register true alias->work_id mappings.
+    alias_reconciliation_gate: Arc<dyn AliasReconciliationGate>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -6020,6 +6039,10 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
+            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
+        );
 
         Self {
             decode_config: DecodeConfig::default(),
@@ -6061,6 +6084,7 @@ impl PrivilegedDispatcher {
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
+            alias_reconciliation_gate,
         }
     }
 
@@ -6099,6 +6123,10 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
+            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
+        );
 
         Self {
             decode_config,
@@ -6140,6 +6168,7 @@ impl PrivilegedDispatcher {
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
+            alias_reconciliation_gate,
         }
     }
 
@@ -6197,6 +6226,10 @@ impl PrivilegedDispatcher {
     ) -> Self {
         // TCK-00415: Shared work authority over the provided emitter.
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
+            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
+        );
 
         Self {
             decode_config,
@@ -6236,6 +6269,7 @@ impl PrivilegedDispatcher {
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
+            alias_reconciliation_gate,
         }
     }
 
@@ -6270,6 +6304,10 @@ impl PrivilegedDispatcher {
         // TCK-00415: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
+        // TCK-00420: Create alias reconciliation gate backed by shared emitter.
+        let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> = Arc::new(
+            ProjectionAliasReconciliationGate::new(Arc::clone(&event_emitter)),
+        );
 
         Self {
             decode_config: DecodeConfig::default(),
@@ -6310,6 +6348,7 @@ impl PrivilegedDispatcher {
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
             permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
+            alias_reconciliation_gate,
         }
     }
 
@@ -6579,6 +6618,15 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub const fn work_authority(&self) -> &Arc<ProjectionWorkAuthority> {
         &self.work_authority
+    }
+
+    /// Returns a reference to the alias reconciliation gate (TCK-00420).
+    ///
+    /// Used by integration tests to verify that the gate is wired into the
+    /// dispatcher and produces expected reconciliation results.
+    #[must_use]
+    pub fn alias_reconciliation_gate(&self) -> &Arc<dyn AliasReconciliationGate> {
+        &self.alias_reconciliation_gate
     }
 
     /// Records a successful governance probe when monitoring is wired.
@@ -8784,6 +8832,128 @@ impl PrivilegedDispatcher {
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!("authority binding validation failed: {auth_err}"),
                 ));
+            }
+        }
+
+        // =====================================================================
+        // TCK-00420: Alias reconciliation promotion gate (fail-closed)
+        //
+        // Verify alias/work_id projection consistency BEFORE state mutation.
+        // The gate checks that the work_id's alias binding matches the
+        // canonical projection. Infrastructure errors (lock failures,
+        // projection rebuild errors) also fail-closed per CTR-2617.
+        //
+        // Current limitation: ClaimWork registers identity-mapped aliases
+        // only (work_id -> work_id). Real TCK-* alias bindings require
+        // operator-layer or policy-resolver wire-up.
+        // TODO(TCK-00425): Wire real ticket aliases through policy resolution.
+        // =====================================================================
+        {
+            use apm2_core::events::alias_reconcile::TicketAliasBinding;
+
+            // Use HTF clock tick for temporal freshness (never SystemTime::now).
+            let current_tick = match self.holonic_clock.now_mono_tick() {
+                Ok(tick) => tick.value(),
+                Err(e) => {
+                    warn!(
+                        work_id = %request.work_id,
+                        error = %e,
+                        "SpawnEpisode rejected: HTF clock tick error for alias reconciliation gate"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "alias reconciliation gate: HTF clock tick unavailable (fail-closed): {e}"
+                        ),
+                    ));
+                },
+            };
+
+            // Read observation window from the gate's configuration rather
+            // than using hardcoded values.
+            let obs_window = self.alias_reconciliation_gate.observation_window();
+
+            let binding = TicketAliasBinding {
+                // Identity mapping: ticket_alias == work_id for now.
+                // TODO(TCK-00425): Use real ticket alias from policy resolution.
+                ticket_alias: request.work_id.clone(),
+                canonical_work_id: work_id_to_hash(&request.work_id),
+                observed_at_tick: current_tick,
+                observation_window_start: obs_window.start_tick,
+                observation_window_end: obs_window.end_tick,
+            };
+
+            match self
+                .alias_reconciliation_gate
+                .check_promotion(&[binding], current_tick)
+            {
+                Ok(result) => {
+                    // For identity-mapped aliases (ticket_alias == work_id),
+                    // NotFound defects are expected when the projection has
+                    // not been populated with work events yet (e.g., first
+                    // spawn, or when ClaimWork uses a stub registry in tests).
+                    // Only Mismatch, Ambiguous, and Stale defects indicate
+                    // real reconciliation failures that must block promotion.
+                    //
+                    // TODO(TCK-00425): When real ticket aliases are wired
+                    // through policy resolution, NotFound defects for real
+                    // aliases MUST also block promotion.
+                    let blocking_defects: Vec<_> = result
+                        .unresolved_defects
+                        .iter()
+                        .filter(|d| {
+                            !matches!(
+                                d.defect_class,
+                                apm2_core::events::alias_reconcile::DefectClass::NotFound
+                            )
+                        })
+                        .collect();
+
+                    if !blocking_defects.is_empty() {
+                        let defect_summary: Vec<String> = blocking_defects
+                            .iter()
+                            .map(|d| format!("{}:{}", d.ticket_alias, d.defect_class))
+                            .collect();
+                        warn!(
+                            work_id = %request.work_id,
+                            defect_count = blocking_defects.len(),
+                            defects = ?defect_summary,
+                            "SpawnEpisode rejected: alias reconciliation promotion gate denied"
+                        );
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!(
+                                "alias reconciliation promotion gate denied: {} blocking defect(s)",
+                                blocking_defects.len()
+                            ),
+                        ));
+                    }
+                    debug!(
+                        work_id = %request.work_id,
+                        resolved_count = result.resolved_count,
+                        not_found_count = result.unresolved_defects.len() - blocking_defects.len(),
+                        "Alias reconciliation promotion gate passed"
+                    );
+                },
+                Err(e) => {
+                    // Infrastructure errors fail-closed per CTR-2617
+                    // (Distributed Capabilities Are Fail-Closed).
+                    //
+                    // The gate's refresh_projection() handles projection
+                    // rebuild errors internally (retaining last good state),
+                    // so errors reaching this point are true infrastructure
+                    // failures (lock poisoning) where the gate state is
+                    // unknown and promotion MUST be rejected.
+                    warn!(
+                        error = %e,
+                        work_id = %request.work_id,
+                        "SpawnEpisode rejected: alias reconciliation infrastructure failure (fail-closed)"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("alias reconciliation gate infrastructure failure: {e}"),
+                    ));
+                },
             }
         }
 
