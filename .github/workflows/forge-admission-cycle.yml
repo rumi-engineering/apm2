@@ -116,8 +116,47 @@ jobs:
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # SECURITY-CRITICAL LOGGING BOUNDARY:
+          # GitHub Actions logs are a public projection surface. Treat stdout as
+          # untrusted egress and fail closed if any non-health line appears.
+          private_log_dir="${HOME}/.apm2/private/fac"
+          mkdir -p "${private_log_dir}"
+          chmod 700 "${private_log_dir}"
+          private_log="${private_log_dir}/github-run-${GITHUB_RUN_ID:-unknown}-${GITHUB_RUN_ATTEMPT:-0}.log"
+          : >"${private_log}"
+          chmod 600 "${private_log}"
+
+          health_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z security=[^[:space:]]+ quality=[^[:space:]]+ events=.*$'
+
+          set +e
           cargo run --locked --quiet -p apm2-cli -- fac kickoff \
             --repo "${{ github.repository }}" \
             --event "${{ github.event_path }}" \
             --event-name "${{ github.event_name }}" \
-            --max-wait-seconds 3600
+            --max-wait-seconds 3600 \
+            --public-projection-only \
+            2>>"${private_log}" | \
+            awk -v health_line_re="${health_line_re}" '
+              $0 ~ health_line_re {
+                print $0
+                fflush(stdout)
+                next
+              }
+              {
+                # SECURITY-CRITICAL: never echo rejected lines (possible secret egress).
+                print "ERROR: FAC output boundary violation (non-health line blocked)." > "/dev/stderr"
+                exit 42
+              }
+            '
+          fac_rc=${PIPESTATUS[0]}
+          filter_rc=${PIPESTATUS[1]}
+          set -e
+
+          if [[ "${filter_rc}" -ne 0 ]]; then
+            echo "ERROR: FAC projection boundary violation. See private runner log: ${private_log}" >&2
+            exit 1
+          fi
+          if [[ "${fac_rc}" -ne 0 ]]; then
+            echo "ERROR: FAC failed. See private runner log: ${private_log}" >&2
+            exit "${fac_rc}"
+          fi
