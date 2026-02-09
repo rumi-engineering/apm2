@@ -71,6 +71,7 @@ pub mod bft_machine;
 pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
+pub mod fact_root;
 pub mod genesis;
 pub mod handlers;
 pub mod merkle;
@@ -119,6 +120,12 @@ pub use equivocation::{
     ConflictingProposal, DOMAIN_PREFIX_EQUIVOCATION, EquivocationCheckResult, EquivocationDetector,
     EquivocationError, EquivocationEvidence, EquivocationType, MAX_CACHED_PROPOSALS,
     MAX_PROPOSAL_AGE_SECS,
+};
+// FactRootV1 composition with RFC-0014 quorum checkpoints (TCK-00370)
+pub use fact_root::{
+    CompactMultiProof, FactRootError, FactRootV1, FactRootVerificationResult, FactRootVerifier,
+    MAX_BATCH_ROOTS, MAX_COMPACT_MULTIPROOF_LEAVES, MAX_COMPACT_PROOF_NODES,
+    MAX_COMPACT_PROOF_STRUCTURE, ProofPathEntry, build_compact_multiproof, compute_qc_anchor_hash,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,

@@ -1123,6 +1123,9 @@ impl ReceiptPointerVerifier {
                 expected_subject_kind,
                 require_temporal,
             ),
+            // TODO(TCK-00370): Route to FactRootVerifier once daemon-side
+            // integration lands. For now, return the existing error so callers
+            // know this path is not yet wired up.
             PointerKind::FactRoot => Err(ReceiptPointerError::FactRootNotImplemented),
         }
     }
