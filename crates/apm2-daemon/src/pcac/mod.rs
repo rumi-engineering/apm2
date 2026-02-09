@@ -8,7 +8,7 @@
 //!
 //! # Integration Point
 //!
-//! The [`LifecycleGate`] is injected into [`SessionDispatcher`] and called
+//! The [`LifecycleGate`] is injected into `SessionDispatcher` and called
 //! between V1 scope enforcement and broker dispatch in `handle_request_tool`.
 
 mod lifecycle_gate;

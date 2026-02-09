@@ -86,14 +86,53 @@ impl InProcessKernel {
         Ok(())
     }
 
-    /// Computes the authority join hash from the input fields.
+    /// Computes the authority join hash from the full normative input set.
+    ///
+    /// Per RFC-0027 §3.1, the join hash commits to ALL required fields:
+    /// session, intent, capabilities, scope witnesses, identity, freshness,
+    /// stop/budget, risk tier, and time/ledger anchors. Omitting any field
+    /// would allow an attacker to produce colliding join hashes for
+    /// semantically distinct authority requests.
     fn compute_join_hash(input: &AuthorityJoinInputV1) -> Hash {
         use blake3::Hasher;
         let mut hasher = Hasher::new();
+        // Subject bindings
         hasher.update(input.session_id.as_bytes());
+        if let Some(ref holon_id) = input.holon_id {
+            hasher.update(b"holon:");
+            hasher.update(holon_id.as_bytes());
+        }
+        // Intent binding
         hasher.update(&input.intent_digest);
+        // Capability bindings
         hasher.update(&input.capability_manifest_hash);
+        for scope_hash in &input.scope_witness_hashes {
+            hasher.update(scope_hash);
+        }
+        // Delegation bindings
+        hasher.update(input.lease_id.as_bytes());
+        if let Some(ref perm_hash) = input.permeability_receipt_hash {
+            hasher.update(perm_hash);
+        }
+        // Identity bindings
         hasher.update(&input.identity_proof_hash);
+        // Freshness bindings
+        hasher.update(&input.directory_head_hash);
+        hasher.update(&input.freshness_policy_hash);
+        hasher.update(&input.freshness_witness_tick.to_le_bytes());
+        // Stop/budget bindings
+        hasher.update(&input.stop_budget_profile_digest);
+        for receipt_hash in &input.pre_actuation_receipt_hashes {
+            hasher.update(receipt_hash);
+        }
+        // Risk classification
+        hasher.update(&[match input.risk_tier {
+            RiskTier::Tier0 => 0u8,
+            RiskTier::Tier1 => 1u8,
+            RiskTier::Tier2Plus => 2u8,
+            _ => u8::MAX, // fail-closed: unknown tiers get maximum ordinal
+        }]);
+        // Time/ledger anchors
         hasher.update(&input.time_envelope_ref);
         hasher.update(&input.as_of_ledger_anchor);
         *hasher.finalize().as_bytes()
@@ -329,15 +368,39 @@ pub struct LifecycleReceipts {
 ///
 /// Executes the full `join -> revalidate -> consume` sequence. If any stage
 /// fails, the deny is returned and no side effect may execute.
+///
+/// TCK-00427: When a `SovereigntyChecker` is configured, Tier2+ operations
+/// are additionally validated against sovereignty state during revalidate
+/// and consume stages.
 pub struct LifecycleGate {
     kernel: Arc<dyn AuthorityJoinKernel>,
+    /// Optional sovereignty checker for Tier2+ enforcement (TCK-00427).
+    sovereignty_checker: Option<super::sovereignty::SovereigntyChecker>,
 }
 
 impl LifecycleGate {
     /// Creates a new lifecycle gate with the given kernel.
     #[must_use]
     pub fn new(kernel: Arc<dyn AuthorityJoinKernel>) -> Self {
-        Self { kernel }
+        Self {
+            kernel,
+            sovereignty_checker: None,
+        }
+    }
+
+    /// Creates a new lifecycle gate with sovereignty enforcement (TCK-00427).
+    ///
+    /// When a sovereignty checker is provided, Tier2+ operations are
+    /// validated against sovereignty state during revalidate and consume.
+    #[must_use]
+    pub fn with_sovereignty_checker(
+        kernel: Arc<dyn AuthorityJoinKernel>,
+        checker: super::sovereignty::SovereigntyChecker,
+    ) -> Self {
+        Self {
+            kernel,
+            sovereignty_checker: Some(checker),
+        }
     }
 
     /// Executes the full PCAC lifecycle for a tool request.
@@ -368,6 +431,45 @@ impl LifecycleGate {
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<LifecycleReceipts, Box<AuthorityDenyV1>> {
+        self.execute_with_sovereignty(
+            input,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+            None,
+            0,
+        )
+    }
+
+    /// Executes the full PCAC lifecycle with optional sovereignty state
+    /// (TCK-00427).
+    ///
+    /// When `sovereignty_state` is `Some` and a sovereignty checker is
+    /// configured, Tier2+ operations are validated against sovereignty
+    /// state during revalidate and consume stages.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` — Authority join inputs.
+    /// * `current_time_envelope_ref` — Current HTF time witness.
+    /// * `current_ledger_anchor` — Current ledger anchor.
+    /// * `current_revocation_head_hash` — Current revocation frontier.
+    /// * `sovereignty_state` — Optional sovereignty state for Tier2+ checks.
+    /// * `current_tick` — Current tick for sovereignty staleness checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Box<AuthorityDenyV1>` from whichever lifecycle or sovereignty
+    /// stage fails first.
+    pub fn execute_with_sovereignty(
+        &self,
+        input: &AuthorityJoinInputV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+    ) -> Result<LifecycleReceipts, Box<AuthorityDenyV1>> {
         // Stage 1: Join — construct AJC from validated inputs.
         let cert = self.kernel.join(input)?;
 
@@ -379,10 +481,32 @@ impl LifecycleGate {
             current_revocation_head_hash,
         )?;
 
+        // Stage 2b (TCK-00427): Sovereignty revalidation for Tier2+.
+        if let (Some(checker), Some(state)) = (&self.sovereignty_checker, sovereignty_state) {
+            checker.check_revalidate(
+                &cert,
+                state,
+                current_tick,
+                current_time_envelope_ref,
+                current_ledger_anchor,
+            )?;
+        }
+
         // Stage 3: Consume — single-use consumption with intent equality.
         let (consumed_witness, consume_record) =
             self.kernel
                 .consume(&cert, input.intent_digest, current_time_envelope_ref)?;
+
+        // Stage 3b (TCK-00427): Sovereignty consume checks for Tier2+.
+        if let (Some(checker), Some(state)) = (&self.sovereignty_checker, sovereignty_state) {
+            checker.check_consume(
+                &cert,
+                state,
+                current_tick,
+                current_time_envelope_ref,
+                current_ledger_anchor,
+            )?;
+        }
 
         Ok(LifecycleReceipts {
             certificate: cert,

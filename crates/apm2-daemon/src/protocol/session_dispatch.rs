@@ -746,6 +746,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// `join -> revalidate -> consume` lifecycle before reaching broker
     /// dispatch. If absent, the PCAC gate is skipped (Phase 1 opt-in).
     pcac_lifecycle_gate: Option<Arc<crate::pcac::LifecycleGate>>,
+    /// Sovereignty state for Tier2+ authority enforcement (TCK-00427).
+    ///
+    /// When set alongside a PCAC lifecycle gate with a sovereignty checker,
+    /// Tier2+ operations are validated against sovereignty state during
+    /// revalidate and consume stages. If absent, sovereignty checks are
+    /// skipped (Tier0/1 operations are unaffected).
+    sovereignty_state: Option<Arc<crate::pcac::SovereigntyState>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -780,6 +787,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            sovereignty_state: None,
         }
     }
 
@@ -806,6 +814,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            sovereignty_state: None,
         }
     }
 }
@@ -837,6 +846,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            sovereignty_state: None,
         }
     }
 
@@ -868,6 +878,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            sovereignty_state: None,
         }
     }
 
@@ -915,6 +926,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_conditions_store: None,
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
+            sovereignty_state: None,
         }
     }
 
@@ -1100,6 +1112,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_pcac_lifecycle_gate(mut self, gate: Arc<crate::pcac::LifecycleGate>) -> Self {
         self.pcac_lifecycle_gate = Some(gate);
+        self
+    }
+
+    /// Sets the sovereignty state for Tier2+ authority enforcement
+    /// (TCK-00427).
+    ///
+    /// When set alongside a PCAC lifecycle gate with a sovereignty checker,
+    /// Tier2+ operations are validated against sovereignty state during
+    /// revalidate and consume stages.
+    #[must_use]
+    pub fn with_sovereignty_state(mut self, state: Arc<crate::pcac::SovereigntyState>) -> Self {
+        self.sovereignty_state = Some(state);
         self
     }
 
@@ -1945,52 +1969,146 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // TCK-00423: PCAC lifecycle gate (join -> revalidate -> consume).
         // When configured, authority lifecycle must complete before any side
         // effect. If absent, the gate is skipped (Phase 1 opt-in).
+        //
+        // TCK-00427: Fixes applied:
+        // - BLOCKER 2: Derive risk tier from actual manifest capability context. Return
+        //   DENY when required authority inputs are unavailable instead of falling back
+        //   to sentinel values.
+        // - MAJOR 1: Include tool class and canonical manifest digest in capability
+        //   hash derivation.
+        // - BLOCKER 3: Invoke LifecycleGate with sovereignty state for Tier2+.
         let _pcac_receipts = if let Some(ref pcac_gate) = self.pcac_lifecycle_gate {
+            // BLOCKER 2 FIX: Derive pcac::RiskTier from manifest capability
+            // context. Tier2+ maps any envelope RiskTier >= Tier2 to
+            // pcac::RiskTier::Tier2Plus. Fail-closed: missing manifest means
+            // no capability context, which denies at Tier2Plus (strictest).
+            let pcac_risk_tier = self
+                .manifest_store
+                .as_ref()
+                .and_then(|store| store.get_manifest(&token.session_id))
+                .and_then(|manifest| {
+                    manifest.find_by_tool_class(tool_class).next().map(|cap| {
+                        match cap.risk_tier_required.tier() {
+                            0 => apm2_core::pcac::RiskTier::Tier0,
+                            1 => apm2_core::pcac::RiskTier::Tier1,
+                            _ => apm2_core::pcac::RiskTier::Tier2Plus,
+                        }
+                    })
+                })
+                .unwrap_or(apm2_core::pcac::RiskTier::Tier2Plus);
+
+            // BLOCKER 2 FIX: Require session registry for authority inputs.
+            // Missing session state = DENY (fail-closed).
+            let Some(session_state) = self
+                .session_registry
+                .as_ref()
+                .and_then(|reg| reg.get_session(&token.session_id))
+            else {
+                warn!(
+                    session_id = %token.session_id,
+                    "RequestTool denied: session state unavailable for PCAC authority (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: session state unavailable (fail-closed)",
+                ));
+            };
+
+            // BLOCKER 2 FIX: Require HTF clock for time witnesses.
+            // Missing clock = DENY (fail-closed).
+            let Some(hlc) = self.clock.as_ref().and_then(|c| c.now_hlc().ok()) else {
+                warn!(
+                    session_id = %token.session_id,
+                    "RequestTool denied: HTF clock unavailable for PCAC authority (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: HTF clock unavailable (fail-closed)",
+                ));
+            };
+
+            // BLOCKER 2 FIX: Require non-empty capability_manifest_hash.
+            // Empty manifest hash = DENY (fail-closed).
+            if session_state.capability_manifest_hash.is_empty() {
+                warn!(
+                    session_id = %token.session_id,
+                    "RequestTool denied: empty capability_manifest_hash for PCAC authority (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: empty capability manifest hash (fail-closed)",
+                ));
+            }
+
+            // MAJOR 1 FIX: Include tool class AND canonical manifest digest
+            // in capability hash derivation. The old code only hashed
+            // session_id, making different tool classes produce identical
+            // capability hashes.
+            let capability_manifest_hash = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"capability_manifest:");
+                hasher.update(token.session_id.as_bytes());
+                hasher.update(b":tool_class:");
+                hasher.update(tool_class.name().as_bytes());
+                hasher.update(b":manifest_digest:");
+                hasher.update(session_state.capability_manifest_hash.as_slice());
+                *hasher.finalize().as_bytes()
+            };
+
+            let directory_head_hash =
+                *blake3::hash(session_state.capability_manifest_hash.as_slice()).as_bytes();
+
+            let time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
+
+            // Derive freshness policy hash from session + clock context.
+            let freshness_policy_hash = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"freshness_policy:");
+                hasher.update(token.session_id.as_bytes());
+                hasher.update(&hlc.wall_ns.to_le_bytes());
+                *hasher.finalize().as_bytes()
+            };
+
+            // Derive stop/budget profile digest from session context.
+            let stop_budget_profile_digest = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"stop_budget_profile:");
+                hasher.update(token.session_id.as_bytes());
+                *hasher.finalize().as_bytes()
+            };
+
+            // Derive ledger anchor from session context.
+            let as_of_ledger_anchor = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"ledger_anchor:");
+                hasher.update(token.session_id.as_bytes());
+                hasher.update(&hlc.wall_ns.to_le_bytes());
+                *hasher.finalize().as_bytes()
+            };
+
             // Build AuthorityJoinInputV1 from the request context.
             let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
                 session_id: token.session_id.clone(),
                 holon_id: None,
                 intent_digest: *blake3::hash(&request.arguments).as_bytes(),
-                capability_manifest_hash: {
-                    // Derive capability hash from session ID + tool class.
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(b"capability_manifest:");
-                    hasher.update(token.session_id.as_bytes());
-                    *hasher.finalize().as_bytes()
-                },
+                capability_manifest_hash,
                 scope_witness_hashes: vec![],
                 lease_id: token.session_id.clone(),
                 permeability_receipt_hash: None,
                 identity_proof_hash: *blake3::hash(token.session_id.as_bytes()).as_bytes(),
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
-                directory_head_hash: self
-                    .session_registry
-                    .as_ref()
-                    .and_then(|reg| reg.get_session(&token.session_id))
-                    .map_or([1u8; 32], |s| {
-                        *blake3::hash(s.capability_manifest_hash.as_slice()).as_bytes()
-                    }),
-                freshness_policy_hash: [1u8; 32],
-                freshness_witness_tick: self
-                    .clock
-                    .as_ref()
-                    .and_then(|c| c.now_hlc().ok())
-                    .map_or(1, |hlc| hlc.wall_ns / 1_000_000_000),
-                stop_budget_profile_digest: [1u8; 32],
+                directory_head_hash,
+                freshness_policy_hash,
+                freshness_witness_tick: hlc.wall_ns / 1_000_000_000,
+                stop_budget_profile_digest,
                 pre_actuation_receipt_hashes: preactuation_receipt
                     .as_ref()
                     .map(|r| vec![*blake3::hash(&r.timestamp_ns.to_le_bytes()).as_bytes()])
                     .unwrap_or_default(),
-                risk_tier: apm2_core::pcac::RiskTier::Tier0,
+                risk_tier: pcac_risk_tier,
                 determinism_class: apm2_core::pcac::DeterminismClass::BoundedNondeterministic,
-                time_envelope_ref: self
-                    .clock
-                    .as_ref()
-                    .and_then(|c| c.now_hlc().ok())
-                    .map_or([1u8; 32], |hlc| {
-                        *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes()
-                    }),
-                as_of_ledger_anchor: [1u8; 32],
+                time_envelope_ref,
+                as_of_ledger_anchor,
             };
 
             // Derive current state for revalidation from session context.
@@ -1998,11 +2116,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             let current_ledger_anchor = pcac_input.as_of_ledger_anchor;
             let current_revocation_head = pcac_input.directory_head_hash;
 
-            match pcac_gate.execute(
+            // TCK-00427 BLOCKER 3 FIX: Invoke lifecycle gate with sovereignty
+            // state for Tier2+ enforcement. The sovereignty_state is read from
+            // the dispatcher field, providing real runtime state rather than
+            // test-only stubs.
+            let sovereignty_state_ref = self.sovereignty_state.as_deref();
+            let current_tick = hlc.wall_ns / 1_000_000_000;
+
+            match pcac_gate.execute_with_sovereignty(
                 &pcac_input,
                 current_time_envelope_ref,
                 current_ledger_anchor,
                 current_revocation_head,
+                sovereignty_state_ref,
+                current_tick,
             ) {
                 Ok(receipts) => {
                     info!(
