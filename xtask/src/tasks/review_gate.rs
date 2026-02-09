@@ -1,7 +1,6 @@
 //! Implementation of the `review-gate` command.
 //!
 //! This command enforces authoritative AI review gating for pull requests:
-//! - Verifies `ai-review/security` and `ai-review/code-quality` commit statuses
 //! - Parses machine-readable metadata from PR comments
 //! - Enforces exact PR number + head SHA binding
 //! - Enforces trusted reviewer identity allowlists
@@ -14,9 +13,6 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use xshell::{Shell, cmd};
-
-const SECURITY_CONTEXT: &str = "ai-review/security";
-const QUALITY_CONTEXT: &str = "ai-review/code-quality";
 
 const TRUSTED_REVIEWER_SCHEMA: &str = "apm2.trusted_reviewers.v1";
 const REVIEW_METADATA_SCHEMA: &str = "apm2.review.metadata.v1";
@@ -44,21 +40,19 @@ pub fn run(
         TrustedReviewerConfig::load(Path::new(reviewers_path))?.to_allowlist_map()?;
 
     let pr_head_sha = fetch_pr_head_sha(&sh, &owner_repo, pr_number)?;
-    if let Some(expected) = expected_head_sha
-        && !expected.eq_ignore_ascii_case(&pr_head_sha)
-    {
-        bail!(
-            "Provided head SHA mismatch for PR #{pr_number}: expected {expected}, actual {pr_head_sha}"
-        );
+    if let Some(expected) = expected_head_sha {
+        if !expected.eq_ignore_ascii_case(&pr_head_sha) {
+            bail!(
+                "Provided head SHA mismatch for PR #{pr_number}: expected {expected}, actual {pr_head_sha}"
+            );
+        }
     }
 
-    let statuses = fetch_commit_statuses(&sh, &owner_repo, &pr_head_sha)?;
     let comments = fetch_pr_issue_comments(&sh, &owner_repo, pr_number)?;
 
     let input = GateEvaluationInput {
         pr_number,
         head_sha: &pr_head_sha,
-        statuses: &statuses,
         comments: &comments,
         trusted_reviewers: &trusted_reviewers,
     };
@@ -70,9 +64,14 @@ pub fn run(
             .context("Failed to serialize review gate evaluation to JSON")?
     );
 
+    // IMPORTANT: stdout is a strict machine contract consumed by workflows.
+    // Keep it JSON-only. Human status hints go to stderr.
     if evaluation.overall_pass {
-        println!("Review gate: PASS");
+        eprintln!("Review gate: PASS");
         Ok(())
+    } else if evaluation.overall_pending {
+        eprintln!("Review gate: PENDING (waiting for AI reviews)");
+        std::process::exit(2);
     } else {
         bail!("Review gate: FAIL");
     }
@@ -121,26 +120,6 @@ fn fetch_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u64) -> Result<Str
     }
 
     Ok(response.head.sha)
-}
-
-fn fetch_commit_statuses(
-    sh: &Shell,
-    owner_repo: &str,
-    head_sha: &str,
-) -> Result<Vec<NormalizedStatus>> {
-    let endpoint = format!("/repos/{owner_repo}/commits/{head_sha}/status");
-    let output = cmd!(sh, "gh api {endpoint}")
-        .read()
-        .with_context(|| format!("Failed to fetch commit status for {owner_repo}@{head_sha}"))?;
-
-    let response: CommitStatusResponse = serde_json::from_str(&output)
-        .with_context(|| format!("Failed to parse commit status payload for {head_sha}"))?;
-
-    response
-        .statuses
-        .into_iter()
-        .map(NormalizedStatus::try_from)
-        .collect()
 }
 
 fn fetch_pr_issue_comments(
@@ -203,8 +182,21 @@ fn evaluate_gate(input: &GateEvaluationInput<'_>) -> GateEvaluation {
     let security = evaluate_category(input, ReviewCategory::Security);
     let code_quality = evaluate_category(input, ReviewCategory::CodeQuality);
 
+    let overall_pass = security.pass && code_quality.pass;
+
+    // Pending: gate didn't pass, at least one category has no authoritative
+    // verdict (review not yet submitted), and neither category has an
+    // authoritative FAIL (which would be a definitive rejection, not a
+    // "waiting" state).
+    let has_authoritative_fail = security.authoritative_verdict == Some(ReviewVerdict::Fail)
+        || code_quality.authoritative_verdict == Some(ReviewVerdict::Fail);
+    let has_missing_verdict =
+        security.authoritative_verdict.is_none() || code_quality.authoritative_verdict.is_none();
+    let overall_pending = !overall_pass && !has_authoritative_fail && has_missing_verdict;
+
     GateEvaluation {
-        overall_pass: security.pass && code_quality.pass,
+        overall_pass,
+        overall_pending,
         security,
         code_quality,
     }
@@ -215,41 +207,48 @@ fn evaluate_category(
     category: ReviewCategory,
 ) -> CategoryEvaluation {
     let mut reasons = Vec::new();
-    let context = category.status_context();
 
     let artifacts = collect_category_artifacts(input, category);
-    if artifacts.is_empty() {
-        reasons.push(format!(
-            "No machine-readable review artifacts found for {}",
-            category.display_name()
-        ));
-    }
 
-    let latest_status = latest_status_for_context(input.statuses, context);
-    let status_state = latest_status.map(|status| status.state.clone());
-    if latest_status.is_none() {
-        reasons.push(format!("Missing commit status context `{context}`"));
-    }
+    // Authoritative selection is based on the newest VALID artifact, not the
+    // newest marker comment. This prevents stale/mismatched artifacts (e.g.,
+    // for an older head SHA) from overriding a valid current-head verdict.
+    let valid_artifacts = artifacts
+        .iter()
+        .filter(|artifact| artifact.rejection_reason.is_none())
+        .collect::<Vec<_>>();
+    let authoritative = valid_artifacts.last();
 
-    let latest_artifact = artifacts.last();
-    let (authoritative_verdict, authoritative_comment_id) = match latest_artifact {
-        Some(artifact) if artifact.rejection_reason.is_none() => {
-            (artifact.verdict, Some(artifact.comment_id))
+    let (authoritative_verdict, authoritative_comment_id) = authoritative.map_or_else(
+        || {
+            // No valid artifacts for the current PR head. Surface the newest
+            // marker comment rejection (if any) to aid debugging, but treat
+            // this category as pending (no authoritative verdict).
+            let latest = artifacts.last();
+            match latest {
+                None => {
+                    reasons.push(format!(
+                        "No machine-readable review artifacts found for {}",
+                        category.display_name()
+                    ));
+                    (None, None)
+                },
+                Some(artifact) => {
+                    reasons.push(format!(
+                        "Newest {} artifact (comment #{}) rejected: {}",
+                        category.display_name(),
+                        artifact.comment_id,
+                        artifact
+                            .rejection_reason
+                            .as_deref()
+                            .unwrap_or("unknown rejection")
+                    ));
+                    (None, Some(artifact.comment_id))
+                },
+            }
         },
-        Some(artifact) => {
-            reasons.push(format!(
-                "Newest {} artifact (comment #{}) rejected: {}",
-                category.display_name(),
-                artifact.comment_id,
-                artifact
-                    .rejection_reason
-                    .as_deref()
-                    .unwrap_or("unknown rejection")
-            ));
-            (None, Some(artifact.comment_id))
-        },
-        None => (None, None),
-    };
+        |artifact| (artifact.verdict, Some(artifact.comment_id)),
+    );
 
     if let Some(verdict) = authoritative_verdict {
         if verdict == ReviewVerdict::Fail {
@@ -257,67 +256,30 @@ fn evaluate_category(
                 "Newest {} artifact verdict is FAIL",
                 category.display_name()
             ));
-        }
 
-        let valid_artifacts: Vec<&CategoryArtifact> = artifacts
-            .iter()
-            .filter(|artifact| artifact.rejection_reason.is_none())
-            .collect();
-
-        let has_pass = valid_artifacts
-            .iter()
-            .any(|artifact| artifact.verdict == Some(ReviewVerdict::Pass));
-        let has_fail = valid_artifacts
-            .iter()
-            .any(|artifact| artifact.verdict == Some(ReviewVerdict::Fail));
-        if has_pass && has_fail && verdict == ReviewVerdict::Fail {
-            reasons.push(format!(
-                "Conflicting PASS/FAIL artifacts for {}; newest valid artifact is FAIL",
-                category.display_name()
-            ));
-        }
-
-        if let Some(status) = latest_status {
-            let normalized_state = status.state.to_ascii_lowercase();
-            match normalized_state.as_str() {
-                "success" | "failure" => {
-                    let expected_state = match verdict {
-                        ReviewVerdict::Pass => "success",
-                        ReviewVerdict::Fail => "failure",
-                    };
-                    if normalized_state != expected_state {
-                        reasons.push(format!(
-                            "Status mismatch for {}: context `{context}` is `{normalized_state}` but authoritative verdict requires `{expected_state}`",
-                            category.display_name()
-                        ));
-                    }
-                },
-                _ => {
-                    reasons.push(format!(
-                        "Status context `{context}` must be success/failure, got `{normalized_state}`"
-                    ));
-                },
+            let has_pass = valid_artifacts
+                .iter()
+                .any(|artifact| artifact.verdict == Some(ReviewVerdict::Pass));
+            let has_fail = valid_artifacts
+                .iter()
+                .any(|artifact| artifact.verdict == Some(ReviewVerdict::Fail));
+            if has_pass && has_fail {
+                reasons.push(format!(
+                    "Conflicting PASS/FAIL artifacts for {}; newest valid artifact is FAIL",
+                    category.display_name()
+                ));
             }
         }
     }
 
+    let pass = authoritative_verdict == Some(ReviewVerdict::Pass);
+
     CategoryEvaluation {
-        pass: reasons.is_empty(),
+        pass,
         authoritative_verdict,
         authoritative_comment_id,
-        status_state,
         reasons,
     }
-}
-
-fn latest_status_for_context<'a>(
-    statuses: &'a [NormalizedStatus],
-    context: &str,
-) -> Option<&'a NormalizedStatus> {
-    statuses
-        .iter()
-        .filter(|status| status.context == context)
-        .max_by_key(|status| status.created_at)
 }
 
 fn collect_category_artifacts(
@@ -384,7 +346,13 @@ fn parse_comment_metadata(
     comment: &IssueComment,
     category: ReviewCategory,
 ) -> Result<ReviewMetadataV1, String> {
-    let body = comment.body.as_deref().unwrap_or_default();
+    parse_metadata_from_body(comment.body.as_deref().unwrap_or_default(), category)
+}
+
+fn parse_metadata_from_body(
+    body: &str,
+    category: ReviewCategory,
+) -> Result<ReviewMetadataV1, String> {
     let marker = category.marker();
     // Use rfind to select the LAST marker in the body, preventing metadata
     // shadowing when free-form reason text contains an earlier marker copy.
@@ -558,20 +526,13 @@ fn is_valid_sha(sha: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum ReviewCategory {
+pub(super) enum ReviewCategory {
     Security,
     #[serde(rename = "code-quality")]
     CodeQuality,
 }
 
 impl ReviewCategory {
-    const fn status_context(self) -> &'static str {
-        match self {
-            Self::Security => SECURITY_CONTEXT,
-            Self::CodeQuality => QUALITY_CONTEXT,
-        }
-    }
-
     const fn display_name(self) -> &'static str {
         match self {
             Self::Security => "security",
@@ -644,7 +605,41 @@ impl ReviewMetadataV1 {
     }
 }
 
-type TrustedReviewerMap = HashMap<ReviewCategory, HashMap<String, BTreeSet<String>>>;
+pub(super) type TrustedReviewerMap = HashMap<ReviewCategory, HashMap<String, BTreeSet<String>>>;
+
+pub(super) fn load_trusted_reviewers_map(path: &Path) -> Result<TrustedReviewerMap> {
+    TrustedReviewerConfig::load(path)?.to_allowlist_map()
+}
+
+pub(super) fn is_authoritative_review_artifact_for_head(
+    body: &str,
+    category: ReviewCategory,
+    pr_number: u64,
+    head_sha: &str,
+    trusted_reviewers: &TrustedReviewerMap,
+    comment_author_login: &str,
+) -> bool {
+    let Ok(metadata) = parse_metadata_from_body(body, category) else {
+        return false;
+    };
+
+    if validate_reviewer_trust(
+        trusted_reviewers,
+        category,
+        &metadata.reviewer_id,
+        comment_author_login,
+    )
+    .is_err()
+    {
+        return false;
+    }
+
+    if metadata.pr_number != pr_number {
+        return false;
+    }
+
+    metadata.head_sha.eq_ignore_ascii_case(head_sha)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -762,46 +757,6 @@ struct PullRequestHead {
     sha: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct CommitStatusResponse {
-    statuses: Vec<CommitStatus>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CommitStatus {
-    context: String,
-    state: String,
-    created_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct NormalizedStatus {
-    context: String,
-    state: String,
-    created_at: DateTime<Utc>,
-}
-
-impl TryFrom<CommitStatus> for NormalizedStatus {
-    type Error = anyhow::Error;
-
-    fn try_from(status: CommitStatus) -> Result<Self> {
-        let created_at = DateTime::parse_from_rfc3339(&status.created_at)
-            .map(|datetime| datetime.with_timezone(&Utc))
-            .with_context(|| {
-                format!(
-                    "Invalid commit status timestamp `{}` for context `{}`",
-                    status.created_at, status.context
-                )
-            })?;
-
-        Ok(Self {
-            context: status.context,
-            state: status.state,
-            created_at,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct IssueComment {
     id: u64,
@@ -820,7 +775,6 @@ struct IssueCommentUser {
 struct GateEvaluationInput<'a> {
     pr_number: u64,
     head_sha: &'a str,
-    statuses: &'a [NormalizedStatus],
     comments: &'a [IssueComment],
     trusted_reviewers: &'a TrustedReviewerMap,
 }
@@ -828,6 +782,7 @@ struct GateEvaluationInput<'a> {
 #[derive(Debug, Serialize)]
 struct GateEvaluation {
     overall_pass: bool,
+    overall_pending: bool,
     security: CategoryEvaluation,
     code_quality: CategoryEvaluation,
 }
@@ -837,7 +792,6 @@ struct CategoryEvaluation {
     pass: bool,
     authoritative_verdict: Option<ReviewVerdict>,
     authoritative_comment_id: Option<u64>,
-    status_state: Option<String>,
     reasons: Vec<String>,
 }
 
@@ -851,6 +805,7 @@ struct CategoryArtifact {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, HashMap};
     use std::fs;
     use std::path::PathBuf;
 
@@ -861,16 +816,8 @@ mod tests {
         name: String,
         pr_number: u64,
         head_sha: String,
-        statuses: Vec<FixtureStatus>,
         comments: Vec<FixtureComment>,
         expected: FixtureExpected,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct FixtureStatus {
-        context: String,
-        state: String,
-        created_at: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -882,8 +829,10 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    #[allow(clippy::struct_excessive_bools)]
     struct FixtureExpected {
         overall_pass: bool,
+        overall_pending: bool,
         security_pass: bool,
         code_quality_pass: bool,
         #[serde(default)]
@@ -902,23 +851,6 @@ mod tests {
         );
 
         for fixture in fixtures {
-            let statuses = fixture
-                .statuses
-                .iter()
-                .map(|status| NormalizedStatus {
-                    context: status.context.clone(),
-                    state: status.state.clone(),
-                    created_at: DateTime::parse_from_rfc3339(&status.created_at)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "Fixture `{}` has invalid status timestamp `{}`: {}",
-                                fixture.name, status.created_at, error
-                            )
-                        })
-                        .with_timezone(&Utc),
-                })
-                .collect::<Vec<_>>();
-
             let comments = fixture
                 .comments
                 .iter()
@@ -936,7 +868,6 @@ mod tests {
             let input = GateEvaluationInput {
                 pr_number: fixture.pr_number,
                 head_sha: &fixture.head_sha,
-                statuses: &statuses,
                 comments: &comments,
                 trusted_reviewers: &trusted_reviewers,
             };
@@ -945,6 +876,11 @@ mod tests {
             assert_eq!(
                 evaluation.overall_pass, fixture.expected.overall_pass,
                 "Fixture `{}` overall gate mismatch",
+                fixture.name
+            );
+            assert_eq!(
+                evaluation.overall_pending, fixture.expected.overall_pending,
+                "Fixture `{}` overall pending mismatch",
                 fixture.name
             );
             assert_eq!(
@@ -1088,6 +1024,74 @@ Authoritative metadata below:
         assert_eq!(
             parse_owner_repo("git@github.com:example/project.git"),
             Some("example/project".to_string())
+        );
+    }
+
+    #[test]
+    fn authoritative_artifact_predicate_requires_trusted_author_and_valid_metadata() {
+        let pr_number = 502;
+        let head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let body = format!(
+            r#"## Review
+
+{SECURITY_METADATA_MARKER}
+```json
+{{
+  "schema": "{REVIEW_METADATA_SCHEMA}",
+  "review_type": "security",
+  "pr_number": {pr_number},
+  "head_sha": "{head_sha}",
+  "verdict": "PASS",
+  "severity_counts": {{ "blocker": 0, "major": 0, "minor": 0, "nit": 0 }},
+  "reviewer_id": "apm2-codex-security"
+}}
+```"#
+        );
+
+        let mut reviewers_by_id = HashMap::new();
+        let mut logins = BTreeSet::new();
+        logins.insert("trusted-bot".to_string());
+        reviewers_by_id.insert("apm2-codex-security".to_string(), logins);
+
+        let mut trusted = TrustedReviewerMap::new();
+        trusted.insert(ReviewCategory::Security, reviewers_by_id);
+
+        assert!(
+            is_authoritative_review_artifact_for_head(
+                &body,
+                ReviewCategory::Security,
+                pr_number,
+                head_sha,
+                &trusted,
+                "trusted-bot",
+            ),
+            "trusted author + valid metadata must be accepted"
+        );
+
+        assert!(
+            !is_authoritative_review_artifact_for_head(
+                &body,
+                ReviewCategory::Security,
+                pr_number,
+                head_sha,
+                &trusted,
+                "untrusted-user",
+            ),
+            "untrusted author must be rejected even if marker + sha appear"
+        );
+
+        let malformed = format!("{SECURITY_METADATA_MARKER}\n(no json fence here)\n{head_sha}\n",);
+        assert!(
+            !is_authoritative_review_artifact_for_head(
+                &malformed,
+                ReviewCategory::Security,
+                pr_number,
+                head_sha,
+                &trusted,
+                "trusted-bot",
+            ),
+            "malformed metadata must not count as authoritative"
         );
     }
 

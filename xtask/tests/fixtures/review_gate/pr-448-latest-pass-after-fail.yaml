@@ -1,13 +1,6 @@
 name: "PR-448 latest PASS supersedes older FAIL"
 pr_number: 448
 head_sha: "6666666666666666666666666666666666666666"
-statuses:
-  - context: "ai-review/security"
-    state: "success"
-    created_at: "2026-02-06T10:35:00Z"
-  - context: "ai-review/code-quality"
-    state: "success"
-    created_at: "2026-02-06T10:36:00Z"
 comments:
   - id: 44801
     user_login: "apm2-security-bot"
@@ -77,5 +70,6 @@ comments:
       ```
 expected:
   overall_pass: true
+  overall_pending: false
   security_pass: true
   code_quality_pass: true

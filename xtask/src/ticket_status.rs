@@ -149,7 +149,7 @@ pub fn get_unresolved_threads(sh: &Shell, pr_number: u32) -> Vec<ReviewThread> {
     // GraphQL query to get review threads
     let query = format!(
         r#"query {{
-  repository(owner: "rumi-engineering", name: "apm2") {{
+  repository(owner: "guardian-intelligence", name: "apm2") {{
     pullRequest(number: {pr_number}) {{
       reviewThreads(first: 100) {{
         nodes {{

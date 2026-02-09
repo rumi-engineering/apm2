@@ -160,6 +160,8 @@ pub use cell_id::{CellGenesisV1, CellIdV1, PolicyRootId};
 pub use certificate::{
     CellCertificateV1, CertificateError, HolonCertificateV1, RevocationPointer, validate_key_roles,
 };
+#[doc(hidden)]
+pub use directory_proof::VerifiedHeadCache;
 pub use directory_proof::{
     DirectoryEntryStatus, DirectoryKindV1, DirectoryProofKind, DirectoryProofKindV1,
     DirectoryProofV1, HolonDirectoryHeadV1, IdentityProofError, IdentityProofProfileV1,

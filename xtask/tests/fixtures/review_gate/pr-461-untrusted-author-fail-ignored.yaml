@@ -1,13 +1,6 @@
 name: "PR-461 untrusted author FAIL marker is ignored (DoS prevention)"
 pr_number: 461
 head_sha: "6161616161616161616161616161616161616161"
-statuses:
-  - context: "ai-review/security"
-    state: "success"
-    created_at: "2026-02-12T10:30:00Z"
-  - context: "ai-review/code-quality"
-    state: "success"
-    created_at: "2026-02-12T10:31:00Z"
 comments:
   # Trusted PASS from security bot
   - id: 46101
@@ -104,5 +97,6 @@ comments:
 expected:
   # Both categories pass because attacker comments are filtered out
   overall_pass: true
+  overall_pending: false
   security_pass: true
   code_quality_pass: true

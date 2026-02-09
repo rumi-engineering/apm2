@@ -1,0 +1,45 @@
+waiver:
+  id: WVR-0104
+  title: "Required-check strictness decrease: remove ai-review/* contexts"
+  description: |
+    Permits removing ai-review/security and ai-review/code-quality from
+    required status checks in branch protection and rulesets. These legacy
+    contexts are superseded by the Review Gate Success workflow
+    (review-gate.yml), which evaluates machine-readable metadata blocks in
+    PR review comments via cargo xtask review-gate.
+
+    The Review Gate Success context is written exclusively by the trusted
+    base-branch evaluator workflow (.github/workflows/review-gate.yml),
+    which runs in pull_request_target / issue_comment context and checks
+    out base-branch code. PR-branch ai-review-*.yml workflows no longer
+    write any status contexts — they only post review comment artifacts.
+
+    GitHub is a projection surface per RFC-0018 (Forge Admission Cycle);
+    it is not the sole source of truth. The operator accepts this
+    strictness reduction as a simplification that removes redundant
+    required checks while preserving equivalent gate strength through
+    the unified Review Gate Success evaluator.
+  status: ACTIVE
+  issued: "2026-02-08"
+  expires: "2026-05-08"
+  scope: "Branch protection required status check reduction"
+  gate_ids:
+    - "ai-review/security"
+    - "ai-review/code-quality"
+  quality_dimension_ids:
+    - "gate-provenance"
+    - "strictness-decrease"
+  binding_tickets:
+    - TCK-00432
+    - TCK-00410
+  references:
+    commit_sha: "501bc6ffc5406f925d1684a9a0971f944c9821d0"
+    pr_number: 505
+    rfc_ids:
+      - RFC-0018
+      - RFC-0019
+  conditions:
+    - "Review Gate Success must remain a required status check on main"
+    - "Only review-gate.yml (base-branch evaluator) writes Review Gate Success"
+    - "AI review workflows post comment artifacts only, no status writes"
+    - "Must be renewed or replaced before expiry"

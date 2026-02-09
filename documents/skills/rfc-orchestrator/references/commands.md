@@ -63,19 +63,21 @@ pr-comments-count:
 ## AI Reviews
 
 ```yaml
-check-ai-review-status:
+check-review-gate-status:
   command: |
     head_sha=$(gh pr view <BRANCH_NAME> --json headRefOid --jq .headRefOid)
     gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/$head_sha/status \
-      --jq '.statuses[] | select(.context | startswith("ai-review/")) | "\(.context): \(.state)"'
-  purpose: Check AI review commit statuses
+      --jq '.statuses[] | select(.context == "Review Gate Success") | "\(.context): \(.state)"'
+  purpose: Check Review Gate Success commit status
 
 trigger-security-review:
   command: cargo xtask review security <PR_URL>
+  note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
   purpose: Run security review (SYNCHRONOUS - no &)
 
 trigger-quality-review:
   command: cargo xtask review quality <PR_URL>
+  note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
   purpose: Run quality review (SYNCHRONOUS - no &)
 ```
 

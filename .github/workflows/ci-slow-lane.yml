@@ -1,0 +1,67 @@
+# Slow-lane CI workflow
+# Runs heavyweight non-gating checks on the same self-hosted machine.
+
+name: CI Slow Lane
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  slow-lane-release-build:
+    name: Slow Lane Release Build
+    runs-on: [self-hosted, linux, x64, fac-ovh]
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
+        with:
+          toolchain: nightly-2025-12-01
+
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Add Cargo bin to PATH
+        run: |
+          if [[ -n "${CARGO_HOME:-}" ]]; then
+            echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          else
+            echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Run slow-lane bounded CI suite
+        run: |
+          cargo run --locked --package apm2-cli -- ci run \
+            --profile github-slow-lane \
+            --bounded-timeout-seconds 4800 \
+            --bounded-kill-after-seconds 30 \
+            --bounded-memory-max 64G \
+            --bounded-pids-max 8192 \
+            --bounded-cpu-quota 1600% \
+            --heartbeat-seconds 1 \
+            --log-mode dual \
+            --artifacts-dir target/ci/runs
+
+      - name: Upload slow-lane CI artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-slow-lane-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/runs/
+          if-no-files-found: warn
+          retention-days: 14

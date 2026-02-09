@@ -1,14 +1,12 @@
 # Main CI workflow
-# Runs on push and PRs to ensure code quality
+# Executes deep CI on main/merge-group SHAs on the OVH self-hosted runner.
 
 name: CI
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-  # Required for GitHub merge queue: run required checks on merge-group SHAs
+  # Required for GitHub merge queue: required checks must run on merge-group SHAs.
   merge_group:
     types: [checks_requested]
 
@@ -26,347 +24,56 @@ permissions:
   contents: read
 
 jobs:
-  # Format check
-  fmt:
-    name: Rustfmt
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
-        with:
-          toolchain: nightly
-          components: rustfmt
-      - run: cargo fmt --all --check
-
-  # Proto code verification (LOW-001 security finding)
-  # Verifies that checked-in generated proto code matches the .proto definition
-  proto-verify:
-    name: Proto Verify
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
-        with:
-          toolchain: stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-      - name: Build to regenerate proto
-        run: cargo build -p apm2-daemon
-      - name: Verify generated code is committed
-        run: |
-          if ! git diff --exit-code crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs; then
-            echo "::error::Generated proto code is out of sync with proto definition."
-            echo "::error::Run 'cargo build -p apm2-daemon' and commit the generated file."
-            exit 1
-          fi
-
-  # Clippy lints
-  clippy:
-    name: Clippy
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
-        with:
-          toolchain: nightly
-          components: clippy
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-  # Documentation
-  doc:
-    name: Documentation
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
-        with:
-          toolchain: nightly
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-      - run: cargo doc --workspace --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-  # Tests
-  test:
-    name: Test
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
-        with:
-          toolchain: nightly
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-      - uses: taiki-e/install-action@44b512a15849018e00cb9330d33250594aa2436c
-        with:
-          tool: cargo-nextest
-      - name: Run tests
-        run: cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci
-      - name: Run doctests
-        run: cargo test --doc --workspace --all-features
-
-  # Canonicalization test vectors (TCK-00130)
-  test-vectors:
-    name: Test Vectors
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
-        with:
-          toolchain: stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-      - name: Run canonicalization test vectors
-        run: cargo test --package apm2-core --features test_vectors canonicalization
-
-  # MSRV check
-  msrv:
-    name: MSRV (1.85)
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # 1.85
-        with:
-          toolchain: "1.85"
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-      - run: cargo check --workspace --all-features
-
-  # Security audit
-  security:
-    name: Security Audit
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Run security audit
-        # Ignore unmaintained warnings (informational), fail only on vulnerabilities
-        run: cargo audit --ignore RUSTSEC-2023-0089
-
-  # Dependency license/ban checks
-  deny:
-    name: Cargo Deny
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
-        with:
-          command: check all
-
-  # Code coverage
-  coverage:
-    name: Coverage
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
-        with:
-          toolchain: nightly
-          components: llvm-tools-preview
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-      - uses: taiki-e/install-action@44b512a15849018e00cb9330d33250594aa2436c # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
-      - name: Generate coverage
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
-      - name: Upload coverage
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-  # SAFETY comment coverage for unsafe code (security gate)
-  # Verifies that all unsafe blocks have documented safety proofs per Rust convention
-  safety-proof-coverage:
-    name: Safety Proof Coverage
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-
-      - name: Check SAFETY documentation
-        run: |
-          echo "Checking for unsafe blocks without SAFETY documentation..."
-
-          # Find all Rust files in crates
-          RUST_FILES=$(find crates/apm2-core crates/apm2-daemon -name '*.rs' -type f)
-
-          if [[ -n "$RUST_FILES" ]]; then
-            # Check each file has corresponding SAFETY comments
-            # Uses standard Rust convention: "// SAFETY:" (case-insensitive)
-            MISSING_PROOFS=""
-            for file in $RUST_FILES; do
-              # Count actual unsafe blocks (excluding doc comments starting with /// or //!)
-              # The grep -v filters out doc comment lines before counting
-              UNSAFE_COUNT=$(rg -n "unsafe\s*\{" "$file" 2>/dev/null | grep -v "^[0-9]*:\s*///" | grep -v "^[0-9]*:\s*//!" | wc -l || echo "0")
-              PROOF_COUNT=$(rg -ci "// SAFETY:" "$file" 2>/dev/null || echo "0")
-
-              # Skip files with no unsafe blocks
-              if [[ "$UNSAFE_COUNT" -eq 0 ]]; then
-                continue
-              fi
-
-              if [[ "$UNSAFE_COUNT" -gt "$PROOF_COUNT" ]]; then
-                MISSING_PROOFS="$MISSING_PROOFS\n$file: $UNSAFE_COUNT unsafe blocks, $PROOF_COUNT SAFETY comments"
-              fi
-            done
-
-            if [[ -n "$MISSING_PROOFS" ]]; then
-              echo "ERROR: Files with unsafe blocks missing SAFETY documentation:"
-              echo -e "$MISSING_PROOFS"
-              exit 1
-            fi
-          fi
-
-          echo "All unsafe blocks have SAFETY documentation"
-
-  # Legacy IPC guard (TCK-00282)
-  # Prevents reintroduction of legacy JSON IPC code removed in TCK-00281
-  legacy-ipc-guard:
-    name: Legacy IPC Guard
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-
-      - name: Check for legacy IPC patterns
-        run: ./scripts/ci/legacy_ipc_guard.sh
-
-  # Evidence/requirement reference integrity (TCK-00409)
-  # Validates that evidence artifacts reference existing requirements and vice versa
-  evidence-refs-lint:
-    name: Evidence Refs Lint
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Validate evidence/requirement cross-references
-        run: ./scripts/ci/evidence_refs_lint.sh
-
-  # Test/source reference integrity (TCK-00409)
-  # Validates that source_refs in evidence artifacts point to existing files
-  test-refs-lint:
-    name: Test Refs Lint
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Validate evidence source references
-        run: ./scripts/ci/test_refs_lint.sh
-
-  # Proto enum drift detection (TCK-00409)
-  # Validates proto enum variant counts match generated Rust code
-  proto-enum-drift:
-    name: Proto Enum Drift
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Detect proto/Rust enum drift
-        run: ./scripts/ci/proto_enum_drift.sh
-
-  # Review artifact integrity (TCK-00409)
-  # Validates review prompts enforce SHA pinning and don't bypass review gates
-  review-artifact-lint:
-    name: Review Artifact Lint
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-
-      - name: Validate review artifact integrity
-        run: ./scripts/ci/review_artifact_lint.sh
-
-  # Direct status-write command drift guard (TCK-00411)
-  # Fails closed if prompt/xtask assets reintroduce `gh api ... /statuses/...`
-  status-write-command-lint:
-    name: Status Write Command Lint
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Validate status-write command contract
-        run: ./scripts/lint/no_direct_status_write_commands.sh
-
-  # Release build check
-  build:
-    name: Release Build
-    if: github.event_name != 'issue_comment'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
-        with:
-          toolchain: nightly
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-      - run: cargo build --workspace --release
-
-  # Final check that all CI jobs passed
   ci-success:
     name: CI Success
-    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage, legacy-ipc-guard, evidence-refs-lint, test-refs-lint, proto-enum-drift, review-artifact-lint, status-write-command-lint]
-    if: always()
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, fac-ovh]
+    timeout-minutes: 90
+
     steps:
-      - name: Check all jobs
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly-2025-12-01
+        with:
+          toolchain: nightly-2025-12-01
+
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Add Cargo bin to PATH
         run: |
-          if [[ "${{ needs.fmt.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.proto-verify.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.clippy.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.doc.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.test.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.test-vectors.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.msrv.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.security.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.deny.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.coverage.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.build.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.safety-proof-coverage.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.legacy-ipc-guard.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.evidence-refs-lint.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.test-refs-lint.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.proto-enum-drift.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.review-artifact-lint.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.status-write-command-lint.result }}" != "success" ]]; then exit 1; fi
+          if [[ -n "${CARGO_HOME:-}" ]]; then
+            echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          else
+            echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Run bounded local CI suite
+        run: |
+          echo "Using CI profile: github-deep"
+          cargo run --locked --package apm2-cli -- ci run \
+            --profile "github-deep" \
+            --bounded-timeout-seconds 4800 \
+            --bounded-kill-after-seconds 30 \
+            --bounded-memory-max 64G \
+            --bounded-pids-max 8192 \
+            --bounded-cpu-quota 1600% \
+            --heartbeat-seconds 1 \
+            --heavy-lane-tokens 4 \
+            --log-mode dual \
+            --artifacts-dir target/ci/runs
+
+      - name: Upload CI run artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-run-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/runs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload coverage
+        if: always() && hashFiles('target/ci/lcov.info') != ''
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
+        with:
+          files: target/ci/lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

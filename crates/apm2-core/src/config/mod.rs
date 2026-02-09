@@ -312,7 +312,7 @@ pub struct ProjectionConfig {
     #[serde(default = "default_github_api_url")]
     pub github_api_url: String,
 
-    /// Repository owner (e.g., "rumi-engineering").
+    /// Repository owner (e.g., "guardian-intelligence").
     #[serde(default)]
     pub github_owner: String,
 
@@ -395,7 +395,7 @@ pub struct DivergenceWatchdogSection {
     #[serde(default)]
     pub enabled: bool,
 
-    /// GitHub repository owner (e.g., "rumi-engineering").
+    /// GitHub repository owner (e.g., "guardian-intelligence").
     #[serde(default)]
     pub github_owner: String,
 

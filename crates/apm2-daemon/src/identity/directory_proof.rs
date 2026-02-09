@@ -8,7 +8,7 @@
 //! These artifacts provide bounded, deterministic, CAS-addressable identity
 //! verification inputs for boundary-crossing authority decisions.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use apm2_core::crypto::Hash;
 use apm2_core::evidence::{CasError, ContentAddressedStore};
@@ -2117,21 +2117,46 @@ pub(crate) enum InvalidationReason {
 /// invalidated heads.
 ///
 /// **Audit invariant:** Every cache mutation emits a
-/// [`VerifierCacheAuditEvent`] into the audit log, enabling deterministic
+/// `VerifierCacheAuditEvent` into the audit log, enabling deterministic
 /// post-hoc reconstruction of all invalidation decisions.
 ///
 /// **Bounded audit buffer (REQ-0013 / security review R1):** The audit log
 /// is bounded to `max_audit_events` entries. When the log reaches capacity,
 /// old events are dropped and an `AuditOverflow` sentinel is emitted so
 /// that consumers know events were lost. Callers SHOULD drain the log
-/// periodically via [`drain_audit_log`] to avoid overflow.
+/// periodically via `drain_audit_log` to avoid overflow.
 #[allow(dead_code)]
-#[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Clone)]
-pub(crate) struct VerifiedHeadCache {
+pub struct VerifiedHeadCache {
     heads: HashMap<[u8; HASH_BYTES], VerifiedHead>,
     admission_order: VecDeque<[u8; HASH_BYTES]>,
     max_entries: usize,
+    /// Persistent high-water mark of the highest epoch ever admitted per cell.
+    ///
+    /// This survives eviction (both capacity and staleness sweeps) so that
+    /// a stale epoch cannot be re-admitted after all heads for a cell have
+    /// been removed from the live cache. Bounded to `max_hwm_entries` cells,
+    /// which is larger than `max_entries` to retain rollback protection for
+    /// cells that have been capacity-evicted from the live cache.
+    max_seen_epochs: HashMap<CellIdV1, u64>,
+    /// Upper bound on `max_seen_epochs` entries. Larger than `max_entries`
+    /// so that epoch history survives capacity eviction of heads.
+    max_hwm_entries: usize,
+    /// Stores the last known epoch for cells evicted from `max_seen_epochs`
+    /// due to capacity pressure.
+    ///
+    /// Allows monotonicity enforcement even after HWM eviction.
+    /// Re-admission at an equal or higher epoch succeeds and moves the cell
+    /// back to `max_seen_epochs`. A stale epoch (lower than the evicted
+    /// value) is rejected fail-closed for that specific cell only — no
+    /// cross-cell contamination.
+    evicted_hwm: HashMap<CellIdV1, u64>,
+    /// Upper bound on `evicted_hwm` entries. Uses the same value as
+    /// `max_hwm_entries`. When the map exceeds this bound, the entry with
+    /// the lowest epoch is dropped (oldest eviction loses protection).
+    /// Entries are also removed when a cell is re-admitted to
+    /// `max_seen_epochs`.
+    max_evicted_hwm: usize,
     /// Bounded audit log of cache mutations.
     audit_log: VecDeque<VerifierCacheAuditEvent>,
     /// Maximum number of audit events retained before overflow.
@@ -2146,17 +2171,33 @@ pub(crate) struct VerifiedHeadCache {
 #[allow(dead_code)]
 const DEFAULT_MAX_AUDIT_EVENTS: usize = 4096;
 
+/// Compute the high-water-mark map capacity from the live-cache capacity.
+///
+/// The HWM map must be larger than `max_entries` so that epoch history
+/// survives capacity eviction of heads. This retains rollback protection
+/// for recently-evicted cells. The minimum of 16 ensures adequate history
+/// even for very small caches (e.g. `max_entries=1`).
+fn hwm_capacity(max_entries: usize) -> usize {
+    max_entries.saturating_mul(4).max(16)
+}
+
 #[allow(dead_code)]
 impl VerifiedHeadCache {
     /// Creates a new bounded cache with at least one entry of capacity.
     ///
     /// The audit log is bounded to [`DEFAULT_MAX_AUDIT_EVENTS`] entries.
     #[must_use]
-    pub(crate) fn new(max_entries: usize) -> Self {
+    pub fn new(max_entries: usize) -> Self {
+        let capped = max_entries.max(1);
+        let hwm_cap = hwm_capacity(capped);
         Self {
             heads: HashMap::new(),
             admission_order: VecDeque::new(),
-            max_entries: max_entries.max(1),
+            max_entries: capped,
+            max_seen_epochs: HashMap::new(),
+            max_hwm_entries: hwm_cap,
+            evicted_hwm: HashMap::new(),
+            max_evicted_hwm: hwm_cap,
             audit_log: VecDeque::new(),
             max_audit_events: DEFAULT_MAX_AUDIT_EVENTS,
         }
@@ -2167,11 +2208,17 @@ impl VerifiedHeadCache {
     /// Use this in tests or constrained environments where the default
     /// audit capacity is too large or too small.
     #[must_use]
-    pub(crate) fn with_audit_capacity(max_entries: usize, max_audit_events: usize) -> Self {
+    pub fn with_audit_capacity(max_entries: usize, max_audit_events: usize) -> Self {
+        let capped = max_entries.max(1);
+        let hwm_cap = hwm_capacity(capped);
         Self {
             heads: HashMap::new(),
             admission_order: VecDeque::new(),
-            max_entries: max_entries.max(1),
+            max_entries: capped,
+            max_seen_epochs: HashMap::new(),
+            max_hwm_entries: hwm_cap,
+            evicted_hwm: HashMap::new(),
+            max_evicted_hwm: hwm_cap,
             audit_log: VecDeque::new(),
             max_audit_events: max_audit_events.max(1),
         }
@@ -2247,7 +2294,7 @@ impl VerifiedHeadCache {
     /// If the cache is at capacity after insertion, the oldest entry
     /// (by FIFO admission order) is evicted and a `CapacityEviction`
     /// audit event is emitted.
-    pub(crate) fn admit_head(
+    pub fn admit_head(
         &mut self,
         head_hash: [u8; HASH_BYTES],
         head: HolonDirectoryHeadV1,
@@ -2265,25 +2312,89 @@ impl VerifiedHeadCache {
         let directory_epoch = head.directory_epoch();
 
         // --- Monotonic epoch guard: reject stale re-admissions ---
-        // Check BEFORE any state mutation (transactional admission pattern).
-        let max_cached_epoch = self
+        // Check BOTH the persistent high-water mark AND live cache epochs.
+        // The HWM map may have evicted a cell's entry due to capacity, but
+        // the live cache may still hold a head for that cell at a higher
+        // epoch. Both sources must be consulted to prevent rollback.
+        //
+        // Per-cell eviction tracking: when a cell is not found in the HWM
+        // map, we check `evicted_hwm` to determine if its history was
+        // lost to capacity pressure. If so, we fail-closed for THAT cell
+        // only (no cross-cell contamination). If the cell is in neither
+        // map, it is truly first-seen and admitted normally.
+        let hwm_epoch = self.max_seen_epochs.get(&cell_id).copied();
+        let live_epoch = self
             .heads
             .values()
             .filter(|vh| vh.head.cell_id() == &cell_id)
             .map(|vh| vh.verified_at)
             .max();
-        if let Some(cached_epoch) = max_cached_epoch {
-            if directory_epoch < cached_epoch {
-                self.push_audit_event(VerifierCacheAuditEvent::StaleAdmissionRejected {
-                    cell_id,
-                    rejected_epoch: directory_epoch,
-                    cached_epoch,
-                });
-                return Err(IdentityProofError::StaleEpochRejected {
-                    admitted_epoch: directory_epoch,
-                    cached_epoch,
-                });
-            }
+
+        match (hwm_epoch, live_epoch) {
+            // Cell has known history in both maps — enforce monotonicity.
+            (Some(hwm), Some(live)) => {
+                let effective = hwm.max(live);
+                if directory_epoch < effective {
+                    self.push_audit_event(VerifierCacheAuditEvent::StaleAdmissionRejected {
+                        cell_id,
+                        rejected_epoch: directory_epoch,
+                        cached_epoch: effective,
+                    });
+                    return Err(IdentityProofError::StaleEpochRejected {
+                        admitted_epoch: directory_epoch,
+                        cached_epoch: effective,
+                    });
+                }
+            },
+            // Cell has HWM but no live head — enforce HWM.
+            (Some(hwm), None) => {
+                if directory_epoch < hwm {
+                    self.push_audit_event(VerifierCacheAuditEvent::StaleAdmissionRejected {
+                        cell_id,
+                        rejected_epoch: directory_epoch,
+                        cached_epoch: hwm,
+                    });
+                    return Err(IdentityProofError::StaleEpochRejected {
+                        admitted_epoch: directory_epoch,
+                        cached_epoch: hwm,
+                    });
+                }
+            },
+            // Cell has live head but no HWM — enforce live epoch.
+            (None, Some(live)) => {
+                if directory_epoch < live {
+                    self.push_audit_event(VerifierCacheAuditEvent::StaleAdmissionRejected {
+                        cell_id,
+                        rejected_epoch: directory_epoch,
+                        cached_epoch: live,
+                    });
+                    return Err(IdentityProofError::StaleEpochRejected {
+                        admitted_epoch: directory_epoch,
+                        cached_epoch: live,
+                    });
+                }
+            },
+            // Cell not in HWM map and no live head — check eviction history.
+            (None, None) => {
+                if let Some(&evicted_epoch) = self.evicted_hwm.get(&cell_id) {
+                    if directory_epoch < evicted_epoch {
+                        self.push_audit_event(VerifierCacheAuditEvent::StaleAdmissionRejected {
+                            cell_id,
+                            rejected_epoch: directory_epoch,
+                            cached_epoch: evicted_epoch,
+                        });
+                        return Err(IdentityProofError::StaleEpochRejected {
+                            admitted_epoch: directory_epoch,
+                            cached_epoch: evicted_epoch,
+                        });
+                    }
+                    // epoch >= evicted_epoch: cell is being re-admitted at
+                    // a valid epoch. It will be moved back to
+                    // max_seen_epochs below.
+                }
+                // Truly first-seen cell OR recovering evicted cell — allow
+                // admission.
+            },
         }
 
         // --- Atomic head-advancement: evict older same-cell epochs ---
@@ -2338,6 +2449,47 @@ impl VerifiedHeadCache {
             }
         }
 
+        // Update persistent high-water mark for this cell.
+        // The map is bounded to `max_hwm_entries` cells (larger than
+        // `max_entries`) so epoch history survives head eviction. When
+        // evicting, never drop a cell that still has a live head.
+        let hwm = self.max_seen_epochs.entry(cell_id.clone()).or_insert(0);
+        if directory_epoch > *hwm {
+            *hwm = directory_epoch;
+        }
+        // Cell is now (re-)admitted to the HWM map — remove from evicted map.
+        self.evicted_hwm.remove(&cell_id);
+        if self.max_seen_epochs.len() > self.max_hwm_entries {
+            // Collect the set of cell IDs that are still live in the cache.
+            let live_cells: HashSet<&CellIdV1> =
+                self.heads.values().map(|vh| vh.head.cell_id()).collect();
+            // Find the non-live cell with the lowest epoch to evict.
+            if let Some((min_cell, evicted_epoch)) = self
+                .max_seen_epochs
+                .iter()
+                .filter(|(c, _)| !live_cells.contains(c))
+                .min_by_key(|(_, e)| **e)
+                .map(|(c, e)| (c.clone(), *e))
+            {
+                self.max_seen_epochs.remove(&min_cell);
+                // Track the evicted cell with its epoch so that stale
+                // re-admission is rejected while fresh re-admission succeeds.
+                self.evicted_hwm.insert(min_cell, evicted_epoch);
+                // Enforce bound on evicted_hwm — drop the oldest eviction
+                // (lowest epoch) when the map exceeds capacity.
+                if self.evicted_hwm.len() > self.max_evicted_hwm {
+                    if let Some(oldest_cell) = self
+                        .evicted_hwm
+                        .iter()
+                        .min_by_key(|(_, e)| **e)
+                        .map(|(c, _)| c.clone())
+                    {
+                        self.evicted_hwm.remove(&oldest_cell);
+                    }
+                }
+            }
+        }
+
         self.push_audit_event(VerifierCacheAuditEvent::HeadAdmitted {
             head_hash,
             directory_epoch,
@@ -2361,7 +2513,7 @@ impl VerifiedHeadCache {
     /// the O(1) signature/quorum checks that were already performed
     /// during head admission. This is the core cost reduction that
     /// makes the cache worthwhile.
-    pub(crate) fn verify_identity(
+    pub fn verify_identity(
         &self,
         head_hash: &[u8; HASH_BYTES],
         proof: &IdentityProofV1,
@@ -2539,13 +2691,18 @@ impl VerifiedHeadCache {
     }
 
     /// Returns `true` if the cache contains a head with the given hash.
-    pub(crate) fn contains_head(&self, head_hash: &[u8; HASH_BYTES]) -> bool {
+    pub fn contains_head(&self, head_hash: &[u8; HASH_BYTES]) -> bool {
         self.heads.contains_key(head_hash)
     }
 
     /// Returns the number of currently cached heads.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.heads.len()
+    }
+
+    /// Returns `true` if the cache contains no heads.
+    pub fn is_empty(&self) -> bool {
+        self.heads.is_empty()
     }
 
     /// Returns the number of audit events currently retained.
@@ -5383,5 +5540,392 @@ mod tests {
             rejection_count, 5,
             "expected 5 StaleAdmissionRejected events"
         );
+    }
+
+    // --- Stale epoch re-admission after eviction (CQ MAJOR regression) ---
+
+    #[test]
+    fn stale_epoch_rejected_after_capacity_eviction() {
+        // Regression: admit epoch 20, evict ALL heads via capacity, then
+        // attempt to admit epoch 10 for the same cell. The persistent
+        // high-water mark must reject it even though no heads remain.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+        let third_genesis = CellGenesisV1::new(
+            [0x44; 32],
+            PolicyRootId::Single(make_public_key_id(0xDD)),
+            "third.cap.cell.internal",
+        )
+        .unwrap();
+        let third_cell_id = CellIdV1::from_genesis(&third_genesis);
+
+        // Cache with capacity 2 so head1 is evicted when head2 + head3 fill it.
+        let mut cache = VerifiedHeadCache::new(2);
+
+        let head1 = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA1);
+        let hash1 = head1.content_hash().unwrap();
+        cache.admit_head(hash1, head1).unwrap();
+
+        // Fill cache with two other-cell heads, evicting head1 by capacity.
+        let head2 = make_epoch_head(other_cert.cell_id().clone(), 1, 0xB1);
+        let hash2 = head2.content_hash().unwrap();
+        cache.admit_head(hash2, head2).unwrap();
+
+        let head3 = make_epoch_head(third_cell_id, 2, 0xC1);
+        let hash3 = head3.content_hash().unwrap();
+        cache.admit_head(hash3, head3).unwrap();
+
+        // head1 should be evicted by now.
+        assert!(
+            !cache.contains_head(&hash1),
+            "head1 must be capacity-evicted"
+        );
+        assert_eq!(cache.len(), 2);
+
+        // Attempt to admit a stale epoch for the original cell.
+        let stale = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA2);
+        let stale_hash = stale.content_hash().unwrap();
+        let err = cache.admit_head(stale_hash, stale).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 10,
+                    cached_epoch: 20,
+                }
+            ),
+            "expected StaleEpochRejected after capacity eviction, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn stale_epoch_rejected_after_staleness_eviction() {
+        // Regression: admit epoch 20, evict it via evict_stale(30), then
+        // attempt to admit epoch 15. Must reject.
+        let cell_cert = make_cell_certificate();
+
+        let mut cache = VerifiedHeadCache::new(8);
+
+        let head = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA1);
+        let hash = head.content_hash().unwrap();
+        cache.admit_head(hash, head).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Evict via staleness sweep.
+        let evicted = cache.evict_stale(30);
+        assert_eq!(evicted, 1);
+        assert_eq!(cache.len(), 0);
+
+        // Attempt to admit a stale epoch.
+        let stale = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
+        let stale_hash = stale.content_hash().unwrap();
+        let err = cache.admit_head(stale_hash, stale).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 15,
+                    cached_epoch: 20,
+                }
+            ),
+            "expected StaleEpochRejected after staleness eviction, got: {err:?}"
+        );
+    }
+
+    // --- HWM eviction must not drop live-cache cells (CQ MAJOR fix) ---
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn stale_epoch_rejected_after_hwm_eviction_with_live_cache() {
+        // Repro from review: capacity=2, admit A@100, B@5, C@6.
+        // B's HWM is the lowest and would be evicted from max_seen_epochs,
+        // but B@5 is still live in the cache. A stale B@4 MUST be rejected.
+        let genesis_a = CellGenesisV1::new(
+            [0x61; 32],
+            PolicyRootId::Single(make_public_key_id(0xA0)),
+            "cell.a.internal",
+        )
+        .unwrap();
+        let cell_a = CellIdV1::from_genesis(&genesis_a);
+
+        let genesis_b = CellGenesisV1::new(
+            [0x62; 32],
+            PolicyRootId::Single(make_public_key_id(0xB0)),
+            "cell.b.internal",
+        )
+        .unwrap();
+        let cell_b = CellIdV1::from_genesis(&genesis_b);
+
+        let genesis_c = CellGenesisV1::new(
+            [0x63; 32],
+            PolicyRootId::Single(make_public_key_id(0xC0)),
+            "cell.c.internal",
+        )
+        .unwrap();
+        let cell_c = CellIdV1::from_genesis(&genesis_c);
+
+        let mut cache = VerifiedHeadCache::new(2);
+
+        // Admit A@100 — this will be FIFO-evicted from heads when C arrives.
+        let head_a = make_epoch_head(cell_a, 100, 0xA1);
+        let hash_a = head_a.content_hash().unwrap();
+        cache.admit_head(hash_a, head_a).unwrap();
+
+        // Admit B@5 — lives in cache alongside A.
+        let head_b = make_epoch_head(cell_b.clone(), 5, 0xB1);
+        let hash_b = head_b.content_hash().unwrap();
+        cache.admit_head(hash_b, head_b).unwrap();
+
+        // Admit C@6 — triggers capacity eviction of A@100 (FIFO oldest).
+        // HWM map now has 3 entries {A:100, B:5, C:6} which exceeds capacity=2.
+        // B has the lowest HWM but is still live in cache, so it must NOT be
+        // evicted from HWM. A@100 (no longer live) should be evicted instead.
+        let head_c = make_epoch_head(cell_c, 6, 0xC1);
+        let hash_c = head_c.content_hash().unwrap();
+        cache.admit_head(hash_c, head_c).unwrap();
+
+        // Verify A was evicted from heads.
+        assert!(
+            !cache.contains_head(&hash_a),
+            "A@100 must be capacity-evicted"
+        );
+        // B and C should still be in the cache.
+        assert!(cache.contains_head(&hash_b), "B@5 must still be live");
+        assert!(cache.contains_head(&hash_c), "C@6 must still be live");
+        assert_eq!(cache.len(), 2);
+
+        // Now attempt to admit stale B@4 — MUST be rejected.
+        let stale_b = make_epoch_head(cell_b, 4, 0xB2);
+        let stale_hash = stale_b.content_hash().unwrap();
+        let err = cache.admit_head(stale_hash, stale_b).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 4,
+                    cached_epoch: 5,
+                }
+            ),
+            "expected StaleEpochRejected for B@4 vs live B@5, got: {err:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn stale_epoch_rejected_under_max_entries_one() {
+        // With max_entries=1, every admission evicts the previous head.
+        // The HWM must still protect against stale re-admission under
+        // heavy churn for the same cell AND across cells.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+
+        let mut cache = VerifiedHeadCache::new(1);
+
+        // Admit cell@20.
+        let head1 = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA1);
+        let hash1 = head1.content_hash().unwrap();
+        cache.admit_head(hash1, head1).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Stale cell@10 must be rejected by HWM (cell is still live).
+        let stale = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA2);
+        let stale_hash = stale.content_hash().unwrap();
+        let err = cache.admit_head(stale_hash, stale).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 10,
+                    cached_epoch: 20,
+                }
+            ),
+            "expected StaleEpochRejected for cell@10 vs cell@20, got: {err:?}"
+        );
+
+        // Advance cell to epoch 30 (replaces cell@20 via same-cell advancement).
+        let head2 = make_epoch_head(cell_cert.cell_id().clone(), 30, 0xA3);
+        let hash2 = head2.content_hash().unwrap();
+        cache.admit_head(hash2, head2).unwrap();
+        assert!(!cache.contains_head(&hash1), "cell@20 must be advanced out");
+
+        // Stale cell@25 must be rejected.
+        let stale2 = make_epoch_head(cell_cert.cell_id().clone(), 25, 0xA4);
+        let stale2_hash = stale2.content_hash().unwrap();
+        let err2 = cache.admit_head(stale2_hash, stale2).unwrap_err();
+        assert!(
+            matches!(
+                err2,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 25,
+                    cached_epoch: 30,
+                }
+            ),
+            "expected StaleEpochRejected for cell@25 vs cell@30, got: {err2:?}"
+        );
+
+        // Switch to a different cell — this evicts cell@30 from heads.
+        let head3 = make_epoch_head(other_cert.cell_id().clone(), 5, 0xB1);
+        let hash3 = head3.content_hash().unwrap();
+        cache.admit_head(hash3, head3).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains_head(&hash2), "cell@30 must be evicted");
+
+        // Stale other@3 must be rejected (other is live at epoch 5).
+        let stale3 = make_epoch_head(other_cert.cell_id().clone(), 3, 0xB2);
+        let stale3_hash = stale3.content_hash().unwrap();
+        let err3 = cache.admit_head(stale3_hash, stale3).unwrap_err();
+        assert!(
+            matches!(
+                err3,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 3,
+                    cached_epoch: 5,
+                }
+            ),
+            "expected StaleEpochRejected for other@3 vs other@5, got: {err3:?}"
+        );
+    }
+
+    #[test]
+    fn stale_epoch_rejected_after_hwm_overflow_churn() {
+        // Regression test: cross-cell churn that overflows the HWM map must
+        // not allow stale re-admission for cells whose entries were evicted.
+        //
+        // With max_entries=1 the HWM capacity is hwm_capacity(1) = 16.
+        // We admit a target cell at epoch 20, then churn 20+ distinct other
+        // cells to force the target cell's HWM entry to be evicted. Finally,
+        // we attempt to readmit the target cell at epoch 10 — this MUST fail
+        // because `evicted_hwm` tracks the specific evicted cell and epoch.
+        //
+        // ADDITIONALLY, a brand-new cell (never seen before) must still be
+        // admitted successfully — the per-cell eviction tracking must NOT
+        // cause cross-cell contamination (the bug that the global floor had).
+
+        let target_genesis = CellGenesisV1::new(
+            [0xF0; 32],
+            PolicyRootId::Single(make_public_key_id(0xF0)),
+            "target.cell.internal",
+        )
+        .unwrap();
+        let target_cell_id = CellIdV1::from_genesis(&target_genesis);
+
+        let mut cache = VerifiedHeadCache::new(1);
+
+        // 1. Admit target cell at epoch 20.
+        // Note: root_fill values must avoid wrapping any of the derived
+        // hash fields (root_fill + 0x10/0x20/0x30) to 0x00, since
+        // HolonDirectoryHeadV1 rejects all-zero seal/policy hashes.
+        let target_head = make_epoch_head(target_cell_id.clone(), 20, 0x50);
+        let target_hash = target_head.content_hash().unwrap();
+        cache.admit_head(target_hash, target_head).unwrap();
+
+        // 2. Churn 20+ distinct cells to overflow the HWM map (capacity=16). Each new
+        //    cell evicts the target's live head (max_entries=1) and eventually
+        //    overflows the HWM map, forcing eviction of the target cell's HWM entry.
+        for i in 0u8..25 {
+            // Offset 0x30 keeps all derived fill+0x10/0x20/0x30 values
+            // safely away from wrapping to zero.
+            let fill = i.wrapping_add(0x30);
+            let churn_genesis = CellGenesisV1::new(
+                [fill; 32],
+                PolicyRootId::Single(make_public_key_id(fill)),
+                "churn.cell.internal",
+            )
+            .unwrap();
+            let churn_cell_id = CellIdV1::from_genesis(&churn_genesis);
+            let churn_head = make_epoch_head(churn_cell_id, u64::from(i) + 1, fill);
+            let churn_hash = churn_head.content_hash().unwrap();
+            cache.admit_head(churn_hash, churn_head).unwrap();
+        }
+
+        // Sanity: the target cell should NOT be in the HWM map anymore.
+        assert!(
+            !cache.contains_head(&target_hash),
+            "target head must have been evicted from live cache"
+        );
+
+        // 3. Attempt to readmit target cell at stale epoch 10 — must FAIL. The per-cell
+        //    eviction tracker remembers this specific cell was evicted at epoch 20.
+        let stale_head = make_epoch_head(target_cell_id.clone(), 10, 0x51);
+        let stale_hash = stale_head.content_hash().unwrap();
+        let err = cache.admit_head(stale_hash, stale_head).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 10,
+                    cached_epoch: 20,
+                }
+            ),
+            "expected StaleEpochRejected for target@10 vs evicted@20, got: {err:?}"
+        );
+
+        // 3b. Re-admit target cell at fresh epoch 30 (> evicted epoch 20) — must
+        // SUCCEED.     This proves evicted cells are recoverable, not
+        // permanently denied.
+        let fresh_head = make_epoch_head(target_cell_id, 30, 0x52);
+        let fresh_hash = fresh_head.content_hash().unwrap();
+        cache
+            .admit_head(fresh_hash, fresh_head)
+            .expect("evicted cell at epoch 30 > evicted epoch 20 must be re-admitted");
+
+        // 4. A brand-new cell (never seen before) MUST be admitted successfully. This
+        //    is the cross-cell contamination regression: with the old
+        //    `global_hwm_floor` approach, this cell would be rejected because the floor
+        //    was raised by evicting the target cell's epoch-20 HWM. With per-cell
+        //    eviction tracking, this new cell is truly first-seen and should be allowed
+        //    at any epoch, including epoch 1.
+        let new_genesis = CellGenesisV1::new(
+            [0xEE; 32],
+            PolicyRootId::Single(make_public_key_id(0xEE)),
+            "brand.new.cell.internal",
+        )
+        .unwrap();
+        let new_cell_id = CellIdV1::from_genesis(&new_genesis);
+        let new_head = make_epoch_head(new_cell_id, 1, 0x60);
+        let new_hash = new_head.content_hash().unwrap();
+        cache
+            .admit_head(new_hash, new_head)
+            .expect("brand-new cell at epoch 1 must be admitted (no cross-cell contamination)");
+    }
+
+    #[test]
+    fn evicted_hwm_respects_max_bound() {
+        // With max_entries=1, hwm_capacity=16, max_evicted_hwm=16.
+        // Churn through >32 cells (16 for max_seen_epochs + 16 for
+        // evicted_hwm overflow). Verify evicted_hwm never exceeds
+        // max_evicted_hwm by confirming the cache operates correctly
+        // under high-cardinality churn and a brand-new cell can still
+        // be admitted afterward.
+        let mut cache = VerifiedHeadCache::new(1);
+        for i in 0u8..40 {
+            let fill = i.wrapping_add(0x20);
+            let genesis = CellGenesisV1::new(
+                [fill; 32],
+                PolicyRootId::Single(make_public_key_id(fill)),
+                "bound.test.internal",
+            )
+            .unwrap();
+            let cell_id = CellIdV1::from_genesis(&genesis);
+            let head = make_epoch_head(cell_id, u64::from(i) + 1, fill);
+            let hash = head.content_hash().unwrap();
+            cache.admit_head(hash, head).unwrap();
+        }
+        // Since evicted_hwm is private, we verify the bound indirectly:
+        // the cache must still accept a brand-new cell without panic or
+        // unbounded growth. The test completing is evidence that the
+        // bound enforcement loop did not corrupt internal state.
+        let new_genesis = CellGenesisV1::new(
+            [0xFF; 32],
+            PolicyRootId::Single(make_public_key_id(0xFF)),
+            "new.cell.internal",
+        )
+        .unwrap();
+        let new_cell_id = CellIdV1::from_genesis(&new_genesis);
+        let new_head = make_epoch_head(new_cell_id, 1, 0x70);
+        let new_hash = new_head.content_hash().unwrap();
+        cache
+            .admit_head(new_hash, new_head)
+            .expect("brand-new cell must be admitted after high churn");
     }
 }

@@ -12,13 +12,19 @@
 //! The `AdmissionGate::check()` method is provided as a library function for
 //! use by those downstream tickets.
 //!
-//! Runtime wiring into the daemon episode spawn path is deferred to:
+//! Runtime wiring into the daemon episode spawn path:
 //!
-//! - **TCK-00375**: Context firewall -- wires `AdmissionGate::check` into the
-//!   daemon actuation path and implements symlink-safe runtime path resolution
-//!   with filesystem-level TOCTOU checks.
-//! - **TCK-00376**: No-bypass path ratchet -- ensures the admission gate cannot
-//!   be circumvented by alternative spawn paths.
+//! - **TCK-00375**: Context firewall -- implements symlink-safe runtime path
+//!   resolution with filesystem-level TOCTOU checks in the daemon actuation
+//!   path.
+//! - **TCK-00376**: No-bypass path ratchet -- the `PathRatchet` in the daemon
+//!   broker enforces that all enforcement components (broker, capability,
+//!   context firewall, capsule admission) are checked before tool actuation.
+//!   Broker/capability/context-firewall are mandatory at Tier2+; capsule
+//!   admission is mandatory at Tier3+ per REQ-0028. Capsule admission is
+//!   defined but **not yet integrated into the broker actuation path**. The
+//!   `PathRatchet` reports capsule as `Unavailable` and denies Tier3+ until a
+//!   future ticket wires `AdmissionGate::check` into the broker path.
 //!
 //! # Security Model
 //!

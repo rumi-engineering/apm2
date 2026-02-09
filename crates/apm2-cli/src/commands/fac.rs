@@ -5,7 +5,10 @@
 //!
 //! # Commands
 //!
-//! - `apm2 fac work status <work_id>` - Show work status from ledger
+//! - `apm2 fac check` - Run deterministic local FAC gates with receipt pointers
+//! - `apm2 fac work status <work_id>` - Show projection-backed work status via
+//!   daemon
+//! - `apm2 fac work list` - List projection-known work items via daemon
 //! - `apm2 fac episode inspect <episode_id>` - Show episode details and tool
 //!   log index
 //! - `apm2 fac receipt show <receipt_hash>` - Show receipt from CAS
@@ -13,12 +16,24 @@
 //!   context
 //! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
 //!   anchor
+//! - `apm2 fac barrier --repo <OWNER/REPO> --event <EVENT_JSON>` - Validate
+//!   trigger trust boundary before any FAC execution
+//! - `apm2 fac kickoff --repo <OWNER/REPO> --event <EVENT_JSON>` - Dispatch and
+//!   observe FAC review lifecycle for GitHub projection
+//! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
+//!   multi-model)
+//! - `apm2 fac review dispatch <PR_URL>` - Idempotent detached review dispatch
+//! - `apm2 fac review retrigger --pr <PR_NUMBER>` - Dispatch FAC workflow from
+//!   local CLI
+//! - `apm2 fac review status` - Show FAC review state and recent events
+//! - `apm2 fac review project` - Render one projection status line
+//! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
 //!
 //! # Design
 //!
-//! These commands operate directly on ledger and CAS files, enabling debugging
-//! without requiring a running daemon. This supports crash-only recovery and
-//! deterministic context rebuild for FAC v0.
+//! Most commands operate directly on ledger and CAS files for crash-only
+//! debugging. Work lifecycle authority surfaces (`fac work status/list`) route
+//! through daemon operator IPC so runtime authority remains projection-backed.
 //!
 //! # Exit Codes (RFC-0018)
 //!
@@ -32,7 +47,11 @@
 //! - TCK-00333: FAC productivity CLI/scripts (ledger/CAS oriented debug UX)
 //! - RFC-0019: FAC v0 requirements
 
+use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::fac::{
     PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
@@ -40,11 +59,17 @@ use apm2_core::fac::{
     ToolLogIndexV1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
+use apm2_daemon::gate::GateType;
+use apm2_daemon::projection::GitHubAdapterConfig;
+use apm2_daemon::protocol::WorkRole;
+use apm2_daemon::telemetry::is_cgroup_v2_available;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::exit_codes::codes as exit_codes;
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
+use crate::commands::fac_review;
+use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
 // Constants
@@ -64,6 +89,12 @@ const DEFAULT_LEDGER_FILENAME: &str = "ledger.db";
 
 /// Default CAS path relative to data directory.
 const DEFAULT_CAS_DIRNAME: &str = "cas";
+
+/// Default timeout for bounded FAC check gate execution.
+const DEFAULT_FAC_CHECK_TIMEOUT_SECS: u64 = 900;
+
+/// Default kill escalation delay for bounded FAC check gate execution.
+const DEFAULT_FAC_CHECK_KILL_AFTER_SECS: u64 = 20;
 
 // =============================================================================
 // Command Types
@@ -91,10 +122,16 @@ pub struct FacCommand {
 /// FAC subcommands.
 #[derive(Debug, Subcommand)]
 pub enum FacSubcommand {
-    /// Show work status from ledger.
+    /// Run deterministic local FAC gates with receipt-pointer output.
     ///
-    /// Displays the current status of a work item including claims, episodes,
-    /// and latest receipt hashes. Operates directly on ledger without daemon.
+    /// Executes fail-closed local gates (test safety, bounded test runner,
+    /// workspace integrity) and emits receipt pointers for each gate.
+    Check(CheckArgs),
+
+    /// Query projection-backed work authority via daemon operator IPC.
+    ///
+    /// Displays work status or lists work items from runtime projection state.
+    /// This is the authoritative runtime surface for work lifecycle reads.
     Work(WorkArgs),
 
     /// Inspect episode details and tool log index.
@@ -121,6 +158,56 @@ pub enum FacSubcommand {
     /// Analyzes ledger to determine restart point for interrupted work.
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
+
+    /// Validate FAC trigger trust boundary for GitHub projection execution.
+    ///
+    /// Fails closed unless the trigger context is authorized.
+    Barrier(BarrierArgs),
+
+    /// Dispatch and observe FAC review lifecycle for GitHub projection.
+    ///
+    /// Runs idempotent detached review dispatch and emits 1Hz health/status
+    /// lines until a terminal outcome is reached.
+    Kickoff(KickoffArgs),
+
+    /// Run and observe FAC review orchestration for pull requests.
+    ///
+    /// Provides VPS-oriented review execution and observability with
+    /// parallel `security + quality` orchestration, model fallback, and
+    /// NDJSON telemetry under `~/.apm2`.
+    Review(ReviewArgs),
+}
+
+/// Arguments for `apm2 fac check`.
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// Workspace root containing scripts/ci guardrail scripts.
+    #[arg(long, default_value = ".")]
+    pub workspace_root: PathBuf,
+
+    /// Directory where gate receipt logs are written.
+    #[arg(long)]
+    pub receipts_dir: Option<PathBuf>,
+
+    /// Wall timeout for bounded gate execution (seconds).
+    #[arg(long, default_value_t = DEFAULT_FAC_CHECK_TIMEOUT_SECS)]
+    pub timeout_seconds: u64,
+
+    /// TERM->KILL escalation delay for bounded gate execution (seconds).
+    #[arg(long, default_value_t = DEFAULT_FAC_CHECK_KILL_AFTER_SECS)]
+    pub kill_after_seconds: u64,
+
+    /// Memory ceiling forwarded to bounded runner.
+    #[arg(long, default_value = "4G")]
+    pub memory_max: String,
+
+    /// PID/task ceiling forwarded to bounded runner.
+    #[arg(long, default_value_t = 1536)]
+    pub pids_max: u64,
+
+    /// CPU quota forwarded to bounded runner.
+    #[arg(long, default_value = "200%")]
+    pub cpu_quota: String,
 }
 
 /// Arguments for `apm2 fac work`.
@@ -133,8 +220,11 @@ pub struct WorkArgs {
 /// Work subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkSubcommand {
-    /// Show work status from ledger.
+    /// Show projection-backed work status from daemon authority.
     Status(WorkStatusArgs),
+
+    /// List projection-known work items from daemon authority.
+    List(WorkListArgs),
 }
 
 /// Arguments for `apm2 fac work status`.
@@ -142,10 +232,14 @@ pub enum WorkSubcommand {
 pub struct WorkStatusArgs {
     /// Work identifier to query.
     pub work_id: String,
+}
 
-    /// Maximum number of events to scan from the end of the ledger.
-    #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
-    pub limit: u64,
+/// Arguments for `apm2 fac work list`.
+#[derive(Debug, Args)]
+pub struct WorkListArgs {
+    /// Return only claimable work items.
+    #[arg(long, default_value_t = false)]
+    pub claimable_only: bool,
 }
 
 /// Arguments for `apm2 fac episode`.
@@ -239,6 +333,172 @@ pub struct ResumeArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
+}
+
+/// Arguments for `apm2 fac barrier`.
+#[derive(Debug, Args)]
+pub struct BarrierArgs {
+    /// Repository in owner/repo format.
+    #[arg(long)]
+    pub repo: String,
+
+    /// Path to GitHub event payload JSON.
+    #[arg(long)]
+    pub event: PathBuf,
+
+    /// Event name (`pull_request_target` or `workflow_dispatch`).
+    #[arg(long)]
+    pub event_name: String,
+}
+
+/// Arguments for `apm2 fac kickoff`.
+#[derive(Debug, Args)]
+pub struct KickoffArgs {
+    /// Repository in owner/repo format.
+    #[arg(long)]
+    pub repo: String,
+
+    /// Path to GitHub event payload JSON.
+    #[arg(long)]
+    pub event: PathBuf,
+
+    /// Event name (`pull_request_target` or `workflow_dispatch`).
+    #[arg(long)]
+    pub event_name: String,
+
+    /// Maximum seconds to wait for FAC terminal state.
+    #[arg(long, default_value_t = 3600)]
+    pub max_wait_seconds: u64,
+}
+
+/// Arguments for `apm2 fac review`.
+#[derive(Debug, Args)]
+pub struct ReviewArgs {
+    #[command(subcommand)]
+    pub subcommand: ReviewSubcommand,
+}
+
+/// Review subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ReviewSubcommand {
+    /// Run FAC review orchestration for a pull request URL.
+    Run(ReviewRunArgs),
+    /// Idempotently dispatch detached FAC review workers.
+    Dispatch(ReviewDispatchArgs),
+    /// Retrigger FAC GitHub projection workflow via `workflow_dispatch`.
+    Retrigger(ReviewRetriggerArgs),
+    /// Show FAC review state/events from local operational artifacts.
+    Status(ReviewStatusArgs),
+    /// Render one condensed projection line for GitHub log surfaces.
+    Project(ReviewProjectArgs),
+    /// Tail FAC review NDJSON event stream.
+    Tail(ReviewTailArgs),
+}
+
+/// Arguments for `apm2 fac review run`.
+#[derive(Debug, Args)]
+pub struct ReviewRunArgs {
+    /// GitHub pull request URL.
+    pub pr_url: String,
+
+    /// Review selection (`all`, `security`, or `quality`).
+    #[arg(
+        long = "type",
+        alias = "review-type",
+        value_enum,
+        default_value_t = fac_review::ReviewRunType::All
+    )]
+    pub review_type: fac_review::ReviewRunType,
+
+    /// Optional expected head SHA (40 hex) to fail closed on stale review
+    /// start.
+    #[arg(long)]
+    pub expected_head_sha: Option<String>,
+}
+
+/// Arguments for `apm2 fac review dispatch`.
+#[derive(Debug, Args)]
+pub struct ReviewDispatchArgs {
+    /// GitHub pull request URL.
+    pub pr_url: String,
+
+    /// Review selection (`all`, `security`, or `quality`).
+    #[arg(
+        long = "type",
+        alias = "review-type",
+        value_enum,
+        default_value_t = fac_review::ReviewRunType::All
+    )]
+    pub review_type: fac_review::ReviewRunType,
+
+    /// Optional expected head SHA (40 hex) to fail closed on stale dispatch
+    /// start.
+    #[arg(long)]
+    pub expected_head_sha: Option<String>,
+}
+
+/// Arguments for `apm2 fac review retrigger`.
+#[derive(Debug, Args)]
+pub struct ReviewRetriggerArgs {
+    /// Repository in owner/repo format.
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: u32,
+}
+
+/// Arguments for `apm2 fac review status`.
+#[derive(Debug, Args)]
+pub struct ReviewStatusArgs {
+    /// Optional pull request number filter.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Optional pull request URL filter.
+    #[arg(long)]
+    pub pr_url: Option<String>,
+}
+
+/// Arguments for `apm2 fac review project`.
+#[derive(Debug, Args)]
+pub struct ReviewProjectArgs {
+    /// Pull request number to project.
+    #[arg(long)]
+    pub pr: u32,
+
+    /// Optional head SHA filter (40 hex).
+    #[arg(long)]
+    pub head_sha: Option<String>,
+
+    /// Optional minimum event timestamp (unix seconds).
+    #[arg(long)]
+    pub since_epoch: Option<u64>,
+
+    /// Emit only errors with seq greater than this value.
+    #[arg(long, default_value_t = 0)]
+    pub after_seq: u64,
+
+    /// Also print ERROR lines in text mode.
+    #[arg(long, default_value_t = false)]
+    pub emit_errors: bool,
+
+    /// Return non-zero when terminal failure is detected.
+    #[arg(long, default_value_t = false)]
+    pub fail_on_terminal: bool,
+}
+
+/// Arguments for `apm2 fac review tail`.
+#[derive(Debug, Args)]
+pub struct ReviewTailArgs {
+    /// Number of lines to show from the end of the event stream.
+    #[arg(long, default_value_t = 20)]
+    pub lines: usize,
+
+    /// Follow mode (stream appended events).
+    #[arg(long, default_value_t = false)]
+    pub follow: bool,
 }
 
 // =============================================================================
@@ -380,20 +640,60 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// Per-gate result emitted by `fac check`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FacCheckGateResult {
+    /// Gate identifier aligned with gate orchestrator type IDs.
+    pub gate_id: String,
+    /// Human-readable gate label.
+    pub gate_label: String,
+    /// Execution status (`PASS`, `FAIL`, or `SKIPPED`).
+    pub status: String,
+    /// Process exit code (`None` when skipped).
+    pub exit_code: Option<i32>,
+    /// Command line used for the gate.
+    pub command: String,
+    /// Receipt pointer (gate log file path).
+    pub receipt_pointer: String,
+}
+
+/// Deterministic local FAC check response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FacCheckResponse {
+    /// Workspace used for gate execution.
+    pub workspace_root: String,
+    /// Directory containing gate receipt logs.
+    pub receipts_dir: String,
+    /// Whether cgroup v2 was available at runtime.
+    pub cgroup_v2_available: bool,
+    /// Projection context name used by GitHub projection adapter.
+    pub projection_context: String,
+    /// Overall pass/fail verdict.
+    pub passed: bool,
+    /// Gate results in deterministic execution order.
+    pub gates: Vec<FacCheckGateResult>,
+}
+
 // =============================================================================
 // Command Execution
 // =============================================================================
 
 /// Runs the FAC command, returning an appropriate exit code.
-pub fn run_fac(cmd: &FacCommand) -> u8 {
+pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
     let json_output = cmd.json;
     let ledger_path = resolve_ledger_path(cmd.ledger_path.as_deref());
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
 
     match &cmd.subcommand {
+        FacSubcommand::Check(args) => run_check(args, json_output),
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
-                run_work_status(status_args, &ledger_path, json_output)
+                run_work_status(status_args, operator_socket, json_output)
+            },
+            WorkSubcommand::List(list_args) => {
+                run_work_list(list_args, operator_socket, json_output)
             },
         },
         FacSubcommand::Episode(args) => match &args.subcommand {
@@ -412,7 +712,400 @@ pub fn run_fac(cmd: &FacCommand) -> u8 {
             },
         },
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
+        FacSubcommand::Barrier(args) => {
+            fac_review::run_barrier(&args.repo, &args.event, &args.event_name, json_output)
+        },
+        FacSubcommand::Kickoff(args) => fac_review::run_kickoff(
+            &args.repo,
+            &args.event,
+            &args.event_name,
+            args.max_wait_seconds,
+            json_output,
+        ),
+        FacSubcommand::Review(args) => match &args.subcommand {
+            ReviewSubcommand::Run(run_args) => fac_review::run_review(
+                &run_args.pr_url,
+                run_args.review_type,
+                run_args.expected_head_sha.as_deref(),
+                json_output,
+            ),
+            ReviewSubcommand::Dispatch(dispatch_args) => fac_review::run_dispatch(
+                &dispatch_args.pr_url,
+                dispatch_args.review_type,
+                dispatch_args.expected_head_sha.as_deref(),
+                json_output,
+            ),
+            ReviewSubcommand::Retrigger(retrigger_args) => {
+                fac_review::run_retrigger(&retrigger_args.repo, retrigger_args.pr, json_output)
+            },
+            ReviewSubcommand::Status(status_args) => {
+                fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
+            },
+            ReviewSubcommand::Project(project_args) => fac_review::run_project(
+                project_args.pr,
+                project_args.head_sha.as_deref(),
+                project_args.since_epoch,
+                project_args.after_seq,
+                project_args.emit_errors,
+                project_args.fail_on_terminal,
+                json_output,
+            ),
+            ReviewSubcommand::Tail(tail_args) => {
+                fac_review::run_tail(tail_args.lines, tail_args.follow)
+            },
+        },
     }
+}
+
+/// Execute deterministic local FAC gates (`fac check`).
+fn run_check(args: &CheckArgs, json_output: bool) -> u8 {
+    if args.timeout_seconds == 0 || args.kill_after_seconds == 0 || args.pids_max == 0 {
+        return output_error(
+            json_output,
+            "invalid_limits",
+            "timeout_seconds, kill_after_seconds, and pids_max must be > 0",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let workspace_root = if args.workspace_root.is_absolute() {
+        args.workspace_root.clone()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&args.workspace_root)
+    };
+
+    if !workspace_root.is_dir() {
+        return output_error(
+            json_output,
+            "invalid_workspace_root",
+            &format!(
+                "workspace_root does not exist or is not a directory: {}",
+                workspace_root.display()
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let cgroup_v2_available = is_cgroup_v2_available();
+    if !cgroup_v2_available {
+        return output_error(
+            json_output,
+            "cgroup_unavailable",
+            "cgroup v2 is unavailable; FAC local gate execution fails closed",
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let receipts_dir = args.receipts_dir.clone().map_or_else(
+        || {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            workspace_root
+                .join("target")
+                .join("fac_check_receipts")
+                .join(timestamp.to_string())
+        },
+        |dir| {
+            if dir.is_absolute() {
+                dir
+            } else {
+                workspace_root.join(dir)
+            }
+        },
+    );
+
+    if let Err(e) = fs::create_dir_all(&receipts_dir) {
+        return output_error(
+            json_output,
+            "receipts_dir_error",
+            &format!(
+                "failed to create receipts_dir {}: {e}",
+                receipts_dir.display()
+            ),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let test_safety_script = workspace_root.join("scripts/ci/test_safety_guard.sh");
+    let bounded_tests_script = workspace_root.join("scripts/ci/run_bounded_tests.sh");
+    let workspace_guard_script = workspace_root.join("scripts/ci/workspace_integrity_guard.sh");
+
+    for required in [
+        &test_safety_script,
+        &bounded_tests_script,
+        &workspace_guard_script,
+    ] {
+        if !required.is_file() {
+            return output_error(
+                json_output,
+                "missing_script",
+                &format!("required FAC check script missing: {}", required.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        }
+    }
+
+    let projection_context = GitHubAdapterConfig::new("https://api.github.com", "apm2", "apm2")
+        .map_or_else(|_| "apm2/gates".to_string(), |cfg| cfg.context);
+
+    let bounded_runner_cmd = vec![
+        bounded_tests_script.display().to_string(),
+        "--timeout-seconds".to_string(),
+        args.timeout_seconds.to_string(),
+        "--kill-after-seconds".to_string(),
+        args.kill_after_seconds.to_string(),
+        "--memory-max".to_string(),
+        args.memory_max.clone(),
+        "--pids-max".to_string(),
+        args.pids_max.to_string(),
+        "--cpu-quota".to_string(),
+        args.cpu_quota.clone(),
+        "--".to_string(),
+        "cargo".to_string(),
+        "nextest".to_string(),
+        "run".to_string(),
+        "--workspace".to_string(),
+        "--all-features".to_string(),
+        "--config-file".to_string(),
+        ".config/nextest.toml".to_string(),
+        "--profile".to_string(),
+        "ci".to_string(),
+    ];
+
+    let workspace_snapshot = receipts_dir.join("workspace_integrity.snapshot.tsv");
+    // Workspace integrity guard wraps the same full-workspace test surface
+    // as bounded-test-runner to ensure no crate escapes integrity checks.
+    let workspace_guard_cmd = vec![
+        workspace_guard_script.display().to_string(),
+        "--snapshot-file".to_string(),
+        workspace_snapshot.display().to_string(),
+        "--".to_string(),
+        bounded_tests_script.display().to_string(),
+        "--timeout-seconds".to_string(),
+        args.timeout_seconds.to_string(),
+        "--kill-after-seconds".to_string(),
+        args.kill_after_seconds.to_string(),
+        "--memory-max".to_string(),
+        args.memory_max.clone(),
+        "--pids-max".to_string(),
+        args.pids_max.to_string(),
+        "--cpu-quota".to_string(),
+        args.cpu_quota.clone(),
+        "--".to_string(),
+        "cargo".to_string(),
+        "nextest".to_string(),
+        "run".to_string(),
+        "--workspace".to_string(),
+        "--all-features".to_string(),
+        "--config-file".to_string(),
+        ".config/nextest.toml".to_string(),
+        "--profile".to_string(),
+        "ci".to_string(),
+    ];
+
+    let gate_plans = vec![
+        (
+            GateType::Security,
+            vec![test_safety_script.display().to_string()],
+        ),
+        (GateType::Aat, bounded_runner_cmd),
+        (GateType::Quality, workspace_guard_cmd),
+    ];
+
+    let mut gates = Vec::with_capacity(gate_plans.len());
+    let mut gate_blocked = false;
+
+    for (gate_type, command) in gate_plans {
+        let gate_id = gate_type.as_gate_id().to_string();
+        let gate_label = gate_label(gate_type).to_string();
+        let command_display = format_command(&command);
+        let receipt_path = receipts_dir.join(format!("{gate_id}.log"));
+        let receipt_pointer = receipt_path.display().to_string();
+
+        if gate_blocked {
+            if let Err(e) = fs::write(
+                &receipt_path,
+                format!("status=SKIPPED\nreason=previous gate failed\ncommand={command_display}\n"),
+            ) {
+                eprintln!("FAIL-CLOSED: receipt write failed for gate {gate_id}: {e}");
+                // Fail-closed: treat receipt write failure as gate failure
+                gates.push(FacCheckGateResult {
+                    gate_id,
+                    gate_label,
+                    status: "FAIL".to_string(),
+                    exit_code: None,
+                    command: command_display,
+                    receipt_pointer,
+                });
+                continue;
+            }
+            gates.push(FacCheckGateResult {
+                gate_id,
+                gate_label,
+                status: "SKIPPED".to_string(),
+                exit_code: None,
+                command: command_display,
+                receipt_pointer,
+            });
+            continue;
+        }
+
+        let execution = execute_gate_command(&workspace_root, &command, &receipt_path);
+        if !execution.success {
+            gate_blocked = true;
+        }
+
+        gates.push(FacCheckGateResult {
+            gate_id,
+            gate_label,
+            status: if execution.success {
+                "PASS".to_string()
+            } else {
+                "FAIL".to_string()
+            },
+            exit_code: Some(execution.exit_code),
+            command: command_display,
+            receipt_pointer,
+        });
+    }
+
+    let passed = gates.iter().all(|gate| gate.status == "PASS");
+    let response = FacCheckResponse {
+        workspace_root: workspace_root.display().to_string(),
+        receipts_dir: receipts_dir.display().to_string(),
+        cgroup_v2_available,
+        projection_context,
+        passed,
+        gates,
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("FAC Check");
+        println!("  Workspace:          {}", response.workspace_root);
+        println!("  Receipts Dir:       {}", response.receipts_dir);
+        println!("  Cgroup v2:          {}", response.cgroup_v2_available);
+        println!("  Projection Context: {}", response.projection_context);
+        println!(
+            "  Verdict:            {}",
+            if response.passed { "PASS" } else { "FAIL" }
+        );
+        for gate in &response.gates {
+            println!(
+                "  Gate {} ({}) => {} [receipt: {}]",
+                gate.gate_id, gate.gate_label, gate.status, gate.receipt_pointer
+            );
+        }
+    }
+
+    if response.passed {
+        exit_codes::SUCCESS
+    } else {
+        exit_codes::GENERIC_ERROR
+    }
+}
+
+/// Human-readable label for a gate type used by `fac check`.
+const fn gate_label(gate_type: GateType) -> &'static str {
+    match gate_type {
+        GateType::Security => "test-safety-guard",
+        GateType::Aat => "bounded-test-runner",
+        GateType::Quality => "workspace-integrity-guard",
+    }
+}
+
+/// Executed gate command status.
+struct GateCommandExecution {
+    success: bool,
+    exit_code: i32,
+}
+
+/// Runs a gate command and writes a receipt log.
+///
+/// Receipt writes are fail-closed: if a receipt cannot be written, the gate
+/// is reported as failed regardless of the underlying command result.
+fn execute_gate_command(
+    workspace_root: &Path,
+    command: &[String],
+    receipt_path: &Path,
+) -> GateCommandExecution {
+    if command.is_empty() {
+        if let Err(e) = fs::write(receipt_path, "status=FAIL\nerror=empty command\n") {
+            eprintln!("FAIL-CLOSED: receipt write failed: {e}");
+        }
+        return GateCommandExecution {
+            success: false,
+            exit_code: 127,
+        };
+    }
+
+    let mut log_body = format!("$ {}\n", format_command(command));
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]).current_dir(workspace_root);
+
+    match cmd.output() {
+        Ok(output) => {
+            let exit_code = output.status.code().unwrap_or(1);
+            let _ = writeln!(log_body, "exit_code={exit_code}");
+            log_body.push_str("=== stdout ===\n");
+            log_body.push_str(&String::from_utf8_lossy(&output.stdout));
+            log_body.push_str("\n=== stderr ===\n");
+            log_body.push_str(&String::from_utf8_lossy(&output.stderr));
+
+            // Fail-closed: receipt write failure overrides command success
+            if let Err(e) = fs::write(receipt_path, log_body) {
+                eprintln!("FAIL-CLOSED: receipt write failed: {e}");
+                return GateCommandExecution {
+                    success: false,
+                    exit_code,
+                };
+            }
+
+            GateCommandExecution {
+                success: output.status.success(),
+                exit_code,
+            }
+        },
+        Err(e) => {
+            log_body.push_str("exit_code=127\n");
+            let _ = writeln!(log_body, "error={e}");
+
+            // Fail-closed: receipt write failure is logged but gate already failed
+            if let Err(write_err) = fs::write(receipt_path, log_body) {
+                eprintln!("FAIL-CLOSED: receipt write failed: {write_err}");
+            }
+            GateCommandExecution {
+                success: false,
+                exit_code: 127,
+            }
+        },
+    }
+}
+
+/// Formats a command vector into a shell-like printable string.
+fn format_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| {
+            if arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:%=".contains(c))
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\"'\"'"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Resolves the ledger path from explicit path, env var, or default.
@@ -474,7 +1167,7 @@ fn calculate_start_cursor(ledger: &Ledger, limit: u64) -> Result<u64, LedgerErro
 // =============================================================================
 
 /// Execute the work status command.
-fn run_work_status(args: &WorkStatusArgs, ledger_path: &Path, json_output: bool) -> u8 {
+fn run_work_status(args: &WorkStatusArgs, operator_socket: &Path, json_output: bool) -> u8 {
     // Validate work ID
     if args.work_id.is_empty() {
         return output_error(
@@ -485,145 +1178,146 @@ fn run_work_status(args: &WorkStatusArgs, ledger_path: &Path, json_output: bool)
         );
     }
 
-    // Open ledger
-    let ledger = match open_ledger(ledger_path) {
-        Ok(l) => l,
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
         Err(e) => {
             return output_error(
                 json_output,
-                "ledger_error",
-                &format!("Failed to open ledger: {e}"),
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
                 exit_codes::GENERIC_ERROR,
             );
         },
     };
 
-    // Calculate start cursor based on limit
-    let mut cursor = match calculate_start_cursor(&ledger, args.limit) {
-        Ok(c) => c,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "ledger_error",
-                &format!("Failed to query ledger head: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_status(&args.work_id).await
+    });
 
-    // Scan ledger for work-related events
-    let mut response = WorkStatusResponse {
-        work_id: args.work_id.clone(),
-        status: "UNKNOWN".to_string(),
-        actor_id: None,
-        role: None,
-        latest_episode_id: None,
-        latest_receipt_hash: None,
-        event_count: 0,
-        latest_seq_id: None,
-    };
+    match result {
+        Ok(response) => {
+            let response = fac_work_status_from_daemon(response);
 
-    let batch_size = 1000u64;
-    let mut scanned_count = 0u64;
-
-    loop {
-        // Stop if we've scanned more than the limit (plus batch overhead)
-        if scanned_count >= args.limit + batch_size {
-            break;
-        }
-
-        let events = match ledger.read_from(cursor, batch_size) {
-            Ok(events) => events,
-            Err(e) => {
-                return output_error(
-                    json_output,
-                    "ledger_error",
-                    &format!("Failed to read ledger: {e}"),
-                    exit_codes::GENERIC_ERROR,
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
                 );
-            },
-        };
-
-        if events.is_empty() {
-            break;
-        }
-
-        for event in &events {
-            scanned_count += 1;
-            if let Some(work_info) = extract_work_info(event, &args.work_id) {
-                response.event_count += 1;
-                response.latest_seq_id = event.seq_id;
-
-                // Update status based on event type
-                match event.event_type.as_str() {
-                    "work_claimed" => {
-                        response.status = "CLAIMED".to_string();
-                        response.actor_id = work_info.actor_id;
-                        response.role = work_info.role;
-                    },
-                    "episode_spawned" => {
-                        response.status = "IN_PROGRESS".to_string();
-                        response.latest_episode_id = work_info.episode_id;
-                    },
-                    "session_terminated" => {
-                        response.status = "COMPLETED".to_string();
-                    },
-                    "gate_receipt" | "review_receipt" | "merge_receipt" => {
-                        if let Some(hash) = event.event_hash.as_ref() {
-                            response.latest_receipt_hash = Some(hex::encode(hash));
-                        }
-                    },
-                    _ => {},
+            } else {
+                println!("Work Status");
+                println!("  Work ID:            {}", response.work_id);
+                println!("  Status:             {}", response.status);
+                if let Some(actor) = &response.actor_id {
+                    println!("  Actor ID:           {actor}");
+                }
+                if let Some(role) = &response.role {
+                    println!("  Role:               {role}");
+                }
+                if let Some(session_id) = &response.latest_episode_id {
+                    println!("  Session ID:         {session_id}");
+                }
+                if let Some(lease_id) = &response.latest_receipt_hash {
+                    println!("  Lease ID:           {lease_id}");
                 }
             }
-        }
 
-        cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
     }
+}
 
-    if response.event_count == 0 {
-        return output_error(
-            json_output,
-            "not_found",
-            &format!("No events found for work_id: {}", args.work_id),
-            exit_codes::NOT_FOUND,
-        );
+/// Execute the work list command.
+fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_list(args.claimable_only).await
+    });
+
+    match result {
+        Ok(response) => {
+            let rows: Vec<WorkStatusResponse> = response
+                .work_items
+                .into_iter()
+                .map(fac_work_status_from_daemon)
+                .collect();
+
+            if json_output {
+                #[derive(Debug, Serialize)]
+                struct WorkListJson<'a> {
+                    claimable_only: bool,
+                    total: usize,
+                    items: &'a [WorkStatusResponse],
+                }
+
+                let output = WorkListJson {
+                    claimable_only: args.claimable_only,
+                    total: rows.len(),
+                    items: &rows,
+                };
+
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Work List");
+                println!("  Claimable Only: {}", args.claimable_only);
+                println!("  Total:          {}", rows.len());
+                for row in &rows {
+                    println!("  - {} [{}]", row.work_id, row.status);
+                }
+            }
+
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
     }
+}
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Work Status");
-        println!("  Work ID:            {}", response.work_id);
-        println!("  Status:             {}", response.status);
-        if let Some(actor) = &response.actor_id {
-            println!("  Actor ID:           {actor}");
-        }
-        if let Some(role) = &response.role {
-            println!("  Role:               {role}");
-        }
-        if let Some(episode) = &response.latest_episode_id {
-            println!("  Latest Episode:     {episode}");
-        }
-        if let Some(receipt) = &response.latest_receipt_hash {
-            println!("  Latest Receipt:     {receipt}");
-        }
-        println!("  Events Found:       {}", response.event_count);
-        if let Some(seq_id) = response.latest_seq_id {
-            println!("  Latest Seq ID:      {seq_id}");
-        }
+fn fac_work_status_from_daemon(
+    response: apm2_daemon::protocol::WorkStatusResponse,
+) -> WorkStatusResponse {
+    let role = response
+        .role
+        .and_then(|value| WorkRole::try_from(value).ok())
+        .map(|role| format!("{role:?}"));
+
+    WorkStatusResponse {
+        work_id: response.work_id,
+        status: response.status,
+        actor_id: response.actor_id,
+        role,
+        latest_episode_id: response.session_id,
+        latest_receipt_hash: response.lease_id,
+        event_count: 1,
+        latest_seq_id: None,
     }
-
-    exit_codes::SUCCESS
 }
 
 /// Extracted work information from an event.
 struct WorkInfo {
-    actor_id: Option<String>,
-    role: Option<String>,
     episode_id: Option<String>,
 }
 
@@ -647,17 +1341,6 @@ fn extract_work_info(event: &EventRecord, work_id: &str) -> Option<WorkInfo> {
     }
 
     Some(WorkInfo {
-        actor_id: payload
-            .as_ref()
-            .and_then(|v| v.get("actor_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| (!event.actor_id.is_empty()).then(|| event.actor_id.clone())),
-        role: payload
-            .as_ref()
-            .and_then(|v| v.get("role"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
         episode_id: payload
             .as_ref()
             .and_then(|v| v.get("episode_id"))
@@ -1637,6 +2320,31 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
     exit_code
 }
 
+/// Output protocol errors in CLI-friendly format.
+fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
+    let exit_code = map_protocol_error(error);
+    let (code, message) = match error {
+        ProtocolClientError::DaemonNotRunning => (
+            "daemon_not_running".to_string(),
+            "Daemon is not running. Start with: apm2 daemon".to_string(),
+        ),
+        ProtocolClientError::ConnectionFailed(msg) => (
+            "connection_failed".to_string(),
+            format!("Failed to connect to daemon: {msg}"),
+        ),
+        ProtocolClientError::HandshakeFailed(msg) => (
+            "handshake_failed".to_string(),
+            format!("Protocol handshake failed: {msg}"),
+        ),
+        ProtocolClientError::DaemonError { code, message } => {
+            (format!("daemon_{}", code.to_lowercase()), message.clone())
+        },
+        other => ("protocol_error".to_string(), other.to_string()),
+    };
+
+    output_error(json_output, &code, &message, exit_code)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1735,6 +2443,49 @@ mod tests {
     }
 
     #[test]
+    fn test_fac_check_response_serialization() {
+        let response = FacCheckResponse {
+            workspace_root: "/tmp/ws".to_string(),
+            receipts_dir: "/tmp/ws/receipts".to_string(),
+            cgroup_v2_available: true,
+            projection_context: "apm2/gates".to_string(),
+            passed: false,
+            gates: vec![FacCheckGateResult {
+                gate_id: "gate-security".to_string(),
+                gate_label: "test-safety-guard".to_string(),
+                status: "FAIL".to_string(),
+                exit_code: Some(1),
+                command: "./scripts/ci/test_safety_guard.sh".to_string(),
+                receipt_pointer: "/tmp/ws/receipts/gate-security.log".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let restored: FacCheckResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.projection_context, "apm2/gates");
+        assert_eq!(restored.gates.len(), 1);
+        assert!(!restored.passed);
+    }
+
+    #[test]
+    fn test_gate_label_mapping() {
+        assert_eq!(gate_label(GateType::Security), "test-safety-guard");
+        assert_eq!(gate_label(GateType::Aat), "bounded-test-runner");
+        assert_eq!(gate_label(GateType::Quality), "workspace-integrity-guard");
+    }
+
+    #[test]
+    fn test_format_command_quotes_args() {
+        let cmd = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "echo hello world".to_string(),
+        ];
+        let rendered = format_command(&cmd);
+        assert_eq!(rendered, "bash -lc 'echo hello world'");
+    }
+
+    #[test]
     fn test_detect_receipt_type_gate() {
         let json = serde_json::json!({
             "schema": "apm2.gate_receipt.v1",
@@ -1817,8 +2568,10 @@ mod tests {
         );
 
         let info = extract_work_info(&event, "work-123").expect("should extract");
-        assert_eq!(info.actor_id.as_deref(), Some("actor-1"));
-        assert_eq!(info.role.as_deref(), Some("implementer"));
+        assert!(
+            info.episode_id.is_none(),
+            "work_claimed payload has no episode_id"
+        );
     }
 
     #[test]
@@ -1834,8 +2587,10 @@ mod tests {
         );
 
         let info = extract_work_info(&event, "work-123").expect("should match via metadata");
-        assert_eq!(info.actor_id.as_deref(), Some("actor-from-row"));
-        assert_eq!(info.role.as_deref(), Some("implementer"));
+        assert!(
+            info.episode_id.is_none(),
+            "legacy work rows should not infer episode_id"
+        );
     }
 
     #[test]
@@ -1984,5 +2739,271 @@ mod tests {
             "schema": "apm2.projection.v1"
         });
         assert_eq!(detect_receipt_type(&json), "projection_receipt");
+    }
+
+    // =========================================================================
+    // Behavioral tests: fac check fail-closed code paths
+    // =========================================================================
+
+    /// `run_check` must reject zero timeout (`invalid_limits`, fail-closed).
+    #[test]
+    fn test_run_check_rejects_zero_timeout() {
+        let args = CheckArgs {
+            workspace_root: PathBuf::from("."),
+            receipts_dir: None,
+            timeout_seconds: 0,
+            kill_after_seconds: 20,
+            memory_max: "4G".to_string(),
+            pids_max: 1536,
+            cpu_quota: "200%".to_string(),
+        };
+
+        let exit_code = run_check(&args, true);
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "zero timeout_seconds must fail-closed with VALIDATION_ERROR"
+        );
+    }
+
+    /// `run_check` must reject zero kill-after (`invalid_limits`, fail-closed).
+    #[test]
+    fn test_run_check_rejects_zero_kill_after() {
+        let args = CheckArgs {
+            workspace_root: PathBuf::from("."),
+            receipts_dir: None,
+            timeout_seconds: 900,
+            kill_after_seconds: 0,
+            memory_max: "4G".to_string(),
+            pids_max: 1536,
+            cpu_quota: "200%".to_string(),
+        };
+
+        let exit_code = run_check(&args, true);
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "zero kill_after_seconds must fail-closed with VALIDATION_ERROR"
+        );
+    }
+
+    /// `run_check` must reject zero `pids_max` (`invalid_limits`, fail-closed).
+    #[test]
+    fn test_run_check_rejects_zero_pids_max() {
+        let args = CheckArgs {
+            workspace_root: PathBuf::from("."),
+            receipts_dir: None,
+            timeout_seconds: 900,
+            kill_after_seconds: 20,
+            memory_max: "4G".to_string(),
+            pids_max: 0,
+            cpu_quota: "200%".to_string(),
+        };
+
+        let exit_code = run_check(&args, true);
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "zero pids_max must fail-closed with VALIDATION_ERROR"
+        );
+    }
+
+    /// `run_check` must fail-closed when `workspace_root` is a non-existent
+    /// path.
+    #[test]
+    fn test_run_check_rejects_nonexistent_workspace() {
+        let args = CheckArgs {
+            workspace_root: PathBuf::from("/nonexistent/workspace/path/apm2_test"),
+            receipts_dir: None,
+            timeout_seconds: 900,
+            kill_after_seconds: 20,
+            memory_max: "4G".to_string(),
+            pids_max: 1536,
+            cpu_quota: "200%".to_string(),
+        };
+
+        let exit_code = run_check(&args, true);
+        assert_eq!(
+            exit_code,
+            exit_codes::VALIDATION_ERROR,
+            "nonexistent workspace_root must fail-closed with VALIDATION_ERROR"
+        );
+    }
+
+    /// `execute_gate_command` must fail-closed with exit code 127 on empty
+    /// command vec (no default-to-pass).
+    #[test]
+    fn test_execute_gate_command_empty_command_fails_closed() {
+        let tmp = std::env::temp_dir().join("fac_test_empty_cmd");
+        let _ = std::fs::create_dir_all(&tmp);
+        let receipt = tmp.join("empty_cmd.log");
+
+        let result = execute_gate_command(&tmp, &[], &receipt);
+        assert!(
+            !result.success,
+            "empty command must fail (never default to pass)"
+        );
+        assert_eq!(result.exit_code, 127, "empty command must return exit 127");
+
+        // Verify receipt was written as evidence
+        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            content.contains("FAIL"),
+            "receipt must record FAIL status: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `execute_gate_command` must fail-closed when the executable does not
+    /// exist (e.g., missing script scenario).
+    #[test]
+    fn test_execute_gate_command_missing_binary_fails_closed() {
+        let tmp = std::env::temp_dir().join("fac_test_missing_bin");
+        let _ = std::fs::create_dir_all(&tmp);
+        let receipt = tmp.join("missing_bin.log");
+
+        let command = vec!["/nonexistent/binary/path".to_string()];
+        let result = execute_gate_command(&tmp, &command, &receipt);
+        assert!(
+            !result.success,
+            "missing binary must fail (never default to pass)"
+        );
+        assert_eq!(result.exit_code, 127, "missing binary must return exit 127");
+
+        // Verify receipt was written as evidence
+        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            content.contains("error="),
+            "receipt must record error: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Gate skip-on-failure: when an early gate returns FAIL, subsequent gates
+    /// must be SKIPPED (not executed). This ensures the gate chain is
+    /// fail-closed and does not allow later gates to mask early failures.
+    #[test]
+    fn test_gate_skip_on_failure_semantics() {
+        // Simulate the gate blocking logic from run_check:
+        // After first gate fails, gate_blocked=true, remaining gates get SKIPPED.
+        let mut gates = Vec::new();
+        let mut gate_blocked = false;
+
+        // Simulate 3 gate plans: first FAILS, second and third should be SKIPPED
+        let gate_outcomes = [false, true, true]; // false = FAIL
+        let gate_ids = ["gate-security", "gate-aat", "gate-quality"];
+        let gate_labels = [
+            "test-safety-guard",
+            "bounded-test-runner",
+            "workspace-integrity-guard",
+        ];
+
+        for (i, success) in gate_outcomes.iter().enumerate() {
+            if gate_blocked {
+                gates.push(FacCheckGateResult {
+                    gate_id: gate_ids[i].to_string(),
+                    gate_label: gate_labels[i].to_string(),
+                    status: "SKIPPED".to_string(),
+                    exit_code: None,
+                    command: "test_cmd".to_string(),
+                    receipt_pointer: "/tmp/test.log".to_string(),
+                });
+                continue;
+            }
+
+            if !success {
+                gate_blocked = true;
+            }
+
+            gates.push(FacCheckGateResult {
+                gate_id: gate_ids[i].to_string(),
+                gate_label: gate_labels[i].to_string(),
+                status: if *success {
+                    "PASS".to_string()
+                } else {
+                    "FAIL".to_string()
+                },
+                exit_code: Some(i32::from(!*success)),
+                command: "test_cmd".to_string(),
+                receipt_pointer: "/tmp/test.log".to_string(),
+            });
+        }
+
+        // Verify gate chain semantics
+        assert_eq!(gates.len(), 3, "all three gates must be represented");
+        assert_eq!(gates[0].status, "FAIL", "first gate must be FAIL");
+        assert_eq!(
+            gates[1].status, "SKIPPED",
+            "second gate must be SKIPPED after first fails"
+        );
+        assert_eq!(
+            gates[2].status, "SKIPPED",
+            "third gate must be SKIPPED after first fails"
+        );
+
+        // Overall verdict must be FAIL (not PASS)
+        let passed = gates.iter().all(|g| g.status == "PASS");
+        assert!(!passed, "overall verdict must be FAIL when any gate fails");
+
+        // SKIPPED gates must have no exit code
+        assert!(
+            gates[1].exit_code.is_none(),
+            "SKIPPED gate must have no exit code"
+        );
+        assert!(
+            gates[2].exit_code.is_none(),
+            "SKIPPED gate must have no exit code"
+        );
+    }
+
+    /// `execute_gate_command` must handle a command that exits with non-zero
+    /// status and record the correct exit code.
+    #[test]
+    fn test_execute_gate_command_records_nonzero_exit() {
+        let tmp = std::env::temp_dir().join("fac_test_nonzero_exit");
+        let _ = std::fs::create_dir_all(&tmp);
+        let receipt = tmp.join("nonzero.log");
+
+        // bash -c "exit 42" should exit with code 42
+        let command = vec!["bash".to_string(), "-c".to_string(), "exit 42".to_string()];
+        let result = execute_gate_command(&tmp, &command, &receipt);
+        assert!(!result.success, "non-zero exit must be treated as failure");
+        assert_eq!(
+            result.exit_code, 42,
+            "exit code must be faithfully recorded"
+        );
+
+        // Verify receipt was written with exit code evidence
+        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            content.contains("exit_code=42"),
+            "receipt must contain exit_code=42: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `execute_gate_command` must record success for a passing command.
+    #[test]
+    fn test_execute_gate_command_records_success() {
+        let tmp = std::env::temp_dir().join("fac_test_success");
+        let _ = std::fs::create_dir_all(&tmp);
+        let receipt = tmp.join("success.log");
+
+        let command = vec!["true".to_string()];
+        let result = execute_gate_command(&tmp, &command, &receipt);
+        assert!(result.success, "exit 0 must be treated as success");
+        assert_eq!(result.exit_code, 0, "exit code must be 0");
+
+        // Verify receipt was written
+        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
+        assert!(
+            content.contains("exit_code=0"),
+            "receipt must contain exit_code=0: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -131,6 +131,8 @@ pub fn orchestrator_role() -> RoleSpecV1 {
              2. Allocate tasks to implementer and reviewer agents\n\
              3. Monitor progress and enforce budgets\n\
              4. Drive iteration loops until completion or failure\n\n\
+             Stage-2 (TCK-00419): Default lifecycle path uses projection-request/receipt \
+             mode. Direct write side-effects require explicit override.\n\n\
              Work ID: {work_id}\n\
              Context: {context}",
         )
@@ -225,6 +227,8 @@ pub fn implementer_role() -> RoleSpecV1 {
              3. Make targeted changes to address the requirements\n\
              4. Run tests to verify your changes\n\
              5. Produce a clean changeset for review\n\n\
+             Stage-2 (TCK-00419): Default lifecycle path uses projection-request/receipt \
+             mode. Direct write side-effects require explicit override.\n\n\
              Work ID: {work_id}\n\
              Context: {context}",
         )
@@ -310,7 +314,11 @@ pub fn code_quality_reviewer_role() -> RoleSpecV1 {
              2. Check code style and consistency\n\
              3. Assess maintainability and readability\n\
              4. Run targeted tests to verify behavior\n\
-             5. Provide specific, actionable feedback\n\n\
+             5. Provide specific, actionable feedback\n\
+             6. Prefer `apm2 fac review` commands for lifecycle/status/retrigger \
+                operations when needed\n\
+             7. Use direct `gh` commands only for PR comment-body interactions \
+                that FAC does not yet expose\n\n\
              Produce a structured review with:\n\
              - APPROVE if the code meets quality standards\n\
              - REQUEST_CHANGES if improvements are needed\n\
@@ -400,7 +408,11 @@ pub fn security_reviewer_role() -> RoleSpecV1 {
              2. Check for common vulnerabilities (injection, auth bypass, etc.)\n\
              3. Verify secrets/credentials are not exposed\n\
              4. Assess policy compliance\n\
-             5. Run security scanning tools where available\n\n\
+             5. Run security scanning tools where available\n\
+             6. Prefer `apm2 fac review` commands for lifecycle/status/retrigger \
+                operations when needed\n\
+             7. Use direct `gh` commands only for PR comment-body interactions \
+                that FAC does not yet expose\n\n\
              Produce a structured security review with:\n\
              - APPROVE if no security issues found\n\
              - REQUEST_CHANGES if security issues must be addressed\n\

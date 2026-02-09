@@ -433,11 +433,21 @@
               }
             },
             "status": {
-              "summary": "Query work status (TCK-00288)",
+              "summary": "Query work status (projection-backed, TCK-00288/TCK-00415)",
               "usage": "apm2 work status --work-id <WORK_ID>",
-              "description": "Returns current status including assigned actor, role, and session information.",
+              "description": "Returns current lifecycle status derived from ledger event projection. Authority is rebuilt from ledger events only; filesystem ticket state is not consulted.",
               "options": {
                 "--work-id <WORK_ID>": "Work identifier to query."
+              }
+            },
+            "list": {
+              "summary": "List work items from projection (TCK-00415)",
+              "usage": "apm2 work list [OPTIONS]",
+              "description": "Lists work items known to the runtime projection. Supports filtering by claimable status, cursor-based pagination, and a hard server-side cap of 500 rows.",
+              "options": {
+                "--claimable-only": "Only show claimable work items.",
+                "--limit <LIMIT>": "Maximum rows to return (clamped to 500).",
+                "--cursor <CURSOR>": "Last work_id from previous page (exclusive start for pagination)."
               }
             }
           }
@@ -539,14 +549,25 @@
           },
           "subcommands": {
             "work": {
-              "summary": "Show work status from ledger",
-              "usage": "apm2 fac work status [OPTIONS] <WORK_ID>",
-              "description": "Displays current status including claims, episodes, and latest receipt hashes. Operates directly on ledger without daemon.",
-              "arguments": {
-                "<WORK_ID>": "Work identifier to query"
-              },
-              "options": {
-                "--limit <LIMIT>": "Maximum events to scan from end of ledger [default: 10000]."
+              "summary": "Work lifecycle queries (projection-backed, TCK-00415)",
+              "description": "Queries work lifecycle state via daemon projection or direct ledger scan. The `status` subcommand returns projection-derived authority state; `list` enumerates known work items with pagination.",
+              "subcommands": {
+                "status": {
+                  "usage": "apm2 fac work status [OPTIONS] <WORK_ID>",
+                  "description": "Displays projection-derived lifecycle status for a work item, including state, claimability, transition count, and timestamps. Routes through the daemon's shared ProjectionWorkAuthority.",
+                  "arguments": {
+                    "<WORK_ID>": "Work identifier to query"
+                  }
+                },
+                "list": {
+                  "usage": "apm2 fac work list [OPTIONS]",
+                  "description": "Lists all projection-known work items via the daemon. Supports --claimable-only filtering and cursor-based pagination with a hard cap of 500 rows.",
+                  "options": {
+                    "--claimable-only": "Only show claimable work items.",
+                    "--limit <LIMIT>": "Maximum rows to return (clamped to 500).",
+                    "--cursor <CURSOR>": "Last work_id from previous page for pagination."
+                  }
+                }
               }
             },
             "episode": {
