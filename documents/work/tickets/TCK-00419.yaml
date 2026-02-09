@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00419"
     title: "Staged xtask demotion and instruction-plane cutover to apm2 fac"
-    status: "OPEN"
+    status: "DONE"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"
@@ -53,6 +53,19 @@ ticket_meta:
       - "Stage-2 default lifecycle path avoids direct write side-effects."
       - "Instruction assets and runtime behavior are lockstep and verifiable."
       - "CI fails on deprecated lifecycle control command reintroduction."
+  resolution:
+    merged_prs:
+      - pr_number: 503
+        title: "feat(TCK-00419): staged xtask demotion + instruction-plane cutover"
+        scope: "Stage-2 demotion default, instruction-plane lockstep, CI lint guard"
+      - pr_number: 516
+        title: "chore: remove xtask crate, replace with apm2 CLI"
+        scope: "Stage-3 xtask removal, skill document updates to apm2 fac equivalents"
+    summary: |
+      All three demotion stages complete: Stage-1 (explicit write controls, TCK-00324),
+      Stage-2 (projection-request/receipt default, PR #503), Stage-3 (xtask crate removal,
+      PR #516). Lifecycle authority now resides entirely in apm2 fac CLI. CI lint guards
+      prevent reintroduction of deprecated lifecycle commands.
   notes:
     security: |
       Instruction/runtime mismatch is treated as policy bypass risk and blocked.
