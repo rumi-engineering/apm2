@@ -48,10 +48,14 @@ mod tests;
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
 pub use kernel::AuthorityJoinKernel;
 pub use receipts::{
-    AuthorityConsumeReceiptV1, AuthorityDenyReceiptV1, AuthorityJoinReceiptV1,
-    AuthorityRevalidateReceiptV1,
+    AuthoritativeBindings, AuthorityConsumeReceiptV1, AuthorityDenyReceiptV1,
+    AuthorityJoinReceiptV1, AuthorityRevalidateReceiptV1, LifecycleStage, ReceiptAuthentication,
+    ReceiptDigestMeta,
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, IdentityEvidenceLevel,
+    AuthorityJoinInputV1, IdentityEvidenceLevel, MAX_CANONICALIZER_ID_LENGTH,
+    MAX_CHECKPOINT_LENGTH, MAX_DESCRIPTION_LENGTH, MAX_FIELD_NAME_LENGTH, MAX_MERKLE_PROOF_STEPS,
+    MAX_OPERATION_LENGTH, MAX_PRE_ACTUATION_RECEIPT_HASHES, MAX_REASON_LENGTH,
+    MAX_SCOPE_WITNESS_HASHES, MAX_STRING_LENGTH, PcacValidationError,
 };

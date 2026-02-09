@@ -12,7 +12,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::types::RiskTier;
+use super::types::{
+    MAX_DESCRIPTION_LENGTH, MAX_FIELD_NAME_LENGTH, MAX_OPERATION_LENGTH, MAX_REASON_LENGTH,
+    PcacValidationError, RiskTier,
+};
 use crate::crypto::Hash;
 
 // =============================================================================
@@ -33,7 +36,7 @@ use crate::crypto::Hash;
 /// - **Policy failures**: Administrative policy denials.
 /// - **Unknown state**: Fail-closed on unrecognized inputs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum AuthorityDenyClass {
     // ---- Join failures ----
@@ -249,6 +252,7 @@ impl std::fmt::Display for AuthorityDenyClass {
 /// - Replay verification (via `time_envelope_ref` and `ledger_anchor`).
 /// - Audit trail (via `ajc_id` when available).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityDenyV1 {
     /// The specific denial class.
     pub deny_class: AuthorityDenyClass,
@@ -279,3 +283,70 @@ impl std::fmt::Display for AuthorityDenyV1 {
 }
 
 impl std::error::Error for AuthorityDenyV1 {}
+
+impl AuthorityDenyClass {
+    /// Validate that all embedded string fields are within size bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError::StringTooLong` if any string field
+    /// exceeds its maximum length.
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        match self {
+            Self::MissingRequiredField { field_name } | Self::ZeroHash { field_name } => {
+                if field_name.len() > MAX_FIELD_NAME_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "field_name",
+                        len: field_name.len(),
+                        max: MAX_FIELD_NAME_LENGTH,
+                    });
+                }
+            },
+            Self::BoundaryMonotonicityViolation { description }
+            | Self::UnknownState { description } => {
+                if description.len() > MAX_DESCRIPTION_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "description",
+                        len: description.len(),
+                        max: MAX_DESCRIPTION_LENGTH,
+                    });
+                }
+            },
+            Self::PolicyDeny { reason } => {
+                if reason.len() > MAX_REASON_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "reason",
+                        len: reason.len(),
+                        max: MAX_REASON_LENGTH,
+                    });
+                }
+            },
+            Self::VerifierEconomicsBoundsExceeded { operation, .. } => {
+                if operation.len() > MAX_OPERATION_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "operation",
+                        len: operation.len(),
+                        max: MAX_OPERATION_LENGTH,
+                    });
+                }
+            },
+            // All other variants have no unbounded string fields.
+            _ => {},
+        }
+        Ok(())
+    }
+}
+
+impl AuthorityDenyV1 {
+    /// Validate all boundary constraints on this deny record.
+    ///
+    /// Delegates to [`AuthorityDenyClass::validate`] for embedded string
+    /// field bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found.
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        self.deny_class.validate()
+    }
+}

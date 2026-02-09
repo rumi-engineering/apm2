@@ -87,20 +87,26 @@ pub trait AuthorityJoinKernel: Send + Sync {
     ///
     /// # Process
     ///
-    /// 1. Verify intent digest equality (Law 2).
-    /// 2. Check AJC has not been consumed (Law 1 — durable check).
-    /// 3. Write durable consume record (before effect acceptance).
-    /// 4. Return consumed witness and consume record.
+    /// 1. Verify revocation frontier has not advanced (Law 4).
+    /// 2. Verify intent digest equality (Law 2).
+    /// 3. Check AJC has not been consumed (Law 1 — durable check).
+    /// 4. Write durable consume record (before effect acceptance).
+    /// 5. Return consumed witness and consume record.
     ///
     /// # Arguments
     ///
     /// * `cert` — The AJC to consume.
     /// * `intent_digest` — Must match the AJC's intent digest exactly.
     /// * `current_time_envelope_ref` — Current HTF time witness.
+    /// * `current_revocation_head_hash` — Current revocation frontier; if this
+    ///   has advanced beyond the AJC's `revocation_head_hash`, consume MUST be
+    ///   denied with `RevocationFrontierAdvanced`.
     ///
     /// # Errors
     ///
     /// Returns `AuthorityDenyV1` with:
+    /// - `RevocationFrontierAdvanced` if the revocation frontier moved since
+    ///   the AJC was issued.
     /// - `IntentDigestMismatch` if digests don't match.
     /// - `AlreadyConsumed` if this AJC was already consumed.
     /// - `CertificateExpired` if the AJC has expired.
@@ -109,5 +115,6 @@ pub trait AuthorityJoinKernel: Send + Sync {
         cert: &AuthorityJoinCertificateV1,
         intent_digest: Hash,
         current_time_envelope_ref: Hash,
+        current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>;
 }

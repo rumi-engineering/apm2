@@ -14,7 +14,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::deny::AuthorityDenyClass;
-use super::types::RiskTier;
+use super::types::{
+    MAX_CANONICALIZER_ID_LENGTH, MAX_CHECKPOINT_LENGTH, MAX_MERKLE_PROOF_STEPS,
+    PcacValidationError, RiskTier,
+};
 use crate::crypto::Hash;
 
 // =============================================================================
@@ -26,6 +29,7 @@ use crate::crypto::Hash;
 /// Per RFC-0027 §3.4: all receipts include canonicalizer identification
 /// and content digest for deterministic verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptDigestMeta {
     /// Canonicalizer identifier (e.g., `"apm2.canonicalizer.jcs"`).
     pub canonicalizer_id: String,
@@ -34,12 +38,18 @@ pub struct ReceiptDigestMeta {
     pub content_digest: Hash,
 }
 
-/// Receipt authentication shape — direct or pointer/batched.
+/// Receipt authentication shape — direct, pointer-unbatched, or
+/// pointer-batched.
 ///
 /// Per RFC-0027 §6.5, authoritative acceptance requires one of these
-/// authentication shapes.
+/// authentication shapes. Pointer authentication is split into two strict
+/// variants to prevent omission of mandatory batched-path fields:
+///
+/// - `PointerUnbatched`: individual receipt auth without batch proof.
+/// - `PointerBatched`: batch receipt auth with mandatory Merkle proof and batch
+///   root hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "auth_type", rename_all = "snake_case")]
+#[serde(tag = "auth_type", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ReceiptAuthentication {
     /// Direct receipt authentication via `authority_seal_hash`.
@@ -48,18 +58,25 @@ pub enum ReceiptAuthentication {
         authority_seal_hash: Hash,
     },
 
-    /// Pointer/batched receipt authentication.
-    Pointer {
+    /// Pointer authentication for an unbatched individual receipt.
+    PointerUnbatched {
         /// Hash of the individual receipt.
         receipt_hash: Hash,
         /// Hash of the authority seal.
         authority_seal_hash: Hash,
-        /// Merkle inclusion proof (required when batched).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        merkle_inclusion_proof: Option<Vec<Hash>>,
-        /// Batch root hash (when using batch descriptor path).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        receipt_batch_root_hash: Option<Hash>,
+    },
+
+    /// Pointer authentication for a batched receipt — Merkle inclusion proof
+    /// and batch root hash are mandatory.
+    PointerBatched {
+        /// Hash of the individual receipt.
+        receipt_hash: Hash,
+        /// Hash of the authority seal.
+        authority_seal_hash: Hash,
+        /// Merkle inclusion proof binding the receipt to the batch root.
+        merkle_inclusion_proof: Vec<Hash>,
+        /// Batch root hash for the receipt batch descriptor.
+        receipt_batch_root_hash: Hash,
     },
 }
 
@@ -68,6 +85,7 @@ pub enum ReceiptAuthentication {
 /// Per RFC-0027 §3.4: missing any required authoritative binding
 /// MUST fail closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthoritativeBindings {
     /// Capability/budget/stop/freshness pinset commitment surface.
     pub episode_envelope_hash: Hash,
@@ -100,6 +118,7 @@ pub struct AuthoritativeBindings {
 ///
 /// Records the creation of an AJC with all binding context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityJoinReceiptV1 {
     /// Digest metadata for verification.
     pub digest_meta: ReceiptDigestMeta,
@@ -136,6 +155,7 @@ pub struct AuthorityJoinReceiptV1 {
 /// Records that the AJC was checked against current authority state
 /// and remains valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityRevalidateReceiptV1 {
     /// Digest metadata for verification.
     pub digest_meta: ReceiptDigestMeta,
@@ -173,6 +193,7 @@ pub struct AuthorityRevalidateReceiptV1 {
 /// Records that the AJC was consumed for a specific effect. This receipt
 /// is the definitive proof that authority was exercised.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityConsumeReceiptV1 {
     /// Digest metadata for verification.
     pub digest_meta: ReceiptDigestMeta,
@@ -213,6 +234,7 @@ pub struct AuthorityConsumeReceiptV1 {
 /// Records the denial with enough context for replay verification
 /// and audit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityDenyReceiptV1 {
     /// Digest metadata for verification.
     pub digest_meta: ReceiptDigestMeta,
@@ -256,5 +278,93 @@ impl std::fmt::Display for LifecycleStage {
             Self::Revalidate => write!(f, "revalidate"),
             Self::Consume => write!(f, "consume"),
         }
+    }
+}
+
+// =============================================================================
+// Boundary validation for receipt types
+// =============================================================================
+
+impl ReceiptDigestMeta {
+    /// Validate that `canonicalizer_id` is within length bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError::StringTooLong` if `canonicalizer_id`
+    /// exceeds [`MAX_CANONICALIZER_ID_LENGTH`].
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.canonicalizer_id.len() > MAX_CANONICALIZER_ID_LENGTH {
+            return Err(PcacValidationError::StringTooLong {
+                field: "canonicalizer_id",
+                len: self.canonicalizer_id.len(),
+                max: MAX_CANONICALIZER_ID_LENGTH,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ReceiptAuthentication {
+    /// Validate batched pointer auth constraints.
+    ///
+    /// For `PointerBatched`, the Merkle inclusion proof must:
+    /// - contain at least one step (non-empty),
+    /// - not exceed [`MAX_MERKLE_PROOF_STEPS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on violation.
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if let Self::PointerBatched {
+            merkle_inclusion_proof,
+            ..
+        } = self
+        {
+            if merkle_inclusion_proof.is_empty() {
+                return Err(PcacValidationError::EmptyMerkleProof);
+            }
+            if merkle_inclusion_proof.len() > MAX_MERKLE_PROOF_STEPS {
+                return Err(PcacValidationError::CollectionTooLarge {
+                    field: "merkle_inclusion_proof",
+                    count: merkle_inclusion_proof.len(),
+                    max: MAX_MERKLE_PROOF_STEPS,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AuthoritativeBindings {
+    /// Validate the embedded receipt authentication shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` if the authentication shape is invalid.
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        self.authentication.validate()
+    }
+}
+
+impl AuthorityRevalidateReceiptV1 {
+    /// Validate the checkpoint string length.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError::StringTooLong` if `checkpoint`
+    /// exceeds [`MAX_CHECKPOINT_LENGTH`].
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        self.digest_meta.validate()?;
+        if self.checkpoint.len() > MAX_CHECKPOINT_LENGTH {
+            return Err(PcacValidationError::StringTooLong {
+                field: "checkpoint",
+                len: self.checkpoint.len(),
+                max: MAX_CHECKPOINT_LENGTH,
+            });
+        }
+        if let Some(ref bindings) = self.authoritative_bindings {
+            bindings.validate()?;
+        }
+        Ok(())
     }
 }

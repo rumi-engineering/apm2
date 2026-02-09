@@ -3,10 +3,51 @@
 //!
 //! These types implement RFC-0027 §3 — the canonical authority lifecycle
 //! primitives.
+//!
+//! # Boundary Validation
+//!
+//! All untrusted string and collection fields enforce explicit size and
+//! cardinality limits via [`AuthorityJoinInputV1::validate`]. Violations
+//! produce deterministic denials (fail-closed).
 
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::Hash;
+
+// =============================================================================
+// Resource Limits
+// =============================================================================
+
+/// Maximum length for string identifier fields (`session_id`, `lease_id`,
+/// `holon_id`).
+pub const MAX_STRING_LENGTH: usize = 256;
+
+/// Maximum number of scope witness hashes in a join input.
+pub const MAX_SCOPE_WITNESS_HASHES: usize = 64;
+
+/// Maximum number of pre-actuation receipt hashes in a join input.
+pub const MAX_PRE_ACTUATION_RECEIPT_HASHES: usize = 64;
+
+/// Maximum length for the `canonicalizer_id` string in receipt digest metadata.
+pub const MAX_CANONICALIZER_ID_LENGTH: usize = 256;
+
+/// Maximum length for the checkpoint string in revalidation receipts.
+pub const MAX_CHECKPOINT_LENGTH: usize = 256;
+
+/// Maximum number of Merkle proof steps in a batched pointer auth.
+pub const MAX_MERKLE_PROOF_STEPS: usize = 64;
+
+/// Maximum length for description strings in deny classes.
+pub const MAX_DESCRIPTION_LENGTH: usize = 1024;
+
+/// Maximum length for machine-readable reason codes in deny classes.
+pub const MAX_REASON_LENGTH: usize = 256;
+
+/// Maximum length for `field_name` strings in deny classes.
+pub const MAX_FIELD_NAME_LENGTH: usize = 128;
+
+/// Maximum length for operation strings in deny classes.
+pub const MAX_OPERATION_LENGTH: usize = 256;
 
 // =============================================================================
 // Identity Evidence Level
@@ -64,6 +105,7 @@ impl std::fmt::Display for IdentityEvidenceLevel {
 /// - `freshness_witness_hash` ensures authority is current.
 /// - `stop_budget_profile_digest` captures stop/budget constraints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityJoinInputV1 {
     // -- Subject bindings --
     /// Session identifier for the requesting session.
@@ -133,6 +175,197 @@ pub struct AuthorityJoinInputV1 {
     pub as_of_ledger_anchor: Hash,
 }
 
+// =============================================================================
+// Boundary validation error
+// =============================================================================
+
+/// Error returned by boundary validation of PCAC types.
+///
+/// All variants represent deterministic denials — there is no "unknown ->
+/// allow" path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PcacValidationError {
+    /// A required string field is empty.
+    EmptyRequiredField {
+        /// Name of the empty field.
+        field: &'static str,
+    },
+    /// A required hash field contains all zeros (uninitialized).
+    ZeroHash {
+        /// Name of the zero-hash field.
+        field: &'static str,
+    },
+    /// A string field exceeds the maximum allowed length.
+    StringTooLong {
+        /// Name of the oversized field.
+        field: &'static str,
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+    /// A collection exceeds the maximum allowed cardinality.
+    CollectionTooLarge {
+        /// Name of the oversized collection.
+        field: &'static str,
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+    /// Merkle proof is empty in a batched pointer auth (must have >= 1 step).
+    EmptyMerkleProof,
+}
+
+impl std::fmt::Display for PcacValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyRequiredField { field } => {
+                write!(f, "required field is empty: {field}")
+            },
+            Self::ZeroHash { field } => {
+                write!(f, "zero hash for required field: {field}")
+            },
+            Self::StringTooLong { field, len, max } => {
+                write!(
+                    f,
+                    "string field '{field}' exceeds maximum length ({len} > {max})"
+                )
+            },
+            Self::CollectionTooLarge { field, count, max } => {
+                write!(
+                    f,
+                    "collection '{field}' exceeds maximum cardinality ({count} > {max})"
+                )
+            },
+            Self::EmptyMerkleProof => {
+                write!(f, "batched pointer auth has empty merkle inclusion proof")
+            },
+        }
+    }
+}
+
+impl std::error::Error for PcacValidationError {}
+
+// =============================================================================
+// AuthorityJoinInputV1 validation
+// =============================================================================
+
+/// Zero hash constant for comparison.
+const ZERO_HASH: Hash = [0u8; 32];
+
+impl AuthorityJoinInputV1 {
+    /// Validate all boundary constraints on this join input.
+    ///
+    /// Checks that:
+    /// - Required string fields are non-empty and within length bounds.
+    /// - Required hash fields are non-zero.
+    /// - Collection fields are within cardinality bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        // String field: session_id
+        if self.session_id.is_empty() {
+            return Err(PcacValidationError::EmptyRequiredField {
+                field: "session_id",
+            });
+        }
+        if self.session_id.len() > MAX_STRING_LENGTH {
+            return Err(PcacValidationError::StringTooLong {
+                field: "session_id",
+                len: self.session_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
+        // String field: holon_id (optional but bounded)
+        if let Some(ref holon_id) = self.holon_id {
+            if holon_id.len() > MAX_STRING_LENGTH {
+                return Err(PcacValidationError::StringTooLong {
+                    field: "holon_id",
+                    len: holon_id.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
+        // String field: lease_id
+        if self.lease_id.is_empty() {
+            return Err(PcacValidationError::EmptyRequiredField { field: "lease_id" });
+        }
+        if self.lease_id.len() > MAX_STRING_LENGTH {
+            return Err(PcacValidationError::StringTooLong {
+                field: "lease_id",
+                len: self.lease_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
+        // Required hash fields — must not be zero
+        if self.intent_digest == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "intent_digest",
+            });
+        }
+        if self.capability_manifest_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "capability_manifest_hash",
+            });
+        }
+        if self.identity_proof_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "identity_proof_hash",
+            });
+        }
+        if self.directory_head_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "directory_head_hash",
+            });
+        }
+        if self.freshness_policy_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "freshness_policy_hash",
+            });
+        }
+        if self.stop_budget_profile_digest == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "stop_budget_profile_digest",
+            });
+        }
+        if self.time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "time_envelope_ref",
+            });
+        }
+        if self.as_of_ledger_anchor == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "as_of_ledger_anchor",
+            });
+        }
+
+        // Collection bounds
+        if self.scope_witness_hashes.len() > MAX_SCOPE_WITNESS_HASHES {
+            return Err(PcacValidationError::CollectionTooLarge {
+                field: "scope_witness_hashes",
+                count: self.scope_witness_hashes.len(),
+                max: MAX_SCOPE_WITNESS_HASHES,
+            });
+        }
+        if self.pre_actuation_receipt_hashes.len() > MAX_PRE_ACTUATION_RECEIPT_HASHES {
+            return Err(PcacValidationError::CollectionTooLarge {
+                field: "pre_actuation_receipt_hashes",
+                count: self.pre_actuation_receipt_hashes.len(),
+                max: MAX_PRE_ACTUATION_RECEIPT_HASHES,
+            });
+        }
+
+        Ok(())
+    }
+}
+
 /// Risk tier for authority classification.
 ///
 /// Maps to the broader `RiskTierClass` but scoped to the PCAC context
@@ -191,6 +424,7 @@ pub enum DeterminismClass {
 /// - `revocation_head_hash`: Revocation frontier commitment.
 /// - `identity_evidence_level`: Evidence level at join time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityJoinCertificateV1 {
     /// Content hash of the canonical certificate bytes (32 bytes).
     pub ajc_id: Hash,
@@ -233,6 +467,7 @@ pub struct AuthorityJoinCertificateV1 {
 /// Returned by `AuthorityJoinKernel::consume()` alongside the durable
 /// consume record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityConsumedV1 {
     /// The consumed certificate's ID.
     pub ajc_id: Hash,
@@ -266,6 +501,7 @@ pub struct AuthorityConsumedV1 {
 /// - The write MUST complete before the side effect is accepted.
 /// - Crash-replay MUST find the record if consumption was committed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityConsumeRecordV1 {
     /// The consumed certificate's ID (primary key for uniqueness).
     pub ajc_id: Hash,
