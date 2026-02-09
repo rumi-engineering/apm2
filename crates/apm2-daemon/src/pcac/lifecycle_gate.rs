@@ -28,7 +28,7 @@ use apm2_core::pcac::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1, AuthorityJoinCertificateV1,
     AuthorityJoinInputV1, AuthorityJoinKernel, FreezeAction, RiskTier,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 const ZERO_HASH: Hash = [0u8; 32];
 
@@ -347,6 +347,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         cert: &AuthorityJoinCertificateV1,
         intent_digest: Hash,
         current_time_envelope_ref: Hash,
+        current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         let tick = self.current_tick();
 
@@ -359,6 +360,18 @@ impl AuthorityJoinKernel for InProcessKernel {
                     expired_at: cert.expires_at_tick,
                     current_tick: tick,
                 },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+
+        // Law 4: Revocation frontier advancement check in consume.
+        if current_revocation_head_hash != cert.revocation_head_hash {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::RevocationFrontierAdvanced,
                 ajc_id: Some(cert.ajc_id),
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: cert.as_of_ledger_anchor,
@@ -460,6 +473,14 @@ pub struct LifecycleGate {
     kernel: Arc<dyn AuthorityJoinKernel>,
     /// Optional sovereignty checker for Tier2+ enforcement (TCK-00427).
     sovereignty_checker: Option<super::sovereignty::SovereigntyChecker>,
+    /// Optional stop authority for sovereignty freeze actuation (TCK-00427
+    /// security review BLOCKER 1).
+    ///
+    /// When a sovereignty denial carries a `containment_action`, the gate
+    /// actuates the freeze via this authority before returning the denial.
+    /// `HardFreeze` triggers an emergency stop (persistent, all sessions).
+    /// `SoftFreeze` triggers a governance stop (session-scoped restriction).
+    stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
 }
 
 impl LifecycleGate {
@@ -475,6 +496,7 @@ impl LifecycleGate {
         Self {
             kernel,
             sovereignty_checker: None,
+            stop_authority: None,
         }
     }
 
@@ -490,18 +512,87 @@ impl LifecycleGate {
         Self {
             kernel,
             sovereignty_checker: Some(checker),
+            stop_authority: None,
         }
     }
 
-    fn emit_containment_marker(stage: &'static str, deny: &AuthorityDenyV1) {
-        if let Some(containment_action) = deny.containment_action {
+    /// Creates a new lifecycle gate with sovereignty enforcement and freeze
+    /// actuation (TCK-00427 security review BLOCKER 1).
+    ///
+    /// When a sovereignty denial carries a `containment_action`, the gate
+    /// actuates the freeze via the provided `StopAuthority` before returning
+    /// the denial. This ensures `HardFreeze` and `SoftFreeze` are
+    /// persistently applied to runtime controls, not just logged.
+    #[must_use]
+    pub fn with_sovereignty_and_stop_authority(
+        kernel: Arc<dyn AuthorityJoinKernel>,
+        checker: super::sovereignty::SovereigntyChecker,
+        stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Self {
+        Self {
+            kernel,
+            sovereignty_checker: Some(checker),
+            stop_authority: Some(stop_authority),
+        }
+    }
+
+    /// Actuates a sovereignty freeze via `StopAuthority` and logs the
+    /// containment action.
+    ///
+    /// TCK-00427 security review BLOCKER 1: Sovereignty denials with
+    /// `containment_action` are now mapped to authoritative runtime controls:
+    /// - `HardFreeze` -> `set_emergency_stop(true)` (persistent, all sessions)
+    /// - `SoftFreeze` -> `set_governance_stop(true)` (session-scoped
+    ///   restriction)
+    fn actuate_containment(&self, stage: &'static str, deny: &AuthorityDenyV1) {
+        let Some(containment_action) = deny.containment_action else {
+            return;
+        };
+
+        warn!(
+            stage = stage,
+            deny_class = %deny.deny_class,
+            containment_action = %containment_action,
+            ajc_id = ?deny.ajc_id.map(hex::encode),
+            denied_at_tick = deny.denied_at_tick,
+            "sovereignty denial emitted containment recommendation"
+        );
+
+        // Actuate the freeze via StopAuthority (BLOCKER 1 fix).
+        if let Some(ref authority) = self.stop_authority {
+            match containment_action {
+                FreezeAction::HardFreeze => {
+                    authority.set_emergency_stop(true);
+                    info!(
+                        stage = stage,
+                        containment_action = %containment_action,
+                        "sovereignty hard freeze actuated: emergency stop set"
+                    );
+                },
+                FreezeAction::SoftFreeze => {
+                    authority.set_governance_stop(true);
+                    info!(
+                        stage = stage,
+                        containment_action = %containment_action,
+                        "sovereignty soft freeze actuated: governance stop set"
+                    );
+                },
+                FreezeAction::NoAction => {},
+                // Fail-closed: unknown freeze actions trigger emergency stop.
+                _ => {
+                    authority.set_emergency_stop(true);
+                    warn!(
+                        stage = stage,
+                        containment_action = %containment_action,
+                        "unknown freeze action actuated as emergency stop (fail-closed)"
+                    );
+                },
+            }
+        } else {
             warn!(
                 stage = stage,
-                deny_class = %deny.deny_class,
                 containment_action = %containment_action,
-                ajc_id = ?deny.ajc_id.map(hex::encode),
-                denied_at_tick = deny.denied_at_tick,
-                "sovereignty denial emitted containment recommendation"
+                "sovereignty freeze recommended but no StopAuthority configured for actuation"
             );
         }
     }
@@ -598,7 +689,7 @@ impl LifecycleGate {
                         current_time_envelope_ref,
                         current_ledger_anchor,
                     ) {
-                        Self::emit_containment_marker("revalidate", &deny);
+                        self.actuate_containment("revalidate", &deny);
                         return Err(deny);
                     }
                 },
@@ -614,7 +705,7 @@ impl LifecycleGate {
                         denied_at_tick: current_tick,
                         containment_action: Some(FreezeAction::HardFreeze),
                     });
-                    Self::emit_containment_marker("revalidate", &deny);
+                    self.actuate_containment("revalidate", &deny);
                     return Err(deny);
                 },
                 (None, _) => {
@@ -638,7 +729,7 @@ impl LifecycleGate {
                         current_time_envelope_ref,
                         current_ledger_anchor,
                     ) {
-                        Self::emit_containment_marker("consume", &deny);
+                        self.actuate_containment("consume", &deny);
                         return Err(deny);
                     }
                 },
@@ -654,7 +745,7 @@ impl LifecycleGate {
                         denied_at_tick: current_tick,
                         containment_action: Some(FreezeAction::HardFreeze),
                     });
-                    Self::emit_containment_marker("consume", &deny);
+                    self.actuate_containment("consume", &deny);
                     return Err(deny);
                 },
                 (None, _) => {},
@@ -665,9 +756,12 @@ impl LifecycleGate {
         // BLOCKER 2 FIX: kernel.consume() is now called AFTER sovereignty
         // checks, preventing irrevocable consume-set mutation before
         // all admission checks pass.
-        let (consumed_witness, consume_record) =
-            self.kernel
-                .consume(&cert, input.intent_digest, current_time_envelope_ref)?;
+        let (consumed_witness, consume_record) = self.kernel.consume(
+            &cert,
+            input.intent_digest,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+        )?;
 
         Ok(LifecycleReceipts {
             certificate: cert,

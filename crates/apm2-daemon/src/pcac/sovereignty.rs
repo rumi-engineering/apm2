@@ -29,6 +29,13 @@ const EPOCH_DOMAIN_SEPARATOR: &[u8] = b"apm2-sovereignty-epoch-v1";
 /// Maximum allowed tick drift before a sovereignty epoch is considered stale.
 const DEFAULT_EPOCH_STALENESS_THRESHOLD: u64 = 100;
 
+/// Maximum allowed future skew in ticks before a sovereignty epoch is rejected.
+///
+/// An epoch with `freshness_tick > current_tick + max_future_skew_ticks` is
+/// treated as sovereignty uncertainty (potential clock manipulation or relay
+/// attack) and triggers a hard freeze.
+const DEFAULT_MAX_FUTURE_SKEW_TICKS: u64 = 300;
+
 /// Sovereignty state for a principal scope.
 ///
 /// Captures the current sovereignty inputs needed for Tier2+ validation.
@@ -61,6 +68,11 @@ pub struct SovereigntyChecker {
     trusted_signer_key: [u8; 32],
     /// Staleness threshold for epoch freshness checks.
     epoch_staleness_threshold: u64,
+    /// Maximum future skew in ticks before a sovereignty epoch is rejected.
+    ///
+    /// An epoch with `freshness_tick > current_tick + max_future_skew_ticks`
+    /// is treated as sovereignty uncertainty and triggers a hard freeze.
+    max_future_skew_ticks: u64,
 }
 
 impl SovereigntyChecker {
@@ -71,6 +83,7 @@ impl SovereigntyChecker {
         Self {
             trusted_signer_key,
             epoch_staleness_threshold: DEFAULT_EPOCH_STALENESS_THRESHOLD,
+            max_future_skew_ticks: DEFAULT_MAX_FUTURE_SKEW_TICKS,
         }
     }
 
@@ -81,6 +94,22 @@ impl SovereigntyChecker {
         Self {
             trusted_signer_key,
             epoch_staleness_threshold: threshold,
+            max_future_skew_ticks: DEFAULT_MAX_FUTURE_SKEW_TICKS,
+        }
+    }
+
+    /// Creates a new sovereignty checker with custom staleness threshold and
+    /// future skew limit.
+    #[must_use]
+    pub const fn with_thresholds(
+        trusted_signer_key: [u8; 32],
+        staleness_threshold: u64,
+        max_future_skew_ticks: u64,
+    ) -> Self {
+        Self {
+            trusted_signer_key,
+            epoch_staleness_threshold: staleness_threshold,
+            max_future_skew_ticks,
         }
     }
 
@@ -329,6 +358,26 @@ impl SovereigntyChecker {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: AuthorityDenyClass::SovereigntyUncertainty {
                     reason: "sovereignty epoch signature verification failed".to_string(),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: current_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
+            }));
+        }
+
+        // Future-skew check: epoch freshness tick must not be too far in the
+        // future. A future-dated epoch indicates clock manipulation, replay
+        // of a pre-signed epoch, or relay attack. Treat as sovereignty
+        // uncertainty with hard freeze (fail-closed).
+        if epoch.freshness_tick > current_tick.saturating_add(self.max_future_skew_ticks) {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::SovereigntyUncertainty {
+                    reason: format!(
+                        "sovereignty epoch freshness_tick {} exceeds current_tick {} + max_future_skew {}",
+                        epoch.freshness_tick, current_tick, self.max_future_skew_ticks,
+                    ),
                 },
                 ajc_id: Some(cert.ajc_id),
                 time_envelope_ref: current_time_envelope_ref,
@@ -917,6 +966,164 @@ mod tests {
             "expected UntrustedSovereigntySigner, got: {:?}",
             err.deny_class
         );
+    }
+
+    // =========================================================================
+    // Future-dated epoch skew tests (MAJOR 1 fix)
+    // =========================================================================
+
+    #[test]
+    fn future_dated_epoch_denied_on_revalidate() {
+        // Use a checker with future skew limit of 300 ticks.
+        let checker = SovereigntyChecker::with_thresholds(trusted_signer_key(), 100, 300);
+        let cert = tier2_cert();
+        // Epoch freshness_tick is 1000, current_tick is 100. Skew = 900 > 300.
+        let mut state = valid_sovereignty_state();
+        state.epoch = Some(signed_epoch("epoch-future", 1000, TRUSTED_SIGNER_SEED));
+
+        let err = checker
+            .check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                    if reason.contains("future_skew")
+            ),
+            "expected SovereigntyUncertainty with future_skew, got: {:?}",
+            err.deny_class
+        );
+        assert_eq!(
+            err.containment_action,
+            Some(FreezeAction::HardFreeze),
+            "future-dated epoch must carry hard-freeze containment signal"
+        );
+    }
+
+    #[test]
+    fn future_dated_epoch_denied_on_consume() {
+        let checker = SovereigntyChecker::with_thresholds(trusted_signer_key(), 100, 300);
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        // freshness_tick=500, current_tick=100, skew=400 > 300
+        state.epoch = Some(signed_epoch("epoch-future-2", 500, TRUSTED_SIGNER_SEED));
+
+        let err = checker
+            .check_consume(&cert, &state, 100, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                    if reason.contains("future_skew")
+            ),
+            "expected SovereigntyUncertainty for future-dated epoch, got: {:?}",
+            err.deny_class
+        );
+    }
+
+    #[test]
+    fn epoch_within_future_skew_passes() {
+        let checker = SovereigntyChecker::with_thresholds(trusted_signer_key(), 100, 300);
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        // freshness_tick=350, current_tick=100, skew=250 <= 300. Should pass.
+        state.epoch = Some(signed_epoch(
+            "epoch-slight-future",
+            350,
+            TRUSTED_SIGNER_SEED,
+        ));
+
+        let result = checker.check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08));
+        assert!(
+            result.is_ok(),
+            "epoch within future skew tolerance should pass"
+        );
+    }
+
+    #[test]
+    fn epoch_at_exact_future_skew_boundary_passes() {
+        let checker = SovereigntyChecker::with_thresholds(trusted_signer_key(), 100, 300);
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        // freshness_tick=400, current_tick=100, skew=300 == max_future_skew.
+        // At the boundary, should pass (boundary is exclusive: > not >=).
+        state.epoch = Some(signed_epoch("epoch-boundary", 400, TRUSTED_SIGNER_SEED));
+
+        let result = checker.check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08));
+        assert!(
+            result.is_ok(),
+            "epoch at exact future skew boundary should pass"
+        );
+    }
+
+    #[test]
+    fn epoch_one_past_future_skew_boundary_denied() {
+        let checker = SovereigntyChecker::with_thresholds(trusted_signer_key(), 100, 300);
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        // freshness_tick=401, current_tick=100, skew=301 > 300. Should deny.
+        state.epoch = Some(signed_epoch(
+            "epoch-past-boundary",
+            401,
+            TRUSTED_SIGNER_SEED,
+        ));
+
+        let err = checker
+            .check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { .. }
+            ),
+            "epoch one past future skew boundary should be denied"
+        );
+    }
+
+    #[test]
+    fn far_future_epoch_adversarial_denied() {
+        // Adversarial test: attacker sets freshness_tick to u64::MAX - 1
+        let checker = checker();
+        let cert = tier2_cert();
+        let mut state = valid_sovereignty_state();
+        state.epoch = Some(signed_epoch(
+            "epoch-adversarial",
+            u64::MAX - 1,
+            TRUSTED_SIGNER_SEED,
+        ));
+
+        let err = checker
+            .check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                    if reason.contains("future_skew")
+            ),
+            "far-future adversarial epoch should be denied as uncertainty"
+        );
+        assert_eq!(
+            err.containment_action,
+            Some(FreezeAction::HardFreeze),
+            "adversarial future epoch must trigger hard freeze"
+        );
+    }
+
+    #[test]
+    fn tier1_bypasses_future_skew_check() {
+        let checker = SovereigntyChecker::with_thresholds(trusted_signer_key(), 100, 300);
+        let cert = tier1_cert();
+        let mut state = valid_sovereignty_state();
+        state.epoch = Some(signed_epoch(
+            "epoch-future-tier1",
+            99999,
+            TRUSTED_SIGNER_SEED,
+        ));
+
+        let result = checker.check_revalidate(&cert, &state, 100, test_hash(0x07), test_hash(0x08));
+        assert!(result.is_ok(), "Tier1 should bypass future skew check");
     }
 
     // =========================================================================

@@ -2168,6 +2168,46 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         freeze_recommended = containment_action.is_some(),
                         "RequestTool denied by PCAC lifecycle gate"
                     );
+
+                    // TCK-00427 security review BLOCKER 1: Actuate
+                    // sovereignty freeze via StopAuthority. The
+                    // LifecycleGate also actuates if it has a stop
+                    // authority wired; this is defense-in-depth at the
+                    // dispatcher layer to ensure freeze actuation even
+                    // if the gate was constructed without a stop
+                    // authority reference.
+                    if let Some(action) = containment_action {
+                        if let Some(ref authority) = self.stop_authority {
+                            match action {
+                                apm2_core::pcac::FreezeAction::HardFreeze => {
+                                    authority.set_emergency_stop(true);
+                                    info!(
+                                        session_id = %token.session_id,
+                                        containment_action = %action,
+                                        "dispatcher: sovereignty hard freeze actuated"
+                                    );
+                                },
+                                apm2_core::pcac::FreezeAction::SoftFreeze => {
+                                    authority.set_governance_stop(true);
+                                    info!(
+                                        session_id = %token.session_id,
+                                        containment_action = %action,
+                                        "dispatcher: sovereignty soft freeze actuated"
+                                    );
+                                },
+                                apm2_core::pcac::FreezeAction::NoAction => {},
+                                _ => {
+                                    authority.set_emergency_stop(true);
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        containment_action = %action,
+                                        "dispatcher: unknown freeze action actuated as emergency stop"
+                                    );
+                                },
+                            }
+                        }
+                    }
+
                     let message = containment_action.map_or_else(
                         || format!("PCAC authority denied: {}", deny.deny_class),
                         |action| {
@@ -4249,6 +4289,7 @@ mod tests {
                 cert: &AuthorityJoinCertificateV1,
                 intent_digest: [u8; 32],
                 current_time_envelope_ref: [u8; 32],
+                _current_revocation_head_hash: [u8; 32],
             ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
             {
                 Ok((

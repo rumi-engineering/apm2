@@ -986,6 +986,7 @@ fn deny_unknown_fields_authority_deny_v1() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let mut json: serde_json::Value = serde_json::to_value(&deny).unwrap();
     json.as_object_mut()
@@ -1201,6 +1202,7 @@ fn authority_deny_v1_validates_embedded_class() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     assert!(deny.validate().is_err());
 }
@@ -2814,6 +2816,7 @@ fn deny_v1_zero_time_envelope_ref_rejected() {
         time_envelope_ref: zero_hash(),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let err = deny.validate().unwrap_err();
     assert!(
@@ -2829,6 +2832,7 @@ fn deny_v1_zero_ledger_anchor_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: zero_hash(),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let err = deny.validate().unwrap_err();
     assert!(
@@ -2844,6 +2848,7 @@ fn deny_v1_zero_ajc_id_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let err = deny.validate().unwrap_err();
     assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
@@ -2857,6 +2862,7 @@ fn deny_v1_non_positive_denied_at_tick_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 0,
+        containment_action: None,
     };
     let err = deny.validate().unwrap_err();
     assert!(
@@ -2872,6 +2878,7 @@ fn deny_v1_valid_ajc_id_passes() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     assert!(deny.validate().is_ok());
 }

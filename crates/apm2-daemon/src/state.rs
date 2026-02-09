@@ -974,12 +974,18 @@ impl DispatcherState {
         // TCK-00427 BLOCKER 1 FIX: Wire PCAC lifecycle gate with sovereignty
         // checker into production dispatcher so the gate is active in real
         // daemon paths (not just tests).
+        // TCK-00427 security review BLOCKER 1: Wire StopAuthority into the
+        // lifecycle gate so sovereignty freeze recommendations are actuated
+        // to persistent runtime stop controls.
         let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
         let sovereignty_checker = crate::pcac::SovereigntyChecker::new([0u8; 32]);
-        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
-            pcac_kernel,
-            sovereignty_checker,
-        ));
+        let pcac_gate = Arc::new(
+            crate::pcac::LifecycleGate::with_sovereignty_and_stop_authority(
+                pcac_kernel,
+                sovereignty_checker,
+                Arc::clone(&stop_authority),
+            ),
+        );
 
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
@@ -1317,12 +1323,18 @@ impl DispatcherState {
         // TCK-00427 BLOCKER 1 FIX: Wire PCAC lifecycle gate with sovereignty
         // checker into production dispatcher so the gate is active in real
         // daemon paths (not just tests).
+        // TCK-00427 security review BLOCKER 1: Wire StopAuthority into the
+        // lifecycle gate so sovereignty freeze recommendations are actuated
+        // to persistent runtime stop controls.
         let pcac_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
         let sovereignty_checker = crate::pcac::SovereigntyChecker::new([0u8; 32]);
-        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
-            pcac_kernel,
-            sovereignty_checker,
-        ));
+        let pcac_gate = Arc::new(
+            crate::pcac::LifecycleGate::with_sovereignty_and_stop_authority(
+                pcac_kernel,
+                sovereignty_checker,
+                Arc::clone(&stop_authority),
+            ),
+        );
 
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
