@@ -16,6 +16,8 @@ mod detection;
 mod dispatch;
 mod events;
 mod evidence;
+mod gate_cache;
+mod gates;
 mod liveness;
 mod logs;
 mod model_pool;
@@ -437,6 +439,24 @@ pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
 
 pub fn run_logs(pr_number: Option<u32>, json_output: bool) -> u8 {
     logs::run_logs(pr_number, json_output)
+}
+
+pub fn run_gates(
+    force: bool,
+    timeout_seconds: u64,
+    memory_max: &str,
+    pids_max: u64,
+    cpu_quota: &str,
+    json_output: bool,
+) -> u8 {
+    gates::run_gates(
+        force,
+        timeout_seconds,
+        memory_max,
+        pids_max,
+        cpu_quota,
+        json_output,
+    )
 }
 
 // ── Internal dispatch helper (shared with pipeline/restart) ─────────────────

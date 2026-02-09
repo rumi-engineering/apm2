@@ -62,7 +62,7 @@ ticket_meta:
       - "Implement `scripts/ci/workspace_integrity_guard.sh` to snapshot tracked repository state before tests and fail if post-test tracked content changes unexpectedly."
       - "Implement `scripts/ci/run_bounded_tests.sh` wrapper to execute `cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci` under hard limits (timeout + cgroup/systemd scope + kill escalation)."
       - "Wire bounded test wrapper and both safety guards as blocking CI jobs in `.github/workflows/ci.yml`; include them in `ci-success` dependencies."
-      - "Add/extend FAC gate trigger path in `crates/apm2-cli/src/commands/fac.rs` for deterministic local gate execution entrypoint (`fac check`), producing receipt pointers for each gate."
+      - "Add/extend FAC gate trigger path in `crates/apm2-cli/src/commands/fac.rs` for deterministic local gate execution entrypoint (`fac check`, superseded by `fac gates` in TCK-00436)."
       - "Use `crates/apm2-daemon/src/gate/orchestrator.rs` for gate orchestration and `crates/apm2-daemon/src/projection/github_sync.rs` + `crates/apm2-daemon/src/projection/worker.rs` for status projection mapping to merge-queue-required contexts."
       - "Use cgroup control primitives from `crates/apm2-daemon/src/telemetry/cgroup.rs` and sandbox constraints from `crates/apm2-daemon/src/episode/handlers.rs` (`SandboxConfig`) to enforce containment in gate execution workers."
       - "Add failure-injection tests for: destructive test signature blocked, hung test terminated, cgroup limit breach fails gate, projection idempotency preserved, and flaky-test quarantine path."

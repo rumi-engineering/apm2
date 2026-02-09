@@ -28,6 +28,7 @@ bootstrap:
 
 notes:
   - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, and enables auto-merge. Reviews auto-start via CI."
+  - "Use `apm2 fac gates` to run all evidence gates locally with resource-bounded test execution. Results are cached per-SHA so `apm2 fac pipeline` skips already-validated gates."
   - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
   - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
   - "Use `apm2 fac logs --pr <N>` to discover and display local pipeline/evidence/review log files. Add `--json` for machine-readable output."

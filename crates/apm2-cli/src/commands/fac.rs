@@ -5,7 +5,8 @@
 //!
 //! # Commands
 //!
-//! - `apm2 fac check` - Run deterministic local FAC gates with receipt pointers
+//! - `apm2 fac gates` - Run all evidence gates locally with resource-bounded
+//!   test execution; results cached per-SHA for pipeline reuse
 //! - `apm2 fac work status <work_id>` - Show projection-backed work status via
 //!   daemon
 //! - `apm2 fac work list` - List projection-known work items via daemon
@@ -46,11 +47,7 @@
 //! - TCK-00333: FAC productivity CLI/scripts (ledger/CAS oriented debug UX)
 //! - RFC-0019: FAC v0 requirements
 
-use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::fac::{
     PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
@@ -58,10 +55,7 @@ use apm2_core::fac::{
     ToolLogIndexV1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
-use apm2_daemon::gate::GateType;
-use apm2_daemon::projection::GitHubAdapterConfig;
 use apm2_daemon::protocol::WorkRole;
-use apm2_daemon::telemetry::is_cgroup_v2_available;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -89,12 +83,6 @@ const DEFAULT_LEDGER_FILENAME: &str = "ledger.db";
 /// Default CAS path relative to data directory.
 const DEFAULT_CAS_DIRNAME: &str = "cas";
 
-/// Default timeout for bounded FAC check gate execution.
-const DEFAULT_FAC_CHECK_TIMEOUT_SECS: u64 = 900;
-
-/// Default kill escalation delay for bounded FAC check gate execution.
-const DEFAULT_FAC_CHECK_KILL_AFTER_SECS: u64 = 20;
-
 // =============================================================================
 // Command Types
 // =============================================================================
@@ -121,11 +109,12 @@ pub struct FacCommand {
 /// FAC subcommands.
 #[derive(Debug, Subcommand)]
 pub enum FacSubcommand {
-    /// Run deterministic local FAC gates with receipt-pointer output.
+    /// Run all evidence gates locally with resource-bounded test execution.
     ///
-    /// Executes fail-closed local gates (test safety, bounded test runner,
-    /// workspace integrity) and emits receipt pointers for each gate.
-    Check(CheckArgs),
+    /// Validates fmt, clippy, doc, test safety, tests (bounded), workspace
+    /// integrity, and review artifact lint. Results are cached per-SHA so
+    /// `apm2 fac pipeline` can skip gates that already passed.
+    Gates(GatesArgs),
 
     /// Query projection-backed work authority via daemon operator IPC.
     ///
@@ -200,34 +189,26 @@ pub enum FacSubcommand {
     Review(ReviewArgs),
 }
 
-/// Arguments for `apm2 fac check`.
+/// Arguments for `apm2 fac gates`.
 #[derive(Debug, Args)]
-pub struct CheckArgs {
-    /// Workspace root containing scripts/ci guardrail scripts.
-    #[arg(long, default_value = ".")]
-    pub workspace_root: PathBuf,
+pub struct GatesArgs {
+    /// Force re-run all gates, ignoring cache.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 
-    /// Directory where gate receipt logs are written.
-    #[arg(long)]
-    pub receipts_dir: Option<PathBuf>,
-
-    /// Wall timeout for bounded gate execution (seconds).
-    #[arg(long, default_value_t = DEFAULT_FAC_CHECK_TIMEOUT_SECS)]
+    /// Wall timeout for bounded test execution (seconds).
+    #[arg(long, default_value_t = 900)]
     pub timeout_seconds: u64,
 
-    /// TERM->KILL escalation delay for bounded gate execution (seconds).
-    #[arg(long, default_value_t = DEFAULT_FAC_CHECK_KILL_AFTER_SECS)]
-    pub kill_after_seconds: u64,
-
-    /// Memory ceiling forwarded to bounded runner.
+    /// Memory ceiling for bounded test execution.
     #[arg(long, default_value = "4G")]
     pub memory_max: String,
 
-    /// PID/task ceiling forwarded to bounded runner.
+    /// PID/task ceiling for bounded test execution.
     #[arg(long, default_value_t = 1536)]
     pub pids_max: u64,
 
-    /// CPU quota forwarded to bounded runner.
+    /// CPU quota for bounded test execution.
     #[arg(long, default_value = "200%")]
     pub cpu_quota: String,
 }
@@ -702,42 +683,6 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
-/// Per-gate result emitted by `fac check`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FacCheckGateResult {
-    /// Gate identifier aligned with gate orchestrator type IDs.
-    pub gate_id: String,
-    /// Human-readable gate label.
-    pub gate_label: String,
-    /// Execution status (`PASS`, `FAIL`, or `SKIPPED`).
-    pub status: String,
-    /// Process exit code (`None` when skipped).
-    pub exit_code: Option<i32>,
-    /// Command line used for the gate.
-    pub command: String,
-    /// Receipt pointer (gate log file path).
-    pub receipt_pointer: String,
-}
-
-/// Deterministic local FAC check response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FacCheckResponse {
-    /// Workspace used for gate execution.
-    pub workspace_root: String,
-    /// Directory containing gate receipt logs.
-    pub receipts_dir: String,
-    /// Whether cgroup v2 was available at runtime.
-    pub cgroup_v2_available: bool,
-    /// Projection context name used by GitHub projection adapter.
-    pub projection_context: String,
-    /// Overall pass/fail verdict.
-    pub passed: bool,
-    /// Gate results in deterministic execution order.
-    pub gates: Vec<FacCheckGateResult>,
-}
-
 // =============================================================================
 // Command Execution
 // =============================================================================
@@ -749,7 +694,14 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
 
     match &cmd.subcommand {
-        FacSubcommand::Check(args) => run_check(args, json_output),
+        FacSubcommand::Gates(args) => fac_review::run_gates(
+            args.force,
+            args.timeout_seconds,
+            &args.memory_max,
+            args.pids_max,
+            &args.cpu_quota,
+            json_output,
+        ),
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
                 run_work_status(status_args, operator_socket, json_output)
@@ -826,357 +778,6 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             },
         },
     }
-}
-
-/// Execute deterministic local FAC gates (`fac check`).
-fn run_check(args: &CheckArgs, json_output: bool) -> u8 {
-    if args.timeout_seconds == 0 || args.kill_after_seconds == 0 || args.pids_max == 0 {
-        return output_error(
-            json_output,
-            "invalid_limits",
-            "timeout_seconds, kill_after_seconds, and pids_max must be > 0",
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
-
-    let workspace_root = if args.workspace_root.is_absolute() {
-        args.workspace_root.clone()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(&args.workspace_root)
-    };
-
-    if !workspace_root.is_dir() {
-        return output_error(
-            json_output,
-            "invalid_workspace_root",
-            &format!(
-                "workspace_root does not exist or is not a directory: {}",
-                workspace_root.display()
-            ),
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
-
-    let cgroup_v2_available = is_cgroup_v2_available();
-    if !cgroup_v2_available {
-        return output_error(
-            json_output,
-            "cgroup_unavailable",
-            "cgroup v2 is unavailable; FAC local gate execution fails closed",
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-
-    let receipts_dir = args.receipts_dir.clone().map_or_else(
-        || {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            workspace_root
-                .join("target")
-                .join("fac_check_receipts")
-                .join(timestamp.to_string())
-        },
-        |dir| {
-            if dir.is_absolute() {
-                dir
-            } else {
-                workspace_root.join(dir)
-            }
-        },
-    );
-
-    if let Err(e) = fs::create_dir_all(&receipts_dir) {
-        return output_error(
-            json_output,
-            "receipts_dir_error",
-            &format!(
-                "failed to create receipts_dir {}: {e}",
-                receipts_dir.display()
-            ),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-
-    let test_safety_script = workspace_root.join("scripts/ci/test_safety_guard.sh");
-    let bounded_tests_script = workspace_root.join("scripts/ci/run_bounded_tests.sh");
-    let workspace_guard_script = workspace_root.join("scripts/ci/workspace_integrity_guard.sh");
-
-    for required in [
-        &test_safety_script,
-        &bounded_tests_script,
-        &workspace_guard_script,
-    ] {
-        if !required.is_file() {
-            return output_error(
-                json_output,
-                "missing_script",
-                &format!("required FAC check script missing: {}", required.display()),
-                exit_codes::GENERIC_ERROR,
-            );
-        }
-    }
-
-    let projection_context = GitHubAdapterConfig::new("https://api.github.com", "apm2", "apm2")
-        .map_or_else(|_| "apm2/gates".to_string(), |cfg| cfg.context);
-
-    let bounded_runner_cmd = vec![
-        bounded_tests_script.display().to_string(),
-        "--timeout-seconds".to_string(),
-        args.timeout_seconds.to_string(),
-        "--kill-after-seconds".to_string(),
-        args.kill_after_seconds.to_string(),
-        "--memory-max".to_string(),
-        args.memory_max.clone(),
-        "--pids-max".to_string(),
-        args.pids_max.to_string(),
-        "--cpu-quota".to_string(),
-        args.cpu_quota.clone(),
-        "--".to_string(),
-        "cargo".to_string(),
-        "nextest".to_string(),
-        "run".to_string(),
-        "--workspace".to_string(),
-        "--all-features".to_string(),
-        "--config-file".to_string(),
-        ".config/nextest.toml".to_string(),
-        "--profile".to_string(),
-        "ci".to_string(),
-    ];
-
-    let workspace_snapshot = receipts_dir.join("workspace_integrity.snapshot.tsv");
-    // Workspace integrity guard wraps the same full-workspace test surface
-    // as bounded-test-runner to ensure no crate escapes integrity checks.
-    let workspace_guard_cmd = vec![
-        workspace_guard_script.display().to_string(),
-        "--snapshot-file".to_string(),
-        workspace_snapshot.display().to_string(),
-        "--".to_string(),
-        bounded_tests_script.display().to_string(),
-        "--timeout-seconds".to_string(),
-        args.timeout_seconds.to_string(),
-        "--kill-after-seconds".to_string(),
-        args.kill_after_seconds.to_string(),
-        "--memory-max".to_string(),
-        args.memory_max.clone(),
-        "--pids-max".to_string(),
-        args.pids_max.to_string(),
-        "--cpu-quota".to_string(),
-        args.cpu_quota.clone(),
-        "--".to_string(),
-        "cargo".to_string(),
-        "nextest".to_string(),
-        "run".to_string(),
-        "--workspace".to_string(),
-        "--all-features".to_string(),
-        "--config-file".to_string(),
-        ".config/nextest.toml".to_string(),
-        "--profile".to_string(),
-        "ci".to_string(),
-    ];
-
-    let gate_plans = vec![
-        (
-            GateType::Security,
-            vec![test_safety_script.display().to_string()],
-        ),
-        (GateType::Aat, bounded_runner_cmd),
-        (GateType::Quality, workspace_guard_cmd),
-    ];
-
-    let mut gates = Vec::with_capacity(gate_plans.len());
-    let mut gate_blocked = false;
-
-    for (gate_type, command) in gate_plans {
-        let gate_id = gate_type.as_gate_id().to_string();
-        let gate_label = gate_label(gate_type).to_string();
-        let command_display = format_command(&command);
-        let receipt_path = receipts_dir.join(format!("{gate_id}.log"));
-        let receipt_pointer = receipt_path.display().to_string();
-
-        if gate_blocked {
-            if let Err(e) = fs::write(
-                &receipt_path,
-                format!("status=SKIPPED\nreason=previous gate failed\ncommand={command_display}\n"),
-            ) {
-                eprintln!("FAIL-CLOSED: receipt write failed for gate {gate_id}: {e}");
-                // Fail-closed: treat receipt write failure as gate failure
-                gates.push(FacCheckGateResult {
-                    gate_id,
-                    gate_label,
-                    status: "FAIL".to_string(),
-                    exit_code: None,
-                    command: command_display,
-                    receipt_pointer,
-                });
-                continue;
-            }
-            gates.push(FacCheckGateResult {
-                gate_id,
-                gate_label,
-                status: "SKIPPED".to_string(),
-                exit_code: None,
-                command: command_display,
-                receipt_pointer,
-            });
-            continue;
-        }
-
-        let execution = execute_gate_command(&workspace_root, &command, &receipt_path);
-        if !execution.success {
-            gate_blocked = true;
-        }
-
-        gates.push(FacCheckGateResult {
-            gate_id,
-            gate_label,
-            status: if execution.success {
-                "PASS".to_string()
-            } else {
-                "FAIL".to_string()
-            },
-            exit_code: Some(execution.exit_code),
-            command: command_display,
-            receipt_pointer,
-        });
-    }
-
-    let passed = gates.iter().all(|gate| gate.status == "PASS");
-    let response = FacCheckResponse {
-        workspace_root: workspace_root.display().to_string(),
-        receipts_dir: receipts_dir.display().to_string(),
-        cgroup_v2_available,
-        projection_context,
-        passed,
-        gates,
-    };
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("FAC Check");
-        println!("  Workspace:          {}", response.workspace_root);
-        println!("  Receipts Dir:       {}", response.receipts_dir);
-        println!("  Cgroup v2:          {}", response.cgroup_v2_available);
-        println!("  Projection Context: {}", response.projection_context);
-        println!(
-            "  Verdict:            {}",
-            if response.passed { "PASS" } else { "FAIL" }
-        );
-        for gate in &response.gates {
-            println!(
-                "  Gate {} ({}) => {} [receipt: {}]",
-                gate.gate_id, gate.gate_label, gate.status, gate.receipt_pointer
-            );
-        }
-    }
-
-    if response.passed {
-        exit_codes::SUCCESS
-    } else {
-        exit_codes::GENERIC_ERROR
-    }
-}
-
-/// Human-readable label for a gate type used by `fac check`.
-const fn gate_label(gate_type: GateType) -> &'static str {
-    match gate_type {
-        GateType::Security => "test-safety-guard",
-        GateType::Aat => "bounded-test-runner",
-        GateType::Quality => "workspace-integrity-guard",
-    }
-}
-
-/// Executed gate command status.
-struct GateCommandExecution {
-    success: bool,
-    exit_code: i32,
-}
-
-/// Runs a gate command and writes a receipt log.
-///
-/// Receipt writes are fail-closed: if a receipt cannot be written, the gate
-/// is reported as failed regardless of the underlying command result.
-fn execute_gate_command(
-    workspace_root: &Path,
-    command: &[String],
-    receipt_path: &Path,
-) -> GateCommandExecution {
-    if command.is_empty() {
-        if let Err(e) = fs::write(receipt_path, "status=FAIL\nerror=empty command\n") {
-            eprintln!("FAIL-CLOSED: receipt write failed: {e}");
-        }
-        return GateCommandExecution {
-            success: false,
-            exit_code: 127,
-        };
-    }
-
-    let mut log_body = format!("$ {}\n", format_command(command));
-    let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..]).current_dir(workspace_root);
-
-    match cmd.output() {
-        Ok(output) => {
-            let exit_code = output.status.code().unwrap_or(1);
-            let _ = writeln!(log_body, "exit_code={exit_code}");
-            log_body.push_str("=== stdout ===\n");
-            log_body.push_str(&String::from_utf8_lossy(&output.stdout));
-            log_body.push_str("\n=== stderr ===\n");
-            log_body.push_str(&String::from_utf8_lossy(&output.stderr));
-
-            // Fail-closed: receipt write failure overrides command success
-            if let Err(e) = fs::write(receipt_path, log_body) {
-                eprintln!("FAIL-CLOSED: receipt write failed: {e}");
-                return GateCommandExecution {
-                    success: false,
-                    exit_code,
-                };
-            }
-
-            GateCommandExecution {
-                success: output.status.success(),
-                exit_code,
-            }
-        },
-        Err(e) => {
-            log_body.push_str("exit_code=127\n");
-            let _ = writeln!(log_body, "error={e}");
-
-            // Fail-closed: receipt write failure is logged but gate already failed
-            if let Err(write_err) = fs::write(receipt_path, log_body) {
-                eprintln!("FAIL-CLOSED: receipt write failed: {write_err}");
-            }
-            GateCommandExecution {
-                success: false,
-                exit_code: 127,
-            }
-        },
-    }
-}
-
-/// Formats a command vector into a shell-like printable string.
-fn format_command(command: &[String]) -> String {
-    command
-        .iter()
-        .map(|arg| {
-            if arg
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_./:%=".contains(c))
-            {
-                arg.clone()
-            } else {
-                format!("'{}'", arg.replace('\'', "'\"'\"'"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Resolves the ledger path from explicit path, env var, or default.
@@ -2514,49 +2115,6 @@ mod tests {
     }
 
     #[test]
-    fn test_fac_check_response_serialization() {
-        let response = FacCheckResponse {
-            workspace_root: "/tmp/ws".to_string(),
-            receipts_dir: "/tmp/ws/receipts".to_string(),
-            cgroup_v2_available: true,
-            projection_context: "apm2/gates".to_string(),
-            passed: false,
-            gates: vec![FacCheckGateResult {
-                gate_id: "gate-security".to_string(),
-                gate_label: "test-safety-guard".to_string(),
-                status: "FAIL".to_string(),
-                exit_code: Some(1),
-                command: "./scripts/ci/test_safety_guard.sh".to_string(),
-                receipt_pointer: "/tmp/ws/receipts/gate-security.log".to_string(),
-            }],
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        let restored: FacCheckResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.projection_context, "apm2/gates");
-        assert_eq!(restored.gates.len(), 1);
-        assert!(!restored.passed);
-    }
-
-    #[test]
-    fn test_gate_label_mapping() {
-        assert_eq!(gate_label(GateType::Security), "test-safety-guard");
-        assert_eq!(gate_label(GateType::Aat), "bounded-test-runner");
-        assert_eq!(gate_label(GateType::Quality), "workspace-integrity-guard");
-    }
-
-    #[test]
-    fn test_format_command_quotes_args() {
-        let cmd = vec![
-            "bash".to_string(),
-            "-lc".to_string(),
-            "echo hello world".to_string(),
-        ];
-        let rendered = format_command(&cmd);
-        assert_eq!(rendered, "bash -lc 'echo hello world'");
-    }
-
-    #[test]
     fn test_detect_receipt_type_gate() {
         let json = serde_json::json!({
             "schema": "apm2.gate_receipt.v1",
@@ -2810,271 +2368,5 @@ mod tests {
             "schema": "apm2.projection.v1"
         });
         assert_eq!(detect_receipt_type(&json), "projection_receipt");
-    }
-
-    // =========================================================================
-    // Behavioral tests: fac check fail-closed code paths
-    // =========================================================================
-
-    /// `run_check` must reject zero timeout (`invalid_limits`, fail-closed).
-    #[test]
-    fn test_run_check_rejects_zero_timeout() {
-        let args = CheckArgs {
-            workspace_root: PathBuf::from("."),
-            receipts_dir: None,
-            timeout_seconds: 0,
-            kill_after_seconds: 20,
-            memory_max: "4G".to_string(),
-            pids_max: 1536,
-            cpu_quota: "200%".to_string(),
-        };
-
-        let exit_code = run_check(&args, true);
-        assert_eq!(
-            exit_code,
-            exit_codes::VALIDATION_ERROR,
-            "zero timeout_seconds must fail-closed with VALIDATION_ERROR"
-        );
-    }
-
-    /// `run_check` must reject zero kill-after (`invalid_limits`, fail-closed).
-    #[test]
-    fn test_run_check_rejects_zero_kill_after() {
-        let args = CheckArgs {
-            workspace_root: PathBuf::from("."),
-            receipts_dir: None,
-            timeout_seconds: 900,
-            kill_after_seconds: 0,
-            memory_max: "4G".to_string(),
-            pids_max: 1536,
-            cpu_quota: "200%".to_string(),
-        };
-
-        let exit_code = run_check(&args, true);
-        assert_eq!(
-            exit_code,
-            exit_codes::VALIDATION_ERROR,
-            "zero kill_after_seconds must fail-closed with VALIDATION_ERROR"
-        );
-    }
-
-    /// `run_check` must reject zero `pids_max` (`invalid_limits`, fail-closed).
-    #[test]
-    fn test_run_check_rejects_zero_pids_max() {
-        let args = CheckArgs {
-            workspace_root: PathBuf::from("."),
-            receipts_dir: None,
-            timeout_seconds: 900,
-            kill_after_seconds: 20,
-            memory_max: "4G".to_string(),
-            pids_max: 0,
-            cpu_quota: "200%".to_string(),
-        };
-
-        let exit_code = run_check(&args, true);
-        assert_eq!(
-            exit_code,
-            exit_codes::VALIDATION_ERROR,
-            "zero pids_max must fail-closed with VALIDATION_ERROR"
-        );
-    }
-
-    /// `run_check` must fail-closed when `workspace_root` is a non-existent
-    /// path.
-    #[test]
-    fn test_run_check_rejects_nonexistent_workspace() {
-        let args = CheckArgs {
-            workspace_root: PathBuf::from("/nonexistent/workspace/path/apm2_test"),
-            receipts_dir: None,
-            timeout_seconds: 900,
-            kill_after_seconds: 20,
-            memory_max: "4G".to_string(),
-            pids_max: 1536,
-            cpu_quota: "200%".to_string(),
-        };
-
-        let exit_code = run_check(&args, true);
-        assert_eq!(
-            exit_code,
-            exit_codes::VALIDATION_ERROR,
-            "nonexistent workspace_root must fail-closed with VALIDATION_ERROR"
-        );
-    }
-
-    /// `execute_gate_command` must fail-closed with exit code 127 on empty
-    /// command vec (no default-to-pass).
-    #[test]
-    fn test_execute_gate_command_empty_command_fails_closed() {
-        let tmp = std::env::temp_dir().join("fac_test_empty_cmd");
-        let _ = std::fs::create_dir_all(&tmp);
-        let receipt = tmp.join("empty_cmd.log");
-
-        let result = execute_gate_command(&tmp, &[], &receipt);
-        assert!(
-            !result.success,
-            "empty command must fail (never default to pass)"
-        );
-        assert_eq!(result.exit_code, 127, "empty command must return exit 127");
-
-        // Verify receipt was written as evidence
-        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
-        assert!(
-            content.contains("FAIL"),
-            "receipt must record FAIL status: {content}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// `execute_gate_command` must fail-closed when the executable does not
-    /// exist (e.g., missing script scenario).
-    #[test]
-    fn test_execute_gate_command_missing_binary_fails_closed() {
-        let tmp = std::env::temp_dir().join("fac_test_missing_bin");
-        let _ = std::fs::create_dir_all(&tmp);
-        let receipt = tmp.join("missing_bin.log");
-
-        let command = vec!["/nonexistent/binary/path".to_string()];
-        let result = execute_gate_command(&tmp, &command, &receipt);
-        assert!(
-            !result.success,
-            "missing binary must fail (never default to pass)"
-        );
-        assert_eq!(result.exit_code, 127, "missing binary must return exit 127");
-
-        // Verify receipt was written as evidence
-        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
-        assert!(
-            content.contains("error="),
-            "receipt must record error: {content}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// Gate skip-on-failure: when an early gate returns FAIL, subsequent gates
-    /// must be SKIPPED (not executed). This ensures the gate chain is
-    /// fail-closed and does not allow later gates to mask early failures.
-    #[test]
-    fn test_gate_skip_on_failure_semantics() {
-        // Simulate the gate blocking logic from run_check:
-        // After first gate fails, gate_blocked=true, remaining gates get SKIPPED.
-        let mut gates = Vec::new();
-        let mut gate_blocked = false;
-
-        // Simulate 3 gate plans: first FAILS, second and third should be SKIPPED
-        let gate_outcomes = [false, true, true]; // false = FAIL
-        let gate_ids = ["gate-security", "gate-aat", "gate-quality"];
-        let gate_labels = [
-            "test-safety-guard",
-            "bounded-test-runner",
-            "workspace-integrity-guard",
-        ];
-
-        for (i, success) in gate_outcomes.iter().enumerate() {
-            if gate_blocked {
-                gates.push(FacCheckGateResult {
-                    gate_id: gate_ids[i].to_string(),
-                    gate_label: gate_labels[i].to_string(),
-                    status: "SKIPPED".to_string(),
-                    exit_code: None,
-                    command: "test_cmd".to_string(),
-                    receipt_pointer: "/tmp/test.log".to_string(),
-                });
-                continue;
-            }
-
-            if !success {
-                gate_blocked = true;
-            }
-
-            gates.push(FacCheckGateResult {
-                gate_id: gate_ids[i].to_string(),
-                gate_label: gate_labels[i].to_string(),
-                status: if *success {
-                    "PASS".to_string()
-                } else {
-                    "FAIL".to_string()
-                },
-                exit_code: Some(i32::from(!*success)),
-                command: "test_cmd".to_string(),
-                receipt_pointer: "/tmp/test.log".to_string(),
-            });
-        }
-
-        // Verify gate chain semantics
-        assert_eq!(gates.len(), 3, "all three gates must be represented");
-        assert_eq!(gates[0].status, "FAIL", "first gate must be FAIL");
-        assert_eq!(
-            gates[1].status, "SKIPPED",
-            "second gate must be SKIPPED after first fails"
-        );
-        assert_eq!(
-            gates[2].status, "SKIPPED",
-            "third gate must be SKIPPED after first fails"
-        );
-
-        // Overall verdict must be FAIL (not PASS)
-        let passed = gates.iter().all(|g| g.status == "PASS");
-        assert!(!passed, "overall verdict must be FAIL when any gate fails");
-
-        // SKIPPED gates must have no exit code
-        assert!(
-            gates[1].exit_code.is_none(),
-            "SKIPPED gate must have no exit code"
-        );
-        assert!(
-            gates[2].exit_code.is_none(),
-            "SKIPPED gate must have no exit code"
-        );
-    }
-
-    /// `execute_gate_command` must handle a command that exits with non-zero
-    /// status and record the correct exit code.
-    #[test]
-    fn test_execute_gate_command_records_nonzero_exit() {
-        let tmp = std::env::temp_dir().join("fac_test_nonzero_exit");
-        let _ = std::fs::create_dir_all(&tmp);
-        let receipt = tmp.join("nonzero.log");
-
-        // bash -c "exit 42" should exit with code 42
-        let command = vec!["bash".to_string(), "-c".to_string(), "exit 42".to_string()];
-        let result = execute_gate_command(&tmp, &command, &receipt);
-        assert!(!result.success, "non-zero exit must be treated as failure");
-        assert_eq!(
-            result.exit_code, 42,
-            "exit code must be faithfully recorded"
-        );
-
-        // Verify receipt was written with exit code evidence
-        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
-        assert!(
-            content.contains("exit_code=42"),
-            "receipt must contain exit_code=42: {content}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// `execute_gate_command` must record success for a passing command.
-    #[test]
-    fn test_execute_gate_command_records_success() {
-        let tmp = std::env::temp_dir().join("fac_test_success");
-        let _ = std::fs::create_dir_all(&tmp);
-        let receipt = tmp.join("success.log");
-
-        let command = vec!["true".to_string()];
-        let result = execute_gate_command(&tmp, &command, &receipt);
-        assert!(result.success, "exit 0 must be treated as success");
-        assert_eq!(result.exit_code, 0, "exit code must be 0");
-
-        // Verify receipt was written
-        let content = std::fs::read_to_string(&receipt).unwrap_or_default();
-        assert!(
-            content.contains("exit_code=0"),
-            "receipt must contain exit_code=0: {content}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
