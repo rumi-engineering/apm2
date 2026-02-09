@@ -314,7 +314,11 @@ pub fn code_quality_reviewer_role() -> RoleSpecV1 {
              2. Check code style and consistency\n\
              3. Assess maintainability and readability\n\
              4. Run targeted tests to verify behavior\n\
-             5. Provide specific, actionable feedback\n\n\
+             5. Provide specific, actionable feedback\n\
+             6. Prefer `apm2 fac review` commands for lifecycle/status/retrigger \
+                operations when needed\n\
+             7. Use direct `gh` commands only for PR comment-body interactions \
+                that FAC does not yet expose\n\n\
              Produce a structured review with:\n\
              - APPROVE if the code meets quality standards\n\
              - REQUEST_CHANGES if improvements are needed\n\
@@ -404,7 +408,11 @@ pub fn security_reviewer_role() -> RoleSpecV1 {
              2. Check for common vulnerabilities (injection, auth bypass, etc.)\n\
              3. Verify secrets/credentials are not exposed\n\
              4. Assess policy compliance\n\
-             5. Run security scanning tools where available\n\n\
+             5. Run security scanning tools where available\n\
+             6. Prefer `apm2 fac review` commands for lifecycle/status/retrigger \
+                operations when needed\n\
+             7. Use direct `gh` commands only for PR comment-body interactions \
+                that FAC does not yet expose\n\n\
              Produce a structured security review with:\n\
              - APPROVE if no security issues found\n\
              - REQUEST_CHANGES if security issues must be addressed\n\

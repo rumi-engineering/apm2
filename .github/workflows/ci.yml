@@ -1,13 +1,10 @@
 # Main CI workflow
-# Executes all gates locally on the OVH self-hosted runner and projects
-# a single required status context (`CI Success`) back to GitHub.
+# Executes deep CI on main/merge-group SHAs on the OVH self-hosted runner.
 
 name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   # Required for GitHub merge queue: required checks must run on merge-group SHAs.
   merge_group:
@@ -29,8 +26,6 @@ permissions:
 jobs:
   ci-success:
     name: CI Success
-    # Trust boundary: fork PRs are not permitted on self-hosted infra.
-    if: github.event_name != 'issue_comment' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, x64, fac-ovh]
     timeout-minutes: 90
 
@@ -53,14 +48,9 @@ jobs:
 
       - name: Run bounded local CI suite
         run: |
-          PROFILE="github-deep"
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            PROFILE="github-pr-fast"
-          fi
-
-          echo "Using CI profile: ${PROFILE}"
+          echo "Using CI profile: github-deep"
           cargo run --locked --package apm2-cli -- ci run \
-            --profile "${PROFILE}" \
+            --profile "github-deep" \
             --bounded-timeout-seconds 4800 \
             --bounded-kill-after-seconds 30 \
             --bounded-memory-max 64G \

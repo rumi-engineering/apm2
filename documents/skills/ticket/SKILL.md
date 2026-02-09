@@ -19,6 +19,12 @@ protocol:
 variables:
   TICKET_ID_OPTIONAL: "$1"
 
+notes:
+  - "Required merge-gate context is `Review Gate Success`, bound to the current PR head SHA. Some repos/branches may still require additional legacy contexts (for example `CI Success`) until branch protection cutover is complete."
+  - "Use `apm2 fac` commands as the primary operational interface for review lifecycle state (`apm2 fac review status`, `apm2 fac review project`, `apm2 fac review retrigger`)."
+  - "Use direct `gh` workflow dispatch only as fallback when FAC projection commands are unavailable."
+  - "Use `gh` for full comment body retrieval until equivalent `apm2` projection support is available."
+
 references[20]:
   - path: "@documents/theory/glossary/glossary.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
