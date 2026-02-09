@@ -537,7 +537,53 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
         self.refresh_projection()?;
 
         let canonical_projections = self.build_canonical_projections()?;
-        let result = reconcile_aliases(bindings, &canonical_projections, current_tick);
+        let mut result = reconcile_aliases(bindings, &canonical_projections, current_tick);
+
+        // TCK-00420 BLOCKER 2 fix: Enforce observation-window staleness in
+        // the production promotion path. Without this, bindings with
+        // arbitrarily old `observed_at_tick` values would pass reconciliation
+        // unchecked, violating REQ-HEF-0017 temporal freshness enforcement.
+        //
+        // For each resolved binding, check staleness against the gate's
+        // observation window configuration. Stale bindings produce
+        // `DefectClass::Stale` defects that block promotion (fail-closed).
+        let mut stale_defects = Vec::new();
+        for binding in bindings {
+            if self
+                .observation_window
+                .is_stale(binding.observed_at_tick, current_tick)
+            {
+                stale_defects.push(alias_reconcile::AliasReconciliationDefect {
+                    ticket_alias: binding.ticket_alias.clone(),
+                    expected_work_id: binding.canonical_work_id,
+                    actual_work_id: alias_reconcile::ZERO_HASH,
+                    defect_class: alias_reconcile::DefectClass::Stale,
+                    detected_at_tick: current_tick,
+                });
+            }
+        }
+
+        if !stale_defects.is_empty() {
+            warn!(
+                stale_count = stale_defects.len(),
+                current_tick = current_tick,
+                max_staleness_ticks = self.observation_window.max_staleness_ticks,
+                "Alias reconciliation: stale bindings detected (fail-closed)"
+            );
+            // Decrement resolved_count for any binding that was counted as
+            // resolved but is now also stale.
+            for stale in &stale_defects {
+                if result
+                    .unresolved_defects
+                    .iter()
+                    .all(|d| d.ticket_alias != stale.ticket_alias)
+                {
+                    // This binding was counted as resolved, but is stale
+                    result.resolved_count = result.resolved_count.saturating_sub(1);
+                }
+            }
+            result.unresolved_defects.extend(stale_defects);
+        }
 
         if !promotion_gate(&result) {
             warn!(

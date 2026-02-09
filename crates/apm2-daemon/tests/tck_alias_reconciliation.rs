@@ -451,3 +451,254 @@ fn tck_alias_reconciliation_not_found_alias_blocks_promotion() {
     );
     assert!(!promotion_gate(&result));
 }
+
+// ============================================================================
+// Staleness enforcement in check_promotion (BLOCKER 2 fix)
+// ============================================================================
+
+#[test]
+fn tck_alias_reconciliation_staleness_blocks_promotion() {
+    // Verify that check_promotion enforces staleness detection fail-closed.
+    // A binding with observed_at_tick far in the past (relative to
+    // current_tick) must produce a Stale defect even if hash matches.
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+
+    emit_transition(
+        emitter.as_ref(),
+        "W-STALE-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:stale-test",
+        1_000_000_000,
+    );
+
+    // Use a gate with tight staleness threshold (10 ticks).
+    let gate = ProjectionAliasReconciliationGate::with_config(
+        Arc::clone(emitter),
+        ObservationWindow {
+            start_tick: 0,
+            end_tick: 100_000,
+            max_staleness_ticks: 10,
+        },
+        SnapshotSunsetCriteria {
+            min_reconciled_ticks: 50,
+            zero_defects_required: true,
+        },
+    );
+
+    // Binding observed at tick 50, but current tick is 200.
+    // Gap = 200 - 50 = 150 > max_staleness_ticks (10) => stale.
+    let binding = TicketAliasBinding {
+        ticket_alias: "W-STALE-001".to_string(),
+        canonical_work_id: work_id_to_hash("W-STALE-001"),
+        observed_at_tick: 50,
+        observation_window_start: 40,
+        observation_window_end: 60,
+    };
+
+    let result = gate
+        .check_promotion(&[binding], 200)
+        .expect("promotion check must succeed on infrastructure");
+
+    // Must produce a Stale defect
+    let has_stale = result
+        .unresolved_defects
+        .iter()
+        .any(|d| d.defect_class == DefectClass::Stale);
+    assert!(
+        has_stale,
+        "stale binding must produce Stale defect (fail-closed)"
+    );
+    assert!(
+        !promotion_gate(&result),
+        "stale binding must block promotion"
+    );
+}
+
+#[test]
+fn tck_alias_reconciliation_fresh_binding_passes_staleness_check() {
+    // Verify that a fresh binding does NOT produce a Stale defect.
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+
+    emit_transition(
+        emitter.as_ref(),
+        "W-FRESH-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:fresh-test",
+        1_000_000_000,
+    );
+
+    let gate = ProjectionAliasReconciliationGate::with_config(
+        Arc::clone(emitter),
+        ObservationWindow {
+            start_tick: 0,
+            end_tick: 100_000,
+            max_staleness_ticks: 10,
+        },
+        SnapshotSunsetCriteria {
+            min_reconciled_ticks: 50,
+            zero_defects_required: true,
+        },
+    );
+
+    // Binding observed at tick 195, current tick is 200.
+    // Gap = 200 - 195 = 5 <= max_staleness_ticks (10) => NOT stale.
+    let binding = TicketAliasBinding {
+        ticket_alias: "W-FRESH-001".to_string(),
+        canonical_work_id: work_id_to_hash("W-FRESH-001"),
+        observed_at_tick: 195,
+        observation_window_start: 190,
+        observation_window_end: 210,
+    };
+
+    let result = gate
+        .check_promotion(&[binding], 200)
+        .expect("promotion check must succeed");
+
+    assert!(result.unresolved_defects.is_empty());
+    assert_eq!(result.resolved_count, 1);
+    assert!(
+        promotion_gate(&result),
+        "fresh binding with matching hash must pass"
+    );
+}
+
+#[test]
+fn tck_alias_reconciliation_tick_regression_blocks_via_check_promotion() {
+    // Verify that temporal inversion (current_tick < observed_at_tick)
+    // produces a Stale defect through the production check_promotion path.
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+
+    emit_transition(
+        emitter.as_ref(),
+        "W-REGRESS-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:regress-test",
+        1_000_000_000,
+    );
+
+    let gate = ProjectionAliasReconciliationGate::with_config(
+        Arc::clone(emitter),
+        ObservationWindow {
+            start_tick: 0,
+            end_tick: 100_000,
+            max_staleness_ticks: 10,
+        },
+        SnapshotSunsetCriteria {
+            min_reconciled_ticks: 50,
+            zero_defects_required: true,
+        },
+    );
+
+    // Temporal inversion: binding observed at tick 200, but current is 100.
+    let binding = TicketAliasBinding {
+        ticket_alias: "W-REGRESS-001".to_string(),
+        canonical_work_id: work_id_to_hash("W-REGRESS-001"),
+        observed_at_tick: 200,
+        observation_window_start: 190,
+        observation_window_end: 210,
+    };
+
+    let result = gate
+        .check_promotion(&[binding], 100)
+        .expect("promotion check must succeed on infrastructure");
+
+    let has_stale = result
+        .unresolved_defects
+        .iter()
+        .any(|d| d.defect_class == DefectClass::Stale);
+    assert!(
+        has_stale,
+        "tick regression must produce Stale defect (fail-closed)"
+    );
+    assert!(
+        !promotion_gate(&result),
+        "tick regression must block promotion"
+    );
+}
+
+// ============================================================================
+// Dispatcher gate wiring tests (BLOCKER 3 fix)
+// ============================================================================
+
+#[test]
+fn tck_alias_reconciliation_dispatcher_gate_accessible() {
+    // Verify the PrivilegedDispatcher exposes the alias reconciliation gate
+    // and that it produces valid results when invoked directly.
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+
+    emit_transition(
+        emitter.as_ref(),
+        "W-DISPATCH-001",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:dispatch-gate-test",
+        1_000_000_000,
+    );
+
+    let gate = dispatcher.alias_reconciliation_gate();
+    let binding = TicketAliasBinding {
+        ticket_alias: "W-DISPATCH-001".to_string(),
+        canonical_work_id: work_id_to_hash("W-DISPATCH-001"),
+        observed_at_tick: 100,
+        observation_window_start: 90,
+        observation_window_end: 110,
+    };
+
+    let result = gate
+        .check_promotion(&[binding], 100)
+        .expect("dispatcher gate must produce valid results");
+    assert_eq!(result.resolved_count, 1);
+    assert!(result.unresolved_defects.is_empty());
+    assert!(promotion_gate(&result));
+}
+
+#[test]
+fn tck_alias_reconciliation_dispatcher_gate_blocks_mismatch() {
+    // Verify the dispatcher's gate blocks on mismatched hashes.
+    let dispatcher = PrivilegedDispatcher::new();
+    let emitter = dispatcher.event_emitter();
+
+    emit_transition(
+        emitter.as_ref(),
+        "W-DISPATCH-MISMATCH",
+        "Open",
+        "Claimed",
+        "claim",
+        0,
+        "actor:dispatch-mismatch",
+        1_000_000_000,
+    );
+
+    let gate = dispatcher.alias_reconciliation_gate();
+    let binding = TicketAliasBinding {
+        ticket_alias: "W-DISPATCH-MISMATCH".to_string(),
+        canonical_work_id: [0xFF; 32], // wrong hash
+        observed_at_tick: 100,
+        observation_window_start: 90,
+        observation_window_end: 110,
+    };
+
+    let result = gate
+        .check_promotion(&[binding], 100)
+        .expect("gate must not fail on infrastructure");
+    assert!(
+        !result.unresolved_defects.is_empty(),
+        "mismatched binding must produce defects via dispatcher gate"
+    );
+    assert!(!promotion_gate(&result));
+}
