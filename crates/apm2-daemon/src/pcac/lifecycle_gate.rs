@@ -95,100 +95,128 @@ impl InProcessKernel {
     /// completeness (RFC-0027 §3.1).
     fn compute_join_hash(input: &AuthorityJoinInputV1) -> Hash {
         use blake3::Hasher;
+        fn put_field(hasher: &mut Hasher, name: &[u8], value: &[u8]) {
+            hasher.update(name);
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+
+        fn put_hash(hasher: &mut Hasher, name: &[u8], hash: &Hash) {
+            put_field(hasher, name, hash);
+        }
+
+        fn put_opt_hash(hasher: &mut Hasher, name: &[u8], value: Option<&Hash>) {
+            hasher.update(name);
+            if let Some(hash) = value {
+                hasher.update(&[1u8]);
+                hasher.update(&(hash.len() as u64).to_le_bytes());
+                hasher.update(hash);
+            } else {
+                hasher.update(&[0u8]);
+                hasher.update(&0u64.to_le_bytes());
+            }
+        }
+
+        fn put_opt_str(hasher: &mut Hasher, name: &[u8], value: Option<&str>) {
+            hasher.update(name);
+            if let Some(text) = value {
+                hasher.update(&[1u8]);
+                hasher.update(&(text.len() as u64).to_le_bytes());
+                hasher.update(text.as_bytes());
+            } else {
+                hasher.update(&[0u8]);
+                hasher.update(&0u64.to_le_bytes());
+            }
+        }
+
+        fn put_sorted_hash_vec(hasher: &mut Hasher, name: &[u8], values: &[Hash]) {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            hasher.update(name);
+            hasher.update(&(sorted.len() as u64).to_le_bytes());
+            for value in sorted {
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(&value);
+            }
+        }
+
         let mut hasher = Hasher::new();
+        hasher.update(b"apm2-authority-join-v1");
 
-        // Domain separation prefix for the authority join hash.
-        hasher.update(b"pcac:authority_join_hash:v1:");
-
-        // -- Subject bindings --
-        hasher.update(b"session_id:");
-        hasher.update(input.session_id.as_bytes());
-        hasher.update(b"\x00");
-
-        hasher.update(b"holon_id:");
-        if let Some(ref holon_id) = input.holon_id {
-            hasher.update(holon_id.as_bytes());
-        }
-        hasher.update(b"\x00");
-
-        // -- Intent binding --
-        hasher.update(b"intent_digest:");
-        hasher.update(&input.intent_digest);
-
-        // -- Capability bindings --
-        hasher.update(b"capability_manifest_hash:");
-        hasher.update(&input.capability_manifest_hash);
-
-        hasher.update(b"scope_witness_hashes:");
-        for swh in &input.scope_witness_hashes {
-            hasher.update(swh);
-        }
-        hasher.update(b"\x00");
-
-        // -- Delegation bindings --
-        hasher.update(b"lease_id:");
-        hasher.update(input.lease_id.as_bytes());
-        hasher.update(b"\x00");
-
-        hasher.update(b"permeability_receipt_hash:");
-        if let Some(ref prh) = input.permeability_receipt_hash {
-            hasher.update(prh);
-        }
-        hasher.update(b"\x00");
-
-        // -- Identity bindings --
-        hasher.update(b"identity_proof_hash:");
-        hasher.update(&input.identity_proof_hash);
-
-        hasher.update(b"identity_evidence_level:");
-        hasher.update(input.identity_evidence_level.to_string().as_bytes());
-        hasher.update(b"\x00");
-
-        // -- Freshness bindings --
-        hasher.update(b"directory_head_hash:");
-        hasher.update(&input.directory_head_hash);
-
-        hasher.update(b"freshness_policy_hash:");
-        hasher.update(&input.freshness_policy_hash);
-
-        hasher.update(b"freshness_witness_tick:");
-        hasher.update(&input.freshness_witness_tick.to_le_bytes());
-
-        // -- Stop/budget policy bindings --
-        hasher.update(b"stop_budget_profile_digest:");
-        hasher.update(&input.stop_budget_profile_digest);
-
-        hasher.update(b"pre_actuation_receipt_hashes:");
-        for parh in &input.pre_actuation_receipt_hashes {
-            hasher.update(parh);
-        }
-        hasher.update(b"\x00");
-
-        // -- Risk classification --
-        hasher.update(b"risk_tier:");
-        hasher.update(input.risk_tier.to_string().as_bytes());
-        hasher.update(b"\x00");
-
-        hasher.update(b"determinism_class:");
-        match input.determinism_class {
-            apm2_core::pcac::DeterminismClass::Deterministic => {
-                hasher.update(b"deterministic");
-            },
+        // Schema-defined canonical field order.
+        put_field(&mut hasher, b"session_id", input.session_id.as_bytes());
+        put_opt_str(&mut hasher, b"holon_id", input.holon_id.as_deref());
+        put_hash(&mut hasher, b"intent_digest", &input.intent_digest);
+        put_hash(
+            &mut hasher,
+            b"capability_manifest_hash",
+            &input.capability_manifest_hash,
+        );
+        put_sorted_hash_vec(
+            &mut hasher,
+            b"scope_witness_hashes",
+            &input.scope_witness_hashes,
+        );
+        put_field(&mut hasher, b"lease_id", input.lease_id.as_bytes());
+        put_opt_hash(
+            &mut hasher,
+            b"permeability_receipt_hash",
+            input.permeability_receipt_hash.as_ref(),
+        );
+        put_hash(
+            &mut hasher,
+            b"identity_proof_hash",
+            &input.identity_proof_hash,
+        );
+        put_field(
+            &mut hasher,
+            b"identity_evidence_level",
+            input.identity_evidence_level.to_string().as_bytes(),
+        );
+        put_hash(
+            &mut hasher,
+            b"directory_head_hash",
+            &input.directory_head_hash,
+        );
+        put_hash(
+            &mut hasher,
+            b"freshness_policy_hash",
+            &input.freshness_policy_hash,
+        );
+        put_field(
+            &mut hasher,
+            b"freshness_witness_tick",
+            &input.freshness_witness_tick.to_le_bytes(),
+        );
+        put_hash(
+            &mut hasher,
+            b"stop_budget_profile_digest",
+            &input.stop_budget_profile_digest,
+        );
+        put_sorted_hash_vec(
+            &mut hasher,
+            b"pre_actuation_receipt_hashes",
+            &input.pre_actuation_receipt_hashes,
+        );
+        put_field(
+            &mut hasher,
+            b"risk_tier",
+            input.risk_tier.to_string().as_bytes(),
+        );
+        let determinism = match input.determinism_class {
+            apm2_core::pcac::DeterminismClass::Deterministic => b"deterministic".as_slice(),
             apm2_core::pcac::DeterminismClass::BoundedNondeterministic => {
-                hasher.update(b"bounded_nondeterministic");
+                b"bounded_nondeterministic".as_slice()
             },
-            _ => {
-                hasher.update(b"unknown");
-            },
-        }
-        hasher.update(b"\x00");
-
-        // -- HTF time witness bindings --
-        hasher.update(b"time_envelope_ref:");
-        hasher.update(&input.time_envelope_ref);
-
-        hasher.update(b"as_of_ledger_anchor:");
-        hasher.update(&input.as_of_ledger_anchor);
+            _ => b"unknown".as_slice(),
+        };
+        put_field(&mut hasher, b"determinism_class", determinism);
+        put_hash(&mut hasher, b"time_envelope_ref", &input.time_envelope_ref);
+        put_hash(
+            &mut hasher,
+            b"as_of_ledger_anchor",
+            &input.as_of_ledger_anchor,
+        );
 
         *hasher.finalize().as_bytes()
     }
@@ -434,6 +462,54 @@ impl LifecycleGate {
         Self { kernel }
     }
 
+    /// Executes `join -> revalidate-before-decision`.
+    ///
+    /// This is the pre-broker lifecycle checkpoint. Callers must still perform
+    /// a fresh revalidate + consume immediately before effect execution.
+    pub fn join_and_revalidate(
+        &self,
+        input: &AuthorityJoinInputV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+        let cert = self.kernel.join(input)?;
+        self.kernel.revalidate(
+            &cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )?;
+        Ok(cert)
+    }
+
+    /// Executes revalidate-before-execution for an already joined certificate.
+    pub fn revalidate_before_execution(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        self.kernel.revalidate(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )
+    }
+
+    /// Consumes authority immediately before effect execution.
+    pub fn consume_before_effect(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        intent_digest: Hash,
+        current_time_envelope_ref: Hash,
+    ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
+        self.kernel
+            .consume(cert, intent_digest, current_time_envelope_ref)
+    }
+
     /// Executes the full PCAC lifecycle for a tool request.
     ///
     /// RFC-0027 §3.3 lifecycle ordering:
@@ -466,13 +542,9 @@ impl LifecycleGate {
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<LifecycleReceipts, Box<AuthorityDenyV1>> {
-        // Stage 1: Join — construct AJC from validated inputs.
-        let cert = self.kernel.join(input)?;
-
-        // Stage 2: Revalidate-before-decision — verify AJC against current
-        // state prior to making the consume decision.
-        self.kernel.revalidate(
-            &cert,
+        // Stage 1+2: Join + revalidate-before-decision.
+        let cert = self.join_and_revalidate(
+            input,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
@@ -481,7 +553,7 @@ impl LifecycleGate {
         // Stage 3: Revalidate-before-execution — second revalidation
         // immediately before consume to close the window between decision
         // and execution (RFC-0027 §3.3 ordering requirement).
-        self.kernel.revalidate(
+        self.revalidate_before_execution(
             &cert,
             current_time_envelope_ref,
             current_ledger_anchor,
@@ -491,8 +563,7 @@ impl LifecycleGate {
         // Stage 4: Consume — single-use consumption with intent equality.
         // Consume must be immediately before the effect.
         let (consumed_witness, consume_record) =
-            self.kernel
-                .consume(&cert, input.intent_digest, current_time_envelope_ref)?;
+            self.consume_before_effect(&cert, input.intent_digest, current_time_envelope_ref)?;
 
         Ok(LifecycleReceipts {
             certificate: cert,

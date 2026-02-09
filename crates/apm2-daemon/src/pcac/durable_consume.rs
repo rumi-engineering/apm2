@@ -25,9 +25,9 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use apm2_core::crypto::Hash;
 use fs2::FileExt;
@@ -86,6 +86,7 @@ pub trait DurableConsumeIndex: Send + Sync {
 // =============================================================================
 
 /// Metrics for durable consume operations.
+#[derive(Clone)]
 pub struct DurableConsumeMetrics {
     /// Counter for successful durable consume writes.
     pub recorded_total: IntCounter,
@@ -124,6 +125,13 @@ impl DurableConsumeMetrics {
             .expect("metric registration"),
         }
     }
+
+    /// Returns process-global durable consume metrics, registering exactly
+    /// once.
+    pub fn global() -> Self {
+        static METRICS: OnceLock<DurableConsumeMetrics> = OnceLock::new();
+        METRICS.get_or_init(Self::register).clone()
+    }
 }
 
 // =============================================================================
@@ -150,11 +158,9 @@ pub struct FileBackedConsumeIndex {
     path: PathBuf,
     /// In-memory set for fast lookup.
     consumed: Mutex<HashSet<Hash>>,
-    /// Append-only file handle (also holds the exclusive lock).
+    /// Append-only file handle (holds an exclusive file lock for process
+    /// lifetime).
     file: Mutex<File>,
-    /// Lock file handle — held for the lifetime of this struct to
-    /// enforce single-writer exclusivity.
-    _lock_file: File,
     /// Optional metrics (None in tests without prometheus).
     metrics: Option<DurableConsumeMetrics>,
 }
@@ -183,25 +189,29 @@ impl FileBackedConsumeIndex {
         let path = path.as_ref().to_path_buf();
         let mut consumed = HashSet::new();
 
-        // MAJOR 2 FIX: Acquire exclusive lock before reading/writing.
-        // The lock file is a sibling with ".lock" suffix.
-        let lock_path = path.with_extension("log.lock");
-        let lock_file = OpenOptions::new()
+        // SECURITY MAJOR 2 FIX: Acquire an exclusive lock on the consume log
+        // file itself for single-writer inter-process exclusivity.
+        let file = OpenOptions::new()
             .create(true)
-            .write(true)
+            .read(true)
             .truncate(false)
-            .open(&lock_path)?;
-        lock_file.try_lock_exclusive().map_err(|e| {
+            .append(true)
+            .open(&path)?;
+        file.try_lock_exclusive().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                format!("durable consume index is locked by another process: {e}"),
+                format!(
+                    "durable consume index is locked by another process ({}): {e}",
+                    path.display()
+                ),
             )
         })?;
 
-        // Replay existing entries if the file exists.
-        if path.exists() {
-            let file = File::open(&path)?;
-            let reader = BufReader::new(file);
+        // Replay existing entries from the locked file.
+        {
+            let mut replay = file.try_clone()?;
+            replay.seek(SeekFrom::Start(0))?;
+            let reader = BufReader::new(replay);
             for (line_idx, line_result) in reader.lines().enumerate() {
                 let line = line_result?;
                 let trimmed = line.trim();
@@ -216,14 +226,10 @@ impl FileBackedConsumeIndex {
             }
         }
 
-        // Open for appending.
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-
         Ok(Self {
             path,
             consumed: Mutex::new(consumed),
             file: Mutex::new(file),
-            _lock_file: lock_file,
             metrics,
         })
     }
@@ -291,8 +297,8 @@ impl DurableConsumeIndex for FileBackedConsumeIndex {
 /// `AuthorityJoinKernel` implementation.
 ///
 /// The inner kernel handles join and revalidate. On consume, the durable index
-/// is checked/written BEFORE the inner kernel's consume is called, enforcing
-/// the pre-effect durability barrier.
+/// is committed AFTER inner consume validation succeeds and BEFORE effect
+/// acceptance, enforcing the pre-effect durability barrier.
 pub struct DurableKernel<K: apm2_core::pcac::AuthorityJoinKernel> {
     inner: K,
     durable_index: Box<dyn DurableConsumeIndex>,
@@ -346,30 +352,15 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         ),
         Box<apm2_core::pcac::AuthorityDenyV1>,
     > {
-        // MAJOR 3 FIX: DurableKernel replaces inner kernel's consume entirely.
-        // This eliminates double-consume and ordering issues where durable state
-        // was committed before the inner kernel validated.
-        //
-        // Sequence: validate intent -> durable commit -> construct witnesses.
-        // The inner kernel is NOT called for consume.
+        // SECURITY MAJOR 1 FIX:
+        // 1) Run inner consume semantics first (all deny-producing checks),
+        // 2) commit durable record barrier,
+        // 3) return witnesses.
+        let (consumed_witness, consume_record) =
+            self.inner
+                .consume(cert, intent_digest, current_time_envelope_ref)?;
 
-        // Step 1: Validate intent digest equality (Law 2).
-        if intent_digest != cert.intent_digest {
-            return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
-                deny_class: apm2_core::pcac::AuthorityDenyClass::IntentDigestMismatch {
-                    expected: cert.intent_digest,
-                    actual: intent_digest,
-                },
-                ajc_id: Some(cert.ajc_id),
-                time_envelope_ref: current_time_envelope_ref,
-                ledger_anchor: cert.as_of_ledger_anchor,
-                denied_at_tick: 0,
-            }));
-        }
-
-        // Step 2: Commit durably. The durable index enforces single-use
-        // (AlreadyConsumed) and persists (fsync) before returning Ok.
-        // This is the pre-effect durability barrier.
+        // Durable commit remains mandatory before effect acceptance.
         if let Err(e) = self.durable_index.record_consume(cert.ajc_id) {
             let denied_at_tick = 0u64;
             match e {
@@ -407,35 +398,6 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                 },
             }
         }
-
-        // Step 3: Construct consume witnesses directly (same logic as
-        // InProcessKernel::consume but WITHOUT calling inner.consume()).
-        // The durable record is already committed, so this is pure
-        // witness construction with no state mutation.
-        let effect_selector_digest = {
-            use blake3::Hasher;
-            let mut hasher = Hasher::new();
-            hasher.update(&cert.ajc_id);
-            hasher.update(&intent_digest);
-            // Use 0 for tick since DurableKernel does not track ticks;
-            // the durable index is the authoritative single-use record.
-            hasher.update(&0u64.to_le_bytes());
-            *hasher.finalize().as_bytes()
-        };
-
-        let consumed_witness = apm2_core::pcac::AuthorityConsumedV1 {
-            ajc_id: cert.ajc_id,
-            intent_digest,
-            consumed_time_envelope_ref: current_time_envelope_ref,
-            consumed_at_tick: 0,
-        };
-
-        let consume_record = apm2_core::pcac::AuthorityConsumeRecordV1 {
-            ajc_id: cert.ajc_id,
-            consumed_time_envelope_ref: current_time_envelope_ref,
-            consumed_at_tick: 0,
-            effect_selector_digest,
-        };
 
         Ok((consumed_witness, consume_record))
     }
@@ -572,13 +534,26 @@ mod tests {
         assert!(matches!(err, ConsumeError::CorruptLog { line: 1, .. }));
     }
 
+    #[test]
+    fn second_open_denied_while_locked() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("consume.log");
+
+        let _index = FileBackedConsumeIndex::open(&path, None).unwrap();
+        let err = FileBackedConsumeIndex::open(&path, None).unwrap_err();
+        assert!(
+            matches!(err, ConsumeError::IoError(ref io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock),
+            "second opener must fail while advisory lock is held; got: {err:?}"
+        );
+    }
+
     // =========================================================================
     // DurableKernel tests
     // =========================================================================
 
     use apm2_core::pcac::{
-        AuthorityJoinInputV1, AuthorityJoinKernel, DeterminismClass, IdentityEvidenceLevel,
-        RiskTier,
+        AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel, DeterminismClass,
+        IdentityEvidenceLevel, RiskTier,
     };
 
     use super::super::lifecycle_gate::InProcessKernel;
@@ -603,6 +578,65 @@ mod tests {
             determinism_class: DeterminismClass::Deterministic,
             time_envelope_ref: test_hash(0x07),
             as_of_ledger_anchor: test_hash(0x08),
+        }
+    }
+
+    struct PostIntentFailureKernel {
+        cert: AuthorityJoinCertificateV1,
+    }
+
+    impl AuthorityJoinKernel for PostIntentFailureKernel {
+        fn join(
+            &self,
+            _input: &AuthorityJoinInputV1,
+        ) -> Result<AuthorityJoinCertificateV1, Box<apm2_core::pcac::AuthorityDenyV1>> {
+            Ok(self.cert.clone())
+        }
+
+        fn revalidate(
+            &self,
+            _cert: &AuthorityJoinCertificateV1,
+            _current_time_envelope_ref: Hash,
+            _current_ledger_anchor: Hash,
+            _current_revocation_head_hash: Hash,
+        ) -> Result<(), Box<apm2_core::pcac::AuthorityDenyV1>> {
+            Ok(())
+        }
+
+        fn consume(
+            &self,
+            cert: &AuthorityJoinCertificateV1,
+            intent_digest: Hash,
+            current_time_envelope_ref: Hash,
+        ) -> Result<
+            (
+                apm2_core::pcac::AuthorityConsumedV1,
+                apm2_core::pcac::AuthorityConsumeRecordV1,
+            ),
+            Box<apm2_core::pcac::AuthorityDenyV1>,
+        > {
+            if intent_digest != cert.intent_digest {
+                return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::IntentDigestMismatch {
+                        expected: cert.intent_digest,
+                        actual: intent_digest,
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: cert.as_of_ledger_anchor,
+                    denied_at_tick: 0,
+                }));
+            }
+
+            Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::UnknownState {
+                    description: "mock inner failure after intent check".to_string(),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: 0,
+            }))
         }
     }
 
@@ -715,6 +749,38 @@ mod tests {
         assert!(
             contents.contains(&expected_hex),
             "durable consume record must be on disk after consume returns"
+        );
+    }
+
+    #[test]
+    fn durable_kernel_does_not_record_when_inner_consume_denies_after_intent_check() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("consume.log");
+        let index = FileBackedConsumeIndex::open(&path, None).unwrap();
+
+        let seed_kernel = InProcessKernel::new(100);
+        let input = valid_input();
+        let cert = seed_kernel.join(&input).unwrap();
+
+        let inner = PostIntentFailureKernel { cert: cert.clone() };
+        let kernel = DurableKernel::new(inner, Box::new(index));
+
+        let err = kernel
+            .consume(&cert, input.intent_digest, input.time_envelope_ref)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.deny_class,
+                apm2_core::pcac::AuthorityDenyClass::UnknownState { .. }
+            ),
+            "inner consume failure must propagate before durable commit"
+        );
+
+        drop(kernel);
+        let reopened = FileBackedConsumeIndex::open(&path, None).unwrap();
+        assert!(
+            !reopened.is_consumed(&cert.ajc_id),
+            "durable record must not be written when inner consume denies"
         );
     }
 

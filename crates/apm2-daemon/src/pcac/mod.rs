@@ -9,7 +9,9 @@
 //! # Integration Point
 //!
 //! The [`LifecycleGate`] is injected into `SessionDispatcher` and called
-//! between V1 scope enforcement and broker dispatch in `handle_request_tool`.
+//! in split stages from `handle_request_tool`:
+//! `join -> revalidate-before-decision -> broker decision ->
+//!  revalidate-before-execution -> consume-before-effect`.
 
 pub mod durable_consume;
 mod lifecycle_gate;
