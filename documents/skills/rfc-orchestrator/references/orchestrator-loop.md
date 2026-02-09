@@ -389,10 +389,11 @@ procedures[3]:
         commands[2]:
           - "cargo xtask review security <pr_url>"
           - "cargo xtask review quality <pr_url>"
+        note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
 
       - id: VERIFY_POSTED
         command: "gh api repos/{owner}/{repo}/commits/{head_sha}/status"
-        expect: "ai-review/security and ai-review/quality contexts present"
+        expect: "Review Gate Success context present or pending review-gate evaluation"
 
   - id: DISPATCH_IMPLEMENTER
     purpose: "Dispatch a subagent to implement or fix a ticket. Worktree creation handled by subagent via /ticket -> xtask start-ticket."

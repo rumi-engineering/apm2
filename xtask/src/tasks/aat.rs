@@ -489,7 +489,7 @@ fn build_ai_script_command(prompt_path: &Path, tool_config: &AatToolConfig) -> S
     match tool_config.ai_tool {
         AiTool::Codex => {
             // Codex uses build_script_command from shell_escape module
-            build_script_command(prompt_path, None, Some(select_review_model()))
+            build_script_command(prompt_path, None, Some(select_review_model()), None)
         },
         AiTool::ClaudeCode => {
             // Claude Code uses similar pattern but different command

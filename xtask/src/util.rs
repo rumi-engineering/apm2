@@ -211,7 +211,8 @@ pub fn use_hef_projection() -> bool {
 /// environment variable is set by the parent process and read by child
 /// processes to enforce consistent behavior.
 ///
-/// Value: `"emit_only"` | `"legacy"` (default: `"legacy"`)
+/// Value: `"emit_only"` | `"legacy"` (default: `"emit_only"` as of Stage 2,
+/// TCK-00419)
 pub const XTASK_CUTOVER_POLICY_ENV: &str = "XTASK_CUTOVER_POLICY";
 
 /// Returns the effective cutover policy from environment.
@@ -251,7 +252,7 @@ pub fn effective_cutover_policy_with_flag(cli_emit_receipt_only: bool) -> Cutove
     if emit_receipt_only_from_env() {
         return CutoverPolicy::EmitOnly;
     }
-    CutoverPolicy::Legacy
+    CutoverPolicy::EmitOnly
 }
 
 /// Cutover policy governing side-effect behavior.
@@ -260,7 +261,8 @@ pub fn effective_cutover_policy_with_flag(cli_emit_receipt_only: bool) -> Cutove
 /// GitHub writes or emit receipts only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CutoverPolicy {
-    /// Legacy mode: direct writes allowed (being phased out).
+    /// Legacy mode: direct writes allowed (deprecated as of Stage 2,
+    /// TCK-00419).
     Legacy,
     /// Emit-only mode: no direct GitHub writes; emit receipts only.
     /// Child processes MUST inherit this policy.
@@ -303,7 +305,7 @@ pub const XTASK_EMIT_RECEIPT_ONLY_ENV: &str = "XTASK_EMIT_RECEIPT_ONLY";
 ///
 /// Per TCK-00324 (REQ-0007), this flag must be explicitly set to "true" to
 /// allow direct GitHub writes when emit-receipt-only mode is enabled (which
-/// is the new default in cutover stage 1).
+/// is the default effective lifecycle path as of cutover Stage 2, TCK-00419).
 ///
 /// This provides an explicit opt-in for development/debugging scenarios where
 /// the projection worker is not available.
@@ -315,8 +317,8 @@ pub const XTASK_ALLOW_GITHUB_WRITE_ENV: &str = "XTASK_ALLOW_GITHUB_WRITE";
 /// to "true" (case-insensitive).
 ///
 /// Per TCK-00324 (REQ-0007), this flag defaults to `false` for backward
-/// compatibility during the Stage 1 rollout. In Stage 2, this will become
-/// `true` by default.
+/// compatibility. As of Stage 2 (TCK-00419), the default effective lifecycle
+/// path is emit-only via [`effective_cutover_policy_with_flag`] fallback.
 ///
 /// When `true`, xtask will emit internal receipts and NOT perform direct
 /// GitHub writes, relying on the projection worker instead.
@@ -448,23 +450,24 @@ pub fn print_status_writes_removed_notice() {
 }
 
 // =============================================================================
-// Emit-Receipt-Only Mode Messages (TCK-00324)
+// Emit-Receipt-Only Mode Messages (TCK-00419 Stage 2)
 // =============================================================================
 
 /// Message printed when emit-receipt-only mode is active.
 ///
-/// Per TCK-00324, this message informs the operator that direct GitHub writes
-/// are disabled and the projection worker will handle the actual writes.
+/// Per TCK-00419 Stage 2, this message informs the operator that direct GitHub
+/// writes are disabled by default and the projection worker will handle the
+/// actual writes.
 pub const EMIT_RECEIPT_ONLY_MESSAGE: &str = r"
 ================================================================================
-                         EMIT-RECEIPT-ONLY MODE (TCK-00324)
+                         EMIT-RECEIPT-ONLY MODE (TCK-00419)
 ================================================================================
   Direct GitHub writes are DISABLED. Emitting projection request receipt only.
 
   The projection worker will perform the actual GitHub API write.
   To force direct writes, use --allow-github-write or set XTASK_ALLOW_GITHUB_WRITE=true.
 
-  This is Stage 1 of the xtask authority reduction per RFC-0019 REQ-0007.
+  This is Stage 2 of the xtask authority demotion per RFC-0019 REQ-0007.
 ================================================================================
 ";
 
@@ -1140,7 +1143,7 @@ mod tests {
     }
 
     // =============================================================================
-    // TCK-00324 Cutover Stage 1 Tests
+    // TCK-00324/TCK-00419 Cutover Tests
     // =============================================================================
 
     #[test]
@@ -1331,8 +1334,8 @@ mod tests {
     fn test_emit_receipt_only_message_contains_key_phrases() {
         // Verify the emit-receipt-only message contains all required info
         assert!(
-            EMIT_RECEIPT_ONLY_MESSAGE.contains("TCK-00324"),
-            "Message must mention TCK-00324"
+            EMIT_RECEIPT_ONLY_MESSAGE.contains("TCK-00419"),
+            "Message must mention TCK-00419"
         );
         assert!(
             EMIT_RECEIPT_ONLY_MESSAGE.contains("EMIT-RECEIPT-ONLY"),
@@ -1367,15 +1370,15 @@ mod tests {
     #[test]
     #[serial]
     #[allow(unsafe_code)]
-    fn test_effective_cutover_policy_default_is_legacy() {
+    fn test_effective_cutover_policy_default_is_emit_only() {
         unsafe {
             std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
             std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
         }
         assert_eq!(
             effective_cutover_policy(),
-            CutoverPolicy::Legacy,
-            "Default cutover policy should be Legacy"
+            CutoverPolicy::EmitOnly,
+            "Stage-2 default cutover policy should be EmitOnly"
         );
         unsafe {
             std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
@@ -1428,11 +1431,11 @@ mod tests {
             std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
             std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
         }
-        // CLI flag false, no env vars -> Legacy
+        // CLI flag false, no env vars -> EmitOnly (Stage 2 default)
         assert_eq!(
             effective_cutover_policy_with_flag(false),
-            CutoverPolicy::Legacy,
-            "CLI flag false with no env vars should be Legacy"
+            CutoverPolicy::EmitOnly,
+            "CLI flag false with no env vars should be EmitOnly in Stage 2"
         );
         // CLI flag true, no env vars -> EmitOnly
         assert_eq!(

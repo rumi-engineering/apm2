@@ -24,16 +24,10 @@
       "parameters": {
         "required_status_checks": [
           {
-            "context": "CI Success"
+            "context": "Guardian Intelligence - Barrier"
           },
           {
-            "context": "ai-review/security"
-          },
-          {
-            "context": "ai-review/code-quality"
-          },
-          {
-            "context": "Review Gate Success"
+            "context": "Forge Admission Cycle"
           }
         ],
         "strict_required_status_checks_policy": true

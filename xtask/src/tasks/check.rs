@@ -16,10 +16,12 @@
 //! | All passed         | Wait for auto-merge, then cleanup             |
 //! | Already merged     | `cargo xtask finish` to cleanup               |
 
-use std::thread;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 use xshell::{Shell, cmd};
 
@@ -699,31 +701,59 @@ fn remediate_reviewer(
         return Ok(());
     }
 
-    // Check if the GitHub status is already completed (success or failure)
-    // If so, the reviewer finished successfully and we don't need to restart
-    let status_context = match reviewer_type {
-        "security" => "ai-review/security",
-        "quality" => "ai-review/code-quality",
-        _ => return Ok(()),
-    };
-
-    if is_review_completed(sh, &current_entry.head_sha, status_context) {
-        // Review completed, clean up the state entry and all temp files
-        let cleaned = cleanup_reviewer_temp_files(&mut state, reviewer_type);
-        state.save()?;
-        if cleaned.is_empty() {
-            println!(
-                "      {} review completed, cleaning up state",
-                capitalize(reviewer_type)
-            );
+    // Check if the reviewer has already posted a machine-readable review
+    // artifact bound to the recorded HEAD SHA. If so, the reviewer finished
+    // and we don't need to restart.
+    if is_review_completed_by_comment(
+        sh,
+        &current_entry.pr_url,
+        &current_entry.head_sha,
+        reviewer_type,
+    ) {
+        // Review completed. If we have captured output, validate it before
+        // cleaning up so shallow/non-compliant reviews are automatically
+        // re-run (bounded by restart_count).
+        if let Some(path) = current_entry.last_message_file.as_ref() {
+            match validate_reviewer_last_message(reviewer_type, &current_entry.head_sha, path) {
+                Ok(()) => {
+                    let cleaned = cleanup_reviewer_temp_files(&mut state, reviewer_type);
+                    state.save()?;
+                    if cleaned.is_empty() {
+                        println!(
+                            "      {} review completed, cleaning up state",
+                            capitalize(reviewer_type)
+                        );
+                    } else {
+                        println!(
+                            "      {} review completed, cleaned up {} temp file(s)",
+                            capitalize(reviewer_type),
+                            cleaned.len()
+                        );
+                    }
+                    return Ok(());
+                },
+                Err(reasons) => {
+                    println!(
+                        "      {} review completed, but output failed validation (will restart):",
+                        capitalize(reviewer_type)
+                    );
+                    for reason in reasons {
+                        println!("        - {reason}");
+                    }
+                    // Continue to restart logic below (do NOT clean up yet).
+                },
+            }
         } else {
+            // No capture file (older state entries). Clean up as before.
+            let cleaned = cleanup_reviewer_temp_files(&mut state, reviewer_type);
+            state.save()?;
             println!(
-                "      {} review completed, cleaned up {} temp file(s)",
+                "      {} review completed (no capture file), cleaned up {} temp file(s)",
                 capitalize(reviewer_type),
                 cleaned.len()
             );
+            return Ok(());
         }
-        return Ok(());
     }
 
     // Check restart count limit
@@ -779,64 +809,106 @@ fn remediate_reviewer(
     Ok(())
 }
 
-/// Check if a review status on GitHub is already completed (success or
-/// failure).
+/// Check if a reviewer has already posted a machine-readable review artifact
+/// bound to `head_sha`.
 ///
-/// Returns true if the status is not pending, false otherwise.
-fn is_review_completed(sh: &Shell, head_sha: &str, status_context: &str) -> bool {
-    // Get owner/repo from git remote
-    let remote_url = cmd!(sh, "git remote get-url origin")
-        .read()
-        .unwrap_or_default();
+/// This deliberately does **not** rely on legacy commit statuses. The
+/// authoritative signal is the comment artifact containing:
+/// - the category marker (security/code-quality)
+/// - the exact 40-hex head SHA
+fn is_review_completed_by_comment(
+    sh: &Shell,
+    pr_url: &str,
+    head_sha: &str,
+    reviewer_type: &str,
+) -> bool {
+    // Align with `xtask review-gate` (MAX_COMMENT_PAGES) to avoid reviewer
+    // churn on high-comment PRs.
+    const MAX_PAGES: u32 = 50;
 
-    let owner_repo = parse_owner_repo_for_check(&remote_url);
-    if owner_repo.is_empty() {
-        return false;
-    }
-
-    // Build the jq filter
-    let jq_filter = format!(".statuses[] | select(.context == \"{status_context}\") | .state");
-
-    // Get the status from GitHub
-    let api_path = format!("/repos/{owner_repo}/commits/{head_sha}/status");
-    let output = cmd!(sh, "gh api {api_path} --jq {jq_filter}")
-        .ignore_status()
-        .read();
-
-    // Couldn't check, assume not completed
-    output.is_ok_and(|state| {
-        let state = state.trim();
-        // If state is "success" or "failure", the review is completed
-        state == "success" || state == "failure"
-    })
-}
-
-/// Parse owner/repo from a GitHub remote URL (for check module).
-fn parse_owner_repo_for_check(url: &str) -> String {
-    // Parse formats like:
-    // - git@github.com:owner/repo.git
-    // - https://github.com/owner/repo.git
-    // - https://github.com/owner/repo
-    let url = url.trim();
-
-    // Extract the owner/repo part
-    let owner_repo = if url.contains("github.com:") {
-        // SSH format: git@github.com:owner/repo.git
-        url.split("github.com:")
-            .nth(1)
-            .unwrap_or("")
-            .trim_end_matches(".git")
-    } else if url.contains("github.com/") {
-        // HTTPS format: https://github.com/owner/repo.git
-        url.split("github.com/")
-            .nth(1)
-            .unwrap_or("")
-            .trim_end_matches(".git")
-    } else {
-        ""
+    let category = match reviewer_type {
+        "security" => crate::tasks::review_gate::ReviewCategory::Security,
+        "quality" => crate::tasks::review_gate::ReviewCategory::CodeQuality,
+        _ => return false,
     };
 
-    owner_repo.to_string()
+    let Some((owner_repo, pr_number)) = parse_pr_url_for_check(pr_url) else {
+        return false;
+    };
+
+    let Ok(trusted_reviewers) = crate::tasks::review_gate::load_trusted_reviewers_map(
+        std::path::Path::new(".github/review-gate/trusted-reviewers.json"),
+    ) else {
+        return false; // fail-closed: cannot validate trust
+    };
+
+    for page in 1..=MAX_PAGES {
+        let endpoint =
+            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
+        let output = cmd!(sh, "gh api {endpoint}").ignore_status().read().ok();
+
+        let Some(payload) = output else {
+            return false; // couldn't check, assume not completed
+        };
+
+        let comments: Vec<GithubIssueCommentForCheck> = match serde_json::from_str(&payload) {
+            Ok(comments) => comments,
+            Err(_) => return false,
+        };
+
+        if comments.is_empty() {
+            break;
+        }
+
+        for comment in comments {
+            let Some(body) = comment.body else {
+                continue;
+            };
+
+            if crate::tasks::review_gate::is_authoritative_review_artifact_for_head(
+                &body,
+                category,
+                pr_number.into(),
+                head_sha,
+                &trusted_reviewers,
+                &comment.user.login,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubIssueCommentForCheck {
+    body: Option<String>,
+    user: GithubIssueCommentUserForCheck,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubIssueCommentUserForCheck {
+    login: String,
+}
+
+fn parse_pr_url_for_check(pr_url: &str) -> Option<(String, u32)> {
+    let url = pr_url.trim();
+    let path = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let path = path.strip_prefix("github.com/")?;
+
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 4 || parts[2] != "pull" {
+        return None;
+    }
+
+    let owner = parts[0];
+    let repo = parts[1];
+    let pr_number: u32 = parts[3].parse().ok()?;
+    Some((format!("{owner}/{repo}"), pr_number))
 }
 
 /// Restart a review using the PR URL and HEAD SHA from the state file.
@@ -887,8 +959,128 @@ fn restart_review(
     Ok(())
 }
 
+fn validate_reviewer_last_message(
+    reviewer_type: &str,
+    expected_head_sha: &str,
+    path: &std::path::Path,
+) -> std::result::Result<(), Vec<String>> {
+    let mut reasons = Vec::new();
+
+    let content = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(e) => {
+            reasons.push(format!(
+                "Could not read last-message capture file {}: {e}",
+                path.display()
+            ));
+            return Err(reasons);
+        },
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        reasons.push("Last-message capture file is empty".to_string());
+        return Err(reasons);
+    }
+
+    // Minimal size threshold: shallow reviews tend to be tiny and omit
+    // required sections. Keep this conservative to avoid false restarts on
+    // small PRs.
+    if trimmed.len() < 800 {
+        reasons.push(format!(
+            "Review output too short ({} chars); expected a structured review comment",
+            trimmed.len()
+        ));
+    }
+
+    let (banner_prefix, marker, required_sections): (&str, &str, &[&str]) = match reviewer_type {
+        "security" => (
+            "## Security Review:",
+            "<!-- apm2-review-metadata:v1:security -->",
+            &[
+                "Summary",
+                "SCP Determination",
+                "Markov Blanket",
+                "Machine-Readable Metadata",
+            ],
+        ),
+        "quality" => (
+            "## Code Quality Review:",
+            "<!-- apm2-review-metadata:v1:code-quality -->",
+            &[
+                "Summary",
+                "Quality Analysis",
+                "Lenses Applied",
+                "Machine-Readable Metadata",
+            ],
+        ),
+        _ => (
+            "##",
+            "<!-- apm2-review-metadata:v1:",
+            &["Machine-Readable Metadata"],
+        ),
+    };
+
+    if !trimmed.contains(banner_prefix) {
+        reasons.push(format!(
+            "Missing required verdict banner starting with `{banner_prefix}`"
+        ));
+    }
+
+    if !trimmed.contains(marker) {
+        reasons.push(format!("Missing required metadata marker `{marker}`"));
+    }
+
+    if !trimmed
+        .to_ascii_lowercase()
+        .contains(&expected_head_sha.to_ascii_lowercase())
+    {
+        reasons.push(format!(
+            "Missing expected head SHA {expected_head_sha} in output (gate requires SHA binding)"
+        ));
+    }
+
+    for section in required_sections {
+        if !trimmed.contains(section) {
+            reasons.push(format!("Missing required section keyword `{section}`"));
+        }
+    }
+
+    let file_refs = count_file_references(trimmed);
+    if file_refs < 5 {
+        reasons.push(format!(
+            "Too few file references ({file_refs}); expected at least 5 concrete file paths"
+        ));
+    }
+
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
+}
+
+fn file_reference_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Conservative file reference matcher for APM2-style reviews.
+        Regex::new(
+            r"(?m)\b[\w./@-]+\.(?:rs|toml|yml|yaml|md|sh|json|proto|lock)(?::\d+(?::\d+)?)?\b",
+        )
+        .expect("file reference regex must compile")
+    })
+}
+
+fn count_file_references(text: &str) -> usize {
+    file_reference_regex().find_iter(text).count()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+
     use super::*;
 
     #[test]
@@ -1259,5 +1451,139 @@ mod tests {
     fn test_exit_timeout_constant() {
         // Verify the timeout exit code is 2 as required
         assert_eq!(EXIT_TIMEOUT, 2);
+    }
+
+    #[test]
+    fn test_parse_pr_url_for_check_accepts_valid_urls() {
+        assert_eq!(
+            parse_pr_url_for_check("https://github.com/guardian-intelligence/apm2/pull/502"),
+            Some(("guardian-intelligence/apm2".to_string(), 502))
+        );
+        assert_eq!(
+            parse_pr_url_for_check("http://github.com/guardian-intelligence/apm2/pull/1"),
+            Some(("guardian-intelligence/apm2".to_string(), 1))
+        );
+        assert_eq!(
+            parse_pr_url_for_check("github.com/guardian-intelligence/apm2/pull/999"),
+            Some(("guardian-intelligence/apm2".to_string(), 999))
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_url_for_check_rejects_invalid_urls() {
+        assert_eq!(parse_pr_url_for_check(""), None);
+        assert_eq!(
+            parse_pr_url_for_check("https://example.com/x/y/pull/1"),
+            None
+        );
+        assert_eq!(
+            parse_pr_url_for_check("https://github.com/guardian-intelligence/apm2/issues/1"),
+            None
+        );
+        assert_eq!(
+            parse_pr_url_for_check(
+                "https://github.com/guardian-intelligence/apm2/pull/not-a-number"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_count_file_references_counts_paths_and_line_numbers() {
+        let text = r"
+Some findings:
+- crates/apm2-cli/src/commands/ci.rs:42
+- .github/workflows/ci.yml:12:3
+- documents/reviews/CI_EXPECTATIONS.md
+- scripts/ci/run_bounded_tests.sh:216
+- proto/kernel_events.proto:1
+";
+        assert_eq!(count_file_references(text), 5);
+    }
+
+    #[test]
+    fn test_validate_reviewer_last_message_quality_happy_path() {
+        let sha = "a".repeat(40);
+        let mut file = NamedTempFile::new().expect("temp file");
+
+        // Ensure output is large enough to avoid "too short" restarts.
+        let filler = "x".repeat(900);
+        let body = format!(
+            r#"## Code Quality Review: PASS
+
+Summary
+This is a synthetic review body for testing.
+
+Quality Analysis
+Notes.
+
+Lenses Applied
+Notes.
+
+Machine-Readable Metadata
+
+Evidence references:
+- crates/apm2-cli/src/commands/ci.rs:42
+- .github/workflows/ci.yml:12
+- documents/reviews/CI_EXPECTATIONS.md:31
+- scripts/ci/run_bounded_tests.sh:216
+- proto/kernel_events.proto:1
+
+{sha}
+
+<!-- apm2-review-metadata:v1:code-quality -->
+```json
+{{"schema":"apm2.review.metadata.v1","review_type":"code-quality","pr_number":1,"head_sha":"{sha}","verdict":"PASS","severity_counts":{{"blocker":0,"major":0,"minor":0,"nit":0}},"reviewer_id":"apm2-codex-quality"}}
+```
+
+{filler}
+"#
+        );
+        file.write_all(body.as_bytes()).expect("write body");
+
+        let result = validate_reviewer_last_message("quality", &sha, file.path());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_validate_reviewer_last_message_quality_missing_sections() {
+        let sha = "b".repeat(40);
+        let mut file = NamedTempFile::new().expect("temp file");
+
+        let body = format!(
+            r#"## Code Quality Review: PASS
+
+Summary
+Only summary present.
+
+{sha}
+
+<!-- apm2-review-metadata:v1:code-quality -->
+```json
+{{"schema":"apm2.review.metadata.v1","review_type":"code-quality","pr_number":1,"head_sha":"{sha}","verdict":"PASS","severity_counts":{{"blocker":0,"major":0,"minor":0,"nit":0}},"reviewer_id":"apm2-codex-quality"}}
+```
+
+crates/apm2-cli/src/commands/ci.rs:42
+.github/workflows/ci.yml:12
+documents/reviews/CI_EXPECTATIONS.md:31
+scripts/ci/run_bounded_tests.sh:216
+proto/kernel_events.proto:1
+
+{}
+"#,
+            "x".repeat(900)
+        );
+        file.write_all(body.as_bytes()).expect("write body");
+
+        let result = validate_reviewer_last_message("quality", &sha, file.path());
+        let Err(reasons) = result else {
+            panic!("expected Err for missing sections");
+        };
+
+        // We should detect missing key sections.
+        let joined = reasons.join("\n");
+        assert!(joined.contains("Missing required section keyword `Quality Analysis`"));
+        assert!(joined.contains("Missing required section keyword `Lenses Applied`"));
+        assert!(joined.contains("Missing required section keyword `Machine-Readable Metadata`"));
     }
 }

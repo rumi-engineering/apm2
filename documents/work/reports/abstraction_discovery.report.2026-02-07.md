@@ -20,7 +20,7 @@
 - Dominance order enforced in selection/validation: `containment/security > verification/correctness > liveness/progress`
 
 ## PR Survey Table
-Window used: last 48h merged PRs from `gh pr list --state merged --limit 50` on `rumi-engineering/apm2`; then top 15 by approximate Rust changed lines (`gh pr diff --name-only` + change-line count approximation).
+Window used: last 48h merged PRs from `gh pr list --state merged --limit 50` on `guardian-intelligence/apm2`; then top 15 by approximate Rust changed lines (`gh pr diff --name-only` + change-line count approximation).
 
 | PR | Approx Rust Changed Lines | New Types (sample) | New Impls (sample) | Error Patterns | Builder/Constructor Patterns | Test Scaffolding |
 |---|---:|---|---|---|---|---|

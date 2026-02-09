@@ -466,8 +466,7 @@ fn create_pending_statuses(
         StatusWriteDecision::Removed => {
             println!("{PUSH_STATUS_PROJECTION_NOTICE}");
             println!("    Target commit: {owner_repo}@{head_sha}");
-            println!("      - ai-review/security  = pending (Waiting for security review)");
-            println!("      - ai-review/code-quality = pending (Waiting for code quality review)");
+            println!("      - Review Gate Success = pending (Waiting for AI reviews)");
             crate::util::print_status_writes_removed_notice();
         },
         // Legacy variants are inert after TCK-00297; keep projection-only output.
@@ -577,7 +576,7 @@ mod tests {
 
         // Test with a simple path (no log)
         let prompt_path = Path::new("/tmp/test_prompt.txt");
-        let shell_cmd = build_script_command(prompt_path, None, None);
+        let shell_cmd = build_script_command(prompt_path, None, None, None);
 
         // Verify command includes PTY allocation
         if cfg!(target_os = "macos") {
@@ -606,7 +605,7 @@ mod tests {
 
         // Test with a path containing spaces - must be properly quoted
         let special_path = Path::new("/tmp/test file.txt");
-        let special_cmd = build_script_command(special_path, None, None);
+        let special_cmd = build_script_command(special_path, None, None, None);
 
         // Verify the command is well-formed
         if cfg!(target_os = "macos") {
@@ -772,6 +771,35 @@ ticket_meta:
         // Cleanup
         unsafe {
             std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_stage2_default_is_emit_only() {
+        use crate::util::{
+            CutoverPolicy, XTASK_CUTOVER_POLICY_ENV, XTASK_EMIT_RECEIPT_ONLY_ENV,
+            effective_cutover_policy_with_flag,
+        };
+
+        // TCK-00419: Stage-2 default cutover policy is EmitOnly when no explicit
+        // override is present.
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
+        }
+
+        let policy = effective_cutover_policy_with_flag(false);
+        assert_eq!(
+            policy,
+            CutoverPolicy::EmitOnly,
+            "Stage-2 (TCK-00419): default cutover policy must be EmitOnly"
+        );
+
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+            std::env::remove_var(XTASK_EMIT_RECEIPT_ONLY_ENV);
         }
     }
 
