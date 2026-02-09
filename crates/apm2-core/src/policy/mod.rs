@@ -79,6 +79,7 @@ mod error;
 mod event;
 mod parser;
 mod schema;
+pub mod taint;
 mod validator;
 
 #[cfg(test)]
@@ -95,4 +96,10 @@ pub use parser::{
     parse_and_validate_policy, parse_policy,
 };
 pub use schema::{BudgetType, Decision, Policy, PolicyDocument, PolicyVersion, Rule, RuleType};
+pub use taint::{
+    BoundaryPolicy, ConfidentialityLevel, DataLabel, DeclassificationPolicy,
+    DeclassificationPreimage, DeclassificationReceipt, DualLatticePolicy, RfcConfidentialityLevel,
+    SignatureVerifier, TaintEnforcementGuard, TaintError, TaintLevel, propagate_classification,
+    propagate_taint,
+};
 pub use validator::{ValidatedPolicy, validate_policy};

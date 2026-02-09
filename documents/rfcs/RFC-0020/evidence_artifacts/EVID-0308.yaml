@@ -1,0 +1,91 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0308"
+  title: "Declassification receipt security and correctness evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that declassification receipts enforce RFC-0020 Section 5
+    security properties:
+    - Receipt issuance requires matching policy rule and valid parameters
+    - Content-addressed BLAKE3 hash with length-prefixed canonical hashing
+    - Authority signature verification (fail-closed when no verifier)
+    - Boundary-scoped receipts (cross-boundary replay rejected)
+    - Receipt freshness with issued_at_ms/expires_at_ms (expired receipts rejected)
+    - Receipt field size bounds (MAX_SIGNATURE_SIZE, MAX_POLICY_REF_LEN, etc.)
+    - Forged/tampered receipt detection via hash recomputation
+    - Duplicate policy ID rejection at construction time
+    - Mandatory 32-byte BLAKE3 digest for payload_hash and envelope_hash
+      (empty/short/long hashes rejected at both issuance and consumption)
+    - Expiry-based eviction of consumed receipt anti-replay entries
+    - Bounded deserialization via proper serde visitors (pre-allocation size checks)
+    - Library-only module with explicit daemon-wiring TODO (TCK-00378-daemon)
+
+    Covers declassification receipt issuance, verification, replay protection,
+    tamper detection, effect-binding hash enforcement, anti-replay eviction,
+    and adversarial resistance.
+  requirement_ids:
+    - "REQ-0032"
+  source_refs:
+    - "crates/apm2-core/src/policy/taint.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        Declassification receipt tests:
+        Receipt issuance:
+        - declassification_produces_receipt: valid receipt created with all fields
+        - declassification_receipt_hash_is_deterministic: same inputs -> same hash
+        - declassification_receipt_hash_varies_with_justification/authority/boundary: hash domain separation
+        - declassification_two_step_chain: multi-step Secret->Internal->Public chain
+        Declassification denial:
+        - declassification_denied_without_matching_rule: unauthorized range rejected
+        - declassification_denied_wrong_rule_id: nonexistent rule rejected
+        - declassification_denied_not_a_downgrade: upgrade attempt rejected
+        - declassification_denied_same_level: no-op attempt rejected
+        - declassification_denied_empty_policy_ref/authority_id/boundary_id: empty fields rejected
+        - declassification_denied_long_justification/authority_id/boundary_id: oversized fields rejected
+        Receipt freshness (replay protection):
+        - expired_receipt_rejected: receipt at or after expires_at_ms rejected
+        - receipt_before_issuance_rejected: now_ms before issued_at_ms rejected
+        - receipt_lifetime_exceeds_max_rejected_at_creation: over-long lifetime rejected
+        - receipt_invalid_timestamps_rejected_at_creation: equal timestamps rejected
+        - receipt_well_after_expiry_rejected: long-expired receipt rejected
+        Boundary propagation with declassification:
+        - propagation_with_receipt_allows_declassified_crossing: valid receipt declassifies
+        - propagation_with_receipt_rejects_wrong_boundary: cross-boundary replay rejected
+        - propagation_with_receipt_passes_when_already_within_clearance: unnecessary receipt still validated
+        - propagation_with_receipt_rejects_insufficient_downgrade: partial downgrade rejected
+        Forged receipt adversarial tests:
+        - forged_receipt_wrong_content_hash_rejected: tampered hash detected
+        - forged_receipt_tampered_fields_rejected: field tampering detected
+        - forged_receipt_invalid_policy_ref_rejected: nonexistent rule via correct hash rejected
+        - forged_receipt_unauthorized_level_transition_rejected: unauthorized transition rejected
+        Authority signature verification:
+        - signature_rejected_when_no_verifier_provided: fail-closed without verifier
+        - signature_rejected_when_empty: empty signature rejected
+        - signature_rejected_when_invalid: wrong signature rejected
+        - signature_accepted_when_valid: correct signature accepted
+        Oversized signature:
+        - oversized_signature_rejected_at_creation: MAX_SIGNATURE_SIZE enforced at issuance
+        - oversized_signature_rejected_at_consumption: MAX_SIGNATURE_SIZE enforced at verification
+        - max_size_signature_accepted: exactly MAX_SIGNATURE_SIZE accepted
+        Receipt field size validation at consumption:
+        - oversized_policy_ref_rejected_at_consumption: deserialized oversized field caught
+        - oversized_justification_rejected_at_consumption: deserialized oversized field caught
+        - oversized_authority_id_rejected_at_consumption: deserialized oversized field caught
+        - oversized_boundary_id_rejected_at_consumption: deserialized oversized field caught
+        Length-framed hash collision prevention:
+        - hash_length_framing_prevents_field_boundary_collision: auth="ab"+bnd="cd" != auth="abc"+bnd="d"
+        - hash_length_framing_prevents_rule_justification_collision: rule/justification split varies hash
+        Mandatory 32-byte BLAKE3 effect hash enforcement:
+        - empty_payload_hash_rejected_at_issuance: empty payload_hash rejected
+        - empty_envelope_hash_rejected_at_issuance: empty envelope_hash rejected
+        - short_payload_hash_rejected_at_issuance: 16-byte hash rejected (need 32)
+        - long_payload_hash_rejected_at_issuance: 33-byte hash rejected (need 32)
+        - exact_32_byte_hashes_accepted_at_issuance: exactly 32 bytes accepted
+        - empty_expected_hashes_rejected_at_consumption: empty expected hash rejected at consumption
+        Anti-replay eviction:
+        - anti_replay_evicts_expired_entries_before_capacity_check: expired entries evicted before cap
+        - anti_replay_saturation_still_works_with_expiry_eviction: full set recovers via eviction
+        - anti_replay_capacity_exceeded_without_evictable_entries_fails: fail-closed when non-evictable
+      ref: "cargo test -p apm2-core taint"
