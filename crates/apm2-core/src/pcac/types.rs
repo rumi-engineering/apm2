@@ -10,13 +10,14 @@
 //! cardinality limits via [`AuthorityJoinInputV1::validate`]. Violations
 //! produce deterministic denials (fail-closed).
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::crypto::Hash;
 
 mod signature_bytes_serde {
-    use serde::de::Error;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
 
     pub fn serialize<S>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -25,15 +26,74 @@ mod signature_bytes_serde {
         serializer.serialize_bytes(value)
     }
 
+    /// Bounded deserializer for 64-byte Ed25519 signatures.
+    ///
+    /// Rejects oversized payloads during deserialization, avoiding
+    /// unbounded allocation through intermediary `Vec<u8>`.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
     where
         D: Deserializer<'de>,
     {
-        let bytes = <Vec<u8>>::deserialize(deserializer)?;
-        let len = bytes.len();
-        bytes
-            .try_into()
-            .map_err(|_| D::Error::invalid_length(len, &"exactly 64 bytes"))
+        struct SignatureBytesVisitor;
+
+        impl<'de> Visitor<'de> for SignatureBytesVisitor {
+            type Value = [u8; 64];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a byte sequence of exactly 64 bytes")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if let Some(size) = seq.size_hint() {
+                    if size > 64 {
+                        return Err(de::Error::custom(format!(
+                            "signature too long: more than 64 bytes ({size})"
+                        )));
+                    }
+                }
+
+                let mut arr = [0u8; 64];
+                for (i, slot) in arr.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                }
+
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::custom("signature too long: more than 64 bytes"));
+                }
+
+                Ok(arr)
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v.len() != 64 {
+                    return Err(E::custom(format!(
+                        "expected 64 bytes for signature, got {}",
+                        v.len()
+                    )));
+                }
+
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(v);
+                Ok(arr)
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_bytes(&v)
+            }
+        }
+
+        deserializer.deserialize_seq(SignatureBytesVisitor)
     }
 }
 
@@ -71,6 +131,54 @@ pub const MAX_FIELD_NAME_LENGTH: usize = 128;
 
 /// Maximum length for operation strings in deny classes.
 pub const MAX_OPERATION_LENGTH: usize = 256;
+
+// =============================================================================
+// Deserialization helpers
+// =============================================================================
+
+/// Serde deserializer that enforces [`MAX_STRING_LENGTH`] during
+/// deserialization.
+///
+/// This rejects oversized strings at the protocol boundary so large payloads
+/// cannot bypass size constraints until `validate()` time.
+pub fn deserialize_bounded_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedStringVisitor;
+
+    impl Visitor<'_> for BoundedStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "a string with at most {MAX_STRING_LENGTH} bytes")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            if v.len() > MAX_STRING_LENGTH {
+                return Err(E::custom(format!(
+                    "string field length {} exceeds maximum {}",
+                    v.len(),
+                    MAX_STRING_LENGTH,
+                )));
+            }
+            Ok(v.to_owned())
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            if v.len() > MAX_STRING_LENGTH {
+                return Err(E::custom(format!(
+                    "string field length {} exceeds maximum {}",
+                    v.len(),
+                    MAX_STRING_LENGTH,
+                )));
+            }
+            Ok(v)
+        }
+    }
+
+    deserializer.deserialize_string(BoundedStringVisitor)
+}
 
 // =============================================================================
 // Identity Evidence Level
@@ -627,6 +735,7 @@ pub struct AuthorityConsumedV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SovereigntyEpoch {
     /// Unique epoch identifier.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub epoch_id: String,
 
     /// The freshness tick at which this epoch was last observed.

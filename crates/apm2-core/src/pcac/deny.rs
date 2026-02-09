@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{
     MAX_DESCRIPTION_LENGTH, MAX_FIELD_NAME_LENGTH, MAX_OPERATION_LENGTH, MAX_REASON_LENGTH,
-    PcacValidationError, RiskTier,
+    MAX_STRING_LENGTH, PcacValidationError, RiskTier, deserialize_bounded_string,
 };
 use crate::crypto::Hash;
 
@@ -132,6 +132,7 @@ pub enum AuthorityDenyClass {
     /// Sovereignty epoch evidence is stale for Tier2+ operations.
     StaleSovereigntyEpoch {
         /// The epoch that was checked.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
         epoch_id: String,
         /// Last known freshness tick for this epoch.
         last_known_tick: u64,
@@ -142,6 +143,7 @@ pub enum AuthorityDenyClass {
     /// Principal revocation head state is unknown or ambiguous.
     UnknownRevocationHead {
         /// The principal whose revocation head is unknown.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
         principal_id: String,
     },
 
@@ -170,6 +172,7 @@ pub enum AuthorityDenyClass {
     /// Sovereignty uncertainty triggered a freeze action.
     SovereigntyUncertainty {
         /// Reason for the sovereignty uncertainty.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
         reason: String,
     },
 
@@ -383,6 +386,33 @@ impl AuthorityDenyClass {
                     });
                 }
             },
+            Self::StaleSovereigntyEpoch { epoch_id, .. } => {
+                if epoch_id.len() > MAX_STRING_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "epoch_id",
+                        len: epoch_id.len(),
+                        max: MAX_STRING_LENGTH,
+                    });
+                }
+            },
+            Self::UnknownRevocationHead { principal_id } => {
+                if principal_id.len() > MAX_STRING_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "principal_id",
+                        len: principal_id.len(),
+                        max: MAX_STRING_LENGTH,
+                    });
+                }
+            },
+            Self::SovereigntyUncertainty { reason } => {
+                if reason.len() > MAX_STRING_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "reason",
+                        len: reason.len(),
+                        max: MAX_STRING_LENGTH,
+                    });
+                }
+            },
             Self::VerifierEconomicsBoundsExceeded { operation, .. } => {
                 if operation.len() > MAX_OPERATION_LENGTH {
                     return Err(PcacValidationError::StringTooLong {
@@ -392,7 +422,7 @@ impl AuthorityDenyClass {
                     });
                 }
             },
-            // All other variants have no unbounded string fields.
+            // All remaining variants have no string fields requiring checks.
             _ => {},
         }
         Ok(())

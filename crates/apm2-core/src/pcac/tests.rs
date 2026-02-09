@@ -72,6 +72,16 @@ fn valid_consume_record() -> AuthorityConsumeRecordV1 {
     }
 }
 
+fn valid_sovereignty_epoch() -> SovereigntyEpoch {
+    SovereigntyEpoch {
+        epoch_id: "epoch-001".to_string(),
+        freshness_tick: 100,
+        principal_scope_hash: test_hash(0x41),
+        signer_public_key: test_hash(0x42),
+        signature: [0xAA; 64],
+    }
+}
+
 // =============================================================================
 // Schema presence tests
 // =============================================================================
@@ -517,6 +527,14 @@ fn consume_record_serde_roundtrip() {
     let json = serde_json::to_string(&record).unwrap();
     let back: AuthorityConsumeRecordV1 = serde_json::from_str(&json).unwrap();
     assert_eq!(back, record);
+}
+
+#[test]
+fn sovereignty_epoch_serde_roundtrip() {
+    let epoch = valid_sovereignty_epoch();
+    let json = serde_json::to_string(&epoch).unwrap();
+    let back: SovereigntyEpoch = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, epoch);
 }
 
 // =============================================================================
@@ -1205,6 +1223,117 @@ fn authority_deny_v1_validates_embedded_class() {
         containment_action: None,
     };
     assert!(deny.validate().is_err());
+}
+
+#[test]
+fn oversize_stale_sovereignty_epoch_epoch_id_rejected_by_validator() {
+    let class = AuthorityDenyClass::StaleSovereigntyEpoch {
+        epoch_id: "x".repeat(types::MAX_STRING_LENGTH + 1),
+        last_known_tick: 100,
+        current_tick: 300,
+    };
+    let err = class.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "epoch_id")
+    );
+}
+
+#[test]
+fn oversize_unknown_revocation_head_principal_id_rejected_by_validator() {
+    let class = AuthorityDenyClass::UnknownRevocationHead {
+        principal_id: "x".repeat(types::MAX_STRING_LENGTH + 1),
+    };
+    let err = class.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "principal_id")
+    );
+}
+
+#[test]
+fn oversize_sovereignty_uncertainty_reason_rejected_by_validator() {
+    let class = AuthorityDenyClass::SovereigntyUncertainty {
+        reason: "x".repeat(types::MAX_STRING_LENGTH + 1),
+    };
+    let err = class.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "reason")
+    );
+}
+
+// =============================================================================
+// Bounded deserialization tests (Security BLOCKER)
+// =============================================================================
+
+#[test]
+fn sovereignty_epoch_deserialize_rejects_oversize_epoch_id() {
+    let mut value = serde_json::to_value(valid_sovereignty_epoch()).unwrap();
+    value["epoch_id"] = serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+    let result: Result<SovereigntyEpoch, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized epoch_id must be rejected");
+}
+
+#[test]
+fn sovereignty_epoch_deserialize_rejects_oversize_signature() {
+    let mut value = serde_json::to_value(valid_sovereignty_epoch()).unwrap();
+    let oversized = [0xAA_u8; 65];
+    value["signature"] = serde_json::Value::Array(
+        oversized
+            .iter()
+            .map(|&b| serde_json::Value::Number(b.into()))
+            .collect(),
+    );
+
+    let result: Result<SovereigntyEpoch, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized signature must be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("64") || err.contains("signature too long"),
+        "expected size-bound error, got: {err}"
+    );
+}
+
+#[test]
+fn deny_class_deserialize_rejects_oversize_stale_sovereignty_epoch_epoch_id() {
+    let mut value = serde_json::to_value(AuthorityDenyClass::StaleSovereigntyEpoch {
+        epoch_id: "epoch-001".to_string(),
+        last_known_tick: 100,
+        current_tick: 300,
+    })
+    .unwrap();
+    value["stale_sovereignty_epoch"]["epoch_id"] =
+        serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+
+    let result: Result<AuthorityDenyClass, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized epoch_id must be rejected");
+}
+
+#[test]
+fn deny_class_deserialize_rejects_oversize_unknown_revocation_head_principal_id() {
+    let mut value = serde_json::to_value(AuthorityDenyClass::UnknownRevocationHead {
+        principal_id: "principal-001".to_string(),
+    })
+    .unwrap();
+    value["unknown_revocation_head"]["principal_id"] =
+        serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+
+    let result: Result<AuthorityDenyClass, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized principal_id must be rejected");
+}
+
+#[test]
+fn deny_class_deserialize_rejects_oversize_sovereignty_uncertainty_reason() {
+    let mut value = serde_json::to_value(AuthorityDenyClass::SovereigntyUncertainty {
+        reason: "uncertain".to_string(),
+    })
+    .unwrap();
+    value["sovereignty_uncertainty"]["reason"] =
+        serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+
+    let result: Result<AuthorityDenyClass, _> = serde_json::from_value(value);
+    assert!(
+        result.is_err(),
+        "oversized uncertainty reason must be rejected"
+    );
 }
 
 // =============================================================================
