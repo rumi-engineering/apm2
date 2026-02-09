@@ -30,6 +30,7 @@ env:
 jobs:
   barrier:
     name: Guardian Intelligence / Barrier
+    if: ${{ github.event_name == 'pull_request_target' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -50,54 +51,76 @@ jobs:
           }
 
           event_name="$GITHUB_EVENT_NAME"
-          repo="$GITHUB_REPOSITORY"
-          actor="$GITHUB_ACTOR"
+          [[ "$event_name" == "pull_request_target" ]] || fail "barrier only supports pull_request_target"
 
-          case "$event_name" in
-            pull_request_target)
-              pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
-              association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
-              [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
-              case "$association" in
-                OWNER|MEMBER|COLLABORATOR) ;;
-                *)
-                  fail "unauthorized pull_request_target author_association=$association for PR #$pr_number"
-                  ;;
-              esac
-              echo "barrier: authorized pull_request_target pr=$pr_number association=$association"
-              ;;
-            workflow_dispatch)
-              pr_number="$(jq -r '.inputs.pr_number // .client_payload.pr_number // empty' "$GITHUB_EVENT_PATH")"
-              [[ -n "$pr_number" ]] || fail "workflow_dispatch requires inputs.pr_number"
-
-              pr_json="$(gh api "repos/$repo/pulls/$pr_number")" || fail "failed to load PR #$pr_number"
-              base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
-              [[ -n "$base_ref" ]] || fail "PR #$pr_number missing base.ref"
-
-              default_branch="$(gh api "repos/$repo" --jq '.default_branch')"
-              dispatch_ref="${GITHUB_REF_NAME:-}"
-              [[ -n "$dispatch_ref" ]] || fail "missing GITHUB_REF_NAME for workflow_dispatch"
-              if [[ "$dispatch_ref" != "$base_ref" && "$dispatch_ref" != "$default_branch" ]]; then
-                fail "workflow_dispatch ref=$dispatch_ref is not trusted (base=$base_ref default=$default_branch)"
-              fi
-
-              permission="$(gh api "repos/$repo/collaborators/$actor/permission" --jq '.permission // empty' 2>/dev/null || true)"
-              case "$permission" in
-                admin|maintain|write) ;;
-                *)
-                  fail "workflow_dispatch actor=$actor lacks permission (need write|maintain|admin, got ${permission:-none})"
-                  ;;
-              esac
-              echo "barrier: authorized workflow_dispatch pr=$pr_number ref=$dispatch_ref actor_permission=$permission"
-              ;;
+          pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
+          association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
+          [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
+          case "$association" in
+            OWNER|MEMBER|COLLABORATOR) ;;
             *)
-              fail "unsupported event_name=$event_name"
+              fail "unauthorized pull_request_target author_association=$association for PR #$pr_number"
               ;;
           esac
+          echo "barrier: authorized pull_request_target pr=$pr_number association=$association"
+
+  dispatch-auth:
+    name: Guardian Intelligence / Dispatch Auth
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate workflow_dispatch trust boundary (fast path)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "dispatch-auth: $1" >&2
+            exit 1
+          }
+
+          repo="$GITHUB_REPOSITORY"
+          actor="$GITHUB_ACTOR"
+          pr_number="$(jq -r '.inputs.pr_number // .client_payload.pr_number // empty' "$GITHUB_EVENT_PATH")"
+          [[ -n "$pr_number" ]] || fail "workflow_dispatch requires inputs.pr_number"
+
+          pr_json="$(gh api "repos/$repo/pulls/$pr_number")" || fail "failed to load PR #$pr_number"
+          base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
+          [[ -n "$base_ref" ]] || fail "PR #$pr_number missing base.ref"
+
+          default_branch="$(gh api "repos/$repo" --jq '.default_branch')"
+          dispatch_ref="${GITHUB_REF_NAME:-}"
+          [[ -n "$dispatch_ref" ]] || fail "missing GITHUB_REF_NAME for workflow_dispatch"
+          if [[ "$dispatch_ref" != "$base_ref" && "$dispatch_ref" != "$default_branch" ]]; then
+            fail "workflow_dispatch ref=$dispatch_ref is not trusted (base=$base_ref default=$default_branch)"
+          fi
+
+          permission="$(gh api "repos/$repo/collaborators/$actor/permission" --jq '.permission // empty' 2>/dev/null || true)"
+          case "$permission" in
+            admin|maintain|write) ;;
+            *)
+              fail "workflow_dispatch actor=$actor lacks permission (need write|maintain|admin, got ${permission:-none})"
+              ;;
+          esac
+          echo "dispatch-auth: authorized workflow_dispatch pr=$pr_number ref=$dispatch_ref actor_permission=$permission"
 
   forge-admission-cycle:
     name: apm2 / Forge Admission Cycle
-    needs: [barrier]
+    needs: [barrier, dispatch-auth]
+    if: >
+      ${{
+        always() &&
+        (
+          (github.event_name == 'pull_request_target' && needs.barrier.result == 'success') ||
+          (github.event_name == 'workflow_dispatch' && needs.dispatch-auth.result == 'success')
+        )
+      }}
     runs-on: [self-hosted, linux, x64, fac-ovh]
     timeout-minutes: 90
     steps:
@@ -126,7 +149,7 @@ jobs:
           : >"${private_log}"
           chmod 600 "${private_log}"
 
-          health_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z security=[^[:space:]]+ quality=[^[:space:]]+ events=.*$'
+          health_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z sha=[^[:space:]]+ current_head_sha=[^[:space:]]+ security=[^[:space:]]+ quality=[^[:space:]]+ events=.*$'
 
           set +e
           cargo run --locked --quiet -p apm2-cli -- fac kickoff \

@@ -375,6 +375,7 @@ pub struct KickoffArgs {
     ///
     /// Use this mode for public log surfaces (for example GitHub Actions logs).
     /// Any rich diagnostics must stay on private runner-local storage.
+    /// Non-health diagnostics are emitted to stderr for private runner logs.
     #[arg(long, default_value_t = false)]
     pub public_projection_only: bool,
 }
@@ -728,8 +729,8 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             &args.event,
             &args.event_name,
             args.max_wait_seconds,
-            json_output,
             args.public_projection_only,
+            json_output,
         ),
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Run(run_args) => fac_review::run_review(
