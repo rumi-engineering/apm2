@@ -719,6 +719,12 @@ pub struct RequestToolRequest {
     /// Deduplication key for idempotent requests.
     #[prost(string, tag = "4")]
     pub dedupe_key: ::prost::alloc::string::String,
+    /// Optional epoch seal payload for Tier2+ admission (TCK-00365).
+    /// When present, the broker verifies monotonicity, anti-equivocation,
+    /// and signature authenticity. Missing at Tier2+ causes fail-closed deny.
+    /// Serialized EpochSealV1 bytes (bincode or canonical encoding).
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub epoch_seal: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RequestToolResponse {

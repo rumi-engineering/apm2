@@ -2763,48 +2763,6 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         }
 
-        // Step 2b: Epoch seal verification for Tier2+ admission (TCK-00365).
-        //
-        // Per REQ-0019, Tier2+ authority claims must present a valid epoch
-        // seal. The verifier enforces strict monotonicity, anti-equivocation,
-        // and signature authenticity. Missing or invalid seals at Tier2+ are
-        // denied (fail-closed).
-        //
-        // The request-carried epoch seal is consumed here when present.
-        // Tier0/Tier1 requests pass through without a seal; Tier2+ requests
-        // require a valid seal or are denied.
-        {
-            let core_risk_tier: apm2_core::fac::RiskTier = request.risk_tier.into();
-            if let Err(e) = self
-                .verify_epoch_seal(request.epoch_seal.as_ref(), core_risk_tier)
-                .await
-            {
-                // Only deny for Tier2+ (verify_with_policy returns Ok(None) for
-                // Tier0/Tier1 with no seal).
-                warn!(
-                    risk_tier = request.risk_tier.tier(),
-                    error = %e,
-                    "epoch seal verification failed (fail-closed)"
-                );
-                // TCK-00268: Emit tool mediation latency metric for epoch seal deny
-                if let Some(ref metrics) = self.metrics {
-                    let latency = start_time.elapsed().as_secs_f64();
-                    metrics
-                        .daemon_metrics()
-                        .record_tool_mediation_latency(tool_id, "deny", latency);
-                }
-                respond!(ToolDecision::Deny {
-                    request_id: request.request_id.clone(),
-                    reason: DenyReason::PolicyDenied {
-                        rule_id: "EPOCH_SEAL".to_string(),
-                        reason: e.to_string(),
-                    },
-                    rule_id: Some("EPOCH_SEAL".to_string()),
-                    policy_hash: self.policy.policy_hash(),
-                });
-            }
-        }
-
         // Step 3: Validate against capability manifest (OCAP check)
         // SECURITY: This MUST happen before cache lookup to prevent authorization
         // bypass
@@ -2998,9 +2956,57 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         }
 
-        // Step 5b: Check dedupe cache (only for authorized requests)
-        // SECURITY: Cache lookup occurs AFTER authorization AND path-ratchet
-        // enforcement to prevent bypass attacks.
+        // Step 5b: Epoch seal verification for Tier2+ admission (TCK-00365).
+        //
+        // SECURITY: This check runs AFTER path-ratchet (Step 5) so that
+        // path-ratchet's terminate+defect semantics for Tier3+ remain
+        // authoritative. If epoch-seal ran first, a missing seal would
+        // produce a plain deny, bypassing the mandatory termination and
+        // defect emission required by REQ-0029 for Tier3+ context-firewall
+        // violations detected by the ratchet.
+        //
+        // Per REQ-0019, Tier2+ authority claims must present a valid epoch
+        // seal. The verifier enforces strict monotonicity, anti-equivocation,
+        // and signature authenticity. Missing or invalid seals at Tier2+ are
+        // denied (fail-closed).
+        //
+        // Tier0/Tier1 requests pass through without a seal; Tier2+ requests
+        // require a valid seal or are denied.
+        {
+            let core_risk_tier: apm2_core::fac::RiskTier = request.risk_tier.into();
+            if let Err(e) = self
+                .verify_epoch_seal(request.epoch_seal.as_ref(), core_risk_tier)
+                .await
+            {
+                // Only deny for Tier2+ (verify_with_policy returns Ok(None) for
+                // Tier0/Tier1 with no seal).
+                warn!(
+                    risk_tier = request.risk_tier.tier(),
+                    error = %e,
+                    "epoch seal verification failed (fail-closed)"
+                );
+                // TCK-00268: Emit tool mediation latency metric for epoch seal deny
+                if let Some(ref metrics) = self.metrics {
+                    let latency = start_time.elapsed().as_secs_f64();
+                    metrics
+                        .daemon_metrics()
+                        .record_tool_mediation_latency(tool_id, "deny", latency);
+                }
+                respond!(ToolDecision::Deny {
+                    request_id: request.request_id.clone(),
+                    reason: DenyReason::PolicyDenied {
+                        rule_id: "EPOCH_SEAL".to_string(),
+                        reason: e.to_string(),
+                    },
+                    rule_id: Some("EPOCH_SEAL".to_string()),
+                    policy_hash: self.policy.policy_hash(),
+                });
+            }
+        }
+
+        // Step 5c: Check dedupe cache (only for authorized requests)
+        // SECURITY: Cache lookup occurs AFTER authorization, path-ratchet,
+        // AND epoch-seal enforcement to prevent bypass attacks.
         if self.config.use_dedupe_cache {
             if let Some(cached) = self
                 .lookup_dedupe(&request.episode_id, &request.dedupe_key, timestamp_ns)
@@ -6860,7 +6866,6 @@ policy:
         assert_eq!(defects[0].risk_tier, 3);
     }
 
-
     // =========================================================================
     // Epoch seal admission tests (TCK-00365)
     // =========================================================================
@@ -6936,11 +6941,12 @@ policy:
     }
 
     /// Helper: creates a `BrokerToolRequest` at a given risk tier with an
-    /// optional epoch seal.
-    fn make_request_at_tier(
+    /// optional epoch seal and a configurable path.
+    fn make_request_at_tier_with_path(
         id: &str,
         tier: RiskTier,
         seal: Option<apm2_core::htf::EpochSealV1>,
+        path: &str,
     ) -> BrokerToolRequest {
         let mut req = BrokerToolRequest::new(
             id,
@@ -6950,34 +6956,77 @@ policy:
             test_args_hash(),
             tier,
         )
-        .with_path("/workspace/file.rs");
+        .with_path(path);
         if let Some(s) = seal {
             req = req.with_epoch_seal(s);
         }
         req
     }
 
-    /// Helper: creates a broker with accept-all signature verifier and a
-    /// Read capability on `/workspace`.
-    async fn make_epoch_seal_test_broker() -> ToolBroker<StubManifestLoader> {
+    /// Context for epoch seal integration tests.
+    ///
+    /// Holds a `TempDir` with a real file on disk so the context firewall
+    /// and TOCTOU verification succeed. The broker has an accept-all
+    /// signature verifier, Read capability, and a context manifest covering
+    /// the temp file so path-ratchet clears at Tier2+.
+    struct EpochSealTestContext {
+        broker: ToolBroker<StubManifestLoader>,
+        file_path: String,
+        #[allow(dead_code)]
+        temp_dir: tempfile::TempDir,
+    }
+
+    /// Helper: creates a broker with accept-all signature verifier, a
+    /// Read capability, and a context manifest covering a real temp file
+    /// so path-ratchet + context firewall + TOCTOU all clear at Tier2+.
+    async fn make_epoch_seal_test_context() -> EpochSealTestContext {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("file.rs");
+        let file_content = b"// epoch seal test file\n";
+        std::fs::write(&file_path, file_content).unwrap();
+        let content_hash = *blake3::hash(file_content).as_bytes();
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let dir_path_str = temp_dir.path().to_string_lossy().to_string();
+
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
-            vec![PathBuf::from("/workspace")],
+            vec![PathBuf::from(&dir_path_str)],
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Load context manifest with the real file's hash so context
+        // firewall + TOCTOU verification succeed. Without this,
+        // path-ratchet denies Tier2+ before epoch-seal runs.
+        let context_manifest = make_context_manifest(
+            vec![(file_path_str.as_str(), content_hash)],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
         broker
             .set_epoch_seal_signature_verifier(Box::new(AcceptAllVerifier))
             .await;
-        broker
+
+        EpochSealTestContext {
+            broker,
+            file_path: file_path_str,
+            temp_dir,
+        }
     }
 
     #[tokio::test]
     async fn broker_epoch_seal_denies_tier2_without_seal() {
-        let broker = make_epoch_seal_test_broker().await;
+        let ctx = make_epoch_seal_test_context().await;
 
-        let request = make_request_at_tier("req-seal-1", RiskTier::Tier2, None);
-        let decision = broker
+        let request =
+            make_request_at_tier_with_path("req-seal-1", RiskTier::Tier2, None, &ctx.file_path);
+        let decision = ctx
+            .broker
             .request(&request, timestamp_ns(0), None)
             .await
             .unwrap();
@@ -6993,10 +7042,12 @@ policy:
 
     #[tokio::test]
     async fn broker_epoch_seal_allows_tier0_without_seal() {
-        let broker = make_epoch_seal_test_broker().await;
+        let ctx = make_epoch_seal_test_context().await;
 
-        let request = make_request_at_tier("req-seal-2", RiskTier::Tier0, None);
-        let decision = broker
+        let request =
+            make_request_at_tier_with_path("req-seal-2", RiskTier::Tier0, None, &ctx.file_path);
+        let decision = ctx
+            .broker
             .request(&request, timestamp_ns(0), None)
             .await
             .unwrap();
@@ -7009,10 +7060,12 @@ policy:
 
     #[tokio::test]
     async fn broker_epoch_seal_allows_tier1_without_seal() {
-        let broker = make_epoch_seal_test_broker().await;
+        let ctx = make_epoch_seal_test_context().await;
 
-        let request = make_request_at_tier("req-seal-3", RiskTier::Tier1, None);
-        let decision = broker
+        let request =
+            make_request_at_tier_with_path("req-seal-3", RiskTier::Tier1, None, &ctx.file_path);
+        let decision = ctx
+            .broker
             .request(&request, timestamp_ns(0), None)
             .await
             .unwrap();
@@ -7025,11 +7078,17 @@ policy:
 
     #[tokio::test]
     async fn broker_epoch_seal_valid_accepted() {
-        let broker = make_epoch_seal_test_broker().await;
+        let ctx = make_epoch_seal_test_context().await;
 
         let seal = make_epoch_seal(1);
-        let request = make_request_at_tier("req-seal-4", RiskTier::Tier2, Some(seal));
-        let decision = broker
+        let request = make_request_at_tier_with_path(
+            "req-seal-4",
+            RiskTier::Tier2,
+            Some(seal),
+            &ctx.file_path,
+        );
+        let decision = ctx
+            .broker
             .request(&request, timestamp_ns(0), None)
             .await
             .unwrap();
@@ -7042,12 +7101,18 @@ policy:
 
     #[tokio::test]
     async fn broker_epoch_seal_rollback_denied() {
-        let broker = make_epoch_seal_test_broker().await;
+        let ctx = make_epoch_seal_test_context().await;
 
         // Accept epoch 5 first
         let seal5 = make_epoch_seal(5);
-        let request5 = make_request_at_tier("req-seal-5a", RiskTier::Tier2, Some(seal5));
-        let decision5 = broker
+        let request5 = make_request_at_tier_with_path(
+            "req-seal-5a",
+            RiskTier::Tier2,
+            Some(seal5),
+            &ctx.file_path,
+        );
+        let decision5 = ctx
+            .broker
             .request(&request5, timestamp_ns(0), None)
             .await
             .unwrap();
@@ -7058,8 +7123,14 @@ policy:
 
         // Attempt rollback to epoch 3 — must be denied
         let seal3 = make_epoch_seal(3);
-        let request3 = make_request_at_tier("req-seal-5b", RiskTier::Tier2, Some(seal3));
-        let decision3 = broker
+        let request3 = make_request_at_tier_with_path(
+            "req-seal-5b",
+            RiskTier::Tier2,
+            Some(seal3),
+            &ctx.file_path,
+        );
+        let decision3 = ctx
+            .broker
             .request(&request3, timestamp_ns(1), None)
             .await
             .unwrap();
@@ -7075,38 +7146,75 @@ policy:
 
     #[tokio::test]
     async fn broker_epoch_seal_missing_seal_denied_at_tier3() {
-        let broker = make_epoch_seal_test_broker().await;
+        let ctx = make_epoch_seal_test_context().await;
 
-        let request = make_request_at_tier("req-seal-6", RiskTier::Tier3, None);
-        let decision = broker
+        let request =
+            make_request_at_tier_with_path("req-seal-6", RiskTier::Tier3, None, &ctx.file_path);
+        let decision = ctx
+            .broker
             .request(&request, timestamp_ns(0), None)
             .await
             .unwrap();
 
+        // At Tier3, path-ratchet is authoritative: capsule admission is
+        // Unavailable (mandatory at Tier3+), so path-ratchet denies before
+        // epoch-seal runs. This is the correct layering — path-ratchet
+        // enforces REQ-0028/REQ-0029 containment semantics which are stronger
+        // than epoch-seal's plain deny.
         assert!(
             decision.is_denied(),
-            "Tier3 without epoch seal must be denied"
+            "Tier3 without epoch seal must be denied (path-ratchet catches first)"
         );
         if let ToolDecision::Deny { rule_id, .. } = &decision {
-            assert_eq!(rule_id.as_deref(), Some("EPOCH_SEAL"));
+            assert_eq!(
+                rule_id.as_deref(),
+                Some("PATH_RATCHET"),
+                "path-ratchet is authoritative at Tier3 (capsule unavailable)"
+            );
         }
     }
 
     #[tokio::test]
     async fn broker_epoch_seal_rejected_by_signature_verifier() {
+        // Set up a real temp file for context firewall + TOCTOU
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("file.rs");
+        let file_content = b"// reject verifier test\n";
+        std::fs::write(&file_path, file_content).unwrap();
+        let content_hash = *blake3::hash(file_content).as_bytes();
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let dir_path_str = temp_dir.path().to_string_lossy().to_string();
+
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
-            vec![PathBuf::from("/workspace")],
+            vec![PathBuf::from(&dir_path_str)],
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Context manifest with real file hash so path-ratchet + TOCTOU clear
+        let context_manifest = make_context_manifest(
+            vec![(file_path_str.as_str(), content_hash)],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
         // Use reject-all verifier
         broker
             .set_epoch_seal_signature_verifier(Box::new(RejectAllVerifier))
             .await;
 
         let seal = make_epoch_seal(1);
-        let request = make_request_at_tier("req-seal-7", RiskTier::Tier2, Some(seal));
+        let request = make_request_at_tier_with_path(
+            "req-seal-7",
+            RiskTier::Tier2,
+            Some(seal),
+            &file_path_str,
+        );
         let decision = broker
             .request(&request, timestamp_ns(0), None)
             .await
@@ -8282,6 +8390,10 @@ policy:
     /// Per REQ-0028, capsule containment is mandatory at Tier3+, not Tier2.
     /// Capsule admission is reported as Unavailable (not yet wired), but
     /// Tier2 only gets a warning.
+    ///
+    /// NOTE: A valid epoch seal is provided because epoch-seal enforcement
+    /// (running after path-ratchet) requires one at Tier2+. This test's
+    /// purpose is to verify path-ratchet behavior, not epoch-seal.
     #[tokio::test]
     async fn test_path_ratchet_tier2_with_context_manifest_allowed_capsule_unavailable() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
@@ -8309,12 +8421,21 @@ policy:
             .await
             .unwrap();
 
-        let request = make_tiered_request(
+        // Configure epoch-seal verifier so the Tier2 request can pass
+        // epoch-seal enforcement after path-ratchet clears.
+        broker
+            .set_epoch_seal_signature_verifier(Box::new(AcceptAllVerifier))
+            .await;
+
+        let mut request = make_tiered_request(
             "req-ratchet-6",
             ToolClass::Write,
             Some("/workspace/file.rs"),
             RiskTier::Tier2,
         );
+        // Provide a valid epoch seal for Tier2 admission
+        request = request.with_epoch_seal(make_epoch_seal(1));
+
         let decision = broker
             .request(&request, timestamp_ns(0), None)
             .await

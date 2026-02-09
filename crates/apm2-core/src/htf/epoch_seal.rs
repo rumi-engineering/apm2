@@ -536,6 +536,34 @@ impl EpochSealV1 {
         hasher.update(&self.content_hash);
         *hasher.finalize().as_bytes()
     }
+
+    /// Serializes this seal to canonical JSON bytes for wire transport.
+    ///
+    /// This uses `serde_json` for deterministic, portable encoding. The
+    /// resulting bytes can be deserialized with [`Self::from_canonical_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EpochSealError::SerializationFailed`] if serialization fails.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, EpochSealError> {
+        serde_json::to_vec(self).map_err(|e| EpochSealError::SerializationFailed {
+            reason: e.to_string(),
+        })
+    }
+
+    /// Deserializes an `EpochSealV1` from canonical JSON bytes.
+    ///
+    /// This is the inverse of [`Self::to_canonical_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EpochSealError::DeserializationFailed`] if the bytes
+    /// cannot be parsed as a valid `EpochSealV1`.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, EpochSealError> {
+        serde_json::from_slice(bytes).map_err(|e| EpochSealError::DeserializationFailed {
+            reason: e.to_string(),
+        })
+    }
 }
 
 impl std::fmt::Display for EpochSealV1 {
@@ -611,6 +639,20 @@ pub enum EpochSealError {
     /// Authority seal hash must be non-zero.
     #[error("authority seal hash must be non-zero")]
     ZeroAuthoritySealHash,
+
+    /// Serialization to canonical bytes failed.
+    #[error("serialization failed: {reason}")]
+    SerializationFailed {
+        /// Why serialization failed.
+        reason: String,
+    },
+
+    /// Deserialization from canonical bytes failed.
+    #[error("deserialization failed: {reason}")]
+    DeserializationFailed {
+        /// Why deserialization failed.
+        reason: String,
+    },
 }
 
 // =============================================================================
@@ -880,13 +922,22 @@ impl EpochSealAuditEvent {
         let mut hasher = blake3::Hasher::new();
         hasher.update(EPOCH_SEAL_AUDIT_DOMAIN);
         hasher.update(self.kind().as_bytes());
+
+        // Helper closure: length-prefix a variable-length byte slice to
+        // prevent concatenation ambiguity. Fixed-size fields (u64, [u8; 32])
+        // do not need framing because their boundaries are unambiguous.
+        let hash_lp = |hasher: &mut blake3::Hasher, data: &[u8]| {
+            hasher.update(&(data.len() as u64).to_le_bytes());
+            hasher.update(data);
+        };
+
         match self {
             Self::Accepted {
                 issuer_cell_id,
                 epoch_number,
                 previous_epoch,
             } => {
-                hasher.update(issuer_cell_id.as_bytes());
+                hash_lp(&mut hasher, issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
                 hasher.update(&previous_epoch.to_le_bytes());
             },
@@ -895,7 +946,7 @@ impl EpochSealAuditEvent {
                 epoch_number,
                 last_accepted_epoch,
             } => {
-                hasher.update(issuer_cell_id.as_bytes());
+                hash_lp(&mut hasher, issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
                 hasher.update(&last_accepted_epoch.to_le_bytes());
             },
@@ -905,7 +956,7 @@ impl EpochSealAuditEvent {
                 existing_root_hash,
                 conflicting_root_hash,
             } => {
-                hasher.update(issuer_cell_id.as_bytes());
+                hash_lp(&mut hasher, issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
                 hasher.update(existing_root_hash);
                 hasher.update(conflicting_root_hash);
@@ -914,22 +965,22 @@ impl EpochSealAuditEvent {
                 hasher.update(&[*risk_tier as u8]);
             },
             Self::InvalidSeal { reason } | Self::ValidationFailed { reason } => {
-                hasher.update(reason.as_bytes());
+                hash_lp(&mut hasher, reason.as_bytes());
             },
             Self::SignatureRejected {
                 issuer_cell_id,
                 epoch_number,
                 reason,
             } => {
-                hasher.update(issuer_cell_id.as_bytes());
+                hash_lp(&mut hasher, issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
-                hasher.update(reason.as_bytes());
+                hash_lp(&mut hasher, reason.as_bytes());
             },
             Self::NoSignatureVerifier {
                 issuer_cell_id,
                 epoch_number,
             } => {
-                hasher.update(issuer_cell_id.as_bytes());
+                hash_lp(&mut hasher, issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
             },
             Self::EvictionReplayRejected {
@@ -937,7 +988,7 @@ impl EpochSealAuditEvent {
                 epoch_number,
                 evicted_high_water_epoch,
             } => {
-                hasher.update(issuer_cell_id.as_bytes());
+                hash_lp(&mut hasher, issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
                 hasher.update(&evicted_high_water_epoch.to_le_bytes());
             },
@@ -4194,5 +4245,100 @@ mod tests {
         let json = serde_json::to_string(&seal).expect("serialize");
         let roundtripped: EpochSealV1 = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(seal, roundtripped, "roundtrip must preserve all fields");
+    }
+
+    // =========================================================================
+    // Canonical Bytes Serialization Tests (TCK-00365)
+    // =========================================================================
+
+    #[test]
+    fn canonical_bytes_roundtrip() {
+        let seal = make_seal(7, "cell-gamma", 0x42);
+        let bytes = seal
+            .to_canonical_bytes()
+            .expect("serialization must succeed");
+        assert!(!bytes.is_empty(), "canonical bytes must be non-empty");
+        let deserialized =
+            EpochSealV1::from_canonical_bytes(&bytes).expect("deserialization must succeed");
+        assert_eq!(seal, deserialized, "roundtrip must preserve all fields");
+    }
+
+    #[test]
+    fn canonical_bytes_invalid_input_fails() {
+        let result = EpochSealV1::from_canonical_bytes(b"not valid json");
+        assert!(result.is_err(), "invalid bytes must fail deserialization");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EpochSealError::DeserializationFailed { .. }),
+            "error must be DeserializationFailed, got: {err:?}"
+        );
+    }
+
+    // =========================================================================
+    // Length-Prefix Collision Resistance Tests (TCK-00365 MAJOR-2)
+    // =========================================================================
+
+    /// Regression: without length-prefix framing, issuer="A" + reason="AA"
+    /// and issuer="AA" + reason="A" produce identical hash preimages when
+    /// concatenated directly. Length-prefix framing must prevent this.
+    #[test]
+    fn signature_rejected_hash_collision_resistance() {
+        let event_a = EpochSealAuditEvent::SignatureRejected {
+            issuer_cell_id: "A".to_string(),
+            epoch_number: 1,
+            reason: "AA".to_string(),
+        };
+        let event_b = EpochSealAuditEvent::SignatureRejected {
+            issuer_cell_id: "AA".to_string(),
+            epoch_number: 1,
+            reason: "A".to_string(),
+        };
+        assert_ne!(
+            event_a.canonical_hash(),
+            event_b.canonical_hash(),
+            "length-prefix framing must prevent concatenation collision \
+             (issuer='A'+reason='AA' vs issuer='AA'+reason='A')"
+        );
+    }
+
+    /// Regression: verify collision resistance for Accepted variant with
+    /// different issuer lengths at the same epoch boundary.
+    #[test]
+    fn accepted_hash_collision_resistance() {
+        let event_a = EpochSealAuditEvent::Accepted {
+            issuer_cell_id: "ab".to_string(),
+            epoch_number: 1,
+            previous_epoch: 0,
+        };
+        // Without length-prefix, if somehow the issuer bytes leak into
+        // epoch_number LE bytes, the hash could collide. With framing,
+        // different issuers always produce different hashes.
+        let event_b = EpochSealAuditEvent::Accepted {
+            issuer_cell_id: "abc".to_string(),
+            epoch_number: 1,
+            previous_epoch: 0,
+        };
+        assert_ne!(
+            event_a.canonical_hash(),
+            event_b.canonical_hash(),
+            "different issuers must produce different hashes"
+        );
+    }
+
+    /// Regression: verify collision resistance for `InvalidSeal` variant
+    /// which only has a reason string field.
+    #[test]
+    fn invalid_seal_hash_collision_resistance() {
+        let event_a = EpochSealAuditEvent::InvalidSeal {
+            reason: "ab".to_string(),
+        };
+        let event_b = EpochSealAuditEvent::InvalidSeal {
+            reason: "abc".to_string(),
+        };
+        assert_ne!(
+            event_a.canonical_hash(),
+            event_b.canonical_hash(),
+            "different reasons must produce different hashes"
+        );
     }
 }

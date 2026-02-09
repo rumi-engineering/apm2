@@ -2085,6 +2085,7 @@ mod tests {
             // the pre-actuation gate admitted the first request.
             arguments: br#"{"url":"https://user:pass@example.com/resource"}"#.to_vec(),
             dedupe_key: "tck-00351-first-request".to_string(),
+            epoch_seal: None,
         };
         let request_frame = encode_request_tool_request(&request_tool);
         let request_response = state
@@ -2234,6 +2235,7 @@ mod tests {
             tool_id: "network".to_string(),
             arguments: br#"{"url":"https://example.com/resource"}"#.to_vec(),
             dedupe_key: "tck-00351-stop-active".to_string(),
+            epoch_seal: None,
         };
         let request_frame = encode_request_tool_request(&request_tool);
         let request_response = state

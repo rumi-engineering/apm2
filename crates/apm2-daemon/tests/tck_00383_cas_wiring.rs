@@ -317,6 +317,7 @@ fn tck_00383_request_tool_returns_broker_result() {
         tool_id: "read".to_string(),
         arguments: vec![1, 2, 3],
         dedupe_key: "key-broker-test".to_string(),
+        epoch_seal: None,
     };
     let frame = encode_request_tool_request(&request);
 
@@ -708,6 +709,7 @@ fn tck_00383_e2e_request_tool_uses_broker() {
         tool_id: "read".to_string(),
         arguments: vec![1, 2, 3],
         dedupe_key: "e2e-tool-test".to_string(),
+        epoch_seal: None,
     };
     let tool_frame = encode_request_tool_request(&tool_request);
     let response = session_dispatcher

@@ -709,6 +709,11 @@ message RequestToolRequest {
   bytes arguments = 3;
   // Deduplication key for idempotent requests.
   string dedupe_key = 4;
+  // Optional epoch seal payload for Tier2+ admission (TCK-00365).
+  // When present, the broker verifies monotonicity, anti-equivocation,
+  // and signature authenticity. Missing at Tier2+ causes fail-closed deny.
+  // Serialized EpochSealV1 bytes (bincode or canonical encoding).
+  optional bytes epoch_seal = 5;
 }
 
 message RequestToolResponse {

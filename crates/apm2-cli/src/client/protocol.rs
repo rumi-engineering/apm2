@@ -2258,6 +2258,7 @@ impl SessionClient {
             tool_id: tool_id.to_string(),
             arguments: arguments.to_vec(),
             dedupe_key: dedupe_key.to_string(),
+            epoch_seal: None,
         };
         let request_bytes = encode_request_tool_request(&request);
 
@@ -2801,6 +2802,7 @@ mod tests {
             tool_id: "file_read".to_string(),
             arguments: b"{}".to_vec(),
             dedupe_key: "dedupe-1".to_string(),
+            epoch_seal: None,
         };
         let encoded = encode_request_tool_request(&request);
 
