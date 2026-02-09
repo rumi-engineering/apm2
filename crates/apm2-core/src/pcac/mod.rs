@@ -55,7 +55,8 @@ pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
 pub use kernel::AuthorityJoinKernel;
 pub use receipts::{
     AuthoritativeBindings, AuthorityConsumeReceiptV1, AuthorityDenyReceiptV1,
-    AuthorityJoinReceiptV1, AuthorityRevalidateReceiptV1, LifecycleStage, ReceiptAuthentication,
+    AuthorityJoinReceiptV1, AuthorityRevalidateReceiptV1, LifecycleStage, MerkleProofEntry,
+    ReceiptAuthentication,
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,

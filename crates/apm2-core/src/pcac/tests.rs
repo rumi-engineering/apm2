@@ -388,7 +388,16 @@ fn receipt_authentication_pointer_serde() {
     let auth = ReceiptAuthentication::Pointer {
         receipt_hash: test_hash(0xE1),
         authority_seal_hash: test_hash(0xE2),
-        merkle_inclusion_proof: Some(vec![test_hash(0xE3), test_hash(0xE4)]),
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: test_hash(0xE3),
+                sibling_is_left: false,
+            },
+            MerkleProofEntry {
+                sibling_hash: test_hash(0xE4),
+                sibling_is_left: false,
+            },
+        ]),
         receipt_batch_root_hash: Some(test_hash(0xE5)),
     };
     let json = serde_json::to_string(&auth).unwrap();
@@ -544,10 +553,13 @@ fn valid_direct_auth(seal: Hash) -> ReceiptAuthentication {
     }
 }
 
-/// Build a valid pointer authentication with a merkle proof that actually
-/// verifies. We compute the batch root deterministically from `receipt_hash`
-/// and proof siblings using the same `hash_leaf` / `hash_internal` logic
-/// that the verifier uses.
+/// Build a valid pointer authentication with a direction-aware merkle proof
+/// that actually verifies. We compute the batch root deterministically from
+/// `receipt_hash` and proof siblings using the same `hash_leaf` /
+/// `hash_internal` logic that the verifier uses.
+///
+/// This proof simulates a left-branch leaf (sibling is on the right at each
+/// level, so `sibling_is_left = false`).
 fn valid_pointer_auth(seal: Hash) -> ReceiptAuthentication {
     use crate::consensus::merkle::{hash_internal, hash_leaf};
 
@@ -556,6 +568,7 @@ fn valid_pointer_auth(seal: Hash) -> ReceiptAuthentication {
     let sibling1 = test_hash(0xE4);
 
     // Recompute the expected root: hash_leaf(receipt_hash), then fold.
+    // sibling_is_left=false means current is on the left, sibling on right.
     let leaf = hash_leaf(&receipt_hash);
     let level1 = hash_internal(&leaf, &sibling0);
     let root = hash_internal(&level1, &sibling1);
@@ -563,7 +576,50 @@ fn valid_pointer_auth(seal: Hash) -> ReceiptAuthentication {
     ReceiptAuthentication::Pointer {
         receipt_hash,
         authority_seal_hash: seal,
-        merkle_inclusion_proof: Some(vec![sibling0, sibling1]),
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: sibling0,
+                sibling_is_left: false,
+            },
+            MerkleProofEntry {
+                sibling_hash: sibling1,
+                sibling_is_left: false,
+            },
+        ]),
+        receipt_batch_root_hash: Some(root),
+    }
+}
+
+/// Build a valid pointer authentication with a right-branch merkle proof.
+///
+/// This proof simulates a right-branch leaf (sibling is on the left at each
+/// level, so `sibling_is_left = true`).
+fn valid_pointer_auth_right_branch(seal: Hash) -> ReceiptAuthentication {
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling0 = test_hash(0xE3);
+    let sibling1 = test_hash(0xE4);
+
+    // Recompute the expected root: hash_leaf(receipt_hash), then fold.
+    // sibling_is_left=true means sibling is on the left, current on right.
+    let leaf = hash_leaf(&receipt_hash);
+    let level1 = hash_internal(&sibling0, &leaf);
+    let root = hash_internal(&sibling1, &level1);
+
+    ReceiptAuthentication::Pointer {
+        receipt_hash,
+        authority_seal_hash: seal,
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: sibling0,
+                sibling_is_left: true,
+            },
+            MerkleProofEntry {
+                sibling_hash: sibling1,
+                sibling_is_left: true,
+            },
+        ]),
         receipt_batch_root_hash: Some(root),
     }
 }
@@ -572,7 +628,8 @@ fn valid_bindings(seal: Hash) -> AuthoritativeBindings {
     AuthoritativeBindings {
         episode_envelope_hash: test_hash(0xA1),
         view_commitment_hash: test_hash(0xA2),
-        time_envelope_ref: test_hash(0xA3),
+        // Must match the contextual TIME_REF for MAJOR 1 contextual binding
+        time_envelope_ref: TIME_REF,
         authentication: valid_direct_auth(seal),
         permeability_receipt_hash: None,
         delegation_chain_hash: None,
@@ -591,7 +648,7 @@ const TICK: u64 = 1000;
 #[test]
 fn direct_auth_happy_path() {
     let auth = valid_direct_auth(SEAL);
-    let result = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK);
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
 }
 
@@ -600,7 +657,8 @@ fn direct_auth_zero_seal_hash_denied() {
     let auth = ReceiptAuthentication::Direct {
         authority_seal_hash: zero_hash(),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "authority_seal_hash")
     );
@@ -610,7 +668,8 @@ fn direct_auth_zero_seal_hash_denied() {
 fn direct_auth_seal_mismatch_denied() {
     let wrong_seal = test_hash(0xFF);
     let auth = valid_direct_auth(wrong_seal);
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { .. }
@@ -624,7 +683,7 @@ fn direct_auth_seal_mismatch_denied() {
 #[test]
 fn pointer_auth_happy_path_with_merkle_proof() {
     let auth = valid_pointer_auth(SEAL);
-    let result = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK);
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
 }
 
@@ -636,7 +695,7 @@ fn pointer_auth_happy_path_without_batching() {
         merkle_inclusion_proof: None,
         receipt_batch_root_hash: None,
     };
-    let result = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK);
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
 }
 
@@ -648,7 +707,8 @@ fn pointer_auth_zero_receipt_hash_denied() {
         merkle_inclusion_proof: None,
         receipt_batch_root_hash: None,
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "receipt_hash")
     );
@@ -662,7 +722,8 @@ fn pointer_auth_zero_seal_hash_denied() {
         merkle_inclusion_proof: None,
         receipt_batch_root_hash: None,
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "authority_seal_hash")
     );
@@ -676,7 +737,8 @@ fn pointer_auth_seal_mismatch_denied() {
         merkle_inclusion_proof: None,
         receipt_batch_root_hash: None,
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { .. }
@@ -691,7 +753,8 @@ fn pointer_auth_empty_merkle_proof_denied() {
         merkle_inclusion_proof: Some(vec![]),
         receipt_batch_root_hash: Some(test_hash(0xE5)),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { .. }
@@ -703,10 +766,20 @@ fn pointer_auth_zero_hash_in_merkle_proof_denied() {
     let auth = ReceiptAuthentication::Pointer {
         receipt_hash: test_hash(0xE1),
         authority_seal_hash: SEAL,
-        merkle_inclusion_proof: Some(vec![test_hash(0xE3), zero_hash()]),
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: test_hash(0xE3),
+                sibling_is_left: false,
+            },
+            MerkleProofEntry {
+                sibling_hash: zero_hash(),
+                sibling_is_left: false,
+            },
+        ]),
         receipt_batch_root_hash: Some(test_hash(0xE5)),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "merkle_inclusion_proof[1]")
     );
@@ -717,10 +790,14 @@ fn pointer_auth_zero_batch_root_denied() {
     let auth = ReceiptAuthentication::Pointer {
         receipt_hash: test_hash(0xE1),
         authority_seal_hash: SEAL,
-        merkle_inclusion_proof: Some(vec![test_hash(0xE3)]),
+        merkle_inclusion_proof: Some(vec![MerkleProofEntry {
+            sibling_hash: test_hash(0xE3),
+            sibling_is_left: false,
+        }]),
         receipt_batch_root_hash: Some(zero_hash()),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "receipt_batch_root_hash")
     );
@@ -731,10 +808,14 @@ fn pointer_auth_proof_without_batch_root_denied() {
     let auth = ReceiptAuthentication::Pointer {
         receipt_hash: test_hash(0xE1),
         authority_seal_hash: SEAL,
-        merkle_inclusion_proof: Some(vec![test_hash(0xE3)]),
+        merkle_inclusion_proof: Some(vec![MerkleProofEntry {
+            sibling_hash: test_hash(0xE3),
+            sibling_is_left: false,
+        }]),
         receipt_batch_root_hash: None,
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { .. }
@@ -749,7 +830,8 @@ fn pointer_auth_batch_root_without_proof_denied() {
         merkle_inclusion_proof: None,
         receipt_batch_root_hash: Some(test_hash(0xE5)),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { .. }
@@ -763,7 +845,7 @@ fn pointer_auth_batch_root_without_proof_denied() {
 #[test]
 fn valid_bindings_pass() {
     let bindings = valid_bindings(SEAL);
-    let result = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK);
+    let result = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, None);
     assert!(result.is_ok());
 }
 
@@ -771,7 +853,7 @@ fn valid_bindings_pass() {
 fn zero_episode_envelope_hash_denied() {
     let mut bindings = valid_bindings(SEAL);
     bindings.episode_envelope_hash = zero_hash();
-    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, None).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "episode_envelope_hash")
     );
@@ -781,7 +863,7 @@ fn zero_episode_envelope_hash_denied() {
 fn zero_view_commitment_hash_denied() {
     let mut bindings = valid_bindings(SEAL);
     bindings.view_commitment_hash = zero_hash();
-    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, None).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "view_commitment_hash")
     );
@@ -791,7 +873,7 @@ fn zero_view_commitment_hash_denied() {
 fn zero_time_envelope_ref_denied() {
     let mut bindings = valid_bindings(SEAL);
     bindings.time_envelope_ref = zero_hash();
-    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, None).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "time_envelope_ref")
     );
@@ -801,7 +883,7 @@ fn zero_time_envelope_ref_denied() {
 fn zero_permeability_receipt_hash_denied() {
     let mut bindings = valid_bindings(SEAL);
     bindings.permeability_receipt_hash = Some(zero_hash());
-    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, None).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "permeability_receipt_hash")
     );
@@ -811,7 +893,7 @@ fn zero_permeability_receipt_hash_denied() {
 fn zero_delegation_chain_hash_denied() {
     let mut bindings = valid_bindings(SEAL);
     bindings.delegation_chain_hash = Some(zero_hash());
-    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, None).unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "delegation_chain_hash")
     );
@@ -822,7 +904,7 @@ fn valid_delegation_bindings_pass() {
     let mut bindings = valid_bindings(SEAL);
     bindings.permeability_receipt_hash = Some(test_hash(0xB1));
     bindings.delegation_chain_hash = Some(test_hash(0xB2));
-    let result = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK);
+    let result = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, None);
     assert!(result.is_ok());
 }
 
@@ -833,7 +915,7 @@ fn valid_delegation_bindings_pass() {
 #[test]
 fn classify_acceptance_fact_with_direct_auth() {
     let bindings = valid_bindings(SEAL);
-    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    let class = classify_fact(Some(&bindings), &SEAL, None, TIME_REF, LEDGER, TICK, None);
     assert_eq!(class, FactClass::AcceptanceFact);
 }
 
@@ -841,13 +923,13 @@ fn classify_acceptance_fact_with_direct_auth() {
 fn classify_acceptance_fact_with_pointer_auth() {
     let mut bindings = valid_bindings(SEAL);
     bindings.authentication = valid_pointer_auth(SEAL);
-    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    let class = classify_fact(Some(&bindings), &SEAL, None, TIME_REF, LEDGER, TICK, None);
     assert_eq!(class, FactClass::AcceptanceFact);
 }
 
 #[test]
 fn classify_routing_fact_no_bindings() {
-    let class = classify_fact(None, &SEAL, TIME_REF, LEDGER, TICK);
+    let class = classify_fact(None, &SEAL, None, TIME_REF, LEDGER, TICK, None);
     assert_eq!(class, FactClass::RoutingFact);
 }
 
@@ -855,7 +937,7 @@ fn classify_routing_fact_no_bindings() {
 fn classify_routing_fact_zero_envelope() {
     let mut bindings = valid_bindings(SEAL);
     bindings.episode_envelope_hash = zero_hash();
-    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    let class = classify_fact(Some(&bindings), &SEAL, None, TIME_REF, LEDGER, TICK, None);
     assert_eq!(class, FactClass::RoutingFact);
 }
 
@@ -865,14 +947,14 @@ fn classify_routing_fact_bad_auth() {
     bindings.authentication = ReceiptAuthentication::Direct {
         authority_seal_hash: zero_hash(),
     };
-    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    let class = classify_fact(Some(&bindings), &SEAL, None, TIME_REF, LEDGER, TICK, None);
     assert_eq!(class, FactClass::RoutingFact);
 }
 
 #[test]
 fn classify_routing_fact_seal_mismatch() {
     let bindings = valid_bindings(test_hash(0xFF));
-    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    let class = classify_fact(Some(&bindings), &SEAL, None, TIME_REF, LEDGER, TICK, None);
     assert_eq!(class, FactClass::RoutingFact);
 }
 
@@ -904,7 +986,8 @@ fn deny_carries_correct_context() {
     let auth = ReceiptAuthentication::Direct {
         authority_seal_hash: zero_hash(),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert_eq!(err.time_envelope_ref, TIME_REF);
     assert_eq!(err.ledger_anchor, LEDGER);
     assert_eq!(err.denied_at_tick, TICK);
@@ -922,10 +1005,20 @@ fn pointer_auth_wrong_batch_root_denied() {
     let auth = ReceiptAuthentication::Pointer {
         receipt_hash: test_hash(0xE1),
         authority_seal_hash: SEAL,
-        merkle_inclusion_proof: Some(vec![test_hash(0xE3), test_hash(0xE4)]),
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: test_hash(0xE3),
+                sibling_is_left: false,
+            },
+            MerkleProofEntry {
+                sibling_hash: test_hash(0xE4),
+                sibling_is_left: false,
+            },
+        ]),
         receipt_batch_root_hash: Some(test_hash(0xFF)), // wrong root
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { ref description }
@@ -952,10 +1045,20 @@ fn pointer_auth_wrong_sibling_branch_denied() {
     let auth = ReceiptAuthentication::Pointer {
         receipt_hash,
         authority_seal_hash: SEAL,
-        merkle_inclusion_proof: Some(vec![wrong_sibling0, sibling1]),
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: wrong_sibling0,
+                sibling_is_left: false,
+            },
+            MerkleProofEntry {
+                sibling_hash: sibling1,
+                sibling_is_left: false,
+            },
+        ]),
         receipt_batch_root_hash: Some(correct_root),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { ref description }
@@ -981,10 +1084,20 @@ fn pointer_auth_wrong_receipt_hash_denied() {
     let auth = ReceiptAuthentication::Pointer {
         receipt_hash: test_hash(0xE2), // different receipt
         authority_seal_hash: SEAL,
-        merkle_inclusion_proof: Some(vec![sibling0, sibling1]),
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: sibling0,
+                sibling_is_left: false,
+            },
+            MerkleProofEntry {
+                sibling_hash: sibling1,
+                sibling_is_left: false,
+            },
+        ]),
         receipt_batch_root_hash: Some(root),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { ref description }
@@ -996,8 +1109,12 @@ fn pointer_auth_wrong_receipt_hash_denied() {
 fn pointer_auth_proof_exceeds_max_depth_denied() {
     // Build a proof that exceeds MAX_MERKLE_INCLUSION_PROOF_DEPTH.
     #[allow(clippy::cast_possible_truncation)]
-    let too_many: Vec<Hash> = (0..=super::auth_verifier::MAX_MERKLE_INCLUSION_PROOF_DEPTH)
-        .map(|i| test_hash((i as u8).wrapping_add(1)))
+    let too_many: Vec<MerkleProofEntry> = (0
+        ..=super::auth_verifier::MAX_MERKLE_INCLUSION_PROOF_DEPTH)
+        .map(|i| MerkleProofEntry {
+            sibling_hash: test_hash((i as u8).wrapping_add(1)),
+            sibling_is_left: false,
+        })
         .collect();
     // Also need a matching root -- but we expect denial before verification.
     let auth = ReceiptAuthentication::Pointer {
@@ -1006,7 +1123,8 @@ fn pointer_auth_proof_exceeds_max_depth_denied() {
         merkle_inclusion_proof: Some(too_many),
         receipt_batch_root_hash: Some(test_hash(0xFF)),
     };
-    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { ref description }
@@ -1016,7 +1134,7 @@ fn pointer_auth_proof_exceeds_max_depth_denied() {
 
 #[test]
 fn pointer_auth_single_sibling_proof_valid() {
-    // Minimal valid proof: one sibling.
+    // Minimal valid proof: one sibling (left-branch leaf).
     use crate::consensus::merkle::{hash_internal, hash_leaf};
 
     let receipt_hash = test_hash(0xE1);
@@ -1027,11 +1145,353 @@ fn pointer_auth_single_sibling_proof_valid() {
     let auth = ReceiptAuthentication::Pointer {
         receipt_hash,
         authority_seal_hash: SEAL,
-        merkle_inclusion_proof: Some(vec![sibling]),
+        merkle_inclusion_proof: Some(vec![MerkleProofEntry {
+            sibling_hash: sibling,
+            sibling_is_left: false,
+        }]),
         receipt_batch_root_hash: Some(root),
     };
-    let result = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK);
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
+}
+
+// =============================================================================
+// Right-branch direction-aware proof tests (TCK-00425, MAJOR 2 fix)
+// =============================================================================
+
+#[test]
+fn pointer_auth_right_branch_proof_valid() {
+    // Right-branch leaf: sibling is on the left at each level.
+    let auth = valid_pointer_auth_right_branch(SEAL);
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn pointer_auth_right_branch_single_sibling_valid() {
+    // Minimal valid proof: one sibling, right-branch leaf.
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling = test_hash(0xE3);
+    let leaf = hash_leaf(&receipt_hash);
+    // sibling is on the left, current on the right
+    let root = hash_internal(&sibling, &leaf);
+
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash,
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![MerkleProofEntry {
+            sibling_hash: sibling,
+            sibling_is_left: true,
+        }]),
+        receipt_batch_root_hash: Some(root),
+    };
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn pointer_auth_mixed_direction_proof_valid() {
+    // Mixed directions: first level is right-branch, second is left-branch.
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling0 = test_hash(0xE3);
+    let sibling1 = test_hash(0xE4);
+
+    let leaf = hash_leaf(&receipt_hash);
+    // Level 0: sibling is on the left (current on right)
+    let level1 = hash_internal(&sibling0, &leaf);
+    // Level 1: sibling is on the right (current on left)
+    let root = hash_internal(&level1, &sibling1);
+
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash,
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: sibling0,
+                sibling_is_left: true,
+            },
+            MerkleProofEntry {
+                sibling_hash: sibling1,
+                sibling_is_left: false,
+            },
+        ]),
+        receipt_batch_root_hash: Some(root),
+    };
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn pointer_auth_wrong_direction_bit_denied() {
+    // Build a valid left-branch proof, then flip a direction bit.
+    // The recomputed root should not match.
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling0 = test_hash(0xE3);
+    let sibling1 = test_hash(0xE4);
+
+    // Left-branch root computation
+    let leaf = hash_leaf(&receipt_hash);
+    let level1 = hash_internal(&leaf, &sibling0);
+    let root = hash_internal(&level1, &sibling1);
+
+    // Now flip first direction bit to right-branch
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash,
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![
+            MerkleProofEntry {
+                sibling_hash: sibling0,
+                sibling_is_left: true, // wrong: was false in original proof
+            },
+            MerkleProofEntry {
+                sibling_hash: sibling1,
+                sibling_is_left: false,
+            },
+        ]),
+        receipt_batch_root_hash: Some(root),
+    };
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("recomputed root does not match")
+    ));
+}
+
+#[test]
+fn pointer_auth_from_canonical_merkle_tree_left_leaf() {
+    // MAJOR 2 fix: derive proof from consensus::merkle::MerkleTree::proof_for
+    // for a left leaf (even index).
+    use crate::consensus::merkle::MerkleTree;
+    use crate::crypto::EventHasher;
+
+    let leaves: Vec<_> = (0..8u64)
+        .map(|i| EventHasher::hash_content(&i.to_le_bytes()))
+        .collect();
+    let tree = MerkleTree::new(leaves.iter().copied()).unwrap();
+    let root = tree.root();
+
+    // Index 0 is a left leaf
+    let proof = tree.proof_for(0).unwrap();
+    assert!(proof.verify(&root).is_ok());
+
+    // Convert canonical MerkleProof to ReceiptAuthentication proof entries.
+    let proof_entries: Vec<MerkleProofEntry> = proof
+        .path
+        .iter()
+        .map(|(sibling_hash, is_right)| MerkleProofEntry {
+            sibling_hash: *sibling_hash,
+            // In MerkleProof, is_right means the CURRENT node is on the right,
+            // so the sibling is on the left.
+            sibling_is_left: *is_right,
+        })
+        .collect();
+
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: leaves[0],
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(proof_entries),
+        receipt_batch_root_hash: Some(root),
+    };
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+    assert!(
+        result.is_ok(),
+        "left leaf proof from canonical tree must verify"
+    );
+}
+
+#[test]
+fn pointer_auth_from_canonical_merkle_tree_right_leaf() {
+    // MAJOR 2 fix: derive proof from consensus::merkle::MerkleTree::proof_for
+    // for a right leaf (odd index).
+    use crate::consensus::merkle::MerkleTree;
+    use crate::crypto::EventHasher;
+
+    let leaves: Vec<_> = (0..8u64)
+        .map(|i| EventHasher::hash_content(&i.to_le_bytes()))
+        .collect();
+    let tree = MerkleTree::new(leaves.iter().copied()).unwrap();
+    let root = tree.root();
+
+    // Index 3 is a right leaf (odd index)
+    let proof = tree.proof_for(3).unwrap();
+    assert!(proof.verify(&root).is_ok());
+
+    // Convert canonical MerkleProof to ReceiptAuthentication proof entries.
+    let proof_entries: Vec<MerkleProofEntry> = proof
+        .path
+        .iter()
+        .map(|(sibling_hash, is_right)| MerkleProofEntry {
+            sibling_hash: *sibling_hash,
+            sibling_is_left: *is_right,
+        })
+        .collect();
+
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: leaves[3],
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(proof_entries),
+        receipt_batch_root_hash: Some(root),
+    };
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+    assert!(
+        result.is_ok(),
+        "right leaf proof from canonical tree must verify"
+    );
+}
+
+#[test]
+fn pointer_auth_from_canonical_merkle_tree_all_leaves() {
+    // Verify all leaves in a canonical tree can be proven through
+    // ReceiptAuthentication.
+    use crate::consensus::merkle::MerkleTree;
+    use crate::crypto::EventHasher;
+
+    let leaves: Vec<_> = (0..16u64)
+        .map(|i| EventHasher::hash_content(&i.to_le_bytes()))
+        .collect();
+    let tree = MerkleTree::new(leaves.iter().copied()).unwrap();
+    let root = tree.root();
+
+    for (idx, leaf) in leaves.iter().enumerate() {
+        let proof = tree.proof_for(idx).unwrap();
+        assert!(proof.verify(&root).is_ok());
+
+        let proof_entries: Vec<MerkleProofEntry> = proof
+            .path
+            .iter()
+            .map(|(sibling_hash, is_right)| MerkleProofEntry {
+                sibling_hash: *sibling_hash,
+                sibling_is_left: *is_right,
+            })
+            .collect();
+
+        let auth = ReceiptAuthentication::Pointer {
+            receipt_hash: *leaf,
+            authority_seal_hash: SEAL,
+            merkle_inclusion_proof: Some(proof_entries),
+            receipt_batch_root_hash: Some(root),
+        };
+        let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+        assert!(
+            result.is_ok(),
+            "leaf {idx} proof from canonical tree must verify"
+        );
+    }
+}
+
+// =============================================================================
+// Seal-anchored batch root tests (TCK-00425, BLOCKER 2 fix)
+// =============================================================================
+
+#[test]
+fn pointer_auth_seal_subject_hash_matches_batch_root() {
+    // When seal_subject_hash is provided and matches batch_root, verification
+    // should succeed.
+    let auth = valid_pointer_auth(SEAL);
+    // Extract the batch root from the valid pointer auth.
+    let batch_root = match &auth {
+        ReceiptAuthentication::Pointer {
+            receipt_batch_root_hash: Some(root),
+            ..
+        } => *root,
+        _ => panic!("expected pointer auth with batch root"),
+    };
+    let result =
+        verify_receipt_authentication(&auth, &SEAL, Some(&batch_root), TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn pointer_auth_seal_subject_hash_mismatch_denied() {
+    // When seal_subject_hash is provided but does NOT match batch_root,
+    // verification must fail — the batch root is not anchored to the seal.
+    let auth = valid_pointer_auth(SEAL);
+    let wrong_subject = test_hash(0xBB);
+    let err =
+        verify_receipt_authentication(&auth, &SEAL, Some(&wrong_subject), TIME_REF, LEDGER, TICK)
+            .unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("batch root not anchored to authority seal")
+    ));
+}
+
+#[test]
+fn pointer_auth_no_seal_subject_hash_skips_anchor_check() {
+    // When seal_subject_hash is None, the anchor check is skipped.
+    // This is the existing behavior for backward compatibility.
+    let auth = valid_pointer_auth(SEAL);
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+// =============================================================================
+// Contextual binding tests (TCK-00425, MAJOR 1 fix)
+// =============================================================================
+
+#[test]
+fn bindings_time_envelope_ref_mismatch_denied() {
+    // Bindings time_envelope_ref does not match the contextual argument.
+    let mut bindings = valid_bindings(SEAL);
+    bindings.time_envelope_ref = test_hash(0xFF); // different from TIME_REF
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, None).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("time_envelope_ref")
+    ));
+}
+
+#[test]
+fn bindings_view_commitment_mismatch_denied() {
+    // Bindings view_commitment_hash does not match the expected value.
+    let bindings = valid_bindings(SEAL);
+    let wrong_vc = test_hash(0xFF);
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, Some(&wrong_vc))
+        .unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { ref description }
+        if description.contains("view_commitment_hash")
+    ));
+}
+
+#[test]
+fn bindings_view_commitment_match_ok() {
+    // Bindings view_commitment_hash matches the expected value.
+    let bindings = valid_bindings(SEAL);
+    let expected_vc = test_hash(0xA2); // same as in valid_bindings
+    let result =
+        validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK, Some(&expected_vc));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn classify_fact_with_contextual_binding_mismatch_is_routing() {
+    // If bindings.time_envelope_ref doesn't match contextual, classify as
+    // routing fact (fail-closed).
+    let mut bindings = valid_bindings(SEAL);
+    bindings.time_envelope_ref = test_hash(0xFF);
+    let class = classify_fact(Some(&bindings), &SEAL, None, TIME_REF, LEDGER, TICK, None);
+    assert_eq!(class, FactClass::RoutingFact);
+}
+
+#[test]
+fn classify_acceptance_fact_with_right_branch_pointer_auth() {
+    // Classification should work with right-branch pointer auth too.
+    let mut bindings = valid_bindings(SEAL);
+    bindings.authentication = valid_pointer_auth_right_branch(SEAL);
+    let class = classify_fact(Some(&bindings), &SEAL, None, TIME_REF, LEDGER, TICK, None);
+    assert_eq!(class, FactClass::AcceptanceFact);
 }
 
 // =============================================================================

@@ -18,6 +18,28 @@ use super::types::RiskTier;
 use crate::crypto::Hash;
 
 // =============================================================================
+// MerkleProofEntry — direction-aware inclusion proof step
+// =============================================================================
+
+/// A single step in a Merkle inclusion proof carrying direction information.
+///
+/// Each entry records a sibling hash and whether that sibling is on the left
+/// side of the pair (`sibling_is_left`). This enables the verifier to
+/// reconstruct the root for both left-branch and right-branch positions
+/// without ambiguity.
+///
+/// Aligns with the canonical `consensus::merkle::MerkleProof` direction
+/// semantics where `is_left` on the sibling indicates the sibling's position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MerkleProofEntry {
+    /// The sibling hash at this level.
+    pub sibling_hash: Hash,
+    /// If `true`, the sibling is on the left (i.e., the current node is on
+    /// the right). If `false`, the sibling is on the right (current on left).
+    pub sibling_is_left: bool,
+}
+
+// =============================================================================
 // Common receipt metadata
 // =============================================================================
 
@@ -54,9 +76,13 @@ pub enum ReceiptAuthentication {
         receipt_hash: Hash,
         /// Hash of the authority seal.
         authority_seal_hash: Hash,
-        /// Merkle inclusion proof (required when batched).
+        /// Direction-aware Merkle inclusion proof (required when batched).
+        ///
+        /// Each entry carries the sibling hash and its position (left or
+        /// right), enabling correct root recomputation for both
+        /// left-branch and right-branch leaves in the batch tree.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        merkle_inclusion_proof: Option<Vec<Hash>>,
+        merkle_inclusion_proof: Option<Vec<MerkleProofEntry>>,
         /// Batch root hash (when using batch descriptor path).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         receipt_batch_root_hash: Option<Hash>,
