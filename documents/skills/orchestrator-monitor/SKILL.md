@@ -50,9 +50,9 @@ references[10]:
   - path: "references/daemon-implementation-patterns.md"
     purpose: "Daemon-specific invariants and wiring rules for implementor agents."
   - path: "@documents/reviews/SECURITY_REVIEW_PROMPT.md"
-    purpose: "Security review prompt contract used by launch scripts."
+    purpose: "Security review prompt contract used by FAC review dispatch."
   - path: "@documents/reviews/CODE_QUALITY_PROMPT.md"
-    purpose: "Code-quality review prompt contract used by launch scripts."
+    purpose: "Code-quality review prompt contract used by FAC review dispatch."
 
 implementor_warm_handoff_required_reads[16]:
   - path: "@documents/theory/glossary/glossary.json"

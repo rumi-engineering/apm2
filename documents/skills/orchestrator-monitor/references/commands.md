@@ -11,10 +11,10 @@ notes:
   - "Use direct `gh` commands only for surfaces that FAC does not yet expose (for example full review comment bodies)."
   - "Do NOT manually dispatch reviews after pushing — the Forge Admission Cycle CI workflow auto-dispatches them."
 
-commands[21]:
+commands[18]:
   - name: resolve_repo_root
     command: "timeout 10s git rev-parse --show-toplevel"
-    purpose: "Discover repository root for asset invocation."
+    purpose: "Discover repository root."
     side_effect: false
 
   - name: auth_check
@@ -30,11 +30,6 @@ commands[21]:
   - name: fac_review_status
     command: "timeout 30s apm2 fac review status --pr <PR_NUMBER>"
     purpose: "Primary FAC-native lifecycle snapshot for reviewer state/events on one PR."
-    side_effect: false
-
-  - name: poll_dashboard
-    command: "timeout 90s bash <ROOT>/documents/skills/orchestrator-monitor/assets/poll-status.sh <PRS...>"
-    purpose: "Generate human-readable status dashboard snapshot."
     side_effect: false
 
   - name: pr_state_json
@@ -62,19 +57,14 @@ commands[21]:
     purpose: "Canonical push workflow: pushes branch, creates/updates PR from ticket YAML, enables auto-merge. Reviews auto-start via CI. Use this instead of raw git push + manual review dispatch."
     side_effect: true
 
-  - name: launch_reviews
-    command: "timeout 900s bash <ROOT>/documents/skills/orchestrator-monitor/assets/launch-reviews.sh <PR_NUMBER|PR_URL> [SCRATCHPAD_DIR]"
-    purpose: "FALLBACK ONLY: Launch FAC review dispatch when CI auto-dispatch has failed. Prefer `apm2 fac push` for normal workflow — reviews auto-start on push."
-    side_effect: true
-
   - name: retrigger_review_stream
     command: "timeout 30s gh workflow run forge-admission-cycle.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
     purpose: "Fallback-only recovery path when `apm2 fac review retrigger` is unavailable."
     side_effect: true
 
-  - name: check_review_progress
-    command: "timeout 30s bash <ROOT>/documents/skills/orchestrator-monitor/assets/check-review.sh [PR_NUMBER|PR_URL]"
-    purpose: "Read FAC review state/events/pulse files and print structured review progress."
+  - name: fac_review_tail
+    command: "timeout 30s apm2 fac review tail --lines 30"
+    purpose: "Tail FAC review NDJSON event stream for recent lifecycle events across all PRs."
     side_effect: false
 
   - name: fetch_full_review_comment_bodies
