@@ -16,11 +16,15 @@
 //!   context
 //! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
 //!   anchor
+//! - `apm2 fac barrier --repo <OWNER/REPO> --event <EVENT_JSON>` - Validate
+//!   trigger trust boundary before any FAC execution
+//! - `apm2 fac kickoff --repo <OWNER/REPO> --event <EVENT_JSON>` - Dispatch and
+//!   observe FAC review lifecycle for GitHub projection
 //! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
 //!   multi-model)
 //! - `apm2 fac review dispatch <PR_URL>` - Idempotent detached review dispatch
-//! - `apm2 fac review retrigger --pr <PR_NUMBER>` - Dispatch FAC workflow
-//!   projection from local CLI
+//! - `apm2 fac review retrigger --pr <PR_NUMBER>` - Dispatch FAC workflow from
+//!   local CLI
 //! - `apm2 fac review status` - Show FAC review state and recent events
 //! - `apm2 fac review project` - Render one projection status line
 //! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
@@ -154,6 +158,17 @@ pub enum FacSubcommand {
     /// Analyzes ledger to determine restart point for interrupted work.
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
+
+    /// Validate FAC trigger trust boundary for GitHub projection execution.
+    ///
+    /// Fails closed unless the trigger context is authorized.
+    Barrier(BarrierArgs),
+
+    /// Dispatch and observe FAC review lifecycle for GitHub projection.
+    ///
+    /// Runs idempotent detached review dispatch and emits 1Hz health/status
+    /// lines until a terminal outcome is reached.
+    Kickoff(KickoffArgs),
 
     /// Run and observe FAC review orchestration for pull requests.
     ///
@@ -320,6 +335,42 @@ pub struct ResumeArgs {
     pub limit: u64,
 }
 
+/// Arguments for `apm2 fac barrier`.
+#[derive(Debug, Args)]
+pub struct BarrierArgs {
+    /// Repository in owner/repo format.
+    #[arg(long)]
+    pub repo: String,
+
+    /// Path to GitHub event payload JSON.
+    #[arg(long)]
+    pub event: PathBuf,
+
+    /// Event name (`pull_request_target` or `workflow_dispatch`).
+    #[arg(long)]
+    pub event_name: String,
+}
+
+/// Arguments for `apm2 fac kickoff`.
+#[derive(Debug, Args)]
+pub struct KickoffArgs {
+    /// Repository in owner/repo format.
+    #[arg(long)]
+    pub repo: String,
+
+    /// Path to GitHub event payload JSON.
+    #[arg(long)]
+    pub event: PathBuf,
+
+    /// Event name (`pull_request_target` or `workflow_dispatch`).
+    #[arg(long)]
+    pub event_name: String,
+
+    /// Maximum seconds to wait for FAC terminal state.
+    #[arg(long, default_value_t = 3600)]
+    pub max_wait_seconds: u64,
+}
+
 /// Arguments for `apm2 fac review`.
 #[derive(Debug, Args)]
 pub struct ReviewArgs {
@@ -396,23 +447,6 @@ pub struct ReviewRetriggerArgs {
     /// Pull request number.
     #[arg(long)]
     pub pr: u32,
-
-    /// Retrigger mode (`dispatch_and_gate` or `gate_only`).
-    #[arg(long, value_enum, default_value_t = fac_review::ReviewRetriggerMode::DispatchAndGate)]
-    pub mode: fac_review::ReviewRetriggerMode,
-
-    /// Review selection (`all`, `security`, or `quality`).
-    #[arg(
-        long = "type",
-        alias = "review-type",
-        value_enum,
-        default_value_t = fac_review::ReviewRunType::All
-    )]
-    pub review_type: fac_review::ReviewRunType,
-
-    /// Seconds to stream 1Hz workflow projection logs (5-600).
-    #[arg(long, default_value_t = 30)]
-    pub projection_seconds: u64,
 }
 
 /// Arguments for `apm2 fac review status`.
@@ -678,6 +712,16 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             },
         },
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
+        FacSubcommand::Barrier(args) => {
+            fac_review::run_barrier(&args.repo, &args.event, &args.event_name, json_output)
+        },
+        FacSubcommand::Kickoff(args) => fac_review::run_kickoff(
+            &args.repo,
+            &args.event,
+            &args.event_name,
+            args.max_wait_seconds,
+            json_output,
+        ),
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Run(run_args) => fac_review::run_review(
                 &run_args.pr_url,
@@ -691,14 +735,9 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
                 dispatch_args.expected_head_sha.as_deref(),
                 json_output,
             ),
-            ReviewSubcommand::Retrigger(retrigger_args) => fac_review::run_retrigger(
-                &retrigger_args.repo,
-                retrigger_args.pr,
-                retrigger_args.mode,
-                retrigger_args.review_type,
-                retrigger_args.projection_seconds,
-                json_output,
-            ),
+            ReviewSubcommand::Retrigger(retrigger_args) => {
+                fac_review::run_retrigger(&retrigger_args.repo, retrigger_args.pr, json_output)
+            },
             ReviewSubcommand::Status(status_args) => {
                 fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
             },

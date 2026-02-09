@@ -40,6 +40,7 @@ const LOOP_SLEEP: Duration = Duration::from_millis(1000);
 const COMMENT_CONFIRM_MAX_PAGES: usize = 20;
 const COMMENT_CONFIRM_MAX_ATTEMPTS: usize = 20;
 const COMMENT_PERMISSION_SCAN_LINES: usize = 200;
+const DISPATCH_PENDING_TTL: Duration = Duration::from_secs(120);
 
 const SECURITY_PROMPT_PATH: &str = "documents/reviews/SECURITY_REVIEW_PROMPT.md";
 const QUALITY_PROMPT_PATH: &str = "documents/reviews/CODE_QUALITY_PROMPT.md";
@@ -69,33 +70,6 @@ pub enum ReviewRunType {
     All,
     Security,
     Quality,
-}
-
-impl ReviewRunType {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Security => "security",
-            Self::Quality => "quality",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-#[value(rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewRetriggerMode {
-    DispatchAndGate,
-    GateOnly,
-}
-
-impl ReviewRetriggerMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::DispatchAndGate => "dispatch_and_gate",
-            Self::GateOnly => "gate_only",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +188,18 @@ struct DispatchReviewResult {
     log_file: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingDispatchEntry {
+    started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_file: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DispatchSummary {
     pr_url: String,
@@ -228,10 +214,34 @@ struct RetriggerSummary {
     workflow: String,
     repo: String,
     pr_number: u32,
-    mode: String,
-    review_type: String,
-    projection_seconds: u64,
     dispatched_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BarrierSummary {
+    repo: String,
+    event_name: String,
+    pr_number: u32,
+    pr_url: String,
+    head_sha: String,
+    base_ref: String,
+    default_branch: String,
+    author_login: String,
+    author_association: String,
+    actor_login: String,
+    actor_permission: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct KickoffSummary {
+    repo: String,
+    event_name: String,
+    pr_number: u32,
+    pr_url: String,
+    head_sha: String,
+    dispatch_epoch: u64,
+    total_secs: u64,
+    terminal_state: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,6 +268,21 @@ struct ProjectionStatus {
 struct ExecutionContext {
     pr_number: u32,
     seq: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone)]
+struct FacEventContext {
+    repo: String,
+    event_name: String,
+    pr_number: u32,
+    pr_url: String,
+    head_sha: String,
+    base_ref: String,
+    default_branch: String,
+    author_login: String,
+    author_association: String,
+    actor_login: String,
+    actor_permission: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -511,15 +536,8 @@ pub fn run_dispatch(
     }
 }
 
-pub fn run_retrigger(
-    repo: &str,
-    pr_number: u32,
-    mode: ReviewRetriggerMode,
-    review_type: ReviewRunType,
-    projection_seconds: u64,
-    json_output: bool,
-) -> u8 {
-    match run_retrigger_inner(repo, pr_number, mode, review_type, projection_seconds) {
+pub fn run_retrigger(repo: &str, pr_number: u32, json_output: bool) -> u8 {
+    match run_retrigger_inner(repo, pr_number) {
         Ok(summary) => {
             if json_output {
                 println!(
@@ -531,9 +549,6 @@ pub fn run_retrigger(
                 println!("  Workflow:          {}", summary.workflow);
                 println!("  Repo:              {}", summary.repo);
                 println!("  PR Number:         {}", summary.pr_number);
-                println!("  Mode:              {}", summary.mode);
-                println!("  Review Type:       {}", summary.review_type);
-                println!("  Projection Seconds {}", summary.projection_seconds);
                 println!("  Dispatched At:     {}", summary.dispatched_at);
             }
             exit_codes::SUCCESS
@@ -548,6 +563,137 @@ pub fn run_retrigger(
                     "{}",
                     serde_json::to_string_pretty(&payload)
                         .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output: bool) -> u8 {
+    match resolve_fac_event_context(repo, event_path, event_name) {
+        Ok(ctx) => {
+            if let Err(err) = enforce_barrier(&ctx) {
+                if json_output {
+                    let payload = serde_json::json!({
+                        "error": "fac_barrier_failed",
+                        "message": err,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    eprintln!("ERROR: {err}");
+                }
+                return exit_codes::GENERIC_ERROR;
+            }
+
+            let summary = BarrierSummary {
+                repo: ctx.repo,
+                event_name: ctx.event_name,
+                pr_number: ctx.pr_number,
+                pr_url: ctx.pr_url,
+                head_sha: ctx.head_sha,
+                base_ref: ctx.base_ref,
+                default_branch: ctx.default_branch,
+                author_login: ctx.author_login,
+                author_association: ctx.author_association,
+                actor_login: ctx.actor_login,
+                actor_permission: ctx.actor_permission,
+            };
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("FAC Barrier");
+                println!("  Repo:              {}", summary.repo);
+                println!("  Event:             {}", summary.event_name);
+                println!("  PR Number:         {}", summary.pr_number);
+                println!("  Head SHA:          {}", summary.head_sha);
+                println!("  Base Ref:          {}", summary.base_ref);
+                println!(
+                    "  Author:            {} ({})",
+                    summary.author_login, summary.author_association
+                );
+                if let Some(permission) = &summary.actor_permission {
+                    println!(
+                        "  Actor:             {} ({permission})",
+                        summary.actor_login
+                    );
+                } else {
+                    println!("  Actor:             {}", summary.actor_login);
+                }
+                println!("  Barrier:           PASS");
+            }
+            exit_codes::SUCCESS
+        },
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_barrier_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
+pub fn run_kickoff(
+    repo: &str,
+    event_path: &Path,
+    event_name: &str,
+    max_wait_seconds: u64,
+    json_output: bool,
+) -> u8 {
+    if !json_output {
+        println!(
+            "details=~/.apm2/review_events.ndjson state=~/.apm2/reviewer_state.json dispatch_logs=~/.apm2/review_dispatch/"
+        );
+    }
+    match run_kickoff_inner(repo, event_path, event_name, max_wait_seconds) {
+        Ok(summary) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("FAC Kickoff");
+                println!("  Repo:              {}", summary.repo);
+                println!("  Event:             {}", summary.event_name);
+                println!("  PR Number:         {}", summary.pr_number);
+                println!("  Head SHA:          {}", summary.head_sha);
+                println!("  Dispatch Epoch:    {}", summary.dispatch_epoch);
+                println!("  Total Seconds:     {}", summary.total_secs);
+                println!("  Terminal State:    {}", summary.terminal_state);
+            }
+            if summary.terminal_state == "success" {
+                exit_codes::SUCCESS
+            } else {
+                exit_codes::GENERIC_ERROR
+            }
+        },
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_kickoff_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
                 eprintln!("ERROR: {err}");
@@ -670,23 +816,13 @@ fn run_dispatch_inner(
     })
 }
 
-fn run_retrigger_inner(
-    repo: &str,
-    pr_number: u32,
-    mode: ReviewRetriggerMode,
-    review_type: ReviewRunType,
-    projection_seconds: u64,
-) -> Result<RetriggerSummary, String> {
+fn run_retrigger_inner(repo: &str, pr_number: u32) -> Result<RetriggerSummary, String> {
     if pr_number == 0 {
         return Err("invalid PR number: must be > 0".to_string());
     }
-    if !(5..=600).contains(&projection_seconds) {
-        return Err("projection_seconds must be between 5 and 600".to_string());
-    }
     let _ = split_owner_repo(repo)?;
 
-    let args =
-        build_retrigger_workflow_args(repo, pr_number, mode, review_type, projection_seconds);
+    let args = build_retrigger_workflow_args(repo, pr_number);
     let output = Command::new("gh")
         .args(&args)
         .output()
@@ -702,20 +838,11 @@ fn run_retrigger_inner(
         workflow: "forge-admission-cycle.yml".to_string(),
         repo: repo.to_string(),
         pr_number,
-        mode: mode.as_str().to_string(),
-        review_type: review_type.as_str().to_string(),
-        projection_seconds,
         dispatched_at: now_iso8601_millis(),
     })
 }
 
-fn build_retrigger_workflow_args(
-    repo: &str,
-    pr_number: u32,
-    mode: ReviewRetriggerMode,
-    review_type: ReviewRunType,
-    projection_seconds: u64,
-) -> Vec<String> {
+fn build_retrigger_workflow_args(repo: &str, pr_number: u32) -> Vec<String> {
     vec![
         "workflow".to_string(),
         "run".to_string(),
@@ -724,13 +851,449 @@ fn build_retrigger_workflow_args(
         repo.to_string(),
         "-f".to_string(),
         format!("pr_number={pr_number}"),
-        "-f".to_string(),
-        format!("mode={}", mode.as_str()),
-        "-f".to_string(),
-        format!("review_type={}", review_type.as_str()),
-        "-f".to_string(),
-        format!("projection_seconds={projection_seconds}"),
     ]
+}
+
+fn run_kickoff_inner(
+    repo: &str,
+    event_path: &Path,
+    event_name: &str,
+    max_wait_seconds: u64,
+) -> Result<KickoffSummary, String> {
+    if max_wait_seconds == 0 {
+        return Err("max_wait_seconds must be greater than zero".to_string());
+    }
+
+    let ctx = resolve_fac_event_context(repo, event_path, event_name)?;
+    enforce_barrier(&ctx)?;
+    ensure_gh_cli_ready()?;
+
+    let started = Instant::now();
+    let dispatch = run_dispatch_inner(&ctx.pr_url, ReviewRunType::All, Some(&ctx.head_sha))?;
+    let mut after_seq = 0_u64;
+    let deadline = Instant::now() + Duration::from_secs(max_wait_seconds);
+    let mut terminal_state = "failure:timeout".to_string();
+
+    loop {
+        let projection = run_project_inner(
+            ctx.pr_number,
+            Some(&ctx.head_sha),
+            Some(dispatch.dispatch_epoch),
+            after_seq,
+        )?;
+        println!("{}", projection.line);
+        for error in &projection.errors {
+            println!(
+                "ERROR ts={} event={} review={} seq={} detail={}",
+                error.ts, error.event, error.review_type, error.seq, error.detail
+            );
+        }
+        after_seq = projection.last_seq;
+
+        if projection.terminal_failure {
+            terminal_state = "failure:terminal_failure".to_string();
+            break;
+        }
+        if projection_state_failed(&projection.security) {
+            terminal_state = "failure:security".to_string();
+            break;
+        }
+        if projection_state_failed(&projection.quality) {
+            terminal_state = "failure:quality".to_string();
+            break;
+        }
+        if projection_state_done(&projection.security) && projection_state_done(&projection.quality)
+        {
+            terminal_state = "success".to_string();
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    Ok(KickoffSummary {
+        repo: ctx.repo,
+        event_name: ctx.event_name,
+        pr_number: ctx.pr_number,
+        pr_url: ctx.pr_url,
+        head_sha: ctx.head_sha,
+        dispatch_epoch: dispatch.dispatch_epoch,
+        total_secs: started.elapsed().as_secs(),
+        terminal_state,
+    })
+}
+
+fn projection_state_done(state: &str) -> bool {
+    state.starts_with("done:")
+}
+
+fn projection_state_failed(state: &str) -> bool {
+    state.starts_with("failed:")
+}
+
+fn apply_sequence_done_fallback(
+    events: &[serde_json::Value],
+    security: &mut String,
+    quality: &mut String,
+) {
+    if *security != "none" && *quality != "none" {
+        return;
+    }
+
+    let Some(sequence_done) = events
+        .iter()
+        .rev()
+        .find(|event| event_name(event) == "sequence_done")
+    else {
+        return;
+    };
+
+    let head_sha = sequence_done
+        .get("head_sha")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let head_short = &head_sha[..head_sha.len().min(7)];
+
+    if *security == "none" {
+        *security = projection_state_from_sequence_verdict(
+            sequence_done
+                .get("security_verdict")
+                .and_then(serde_json::Value::as_str),
+            head_short,
+        );
+    }
+    if *quality == "none" {
+        *quality = projection_state_from_sequence_verdict(
+            sequence_done
+                .get("quality_verdict")
+                .and_then(serde_json::Value::as_str),
+            head_short,
+        );
+    }
+}
+
+fn projection_state_from_sequence_verdict(verdict: Option<&str>, head_short: &str) -> String {
+    let normalized = verdict.unwrap_or("").trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "PASS" | "DEDUPED" | "SKIPPED" => format!("done:sequence/summary:r0:{head_short}"),
+        "FAIL" => "failed:sequence_fail".to_string(),
+        "UNKNOWN" => "failed:sequence_unknown".to_string(),
+        _ => "none".to_string(),
+    }
+}
+
+fn ensure_gh_cli_ready() -> Result<(), String> {
+    let output = Command::new("gh")
+        .args(["auth", "status"])
+        .output()
+        .map_err(|err| format!("failed to execute `gh auth status`: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if detail.is_empty() {
+            Err("`gh auth status` failed; authenticate the VPS runner with GitHub CLI".to_string())
+        } else {
+            Err(format!(
+                "`gh auth status` failed; authenticate the VPS runner with GitHub CLI ({detail})"
+            ))
+        }
+    }
+}
+
+fn resolve_fac_event_context(
+    repo: &str,
+    event_path: &Path,
+    event_name: &str,
+) -> Result<FacEventContext, String> {
+    let _ = split_owner_repo(repo)?;
+    let payload_text = fs::read_to_string(event_path).map_err(|err| {
+        format!(
+            "failed to read event payload {}: {err}",
+            event_path.display()
+        )
+    })?;
+    let payload: serde_json::Value =
+        serde_json::from_str(&payload_text).map_err(|err| format!("invalid event JSON: {err}"))?;
+
+    match event_name {
+        "pull_request_target" => resolve_pull_request_target_context(repo, &payload),
+        "workflow_dispatch" => resolve_workflow_dispatch_context(repo, &payload),
+        other => Err(format!(
+            "unsupported event_name `{other}`; expected pull_request_target or workflow_dispatch"
+        )),
+    }
+}
+
+fn resolve_pull_request_target_context(
+    repo: &str,
+    payload: &serde_json::Value,
+) -> Result<FacEventContext, String> {
+    let event_repo = payload
+        .pointer("/repository/full_name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing repository.full_name in event payload".to_string())?;
+    if event_repo != repo {
+        return Err(format!(
+            "event repository mismatch: expected `{repo}`, got `{event_repo}`"
+        ));
+    }
+
+    let pr_number = payload
+        .pointer("/pull_request/number")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "missing pull_request.number in event payload".to_string())
+        .and_then(|value| {
+            u32::try_from(value).map_err(|_| format!("invalid pull_request.number: {value}"))
+        })?;
+    let pr_url = payload
+        .pointer("/pull_request/html_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing pull_request.html_url in event payload".to_string())?
+        .to_string();
+    let head_sha = payload
+        .pointer("/pull_request/head/sha")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing pull_request.head.sha in event payload".to_string())?
+        .to_string();
+    let base_ref = payload
+        .pointer("/pull_request/base/ref")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing pull_request.base.ref in event payload".to_string())?
+        .to_string();
+    let default_branch = payload
+        .pointer("/repository/default_branch")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing repository.default_branch in event payload".to_string())?
+        .to_string();
+    let author_login = payload
+        .pointer("/pull_request/user/login")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing pull_request.user.login in event payload".to_string())?
+        .to_string();
+    let author_association = payload
+        .pointer("/pull_request/author_association")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing pull_request.author_association in event payload".to_string())?
+        .to_string();
+    let actor_login = resolve_actor_login(payload);
+
+    Ok(FacEventContext {
+        repo: repo.to_string(),
+        event_name: "pull_request_target".to_string(),
+        pr_number,
+        pr_url,
+        head_sha,
+        base_ref,
+        default_branch,
+        author_login,
+        author_association,
+        actor_login,
+        actor_permission: None,
+    })
+}
+
+fn resolve_workflow_dispatch_context(
+    repo: &str,
+    payload: &serde_json::Value,
+) -> Result<FacEventContext, String> {
+    let event_repo = payload
+        .pointer("/repository/full_name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing repository.full_name in event payload".to_string())?;
+    if event_repo != repo {
+        return Err(format!(
+            "event repository mismatch: expected `{repo}`, got `{event_repo}`"
+        ));
+    }
+
+    let pr_number_raw = payload
+        .pointer("/inputs/pr_number")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "workflow_dispatch requires inputs.pr_number".to_string())?;
+    let pr_number = pr_number_raw
+        .parse::<u32>()
+        .map_err(|err| format!("invalid inputs.pr_number `{pr_number_raw}`: {err}"))?;
+    if pr_number == 0 {
+        return Err("inputs.pr_number must be greater than zero".to_string());
+    }
+
+    let pr_data = fetch_pr_data(repo, pr_number)?;
+    let pr_url = pr_data
+        .pointer("/html_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing html_url from PR API response".to_string())?
+        .to_string();
+    let head_sha = pr_data
+        .pointer("/head/sha")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing head.sha from PR API response".to_string())?
+        .to_string();
+    let base_ref = pr_data
+        .pointer("/base/ref")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing base.ref from PR API response".to_string())?
+        .to_string();
+    let author_login = pr_data
+        .pointer("/user/login")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing user.login from PR API response".to_string())?
+        .to_string();
+    let author_association = pr_data
+        .pointer("/author_association")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing author_association from PR API response".to_string())?
+        .to_string();
+
+    let default_branch = payload
+        .pointer("/repository/default_branch")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || fetch_default_branch(repo).unwrap_or_else(|_| "main".to_string()),
+            ToString::to_string,
+        );
+    let actor_login = resolve_actor_login(payload);
+    let actor_permission = resolve_actor_permission(repo, &actor_login)?;
+
+    Ok(FacEventContext {
+        repo: repo.to_string(),
+        event_name: "workflow_dispatch".to_string(),
+        pr_number,
+        pr_url,
+        head_sha,
+        base_ref,
+        default_branch,
+        author_login,
+        author_association,
+        actor_login,
+        actor_permission: Some(actor_permission),
+    })
+}
+
+fn resolve_actor_login(payload: &serde_json::Value) -> String {
+    std::env::var("GITHUB_ACTOR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            payload
+                .pointer("/sender/login")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn enforce_barrier(ctx: &FacEventContext) -> Result<(), String> {
+    validate_expected_head_sha(&ctx.head_sha)?;
+    if !is_allowed_author_association(&ctx.author_association) {
+        return Err(format!(
+            "unauthorized PR author identity: {} ({})",
+            ctx.author_login, ctx.author_association
+        ));
+    }
+
+    if ctx.event_name == "workflow_dispatch" {
+        let permission = ctx.actor_permission.as_deref().unwrap_or("none");
+        if !matches!(permission, "admin" | "maintain" | "write") {
+            return Err(format!(
+                "workflow_dispatch actor `{}` lacks repository permission (need write|maintain|admin, got `{permission}`)",
+                ctx.actor_login
+            ));
+        }
+
+        let dispatch_ref = resolve_dispatch_ref_name();
+        if dispatch_ref.is_empty() {
+            return Err(
+                "workflow_dispatch trusted-ref check failed: missing GITHUB_REF_NAME".to_string(),
+            );
+        }
+        if dispatch_ref != ctx.base_ref && dispatch_ref != ctx.default_branch {
+            return Err(format!(
+                "workflow_dispatch ref `{dispatch_ref}` is not trusted for PR base `{}` (default `{}`)",
+                ctx.base_ref, ctx.default_branch
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_allowed_author_association(value: &str) -> bool {
+    matches!(value, "OWNER" | "MEMBER" | "COLLABORATOR")
+}
+
+fn resolve_dispatch_ref_name() -> String {
+    if let Ok(ref_name) = std::env::var("GITHUB_REF_NAME") {
+        if !ref_name.is_empty() {
+            return ref_name;
+        }
+    }
+    if let Ok(full_ref) = std::env::var("GITHUB_REF") {
+        if let Some(stripped) = full_ref.strip_prefix("refs/heads/") {
+            return stripped.to_string();
+        }
+    }
+    String::new()
+}
+
+fn fetch_default_branch(repo: &str) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args(["api", &format!("/repos/{repo}")])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for default branch: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed resolving default branch: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("invalid JSON from default branch API response: {err}"))?;
+    value
+        .get("default_branch")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| "default_branch missing from repository API response".to_string())
+}
+
+fn fetch_pr_data(repo: &str, pr_number: u32) -> Result<serde_json::Value, String> {
+    let output = Command::new("gh")
+        .args(["api", &format!("/repos/{repo}/pulls/{pr_number}")])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for PR metadata: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh api failed resolving PR #{pr_number}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("invalid JSON from PR metadata API response: {err}"))
+}
+
+fn resolve_actor_permission(repo: &str, actor: &str) -> Result<String, String> {
+    if actor.is_empty() || actor == "unknown" {
+        return Ok("none".to_string());
+    }
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("/repos/{repo}/collaborators/{actor}/permission"),
+        ])
+        .output()
+        .map_err(|err| format!("failed to execute gh api for actor permission: {err}"))?;
+    if !output.status.success() {
+        return Ok("none".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("invalid JSON from actor permission API response: {err}"))?;
+    Ok(value
+        .get("permission")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none")
+        .to_string())
 }
 
 fn run_project_inner(
@@ -775,20 +1338,21 @@ fn run_project_inner(
         .collect::<Vec<_>>();
     events.sort_by_key(event_seq);
 
-    let security = projection_state_for_type(
+    let mut security = projection_state_for_type(
         &state,
         &events,
         pr_number,
         ReviewKind::Security,
         normalized_head.as_deref(),
     );
-    let quality = projection_state_for_type(
+    let mut quality = projection_state_for_type(
         &state,
         &events,
         pr_number,
         ReviewKind::Quality,
         normalized_head.as_deref(),
     );
+    apply_sequence_done_fallback(&events, &mut security, &mut quality);
 
     let recent_events = events
         .iter()
@@ -906,7 +1470,29 @@ fn dispatch_single_review(
                     log_file: Some(existing.log_file.display().to_string()),
                 });
             }
-            spawn_detached_review(pr_url, pr_number, review_kind, head_sha, dispatch_epoch)
+
+            if let Some(pending) =
+                read_fresh_pending_dispatch(owner_repo, pr_number, review_kind.as_str(), head_sha)?
+            {
+                return Ok(DispatchReviewResult {
+                    review_type: review_kind.as_str().to_string(),
+                    mode: "joined".to_string(),
+                    pid: pending.pid,
+                    unit: pending.unit,
+                    log_file: pending.log_file,
+                });
+            }
+
+            let result =
+                spawn_detached_review(pr_url, pr_number, review_kind, head_sha, dispatch_epoch)?;
+            write_pending_dispatch(
+                owner_repo,
+                pr_number,
+                review_kind.as_str(),
+                head_sha,
+                &result,
+            )?;
+            Ok(result)
         },
     )
 }
@@ -1171,6 +1757,99 @@ fn review_dispatch_lock_path(
     )))
 }
 
+fn review_dispatch_pending_dir_path() -> Result<PathBuf, String> {
+    Ok(apm2_home_dir()?.join("review_dispatch_pending"))
+}
+
+fn review_dispatch_pending_path(
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+) -> Result<PathBuf, String> {
+    let safe_repo = sanitize_for_path(owner_repo);
+    let safe_type = sanitize_for_path(review_type);
+    let safe_head = sanitize_for_path(&head_sha[..head_sha.len().min(12)]);
+    Ok(review_dispatch_pending_dir_path()?.join(format!(
+        "{safe_repo}-pr{pr_number}-{safe_type}-{safe_head}.json"
+    )))
+}
+
+fn read_pending_dispatch_entry(path: &Path) -> Result<Option<PendingDispatchEntry>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read dispatch marker {}: {err}", path.display()))?;
+    let entry = serde_json::from_str::<PendingDispatchEntry>(&text)
+        .map_err(|err| format!("failed to parse dispatch marker {}: {err}", path.display()))?;
+    Ok(Some(entry))
+}
+
+fn read_fresh_pending_dispatch(
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+) -> Result<Option<PendingDispatchEntry>, String> {
+    let path = review_dispatch_pending_path(owner_repo, pr_number, review_type, head_sha)?;
+    let Some(entry) = read_pending_dispatch_entry(&path)? else {
+        return Ok(None);
+    };
+    let age = Utc::now()
+        .signed_duration_since(entry.started_at)
+        .to_std()
+        .unwrap_or_default();
+    if age <= DISPATCH_PENDING_TTL {
+        if pending_dispatch_is_live(&entry) {
+            return Ok(Some(entry));
+        }
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    }
+
+    let _ = fs::remove_file(&path);
+    Ok(None)
+}
+
+fn write_pending_dispatch(
+    owner_repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    head_sha: &str,
+    result: &DispatchReviewResult,
+) -> Result<(), String> {
+    let path = review_dispatch_pending_path(owner_repo, pr_number, review_type, head_sha)?;
+    ensure_parent_dir(&path)?;
+    let entry = PendingDispatchEntry {
+        started_at: Utc::now(),
+        pid: result.pid,
+        unit: result.unit.clone(),
+        log_file: result.log_file.clone(),
+    };
+    let payload = serde_json::to_string(&entry)
+        .map_err(|err| format!("failed to serialize dispatch marker: {err}"))?;
+    fs::write(&path, payload)
+        .map_err(|err| format!("failed to write dispatch marker {}: {err}", path.display()))
+}
+
+fn pending_dispatch_is_live(entry: &PendingDispatchEntry) -> bool {
+    if let Some(pid) = entry.pid {
+        return is_process_alive(pid);
+    }
+    if let Some(unit) = entry.unit.as_deref() {
+        return is_systemd_unit_active(unit);
+    }
+    false
+}
+
+fn is_systemd_unit_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", unit])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn with_dispatch_lock<T>(
     owner_repo: &str,
     pr_number: u32,
@@ -1422,7 +2101,6 @@ fn run_single_review(
             final_head_sha: current_head_sha,
         });
     };
-
     write_pulse_file(pr_number, review_type, &current_head_sha)?;
     let run_key = build_run_key(pr_number, review_type, &current_head_sha);
 
@@ -3201,34 +3879,41 @@ mod tests {
     }
 
     #[test]
-    fn test_review_type_and_mode_as_str() {
-        assert_eq!(ReviewRunType::All.as_str(), "all");
-        assert_eq!(ReviewRunType::Security.as_str(), "security");
-        assert_eq!(ReviewRunType::Quality.as_str(), "quality");
-        assert_eq!(
-            ReviewRetriggerMode::DispatchAndGate.as_str(),
-            "dispatch_and_gate"
-        );
-        assert_eq!(ReviewRetriggerMode::GateOnly.as_str(), "gate_only");
-    }
-
-    #[test]
     fn test_build_retrigger_workflow_args() {
-        let args = build_retrigger_workflow_args(
-            "guardian-intelligence/apm2",
-            508,
-            ReviewRetriggerMode::DispatchAndGate,
-            ReviewRunType::Quality,
-            45,
-        );
+        let args = build_retrigger_workflow_args("guardian-intelligence/apm2", 508);
         assert_eq!(args[0], "workflow");
         assert_eq!(args[1], "run");
         assert!(args.contains(&"forge-admission-cycle.yml".to_string()));
         assert!(args.contains(&"guardian-intelligence/apm2".to_string()));
         assert!(args.contains(&"pr_number=508".to_string()));
-        assert!(args.contains(&"mode=dispatch_and_gate".to_string()));
-        assert!(args.contains(&"review_type=quality".to_string()));
-        assert!(args.contains(&"projection_seconds=45".to_string()));
+        assert!(!args.iter().any(|value| value.contains("mode=")));
+        assert!(!args.iter().any(|value| value.contains("review_type=")));
+        assert!(
+            !args
+                .iter()
+                .any(|value| value.contains("projection_seconds="))
+        );
+    }
+
+    #[test]
+    fn test_projection_state_helpers() {
+        assert!(projection_state_done("done:gpt-5.3-codex/codex:r0:abcdef0"));
+        assert!(!projection_state_done(
+            "alive:gpt-5.3-codex/codex:r0:abcdef0"
+        ));
+        assert!(projection_state_failed(
+            "failed:comment_post_permission_denied"
+        ));
+        assert!(!projection_state_failed("none"));
+    }
+
+    #[test]
+    fn test_allowed_author_association_guard() {
+        assert!(is_allowed_author_association("OWNER"));
+        assert!(is_allowed_author_association("MEMBER"));
+        assert!(is_allowed_author_association("COLLABORATOR"));
+        assert!(!is_allowed_author_association("CONTRIBUTOR"));
+        assert!(!is_allowed_author_association("NONE"));
     }
 
     #[test]
@@ -3538,5 +4223,41 @@ mod tests {
 
         let rendered = projection_state_for_type(&state, &events, 17, ReviewKind::Quality, None);
         assert_eq!(rendered, "failed:comment_post_permission_denied");
+    }
+
+    #[test]
+    fn test_apply_sequence_done_fallback_sets_done_states() {
+        let events = vec![serde_json::json!({
+            "event": "sequence_done",
+            "head_sha": "abcdef1234567890",
+            "security_verdict": "DEDUPED",
+            "quality_verdict": "PASS",
+            "seq": 9
+        })];
+        let mut security = "none".to_string();
+        let mut quality = "none".to_string();
+
+        apply_sequence_done_fallback(&events, &mut security, &mut quality);
+
+        assert_eq!(security, "done:sequence/summary:r0:abcdef1");
+        assert_eq!(quality, "done:sequence/summary:r0:abcdef1");
+    }
+
+    #[test]
+    fn test_apply_sequence_done_fallback_sets_failed_state() {
+        let events = vec![serde_json::json!({
+            "event": "sequence_done",
+            "head_sha": "abcdef1234567890",
+            "security_verdict": "FAIL",
+            "quality_verdict": "UNKNOWN",
+            "seq": 9
+        })];
+        let mut security = "none".to_string();
+        let mut quality = "none".to_string();
+
+        apply_sequence_done_fallback(&events, &mut security, &mut quality);
+
+        assert_eq!(security, "failed:sequence_fail");
+        assert_eq!(quality, "failed:sequence_unknown");
     }
 }

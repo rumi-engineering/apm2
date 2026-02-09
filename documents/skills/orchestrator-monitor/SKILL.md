@@ -91,7 +91,7 @@ review_prompt_required_payload[1]:
 
 runtime_review_protocol:
   primary_entrypoint: "apm2 fac review dispatch <PR_URL> --type all"
-  recovery_entrypoint: "apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER> --mode <dispatch_and_gate|gate_only> --type <all|security|quality> --projection-seconds 30"
+  recovery_entrypoint: "apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER>"
   observability_surfaces:
     - "~/.apm2/review_events.ndjson (append-only lifecycle events)"
     - "~/.apm2/review_state.json (active review process/model/backend state)"
@@ -115,7 +115,7 @@ invariants[13]:
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch per PR at any time."
-  - "No merge action without Guardian Intelligence - Barrier=success and Forge Admission Cycle=success for current HEAD SHA."
+  - "No merge action without Forge Admission Cycle=success for current HEAD SHA."
   - "Review prompt dispatch includes review_prompt_required_payload."
   - "Never use the same model family for both implementing and reviewing the same PR cycle."
   - "Fix subagents assume their branch is stale until proven current against origin/main."

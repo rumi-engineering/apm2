@@ -1,45 +1,18 @@
-# Unified FAC-first review execution and authoritative admission projection.
-# GitHub remains a projection surface over VPS-executed FAC reviewers.
-
 name: Forge Admission Cycle
 
 on:
   pull_request_target:
     branches: [main]
     types: [opened, reopened, synchronize, ready_for_review]
-  issue_comment:
-    types: [created, edited]
   workflow_dispatch:
     inputs:
       pr_number:
         description: "Pull request number to process"
         required: true
         type: string
-      mode:
-        description: "Execution mode"
-        required: true
-        type: choice
-        default: dispatch_and_gate
-        options:
-          - dispatch_and_gate
-          - gate_only
-      review_type:
-        description: "Review stream to dispatch (ignored for gate_only mode)"
-        required: true
-        type: choice
-        default: all
-        options:
-          - all
-          - security
-          - quality
-      projection_seconds:
-        description: "Seconds to stream 1Hz FAC projection logs"
-        required: true
-        type: string
-        default: "30"
 
 concurrency:
-  group: forge-admission-cycle-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event_name == 'issue_comment' && github.event.issue.number || github.event.inputs.pr_number || github.run_id }}
+  group: forge-admission-cycle-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -54,250 +27,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Pre-filter issue_comment events to trusted actors only so arbitrary
-  # commenters cannot trigger gate projections or self-hosted execution.
-  pre-filter:
-    name: Pre-filter
-    if: >-
-      github.event_name == 'pull_request_target' ||
-      github.event_name == 'workflow_dispatch' ||
-      (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        (
-          github.event.comment.author_association == 'OWNER' ||
-          github.event.comment.author_association == 'MEMBER' ||
-          github.event.comment.author_association == 'COLLABORATOR'
-        )
-      )
+  barrier:
+    name: Barrier
     runs-on: ubuntu-24.04
     steps:
-      - run: echo "Pre-filter passed"
-
-  fac-preflight:
-    name: FAC Preflight
-    needs: [pre-filter]
-    if: needs.pre-filter.result == 'success'
-    runs-on: ubuntu-24.04
-    outputs:
-      pr_number: ${{ steps.pr.outputs.pr_number }}
-      pr_url: ${{ steps.pr.outputs.pr_url }}
-      head_sha: ${{ steps.pr.outputs.head_sha }}
-      base_ref: ${{ steps.pr.outputs.base_ref }}
-      default_branch: ${{ steps.pr.outputs.default_branch }}
-      checkout_ref: ${{ steps.pr.outputs.checkout_ref }}
-      review_type: ${{ steps.pr.outputs.review_type }}
-      projection_seconds: ${{ steps.pr.outputs.projection_seconds }}
-      run_dispatch: ${{ steps.pr.outputs.run_dispatch }}
-
-    steps:
-      - name: Resolve PR context
-        id: pr
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
-            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-            echo "pr_url=${{ github.event.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
-            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
-            echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
-            echo "default_branch=${{ github.event.repository.default_branch }}" >> "$GITHUB_OUTPUT"
-            echo "checkout_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
-            echo "author_login=${{ github.event.pull_request.user.login }}" >> "$GITHUB_OUTPUT"
-            echo "author_assoc=${{ github.event.pull_request.author_association }}" >> "$GITHUB_OUTPUT"
-            echo "review_type=all" >> "$GITHUB_OUTPUT"
-            echo "projection_seconds=30" >> "$GITHUB_OUTPUT"
-            echo "run_dispatch=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
-            PR_NUMBER='${{ github.event.issue.number }}'
-            PR_JSON=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
-            echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-            echo "pr_url=$(jq -r '.html_url' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-            echo "head_sha=$(jq -r '.head.sha' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-            echo "base_ref=$(jq -r '.base.ref' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-            echo "default_branch=${{ github.event.repository.default_branch }}" >> "$GITHUB_OUTPUT"
-            echo "checkout_ref=$(jq -r '.base.ref' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-            echo "author_login=$(jq -r '.user.login' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-            echo "author_assoc=$(jq -r '.author_association' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-            echo "review_type=all" >> "$GITHUB_OUTPUT"
-            echo "projection_seconds=30" >> "$GITHUB_OUTPUT"
-            echo "run_dispatch=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          PR_NUMBER='${{ github.event.inputs.pr_number }}'
-          if [[ -z "${PR_NUMBER}" ]] || ! [[ "${PR_NUMBER}" =~ ^[0-9]+$ ]]; then
-            echo "::error::workflow_dispatch requires numeric input `pr_number`"
-            exit 1
-          fi
-
-          PR_JSON=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
-          DEFAULT_BRANCH=$(gh api "/repos/${{ github.repository }}" --jq '.default_branch')
-
-          REVIEW_TYPE='${{ github.event.inputs.review_type }}'
-          if [[ -z "${REVIEW_TYPE}" ]]; then
-            REVIEW_TYPE="all"
-          fi
-          case "${REVIEW_TYPE}" in
-            all|security|quality)
-              ;;
-            *)
-              echo "::error::Invalid review_type=${REVIEW_TYPE}. Expected one of: all, security, quality."
-              exit 1
-              ;;
-          esac
-
-          PROJECTION_SECONDS='${{ github.event.inputs.projection_seconds }}'
-          if [[ -z "${PROJECTION_SECONDS}" ]]; then
-            PROJECTION_SECONDS="30"
-          fi
-          if ! [[ "${PROJECTION_SECONDS}" =~ ^[0-9]+$ ]]; then
-            echo "::error::projection_seconds must be numeric."
-            exit 1
-          fi
-          if [[ "${PROJECTION_SECONDS}" -lt 5 || "${PROJECTION_SECONDS}" -gt 600 ]]; then
-            echo "::error::projection_seconds must be between 5 and 600."
-            exit 1
-          fi
-
-          MODE='${{ github.event.inputs.mode }}'
-          if [[ -z "${MODE}" ]]; then
-            MODE="dispatch_and_gate"
-          fi
-          case "${MODE}" in
-            dispatch_and_gate)
-              RUN_DISPATCH="true"
-              ;;
-            gate_only)
-              RUN_DISPATCH="false"
-              ;;
-            *)
-              echo "::error::Invalid mode=${MODE}. Expected one of: dispatch_and_gate, gate_only."
-              exit 1
-              ;;
-          esac
-
-          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "pr_url=$(jq -r '.html_url' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$(jq -r '.head.sha' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-          echo "base_ref=$(jq -r '.base.ref' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-          echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
-          echo "checkout_ref=$(jq -r '.base.ref' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-          echo "author_login=$(jq -r '.user.login' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-          echo "author_assoc=$(jq -r '.author_association' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-          echo "review_type=${REVIEW_TYPE}" >> "$GITHUB_OUTPUT"
-          echo "projection_seconds=${PROJECTION_SECONDS}" >> "$GITHUB_OUTPUT"
-          echo "run_dispatch=${RUN_DISPATCH}" >> "$GITHUB_OUTPUT"
-
-      - name: Authorize PR author identity (fail closed)
-        run: |
-          set -euo pipefail
-
-          AUTHOR_LOGIN='${{ steps.pr.outputs.author_login }}'
-          AUTHOR_ASSOC='${{ steps.pr.outputs.author_assoc }}'
-          case "${AUTHOR_ASSOC}" in
-            OWNER|MEMBER|COLLABORATOR)
-              echo "Authorized PR author: ${AUTHOR_LOGIN} (${AUTHOR_ASSOC})"
-              ;;
-            *)
-              echo "::error::Unauthorized PR author identity: ${AUTHOR_LOGIN} (${AUTHOR_ASSOC})"
-              exit 1
-              ;;
-          esac
-
-      - name: Authorize manual dispatch actor (write+ required)
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          ACTOR='${{ github.actor }}'
-          PERMISSION=$(gh api "/repos/${{ github.repository }}/collaborators/${ACTOR}/permission" --jq '.permission' 2>/dev/null || true)
-          case "${PERMISSION}" in
-            admin|maintain|write)
-              echo "Authorized dispatch actor: ${ACTOR} (${PERMISSION})"
-              ;;
-            *)
-              echo "::error::workflow_dispatch actor '${ACTOR}' lacks required repository permission (need write|maintain|admin)."
-              exit 1
-              ;;
-          esac
-
-      - name: Guard trusted dispatch ref
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          set -euo pipefail
-
-          DISPATCH_REF='${{ github.ref_name }}'
-          BASE_REF='${{ steps.pr.outputs.base_ref }}'
-          DEFAULT_BRANCH='${{ steps.pr.outputs.default_branch }}'
-
-          if [[ "${DISPATCH_REF}" != "${BASE_REF}" && "${DISPATCH_REF}" != "${DEFAULT_BRANCH}" ]]; then
-            echo "::error::workflow_dispatch ref '${DISPATCH_REF}' is not trusted for PR base '${BASE_REF}' (default '${DEFAULT_BRANCH}')."
-            exit 1
-          fi
-
-      - name: Checkout trusted base-branch policy
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ steps.pr.outputs.base_ref }}
-
-      - name: Validate reviewer identity is allowlisted
-        if: steps.pr.outputs.run_dispatch == 'true'
-        env:
-          REVIEW_BOT_TOKEN: ${{ secrets.AUTO_APPROVE_PAT }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${REVIEW_BOT_TOKEN:-}" ]]; then
-            echo "::error::Missing required secret AUTO_APPROVE_PAT."
-            exit 1
-          fi
-
-          BOT_LOGIN=$(GH_TOKEN="${REVIEW_BOT_TOKEN}" gh api user --jq '.login')
-          echo "Using reviewer login: ${BOT_LOGIN}"
-
-          jq -e --arg login "$BOT_LOGIN" \
-            '[.reviewers.security[].github_logins[] | ascii_downcase] | index($login|ascii_downcase) != null' \
-            .github/review-gate/trusted-reviewers.json >/dev/null
-
-          jq -e --arg login "$BOT_LOGIN" \
-            '[.reviewers.code_quality[].github_logins[] | ascii_downcase] | index($login|ascii_downcase) != null' \
-            .github/review-gate/trusted-reviewers.json >/dev/null
-
-      - name: Emit manual recovery commands
-        run: |
-          set -euo pipefail
-
-          PR_NUMBER='${{ steps.pr.outputs.pr_number }}'
-          echo "Manual barrier check:       gh workflow run guardian-intelligence-barrier.yml --repo ${{ github.repository }} -f pr_number=${PR_NUMBER}"
-          echo "Manual FAC (all):           gh workflow run forge-admission-cycle.yml --repo ${{ github.repository }} -f pr_number=${PR_NUMBER} -f mode=dispatch_and_gate -f review_type=all -f projection_seconds=30"
-          echo "Manual FAC (security):      gh workflow run forge-admission-cycle.yml --repo ${{ github.repository }} -f pr_number=${PR_NUMBER} -f mode=dispatch_and_gate -f review_type=security -f projection_seconds=30"
-          echo "Manual FAC (quality):       gh workflow run forge-admission-cycle.yml --repo ${{ github.repository }} -f pr_number=${PR_NUMBER} -f mode=dispatch_and_gate -f review_type=quality -f projection_seconds=30"
-          echo "Manual FAC gate-only:       gh workflow run forge-admission-cycle.yml --repo ${{ github.repository }} -f pr_number=${PR_NUMBER} -f mode=gate_only -f review_type=all -f projection_seconds=30"
-
-  fac-review:
-    name: FAC Review Projection
-    needs: [fac-preflight]
-    if: needs.fac-preflight.result == 'success' && needs.fac-preflight.outputs.run_dispatch == 'true'
-    runs-on: [self-hosted, linux, x64, fac-ovh]
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-
-    steps:
-      - name: Checkout trusted base branch code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ needs.fac-preflight.outputs.checkout_ref }}
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
         with:
@@ -305,253 +39,42 @@ jobs:
 
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
-      - name: Add Cargo bin to PATH
-        run: |
-          if [[ -n "${CARGO_HOME:-}" ]]; then
-            echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
-          else
-            echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
-          fi
-
-      - name: Build apm2 CLI
-        run: cargo build --locked -p apm2-cli
-
-      - name: Dispatch FAC reviewers (idempotent start-or-join)
-        id: dispatch
-        env:
-          GH_TOKEN: ${{ secrets.AUTO_APPROVE_PAT }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "::error::Missing required secret AUTO_APPROVE_PAT (authoritative reviewer identity token)."
-            exit 1
-          fi
-
-          if ! gh auth status >/dev/null 2>&1; then
-            echo "::error::No gh authentication available on runner; detached reviewers cannot access GitHub APIs."
-            exit 1
-          fi
-
-          FAC_BIN="${PWD}/target/debug/apm2"
-          PR_URL='${{ needs.fac-preflight.outputs.pr_url }}'
-          HEAD_SHA='${{ needs.fac-preflight.outputs.head_sha }}'
-          REVIEW_TYPE='${{ needs.fac-preflight.outputs.review_type }}'
-
-          DISPATCH_JSON=$("${FAC_BIN}" fac --json review dispatch "${PR_URL}" --type "${REVIEW_TYPE}" --expected-head-sha "${HEAD_SHA}")
-          echo "dispatch_json<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$DISPATCH_JSON" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          DISPATCH_EPOCH=$(jq -r '.dispatch_epoch // 0' <<<"${DISPATCH_JSON}")
-          if [[ "${DISPATCH_EPOCH}" == "0" ]]; then
-            echo "::error::FAC dispatch did not return a valid dispatch_epoch"
-            exit 1
-          fi
-          echo "dispatch_epoch=${DISPATCH_EPOCH}" >> "$GITHUB_OUTPUT"
-
-          jq -r '.results[] | "dispatch review_type=\(.review_type) mode=\(.mode)" +
-            (if .unit then " unit=\(.unit)" else "" end) +
-            (if .pid then " pid=\(.pid|tostring)" else "" end)' <<<"${DISPATCH_JSON}"
-
-      - name: Project 1Hz reviewer health window
-        run: |
-          set -euo pipefail
-
-          FAC_BIN="${PWD}/target/debug/apm2"
-          PR_NUMBER='${{ needs.fac-preflight.outputs.pr_number }}'
-          HEAD_SHA='${{ needs.fac-preflight.outputs.head_sha }}'
-          DISPATCH_EPOCH='${{ steps.dispatch.outputs.dispatch_epoch }}'
-          PROJECTION_SECONDS='${{ needs.fac-preflight.outputs.projection_seconds }}'
-
-          terminal_failure=0
-          after_seq=0
-
-          for _ in $(seq 1 "${PROJECTION_SECONDS}"); do
-            PROJECT_JSON=$("${FAC_BIN}" fac --json review project \
-              --pr "${PR_NUMBER}" \
-              --head-sha "${HEAD_SHA}" \
-              --since-epoch "${DISPATCH_EPOCH}" \
-              --after-seq "${after_seq}")
-
-            if [[ -z "${PROJECT_JSON}" ]] || ! jq -e . >/dev/null 2>&1 <<<"${PROJECT_JSON}"; then
-              NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-              echo "ts=${NOW} security=unknown quality=unknown events=-"
-              sleep 1
-              continue
-            fi
-
-            NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            jq -r --arg now "${NOW}" '.line // ("ts=" + $now + " security=unknown quality=unknown events=-")' <<<"${PROJECT_JSON}"
-            jq -r '.errors[]? | "ERROR ts=\(.ts) event=\(.event) review=\(.review_type) seq=\(.seq) detail=\(.detail)"' <<<"${PROJECT_JSON}"
-
-            next_seq=$(jq -r '.last_seq // 0' <<<"${PROJECT_JSON}")
-            if [[ "${next_seq}" =~ ^[0-9]+$ ]]; then
-              after_seq="${next_seq}"
-            fi
-
-            if jq -e '.terminal_failure == true' >/dev/null 2>&1 <<<"${PROJECT_JSON}"; then
-              terminal_failure=1
-              break
-            fi
-
-            sleep 1
-          done
-
-          if [[ "${terminal_failure}" -ne 0 ]]; then
-            echo "::error::Terminal FAC reviewer failure detected in projection window."
-            exit 1
-          fi
-
-  gate-projection:
-    name: Forge Admission Cycle
-    needs: [pre-filter, fac-preflight, fac-review]
-    if: always()
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Determine whether status projection is allowed
-        id: gate
-        run: |
-          set -euo pipefail
-
-          if [[ "${{ needs.pre-filter.result }}" == "skipped" ]]; then
-            echo "should_post=false" >> "$GITHUB_OUTPUT"
-            echo "state=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Gate projection not allowed for untrusted trigger" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "should_post=true" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve PR context for gate evaluation
-        id: ctx
-        if: steps.gate.outputs.should_post == 'true'
+      - name: Validate trigger trust boundary
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-
-          if [[ -n '${{ needs.fac-preflight.outputs.pr_number }}' && -n '${{ needs.fac-preflight.outputs.head_sha }}' && -n '${{ needs.fac-preflight.outputs.base_ref }}' ]]; then
-            echo "pr_number=${{ needs.fac-preflight.outputs.pr_number }}" >> "$GITHUB_OUTPUT"
-            echo "head_sha=${{ needs.fac-preflight.outputs.head_sha }}" >> "$GITHUB_OUTPUT"
-            echo "base_ref=${{ needs.fac-preflight.outputs.base_ref }}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
-            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
-            echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            PR_NUMBER='${{ github.event.inputs.pr_number }}'
-          else
-            PR_NUMBER='${{ github.event.issue.number }}'
-          fi
-
-          if [[ -z "${PR_NUMBER}" ]] || ! [[ "${PR_NUMBER}" =~ ^[0-9]+$ ]]; then
-            echo "::error::Cannot resolve PR context: missing numeric PR number"
-            exit 1
-          fi
-
-          PR_JSON=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
-          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$(jq -r '.head.sha' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-          echo "base_ref=$(jq -r '.base.ref' <<<"${PR_JSON}")" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout trusted base branch code
-        if: steps.gate.outputs.should_post == 'true'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ steps.ctx.outputs.base_ref }}
-
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
-        if: steps.gate.outputs.should_post == 'true'
-        with:
-          toolchain: stable
-
-      - name: Install protoc
-        if: steps.gate.outputs.should_post == 'true'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-        if: steps.gate.outputs.should_post == 'true'
-
-      - name: Fetch trusted-reviewers from base branch
-        if: steps.gate.outputs.should_post == 'true'
-        run: |
-          set -euo pipefail
-          git fetch origin "${{ steps.ctx.outputs.base_ref }}" --depth=1
-          git show "origin/${{ steps.ctx.outputs.base_ref }}:.github/review-gate/trusted-reviewers.json" > /tmp/trusted-reviewers-base.json
-
-      - name: Evaluate review gate
-        id: eval
-        if: steps.gate.outputs.should_post == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          set +e
-          cargo xtask review-gate \
+          cargo run --locked --quiet -p apm2-cli -- fac barrier \
             --repo "${{ github.repository }}" \
-            --pr-number "${{ steps.ctx.outputs.pr_number }}" \
-            --head-sha "${{ steps.ctx.outputs.head_sha }}" \
-            --trusted-reviewers "/tmp/trusted-reviewers-base.json" \
-            | tee /tmp/review-gate-evaluation.json
-          code=${PIPESTATUS[0]}
-          set -e
+            --event "${{ github.event_path }}" \
+            --event-name "${{ github.event_name }}"
 
-          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+  forge-admission-cycle:
+    name: Forge Admission Cycle
+    needs: [barrier]
+    runs-on: [self-hosted, linux, x64, fac-ovh]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Determine projected status
-        id: state
-        if: steps.gate.outputs.should_post == 'true'
-        run: |
-          set -euo pipefail
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
+        with:
+          toolchain: stable
 
-          if [[ "${{ needs.fac-preflight.result }}" != "success" ]]; then
-            echo "state=failure" >> "$GITHUB_OUTPUT"
-            echo "description=FAC preflight failed" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
-          code='${{ steps.eval.outputs.exit_code }}'
-          if [[ -z "${code}" ]]; then
-            echo "state=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Review gate evaluator did not produce an exit code" >> "$GITHUB_OUTPUT"
-          elif [[ "${code}" -eq 0 ]]; then
-            echo "state=success" >> "$GITHUB_OUTPUT"
-            echo "description=Forge admission cycle passed" >> "$GITHUB_OUTPUT"
-          elif [[ "${code}" -eq 2 ]]; then
-            echo "state=failure" >> "$GITHUB_OUTPUT"
-            echo "description=AI reviews incomplete or failed" >> "$GITHUB_OUTPUT"
-          else
-            echo "state=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Forge admission cycle failed" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Post gate status to PR head
-        if: >-
-          steps.gate.outputs.should_post == 'true' &&
-          steps.ctx.outputs.head_sha != ''
+      - name: Kick off FAC and project health
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-
-          gh api --method POST "/repos/${{ github.repository }}/statuses/${{ steps.ctx.outputs.head_sha }}" \
-            -f state="${{ steps.state.outputs.state || 'failure' }}" \
-            -f context="Forge Admission Cycle" \
-            -f description="${{ steps.state.outputs.description || 'Forge admission cycle evaluation failed' }}"
-
-      - name: Fail workflow when gate is not success
-        if: >-
-          steps.gate.outputs.should_post == 'true' &&
-          steps.state.outputs.state != 'success'
-        run: |
-          set -euo pipefail
-          echo "::error::${{ steps.state.outputs.description }}"
-          exit 1
+          cargo run --locked --quiet -p apm2-cli -- fac kickoff \
+            --repo "${{ github.repository }}" \
+            --event "${{ github.event_path }}" \
+            --event-name "${{ github.event_name }}" \
+            --max-wait-seconds 3600

@@ -72,8 +72,8 @@ done
 
 echo ""
 
-# --- Section 2: Barrier + Forge Admission Cycle Status ---
-echo -e "${BOLD}--- Barrier + Forge Admission Cycle Status ---${NC}"
+# --- Section 2: Forge Admission Cycle Status ---
+echo -e "${BOLD}--- Forge Admission Cycle Status ---${NC}"
 printf "%-6s %-30s %-10s %s\n" "PR" "Check" "State" "Description"
 
 for pr in "${PRS[@]}"; do
@@ -81,10 +81,10 @@ for pr in "${PRS[@]}"; do
   state=$(gh pr view "$pr" --repo "$REPO" --json state --jq '.state' 2>/dev/null)
   [[ "$state" == "MERGED" ]] && { printf "%-6s %s\n" "#$pr" "(merged)"; continue; }
 
-  gate_status=$(gh api "repos/$REPO/commits/$head/status" --jq '.statuses[] | select(.context == "Guardian Intelligence - Barrier" or .context == "Forge Admission Cycle") | "\(.context)|\(.state)|\(.description)"' 2>/dev/null || true)
+  gate_status=$(gh api "repos/$REPO/commits/$head/status" --jq '.statuses[] | select(.context == "Forge Admission Cycle") | "\(.context)|\(.state)|\(.description)"' 2>/dev/null || true)
 
   if [[ -z "$gate_status" ]]; then
-    printf "%-6s %s\n" "#$pr" "(no Barrier/FAC status posted)"
+    printf "%-6s %s\n" "#$pr" "(no Forge Admission Cycle status posted)"
   else
     while IFS='|' read -r ctx st desc; do
       if [[ "$st" == "success" ]]; then
