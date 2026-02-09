@@ -153,6 +153,7 @@ async fn test_atomic_receipt_emission() {
             reviewer_actor_id,
             timestamp_ns,
             &identity_proof_hash,
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         )
         .unwrap();
 

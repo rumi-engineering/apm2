@@ -16,8 +16,7 @@ decision_tree:
               - Include escalation context in next supervision cycle.
             If subagent stopped:
               - Spawn new subagent via Task tool with escalation context:
-                Task(subagent_type="general-purpose", description="Fix <TICKET_ID>", prompt="/ticket <TICKET_ID>\n\nESCALATION: <CHECK_OUTPUT_SNIPPET>\nTask: fix block, `cargo xtask commit`, `cargo xtask push`. Report when green.", run_in_background=true)
-              - Stage-2 demotion (TCK-00419): `cargo xtask commit`/`cargo xtask push` are projection-only by default; direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle state.
+                Task(subagent_type="general-purpose", description="Fix <TICKET_ID>", prompt="/ticket <TICKET_ID>\n\nESCALATION: <CHECK_OUTPUT_SNIPPET>\nTask: fix block, commit changes, then `apm2 fac push`. Report when green.", run_in_background=true)
         - id: SUPERVISE_PROGRESS
           action: "Monitor via TaskOutput every 3m. Use TaskStop and restart if no progress for 5m."
         - id: RECHECK

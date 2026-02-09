@@ -1023,6 +1023,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
+        time_envelope_ref: &str,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
         // protocol compatibility across daemon/core boundary.
@@ -1050,6 +1051,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
             "identity_proof_hash": hex::encode(identity_proof_hash),
+            "time_envelope_ref": time_envelope_ref,
         });
 
         // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
@@ -1107,6 +1109,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             event_id = %event_id,
             episode_id = %episode_id,
             receipt_id = %receipt_id,
+            time_envelope_ref = %time_envelope_ref,
             "Persisted ReviewReceiptRecorded event"
         );
 
@@ -1125,6 +1128,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
+        time_envelope_ref: &str,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use crate::protocol::dispatch::REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX;
 
@@ -1147,6 +1151,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
             "identity_proof_hash": hex::encode(identity_proof_hash),
+            "time_envelope_ref": time_envelope_ref,
         });
 
         let payload_string = payload_json.to_string();
@@ -1200,6 +1205,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             event_id = %event_id,
             receipt_id = %receipt_id,
             reason_code = %reason_code,
+            time_envelope_ref = %time_envelope_ref,
             "Persisted ReviewBlockedRecorded event"
         );
 
@@ -3073,6 +3079,7 @@ mod tests {
                 "reviewer-actor-x",
                 1_000_000_000,
                 &identity_proof,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
             .expect("first emit should succeed");
 
@@ -3119,6 +3126,7 @@ mod tests {
                 "reviewer-actor-y",
                 2_000_000_000,
                 &identity_proof_hash,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             )
             .expect("blocked receipt emit should succeed");
 
@@ -3382,6 +3390,7 @@ mod tests {
                 "reviewer-actor-z",
                 3_000_000_000,
                 &identity_proof_hash,
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             )
             .expect("blocked receipt emit should succeed");
 

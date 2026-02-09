@@ -19,6 +19,11 @@ protocol:
 variables:
   TICKET_ID_OPTIONAL: "$1"
 
+bootstrap:
+  - step: "DISCOVER_CLI"
+    action: "Run `apm2 fac --help` and read the output to discover available subcommands. Then run `apm2 fac <subcommand> --help` for each subcommand you will use during this workflow. Do NOT assume subcommand names or flag syntax — use the help output as the authoritative reference."
+    when: "FIRST — before invoking any `apm2 fac` command."
+
 notes:
   - "Required merge-gate context is `Review Gate Success`, bound to the current PR head SHA. Some repos/branches may still require additional legacy contexts (for example `CI Success`) until branch protection cutover is complete."
   - "Use `apm2 fac` commands as the primary operational interface for review lifecycle state (`apm2 fac review status`, `apm2 fac review project`, `apm2 fac review retrigger`)."
