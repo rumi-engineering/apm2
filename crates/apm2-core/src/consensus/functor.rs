@@ -59,6 +59,12 @@ pub const MAX_RULE_ID_LEN: usize = 128;
 /// Maximum length of a proof obligation reference.
 pub const MAX_PROOF_REF_LEN: usize = 256;
 
+/// Maximum length of the description field on a rewrite rule.
+///
+/// Prevents denial-of-service via arbitrarily large descriptions in
+/// deserialized `RewriteRule` instances.
+pub const MAX_DESCRIPTION_LEN: usize = 4096;
+
 /// Maximum number of observation points to check per rewrite rule.
 ///
 /// Each observation point is an HSI operation whose output is compared
@@ -134,6 +140,50 @@ pub enum FunctorError {
     NoProofObligation {
         /// The rule missing a proof.
         rule_id: String,
+    },
+
+    /// The description field exceeds the maximum allowed length.
+    #[error("description length {len} exceeds maximum {max}")]
+    DescriptionTooLong {
+        /// The actual length.
+        len: usize,
+        /// The maximum allowed length.
+        max: usize,
+    },
+
+    /// A string field within an embedded `ObservableSemantics` exceeds bounds.
+    #[error("string too long in {field}: length {actual} exceeds maximum {max}")]
+    StringTooLong {
+        /// Which field exceeded its bound.
+        field: &'static str,
+        /// The actual length.
+        actual: usize,
+        /// The maximum allowed length.
+        max: usize,
+    },
+
+    /// An embedded `ObservableSemantics` has too many states.
+    #[error("too many states in {field}: {actual} exceeds maximum {max}")]
+    StatesTooMany {
+        /// Which field exceeded its bound.
+        field: &'static str,
+        /// The actual count.
+        actual: usize,
+        /// The maximum allowed count.
+        max: usize,
+    },
+
+    /// An embedded `ObservableSemantics` has too many transitions per state.
+    #[error("too many transitions per state in {field}: state {state} has {actual} (max {max})")]
+    TransitionsPerStateTooMany {
+        /// Which field exceeded its bound.
+        field: &'static str,
+        /// The state identifier.
+        state: u64,
+        /// The actual count.
+        actual: usize,
+        /// The maximum allowed count.
+        max: usize,
     },
 }
 
@@ -220,6 +270,95 @@ impl RewriteRule {
         })
     }
 
+    /// Validates a `RewriteRule` after deserialization.
+    ///
+    /// Enforces:
+    /// - `id.len() <= MAX_RULE_ID_LEN`
+    /// - `description.len() <= MAX_DESCRIPTION_LEN`
+    /// - `source_pattern` and `target_pattern` pass
+    ///   [`ObservableSemantics::validate`]
+    ///
+    /// This **must** be called immediately after deserializing a
+    /// `RewriteRule` to prevent denial-of-service via oversized inputs
+    /// that bypass constructor constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any bound is exceeded.
+    pub fn validate(&self) -> Result<(), FunctorError> {
+        if self.id.len() > MAX_RULE_ID_LEN {
+            return Err(FunctorError::RuleIdTooLong {
+                len: self.id.len(),
+                max: MAX_RULE_ID_LEN,
+            });
+        }
+
+        if self.description.len() > MAX_DESCRIPTION_LEN {
+            return Err(FunctorError::DescriptionTooLong {
+                len: self.description.len(),
+                max: MAX_DESCRIPTION_LEN,
+            });
+        }
+
+        self.source_pattern.validate().map_err(|e| match e {
+            BisimulationError::CollectionTooLarge { actual, max, .. } => {
+                FunctorError::StatesTooMany {
+                    field: "source_pattern",
+                    actual,
+                    max,
+                }
+            },
+            BisimulationError::TransitionsPerStateExceeded {
+                state, actual, max, ..
+            } => FunctorError::TransitionsPerStateTooMany {
+                field: "source_pattern",
+                state,
+                actual,
+                max,
+            },
+            BisimulationError::StringTooLong {
+                field: _,
+                actual,
+                max,
+            } => FunctorError::StringTooLong {
+                field: "source_pattern",
+                actual,
+                max,
+            },
+            other => FunctorError::Bisimulation(other),
+        })?;
+
+        self.target_pattern.validate().map_err(|e| match e {
+            BisimulationError::CollectionTooLarge { actual, max, .. } => {
+                FunctorError::StatesTooMany {
+                    field: "target_pattern",
+                    actual,
+                    max,
+                }
+            },
+            BisimulationError::TransitionsPerStateExceeded {
+                state, actual, max, ..
+            } => FunctorError::TransitionsPerStateTooMany {
+                field: "target_pattern",
+                state,
+                actual,
+                max,
+            },
+            BisimulationError::StringTooLong {
+                field: _,
+                actual,
+                max,
+            } => FunctorError::StringTooLong {
+                field: "target_pattern",
+                actual,
+                max,
+            },
+            other => FunctorError::Bisimulation(other),
+        })?;
+
+        Ok(())
+    }
+
     /// Returns the rule identifier.
     #[must_use]
     pub fn id(&self) -> &str {
@@ -265,6 +404,27 @@ impl fmt::Display for RewriteRule {
             self.id, self.description, self.proof_status
         )
     }
+}
+
+/// Deserializes a [`RewriteRule`] from the given deserializer and
+/// immediately validates it against resource bounds.
+///
+/// This is the safe entry point for deserialization — it ensures that
+/// `MAX_RULE_ID_LEN`, `MAX_DESCRIPTION_LEN`, `MAX_TOTAL_STATES`,
+/// `MAX_TRANSITIONS_PER_STATE`, and `MAX_STRING_LEN` constraints are
+/// enforced even when the input bypasses constructors.
+///
+/// # Errors
+///
+/// Returns the underlying serde error if deserialization fails, or wraps
+/// a validation error if any bound is exceeded.
+pub fn deserialize_and_validate_rule<'de, D>(deserializer: D) -> Result<RewriteRule, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rule = RewriteRule::deserialize(deserializer)?;
+    rule.validate().map_err(serde::de::Error::custom)?;
+    Ok(rule)
 }
 
 // ============================================================================
@@ -1666,5 +1826,208 @@ mod tests {
             result.unwrap_err(),
             FunctorError::CatalogFull { .. }
         ));
+    }
+
+    // ====================================================================
+    // Post-deserialization validation tests (DoS prevention)
+    // ====================================================================
+
+    #[test]
+    fn test_validate_rewrite_rule_id_too_long() {
+        let json = serde_json::json!({
+            "id": "x".repeat(MAX_RULE_ID_LEN + 1),
+            "description": "test",
+            "source_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "target_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "proof_status": "Pending"
+        });
+        let rule: RewriteRule = serde_json::from_value(json).unwrap();
+        let err = rule.validate().unwrap_err();
+        assert!(
+            matches!(err, FunctorError::RuleIdTooLong { len, max }
+                if len == MAX_RULE_ID_LEN + 1
+                    && max == MAX_RULE_ID_LEN
+            ),
+            "Expected RuleIdTooLong, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_rule_description_too_long() {
+        let json = serde_json::json!({
+            "id": "R001",
+            "description": "d".repeat(MAX_DESCRIPTION_LEN + 1),
+            "source_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "target_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "proof_status": "Pending"
+        });
+        let rule: RewriteRule = serde_json::from_value(json).unwrap();
+        let err = rule.validate().unwrap_err();
+        assert!(
+            matches!(err, FunctorError::DescriptionTooLong { len, max }
+                if len == MAX_DESCRIPTION_LEN + 1
+                    && max == MAX_DESCRIPTION_LEN
+            ),
+            "Expected DescriptionTooLong, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_rule_source_pattern_too_many_states() {
+        // Build states map with MAX_TOTAL_STATES + 1 entries
+        let mut states_map = serde_json::Map::new();
+        for i in 0..=(super::super::bisimulation::MAX_TOTAL_STATES as u64) {
+            states_map.insert(i.to_string(), serde_json::json!([]));
+        }
+        let json = serde_json::json!({
+            "id": "R001",
+            "description": "test",
+            "source_pattern": { "states": states_map, "initial_state": 0, "depth": 0 },
+            "target_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "proof_status": "Pending"
+        });
+        let rule: RewriteRule = serde_json::from_value(json).unwrap();
+        let err = rule.validate().unwrap_err();
+        assert!(
+            matches!(err, FunctorError::StatesTooMany { field, .. } if field == "source_pattern"),
+            "Expected StatesTooMany for source_pattern, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_rule_target_pattern_too_many_transitions() {
+        // Build a state with MAX_TRANSITIONS_PER_STATE + 1 transitions
+        let transitions: Vec<serde_json::Value> = (0
+            ..=(super::super::bisimulation::MAX_TRANSITIONS_PER_STATE))
+            .map(|i| {
+                serde_json::json!({
+                    "operation": { "Spawn": { "depth": i } },
+                    "target": 0
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "id": "R001",
+            "description": "test",
+            "source_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "target_pattern": { "states": { "0": transitions }, "initial_state": 0, "depth": 0 },
+            "proof_status": "Pending"
+        });
+        let rule: RewriteRule = serde_json::from_value(json).unwrap();
+        let err = rule.validate().unwrap_err();
+        assert!(
+            matches!(err, FunctorError::TransitionsPerStateTooMany { field, .. }
+                if field == "target_pattern"
+            ),
+            "Expected TransitionsPerStateTooMany for target_pattern, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_rule_string_in_source_pattern_too_long() {
+        let long_tag = "x".repeat(super::super::bisimulation::MAX_STRING_LEN + 1);
+        let json = serde_json::json!({
+            "id": "R001",
+            "description": "test",
+            "source_pattern": {
+                "states": {
+                    "0": [{
+                        "operation": { "Execute": { "output_tag": long_tag } },
+                        "target": 0
+                    }]
+                },
+                "initial_state": 0,
+                "depth": 0
+            },
+            "target_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "proof_status": "Pending"
+        });
+        let rule: RewriteRule = serde_json::from_value(json).unwrap();
+        let err = rule.validate().unwrap_err();
+        assert!(
+            matches!(err, FunctorError::StringTooLong { field, .. }
+                if field == "source_pattern"
+            ),
+            "Expected StringTooLong for source_pattern, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_well_formed_rewrite_rule_passes() {
+        let source = ObservableSemantics::new(0);
+        let target = ObservableSemantics::new(0);
+        let rule =
+            RewriteRule::new("R001".to_string(), "test".to_string(), source, target).unwrap();
+        rule.validate().unwrap();
+    }
+
+    #[test]
+    fn test_deserialize_and_validate_rule_rejects_oversized_id() {
+        let json = serde_json::json!({
+            "id": "x".repeat(MAX_RULE_ID_LEN + 1),
+            "description": "test",
+            "source_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "target_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "proof_status": "Pending"
+        });
+        let json_str = serde_json::to_string(&json).unwrap();
+        let mut de = serde_json::Deserializer::from_str(&json_str);
+        let result = deserialize_and_validate_rule(&mut de);
+        assert!(
+            result.is_err(),
+            "deserialize_and_validate_rule must reject oversized rule id"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_and_validate_rule_accepts_valid() {
+        let json = serde_json::json!({
+            "id": "R001",
+            "description": "identity rewrite",
+            "source_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "target_pattern": { "states": { "0": [] }, "initial_state": 0, "depth": 0 },
+            "proof_status": "Pending"
+        });
+        let json_str = serde_json::to_string(&json).unwrap();
+        let mut de = serde_json::Deserializer::from_str(&json_str);
+        let rule = deserialize_and_validate_rule(&mut de).unwrap();
+        assert_eq!(rule.id(), "R001");
+    }
+
+    // ====================================================================
+    // New error variant display tests
+    // ====================================================================
+
+    #[test]
+    fn test_new_error_variants_display() {
+        let err = FunctorError::DescriptionTooLong {
+            len: 5000,
+            max: 4096,
+        };
+        assert!(err.to_string().contains("5000"));
+        assert!(err.to_string().contains("4096"));
+
+        let err = FunctorError::StringTooLong {
+            field: "source_pattern",
+            actual: 5000,
+            max: 4096,
+        };
+        assert!(err.to_string().contains("source_pattern"));
+
+        let err = FunctorError::StatesTooMany {
+            field: "source_pattern",
+            actual: 5000,
+            max: 4096,
+        };
+        assert!(err.to_string().contains("source_pattern"));
+
+        let err = FunctorError::TransitionsPerStateTooMany {
+            field: "target_pattern",
+            state: 42,
+            actual: 100,
+            max: 64,
+        };
+        assert!(err.to_string().contains("target_pattern"));
+        assert!(err.to_string().contains("42"));
     }
 }

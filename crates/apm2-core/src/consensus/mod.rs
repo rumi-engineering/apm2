@@ -115,8 +115,9 @@ pub use bft_machine::{
 pub use bisimulation::{
     BisimulationChecker, BisimulationError, BisimulationResult, BlockingDefect, DepthCheckResult,
     FlatteningRelation, HsiOperation, MAX_COUNTEREXAMPLE_LENGTH, MAX_RECURSION_DEPTH,
-    MAX_TOTAL_STATES, MAX_TRANSITIONS_PER_STATE, MismatchDirection, ObservableSemantics,
-    PromotionGate, PromotionGateResult, StopKind, TraceStep, Transition, build_linear_composition,
+    MAX_STRING_LEN, MAX_TOTAL_STATES, MAX_TRANSITIONS_PER_STATE, MismatchDirection,
+    ObservableSemantics, PromotionGate, PromotionGateResult, StopKind, TraceStep, Transition,
+    build_linear_composition, deserialize_and_validate_semantics,
 };
 // HLC-based CRDT merge operators (TCK-00197)
 // Revocation-wins signed CRDT merge law (TCK-00360)
@@ -145,8 +146,9 @@ pub use fact_root::{
 // Functorial observation law checks for admitted rewrites (TCK-00368)
 pub use functor::{
     AdmittedRewriteCatalog, FunctorError, FunctorLawChecker, FunctorLawResult, MAX_CATALOG_RULES,
-    MAX_OBSERVATION_POINTS, MAX_PROOF_REF_LEN, MAX_RULE_ID_LEN, ProofStatus, RewriteBlockingDefect,
-    RewriteDefectKind, RewriteGateResult, RewritePromotionGate, RewriteRule,
+    MAX_DESCRIPTION_LEN, MAX_OBSERVATION_POINTS, MAX_PROOF_REF_LEN, MAX_RULE_ID_LEN, ProofStatus,
+    RewriteBlockingDefect, RewriteDefectKind, RewriteGateResult, RewritePromotionGate, RewriteRule,
+    deserialize_and_validate_rule,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,

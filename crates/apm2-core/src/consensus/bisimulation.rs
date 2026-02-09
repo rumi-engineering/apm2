@@ -63,6 +63,12 @@ pub const MAX_TOTAL_STATES: usize = 4096;
 /// Maximum length of a counterexample trace.
 pub const MAX_COUNTEREXAMPLE_LENGTH: usize = 128;
 
+/// Maximum length of any string field within HSI operations.
+///
+/// Prevents denial-of-service via arbitrarily large strings in
+/// deserialized `HsiOperation` variants (e.g., `output_tag`, `reason`).
+pub const MAX_STRING_LEN: usize = 4096;
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -95,6 +101,39 @@ pub enum BisimulationError {
     /// Internal error during bisimulation checking.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A collection field exceeds its maximum allowed size.
+    #[error("collection too large: {field} has {actual} elements (max {max})")]
+    CollectionTooLarge {
+        /// Which field exceeded its bound.
+        field: &'static str,
+        /// The actual size.
+        actual: usize,
+        /// The maximum allowed size.
+        max: usize,
+    },
+
+    /// A string field exceeds the maximum allowed length.
+    #[error("string too long: {field} has length {actual} (max {max})")]
+    StringTooLong {
+        /// Which field exceeded its bound.
+        field: &'static str,
+        /// The actual length.
+        actual: usize,
+        /// The maximum allowed length.
+        max: usize,
+    },
+
+    /// Transitions per state exceeds the maximum.
+    #[error("too many transitions: state {state} has {actual} transitions (max {max})")]
+    TransitionsPerStateExceeded {
+        /// The state that exceeded the limit.
+        state: StateId,
+        /// The actual count.
+        actual: usize,
+        /// The maximum allowed.
+        max: usize,
+    },
 }
 
 // ============================================================================
@@ -142,6 +181,45 @@ pub enum StopKind {
     BudgetExhausted,
     /// Maximum episodes reached.
     MaxEpisodesReached,
+}
+
+impl HsiOperation {
+    /// Validates that all string fields within this operation are within
+    /// bounds.
+    ///
+    /// This must be called after deserialization to prevent denial-of-service
+    /// via arbitrarily large strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BisimulationError::StringTooLong`] if any string field
+    /// exceeds `MAX_STRING_LEN`.
+    pub fn validate(&self) -> Result<(), BisimulationError> {
+        match self {
+            Self::Execute { output_tag } => {
+                if output_tag.len() > MAX_STRING_LEN {
+                    return Err(BisimulationError::StringTooLong {
+                        field: "HsiOperation::Execute::output_tag",
+                        actual: output_tag.len(),
+                        max: MAX_STRING_LEN,
+                    });
+                }
+            },
+            Self::Escalate { reason } => {
+                if reason.len() > MAX_STRING_LEN {
+                    return Err(BisimulationError::StringTooLong {
+                        field: "HsiOperation::Escalate::reason",
+                        actual: reason.len(),
+                        max: MAX_STRING_LEN,
+                    });
+                }
+            },
+            Self::Spawn { .. } | Self::Stop { .. } => {
+                // No string fields to validate.
+            },
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for HsiOperation {
@@ -223,6 +301,47 @@ impl ObservableSemantics {
             .map_or(&[] as &[Transition], Vec::as_slice)
     }
 
+    /// Validates the observable semantics after deserialization.
+    ///
+    /// Enforces:
+    /// - `states.len() <= MAX_TOTAL_STATES`
+    /// - Transitions per state `<= MAX_TRANSITIONS_PER_STATE`
+    /// - All string fields within transitions `<= MAX_STRING_LEN`
+    ///
+    /// This **must** be called immediately after deserializing an
+    /// `ObservableSemantics` to prevent denial-of-service via arbitrarily
+    /// large inputs that bypass constructor constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any bound is exceeded.
+    pub fn validate(&self) -> Result<(), BisimulationError> {
+        // Check total state count.
+        if self.states.len() > MAX_TOTAL_STATES {
+            return Err(BisimulationError::CollectionTooLarge {
+                field: "ObservableSemantics::states",
+                actual: self.states.len(),
+                max: MAX_TOTAL_STATES,
+            });
+        }
+
+        // Check per-state transition count and string fields within each transition.
+        for (&state_id, transitions) in &self.states {
+            if transitions.len() > MAX_TRANSITIONS_PER_STATE {
+                return Err(BisimulationError::TransitionsPerStateExceeded {
+                    state: state_id,
+                    actual: transitions.len(),
+                    max: MAX_TRANSITIONS_PER_STATE,
+                });
+            }
+            for transition in transitions {
+                transition.operation.validate()?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Adds a state and returns its ID.
     ///
     /// # Errors
@@ -265,6 +384,28 @@ impl ObservableSemantics {
         transitions.push(Transition { operation, target });
         Ok(())
     }
+}
+
+/// Deserializes an [`ObservableSemantics`] from the given deserializer and
+/// immediately validates it against resource bounds.
+///
+/// This is the safe entry point for deserialization — it ensures that
+/// `MAX_TOTAL_STATES`, `MAX_TRANSITIONS_PER_STATE`, and `MAX_STRING_LEN`
+/// constraints are enforced even when the input bypasses constructors.
+///
+/// # Errors
+///
+/// Returns the underlying serde error if deserialization fails, or wraps
+/// a validation error if any bound is exceeded.
+pub fn deserialize_and_validate_semantics<'de, D>(
+    deserializer: D,
+) -> Result<ObservableSemantics, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let semantics = ObservableSemantics::deserialize(deserializer)?;
+    semantics.validate().map_err(serde::de::Error::custom)?;
+    Ok(semantics)
 }
 
 // ============================================================================
@@ -1405,5 +1546,207 @@ mod tests {
 
         let err = BisimulationError::Internal("oops".to_string());
         assert!(err.to_string().contains("oops"));
+    }
+
+    // ====================================================================
+    // Post-deserialization validation tests (DoS prevention)
+    // ====================================================================
+
+    #[test]
+    fn test_validate_hsi_operation_output_tag_too_long() {
+        let op = HsiOperation::Execute {
+            output_tag: "x".repeat(MAX_STRING_LEN + 1),
+        };
+        let err = op.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { field, actual, max }
+                if field == "HsiOperation::Execute::output_tag"
+                    && actual == MAX_STRING_LEN + 1
+                    && max == MAX_STRING_LEN
+            ),
+            "Expected StringTooLong for oversized output_tag, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_hsi_operation_escalate_reason_too_long() {
+        let op = HsiOperation::Escalate {
+            reason: "r".repeat(MAX_STRING_LEN + 1),
+        };
+        let err = op.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { field, .. }
+                if field == "HsiOperation::Escalate::reason"
+            ),
+            "Expected StringTooLong for oversized reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_hsi_operation_spawn_and_stop_always_ok() {
+        HsiOperation::Spawn { depth: 9999 }.validate().unwrap();
+        HsiOperation::Stop {
+            kind: StopKind::GoalSatisfied,
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn test_validate_observable_semantics_too_many_states() {
+        // Build an ObservableSemantics with MAX_TOTAL_STATES + 1 states
+        // by directly deserializing crafted JSON (bypassing add_state).
+        let mut states_map = serde_json::Map::new();
+        for i in 0..=(MAX_TOTAL_STATES as u64) {
+            states_map.insert(i.to_string(), serde_json::json!([]));
+        }
+        let json = serde_json::json!({
+            "states": states_map,
+            "initial_state": 0,
+            "depth": 0
+        });
+        let semantics: ObservableSemantics = serde_json::from_value(json).unwrap();
+        assert_eq!(semantics.state_count(), MAX_TOTAL_STATES + 1);
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::CollectionTooLarge { field, actual, max }
+                if field == "ObservableSemantics::states"
+                    && actual == MAX_TOTAL_STATES + 1
+                    && max == MAX_TOTAL_STATES
+            ),
+            "Expected CollectionTooLarge, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_observable_semantics_too_many_transitions() {
+        // Build a state with MAX_TRANSITIONS_PER_STATE + 1 transitions
+        // by crafting JSON directly.
+        let transitions: Vec<serde_json::Value> = (0..=MAX_TRANSITIONS_PER_STATE)
+            .map(|i| {
+                serde_json::json!({
+                    "operation": { "Spawn": { "depth": i } },
+                    "target": 0
+                })
+            })
+            .collect();
+
+        let json = serde_json::json!({
+            "states": { "0": transitions },
+            "initial_state": 0,
+            "depth": 0
+        });
+        let semantics: ObservableSemantics = serde_json::from_value(json).unwrap();
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::TransitionsPerStateExceeded { state: 0, actual, max }
+                if actual == MAX_TRANSITIONS_PER_STATE + 1
+                    && max == MAX_TRANSITIONS_PER_STATE
+            ),
+            "Expected TransitionsPerStateExceeded, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_observable_semantics_string_in_transition_too_long() {
+        let long_tag = "x".repeat(MAX_STRING_LEN + 1);
+        let json = serde_json::json!({
+            "states": {
+                "0": [{
+                    "operation": { "Execute": { "output_tag": long_tag } },
+                    "target": 0
+                }]
+            },
+            "initial_state": 0,
+            "depth": 0
+        });
+        let semantics: ObservableSemantics = serde_json::from_value(json).unwrap();
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { .. }),
+            "Expected StringTooLong, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_well_formed_semantics_passes() {
+        let mut semantics = ObservableSemantics::new(0);
+        let s1 = semantics.add_state().unwrap();
+        semantics
+            .add_transition(0, HsiOperation::Spawn { depth: 0 }, s1)
+            .unwrap();
+        semantics.validate().unwrap();
+    }
+
+    #[test]
+    fn test_deserialize_and_validate_semantics_rejects_oversized() {
+        let mut states_map = serde_json::Map::new();
+        for i in 0..=(MAX_TOTAL_STATES as u64) {
+            states_map.insert(i.to_string(), serde_json::json!([]));
+        }
+        let json = serde_json::json!({
+            "states": states_map,
+            "initial_state": 0,
+            "depth": 0
+        });
+        let json_str = serde_json::to_string(&json).unwrap();
+        let mut de = serde_json::Deserializer::from_str(&json_str);
+        let result = deserialize_and_validate_semantics(&mut de);
+        assert!(
+            result.is_err(),
+            "deserialize_and_validate_semantics must reject oversized input"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_and_validate_semantics_accepts_valid() {
+        let json = serde_json::json!({
+            "states": {
+                "0": [{
+                    "operation": { "Spawn": { "depth": 0 } },
+                    "target": 0
+                }]
+            },
+            "initial_state": 0,
+            "depth": 0
+        });
+        let json_str = serde_json::to_string(&json).unwrap();
+        let mut de = serde_json::Deserializer::from_str(&json_str);
+        let semantics = deserialize_and_validate_semantics(&mut de).unwrap();
+        assert_eq!(semantics.state_count(), 1);
+    }
+
+    // ====================================================================
+    // New error variant display tests
+    // ====================================================================
+
+    #[test]
+    fn test_validation_error_display() {
+        let err = BisimulationError::CollectionTooLarge {
+            field: "states",
+            actual: 5000,
+            max: 4096,
+        };
+        assert!(err.to_string().contains("5000"));
+        assert!(err.to_string().contains("4096"));
+
+        let err = BisimulationError::StringTooLong {
+            field: "output_tag",
+            actual: 5000,
+            max: 4096,
+        };
+        assert!(err.to_string().contains("output_tag"));
+        assert!(err.to_string().contains("5000"));
+
+        let err = BisimulationError::TransitionsPerStateExceeded {
+            state: 42,
+            actual: 100,
+            max: 64,
+        };
+        assert!(err.to_string().contains("42"));
+        assert!(err.to_string().contains("100"));
     }
 }
