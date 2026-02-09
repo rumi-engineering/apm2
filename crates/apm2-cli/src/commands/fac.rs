@@ -370,8 +370,12 @@ pub struct KickoffArgs {
     #[arg(long, default_value_t = 3600)]
     pub max_wait_seconds: u64,
 
-    /// Restrict stdout to 1Hz health projection lines only. All non-health
-    /// diagnostics are emitted to stderr for private runner logs.
+    /// SECURITY-CRITICAL: limit stdout to one projection health line per
+    /// second.
+    ///
+    /// Use this mode for public log surfaces (for example GitHub Actions logs).
+    /// Any rich diagnostics must stay on private runner-local storage.
+    /// Non-health diagnostics are emitted to stderr for private runner logs.
     #[arg(long, default_value_t = false)]
     pub public_projection_only: bool,
 }
