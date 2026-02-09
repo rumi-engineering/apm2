@@ -496,6 +496,15 @@ pub trait LedgerEventEmitter: Send + Sync {
         0
     }
 
+    /// Returns the most recent ledger event in O(1) time.
+    ///
+    /// Used by PCAC ledger anchor derivation to avoid full-table
+    /// materialization. `SQLite` implementations should use
+    /// `SELECT ... ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1`.
+    fn get_latest_event(&self) -> Option<SignedLedgerEvent> {
+        None
+    }
+
     /// Queries a signed event by `receipt_id` embedded in the payload.
     ///
     /// This searches for events of type `review_receipt_recorded` or
@@ -2699,6 +2708,14 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     fn get_event_count(&self) -> usize {
         let guard = self.events.read().expect("lock poisoned");
         guard.0.len()
+    }
+
+    fn get_latest_event(&self) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        let (order, events) = &*guard;
+        order
+            .last()
+            .and_then(|event_id| events.get(event_id).cloned())
     }
 
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {

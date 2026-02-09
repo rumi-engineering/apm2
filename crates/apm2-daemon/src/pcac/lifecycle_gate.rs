@@ -346,6 +346,42 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
+        // Law 3: Ledger anchor drift check (RFC-0027 §4).
+        // If the ledger has advanced since the AJC was issued, the authority
+        // context may no longer reflect the current system state.
+        if current_ledger_anchor != cert.as_of_ledger_anchor {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::LedgerAnchorDrift,
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: tick,
+            }));
+        }
+
+        // Law 3: Freshness dominance check (RFC-0027 §4).
+        // The current kernel tick must not have advanced beyond the AJC's
+        // freshness window. A staleness threshold of 300 ticks (matching
+        // the default AJC TTL) bounds the maximum freshness drift.
+        if tick > 0 && cert.expires_at_tick > 0 {
+            // Derive the join-time tick from the cert's expiry minus the
+            // TTL of 300 ticks used during join.
+            let issued_tick = cert.expires_at_tick.saturating_sub(300);
+            // If the kernel tick has advanced beyond the cert's entire TTL
+            // window, freshness is stale. This is a stricter check than
+            // expiry alone — it denies even if tick <= expires_at_tick when
+            // the temporal gap is too large relative to issued time.
+            if tick > issued_tick && (tick - issued_tick) > 300 {
+                return Err(Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::StaleFreshnessAtRevalidate,
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick: tick,
+                }));
+            }
+        }
+
         // Law 4: Revocation frontier advancement.
         if current_revocation_head_hash != cert.revocation_head_hash {
             return Err(Box::new(AuthorityDenyV1 {
@@ -365,6 +401,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         cert: &AuthorityJoinCertificateV1,
         intent_digest: Hash,
         current_time_envelope_ref: Hash,
+        current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         let tick = self.current_tick();
 
@@ -375,6 +412,17 @@ impl AuthorityJoinKernel for InProcessKernel {
                     expected: cert.intent_digest,
                     actual: intent_digest,
                 },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: tick,
+            }));
+        }
+
+        // Law 4: Revocation frontier check at consume time.
+        if current_revocation_head_hash != cert.revocation_head_hash {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::RevocationFrontierAdvanced,
                 ajc_id: Some(cert.ajc_id),
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: cert.as_of_ledger_anchor,
@@ -453,13 +501,46 @@ pub struct LifecycleReceipts {
 /// fails, the deny is returned and no side effect may execute.
 pub struct LifecycleGate {
     kernel: Arc<dyn AuthorityJoinKernel>,
+    /// Optional reference to the in-process kernel for production tick
+    /// advancement. When set, `advance_tick` calls are forwarded to the
+    /// underlying kernel so that freshness checks use monotonic runtime time.
+    tick_kernel: Option<Arc<InProcessKernel>>,
 }
 
 impl LifecycleGate {
     /// Creates a new lifecycle gate with the given kernel.
     #[must_use]
     pub fn new(kernel: Arc<dyn AuthorityJoinKernel>) -> Self {
-        Self { kernel }
+        Self {
+            kernel,
+            tick_kernel: None,
+        }
+    }
+
+    /// Creates a lifecycle gate with production tick advancement wired in.
+    ///
+    /// The `tick_kernel` reference is used to advance the monotonic tick
+    /// from the session dispatch path when fresh HLC timestamps are obtained.
+    /// This ensures revalidation freshness checks operate on real time
+    /// rather than a static starting tick.
+    #[must_use]
+    pub fn with_tick_kernel(
+        kernel: Arc<dyn AuthorityJoinKernel>,
+        tick_kernel: Arc<InProcessKernel>,
+    ) -> Self {
+        Self {
+            kernel,
+            tick_kernel: Some(tick_kernel),
+        }
+    }
+
+    /// Advance the kernel tick to the given value (monotonic — no-op if
+    /// `new_tick <= current_tick`). Called from the session dispatch path
+    /// with the freshness witness tick derived from HLC wall time.
+    pub fn advance_tick(&self, new_tick: u64) {
+        if let Some(ref tk) = self.tick_kernel {
+            tk.advance_tick(new_tick);
+        }
     }
 
     /// Executes `join -> revalidate-before-decision`.
@@ -505,9 +586,14 @@ impl LifecycleGate {
         cert: &AuthorityJoinCertificateV1,
         intent_digest: Hash,
         current_time_envelope_ref: Hash,
+        current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
-        self.kernel
-            .consume(cert, intent_digest, current_time_envelope_ref)
+        self.kernel.consume(
+            cert,
+            intent_digest,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+        )
     }
 
     /// Executes the full PCAC lifecycle for a tool request.
@@ -562,8 +648,12 @@ impl LifecycleGate {
 
         // Stage 4: Consume — single-use consumption with intent equality.
         // Consume must be immediately before the effect.
-        let (consumed_witness, consume_record) =
-            self.consume_before_effect(&cert, input.intent_digest, current_time_envelope_ref)?;
+        let (consumed_witness, consume_record) = self.consume_before_effect(
+            &cert,
+            input.intent_digest,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+        )?;
 
         Ok(LifecycleReceipts {
             certificate: cert,

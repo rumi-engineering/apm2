@@ -1017,12 +1017,17 @@ impl DispatcherState {
                             consume_log_path.display()
                         )
                     })?;
-                    let inner_kernel = crate::pcac::InProcessKernel::new(1);
-                    let durable_kernel =
-                        crate::pcac::DurableKernel::new(inner_kernel, Box::new(durable_index));
+                    let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+                    let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
+                        Arc::clone(&tick_kernel),
+                        Box::new(durable_index),
+                    );
                     let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                         Arc::new(durable_kernel);
-                    let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
+                    let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_tick_kernel(
+                        pcac_kernel,
+                        tick_kernel,
+                    ));
                     session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
                 },
                 Err(error) if error.contains("in-memory main database has no durable path") => {
@@ -1371,10 +1376,16 @@ impl DispatcherState {
                 consume_log_path.display()
             ),
         })?;
-        let inner_kernel = crate::pcac::InProcessKernel::new(1);
-        let durable_kernel = crate::pcac::DurableKernel::new(inner_kernel, Box::new(durable_index));
+        let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
+            Arc::clone(&tick_kernel),
+            Box::new(durable_index),
+        );
         let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(durable_kernel);
-        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
+        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_tick_kernel(
+            pcac_kernel,
+            tick_kernel,
+        ));
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)

@@ -20,6 +20,7 @@ mod lifecycle_gate;
 mod tests;
 
 pub use durable_consume::{
-    ConsumeError, DurableConsumeIndex, DurableConsumeMetrics, DurableKernel, FileBackedConsumeIndex,
+    ConsumeError, DurableConsumeIndex, DurableConsumeMetrics, DurableKernel, DurableKernelShared,
+    FileBackedConsumeIndex,
 };
 pub use lifecycle_gate::{InProcessKernel, LifecycleGate, LifecycleReceipts};

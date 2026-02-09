@@ -211,7 +211,12 @@ fn consume_succeeds_with_matching_intent() {
     let cert = kernel.join(&input).unwrap();
 
     let (witness, record) = kernel
-        .consume(&cert, input.intent_digest, input.time_envelope_ref)
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
         .unwrap();
     assert_eq!(witness.ajc_id, cert.ajc_id);
     assert_eq!(record.ajc_id, cert.ajc_id);
@@ -225,7 +230,12 @@ fn consume_denies_intent_mismatch() {
     let cert = kernel.join(&input).unwrap();
 
     let err = kernel
-        .consume(&cert, test_hash(0xFF), input.time_envelope_ref)
+        .consume(
+            &cert,
+            test_hash(0xFF),
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
         .unwrap_err();
     assert!(matches!(
         err.deny_class,
@@ -241,12 +251,22 @@ fn consume_denies_double_consume() {
 
     // First consume succeeds
     kernel
-        .consume(&cert, input.intent_digest, input.time_envelope_ref)
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
         .unwrap();
 
     // Second consume is denied (Law 1: Linear Consumption)
     let err = kernel
-        .consume(&cert, input.intent_digest, input.time_envelope_ref)
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
         .unwrap_err();
     assert!(matches!(
         err.deny_class,
@@ -611,6 +631,108 @@ fn revalidation_denies_with_different_revocation_head() {
 }
 
 // =============================================================================
+// BLOCKER 1 FIX: Revalidation denies on ledger anchor drift
+// =============================================================================
+
+#[test]
+fn test_revalidate_denies_ledger_anchor_drift() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let cert = kernel.join(&input).unwrap();
+
+    // Revalidation with the SAME ledger anchor succeeds.
+    kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .expect("revalidation with matching ledger anchor should succeed");
+
+    // Revalidation with a DIFFERENT ledger anchor must deny with
+    // LedgerAnchorDrift — the ledger has advanced since join.
+    let different_anchor = test_hash(0xBB);
+    assert_ne!(different_anchor, input.as_of_ledger_anchor);
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            different_anchor,
+            cert.revocation_head_hash,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::LedgerAnchorDrift),
+        "revalidation must deny when ledger anchor has drifted, got: {:?}",
+        err.deny_class
+    );
+}
+
+// =============================================================================
+// BLOCKER 1 FIX: Revalidation denies on stale freshness
+// =============================================================================
+
+#[test]
+fn test_revalidate_denies_stale_freshness() {
+    let kernel = InProcessKernel::new(100);
+    let input = valid_input();
+    let cert = kernel.join(&input).unwrap();
+    // AJC expires_at_tick = 100 + 300 = 400, so issued_tick = 100.
+
+    // Advance tick beyond the staleness threshold (300 ticks from issued).
+    // issued_tick=100, so tick=401 gives gap=301 > 300.
+    kernel.advance_tick(401);
+
+    let err = kernel
+        .revalidate(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            cert.revocation_head_hash,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::StaleFreshnessAtRevalidate
+                | AuthorityDenyClass::CertificateExpired { .. }
+        ),
+        "revalidation must deny when freshness is stale, got: {:?}",
+        err.deny_class
+    );
+}
+
+// =============================================================================
+// BLOCKER 1 FIX: LifecycleGate tick advancement via with_tick_kernel
+// =============================================================================
+
+#[test]
+fn test_lifecycle_gate_advance_tick_wiring() {
+    // Verify that LifecycleGate::with_tick_kernel properly forwards
+    // advance_tick to the underlying InProcessKernel.
+    let tick_kernel = Arc::new(InProcessKernel::new(1));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&tick_kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&tick_kernel));
+
+    assert_eq!(tick_kernel.current_tick(), 1);
+    gate.advance_tick(500);
+    assert_eq!(
+        tick_kernel.current_tick(),
+        500,
+        "advance_tick through LifecycleGate must update the shared kernel"
+    );
+
+    // Monotonic: advancing to a lower tick is a no-op.
+    gate.advance_tick(100);
+    assert_eq!(
+        tick_kernel.current_tick(),
+        500,
+        "advance_tick must be monotonic (no-op for lower values)"
+    );
+}
+
+// =============================================================================
 // TCK-00426 MAJOR 3: DurableKernel does not double-consume
 // =============================================================================
 
@@ -631,7 +753,12 @@ fn durable_kernel_consume_does_not_double_consume_inner() {
 
     // Consume through the durable kernel.
     let (witness, record) = durable
-        .consume(&cert, input.intent_digest, input.time_envelope_ref)
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
         .unwrap();
 
     // Verify witnesses are correct.
@@ -649,7 +776,12 @@ fn durable_kernel_consume_does_not_double_consume_inner() {
 
     // Second consume through durable kernel must be denied by durable index.
     let err = durable
-        .consume(&cert, input.intent_digest, input.time_envelope_ref)
+        .consume(
+            &cert,
+            input.intent_digest,
+            input.time_envelope_ref,
+            cert.revocation_head_hash,
+        )
         .unwrap_err();
     assert!(
         matches!(err.deny_class, AuthorityDenyClass::AlreadyConsumed { .. }),

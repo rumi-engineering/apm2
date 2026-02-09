@@ -1560,12 +1560,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         })
     }
 
+    /// Derive a PCAC ledger anchor from bounded metadata (O(1) cost).
+    ///
+    /// Uses `get_event_count()` + `get_latest_event()` instead of
+    /// `get_all_events()` to avoid full-table materialization on every
+    /// PCAC-gated request. The anchor hash is computed from the event
+    /// count and latest event fields, providing equivalent collision
+    /// resistance without O(N) memory/CPU cost.
     fn derive_pcac_ledger_anchor(ledger: &dyn LedgerEventEmitter) -> Hash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"pcac-ledger-anchor-v1");
-        let events = ledger.get_all_events();
-        hasher.update(&(events.len() as u64).to_le_bytes());
-        if let Some(last) = events.last() {
+        let count = ledger.get_event_count() as u64;
+        hasher.update(&count.to_le_bytes());
+        if let Some(last) = ledger.get_latest_event() {
             hasher.update(last.event_id.as_bytes());
             hasher.update(last.event_type.as_bytes());
             hasher.update(last.work_id.as_bytes());
@@ -2189,6 +2196,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     "PCAC authority denied: freshness witness tick is zero (fail-closed)",
                 ));
             }
+
+            // BLOCKER 1 FIX: Advance the kernel tick from the HLC-derived
+            // freshness witness so that revalidation freshness checks operate
+            // on real monotonic time rather than a static starting tick.
+            pcac_gate.advance_tick(freshness_witness_tick);
 
             let pre_actuation_receipt_hashes = preactuation_receipt
                 .as_ref()
@@ -2853,6 +2865,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             &pending_pcac.certificate,
                             pending_pcac.intent_digest,
                             current_time_envelope_ref,
+                            current_revocation_head,
                         ) {
                         Ok(receipts) => receipts,
                         Err(deny) => {
@@ -5808,6 +5821,7 @@ mod tests {
                 cert: &AuthorityJoinCertificateV1,
                 intent_digest: Hash,
                 current_time_envelope_ref: Hash,
+                _current_revocation_head_hash: Hash,
             ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
             {
                 self.consumes.fetch_add(1, Ordering::SeqCst);

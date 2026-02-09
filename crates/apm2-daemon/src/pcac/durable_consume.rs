@@ -208,22 +208,68 @@ impl FileBackedConsumeIndex {
         })?;
 
         // Replay existing entries from the locked file.
+        //
+        // MAJOR 2 FIX: Handle torn tail writes gracefully. If the LAST
+        // line fails parsing, it is treated as a torn write from a crash
+        // before fsync completed — the file is truncated to remove the
+        // incomplete record and startup continues. Mid-file corruption
+        // still returns CorruptLog (fail-closed) because it indicates
+        // data integrity violations beyond a simple torn tail.
+        let mut needs_truncate_to: Option<u64> = None;
         {
             let mut replay = file.try_clone()?;
             replay.seek(SeekFrom::Start(0))?;
-            let reader = BufReader::new(replay);
-            for (line_idx, line_result) in reader.lines().enumerate() {
-                let line = line_result?;
+            let reader = BufReader::new(&mut replay);
+
+            // Collect all lines to determine which is the last.
+            let raw_lines: Vec<String> = reader.lines().collect::<Result<Vec<_>, _>>()?;
+            let line_count = raw_lines.len();
+
+            // Track byte offset for potential tail truncation.
+            let mut byte_offset: u64 = 0;
+            for (line_idx, line) in raw_lines.iter().enumerate() {
                 let trimmed = line.trim();
+                let line_byte_len = (line.len() + 1) as u64; // +1 for newline
                 if trimmed.is_empty() {
+                    byte_offset += line_byte_len;
                     continue;
                 }
-                let hash = hex_to_hash(trimmed).map_err(|reason| ConsumeError::CorruptLog {
-                    line: line_idx + 1,
-                    reason,
-                })?;
-                consumed.insert(hash);
+                match hex_to_hash(trimmed) {
+                    Ok(hash) => {
+                        consumed.insert(hash);
+                    },
+                    Err(reason) => {
+                        if line_idx == line_count - 1 {
+                            // Torn tail record — safe to truncate because
+                            // if fsync did not complete, the effect was
+                            // never accepted (consume returns only after
+                            // fsync).
+                            tracing::warn!(
+                                line = line_idx + 1,
+                                reason = %reason,
+                                path = %path.display(),
+                                "truncating torn tail record from durable consume log"
+                            );
+                            needs_truncate_to = Some(byte_offset);
+                        } else {
+                            // Mid-file corruption — fail closed.
+                            return Err(ConsumeError::CorruptLog {
+                                line: line_idx + 1,
+                                reason,
+                            });
+                        }
+                    },
+                }
+                byte_offset += line_byte_len;
             }
+        }
+
+        // If a torn tail was detected, truncate the file to remove
+        // the incomplete record.
+        if let Some(truncate_pos) = needs_truncate_to {
+            let truncate_file = OpenOptions::new().write(true).open(&path)?;
+            truncate_file.set_len(truncate_pos)?;
+            truncate_file.sync_all()?;
         }
 
         Ok(Self {
@@ -314,6 +360,37 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> DurableKernel<K> {
     }
 }
 
+impl DurableKernel<super::lifecycle_gate::InProcessKernel> {
+    /// Create a durable kernel using a shared `InProcessKernel` reference.
+    ///
+    /// The `tick_kernel` is cloned into a new `InProcessKernel` that shares
+    /// the same tick state via the caller holding an `Arc` to the original.
+    /// For production use, prefer `new_with_shared_kernel` when tick
+    /// advancement must be visible to both the durable kernel and the
+    /// lifecycle gate.
+    pub fn new_with_shared_kernel(
+        tick_kernel: std::sync::Arc<super::lifecycle_gate::InProcessKernel>,
+        durable_index: Box<dyn DurableConsumeIndex>,
+    ) -> DurableKernelShared {
+        DurableKernelShared {
+            inner: tick_kernel,
+            durable_index,
+        }
+    }
+}
+
+/// Durable kernel variant using a shared `Arc<InProcessKernel>` for
+/// production tick synchronization.
+///
+/// This allows the same `InProcessKernel` instance to be shared between
+/// the `DurableKernelShared` (for join/revalidate/consume) and the
+/// `LifecycleGate` (for tick advancement), ensuring freshness checks
+/// see real monotonic time progression.
+pub struct DurableKernelShared {
+    inner: std::sync::Arc<super::lifecycle_gate::InProcessKernel>,
+    durable_index: Box<dyn DurableConsumeIndex>,
+}
+
 impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKernel
     for DurableKernel<K>
 {
@@ -345,6 +422,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
         intent_digest: Hash,
         current_time_envelope_ref: Hash,
+        current_revocation_head_hash: Hash,
     ) -> Result<
         (
             apm2_core::pcac::AuthorityConsumedV1,
@@ -356,9 +434,12 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         // 1) Run inner consume semantics first (all deny-producing checks),
         // 2) commit durable record barrier,
         // 3) return witnesses.
-        let (consumed_witness, consume_record) =
-            self.inner
-                .consume(cert, intent_digest, current_time_envelope_ref)?;
+        let (consumed_witness, consume_record) = self.inner.consume(
+            cert,
+            intent_digest,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+        )?;
 
         // Durable commit remains mandatory before effect acceptance.
         if let Err(e) = self.durable_index.record_consume(cert.ajc_id) {
@@ -375,6 +456,96 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                 },
                 ConsumeError::IoError(io_err) => {
                     // I/O failure is fail-closed: deny with UnknownState.
+                    return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::UnknownState {
+                            description: format!("durable consume write failed: {io_err}"),
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: cert.as_of_ledger_anchor,
+                        denied_at_tick,
+                    }));
+                },
+                ConsumeError::CorruptLog { line, reason } => {
+                    return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::UnknownState {
+                            description: format!("corrupt consume log at line {line}: {reason}"),
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: cert.as_of_ledger_anchor,
+                        denied_at_tick,
+                    }));
+                },
+            }
+        }
+
+        Ok((consumed_witness, consume_record))
+    }
+}
+
+impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
+    fn join(
+        &self,
+        input: &apm2_core::pcac::AuthorityJoinInputV1,
+    ) -> Result<apm2_core::pcac::AuthorityJoinCertificateV1, Box<apm2_core::pcac::AuthorityDenyV1>>
+    {
+        self.inner.join(input)
+    }
+
+    fn revalidate(
+        &self,
+        cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<(), Box<apm2_core::pcac::AuthorityDenyV1>> {
+        self.inner.revalidate(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )
+    }
+
+    fn consume(
+        &self,
+        cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
+        intent_digest: Hash,
+        current_time_envelope_ref: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<
+        (
+            apm2_core::pcac::AuthorityConsumedV1,
+            apm2_core::pcac::AuthorityConsumeRecordV1,
+        ),
+        Box<apm2_core::pcac::AuthorityDenyV1>,
+    > {
+        // Same semantic as DurableKernel<K>::consume:
+        // 1) Run inner consume semantics first (all deny-producing checks),
+        // 2) commit durable record barrier,
+        // 3) return witnesses.
+        let (consumed_witness, consume_record) = self.inner.consume(
+            cert,
+            intent_digest,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+        )?;
+
+        // Durable commit remains mandatory before effect acceptance.
+        if let Err(e) = self.durable_index.record_consume(cert.ajc_id) {
+            let denied_at_tick = 0u64;
+            match e {
+                ConsumeError::AlreadyConsumed { ajc_id } => {
+                    return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::AlreadyConsumed { ajc_id },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: cert.as_of_ledger_anchor,
+                        denied_at_tick,
+                    }));
+                },
+                ConsumeError::IoError(io_err) => {
                     return Err(Box::new(apm2_core::pcac::AuthorityDenyV1 {
                         deny_class: apm2_core::pcac::AuthorityDenyClass::UnknownState {
                             description: format!("durable consume write failed: {io_err}"),
@@ -523,15 +694,90 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_log_detected() {
+    fn corrupt_log_mid_file_detected() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("consume.log");
 
-        // Write corrupt data.
-        std::fs::write(&path, "not-valid-hex\n").unwrap();
+        // Write a corrupt line followed by a valid line — mid-file
+        // corruption must still fail closed.
+        let valid_hex = hex::encode(test_hash(0xAA));
+        std::fs::write(&path, format!("not-valid-hex\n{valid_hex}\n")).unwrap();
 
         let err = FileBackedConsumeIndex::open(&path, None).unwrap_err();
         assert!(matches!(err, ConsumeError::CorruptLog { line: 1, .. }));
+    }
+
+    #[test]
+    fn torn_tail_record_recovered_on_open() {
+        // MAJOR 2 FIX: Write a valid record followed by a partial/torn
+        // hex line. The open should succeed, only the valid record should
+        // be in the consumed set, and the file should be truncated.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("consume.log");
+
+        let valid_hash = test_hash(0xCC);
+        let valid_hex = hex::encode(valid_hash);
+        // Torn tail: only 20 hex chars (incomplete).
+        std::fs::write(&path, format!("{valid_hex}\nabcdef0123456789abcd\n")).unwrap();
+
+        let index = FileBackedConsumeIndex::open(&path, None).unwrap();
+        assert!(
+            index.is_consumed(&valid_hash),
+            "valid record must be preserved after torn tail recovery"
+        );
+        assert_eq!(index.len(), 1, "only valid record should be in index");
+
+        // Verify the file was truncated to remove the torn tail.
+        drop(index);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("abcdef0123456789abcd"),
+            "torn tail must be removed from file after recovery"
+        );
+        assert!(
+            contents.contains(&valid_hex),
+            "valid record must remain in file after recovery"
+        );
+    }
+
+    #[test]
+    fn truncated_tail_allows_re_consume() {
+        // MAJOR 2 FIX: Write a valid record + torn tail for a different hash.
+        // After recovery, the torn hash should be re-consumable since it was
+        // never durably committed.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("consume.log");
+
+        let valid_hash = test_hash(0xDD);
+        let valid_hex = hex::encode(valid_hash);
+        let torn_hash = test_hash(0xEE);
+        let torn_hex = hex::encode(torn_hash);
+        // Write valid + partial torn (only first 30 chars of the 64-char hex).
+        std::fs::write(&path, format!("{valid_hex}\n{}\n", &torn_hex[..30])).unwrap();
+
+        let index = FileBackedConsumeIndex::open(&path, None).unwrap();
+        assert!(index.is_consumed(&valid_hash));
+        assert!(
+            !index.is_consumed(&torn_hash),
+            "torn tail hash must not be in consumed set"
+        );
+
+        // The torn hash can now be consumed normally.
+        index.record_consume(torn_hash).unwrap();
+        assert!(index.is_consumed(&torn_hash));
+    }
+
+    #[test]
+    fn single_corrupt_line_only_treated_as_torn_tail() {
+        // A single corrupt line (which is both the first and last line)
+        // is treated as a torn tail and recovered.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("consume.log");
+
+        std::fs::write(&path, "not-valid-hex\n").unwrap();
+
+        let index = FileBackedConsumeIndex::open(&path, None).unwrap();
+        assert_eq!(index.len(), 0, "torn single line should be truncated");
     }
 
     #[test]
@@ -608,6 +854,7 @@ mod tests {
             cert: &AuthorityJoinCertificateV1,
             intent_digest: Hash,
             current_time_envelope_ref: Hash,
+            _current_revocation_head_hash: Hash,
         ) -> Result<
             (
                 apm2_core::pcac::AuthorityConsumedV1,
@@ -651,7 +898,12 @@ mod tests {
         let input = valid_input();
         let cert = kernel.join(&input).unwrap();
         let (witness, record) = kernel
-            .consume(&cert, input.intent_digest, input.time_envelope_ref)
+            .consume(
+                &cert,
+                input.intent_digest,
+                input.time_envelope_ref,
+                cert.revocation_head_hash,
+            )
             .unwrap();
         assert_eq!(witness.ajc_id, cert.ajc_id);
         assert_eq!(record.ajc_id, cert.ajc_id);
@@ -670,12 +922,22 @@ mod tests {
 
         // First consume succeeds.
         kernel
-            .consume(&cert, input.intent_digest, input.time_envelope_ref)
+            .consume(
+                &cert,
+                input.intent_digest,
+                input.time_envelope_ref,
+                cert.revocation_head_hash,
+            )
             .unwrap();
 
         // Second consume denied by durable index.
         let err = kernel
-            .consume(&cert, input.intent_digest, input.time_envelope_ref)
+            .consume(
+                &cert,
+                input.intent_digest,
+                input.time_envelope_ref,
+                cert.revocation_head_hash,
+            )
             .unwrap_err();
         assert!(matches!(
             err.deny_class,
@@ -700,7 +962,12 @@ mod tests {
             let cert = kernel.join(&input).unwrap();
             ajc_id = cert.ajc_id;
             kernel
-                .consume(&cert, input.intent_digest, input.time_envelope_ref)
+                .consume(
+                    &cert,
+                    input.intent_digest,
+                    input.time_envelope_ref,
+                    cert.revocation_head_hash,
+                )
                 .unwrap();
         }
         // Drop = simulated crash.
@@ -718,7 +985,12 @@ mod tests {
             assert_eq!(cert.ajc_id, ajc_id);
 
             let err = kernel
-                .consume(&cert, input.intent_digest, input.time_envelope_ref)
+                .consume(
+                    &cert,
+                    input.intent_digest,
+                    input.time_envelope_ref,
+                    cert.revocation_head_hash,
+                )
                 .unwrap_err();
             assert!(matches!(
                 err.deny_class,
@@ -740,7 +1012,12 @@ mod tests {
         let input = valid_input();
         let cert = kernel.join(&input).unwrap();
         kernel
-            .consume(&cert, input.intent_digest, input.time_envelope_ref)
+            .consume(
+                &cert,
+                input.intent_digest,
+                input.time_envelope_ref,
+                cert.revocation_head_hash,
+            )
             .unwrap();
 
         // Read the file directly — the record must be present.
@@ -766,7 +1043,12 @@ mod tests {
         let kernel = DurableKernel::new(inner, Box::new(index));
 
         let err = kernel
-            .consume(&cert, input.intent_digest, input.time_envelope_ref)
+            .consume(
+                &cert,
+                input.intent_digest,
+                input.time_envelope_ref,
+                cert.revocation_head_hash,
+            )
             .unwrap_err();
         assert!(
             matches!(
