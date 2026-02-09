@@ -112,6 +112,7 @@ async fn test_persistence_end_to_end() {
         adapter_profile_hash: None,
         max_episodes: None,
         escalation_predicate: None,
+        permeability_receipt_hash: None,
     };
     let spawn_frame = encode_spawn_episode_request(&spawn_req);
     let spawn_resp = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -155,6 +156,7 @@ async fn test_persistence_end_to_end() {
         adapter_profile_hash: None,
         max_episodes: None,
         escalation_predicate: None,
+        permeability_receipt_hash: None,
     };
     let spawn_frame_impl = encode_spawn_episode_request(&spawn_req_impl);
     let spawn_resp_impl = dispatcher.dispatch(&spawn_frame_impl, &ctx).unwrap();

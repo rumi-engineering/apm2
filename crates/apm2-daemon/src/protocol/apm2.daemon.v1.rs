@@ -347,6 +347,12 @@ pub struct SpawnEpisodeRequest {
     /// Tag 8 chosen to avoid renumbering existing fields (wire stability).
     #[prost(bytes = "vec", optional, tag = "8")]
     pub adapter_profile_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// TCK-00373: Optional permeability receipt hash for delegated spawns.
+    /// When present, the spawn path routes through validate_delegated_spawn_gate
+    /// for full consumption-binding verification. Must be a 32-byte BLAKE3 digest.
+    /// Tag 9 chosen to preserve wire stability.
+    #[prost(bytes = "vec", optional, tag = "9")]
+    pub permeability_receipt_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SpawnEpisodeResponse {

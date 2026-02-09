@@ -316,6 +316,11 @@ message SpawnEpisodeRequest {
   // Must be a 32-byte BLAKE3 digest and must resolve in CAS (fail-closed).
   // Tag 8 chosen to avoid renumbering existing fields (wire stability).
   optional bytes adapter_profile_hash = 8;
+  // TCK-00373: Optional permeability receipt hash for delegated spawns.
+  // When present, the spawn path routes through validate_delegated_spawn_gate
+  // for full consumption-binding verification. Must be a 32-byte BLAKE3 digest.
+  // Tag 9 chosen to preserve wire stability.
+  optional bytes permeability_receipt_hash = 9;
 }
 
 message SpawnEpisodeResponse {

@@ -117,25 +117,34 @@ fn spawn_accepted_with_valid_envelope() {
     assert!(result.is_ok(), "spawn must succeed with valid envelope");
 }
 
-/// Delegated episode requires `permeability_receipt_hash`.
+/// Legacy spawn gate rejects delegated mode outright (must use
+/// `validate_delegated_spawn_gate` for consumption binding enforcement).
 #[test]
-fn delegated_spawn_denied_without_permeability_receipt() {
+fn delegated_spawn_denied_via_legacy_gate_without_receipt() {
     let env = test_v1_envelope(); // No permeability_receipt_hash
     let result = validate_spawn_gate(Some(&env), true);
     assert!(
-        matches!(result, Err(EnvelopeV1Error::MissingPermeabilityReceiptHash)),
-        "delegated spawn must be denied without permeability_receipt_hash, got: {result:?}"
+        matches!(
+            result,
+            Err(EnvelopeV1Error::DelegatedRequiresConsumptionBinding)
+        ),
+        "legacy gate must reject delegated mode, got: {result:?}"
     );
 }
 
-/// Delegated episode accepted with `permeability_receipt_hash`.
+/// Legacy spawn gate rejects delegated mode even when
+/// `permeability_receipt_hash` is present — full consumption binding is
+/// required.
 #[test]
-fn delegated_spawn_accepted_with_permeability_receipt() {
+fn delegated_spawn_denied_via_legacy_gate_with_receipt() {
     let env = test_delegated_v1_envelope();
     let result = validate_spawn_gate(Some(&env), true);
     assert!(
-        result.is_ok(),
-        "delegated spawn must succeed with permeability_receipt_hash"
+        matches!(
+            result,
+            Err(EnvelopeV1Error::DelegatedRequiresConsumptionBinding)
+        ),
+        "legacy gate must reject delegated mode even with receipt hash, got: {result:?}"
     );
 }
 
