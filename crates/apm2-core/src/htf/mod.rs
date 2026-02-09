@@ -70,17 +70,24 @@
 //! ```
 
 pub mod canonical;
+pub mod epoch_seal;
 pub mod freshness;
 mod types;
 
 // Re-export all public types
 pub use canonical::{Canonicalizable, CanonicalizationError};
+pub use epoch_seal::{
+    EpochSealAuditEvent, EpochSealError, EpochSealIssuanceError, EpochSealIssuer, EpochSealV1,
+    EpochSealVerdict, EpochSealVerificationError, EpochSealVerifier, MAX_EVICTION_HIGH_WATER_MARKS,
+    MAX_SEAL_AUDIT_EVENTS, MAX_SEAL_STRING_LENGTH, MAX_TRACKED_ISSUERS, SignatureVerificationError,
+    SignatureVerifier, is_seal_required_tier,
+};
 pub use freshness::{
     DEFAULT_TIER0_MAX_HEAD_AGE_TICKS, DEFAULT_TIER1_MAX_HEAD_AGE_TICKS,
     DEFAULT_TIER2_MAX_HEAD_AGE_TICKS, DEFAULT_TIER3_MAX_HEAD_AGE_TICKS,
     DEFAULT_TIER4_MAX_HEAD_AGE_TICKS, FreshnessAuditEvent, FreshnessEvaluationError,
-    FreshnessPolicyEvaluator, FreshnessPolicyV1, MAX_AUDIT_EVENTS, StalenessAction,
-    StalenessVerdict, TierFreshnessConfig,
+    FreshnessPolicyError, FreshnessPolicyEvaluator, FreshnessPolicyV1, MAX_AUDIT_EVENTS,
+    StalenessAction, StalenessVerdict, TierFreshnessConfig,
 };
 pub use types::{
     BoundedWallInterval,

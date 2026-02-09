@@ -124,6 +124,7 @@ fn session_request_tool_exec_allow_with_manifest() {
         tool_id: "read".to_string(),
         arguments: vec![1, 2, 3],
         dedupe_key: "key-001".to_string(),
+        epoch_seal: None,
     };
     let frame = encode_request_tool_request(&request);
 
@@ -166,6 +167,7 @@ fn session_request_tool_exec_deny_not_in_allowlist() {
         tool_id: "execute".to_string(), // Not in allowlist
         arguments: vec![],
         dedupe_key: "key-002".to_string(),
+        epoch_seal: None,
     };
     let frame = encode_request_tool_request(&request);
 
@@ -203,6 +205,7 @@ fn session_request_tool_exec_deny_no_manifest_for_session() {
         tool_id: "read".to_string(),
         arguments: vec![],
         dedupe_key: "key-003".to_string(),
+        epoch_seal: None,
     };
     let frame = encode_request_tool_request(&request);
 
@@ -238,6 +241,7 @@ fn session_request_tool_exec_deny_no_store_configured() {
         tool_id: "read".to_string(),
         arguments: vec![],
         dedupe_key: "key-004".to_string(),
+        epoch_seal: None,
     };
     let frame = encode_request_tool_request(&request);
 
@@ -517,6 +521,7 @@ fn session_event_evidence_persist_full_config_integration() {
         tool_id: "write".to_string(),
         arguments: vec![],
         dedupe_key: "full-test-tool".to_string(),
+        epoch_seal: None,
     };
     let tool_frame = encode_request_tool_request(&tool_request);
     let tool_response = dispatcher.dispatch(&tool_frame, &ctx).unwrap();

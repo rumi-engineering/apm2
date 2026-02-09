@@ -2210,6 +2210,27 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
+        // TCK-00365: Extract epoch seal from protocol message and attach to
+        // broker request for Tier2+ admission verification.
+        if let Some(seal_bytes) = &request.epoch_seal {
+            match apm2_core::htf::EpochSealV1::from_canonical_bytes(seal_bytes) {
+                Ok(seal) => {
+                    broker_request = broker_request.with_epoch_seal(seal);
+                },
+                Err(e) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "epoch seal deserialization failed (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInvalid,
+                        format!("epoch seal deserialization failed: {e}"),
+                    ));
+                },
+            }
+        }
+
         // Call broker.request() asynchronously using tokio runtime
         let broker_response = tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
@@ -3938,6 +3959,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![1, 2, 3],
                 dedupe_key: "key-001".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -4093,6 +4115,7 @@ mod tests {
                     tool_id: "read".to_string(),
                     arguments: vec![],
                     dedupe_key: String::new(),
+                    epoch_seal: None,
                 }),
                 encode_emit_event_request(&EmitEventRequest {
                     session_token: serde_json::to_string(&token).unwrap(),
@@ -4142,6 +4165,7 @@ mod tests {
             tool_id: "read".to_string(),
             arguments: vec![],
             dedupe_key: String::new(),
+            epoch_seal: None,
         };
         let frame = encode_request_tool_request(&request);
 
@@ -4166,6 +4190,7 @@ mod tests {
             tool_id: "read".to_string(),
             arguments: vec![],
             dedupe_key: String::new(),
+            epoch_seal: None,
         };
         let frame = encode_request_tool_request(&request);
 
@@ -4197,6 +4222,7 @@ mod tests {
             tool_id: "read".to_string(),
             arguments: vec![],
             dedupe_key: String::new(),
+            epoch_seal: None,
         };
         let frame = encode_request_tool_request(&request);
 
@@ -4225,6 +4251,7 @@ mod tests {
             tool_id: String::new(), // Missing tool_id
             arguments: vec![],
             dedupe_key: String::new(),
+            epoch_seal: None,
         };
         let frame = encode_request_tool_request(&request);
 
@@ -4422,6 +4449,7 @@ mod tests {
                 tool_id: "read".to_string(), // ToolClass::Read
                 arguments: vec![],
                 dedupe_key: "key-001".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -4462,6 +4490,7 @@ mod tests {
                 tool_id: "write".to_string(), // ToolClass::Write - NOT in allowlist
                 arguments: vec![],
                 dedupe_key: "key-002".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -4506,6 +4535,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "key-003".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -4540,6 +4570,7 @@ mod tests {
                 tool_id: "unknown_tool_xyz".to_string(), // Not a valid ToolClass
                 arguments: vec![],
                 dedupe_key: "key-004".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -4576,6 +4607,7 @@ mod tests {
                 tool_id: long_tool_id,
                 arguments: vec![],
                 dedupe_key: "key-005".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -4618,6 +4650,7 @@ mod tests {
                     tool_id: tool_id.to_string(),
                     arguments: vec![],
                     dedupe_key: format!("key-{tool_id}"),
+                    epoch_seal: None,
                 };
                 let frame = encode_request_tool_request(&request);
 
@@ -4645,6 +4678,7 @@ mod tests {
                     tool_id: tool_id.to_string(),
                     arguments: vec![],
                     dedupe_key: format!("key-{tool_id}"),
+                    epoch_seal: None,
                 };
                 let frame = encode_request_tool_request(&request);
 
@@ -4696,6 +4730,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "perf-test".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -5097,6 +5132,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "test-dedupe-key".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -5138,6 +5174,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "test-no-broker-skip-gate".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -5239,6 +5276,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "test-dedupe-key".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -5294,6 +5332,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "test-dedupe-no-gate".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -5580,6 +5619,7 @@ mod tests {
                     arguments: serde_json::to_vec(&request_args)
                         .expect("request args serialization"),
                     dedupe_key: "tck-00375-tier3-toctou".to_string(),
+                    epoch_seal: None,
                 };
                 let frame = encode_request_tool_request(&request);
                 let response = dispatcher
@@ -5802,6 +5842,7 @@ mod tests {
                     arguments: serde_json::to_vec(&request_args)
                         .expect("request args serialization"),
                     dedupe_key: "tck-00375-tier3-search-defect".to_string(),
+                    epoch_seal: None,
                 };
                 let frame = encode_request_tool_request(&request);
                 let response = dispatcher
@@ -5946,6 +5987,7 @@ mod tests {
                     arguments: serde_json::to_vec(&request_args)
                         .expect("request args serialization"),
                     dedupe_key: "tck-00375-tier3-no-ledger".to_string(),
+                    epoch_seal: None,
                 };
                 let frame = encode_request_tool_request(&request);
                 let response = dispatcher
@@ -6034,6 +6076,7 @@ mod tests {
                     tool_id: tool_id.to_string(),
                     arguments: vec![],
                     dedupe_key: format!("dedupe-{tool_id}"),
+                    epoch_seal: None,
                 };
                 let frame = encode_request_tool_request(&request);
                 let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -6077,6 +6120,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "test-dedupe".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -6120,6 +6164,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "manifest-test".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -6180,6 +6225,7 @@ mod tests {
                 tool_id: "read".to_string(),
                 arguments: vec![],
                 dedupe_key: "runtime-test".to_string(),
+                epoch_seal: None,
             };
             let frame = encode_request_tool_request(&request);
 
@@ -6239,6 +6285,7 @@ mod tests {
                     tool_id: tool_id.to_string(),
                     arguments: vec![],
                     dedupe_key: format!("unknown-{}", tool_id.chars().take(10).collect::<String>()),
+                    epoch_seal: None,
                 };
                 let frame = encode_request_tool_request(&request);
                 let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -6795,6 +6842,7 @@ mod tests {
                     tool_id: "read".to_string(),
                     arguments: serde_json::to_vec(&read_args).unwrap(),
                     dedupe_key: "e2e-dedupe-1".to_string(),
+                    epoch_seal: None,
                 };
                 let frame = encode_request_tool_request(&tool_request);
                 let tool_result = dispatcher.dispatch(&frame, &ctx);
@@ -7793,6 +7841,7 @@ mod tests {
                 tool_id: tool_id.to_string(),
                 arguments: serde_json::to_vec(args_json).unwrap(),
                 dedupe_key: format!("dedupe-{}", uuid::Uuid::new_v4()),
+                epoch_seal: None,
             };
             encode_request_tool_request(&request)
         }
