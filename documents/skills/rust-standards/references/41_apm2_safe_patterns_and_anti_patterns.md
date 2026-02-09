@@ -110,7 +110,7 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 [PROVENANCE] RSK-0701 (Panic-as-DoS).
 
 [CONTRACT: CTR-2622] Centralized Configuration.
-- REJECT IF: `std::env::var` is called in business logic (outside `crate::config` or `xtask` scripts).
+- REJECT IF: `std::env::var` is called in business logic (outside `crate::config`).
 - ENFORCE BY: Load all config into a typed `Config` struct at startup; pass `Config` or specific fields to components.
 - PROVENANCE: Ensures 12-factor app compliance and testability (environment injection).
 

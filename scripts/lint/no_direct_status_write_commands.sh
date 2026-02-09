@@ -4,10 +4,9 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 VIOLATIONS=0
 
-# Restrict scope to executable review prompt and xtask assets.
+# Restrict scope to executable review prompts.
 TARGET_FILES=(
     "$(find "$REPO_ROOT/documents/reviews" -type f -name '*.md' | sort)"
-    "$(find "$REPO_ROOT/xtask/src" -type f -name '*.rs' | sort)"
 )
 
 # Flatten array entries that may contain newlines from command substitution.
@@ -37,7 +36,7 @@ check_logical_line() {
     # are already filtered above (line 27).
     if [[ "$lc" =~ (^|[^a-z0-9_-])gh([^a-z0-9_-]|$) ]] && [[ "$lc" == *"/statuses/"* ]]; then
         local rel="${file#"$REPO_ROOT/"}"
-        echo "::error file=$rel,line=$line_no::Direct GitHub status-write command string is forbidden in prompts/xtask assets (TCK-00411)."
+        echo "::error file=$rel,line=$line_no::Direct GitHub status-write command string is forbidden in review prompts (TCK-00411)."
         VIOLATIONS=1
     fi
 }

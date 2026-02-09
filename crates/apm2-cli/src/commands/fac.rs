@@ -170,6 +170,13 @@ pub enum FacSubcommand {
     /// lines until a terminal outcome is reached.
     Kickoff(KickoffArgs),
 
+    /// Push code and orchestrate FAC lifecycle (gates → push → reviews →
+    /// project).
+    ///
+    /// Runs evidence gates (fail-closed), pushes to remote, dispatches reviews,
+    /// and polls projection health lines to a projection log file.
+    Push(PushArgs),
+
     /// Run and observe FAC review orchestration for pull requests.
     ///
     /// Provides VPS-oriented review execution and observability with
@@ -365,6 +372,35 @@ pub struct KickoffArgs {
     /// Event name (`pull_request_target` or `workflow_dispatch`).
     #[arg(long)]
     pub event_name: String,
+
+    /// Maximum seconds to wait for FAC terminal state.
+    #[arg(long, default_value_t = 3600)]
+    pub max_wait_seconds: u64,
+
+    /// SECURITY-CRITICAL: limit stdout to one projection health line per
+    /// second.
+    ///
+    /// Use this mode for public log surfaces (for example GitHub Actions logs).
+    /// Any rich diagnostics must stay on private runner-local storage.
+    /// Non-health diagnostics are emitted to stderr for private runner logs.
+    #[arg(long, default_value_t = false)]
+    pub public_projection_only: bool,
+}
+
+/// Arguments for `apm2 fac push`.
+#[derive(Debug, Args)]
+pub struct PushArgs {
+    /// Repository in owner/repo format.
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Git remote name.
+    #[arg(long, default_value = "origin")]
+    pub remote: String,
+
+    /// Git branch to push. Defaults to current branch.
+    #[arg(long)]
+    pub branch: Option<String>,
 
     /// Maximum seconds to wait for FAC terminal state.
     #[arg(long, default_value_t = 3600)]
@@ -720,7 +756,14 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             &args.event,
             &args.event_name,
             args.max_wait_seconds,
+            args.public_projection_only,
             json_output,
+        ),
+        FacSubcommand::Push(args) => fac_review::run_push(
+            &args.repo,
+            &args.remote,
+            args.branch.as_deref(),
+            args.max_wait_seconds,
         ),
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Run(run_args) => fac_review::run_review(
