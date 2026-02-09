@@ -384,16 +384,19 @@ fn verify_pointer_auth(
                     ctx,
                 ));
             }
-            for (i, entry) in proof.iter().enumerate() {
-                if entry.sibling_hash == ZERO_HASH {
-                    return Err(make_deny(
-                        AuthorityDenyClass::ZeroHash {
-                            field_name: format!("merkle_inclusion_proof[{i}]"),
-                        },
-                        ctx,
-                    ));
-                }
-            }
+            // NOTE: We intentionally do NOT reject zero-hash sibling entries
+            // in the proof. The canonical Merkle tree implementation
+            // (`consensus::merkle`) uses EMPTY_HASH ([0u8; 32]) as the
+            // padding value for missing siblings in odd-sized trees. Rejecting
+            // zero-hash siblings would deny valid proofs from any non-power-of-two
+            // tree.
+            //
+            // Security is maintained because:
+            // 1. The batch root itself must be non-zero (checked below).
+            // 2. The recomputed root must match the batch root exactly.
+            // 3. The batch root must match the seal subject hash (when provided).
+            // Thus, an attacker cannot inject arbitrary zero siblings without
+            // breaking the root recomputation check.
             require_nonzero(batch_root, "receipt_batch_root_hash", ctx)?;
 
             // BLOCKER 2 fix: Verify batch root is authenticated by the
@@ -525,8 +528,17 @@ pub struct ReplayLifecycleEntry {
 /// 3. All Revalidate entries come before all Consume entries (strict `<`).
 /// 4. If `effect_receipt_tick` is present, all Consume ticks are `<=` it.
 /// 5. When a Consume entry has `requires_pre_actuation`, the
-///    `pre_actuation_selector_hash` MUST be present and non-zero.
+///    `pre_actuation_selector_hash` MUST be present, non-zero, AND contained in
+///    `known_pre_actuation_hashes` (referential equality).
 /// 6. Entries do not exceed `MAX_REPLAY_LIFECYCLE_ENTRIES`.
+///
+/// # Arguments
+///
+/// * `known_pre_actuation_hashes` - The authoritative set of pre-actuation
+///   receipt hashes from this lifecycle. When a Consume entry has
+///   `requires_pre_actuation`, its `pre_actuation_selector_hash` MUST be a
+///   member of this set. If the set is empty and any Consume entry requires
+///   pre-actuation, the entry is denied (fail-closed).
 ///
 /// # Errors
 ///
@@ -535,6 +547,7 @@ pub struct ReplayLifecycleEntry {
 pub fn validate_replay_lifecycle_order(
     entries: &[ReplayLifecycleEntry],
     effect_receipt_tick: Option<u64>,
+    known_pre_actuation_hashes: &[Hash],
     time_envelope_ref: Hash,
     ledger_anchor: Hash,
     denied_at_tick: u64,
@@ -558,7 +571,7 @@ pub fn validate_replay_lifecycle_order(
         ));
     }
 
-    let classified = classify_lifecycle_entries(entries, &ctx)?;
+    let classified = classify_lifecycle_entries(entries, known_pre_actuation_hashes, &ctx)?;
     require_all_stages_present(&classified, &ctx)?;
     check_stage_ordering(&classified, effect_receipt_tick, &ctx)
 }
@@ -574,6 +587,7 @@ struct ClassifiedTicks {
 /// the way.
 fn classify_lifecycle_entries(
     entries: &[ReplayLifecycleEntry],
+    known_pre_actuation_hashes: &[Hash],
     ctx: &DenyContext,
 ) -> Result<ClassifiedTicks, Box<AuthorityDenyV1>> {
     let mut result = ClassifiedTicks {
@@ -587,16 +601,24 @@ fn classify_lifecycle_entries(
             LifecycleStage::Revalidate => result.revalidate.push(entry.tick),
             LifecycleStage::Consume => {
                 result.consume.push(entry.tick);
-                check_pre_actuation(entry, ctx)?;
+                check_pre_actuation(entry, known_pre_actuation_hashes, ctx)?;
             },
         }
     }
     Ok(result)
 }
 
-/// Validate pre-actuation selector completeness for a consume entry.
+/// Validate pre-actuation selector completeness and referential integrity for
+/// a consume entry.
+///
+/// Per REQ-0006: the consume entry's `pre_actuation_selector_hash` must:
+/// 1. Be present (not `None`).
+/// 2. Be non-zero.
+/// 3. Match one of the known pre-actuation receipt hashes from the lifecycle
+///    (referential equality — not just non-zero presence).
 fn check_pre_actuation(
     entry: &ReplayLifecycleEntry,
+    known_pre_actuation_hashes: &[Hash],
     ctx: &DenyContext,
 ) -> Result<(), Box<AuthorityDenyV1>> {
     if !entry.requires_pre_actuation {
@@ -607,7 +629,19 @@ fn check_pre_actuation(
             AuthorityDenyClass::MissingPreActuationReceipt,
             ctx,
         )),
-        Some(_) => Ok(()),
+        Some(selector) => {
+            // REQ-0006: Referential equality check — the selector MUST be
+            // present in the authoritative set of known pre-actuation
+            // receipt hashes. An arbitrary non-zero hash that is not linked
+            // to any actual prerequisite pre-actuation receipt is denied.
+            if !known_pre_actuation_hashes.contains(&selector) {
+                return Err(make_deny(
+                    AuthorityDenyClass::MissingPreActuationReceipt,
+                    ctx,
+                ));
+            }
+            Ok(())
+        },
     }
 }
 

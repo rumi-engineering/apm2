@@ -64,6 +64,7 @@ impl std::fmt::Display for IdentityEvidenceLevel {
 /// - `freshness_witness_hash` ensures authority is current.
 /// - `stop_budget_profile_digest` captures stop/budget constraints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityJoinInputV1 {
     // -- Subject bindings --
     /// Session identifier for the requesting session.
@@ -191,6 +192,7 @@ pub enum DeterminismClass {
 /// - `revocation_head_hash`: Revocation frontier commitment.
 /// - `identity_evidence_level`: Evidence level at join time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityJoinCertificateV1 {
     /// Content hash of the canonical certificate bytes (32 bytes).
     pub ajc_id: Hash,
@@ -233,6 +235,7 @@ pub struct AuthorityJoinCertificateV1 {
 /// Returned by `AuthorityJoinKernel::consume()` alongside the durable
 /// consume record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityConsumedV1 {
     /// The consumed certificate's ID.
     pub ajc_id: Hash,
@@ -266,6 +269,7 @@ pub struct AuthorityConsumedV1 {
 /// - The write MUST complete before the side effect is accepted.
 /// - Crash-replay MUST find the record if consumption was committed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityConsumeRecordV1 {
     /// The consumed certificate's ID (primary key for uniqueness).
     pub ajc_id: Hash,

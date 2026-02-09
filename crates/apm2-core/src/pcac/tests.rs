@@ -762,26 +762,44 @@ fn pointer_auth_empty_merkle_proof_denied() {
 }
 
 #[test]
-fn pointer_auth_zero_hash_in_merkle_proof_denied() {
+fn pointer_auth_zero_hash_sibling_allowed_as_canonical_padding() {
+    // Zero-hash siblings are the canonical EMPTY_HASH padding used by
+    // consensus::merkle for odd-sized trees. The verifier must allow them
+    // and rely on root recomputation for integrity. This proof will fail
+    // because the batch root doesn't match the recomputed root (not because
+    // of the zero sibling itself).
+    use crate::consensus::merkle::{hash_internal, hash_leaf};
+
+    let receipt_hash = test_hash(0xE1);
+    let sibling0 = test_hash(0xE3);
+    let zero_sibling = zero_hash(); // canonical EMPTY_HASH padding
+
+    // Compute the correct root with the zero sibling
+    let leaf = hash_leaf(&receipt_hash);
+    let level1 = hash_internal(&leaf, &sibling0);
+    let root = hash_internal(&level1, &zero_sibling);
+
     let auth = ReceiptAuthentication::Pointer {
-        receipt_hash: test_hash(0xE1),
+        receipt_hash,
         authority_seal_hash: SEAL,
         merkle_inclusion_proof: Some(vec![
             MerkleProofEntry {
-                sibling_hash: test_hash(0xE3),
+                sibling_hash: sibling0,
                 sibling_is_left: false,
             },
             MerkleProofEntry {
-                sibling_hash: zero_hash(),
+                sibling_hash: zero_sibling,
                 sibling_is_left: false,
             },
         ]),
-        receipt_batch_root_hash: Some(test_hash(0xE5)),
+        receipt_batch_root_hash: Some(root),
     };
-    let err =
-        verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    // Must pass: the zero sibling is canonical padding and the proof
+    // recomputation matches the batch root.
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
     assert!(
-        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "merkle_inclusion_proof[1]")
+        result.is_ok(),
+        "zero-hash sibling (canonical padding) with matching root must be accepted"
     );
 }
 
@@ -1520,7 +1538,7 @@ fn replay_lifecycle_valid_ordering() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let result = validate_replay_lifecycle_order(&entries, Some(300), TIME_REF, LEDGER, TICK);
+    let result = validate_replay_lifecycle_order(&entries, Some(300), &[], TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
 }
 
@@ -1546,7 +1564,7 @@ fn replay_lifecycle_valid_with_effect_after_consume() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let result = validate_replay_lifecycle_order(&entries, Some(50), TIME_REF, LEDGER, TICK);
+    let result = validate_replay_lifecycle_order(&entries, Some(50), &[], TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
 }
 
@@ -1566,7 +1584,8 @@ fn replay_lifecycle_missing_join_denied() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
@@ -1590,7 +1609,8 @@ fn replay_lifecycle_missing_revalidate_denied() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
@@ -1614,7 +1634,8 @@ fn replay_lifecycle_missing_consume_denied() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
@@ -1645,7 +1666,8 @@ fn replay_lifecycle_join_not_before_revalidate_denied() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
@@ -1676,7 +1698,8 @@ fn replay_lifecycle_revalidate_not_before_consume_denied() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
@@ -1707,8 +1730,8 @@ fn replay_lifecycle_consume_after_effect_receipt_denied() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let err =
-        validate_replay_lifecycle_order(&entries, Some(300), TIME_REF, LEDGER, TICK).unwrap_err();
+    let err = validate_replay_lifecycle_order(&entries, Some(300), &[], TIME_REF, LEDGER, TICK)
+        .unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::BoundaryMonotonicityViolation { ref description }
@@ -1739,13 +1762,14 @@ fn replay_lifecycle_consume_equal_to_effect_receipt_ok() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let result = validate_replay_lifecycle_order(&entries, Some(300), TIME_REF, LEDGER, TICK);
+    let result = validate_replay_lifecycle_order(&entries, Some(300), &[], TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
 }
 
 #[test]
 fn replay_lifecycle_missing_pre_actuation_selector_denied() {
     // Consume requires pre-actuation but selector is None
+    let known_hashes = [test_hash(0xAB)];
     let entries = vec![
         ReplayLifecycleEntry {
             stage: LifecycleStage::Join,
@@ -1766,7 +1790,9 @@ fn replay_lifecycle_missing_pre_actuation_selector_denied() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &known_hashes, TIME_REF, LEDGER, TICK)
+            .unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::MissingPreActuationReceipt
@@ -1776,6 +1802,7 @@ fn replay_lifecycle_missing_pre_actuation_selector_denied() {
 #[test]
 fn replay_lifecycle_zero_pre_actuation_selector_denied() {
     // Consume requires pre-actuation but selector hash is zero
+    let known_hashes = [test_hash(0xAB)];
     let entries = vec![
         ReplayLifecycleEntry {
             stage: LifecycleStage::Join,
@@ -1796,7 +1823,9 @@ fn replay_lifecycle_zero_pre_actuation_selector_denied() {
             pre_actuation_selector_hash: Some(zero_hash()),
         },
     ];
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &known_hashes, TIME_REF, LEDGER, TICK)
+            .unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::MissingPreActuationReceipt
@@ -1805,7 +1834,9 @@ fn replay_lifecycle_zero_pre_actuation_selector_denied() {
 
 #[test]
 fn replay_lifecycle_valid_pre_actuation_selector_ok() {
-    // Consume requires pre-actuation and selector is present and non-zero
+    // Consume requires pre-actuation and selector is present, non-zero,
+    // and present in the known pre-actuation hash set.
+    let known_hashes = [test_hash(0xAB)];
     let entries = vec![
         ReplayLifecycleEntry {
             stage: LifecycleStage::Join,
@@ -1826,7 +1857,8 @@ fn replay_lifecycle_valid_pre_actuation_selector_ok() {
             pre_actuation_selector_hash: Some(test_hash(0xAB)),
         },
     ];
-    let result = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK);
+    let result =
+        validate_replay_lifecycle_order(&entries, None, &known_hashes, TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
 }
 
@@ -1855,7 +1887,8 @@ fn replay_lifecycle_exceeds_max_entries_denied() {
         requires_pre_actuation: false,
         pre_actuation_selector_hash: None,
     });
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::UnknownState { ref description }
@@ -1886,7 +1919,8 @@ fn replay_lifecycle_join_after_revalidate_denied() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let err = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK).unwrap_err();
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK).unwrap_err();
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::BoundaryMonotonicityViolation { .. }
@@ -1916,6 +1950,446 @@ fn replay_lifecycle_no_effect_receipt_ok() {
             pre_actuation_selector_hash: None,
         },
     ];
-    let result = validate_replay_lifecycle_order(&entries, None, TIME_REF, LEDGER, TICK);
+    let result = validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK);
     assert!(result.is_ok());
+}
+
+// =============================================================================
+// REQ-0006 referential selector invariant tests (Security BLOCKER fix)
+// =============================================================================
+
+#[test]
+fn replay_lifecycle_arbitrary_nonzero_selector_not_in_known_set_denied() {
+    // REQ-0006: A consume entry with a non-zero pre_actuation_selector_hash
+    // that does NOT appear in the known pre-actuation set must be denied.
+    // This closes the vulnerability where an arbitrary hash could bypass the
+    // selector-reference invariant.
+    let known_hashes = [test_hash(0xAB)];
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: true,
+            // Non-zero but NOT in known_hashes
+            pre_actuation_selector_hash: Some(test_hash(0xCD)),
+        },
+    ];
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &known_hashes, TIME_REF, LEDGER, TICK)
+            .unwrap_err();
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::MissingPreActuationReceipt
+        ),
+        "arbitrary non-zero selector not in known set must be denied"
+    );
+}
+
+#[test]
+fn replay_lifecycle_selector_in_known_set_passes() {
+    // REQ-0006: When the selector IS in the known set, validation passes.
+    let known_hashes = [test_hash(0xAB), test_hash(0xCD)];
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: true,
+            pre_actuation_selector_hash: Some(test_hash(0xCD)),
+        },
+    ];
+    let result =
+        validate_replay_lifecycle_order(&entries, None, &known_hashes, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok(), "selector present in known set must pass");
+}
+
+#[test]
+fn replay_lifecycle_empty_known_set_with_pre_actuation_denied() {
+    // REQ-0006: If the known set is empty but pre-actuation is required,
+    // any non-zero selector must be denied (fail-closed: no known hashes
+    // means no valid reference).
+    let entries = vec![
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Join,
+            tick: 100,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Revalidate,
+            tick: 200,
+            requires_pre_actuation: false,
+            pre_actuation_selector_hash: None,
+        },
+        ReplayLifecycleEntry {
+            stage: LifecycleStage::Consume,
+            tick: 300,
+            requires_pre_actuation: true,
+            pre_actuation_selector_hash: Some(test_hash(0xAB)),
+        },
+    ];
+    let err =
+        validate_replay_lifecycle_order(&entries, None, &[], TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::MissingPreActuationReceipt
+        ),
+        "empty known set must deny any pre-actuation selector"
+    );
+}
+
+// =============================================================================
+// deny_unknown_fields negative serde tests (Security MAJOR fix)
+// =============================================================================
+
+#[test]
+fn receipt_digest_meta_rejects_unknown_fields() {
+    use super::receipts::ReceiptDigestMeta;
+    let json = r#"{"canonicalizer_id":"jcs","content_digest":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"extra_field":"unexpected"}"#;
+    let result = serde_json::from_str::<ReceiptDigestMeta>(json);
+    assert!(
+        result.is_err(),
+        "unknown field must be rejected by ReceiptDigestMeta"
+    );
+}
+
+#[test]
+fn merkle_proof_entry_rejects_unknown_fields() {
+    let json = r#"{"sibling_hash":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"sibling_is_left":false,"injected":true}"#;
+    let result = serde_json::from_str::<MerkleProofEntry>(json);
+    assert!(
+        result.is_err(),
+        "unknown field must be rejected by MerkleProofEntry"
+    );
+}
+
+#[test]
+fn authoritative_bindings_rejects_unknown_fields() {
+    use super::receipts::*;
+    let bindings = AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0xA1),
+        view_commitment_hash: test_hash(0xA2),
+        time_envelope_ref: test_hash(0x07),
+        authentication: ReceiptAuthentication::Direct {
+            authority_seal_hash: test_hash(0xDD),
+        },
+        permeability_receipt_hash: None,
+        delegation_chain_hash: None,
+    };
+    let mut json: serde_json::Value = serde_json::to_value(&bindings).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("rogue_field".to_string(), serde_json::json!("injected"));
+    let result = serde_json::from_value::<AuthoritativeBindings>(json);
+    assert!(
+        result.is_err(),
+        "unknown field must be rejected by AuthoritativeBindings"
+    );
+}
+
+#[test]
+fn authority_join_receipt_rejects_unknown_fields() {
+    use super::receipts::ReceiptDigestMeta;
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: ReceiptDigestMeta {
+            canonicalizer_id: "apm2.canonicalizer.jcs".to_string(),
+            content_digest: test_hash(0xF0),
+        },
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: None,
+    };
+    let mut json: serde_json::Value = serde_json::to_value(&receipt).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("extra".to_string(), serde_json::json!(42));
+    let result = serde_json::from_value::<AuthorityJoinReceiptV1>(json);
+    assert!(
+        result.is_err(),
+        "unknown field must be rejected by AuthorityJoinReceiptV1"
+    );
+}
+
+#[test]
+fn authority_consume_receipt_rejects_unknown_fields() {
+    use super::receipts::ReceiptDigestMeta;
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: ReceiptDigestMeta {
+            canonicalizer_id: "apm2.canonicalizer.jcs".to_string(),
+            content_digest: test_hash(0xF0),
+        },
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: None,
+    };
+    let mut json: serde_json::Value = serde_json::to_value(&receipt).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("rogue".to_string(), serde_json::json!("bad"));
+    let result = serde_json::from_value::<AuthorityConsumeReceiptV1>(json);
+    assert!(
+        result.is_err(),
+        "unknown field must be rejected by AuthorityConsumeReceiptV1"
+    );
+}
+
+#[test]
+fn authority_join_input_rejects_unknown_fields() {
+    let input = valid_join_input();
+    let mut json: serde_json::Value = serde_json::to_value(&input).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("injected_field".to_string(), serde_json::json!("attacker"));
+    let result = serde_json::from_value::<AuthorityJoinInputV1>(json);
+    assert!(
+        result.is_err(),
+        "unknown field must be rejected by AuthorityJoinInputV1"
+    );
+}
+
+#[test]
+fn authority_join_certificate_rejects_unknown_fields() {
+    let cert = valid_certificate();
+    let mut json: serde_json::Value = serde_json::to_value(&cert).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("extra".to_string(), serde_json::json!(true));
+    let result = serde_json::from_value::<AuthorityJoinCertificateV1>(json);
+    assert!(
+        result.is_err(),
+        "unknown field must be rejected by AuthorityJoinCertificateV1"
+    );
+}
+
+#[test]
+fn authority_consume_record_rejects_unknown_fields() {
+    let record = AuthorityConsumeRecordV1 {
+        ajc_id: test_hash(0xAA),
+        consumed_time_envelope_ref: test_hash(0xDD),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+    };
+    let mut json: serde_json::Value = serde_json::to_value(&record).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("rogue".to_string(), serde_json::json!(99));
+    let result = serde_json::from_value::<AuthorityConsumeRecordV1>(json);
+    assert!(
+        result.is_err(),
+        "unknown field must be rejected by AuthorityConsumeRecordV1"
+    );
+}
+
+// =============================================================================
+// Odd-sized canonical Merkle tree proof tests (Quality BLOCKER + MAJOR fix)
+// =============================================================================
+
+#[test]
+fn pointer_auth_from_canonical_merkle_tree_3_leaves() {
+    // Odd-size tree: 3 leaves means the rightmost leaf gets EMPTY_HASH
+    // padding as its sibling.
+    use crate::consensus::merkle::MerkleTree;
+    use crate::crypto::EventHasher;
+
+    let leaves: Vec<_> = (0..3u64)
+        .map(|i| EventHasher::hash_content(&i.to_le_bytes()))
+        .collect();
+    let tree = MerkleTree::new(leaves.iter().copied()).unwrap();
+    let root = tree.root();
+
+    for (idx, leaf) in leaves.iter().enumerate() {
+        let proof = tree.proof_for(idx).unwrap();
+        assert!(
+            proof.verify(&root).is_ok(),
+            "canonical proof {idx} must self-verify"
+        );
+
+        let proof_entries: Vec<MerkleProofEntry> = proof
+            .path
+            .iter()
+            .map(|(sibling_hash, is_right)| MerkleProofEntry {
+                sibling_hash: *sibling_hash,
+                sibling_is_left: *is_right,
+            })
+            .collect();
+
+        let auth = ReceiptAuthentication::Pointer {
+            receipt_hash: *leaf,
+            authority_seal_hash: SEAL,
+            merkle_inclusion_proof: Some(proof_entries),
+            receipt_batch_root_hash: Some(root),
+        };
+        let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+        assert!(
+            result.is_ok(),
+            "leaf {idx} proof from 3-leaf canonical tree must verify through auth verifier"
+        );
+    }
+}
+
+#[test]
+fn pointer_auth_from_canonical_merkle_tree_5_leaves() {
+    // Odd-size tree: 5 leaves
+    use crate::consensus::merkle::MerkleTree;
+    use crate::crypto::EventHasher;
+
+    let leaves: Vec<_> = (0..5u64)
+        .map(|i| EventHasher::hash_content(&i.to_le_bytes()))
+        .collect();
+    let tree = MerkleTree::new(leaves.iter().copied()).unwrap();
+    let root = tree.root();
+
+    for (idx, leaf) in leaves.iter().enumerate() {
+        let proof = tree.proof_for(idx).unwrap();
+        assert!(
+            proof.verify(&root).is_ok(),
+            "canonical proof {idx} must self-verify"
+        );
+
+        let proof_entries: Vec<MerkleProofEntry> = proof
+            .path
+            .iter()
+            .map(|(sibling_hash, is_right)| MerkleProofEntry {
+                sibling_hash: *sibling_hash,
+                sibling_is_left: *is_right,
+            })
+            .collect();
+
+        let auth = ReceiptAuthentication::Pointer {
+            receipt_hash: *leaf,
+            authority_seal_hash: SEAL,
+            merkle_inclusion_proof: Some(proof_entries),
+            receipt_batch_root_hash: Some(root),
+        };
+        let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+        assert!(
+            result.is_ok(),
+            "leaf {idx} proof from 5-leaf canonical tree must verify through auth verifier"
+        );
+    }
+}
+
+#[test]
+fn pointer_auth_from_canonical_merkle_tree_1000_leaves() {
+    // Large odd-size tree: 1000 leaves. Rightmost leaves will have
+    // EMPTY_HASH padding siblings.
+    use crate::consensus::merkle::MerkleTree;
+    use crate::crypto::EventHasher;
+
+    let leaves: Vec<_> = (0..1000u64)
+        .map(|i| EventHasher::hash_content(&i.to_le_bytes()))
+        .collect();
+    let tree = MerkleTree::new(leaves.iter().copied()).unwrap();
+    let root = tree.root();
+
+    // Verify a representative set including the rightmost leaf where
+    // EMPTY_HASH padding occurs.
+    let test_indices = [0, 1, 2, 498, 499, 500, 997, 998, 999];
+    for &idx in &test_indices {
+        let proof = tree.proof_for(idx).unwrap();
+        assert!(
+            proof.verify(&root).is_ok(),
+            "canonical proof {idx} must self-verify"
+        );
+
+        let proof_entries: Vec<MerkleProofEntry> = proof
+            .path
+            .iter()
+            .map(|(sibling_hash, is_right)| MerkleProofEntry {
+                sibling_hash: *sibling_hash,
+                sibling_is_left: *is_right,
+            })
+            .collect();
+
+        let auth = ReceiptAuthentication::Pointer {
+            receipt_hash: leaves[idx],
+            authority_seal_hash: SEAL,
+            merkle_inclusion_proof: Some(proof_entries),
+            receipt_batch_root_hash: Some(root),
+        };
+        let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+        assert!(
+            result.is_ok(),
+            "leaf {idx} proof from 1000-leaf canonical tree must verify through auth verifier"
+        );
+    }
+}
+
+#[test]
+fn pointer_auth_odd_tree_rightmost_leaf_has_empty_hash_sibling() {
+    // Verify that the rightmost leaf in a 3-leaf tree actually produces an
+    // EMPTY_HASH sibling and still verifies. This is the specific regression
+    // scenario from the Quality BLOCKER.
+    use crate::consensus::merkle::{EMPTY_HASH, MerkleTree};
+    use crate::crypto::EventHasher;
+
+    let leaves: Vec<_> = (0..3u64)
+        .map(|i| EventHasher::hash_content(&i.to_le_bytes()))
+        .collect();
+    let tree = MerkleTree::new(leaves.iter().copied()).unwrap();
+    let root = tree.root();
+
+    // Leaf index 2 is the rightmost in a 3-leaf tree. Its sibling at
+    // level 0 should be EMPTY_HASH (the padding value).
+    let proof = tree.proof_for(2).unwrap();
+    assert!(
+        proof.path.iter().any(|(h, _)| *h == EMPTY_HASH),
+        "rightmost leaf in odd tree must have EMPTY_HASH sibling as padding"
+    );
+    assert!(proof.verify(&root).is_ok());
+
+    let proof_entries: Vec<MerkleProofEntry> = proof
+        .path
+        .iter()
+        .map(|(sibling_hash, is_right)| MerkleProofEntry {
+            sibling_hash: *sibling_hash,
+            sibling_is_left: *is_right,
+        })
+        .collect();
+
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: leaves[2],
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(proof_entries),
+        receipt_batch_root_hash: Some(root),
+    };
+    let result = verify_receipt_authentication(&auth, &SEAL, None, TIME_REF, LEDGER, TICK);
+    assert!(
+        result.is_ok(),
+        "rightmost leaf with EMPTY_HASH padding sibling must verify through auth verifier"
+    );
 }

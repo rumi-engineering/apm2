@@ -31,6 +31,7 @@ use crate::crypto::Hash;
 /// Aligns with the canonical `consensus::merkle::MerkleProof` direction
 /// semantics where `is_left` on the sibling indicates the sibling's position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MerkleProofEntry {
     /// The sibling hash at this level.
     pub sibling_hash: Hash,
@@ -48,6 +49,7 @@ pub struct MerkleProofEntry {
 /// Per RFC-0027 §3.4: all receipts include canonicalizer identification
 /// and content digest for deterministic verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptDigestMeta {
     /// Canonicalizer identifier (e.g., `"apm2.canonicalizer.jcs"`).
     pub canonicalizer_id: String,
@@ -61,7 +63,7 @@ pub struct ReceiptDigestMeta {
 /// Per RFC-0027 §6.5, authoritative acceptance requires one of these
 /// authentication shapes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "auth_type", rename_all = "snake_case")]
+#[serde(tag = "auth_type", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ReceiptAuthentication {
     /// Direct receipt authentication via `authority_seal_hash`.
@@ -94,6 +96,7 @@ pub enum ReceiptAuthentication {
 /// Per RFC-0027 §3.4: missing any required authoritative binding
 /// MUST fail closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthoritativeBindings {
     /// Capability/budget/stop/freshness pinset commitment surface.
     pub episode_envelope_hash: Hash,
@@ -126,6 +129,7 @@ pub struct AuthoritativeBindings {
 ///
 /// Records the creation of an AJC with all binding context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityJoinReceiptV1 {
     /// Digest metadata for verification.
     pub digest_meta: ReceiptDigestMeta,
@@ -162,6 +166,7 @@ pub struct AuthorityJoinReceiptV1 {
 /// Records that the AJC was checked against current authority state
 /// and remains valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityRevalidateReceiptV1 {
     /// Digest metadata for verification.
     pub digest_meta: ReceiptDigestMeta,
@@ -199,6 +204,7 @@ pub struct AuthorityRevalidateReceiptV1 {
 /// Records that the AJC was consumed for a specific effect. This receipt
 /// is the definitive proof that authority was exercised.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityConsumeReceiptV1 {
     /// Digest metadata for verification.
     pub digest_meta: ReceiptDigestMeta,
@@ -239,6 +245,7 @@ pub struct AuthorityConsumeReceiptV1 {
 /// Records the denial with enough context for replay verification
 /// and audit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityDenyReceiptV1 {
     /// Digest metadata for verification.
     pub digest_meta: ReceiptDigestMeta,
