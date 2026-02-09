@@ -63,6 +63,14 @@ pub const MAX_TOTAL_STATES: usize = 4096;
 /// Maximum length of a counterexample trace.
 pub const MAX_COUNTEREXAMPLE_LENGTH: usize = 128;
 
+/// Maximum length of string fields in HSI operations and defect descriptions.
+///
+/// Bounds `HsiOperation::Execute::output_tag`,
+/// `HsiOperation::Escalate::reason`, and `BlockingDefect::description` to
+/// prevent unbounded memory consumption via deserialization or programmatic
+/// construction.
+pub const MAX_STRING_LENGTH: usize = 1024;
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -91,6 +99,17 @@ pub enum BisimulationError {
     /// Invalid composition structure.
     #[error("invalid composition: {0}")]
     InvalidComposition(String),
+
+    /// A string field exceeds the maximum allowed length.
+    #[error("string field '{field}' length {length} exceeds maximum {max}")]
+    StringTooLong {
+        /// The name of the field that is too long.
+        field: String,
+        /// The actual length.
+        length: usize,
+        /// The maximum allowed length.
+        max: usize,
+    },
 
     /// Internal error during bisimulation checking.
     #[error("internal error: {0}")]
@@ -151,6 +170,34 @@ impl fmt::Display for HsiOperation {
             Self::Execute { output_tag } => write!(f, "execute({output_tag})"),
             Self::Escalate { reason } => write!(f, "escalate({reason})"),
             Self::Stop { kind } => write!(f, "stop({kind:?})"),
+        }
+    }
+}
+
+impl HsiOperation {
+    /// Validates that all string fields are within [`MAX_STRING_LENGTH`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BisimulationError::StringTooLong`] on the first field
+    /// that exceeds the limit.
+    pub fn validate_string_lengths(&self) -> Result<(), BisimulationError> {
+        match self {
+            Self::Execute { output_tag } if output_tag.len() > MAX_STRING_LENGTH => {
+                Err(BisimulationError::StringTooLong {
+                    field: "output_tag".to_string(),
+                    length: output_tag.len(),
+                    max: MAX_STRING_LENGTH,
+                })
+            },
+            Self::Escalate { reason } if reason.len() > MAX_STRING_LENGTH => {
+                Err(BisimulationError::StringTooLong {
+                    field: "reason".to_string(),
+                    length: reason.len(),
+                    max: MAX_STRING_LENGTH,
+                })
+            },
+            _ => Ok(()),
         }
     }
 }
@@ -297,6 +344,49 @@ impl ObservableSemantics {
             }
         }
         Ok(())
+    }
+
+    /// Validates post-deserialization invariants on this `ObservableSemantics`.
+    ///
+    /// Because `ObservableSemantics` derives `Deserialize`, an attacker could
+    /// craft a payload that bypasses the runtime checks in [`Self::add_state`]
+    /// and [`Self::add_transition`]. This method enforces the same bounds on deserialized
+    /// (or otherwise externally-constructed) instances:
+    ///
+    /// - Total state count <= [`MAX_TOTAL_STATES`]
+    /// - Transitions per state <= [`MAX_TRANSITIONS_PER_STATE`]
+    /// - All string fields in [`HsiOperation`] labels <= [`MAX_STRING_LENGTH`]
+    /// - Graph integrity (no dangling targets)
+    ///
+    /// # Errors
+    ///
+    /// Returns the first violated invariant as a [`BisimulationError`].
+    pub fn validate(&self) -> Result<(), BisimulationError> {
+        // Bound: total state count
+        if self.states.len() > MAX_TOTAL_STATES {
+            return Err(BisimulationError::StateSpaceExhausted {
+                explored: self.states.len(),
+                max: MAX_TOTAL_STATES,
+            });
+        }
+
+        for (&state_id, transitions) in &self.states {
+            // Bound: transitions per state
+            if transitions.len() > MAX_TRANSITIONS_PER_STATE {
+                return Err(BisimulationError::InvalidComposition(format!(
+                    "state {state_id} has {} transitions, exceeding limit {MAX_TRANSITIONS_PER_STATE}",
+                    transitions.len()
+                )));
+            }
+
+            // Bound: string field lengths in operation labels
+            for tr in transitions {
+                tr.operation.validate_string_lengths()?;
+            }
+        }
+
+        // Integrity: no dangling targets
+        self.validate_graph_integrity()
     }
 }
 
@@ -734,6 +824,25 @@ pub struct BlockingDefect {
     pub description: String,
 }
 
+impl BlockingDefect {
+    /// Validates that the description field is within [`MAX_STRING_LENGTH`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BisimulationError::StringTooLong`] if the description
+    /// exceeds the limit.
+    pub fn validate_description(&self) -> Result<(), BisimulationError> {
+        if self.description.len() > MAX_STRING_LENGTH {
+            return Err(BisimulationError::StringTooLong {
+                field: "description".to_string(),
+                length: self.description.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for BlockingDefect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -822,6 +931,11 @@ impl PromotionGate {
             if depth > self.checker.max_depth() {
                 break;
             }
+
+            // Fail-closed: validate post-deserialization bounds before any
+            // processing. This prevents unbounded state maps, transition
+            // counts, and string lengths from being accepted via serde.
+            semantics.validate()?;
 
             // Fail-closed: enforce that the composition's declared depth
             // matches the expected depth for this position. A caller must
@@ -1855,5 +1969,282 @@ mod tests {
 
         let err = BisimulationError::Internal("oops".to_string());
         assert!(err.to_string().contains("oops"));
+
+        let err = BisimulationError::StringTooLong {
+            field: "output_tag".to_string(),
+            length: 2000,
+            max: 1024,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("output_tag"));
+        assert!(msg.contains("2000"));
+        assert!(msg.contains("1024"));
+    }
+
+    // ====================================================================
+    // Post-deserialization validation tests (security)
+    // ====================================================================
+
+    #[test]
+    fn test_validate_rejects_oversized_state_map() {
+        // Simulate deserialization that bypasses add_state's MAX_TOTAL_STATES
+        // by directly constructing the states map.
+        let mut states = BTreeMap::new();
+        for i in 0..=(MAX_TOTAL_STATES as u64) {
+            states.insert(i, Vec::new());
+        }
+        let semantics: ObservableSemantics = serde_json::from_str(
+            &serde_json::to_string(&ObservableSemantics {
+                states: states.clone(),
+                initial_state: 0,
+                depth: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StateSpaceExhausted { .. }),
+            "Oversized state map must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_transitions_per_state() {
+        // Construct a state with more transitions than MAX_TRANSITIONS_PER_STATE.
+        let mut transitions = Vec::new();
+        for _ in 0..=MAX_TRANSITIONS_PER_STATE {
+            transitions.push(Transition {
+                operation: HsiOperation::Spawn { depth: 0 },
+                target: 0,
+            });
+        }
+        let mut states = BTreeMap::new();
+        states.insert(0, transitions);
+
+        let semantics: ObservableSemantics = serde_json::from_str(
+            &serde_json::to_string(&ObservableSemantics {
+                states,
+                initial_state: 0,
+                depth: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::InvalidComposition(_)),
+            "Oversized transitions must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_output_tag() {
+        let long_tag = "x".repeat(MAX_STRING_LENGTH + 1);
+        let mut semantics = ObservableSemantics::new(0);
+        let s1 = semantics.add_state().unwrap();
+        // Bypass validation by directly constructing via serde round-trip
+        // after adding the transition (add_transition does not check string
+        // lengths, so this simulates deserialized data).
+        semantics
+            .add_transition(
+                0,
+                HsiOperation::Execute {
+                    output_tag: long_tag,
+                },
+                s1,
+            )
+            .unwrap();
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { ref field, .. } if field == "output_tag"),
+            "Oversized output_tag must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_reason() {
+        let long_reason = "r".repeat(MAX_STRING_LENGTH + 1);
+        let mut semantics = ObservableSemantics::new(0);
+        let s1 = semantics.add_state().unwrap();
+        semantics
+            .add_transition(
+                0,
+                HsiOperation::Escalate {
+                    reason: long_reason,
+                },
+                s1,
+            )
+            .unwrap();
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { ref field, .. } if field == "reason"),
+            "Oversized reason must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_passes_for_well_formed_semantics() {
+        let mut semantics = ObservableSemantics::new(1);
+        let s1 = semantics.add_state().unwrap();
+        let s2 = semantics.add_state().unwrap();
+        semantics
+            .add_transition(0, HsiOperation::Spawn { depth: 1 }, s1)
+            .unwrap();
+        semantics
+            .add_transition(
+                s1,
+                HsiOperation::Execute {
+                    output_tag: "ok".to_string(),
+                },
+                s2,
+            )
+            .unwrap();
+
+        assert!(semantics.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_deserialized_oversized_state_map_via_json() {
+        // Construct a JSON payload with MAX_TOTAL_STATES+1 states,
+        // deserialize it, and confirm validate() rejects it.
+        use std::fmt::Write as _;
+
+        let state_count = MAX_TOTAL_STATES + 1;
+        let mut states_json = String::from("{");
+        for i in 0..state_count {
+            if i > 0 {
+                states_json.push(',');
+            }
+            write!(states_json, "\"{i}\":[]").unwrap();
+        }
+        states_json.push('}');
+
+        let json = format!(r#"{{"states":{states_json},"initial_state":0,"depth":0}}"#,);
+
+        let semantics: ObservableSemantics = serde_json::from_str(&json).unwrap();
+        assert_eq!(semantics.state_count(), state_count);
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StateSpaceExhausted { .. }),
+            "Deserialized oversized state map must fail validation: {err}"
+        );
+    }
+
+    #[test]
+    fn test_promotion_gate_rejects_oversized_deserialized_semantics() {
+        // End-to-end: PromotionGate::evaluate must reject compositions
+        // with oversized string fields via validate() before processing.
+        let gate = PromotionGate::new(1).unwrap();
+
+        let long_tag = "x".repeat(MAX_STRING_LENGTH + 1);
+        let mut semantics = ObservableSemantics::new(1);
+        let s1 = semantics.add_state().unwrap();
+        semantics
+            .add_transition(
+                0,
+                HsiOperation::Execute {
+                    output_tag: long_tag,
+                },
+                s1,
+            )
+            .unwrap();
+
+        let result = gate.evaluate(&[semantics]);
+        assert!(result.is_err(), "Gate must reject oversized string fields");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { .. }),
+            "Error must be StringTooLong: {err}"
+        );
+    }
+
+    #[test]
+    fn test_blocking_defect_validate_description() {
+        let defect = BlockingDefect {
+            depth: 1,
+            counterexample: Vec::new(),
+            description: "short".to_string(),
+        };
+        assert!(defect.validate_description().is_ok());
+
+        let long_defect = BlockingDefect {
+            depth: 1,
+            counterexample: Vec::new(),
+            description: "d".repeat(MAX_STRING_LENGTH + 1),
+        };
+        let err = long_defect.validate_description().unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { ref field, .. } if field == "description"),
+            "Oversized description must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_hsi_operation_validate_string_lengths() {
+        // Spawn and Stop have no string fields — always valid
+        assert!(
+            HsiOperation::Spawn { depth: 0 }
+                .validate_string_lengths()
+                .is_ok()
+        );
+        assert!(
+            HsiOperation::Stop {
+                kind: StopKind::GoalSatisfied
+            }
+            .validate_string_lengths()
+            .is_ok()
+        );
+
+        // Short strings — valid
+        assert!(
+            HsiOperation::Execute {
+                output_tag: "ok".to_string()
+            }
+            .validate_string_lengths()
+            .is_ok()
+        );
+        assert!(
+            HsiOperation::Escalate {
+                reason: "ok".to_string()
+            }
+            .validate_string_lengths()
+            .is_ok()
+        );
+
+        // Exactly at limit — valid
+        let at_limit = "a".repeat(MAX_STRING_LENGTH);
+        assert!(
+            HsiOperation::Execute {
+                output_tag: at_limit.clone()
+            }
+            .validate_string_lengths()
+            .is_ok()
+        );
+        assert!(
+            HsiOperation::Escalate { reason: at_limit }
+                .validate_string_lengths()
+                .is_ok()
+        );
+
+        // Over limit — invalid
+        let over_limit = "a".repeat(MAX_STRING_LENGTH + 1);
+        assert!(
+            HsiOperation::Execute {
+                output_tag: over_limit.clone()
+            }
+            .validate_string_lengths()
+            .is_err()
+        );
+        assert!(
+            HsiOperation::Escalate { reason: over_limit }
+                .validate_string_lengths()
+                .is_err()
+        );
     }
 }
