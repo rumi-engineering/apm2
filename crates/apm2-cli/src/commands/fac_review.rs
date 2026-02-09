@@ -1856,6 +1856,15 @@ fn projection_state_for_type(
     review_kind: ReviewKind,
     head_filter: Option<&str>,
 ) -> String {
+    let mut latest_entry_for_kind = state
+        .reviewers
+        .values()
+        .filter(|entry| entry_pr_number(entry).is_some_and(|number| number == pr_number))
+        .filter(|entry| entry.review_type.eq_ignore_ascii_case(review_kind.as_str()))
+        .filter(|entry| head_filter.is_none_or(|head| entry.head_sha.eq_ignore_ascii_case(head)))
+        .collect::<Vec<_>>();
+    latest_entry_for_kind.sort_by_key(|entry| entry.started_at);
+
     let mut active_entries = state
         .reviewers
         .values()
@@ -1950,6 +1959,17 @@ fn projection_state_for_type(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("run_crash");
         return format!("failed:{reason}");
+    }
+
+    let has_current_activity = !events_for_kind.is_empty();
+
+    // Fail closed only after current-run activity is observed for this review
+    // type. This avoids false failures from stale entries left by prior runs
+    // before the new dispatch emits its first event in the current window.
+    if let Some(stale) = latest_entry_for_kind.last() {
+        if has_current_activity && !is_process_alive(stale.pid) {
+            return "failed:stale_process_state".to_string();
+        }
     }
 
     "none".to_string()
@@ -4156,6 +4176,16 @@ fn is_process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    fn dead_pid_for_test() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .args(["-lc", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
     #[test]
     fn test_select_review_model_random_returns_pool_member() {
         let models = MODEL_POOL
@@ -4570,6 +4600,80 @@ mod tests {
 
         let rendered = projection_state_for_type(&state, &events, 17, ReviewKind::Quality, None);
         assert_eq!(rendered, "failed:comment_post_permission_denied");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_stale_without_current_events_is_none() {
+        let dead_pid = dead_pid_for_test();
+        let mut state = ReviewStateFile::default();
+        state.reviewers.insert(
+            "stale-security".to_string(),
+            ReviewStateEntry {
+                pid: dead_pid,
+                started_at: Utc::now(),
+                log_file: PathBuf::from("/tmp/stale.log"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "security".to_string(),
+                pr_number: 42,
+                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                head_sha: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+                restart_count: 0,
+                model: default_model(),
+                backend: ReviewBackend::Codex,
+                temp_files: Vec::new(),
+            },
+        );
+        let events = Vec::<serde_json::Value>::new();
+
+        let rendered = projection_state_for_type(
+            &state,
+            &events,
+            42,
+            ReviewKind::Security,
+            Some("abcdef1234567890abcdef1234567890abcdef12"),
+        );
+        assert_eq!(rendered, "none");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_stale_with_current_events_is_failed() {
+        let dead_pid = dead_pid_for_test();
+        let mut state = ReviewStateFile::default();
+        state.reviewers.insert(
+            "stale-quality".to_string(),
+            ReviewStateEntry {
+                pid: dead_pid,
+                started_at: Utc::now(),
+                log_file: PathBuf::from("/tmp/stale.log"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "quality".to_string(),
+                pr_number: 17,
+                pr_url: "https://github.com/owner/repo/pull/17".to_string(),
+                head_sha: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+                restart_count: 0,
+                model: default_model(),
+                backend: ReviewBackend::Codex,
+                temp_files: Vec::new(),
+            },
+        );
+        let events = vec![serde_json::json!({
+            "event": "run_start",
+            "review_type": "quality",
+            "pr_number": 17,
+            "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+            "seq": 1
+        })];
+
+        let rendered = projection_state_for_type(
+            &state,
+            &events,
+            17,
+            ReviewKind::Quality,
+            Some("abcdef1234567890abcdef1234567890abcdef12"),
+        );
+        assert_eq!(rendered, "failed:stale_process_state");
     }
 
     #[test]
