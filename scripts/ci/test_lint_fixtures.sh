@@ -197,7 +197,7 @@ else
 fi
 
 # Test 2d-iii: CODE_QUALITY line without security-review-exec -> MUST PASS (no violation)
-if detect_cross_category_exec "cargo xtask review --pr 123 --type code-quality" "CODE_QUALITY_PROMPT.md"; then
+if detect_cross_category_exec "apm2 fac review --pr 123 --type code-quality" "CODE_QUALITY_PROMPT.md"; then
     log_fail "Cross-category exec false positive on CODE_QUALITY line without security-review-exec"
 else
     log_pass "Cross-category exec correctly permits CODE_QUALITY line without security-review-exec"
