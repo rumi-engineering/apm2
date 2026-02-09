@@ -22,17 +22,24 @@ decision_tree:
           action: "Read the context files listed above and note global constraints."
         - id: NOTE_ARGUMENT_SUBSTITUTION
           action: "If this runner does not interpolate $1 in references, replace $1 manually with the ticket ID or omit it to auto-select the next unblocked ticket."
-        - id: START_TICKET
+        - id: FIND_WORKTREE
           action: command
-          run: "cargo xtask start-ticket $1"
-          capture_as: start_ticket_output
-        - id: ENTER_WORKTREE
-          action: command
-          run: "cd \"$(cargo xtask start-ticket $1 --print-path)\""
+          run: "git worktree list | grep $1"
+          capture_as: worktree_match
+        - id: CREATE_OR_ENTER_WORKTREE
+          action: |
+            If worktree_match is non-empty, extract the path and cd into it.
+            If worktree_match is empty, create a new worktree:
+              git worktree add /home/ubuntu/Projects/apm2-$1 -b ticket/<RFC_ID>/$1
+            Then cd into the worktree path.
           capture_as: worktree_path
+        - id: READ_TICKET_YAML
+          action: command
+          run: "cat documents/work/tickets/$1.yaml"
+          capture_as: ticket_yaml
         - id: EXTRACT_CONTEXT
           action: parse_text
-          from: start_ticket_output
+          from: ticket_yaml
           extract[4]:
             - TICKET_ID
             - RFC_ID

@@ -220,15 +220,15 @@ fn escape_path_for_glob(path: &Path) -> String {
 /// Discovers all source files in the repository.
 ///
 /// Searches for `*.rs`, `*.yaml`, `*.yml`, and `*.md` files in the `crates/`
-/// and `xtask/` directories, and `*.rs` files in the `fuzz/` directory.
+/// directory, and `*.rs` files in the `fuzz/` directory.
 /// Returns paths sorted alphabetically for determinism.
 fn discover_source_files(repo_root: &Path) -> Result<Vec<PathBuf>, CcpIndexError> {
     let mut paths = Vec::new();
     let escaped_root = escape_path_for_glob(repo_root);
 
-    // File extensions to scan in crates/ and xtask/
+    // File extensions to scan in crates/
     let extensions = ["rs", "yaml", "yml", "md"];
-    let directories = ["crates", "xtask"];
+    let directories = ["crates"];
 
     for dir in &directories {
         for ext in &extensions {

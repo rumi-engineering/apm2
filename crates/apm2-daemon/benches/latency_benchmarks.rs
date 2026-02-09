@@ -74,6 +74,7 @@ fn create_tool_request(request_id: &str, episode_id: &EpisodeId) -> BrokerToolRe
         query: None,
         artifact_hash: None,
         risk_tier: RiskTier::Tier2,
+        tool_kind: None,
     }
 }
 

@@ -9,7 +9,6 @@ decision_tree:
         - path: documents/README.md
         - path: documents/skills/README.md
         - path: documents/skills/ticket/SKILL.md
-        - path: xtask/src/reviewer_state.rs
       steps[6]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "Replace $1 with <TARGET_RFC>."
