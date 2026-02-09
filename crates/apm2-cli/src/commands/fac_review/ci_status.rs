@@ -3,6 +3,24 @@
 //! Projects all CI gate results to a single machine-readable YAML PR comment
 //! with marker `apm2-ci-status:v1`. The comment is created once per SHA and
 //! updated in-place as gates complete.
+//!
+//! # Security boundary
+//!
+//! PR comments are **publicly visible**. Only the following fields are
+//! projected:
+//!
+//! - `sha`: commit hash (already public)
+//! - `pr`: PR number (already public)
+//! - `updated_at`: ISO-8601 timestamp
+//! - `gates.<name>.status`: `RUNNING` / `PASS` / `FAIL`
+//! - `gates.<name>.duration_secs`: wall time in seconds
+//! - `gates.<name>.tokens_used`: LLM token count (optional)
+//! - `gates.<name>.model`: model identifier (optional)
+//!
+//! **Never** include: local file paths, error output, environment variables,
+//! compilation diagnostics, or any runner-local data. All such detail is
+//! written to private logs under `~/.apm2/` and surfaced via
+//! `apm2 fac logs --pr <N>`.
 
 use std::collections::BTreeMap;
 use std::process::Command;

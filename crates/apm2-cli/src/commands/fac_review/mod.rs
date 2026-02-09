@@ -17,6 +17,7 @@ mod dispatch;
 mod events;
 mod evidence;
 mod liveness;
+mod logs;
 mod model_pool;
 mod orchestrator;
 mod pipeline;
@@ -432,6 +433,10 @@ pub fn run_restart(
 
 pub fn run_pipeline(repo: &str, pr_url: &str, pr_number: u32, sha: &str) -> u8 {
     pipeline::run_pipeline(repo, pr_url, pr_number, sha)
+}
+
+pub fn run_logs(pr_number: Option<u32>, json_output: bool) -> u8 {
+    logs::run_logs(pr_number, json_output)
 }
 
 // ── Internal dispatch helper (shared with pipeline/restart) ─────────────────

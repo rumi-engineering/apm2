@@ -182,6 +182,12 @@ pub enum FacSubcommand {
     /// whether to re-run evidence gates, dispatch reviews, or both.
     Restart(RestartArgs),
 
+    /// Show local pipeline, evidence, and review log paths.
+    ///
+    /// Lists all FAC log files under `~/.apm2/` with sizes.
+    /// Use `--pr <N>` to filter to a specific pull request.
+    Logs(LogsArgs),
+
     /// Internal: background evidence+review pipeline (hidden from help).
     #[command(hide = true)]
     Pipeline(PipelineArgs),
@@ -434,6 +440,14 @@ pub struct RestartArgs {
     /// Restart everything regardless of current CI state.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+}
+
+/// Arguments for `apm2 fac logs`.
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// Filter logs to a specific pull request number.
+    #[arg(long)]
+    pub pr: Option<u32>,
 }
 
 /// Arguments for `apm2 fac pipeline` (hidden, internal).
@@ -784,6 +798,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             args.force,
             json_output,
         ),
+        FacSubcommand::Logs(args) => fac_review::run_logs(args.pr, json_output),
         FacSubcommand::Pipeline(args) => {
             fac_review::run_pipeline(&args.repo, &args.pr_url, args.pr, &args.sha)
         },
