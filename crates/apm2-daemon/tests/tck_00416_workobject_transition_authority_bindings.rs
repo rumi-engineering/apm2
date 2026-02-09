@@ -660,6 +660,7 @@ fn test_derive_claim_bindings_matches_manual() {
         },
         executor_custody_domains: vec![],
         author_custody_domains: vec![],
+        permeability_receipt: None,
     };
 
     let claim_bindings =
@@ -1130,6 +1131,7 @@ fn test_emit_work_claimed_includes_authority_fields() {
         },
         executor_custody_domains: vec![],
         author_custody_domains: vec![],
+        permeability_receipt: None,
     };
 
     let emitter = StubLedgerEventEmitter::new();
