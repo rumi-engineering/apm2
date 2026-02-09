@@ -768,7 +768,15 @@ use crate::session::{SessionRegistry, SessionRegistryError, SessionState, Sessio
 ///
 /// Per CTR-1303: In-memory stores must have `max_entries` limit to prevent
 /// denial-of-service via memory exhaustion.
+///
+/// Test binaries use a smaller cap to keep capacity/eviction coverage while
+/// avoiding 10k-iteration loops in unit-test execution.
+#[cfg(not(test))]
 pub const MAX_SESSIONS: usize = 10_000;
+/// Unit-test capacity override used to keep eviction tests fast while
+/// exercising the same bounded-capacity behavior.
+#[cfg(test)]
+pub const MAX_SESSIONS: usize = 128;
 
 /// Maximum number of terminated session entries retained (TCK-00385).
 ///
@@ -776,7 +784,15 @@ pub const MAX_SESSIONS: usize = 10_000;
 /// prevent unbounded memory growth under high session churn. When this
 /// limit is reached, the oldest entries (by `terminated_at` timestamp)
 /// are evicted to make room.
+///
+/// Test binaries use a smaller cap to keep retention/eviction behavior covered
+/// without long churn loops.
+#[cfg(not(test))]
 pub const MAX_TERMINATED_SESSIONS: usize = 10_000;
+/// Unit-test retention override used to keep termination-churn tests fast
+/// while preserving bounded-retention semantics.
+#[cfg(test)]
+pub const MAX_TERMINATED_SESSIONS: usize = 256;
 
 /// TTL for terminated session entries in seconds (TCK-00385).
 ///

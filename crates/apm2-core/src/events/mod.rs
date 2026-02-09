@@ -85,6 +85,7 @@ mod generated {
     include!("apm2.kernel.v1.rs");
 }
 
+pub mod alias_reconcile;
 mod canonical;
 pub mod ci;
 pub mod validation;
