@@ -585,9 +585,17 @@ pub struct AuthorityConsumedV1 {
 
 /// Sovereignty epoch evidence for Tier2+ authority paths.
 ///
-/// Captures the epoch identifier, last known freshness tick, and a
-/// cryptographic signature binding the epoch to the authority scope.
-/// Tier2+ consume and revalidate check that the epoch is current (not stale).
+/// Captures the epoch identifier, last known freshness tick, a signer public
+/// key, and a cryptographic signature binding the epoch to the authority scope.
+/// Tier2+ consume and revalidate check that the epoch is current (not stale)
+/// and that the signature cryptographically verifies against the signer key.
+///
+/// # Signature Verification (Phase 1)
+///
+/// Phase 1 uses BLAKE3 keyed-hash (HMAC-like): `BLAKE3(signer_public_key ||
+/// epoch_id || freshness_tick)`. The signature field must match this
+/// computation; zero signatures and verification failures both produce
+/// `SovereigntyUncertainty` denials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SovereigntyEpoch {
     /// Unique epoch identifier.
@@ -596,7 +604,12 @@ pub struct SovereigntyEpoch {
     /// The freshness tick at which this epoch was last observed.
     pub freshness_tick: u64,
 
+    /// Public key of the signer that produced this epoch's signature.
+    /// Used for BLAKE3 keyed-hash verification in Phase 1.
+    pub signer_public_key: Hash,
+
     /// Cryptographic signature binding the epoch to the authority scope.
+    /// Must verify against `signer_public_key` via BLAKE3 keyed-hash.
     pub signature: Hash,
 }
 

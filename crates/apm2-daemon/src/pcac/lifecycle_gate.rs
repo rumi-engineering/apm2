@@ -90,38 +90,74 @@ impl InProcessKernel {
     ///
     /// Per RFC-0027 §3.1, the join hash commits to ALL required fields:
     /// session, intent, capabilities, scope witnesses, identity, freshness,
-    /// stop/budget, risk tier, and time/ledger anchors. Omitting any field
-    /// would allow an attacker to produce colliding join hashes for
-    /// semantically distinct authority requests.
+    /// stop/budget, risk tier, determinism class, identity evidence level,
+    /// and time/ledger anchors. Omitting any field would allow an attacker
+    /// to produce colliding join hashes for semantically distinct authority
+    /// requests.
+    ///
+    /// # Framing
+    ///
+    /// All variable-length fields are prefixed with `(len as
+    /// u64).to_le_bytes()` to prevent concatenation ambiguity attacks. Vec
+    /// fields additionally include a count prefix.
     fn compute_join_hash(input: &AuthorityJoinInputV1) -> Hash {
+        use apm2_core::pcac::{DeterminismClass, IdentityEvidenceLevel};
         use blake3::Hasher;
         let mut hasher = Hasher::new();
-        // Subject bindings
-        hasher.update(input.session_id.as_bytes());
-        if let Some(ref holon_id) = input.holon_id {
-            hasher.update(b"holon:");
-            hasher.update(holon_id.as_bytes());
+
+        // Helper: length-prefixed variable-length field.
+        let update_var = |h: &mut Hasher, data: &[u8]| {
+            h.update(&(data.len() as u64).to_le_bytes());
+            h.update(data);
+        };
+
+        // Subject bindings (length-prefixed strings)
+        update_var(&mut hasher, input.session_id.as_bytes());
+        match input.holon_id {
+            Some(ref holon_id) => {
+                hasher.update(&[1u8]); // present marker
+                update_var(&mut hasher, holon_id.as_bytes());
+            },
+            None => {
+                hasher.update(&[0u8]); // absent marker
+            },
         }
-        // Intent binding
+        // Intent binding (fixed-length hash, no prefix needed)
         hasher.update(&input.intent_digest);
         // Capability bindings
         hasher.update(&input.capability_manifest_hash);
+        // Scope witnesses: count prefix + each hash
+        hasher.update(&(input.scope_witness_hashes.len() as u64).to_le_bytes());
         for scope_hash in &input.scope_witness_hashes {
             hasher.update(scope_hash);
         }
-        // Delegation bindings
-        hasher.update(input.lease_id.as_bytes());
-        if let Some(ref perm_hash) = input.permeability_receipt_hash {
-            hasher.update(perm_hash);
+        // Delegation bindings (length-prefixed strings)
+        update_var(&mut hasher, input.lease_id.as_bytes());
+        match input.permeability_receipt_hash {
+            Some(ref perm_hash) => {
+                hasher.update(&[1u8]);
+                hasher.update(perm_hash);
+            },
+            None => {
+                hasher.update(&[0u8]);
+            },
         }
         // Identity bindings
         hasher.update(&input.identity_proof_hash);
+        // MAJOR 2 FIX: Include identity_evidence_level in hash.
+        hasher.update(&[match input.identity_evidence_level {
+            IdentityEvidenceLevel::Verified => 0u8,
+            IdentityEvidenceLevel::PointerOnly => 1u8,
+            _ => u8::MAX, // fail-closed: unknown levels
+        }]);
         // Freshness bindings
         hasher.update(&input.directory_head_hash);
         hasher.update(&input.freshness_policy_hash);
         hasher.update(&input.freshness_witness_tick.to_le_bytes());
         // Stop/budget bindings
         hasher.update(&input.stop_budget_profile_digest);
+        // Pre-actuation receipts: count prefix + each hash
+        hasher.update(&(input.pre_actuation_receipt_hashes.len() as u64).to_le_bytes());
         for receipt_hash in &input.pre_actuation_receipt_hashes {
             hasher.update(receipt_hash);
         }
@@ -131,6 +167,12 @@ impl InProcessKernel {
             RiskTier::Tier1 => 1u8,
             RiskTier::Tier2Plus => 2u8,
             _ => u8::MAX, // fail-closed: unknown tiers get maximum ordinal
+        }]);
+        // MAJOR 2 FIX: Include determinism_class in hash.
+        hasher.update(&[match input.determinism_class {
+            DeterminismClass::Deterministic => 0u8,
+            DeterminismClass::BoundedNondeterministic => 1u8,
+            _ => u8::MAX, // fail-closed: unknown classes
         }]);
         // Time/ledger anchors
         hasher.update(&input.time_envelope_ref);
@@ -274,6 +316,20 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
+        // MAJOR 3 FIX: LedgerAnchorDrift check — if the current ledger
+        // anchor has advanced beyond the AJC's `as_of_ledger_anchor`, the
+        // authority is stale. This enforces the trait contract documented in
+        // kernel.rs.
+        if current_ledger_anchor != cert.as_of_ledger_anchor {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::LedgerAnchorDrift,
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: tick,
+            }));
+        }
+
         Ok(())
     }
 
@@ -284,6 +340,22 @@ impl AuthorityJoinKernel for InProcessKernel {
         current_time_envelope_ref: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         let tick = self.current_tick();
+
+        // MAJOR 3 FIX: Certificate expiry check in consume — the trait
+        // contract documents this as a required check, and time can advance
+        // between revalidate and consume.
+        if tick > cert.expires_at_tick {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::CertificateExpired {
+                    expired_at: cert.expires_at_tick,
+                    current_tick: tick,
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: tick,
+            }));
+        }
 
         // Law 2: Intent digest equality.
         if intent_digest != cert.intent_digest {
@@ -379,6 +451,12 @@ pub struct LifecycleGate {
 }
 
 impl LifecycleGate {
+    /// Returns `true` if the certificate's risk tier requires sovereignty
+    /// checks.
+    const fn requires_sovereignty_check(cert: &AuthorityJoinCertificateV1) -> bool {
+        matches!(cert.risk_tier, RiskTier::Tier2Plus)
+    }
+
     /// Creates a new lifecycle gate with the given kernel.
     #[must_use]
     pub fn new(kernel: Arc<dyn AuthorityJoinKernel>) -> Self {
@@ -482,31 +560,77 @@ impl LifecycleGate {
         )?;
 
         // Stage 2b (TCK-00427): Sovereignty revalidation for Tier2+.
-        if let (Some(checker), Some(state)) = (&self.sovereignty_checker, sovereignty_state) {
-            checker.check_revalidate(
-                &cert,
-                state,
-                current_tick,
-                current_time_envelope_ref,
-                current_ledger_anchor,
-            )?;
+        // BLOCKER 1 FIX: Fail-closed when checker is configured but state
+        // is absent for a Tier2+ operation. Previously the `if let` conjunction
+        // silently skipped the check.
+        if Self::requires_sovereignty_check(&cert) {
+            match (&self.sovereignty_checker, sovereignty_state) {
+                (Some(checker), Some(state)) => {
+                    checker.check_revalidate(
+                        &cert,
+                        state,
+                        current_tick,
+                        current_time_envelope_ref,
+                        current_ledger_anchor,
+                    )?;
+                },
+                (Some(_), None) => {
+                    return Err(Box::new(AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                            reason: "sovereignty state not available for Tier2+ revalidation"
+                                .to_string(),
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: current_ledger_anchor,
+                        denied_at_tick: current_tick,
+                    }));
+                },
+                (None, _) => {
+                    // No sovereignty checker configured — sovereignty checks
+                    // are not enforced (Phase 1 opt-in).
+                },
+            }
+        }
+
+        // Stage 3b (TCK-00427): Sovereignty consume checks for Tier2+.
+        // BLOCKER 2 FIX: This check is performed BEFORE kernel.consume() to
+        // prevent irrevocable consume-set mutation before sovereignty
+        // validation passes.
+        if Self::requires_sovereignty_check(&cert) {
+            match (&self.sovereignty_checker, sovereignty_state) {
+                (Some(checker), Some(state)) => {
+                    checker.check_consume(
+                        &cert,
+                        state,
+                        current_tick,
+                        current_time_envelope_ref,
+                        current_ledger_anchor,
+                    )?;
+                },
+                (Some(_), None) => {
+                    return Err(Box::new(AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                            reason: "sovereignty state not available for Tier2+ consume"
+                                .to_string(),
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: current_ledger_anchor,
+                        denied_at_tick: current_tick,
+                    }));
+                },
+                (None, _) => {},
+            }
         }
 
         // Stage 3: Consume — single-use consumption with intent equality.
+        // BLOCKER 2 FIX: kernel.consume() is now called AFTER sovereignty
+        // checks, preventing irrevocable consume-set mutation before
+        // all admission checks pass.
         let (consumed_witness, consume_record) =
             self.kernel
                 .consume(&cert, input.intent_digest, current_time_envelope_ref)?;
-
-        // Stage 3b (TCK-00427): Sovereignty consume checks for Tier2+.
-        if let (Some(checker), Some(state)) = (&self.sovereignty_checker, sovereignty_state) {
-            checker.check_consume(
-                &cert,
-                state,
-                current_tick,
-                current_time_envelope_ref,
-                current_ledger_anchor,
-            )?;
-        }
 
         Ok(LifecycleReceipts {
             certificate: cert,

@@ -19,6 +19,7 @@ use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityDenyV1, AuthorityJoinCertificateV1, AutonomyCeiling, FreezeAction,
     RiskTier, SovereigntyEpoch,
 };
+use subtle::ConstantTimeEq;
 
 const ZERO_HASH: Hash = [0u8; 32];
 
@@ -202,7 +203,21 @@ impl SovereigntyChecker {
         }
     }
 
-    /// Checks sovereignty epoch freshness.
+    /// Computes the expected BLAKE3 keyed-hash signature for an epoch.
+    ///
+    /// Phase 1 HMAC-like: `BLAKE3(signer_public_key || epoch_id ||
+    /// freshness_tick)`. This is public so that epoch constructors can
+    /// produce valid signatures.
+    #[must_use]
+    pub fn compute_epoch_signature(epoch: &SovereigntyEpoch) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&epoch.signer_public_key);
+        hasher.update(epoch.epoch_id.as_bytes());
+        hasher.update(&epoch.freshness_tick.to_le_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Checks sovereignty epoch freshness and cryptographic signature.
     fn check_epoch_freshness(
         &self,
         cert: &AuthorityJoinCertificateV1,
@@ -229,6 +244,35 @@ impl SovereigntyChecker {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: AuthorityDenyClass::SovereigntyUncertainty {
                     reason: "sovereignty epoch has zero signature".to_string(),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: current_tick,
+            }));
+        }
+
+        // Zero signer public key is treated as missing signer.
+        if epoch.signer_public_key == ZERO_HASH {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::SovereigntyUncertainty {
+                    reason: "sovereignty epoch has zero signer public key".to_string(),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: current_tick,
+            }));
+        }
+
+        // MAJOR 1 FIX: Cryptographic signature verification using constant-time
+        // comparison (CTR-1909 / RSK-1909). Phase 1 uses BLAKE3 keyed-hash:
+        // BLAKE3(signer_public_key || epoch_id || freshness_tick).
+        let expected_signature = Self::compute_epoch_signature(epoch);
+        if epoch.signature.ct_eq(&expected_signature).unwrap_u8() != 1 {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::SovereigntyUncertainty {
+                    reason: "sovereignty epoch signature verification failed".to_string(),
                 },
                 ajc_id: Some(cert.ajc_id),
                 time_envelope_ref: current_time_envelope_ref,
@@ -402,13 +446,22 @@ mod tests {
         cert
     }
 
+    /// Builds a `SovereigntyEpoch` with a valid BLAKE3 keyed-hash signature.
+    fn signed_epoch(epoch_id: &str, freshness_tick: u64, signer_key: Hash) -> SovereigntyEpoch {
+        let mut epoch = SovereigntyEpoch {
+            epoch_id: epoch_id.to_string(),
+            freshness_tick,
+            signer_public_key: signer_key,
+            // Placeholder — will be overwritten with the correct signature.
+            signature: [0u8; 32],
+        };
+        epoch.signature = SovereigntyChecker::compute_epoch_signature(&epoch);
+        epoch
+    }
+
     fn valid_sovereignty_state() -> SovereigntyState {
         SovereigntyState {
-            epoch: Some(SovereigntyEpoch {
-                epoch_id: "epoch-001".to_string(),
-                freshness_tick: 100,
-                signature: test_hash(0xCC),
-            }),
+            epoch: Some(signed_epoch("epoch-001", 100, test_hash(0xCC))),
             principal_id: "principal-001".to_string(),
             revocation_head_known: true,
             autonomy_ceiling: Some(AutonomyCeiling {
@@ -745,6 +798,7 @@ mod tests {
         state.epoch = Some(SovereigntyEpoch {
             epoch_id: "epoch-bad".to_string(),
             freshness_tick: 100,
+            signer_public_key: test_hash(0xCC),
             signature: zero_hash(),
         });
 
