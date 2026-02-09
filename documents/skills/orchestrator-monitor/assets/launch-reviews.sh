@@ -153,9 +153,9 @@ if command -v codex >/dev/null 2>&1; then
 fi
 
 if command -v gemini >/dev/null 2>&1; then
-  gemini -m gemini-2.5-flash -y -o stream-json -p "$(cat "$SEC_PROMPT")" &
+  gemini -m gemini-3.0-flash-preview -y -o stream-json -p "$(cat "$SEC_PROMPT")" &
   sec_pid=$!
-  gemini -m gemini-2.5-flash -y -o stream-json -p "$(cat "$QUAL_PROMPT")" &
+  gemini -m gemini-3.0-flash-preview -y -o stream-json -p "$(cat "$QUAL_PROMPT")" &
   qual_pid=$!
   wait "$sec_pid"
   wait "$qual_pid"

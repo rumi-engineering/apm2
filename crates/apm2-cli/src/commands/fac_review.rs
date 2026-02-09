@@ -320,11 +320,11 @@ struct PostedReview {
 
 const MODEL_POOL: [ModelPoolEntry; 3] = [
     ModelPoolEntry {
-        model: "gemini-2.5-flash",
+        model: "gemini-3.0-flash-preview",
         backend: ReviewBackend::Gemini,
     },
     ModelPoolEntry {
-        model: "gemini-2.5-pro",
+        model: "gemini-3.0-pro-preview",
         backend: ReviewBackend::Gemini,
     },
     ModelPoolEntry {
@@ -3967,17 +3967,17 @@ mod tests {
 
     #[test]
     fn test_select_fallback_model_cycles() {
-        let next =
-            select_fallback_model("gemini-2.5-flash").expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-2.5-pro");
+        let next = select_fallback_model("gemini-3.0-flash-preview")
+            .expect("known model should produce fallback");
+        assert_eq!(next.model, "gemini-3.0-pro-preview");
 
-        let next =
-            select_fallback_model("gemini-2.5-pro").expect("known model should produce fallback");
+        let next = select_fallback_model("gemini-3.0-pro-preview")
+            .expect("known model should produce fallback");
         assert_eq!(next.model, "gpt-5.3-codex");
 
         let next =
             select_fallback_model("gpt-5.3-codex").expect("known model should produce fallback");
-        assert_eq!(next.model, "gemini-2.5-flash");
+        assert_eq!(next.model, "gemini-3.0-flash-preview");
     }
 
     #[test]
@@ -4027,7 +4027,7 @@ mod tests {
     fn test_build_gemini_script_command_syntax() {
         let prompt = Path::new("/tmp/prompt.md");
         let log = Path::new("/tmp/review.log");
-        let cmd = build_gemini_script_command(prompt, log, "gemini-2.5-flash");
+        let cmd = build_gemini_script_command(prompt, log, "gemini-3.0-flash-preview");
         assert!(cmd.contains("script -q"));
         assert!(cmd.contains("gemini -m"));
         assert!(cmd.contains("-o stream-json"));
@@ -4054,7 +4054,7 @@ mod tests {
             ReviewBackend::Gemini,
             prompt,
             log,
-            "gemini-2.5-flash",
+            "gemini-3.0-flash-preview",
             None,
         );
         assert!(gemini.contains("gemini -m"));

@@ -6,8 +6,10 @@ notes:
   - "NOTE_VARIABLE_SUBSTITUTION: references do not interpolate variables. Replace <...> placeholders before running commands."
   - "All commands that can hang should use timeout wrappers."
   - "Commands labeled side_effect=true modify external state."
+  - "Prefer FAC-native `apm2 fac review ...` commands for reviewer lifecycle state and retrigger operations."
+  - "Use direct `gh` commands only for surfaces that FAC does not yet expose (for example full review comment bodies)."
 
-commands[17]:
+commands[20]:
   - name: resolve_repo_root
     command: "timeout 10s git rev-parse --show-toplevel"
     purpose: "Discover repository root for asset invocation."
@@ -23,6 +25,11 @@ commands[17]:
     purpose: "Discover open PR scope when user did not supply PR numbers."
     side_effect: false
 
+  - name: fac_review_status
+    command: "timeout 30s apm2 fac review status --pr <PR_NUMBER>"
+    purpose: "Primary FAC-native lifecycle snapshot for reviewer state/events on one PR."
+    side_effect: false
+
   - name: poll_dashboard
     command: "timeout 90s bash <ROOT>/documents/skills/orchestrator-monitor/assets/poll-status.sh <PRS...>"
     purpose: "Generate human-readable status dashboard snapshot."
@@ -30,12 +37,17 @@ commands[17]:
 
   - name: pr_state_json
     command: "timeout 30s gh pr view <PR_NUMBER> --repo guardian-intelligence/apm2 --json state,mergeable,headRefOid,isDraft,statusCheckRollup"
-    purpose: "Fetch machine-readable PR state and CI rollup."
+    purpose: "Fetch PR metadata (mergeable/state/head SHA) that is not yet emitted by FAC review projection."
+    side_effect: false
+
+  - name: fac_review_project
+    command: "timeout 30s apm2 fac review project --pr <PR_NUMBER> --head-sha <HEAD_SHA> --emit-errors"
+    purpose: "Primary 1Hz FAC projection line with reviewer lifecycle states and terminal error hints."
     side_effect: false
 
   - name: commit_statuses
     command: "timeout 30s gh api repos/guardian-intelligence/apm2/commits/<HEAD_SHA>/status"
-    purpose: "Fetch Forge Admission Cycle status context for exact HEAD SHA binding."
+    purpose: "Fallback cross-check of projected status contexts on GitHub for exact HEAD SHA binding."
     side_effect: false
 
   - name: retrigger_fac_via_apm2
@@ -50,12 +62,17 @@ commands[17]:
 
   - name: retrigger_review_stream
     command: "timeout 30s gh workflow run forge-admission-cycle.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
-    purpose: "Manual recovery path: retrigger Forge Admission Cycle for current PR head SHA."
+    purpose: "Fallback-only recovery path when `apm2 fac review retrigger` is unavailable."
     side_effect: true
 
   - name: check_review_progress
     command: "timeout 30s bash <ROOT>/documents/skills/orchestrator-monitor/assets/check-review.sh [PR_NUMBER|PR_URL]"
     purpose: "Read FAC review state/events/pulse files and print structured review progress."
+    side_effect: false
+
+  - name: fetch_full_review_comment_bodies
+    command: "timeout 30s gh pr view <PR_NUMBER> --repo guardian-intelligence/apm2 --json reviews,reviewThreads"
+    purpose: "Fetch full review comment bodies via GitHub until FAC projection exposes full comment text."
     side_effect: false
 
   - name: enable_auto_merge

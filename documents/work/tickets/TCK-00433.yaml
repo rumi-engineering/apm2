@@ -50,7 +50,7 @@ ticket_meta:
       - "Implement idempotent review dispatch per `(repo, pr_number, review_type)` so duplicate requests for the same SHA do not spawn duplicate reviewers."
       - "Implement join semantics for duplicate `(repo, pr_number, head_sha)` dispatches so concurrent callers attach to an existing run instead of creating duplicate reviewers."
       - "Fail closed for unauthorized PR author identity in workflow preflight policy checks."
-      - "Implement uniform random model selection across environment-available models (`gemini-2.5-flash`, `gemini-2.5-pro`, and `gpt-5.3-codex`)."
+      - "Implement uniform random model selection across environment-available models (`gemini-3.0-flash-preview`, `gemini-3.0-pro-preview`, and `gpt-5.3-codex-xhigh`)."
       - "Implement backend-aware command dispatch for Codex and Gemini initial spawn and resume paths."
       - "Emit append-only review lifecycle telemetry to `~/.apm2/review_events.ndjson` with rotation at 10MB."
       - "Implement PR-scoped pulse files for SHA freshness (`review_pulses/pr<PR>_review_pulse_{security|quality}.json`) and kill+resume on head movement."

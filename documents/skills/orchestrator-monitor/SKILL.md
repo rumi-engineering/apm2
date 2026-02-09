@@ -21,6 +21,10 @@ protocol:
 variables:
   PR_SCOPE_OPTIONAL: "$1"
 
+notes:
+  - "Use `apm2 fac review` as the primary authority path for reviewer lifecycle actions (`dispatch`, `status`, `project`, `retrigger`)."
+  - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata, merge actions, and full comment-body retrieval)."
+
 references[10]:
   - path: "@documents/theory/glossary/glossary.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
@@ -100,6 +104,7 @@ runtime_review_protocol:
     - "Review runs execute security and quality in parallel when `--type all` is used."
     - "Dispatch is idempotent start-or-join for duplicate PR/SHA requests."
     - "Projection snapshots are emitted via `apm2 fac review project` for 1Hz GitHub-style status rendering."
+    - "Treat FAC projection output as reviewer-lifecycle source of truth; GitHub remains a projection surface."
     - "Mid-review SHA movement uses kill+resume flow with backend-native session resume."
     - "Stalls and crashes emit structured events and trigger bounded model fallback."
 
@@ -110,11 +115,12 @@ decision_tree:
       action: invoke_reference
       reference: references/orchestration-loop.md
 
-invariants[13]:
+invariants[14]:
   - "Use conservative gating: if PR state, SHA binding, review verdict, or CI truth is ambiguous, classify as BLOCKED and do not merge."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch per PR at any time."
+  - "Use `apm2 fac review retrigger` for review reruns; direct `gh workflow run forge-admission-cycle.yml` is fallback-only."
   - "No merge action without Forge Admission Cycle=success for current HEAD SHA."
   - "Review prompt dispatch includes review_prompt_required_payload."
   - "Never use the same model family for both implementing and reviewing the same PR cycle."
