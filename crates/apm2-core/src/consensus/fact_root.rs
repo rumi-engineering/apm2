@@ -1694,7 +1694,8 @@ mod tck_00370_unit_tests {
     /// (production) QCs with real Ed25519 signatures.
     ///
     /// The construction flow is:
-    /// 1. Proposer builds `FactRootV1` with batch data and a placeholder anchor.
+    /// 1. Proposer builds `FactRootV1` with batch data and a placeholder
+    ///    anchor.
     /// 2. Proposer computes `content_hash()` -> this becomes `block_hash`.
     /// 3. Validators sign `block_hash` (= `content_hash()`).
     /// 4. Aggregator collects 2f+1 signatures into a QC.

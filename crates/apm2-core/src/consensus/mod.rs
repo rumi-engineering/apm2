@@ -69,6 +69,7 @@ pub mod anti_entropy;
 pub mod batch_epoch;
 pub mod bft;
 pub mod bft_machine;
+pub mod bisimulation;
 pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
@@ -83,6 +84,7 @@ pub mod relay;
 pub mod replication;
 pub mod tunnel;
 
+// Bisimulation gate for recursive composition (TCK-00367)
 // BFT consensus (Chained HotStuff)
 // Anti-entropy and Merkle tree (TCK-00191)
 pub use anti_entropy::{
@@ -108,6 +110,12 @@ pub use bft::{
 pub use bft_machine::{
     BftAction, BftEvent, BftMachine, MAX_BUFFERED_MESSAGES, MAX_PENDING_ACTIONS, MSG_BFT_NEW_VIEW,
     MSG_BFT_PROPOSAL, MSG_BFT_QC, MSG_BFT_VOTE,
+};
+pub use bisimulation::{
+    BisimulationChecker, BisimulationError, BisimulationResult, BlockingDefect, DepthCheckResult,
+    FlatteningRelation, HsiOperation, MAX_COUNTEREXAMPLE_LENGTH, MAX_RECURSION_DEPTH,
+    MAX_TOTAL_STATES, MAX_TRANSITIONS_PER_STATE, MismatchDirection, ObservableSemantics,
+    PromotionGate, PromotionGateResult, StopKind, TraceStep, Transition, build_linear_composition,
 };
 // HLC-based CRDT merge operators (TCK-00197)
 // Revocation-wins signed CRDT merge law (TCK-00360)
