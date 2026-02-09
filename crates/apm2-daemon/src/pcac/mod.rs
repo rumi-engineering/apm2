@@ -11,9 +11,13 @@
 //! The [`LifecycleGate`] is injected into [`SessionDispatcher`] and called
 //! between V1 scope enforcement and broker dispatch in `handle_request_tool`.
 
+pub mod durable_consume;
 mod lifecycle_gate;
 
 #[cfg(test)]
 mod tests;
 
+pub use durable_consume::{
+    ConsumeError, DurableConsumeIndex, DurableConsumeMetrics, DurableKernel, FileBackedConsumeIndex,
+};
 pub use lifecycle_gate::{InProcessKernel, LifecycleGate, LifecycleReceipts};
