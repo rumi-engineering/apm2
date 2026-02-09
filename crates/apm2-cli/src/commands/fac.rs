@@ -170,11 +170,10 @@ pub enum FacSubcommand {
     /// lines until a terminal outcome is reached.
     Kickoff(KickoffArgs),
 
-    /// Push code and orchestrate FAC lifecycle (gates → push → reviews →
-    /// project).
+    /// Push code and create/update PR (lean push).
     ///
-    /// Runs evidence gates (fail-closed), pushes to remote, dispatches reviews,
-    /// and polls projection health lines to a projection log file.
+    /// Pushes to remote, creates or updates a PR from ticket YAML metadata,
+    /// enables auto-merge, and exits immediately.
     Push(PushArgs),
 
     /// Run and observe FAC review orchestration for pull requests.
@@ -402,9 +401,9 @@ pub struct PushArgs {
     #[arg(long)]
     pub branch: Option<String>,
 
-    /// Maximum seconds to wait for FAC terminal state.
-    #[arg(long, default_value_t = 3600)]
-    pub max_wait_seconds: u64,
+    /// Path to ticket YAML for PR title/body generation.
+    #[arg(long)]
+    pub ticket: Option<PathBuf>,
 }
 
 /// Arguments for `apm2 fac review`.
@@ -763,7 +762,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             &args.repo,
             &args.remote,
             args.branch.as_deref(),
-            args.max_wait_seconds,
+            args.ticket.as_deref(),
         ),
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Run(run_args) => fac_review::run_review(

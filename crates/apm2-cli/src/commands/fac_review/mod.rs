@@ -11,9 +11,12 @@
 
 mod backend;
 mod barrier;
+#[allow(dead_code)]
+mod ci_status;
 mod detection;
 mod dispatch;
 mod events;
+#[allow(dead_code)]
 mod evidence;
 mod liveness;
 mod model_pool;
@@ -114,8 +117,11 @@ pub fn run_review(
                 println!("  Head (final): {}", summary.final_head_sha);
                 println!("  Total secs:   {}", summary.total_secs);
                 if let Some(security) = &summary.security {
+                    let tok = security
+                        .tokens_used
+                        .map_or_else(String::new, |n| format!(", tokens={n}"));
                     println!(
-                        "  Security:     {} (verdict={}, model={}, backend={}, restarts={}, secs={})",
+                        "  Security:     {} (verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
                         if security.success { "PASS" } else { "FAIL" },
                         security.verdict,
                         security.model,
@@ -125,8 +131,11 @@ pub fn run_review(
                     );
                 }
                 if let Some(quality) = &summary.quality {
+                    let tok = quality
+                        .tokens_used
+                        .map_or_else(String::new, |n| format!(", tokens={n}"));
                     println!(
-                        "  Quality:      {} (verdict={}, model={}, backend={}, restarts={}, secs={})",
+                        "  Quality:      {} (verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
                         if quality.success { "PASS" } else { "FAIL" },
                         quality.verdict,
                         quality.model,
@@ -502,8 +511,8 @@ pub fn run_tail(lines: usize, follow: bool) -> u8 {
     }
 }
 
-pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, max_wait: u64) -> u8 {
-    push::run_push(repo, remote, branch, max_wait)
+pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
+    push::run_push(repo, remote, branch, ticket)
 }
 
 // ── Internal dispatch helper (shared with push) ─────────────────────────────

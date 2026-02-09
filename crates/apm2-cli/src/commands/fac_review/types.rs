@@ -155,6 +155,8 @@ pub struct SingleReviewSummary {
     pub backend: String,
     pub duration_secs: u64,
     pub restart_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

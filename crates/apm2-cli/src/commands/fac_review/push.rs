@@ -1,47 +1,187 @@
-//! `run_push` pipeline: evidence gates, git push, dispatch reviews, project.
+//! Lean `run_push` pipeline: git push → create/update PR → enable auto-merge.
 
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
-use super::evidence::run_evidence_gates;
-use super::projection::{projection_state_done, projection_state_failed, run_project_inner};
-use super::types::{ReviewRunType, apm2_home_dir, now_iso8601};
 use crate::exit_codes::codes as exit_codes;
 
-// ── Projection log helpers ──────────────────────────────────────────────────
+// ── Ticket YAML parsing ─────────────────────────────────────────────────────
 
-fn projection_log_path(pr_number: u32) -> Result<PathBuf, String> {
-    let dir = apm2_home_dir()?.join("projection");
-    fs::create_dir_all(&dir).map_err(|e| format!("failed to create projection dir: {e}"))?;
-    Ok(dir.join(format!("pr{pr_number}.log")))
+/// Minimal ticket metadata extracted from a ticket YAML file.
+struct TicketMeta {
+    id: String,
+    title: String,
+    in_scope: Vec<String>,
+    rationale: String,
 }
 
-fn write_projection_line(file: &mut File, line: &str) {
-    let _ = writeln!(file, "{line}");
+/// Parse a ticket YAML file and extract metadata for PR title/body.
+fn parse_ticket_yaml(path: &Path) -> Result<TicketMeta, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read ticket YAML: {e}"))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&content).map_err(|e| format!("failed to parse ticket YAML: {e}"))?;
+
+    let meta = doc
+        .get("ticket_meta")
+        .ok_or_else(|| "ticket YAML missing `ticket_meta` key".to_string())?;
+
+    let ticket = meta
+        .get("ticket")
+        .ok_or_else(|| "ticket YAML missing `ticket_meta.ticket` key".to_string())?;
+
+    let id = ticket
+        .get("id")
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or("UNKNOWN")
+        .to_string();
+
+    let title = ticket
+        .get("title")
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or("Untitled")
+        .to_string();
+
+    let scope = meta.get("scope");
+    let in_scope = scope
+        .and_then(|s| s.get("in_scope"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|seq| {
+            seq.iter()
+                .filter_map(serde_yaml::Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rationale = meta
+        .get("rationale")
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Ok(TicketMeta {
+        id,
+        title,
+        in_scope,
+        rationale,
+    })
 }
 
-fn emit_terminal_line(file: &mut File, sha: &str, success: bool, reason: Option<&str>) {
-    let ts = now_iso8601();
-    let terminal = if success { "success" } else { "failure" };
-    let mut line = format!("ts={ts} sha={sha} terminal={terminal}");
-    if let Some(r) = reason {
-        use std::fmt::Write as _;
-        let _ = write!(line, " reason={r}");
+/// Build a PR title from ticket metadata: `{id}: {title}`.
+fn build_pr_title(meta: &TicketMeta) -> String {
+    format!("{}: {}", meta.id, meta.title)
+}
+
+/// Build a PR body from ticket metadata as Markdown.
+fn build_pr_body(meta: &TicketMeta) -> String {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    if !meta.in_scope.is_empty() {
+        body.push_str("## Scope\n\n");
+        for item in &meta.in_scope {
+            let _ = writeln!(body, "- {item}");
+        }
+        body.push('\n');
     }
-    write_projection_line(file, &line);
+    if !meta.rationale.is_empty() {
+        body.push_str("## Rationale\n\n");
+        body.push_str(&meta.rationale);
+        body.push('\n');
+    }
+    body
 }
 
-// ── run_push entry point ────────────────────────────────────────────────────
+// ── PR helpers ───────────────────────────────────────────────────────────────
 
-pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, max_wait: u64) -> u8 {
-    if max_wait == 0 {
-        eprintln!("ERROR: max_wait_seconds must be > 0");
-        return exit_codes::GENERIC_ERROR;
+/// Look up an existing PR number for the given branch, or return 0 if none.
+fn find_existing_pr(repo: &str, branch: &str) -> u32 {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--head",
+            branch,
+            "--json",
+            "number",
+            "--jq",
+            ".[0].number",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let num_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            num_str.parse::<u32>().unwrap_or(0)
+        },
+        _ => 0,
+    }
+}
+
+/// Create a new PR and return the PR number on success.
+fn create_pr(repo: &str, title: &str, body: &str) -> Result<u32, String> {
+    let output = Command::new("gh")
+        .args([
+            "pr", "create", "--repo", repo, "--title", title, "--body", body, "--base", "main",
+        ])
+        .output()
+        .map_err(|e| format!("failed to execute gh pr create: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh pr create failed: {stderr}"));
     }
 
+    // gh pr create prints the PR URL on stdout; extract the number.
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let pr_number = url
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| format!("could not parse PR number from gh output: {url}"))?;
+
+    Ok(pr_number)
+}
+
+/// Update an existing PR's title and body.
+fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), String> {
+    let pr_ref = pr_number.to_string();
+    let output = Command::new("gh")
+        .args([
+            "pr", "edit", &pr_ref, "--repo", repo, "--title", title, "--body", body,
+        ])
+        .output()
+        .map_err(|e| format!("failed to execute gh pr edit: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh pr edit failed: {stderr}"));
+    }
+    Ok(())
+}
+
+/// Enable auto-merge (squash) on a PR.
+fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
+    let pr_ref = pr_number.to_string();
+    let output = Command::new("gh")
+        .args(["pr", "merge", &pr_ref, "--repo", repo, "--auto", "--squash"])
+        .output()
+        .map_err(|e| format!("failed to execute gh pr merge --auto: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Auto-merge may already be enabled — treat as non-fatal warning.
+        eprintln!("WARNING: gh pr merge --auto: {stderr}");
+    }
+    Ok(())
+}
+
+// ── run_push entry point ─────────────────────────────────────────────────────
+
+pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
+    // Resolve branch name.
     let branch = if let Some(b) = branch {
         b.to_string()
     } else {
@@ -57,6 +197,7 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, max_wait: u64) -
         }
     };
 
+    // Resolve HEAD SHA for logging.
     let sha = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => {
@@ -65,88 +206,9 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, max_wait: u64) -
         },
     };
 
-    let pr_number = match Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--head",
-            &branch,
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let num_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            num_str.parse::<u32>().unwrap_or(0)
-        },
-        _ => 0,
-    };
+    eprintln!("fac push: sha={sha} branch={branch}");
 
-    if pr_number == 0 {
-        eprintln!("ERROR: no open PR found for branch `{branch}` in repo `{repo}`");
-        return exit_codes::GENERIC_ERROR;
-    }
-
-    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
-    eprintln!("fac push: PR #{pr_number} sha={sha} branch={branch}");
-
-    let log_path = match projection_log_path(pr_number) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ERROR: {e}");
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-
-    if log_path.exists() {
-        if let Ok(meta) = fs::metadata(&log_path) {
-            if meta.len() > 1_048_576 {
-                let backup = log_path.with_extension("log.1");
-                let _ = fs::rename(&log_path, &backup);
-            }
-        }
-    }
-
-    let mut projection_file = match File::create(&log_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("ERROR: failed to create projection log: {e}");
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match run_evidence_gates(&workspace_root, &sha, Some(&mut projection_file)) {
-        Ok(true) => {
-            eprintln!("fac push: all evidence gates passed");
-        },
-        Ok(false) => {
-            eprintln!("ERROR: evidence gates failed — fix before pushing");
-            emit_terminal_line(
-                &mut projection_file,
-                &sha,
-                false,
-                Some("evidence_gate_failure"),
-            );
-            return exit_codes::GENERIC_ERROR;
-        },
-        Err(e) => {
-            eprintln!("ERROR: evidence gate error: {e}");
-            emit_terminal_line(
-                &mut projection_file,
-                &sha,
-                false,
-                Some("evidence_gate_error"),
-            );
-            return exit_codes::GENERIC_ERROR;
-        },
-    }
-
+    // Step 1: git push.
     let push_output = Command::new("git").args(["push", remote, &branch]).output();
     match push_output {
         Ok(o) if o.status.success() => {
@@ -155,95 +217,63 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, max_wait: u64) -
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             eprintln!("ERROR: git push failed: {stderr}");
-            emit_terminal_line(&mut projection_file, &sha, false, Some("git_push_failed"));
             return exit_codes::GENERIC_ERROR;
         },
         Err(e) => {
             eprintln!("ERROR: failed to execute git push: {e}");
-            emit_terminal_line(&mut projection_file, &sha, false, Some("git_push_error"));
             return exit_codes::GENERIC_ERROR;
         },
     }
 
-    match super::run_dispatch_inner(&pr_url, ReviewRunType::All, Some(&sha)) {
-        Ok(dispatch) => {
-            eprintln!(
-                "fac push: reviews dispatched (epoch={})",
-                dispatch.dispatch_epoch
-            );
-
-            let deadline = Instant::now() + Duration::from_secs(max_wait);
-            let mut after_seq = 0_u64;
-
-            loop {
-                match run_project_inner(
-                    pr_number,
-                    Some(&sha),
-                    Some(dispatch.dispatch_epoch),
-                    after_seq,
-                ) {
-                    Ok(projection) => {
-                        write_projection_line(&mut projection_file, &projection.line);
-                        println!("{}", projection.line);
-
-                        for error in &projection.errors {
-                            eprintln!(
-                                "ERROR ts={} event={} review={} seq={} detail={}",
-                                error.ts, error.event, error.review_type, error.seq, error.detail
-                            );
-                        }
-                        after_seq = projection.last_seq;
-
-                        if projection.terminal_failure {
-                            emit_terminal_line(
-                                &mut projection_file,
-                                &sha,
-                                false,
-                                Some("terminal_failure"),
-                            );
-                            return exit_codes::GENERIC_ERROR;
-                        }
-                        if projection_state_failed(&projection.security) {
-                            emit_terminal_line(
-                                &mut projection_file,
-                                &sha,
-                                false,
-                                Some("security_failure"),
-                            );
-                            return exit_codes::GENERIC_ERROR;
-                        }
-                        if projection_state_failed(&projection.quality) {
-                            emit_terminal_line(
-                                &mut projection_file,
-                                &sha,
-                                false,
-                                Some("quality_failure"),
-                            );
-                            return exit_codes::GENERIC_ERROR;
-                        }
-                        if projection_state_done(&projection.security)
-                            && projection_state_done(&projection.quality)
-                        {
-                            emit_terminal_line(&mut projection_file, &sha, true, None);
-                            return exit_codes::SUCCESS;
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("ERROR: projection failed: {e}");
-                    },
-                }
-
-                if Instant::now() >= deadline {
-                    emit_terminal_line(&mut projection_file, &sha, false, Some("timeout"));
-                    return exit_codes::GENERIC_ERROR;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        },
+    // Parse ticket metadata if provided.
+    let ticket_meta = ticket.map(parse_ticket_yaml).transpose();
+    let ticket_meta = match ticket_meta {
+        Ok(meta) => meta,
         Err(e) => {
-            eprintln!("ERROR: review dispatch failed: {e}");
-            emit_terminal_line(&mut projection_file, &sha, false, Some("dispatch_failed"));
-            exit_codes::GENERIC_ERROR
+            eprintln!("ERROR: {e}");
+            return exit_codes::GENERIC_ERROR;
         },
+    };
+
+    // Step 2: create or update PR.
+    let pr_number = find_existing_pr(repo, &branch);
+    let pr_number = if pr_number == 0 {
+        // No existing PR — create one.
+        let (title, body) = ticket_meta.as_ref().map_or_else(
+            || (branch.clone(), String::new()),
+            |meta| (build_pr_title(meta), build_pr_body(meta)),
+        );
+        match create_pr(repo, &title, &body) {
+            Ok(num) => {
+                eprintln!("fac push: created PR #{num}");
+                num
+            },
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                return exit_codes::GENERIC_ERROR;
+            },
+        }
+    } else {
+        // PR exists — update body if ticket metadata available.
+        if let Some(ref meta) = ticket_meta {
+            let title = build_pr_title(meta);
+            let body = build_pr_body(meta);
+            if let Err(e) = update_pr(repo, pr_number, &title, &body) {
+                eprintln!("WARNING: {e}");
+            } else {
+                eprintln!("fac push: updated PR #{pr_number}");
+            }
+        }
+        pr_number
+    };
+
+    // Step 3: enable auto-merge.
+    if let Err(e) = enable_auto_merge(repo, pr_number) {
+        eprintln!("WARNING: auto-merge enable failed: {e}");
+    } else {
+        eprintln!("fac push: auto-merge enabled on PR #{pr_number}");
     }
+
+    eprintln!("fac push: done (PR #{pr_number})");
+    exit_codes::SUCCESS
 }

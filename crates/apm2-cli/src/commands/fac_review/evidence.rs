@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
+use super::ci_status::{CiStatus, ThrottledUpdater};
 use super::types::{apm2_home_dir, now_iso8601};
 
 /// Format and emit a single evidence line to stderr and an optional projection
@@ -155,6 +156,132 @@ pub fn run_evidence_gates(
             log_path.display()
         ));
     }
+
+    if let Some(file) = projection_log {
+        for line in &evidence_lines {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    Ok(all_passed)
+}
+
+/// Run evidence gates with CI status comment updates.
+///
+/// Same as [`run_evidence_gates`] but also updates a PR CI status comment
+/// after each gate completes.
+pub fn run_evidence_gates_with_status(
+    workspace_root: &Path,
+    sha: &str,
+    owner_repo: &str,
+    pr_number: u32,
+    projection_log: Option<&mut File>,
+) -> Result<bool, String> {
+    let evidence_dir = apm2_home_dir()?.join("private/fac/evidence");
+    fs::create_dir_all(&evidence_dir)
+        .map_err(|e| format!("failed to create evidence directory: {e}"))?;
+
+    let mut status = CiStatus::new(sha, pr_number);
+    let mut updater = ThrottledUpdater::new(owner_repo, pr_number);
+
+    let gates: &[(&str, &[&str])] = &[
+        ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
+        (
+            "clippy",
+            &[
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
+        ("test", &["cargo", "test", "--workspace"]),
+    ];
+
+    let script_gates: &[(&str, &str)] = &[
+        ("test_safety_guard", "scripts/ci/test_safety_guard.sh"),
+        (
+            "workspace_integrity",
+            "scripts/ci/workspace_integrity_guard.sh",
+        ),
+        ("review_artifact_lint", "scripts/ci/review_artifact_lint.sh"),
+    ];
+
+    let mut all_passed = true;
+    let mut evidence_lines = Vec::new();
+
+    for &(gate_name, cmd_args) in gates {
+        status.set_running(gate_name);
+        updater.update(&status);
+
+        let log_path = evidence_dir.join(format!("{gate_name}.log"));
+        let started = Instant::now();
+        let passed = run_single_evidence_gate(
+            workspace_root,
+            sha,
+            gate_name,
+            cmd_args[0],
+            &cmd_args[1..],
+            &log_path,
+        );
+        let duration = started.elapsed().as_secs();
+
+        status.set_result(gate_name, passed, duration);
+        updater.update(&status);
+
+        if !passed {
+            all_passed = false;
+        }
+        let ts = now_iso8601();
+        let gate_status = if passed { "PASS" } else { "FAIL" };
+        evidence_lines.push(format!(
+            "ts={ts} sha={sha} gate={gate_name} status={gate_status} log={}",
+            log_path.display()
+        ));
+    }
+
+    for &(gate_name, script_path) in script_gates {
+        let full_path = workspace_root.join(script_path);
+        if !full_path.exists() {
+            continue;
+        }
+
+        status.set_running(gate_name);
+        updater.update(&status);
+
+        let log_path = evidence_dir.join(format!("{gate_name}.log"));
+        let started = Instant::now();
+        let passed = run_single_evidence_gate(
+            workspace_root,
+            sha,
+            gate_name,
+            "bash",
+            &[full_path.to_str().unwrap_or("")],
+            &log_path,
+        );
+        let duration = started.elapsed().as_secs();
+
+        status.set_result(gate_name, passed, duration);
+        updater.update(&status);
+
+        if !passed {
+            all_passed = false;
+        }
+        let ts = now_iso8601();
+        let gate_status = if passed { "PASS" } else { "FAIL" };
+        evidence_lines.push(format!(
+            "ts={ts} sha={sha} gate={gate_name} status={gate_status} log={}",
+            log_path.display()
+        ));
+    }
+
+    // Force a final update to ensure all gate results are posted.
+    updater.force_update(&status);
 
     if let Some(file) = projection_log {
         for line in &evidence_lines {

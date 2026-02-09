@@ -38,7 +38,6 @@ pub const APM2_SESSION_TOKEN_ENV: &str = "APM2_SESSION_TOKEN";
 
 pub mod cac;
 pub mod capability;
-pub mod ci;
 pub mod consensus;
 pub mod coordinate;
 pub mod creds;
