@@ -757,6 +757,80 @@ pub enum PermeabilityError {
 }
 
 // =============================================================================
+// Canonical Risk-Tier → Authority-Ceiling Mapping
+// =============================================================================
+
+/// Returns the canonical authority ceiling for the given risk tier value.
+///
+/// This is the **single authoritative** mapping from `resolved_risk_tier`
+/// (u8, as stored in `PolicyResolution`) to a permeability
+/// [`AuthorityVector`] ceiling.  Every code path that derives an authority
+/// ceiling from a risk tier **MUST** call this function to avoid
+/// inconsistency between the dispatcher delegated-spawn gate, the envelope
+/// path, and any future consumers.
+///
+/// # Return Value
+///
+/// * `Some(ceiling)` for valid tiers 0-4.
+/// * `None` for any value outside the `[0, 4]` range.  Callers MUST treat
+///   `None` as a **fail-closed deny** — invalid / corrupt / tampered tier
+///   metadata MUST NOT be mapped to a permissive ceiling.
+///
+/// # Tier Mapping
+///
+/// | Tier | Risk | Capability  | Budget        | Stop    | Taint       | Classification |
+/// |------|------|-------------|---------------|---------|-------------|----------------|
+/// | 0    | Low  | `ReadOnly`  | Capped(1M)    | Inherit | Attested    | Confidential   |
+/// | 1    | Med  | `ReadWrite` | Capped(10M)   | Extend  | Untrusted   | Secret         |
+/// | 2    | High | `ReadWrite` | Capped(50M)   | Extend  | Untrusted   | Secret         |
+/// | 3    | High | Full        | Unlimited     | Override| Adversarial | `TopSecret`    |
+/// | 4    | High | Full        | Unlimited     | Override| Adversarial | `TopSecret`    |
+///
+/// Tier 4 is the most restrictive *operational* tier (highest risk
+/// classification) and gets the same ceiling as Tier 3.  The ceiling
+/// itself is maximally permissive for Tier 3/4 because the receipt's
+/// own delegated authority is the binding constraint -- the ceiling
+/// only filters obviously-mismatched receipts.
+#[must_use]
+pub const fn authority_ceiling_for_risk_tier(tier: u8) -> Option<AuthorityVector> {
+    match tier {
+        0 => Some(AuthorityVector::new(
+            RiskLevel::Low,
+            CapabilityLevel::ReadOnly,
+            BudgetLevel::Capped(1_000_000),
+            StopPredicateLevel::Inherit,
+            TaintCeiling::Attested,
+            ClassificationLevel::Confidential,
+        )),
+        1 => Some(AuthorityVector::new(
+            RiskLevel::Med,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(10_000_000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        )),
+        2 => Some(AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::ReadWrite,
+            BudgetLevel::Capped(50_000_000),
+            StopPredicateLevel::Extend,
+            TaintCeiling::Untrusted,
+            ClassificationLevel::Secret,
+        )),
+        3 | 4 => Some(AuthorityVector::new(
+            RiskLevel::High,
+            CapabilityLevel::Full,
+            BudgetLevel::Unlimited,
+            StopPredicateLevel::Override,
+            TaintCeiling::Adversarial,
+            ClassificationLevel::TopSecret,
+        )),
+        _ => None,
+    }
+}
+
+// =============================================================================
 // PermeabilityReceipt
 // =============================================================================
 

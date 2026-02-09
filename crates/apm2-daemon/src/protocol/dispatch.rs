@@ -2853,6 +2853,72 @@ impl PolicyResolver for StubPolicyResolver {
 }
 
 // ============================================================================
+// Permeability Receipt Resolver (TCK-00373)
+// ============================================================================
+
+/// Resolves an optional permeability receipt for a work claim.
+///
+/// During `ClaimWork`, the dispatcher calls this resolver to determine
+/// whether the actor's claim is subject to delegated authority constraints.
+/// When the resolver returns `Some(receipt)`, the receipt is stored on the
+/// `WorkClaim` and enforced by the delegated spawn gate in `SpawnEpisode`.
+///
+/// # Contract
+///
+/// * If the actor operates under a delegation, the resolver **MUST** return a
+///   valid receipt whose `delegate_actor_id` matches `actor_id` and whose
+///   `policy_root_hash` matches `resolved_policy_hash`.
+/// * If the actor is a root (non-delegated) operator, the resolver returns
+///   `None` and no delegated spawn gate is entered.
+/// * Errors from the resolver are surfaced as `CapabilityRequestRejected` to
+///   the caller (fail-closed).
+pub trait PermeabilityReceiptResolver: Send + Sync {
+    /// Resolves a permeability receipt for the given claim context.
+    ///
+    /// # Arguments
+    ///
+    /// * `actor_id` - The authoritative actor ID (derived from credential).
+    /// * `work_id` - The work ID being claimed.
+    /// * `resolved_policy_hash` - The policy hash from governance resolution.
+    ///
+    /// # Returns
+    ///
+    /// `Some(receipt)` if the actor operates under delegated authority,
+    /// `None` for root (non-delegated) operators.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error description if the receipt cannot be resolved
+    /// (e.g., store unavailable, receipt invalid). Callers MUST treat
+    /// errors as fail-closed.
+    fn resolve_receipt(
+        &self,
+        actor_id: &str,
+        work_id: &str,
+        resolved_policy_hash: &[u8; 32],
+    ) -> Result<Option<apm2_core::policy::permeability::PermeabilityReceipt>, String>;
+}
+
+/// Stub receipt resolver that always returns `None` (no delegation).
+///
+/// Used in tests and non-delegated deployments. In production, this
+/// would be replaced with a governance-backed resolver that queries
+/// active delegation receipts for the actor.
+#[derive(Debug, Clone, Default)]
+pub struct StubPermeabilityReceiptResolver;
+
+impl PermeabilityReceiptResolver for StubPermeabilityReceiptResolver {
+    fn resolve_receipt(
+        &self,
+        _actor_id: &str,
+        _work_id: &str,
+        _resolved_policy_hash: &[u8; 32],
+    ) -> Result<Option<apm2_core::policy::permeability::PermeabilityReceipt>, String> {
+        Ok(None)
+    }
+}
+
+// ============================================================================
 // Work Registry Interface (TCK-00253)
 // ============================================================================
 
@@ -4824,6 +4890,14 @@ pub struct PrivilegedDispatcher {
     /// without inadvertently enabling `PublishChangeSet` (TCK-00412
     /// fail-closed).
     adapter_profile_cas: Option<Arc<dyn ContentAddressedStore>>,
+
+    /// TCK-00373: Permeability receipt resolver for delegated claim binding.
+    ///
+    /// During `ClaimWork`, the dispatcher queries this resolver to determine
+    /// whether the actor operates under a delegated authority. When the
+    /// resolver returns a receipt, it is stored on the `WorkClaim` and
+    /// subsequently enforced by the delegated spawn gate.
+    permeability_receipt_resolver: Arc<dyn PermeabilityReceiptResolver>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -4980,6 +5054,7 @@ impl PrivilegedDispatcher {
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
+            permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
         }
     }
 
@@ -5057,6 +5132,7 @@ impl PrivilegedDispatcher {
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
+            permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
         }
     }
 
@@ -5152,6 +5228,7 @@ impl PrivilegedDispatcher {
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
+            permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
         }
     }
 
@@ -5225,6 +5302,7 @@ impl PrivilegedDispatcher {
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
+            permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
         }
     }
 
@@ -5345,6 +5423,17 @@ impl PrivilegedDispatcher {
         store: crate::protocol::session_dispatch::SharedV1ManifestStore,
     ) -> Self {
         self.v1_manifest_store = Some(store);
+        self
+    }
+
+    /// Sets the permeability receipt resolver for delegated claim binding
+    /// (TCK-00373).
+    #[must_use]
+    pub fn with_permeability_receipt_resolver(
+        mut self,
+        resolver: Arc<dyn PermeabilityReceiptResolver>,
+    ) -> Self {
+        self.permeability_receipt_resolver = resolver;
         self
     }
 
@@ -6201,6 +6290,40 @@ impl PrivilegedDispatcher {
             },
         };
 
+        // TCK-00373 CQ MAJOR fix: Resolve permeability receipt for delegated
+        // claims. The resolver queries governance/store for active delegations
+        // bound to this actor and policy root. When a receipt is returned, it
+        // is stored on the WorkClaim and subsequently enforced by the delegated
+        // spawn gate in handle_spawn_episode. Errors are fail-closed.
+        let permeability_receipt = match self.permeability_receipt_resolver.resolve_receipt(
+            &actor_id,
+            &work_id,
+            &policy_resolution.resolved_policy_hash,
+        ) {
+            Ok(receipt) => {
+                if receipt.is_some() {
+                    debug!(
+                        work_id = %work_id,
+                        actor_id = %actor_id,
+                        "Permeability receipt resolved for delegated claim"
+                    );
+                }
+                receipt
+            },
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    actor_id = %actor_id,
+                    error = %e,
+                    "ClaimWork rejected: permeability receipt resolution failed (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("permeability receipt resolution failed: {e}"),
+                ));
+            },
+        };
+
         // TCK-00395: Clone actor_id before it is moved into WorkClaim,
         // as we need it later for emit_work_transitioned.
         let actor_id_for_transition = actor_id.clone();
@@ -6214,7 +6337,7 @@ impl PrivilegedDispatcher {
             policy_resolution: policy_resolution.clone(),
             executor_custody_domains,
             author_custody_domains,
-            permeability_receipt: None,
+            permeability_receipt,
         };
 
         let claim = match self.work_registry.register_claim(claim) {
@@ -7200,13 +7323,7 @@ impl PrivilegedDispatcher {
         }
 
         if let Some(ref receipt_hash_bytes) = request.permeability_receipt_hash {
-            use apm2_core::policy::permeability::{
-                AuthorityVector as PermAuthorityVector, BudgetLevel as PermBudgetLevel,
-                CapabilityLevel as PermCapabilityLevel,
-                ClassificationLevel as PermClassificationLevel, ConsumptionContext,
-                RiskLevel as PermRiskLevel, StopPredicateLevel as PermStopPredicateLevel,
-                TaintCeiling as PermTaintCeiling,
-            };
+            use apm2_core::policy::permeability::ConsumptionContext;
 
             if receipt_hash_bytes.len() != 32 {
                 warn!(
@@ -7271,19 +7388,43 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            // Derive required authority from the claim's policy resolution.
-            // For delegated spawns, the minimum required authority is
-            // determined by the resolved risk tier ceiling.
-            // Minimum authority: use bottom as baseline (any valid
-            // delegated authority satisfies it).
-            let required_authority = PermAuthorityVector::new(
-                PermRiskLevel::Low,
-                PermCapabilityLevel::ReadOnly,
-                PermBudgetLevel::Capped(1),
-                PermStopPredicateLevel::Inherit,
-                PermTaintCeiling::Attested,
-                PermClassificationLevel::Public,
-            );
+            // BLOCKER 2 (Security): Derive authority ceiling from the
+            // resolved risk tier through the SINGLE canonical mapping.
+            // Invalid/unknown tier values are **denied** (fail-closed),
+            // NOT mapped to `AuthorityVector::top()`.
+            let Some(authority_ceiling_vec) =
+                apm2_core::policy::permeability::authority_ceiling_for_risk_tier(
+                    claim.policy_resolution.resolved_risk_tier,
+                )
+            else {
+                warn!(
+                    work_id = %request.work_id,
+                    resolved_risk_tier = claim.policy_resolution.resolved_risk_tier,
+                    "SpawnEpisode rejected: invalid resolved_risk_tier (fail-closed deny)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "invalid resolved_risk_tier {} -- fail-closed deny \
+                         (valid range 0-4)",
+                        claim.policy_resolution.resolved_risk_tier,
+                    ),
+                ));
+            };
+
+            // BLOCKER 1 (Security): The `required_authority` is the
+            // risk-tier ceiling itself. The subsequent
+            // `validate_consumption_binding` checks that
+            // `required_authority.is_subset_of(&receipt.delegated)`,
+            // which enforces that the receipt carries AT LEAST the
+            // authority demanded by the spawn's risk tier.
+            //
+            // Using `lattice_meet(ceiling, delegated)` here would be
+            // tautological — the meet is always <= delegated, so the
+            // subset check would always pass.  By using the ceiling
+            // directly, a low-authority receipt attempting a
+            // high-risk-tier spawn is correctly rejected.
+            let required_authority = authority_ceiling_vec;
 
             // Use HTF timestamp for consumption time verification.
             let now_ms = match self.get_htf_timestamp_ns() {
@@ -7301,58 +7442,15 @@ impl PrivilegedDispatcher {
                 },
             };
 
-            // BLOCKER 2: Construct ConsumptionContext from dispatch state.
+            // Construct ConsumptionContext from dispatch state.
             //
             // The context provides:
             //   - actor_id: from the claim's authenticated actor identity
             //   - policy_root_hash: from the claim's resolved policy hash
-            //   - authority_ceiling: derived from the resolved risk tier
+            //   - authority_ceiling: derived from the canonical risk tier mapping
             //   - parent_chain_commitment: None (root receipts are self-verifiable;
             //     delegated receipts at depth > 0 will fail-closed if parent chain
             //     commitment is unavailable)
-
-            // Derive authority ceiling from the resolved risk tier.
-            // Higher tiers are more restrictive. This maps the numeric
-            // tier (0-4) to a concrete authority ceiling vector.
-            let authority_ceiling_vec = match claim.policy_resolution.resolved_risk_tier {
-                0 => PermAuthorityVector::new(
-                    PermRiskLevel::Low,
-                    PermCapabilityLevel::ReadOnly,
-                    PermBudgetLevel::Capped(1000),
-                    PermStopPredicateLevel::Inherit,
-                    PermTaintCeiling::Attested,
-                    PermClassificationLevel::Public,
-                ),
-                1 => PermAuthorityVector::new(
-                    PermRiskLevel::Med,
-                    PermCapabilityLevel::ReadWrite,
-                    PermBudgetLevel::Capped(10000),
-                    PermStopPredicateLevel::Extend,
-                    PermTaintCeiling::Untrusted,
-                    PermClassificationLevel::Confidential,
-                ),
-                2 => PermAuthorityVector::new(
-                    PermRiskLevel::High,
-                    PermCapabilityLevel::ReadWrite,
-                    PermBudgetLevel::Capped(50000),
-                    PermStopPredicateLevel::Extend,
-                    PermTaintCeiling::Untrusted,
-                    PermClassificationLevel::Secret,
-                ),
-                3 => PermAuthorityVector::new(
-                    PermRiskLevel::High,
-                    PermCapabilityLevel::Full,
-                    PermBudgetLevel::Unlimited,
-                    PermStopPredicateLevel::Override,
-                    PermTaintCeiling::Adversarial,
-                    PermClassificationLevel::TopSecret,
-                ),
-                // Fail-closed: unknown/high risk tiers get maximum ceiling
-                // (most permissive ceiling = least restrictive check).
-                // The receipt's own authority is the binding constraint.
-                _ => PermAuthorityVector::top(),
-            };
-
             let consumption_ctx = ConsumptionContext {
                 actor_id: &claim.actor_id,
                 policy_root_hash: &claim.policy_resolution.resolved_policy_hash,
@@ -7368,7 +7466,7 @@ impl PrivilegedDispatcher {
             // - Delegation chain continuity
             // - Chain commitment (cryptographic verification)
             // - Authority ceiling (against risk-tier-derived ceiling)
-            // - Authority subset
+            // - Authority subset (against ceil-constrained required_authority)
             if let Err(e) = apm2_core::policy::permeability::validate_consumption_binding(
                 receipt,
                 &receipt_hash,
@@ -25179,6 +25277,10 @@ mod tests {
         }
 
         /// Helper: build a valid permeability receipt for testing.
+        ///
+        /// The receipt's delegated authority is `(Med, ReadWrite,
+        /// Capped(10M), Extend, Untrusted, Secret)` which satisfies
+        /// tier-0 and tier-1 ceilings.
         fn build_test_receipt(
             delegate_actor_id: &str,
             policy_root_hash: [u8; 32],
@@ -25189,10 +25291,14 @@ mod tests {
             };
 
             let parent = AuthorityVector::top();
+            // Authority that satisfies tier-0 ceiling (Low, ReadOnly,
+            // Capped(1M), Inherit, Attested, Confidential) and tier-1
+            // ceiling (Med, ReadWrite, Capped(10M), Extend, Untrusted,
+            // Secret):
             let overlay = AuthorityVector::new(
                 RiskLevel::Med,
                 CapabilityLevel::ReadWrite,
-                BudgetLevel::Capped(5000),
+                BudgetLevel::Capped(10_000_000),
                 StopPredicateLevel::Extend,
                 TaintCeiling::Untrusted,
                 ClassificationLevel::Secret,
@@ -25411,6 +25517,109 @@ mod tests {
             }
         }
 
+        /// Helper: build a low-authority permeability receipt for testing.
+        ///
+        /// The receipt's delegated authority is minimal (Low/ReadOnly/Public).
+        /// Used by the authority-insufficient rejection test.
+        fn build_low_authority_receipt(
+            delegate_actor_id: &str,
+            policy_root_hash: [u8; 32],
+        ) -> apm2_core::policy::permeability::PermeabilityReceipt {
+            use apm2_core::policy::permeability::{
+                AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+                PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+            };
+
+            let parent = AuthorityVector::new(
+                RiskLevel::Low,
+                CapabilityLevel::ReadOnly,
+                BudgetLevel::Capped(100),
+                StopPredicateLevel::Inherit,
+                TaintCeiling::Attested,
+                ClassificationLevel::Public,
+            );
+            let overlay = parent; // overlay == parent => delegated == parent
+            PermeabilityReceiptBuilder::new("test-receipt-low-auth", parent, overlay)
+                .delegator_actor_id("root-delegator")
+                .delegate_actor_id(delegate_actor_id)
+                .issued_at_ms(1_000_000)
+                .expires_at_ms(u64::MAX / 2)
+                .policy_root_hash(policy_root_hash)
+                .build()
+                .unwrap()
+        }
+
+        /// TCK-00373 BLOCKER 1: Low-authority receipt used with a
+        /// high-risk-tier spawn MUST be rejected.
+        ///
+        /// The receipt carries `(Low, ReadOnly, Capped(100), ...)` but the
+        /// spawn's risk tier 3 demands `(High, Full, Unlimited, ...)`.
+        /// Because `required_authority = ceiling` and the receipt's delegated
+        /// authority is NOT a superset of the ceiling, the
+        /// `validate_consumption_binding` subset check rejects the spawn.
+        #[test]
+        fn low_authority_receipt_rejected_for_high_risk_tier_spawn() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = priv_ctx();
+
+            let policy_hash = [0xEE; 32];
+            let receipt = build_low_authority_receipt("actor:low-auth-user", policy_hash);
+            let receipt_hash = receipt.content_hash().to_vec();
+
+            let claim = WorkClaim {
+                work_id: "W-DELEGATED-LOWAUTH".to_string(),
+                lease_id: "L-DELEGATED-LOWAUTH".to_string(),
+                actor_id: "actor:low-auth-user".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-low-auth".to_string(),
+                    resolved_policy_hash: policy_hash,
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 3, // High risk tier
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: Some(receipt),
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-DELEGATED-LOWAUTH".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-DELEGATED-LOWAUTH".to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for insufficient authority"
+                    );
+                    assert!(
+                        err.message.contains("consumption binding failed")
+                            || err.message.contains("DelegationWidening")
+                            || err.message.contains("authority"),
+                        "Error should mention consumption binding failure or authority: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected rejection for low-authority receipt with high risk tier, got: {other:?}"
+                ),
+            }
+        }
+
         /// TCK-00373: Policy root mismatch between receipt and claim's
         /// resolved policy hash => MUST reject.
         #[test]
@@ -25475,6 +25684,254 @@ mod tests {
                 other => panic!(
                     "Expected rejection for policy root mismatch in delegated path, got: {other:?}"
                 ),
+            }
+        }
+
+        /// TCK-00373 MAJOR 1: End-to-end claim->spawn success using
+        /// `PermeabilityReceiptResolver` wiring.
+        ///
+        /// A dynamic resolver builds a valid receipt at claim-time using
+        /// the actual `resolved_policy_hash` and `actor_id` provided by
+        /// the claim handler. The subsequent `SpawnEpisode` carries the
+        /// receipt hash and the delegated gate passes. This proves the
+        /// production path is wired (non-dead code) and that claim-level
+        /// receipt binding flows into the spawn gate.
+        #[test]
+        fn claim_to_spawn_delegated_success_via_resolver() {
+            use std::sync::{Arc, Mutex};
+
+            use apm2_core::policy::permeability::{
+                AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+                PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+            };
+
+            // Dynamic resolver: builds a receipt at resolve time using
+            // the actual policy hash from the governance stub. This avoids
+            // the chicken-and-egg problem of needing the policy hash before
+            // ClaimWork generates it.
+            struct DynamicReceiptResolver {
+                /// Capture the built receipt so the test can read the hash.
+                built_receipt: Mutex<Option<apm2_core::policy::permeability::PermeabilityReceipt>>,
+            }
+
+            impl PermeabilityReceiptResolver for DynamicReceiptResolver {
+                fn resolve_receipt(
+                    &self,
+                    actor_id: &str,
+                    _work_id: &str,
+                    resolved_policy_hash: &[u8; 32],
+                ) -> Result<Option<apm2_core::policy::permeability::PermeabilityReceipt>, String>
+                {
+                    let parent = AuthorityVector::top();
+                    // Authority that satisfies tier-0 ceiling.
+                    let overlay = AuthorityVector::new(
+                        RiskLevel::Low,
+                        CapabilityLevel::ReadOnly,
+                        BudgetLevel::Capped(1_000_000),
+                        StopPredicateLevel::Inherit,
+                        TaintCeiling::Attested,
+                        ClassificationLevel::Confidential,
+                    );
+                    let receipt =
+                        PermeabilityReceiptBuilder::new("resolver-e2e-receipt", parent, overlay)
+                            .delegator_actor_id("root-delegator")
+                            .delegate_actor_id(actor_id)
+                            .issued_at_ms(1_000_000)
+                            .expires_at_ms(u64::MAX / 2)
+                            .policy_root_hash(*resolved_policy_hash)
+                            .build()
+                            .map_err(|e| format!("receipt build failed: {e}"))?;
+
+                    *self.built_receipt.lock().unwrap() = Some(receipt.clone());
+                    Ok(Some(receipt))
+                }
+            }
+
+            let resolver = Arc::new(DynamicReceiptResolver {
+                built_receipt: Mutex::new(None),
+            });
+
+            let resolver_dyn: Arc<dyn PermeabilityReceiptResolver> = resolver;
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_permeability_receipt_resolver(Arc::clone(&resolver_dyn));
+            let ctx = priv_ctx();
+
+            // Step 1: ClaimWork -- resolver dynamically builds and attaches receipt
+            let claim_request = ClaimWorkRequest {
+                actor_id: "delegated-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            };
+
+            // Verify the claim now carries the receipt
+            let stored_claim = dispatcher.work_registry.get_claim(&work_id).unwrap();
+            assert!(
+                stored_claim.permeability_receipt.is_some(),
+                "Claim MUST carry permeability_receipt after resolver wiring"
+            );
+
+            // Get the receipt hash from the stored claim for the spawn request
+            let receipt_hash_vec = stored_claim
+                .permeability_receipt
+                .as_ref()
+                .unwrap()
+                .content_hash()
+                .to_vec();
+
+            // Step 2: SpawnEpisode with receipt hash
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash_vec),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+            // The delegated gate should pass. The response may be a later-stage
+            // error (e.g., scope baseline) but NOT a permeability rejection.
+            match spawn_response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        !err.message.contains("permeability"),
+                        "Delegated gate should pass for valid resolver-wired claim, \
+                         but got permeability error: {}",
+                        err.message
+                    );
+                },
+                PrivilegedResponse::SpawnEpisode(_) => {
+                    // Full success is also acceptable.
+                },
+                other => {
+                    panic!("Unexpected response type: {other:?}");
+                },
+            }
+        }
+
+        /// TCK-00373 MAJOR 1 (failure path): When the receipt resolver
+        /// returns an error during `ClaimWork`, the claim MUST be rejected
+        /// (fail-closed).
+        #[test]
+        fn claim_rejected_when_receipt_resolver_fails() {
+            use std::sync::Arc;
+
+            struct FailingReceiptResolver;
+            impl PermeabilityReceiptResolver for FailingReceiptResolver {
+                fn resolve_receipt(
+                    &self,
+                    _actor_id: &str,
+                    _work_id: &str,
+                    _resolved_policy_hash: &[u8; 32],
+                ) -> Result<Option<apm2_core::policy::permeability::PermeabilityReceipt>, String>
+                {
+                    Err("governance store unavailable (simulated)".to_string())
+                }
+            }
+
+            let resolver = Arc::new(FailingReceiptResolver);
+            let dispatcher =
+                PrivilegedDispatcher::new().with_permeability_receipt_resolver(resolver);
+            let ctx = priv_ctx();
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor-fail".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            match claim_response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for resolver failure"
+                    );
+                    assert!(
+                        err.message
+                            .contains("permeability receipt resolution failed")
+                            || err.message.contains("governance store unavailable"),
+                        "Error should mention resolution failure: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected claim rejection when resolver fails, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00373 BLOCKER 1: Invalid risk tier (out of range 0-4) MUST
+        /// be rejected fail-closed, not mapped to a permissive ceiling.
+        #[test]
+        fn invalid_risk_tier_rejected_fail_closed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = priv_ctx();
+
+            let policy_hash = [0xFF; 32];
+            let receipt = build_test_receipt("actor:invalid-tier", policy_hash);
+            let receipt_hash = receipt.content_hash().to_vec();
+
+            let claim = WorkClaim {
+                work_id: "W-DELEGATED-BADTIER".to_string(),
+                lease_id: "L-DELEGATED-BADTIER".to_string(),
+                actor_id: "actor:invalid-tier".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-bad-tier".to_string(),
+                    resolved_policy_hash: policy_hash,
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 255, // Invalid!
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: Some(receipt),
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-DELEGATED-BADTIER".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-DELEGATED-BADTIER".to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for invalid risk tier"
+                    );
+                    assert!(
+                        err.message.contains("invalid resolved_risk_tier")
+                            || err.message.contains("fail-closed deny"),
+                        "Error should mention invalid risk tier: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected rejection for invalid risk tier, got: {other:?}"),
             }
         }
     }

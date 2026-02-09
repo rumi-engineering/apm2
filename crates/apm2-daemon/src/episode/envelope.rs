@@ -1607,8 +1607,9 @@ impl EpisodeEnvelopeV1 {
         // caller-controlled value.
         let policy_root = self.derive_policy_root_hash()?;
 
-        // Derive authority ceiling from the envelope's risk tier.
-        let authority_ceiling = self.derive_authority_ceiling();
+        // Derive authority ceiling from the envelope's risk tier using
+        // the canonical mapping. Invalid tiers are fail-closed.
+        let authority_ceiling = self.derive_authority_ceiling()?;
 
         let ctx = apm2_core::policy::permeability::ConsumptionContext {
             actor_id: self.inner.actor_id(),
@@ -1658,38 +1659,27 @@ impl EpisodeEnvelopeV1 {
         Err(EnvelopeV1Error::MissingPolicyRootDerivation)
     }
 
-    /// Derives an authority ceiling from the envelope's risk tier.
+    /// Derives an authority ceiling from the envelope's risk tier using the
+    /// canonical mapping in
+    /// [`apm2_core::policy::permeability::authority_ceiling_for_risk_tier`].
     ///
     /// The risk tier constrains the maximum authority that can be
     /// consumed in this envelope context. Higher tiers allow wider
     /// authority ceilings.
-    const fn derive_authority_ceiling(&self) -> apm2_core::policy::permeability::AuthorityVector {
-        use apm2_core::policy::permeability::{
-            AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel, RiskLevel,
-            StopPredicateLevel, TaintCeiling,
-        };
-
-        match self.inner.risk_tier() {
-            RiskTier::Tier0 => AuthorityVector::new(
-                RiskLevel::Low,
-                CapabilityLevel::ReadOnly,
-                BudgetLevel::Capped(1_000_000),
-                StopPredicateLevel::Inherit,
-                TaintCeiling::Attested,
-                ClassificationLevel::Confidential,
-            ),
-            RiskTier::Tier1 => AuthorityVector::new(
-                RiskLevel::Med,
-                CapabilityLevel::ReadWrite,
-                BudgetLevel::Capped(10_000_000),
-                StopPredicateLevel::Extend,
-                TaintCeiling::Untrusted,
-                ClassificationLevel::Secret,
-            ),
-            // Tier2+ get full authority ceiling — the receipt's
-            // delegated authority is the binding constraint.
-            RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4 => AuthorityVector::top(),
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeV1Error::InvalidRiskTier`] if the envelope's risk
+    /// tier value is outside the valid `[0, 4]` range (fail-closed).
+    fn derive_authority_ceiling(
+        &self,
+    ) -> Result<apm2_core::policy::permeability::AuthorityVector, EnvelopeV1Error> {
+        let tier_u8 = self.inner.risk_tier().tier();
+        apm2_core::policy::permeability::authority_ceiling_for_risk_tier(tier_u8).ok_or_else(|| {
+            EnvelopeV1Error::InnerEnvelopeError(EnvelopeError::InvalidRiskTier {
+                value: u32::from(tier_u8),
+            })
+        })
     }
 }
 
