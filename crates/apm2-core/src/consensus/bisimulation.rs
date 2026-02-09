@@ -111,6 +111,30 @@ pub enum BisimulationError {
         max: usize,
     },
 
+    /// The initial state does not exist in the states map.
+    #[error("initial state {initial_state} does not exist in states map ({state_count} state(s))")]
+    InvalidInitialState {
+        /// The initial state that was referenced.
+        initial_state: StateId,
+        /// The number of states in the map.
+        state_count: usize,
+    },
+
+    /// A state has nondeterministic transitions (multiple transitions with the
+    /// same label).
+    #[error(
+        "nondeterministic LTS: state {state} has {count} transitions with label `{label}` \
+         (max 1 per label)"
+    )]
+    NondeterministicTransitions {
+        /// The state with duplicate-label transitions.
+        state: StateId,
+        /// The duplicated operation label.
+        label: String,
+        /// The number of transitions with that label.
+        count: usize,
+    },
+
     /// Internal error during bisimulation checking.
     #[error("internal error: {0}")]
     Internal(String),
@@ -300,6 +324,10 @@ impl ObservableSemantics {
         operation: HsiOperation,
         target: StateId,
     ) -> Result<(), BisimulationError> {
+        // Defense-in-depth: validate string lengths at every entry point,
+        // not only during post-deserialization validate().
+        operation.validate_string_lengths()?;
+
         // Validate target state exists (fail-closed on dangling targets).
         if !self.states.contains_key(&target) {
             return Err(BisimulationError::InvalidComposition(format!(
@@ -350,18 +378,32 @@ impl ObservableSemantics {
     ///
     /// Because `ObservableSemantics` derives `Deserialize`, an attacker could
     /// craft a payload that bypasses the runtime checks in [`Self::add_state`]
-    /// and [`Self::add_transition`]. This method enforces the same bounds on deserialized
-    /// (or otherwise externally-constructed) instances:
+    /// and [`Self::add_transition`]. This method enforces the same bounds on
+    /// deserialized (or otherwise externally-constructed) instances:
     ///
+    /// - `initial_state` exists in `states` (prevents false PASS on empty-slice
+    ///   transitions)
     /// - Total state count <= [`MAX_TOTAL_STATES`]
     /// - Transitions per state <= [`MAX_TRANSITIONS_PER_STATE`]
     /// - All string fields in [`HsiOperation`] labels <= [`MAX_STRING_LENGTH`]
+    /// - Deterministic LTS: at most one transition per label per state
     /// - Graph integrity (no dangling targets)
     ///
     /// # Errors
     ///
     /// Returns the first violated invariant as a [`BisimulationError`].
     pub fn validate(&self) -> Result<(), BisimulationError> {
+        // BLOCKER-1: verify that initial_state exists in the states map.
+        // A crafted deserialized input with a nonexistent initial_state would
+        // cause transitions(initial_state) to return an empty slice, making
+        // bisimulation trivially pass (false PASS).
+        if !self.states.contains_key(&self.initial_state) {
+            return Err(BisimulationError::InvalidInitialState {
+                initial_state: self.initial_state,
+                state_count: self.states.len(),
+            });
+        }
+
         // Bound: total state count
         if self.states.len() > MAX_TOTAL_STATES {
             return Err(BisimulationError::StateSpaceExhausted {
@@ -382,6 +424,25 @@ impl ObservableSemantics {
             // Bound: string field lengths in operation labels
             for tr in transitions {
                 tr.operation.validate_string_lengths()?;
+            }
+
+            // Quality BLOCKER-1: reject nondeterministic LTS.
+            // The bisimulation checker pairs targets positionally when
+            // multiple transitions share the same label. This is only
+            // correct for deterministic LTS (at most one transition per
+            // label per state). Reject nondeterministic inputs so the
+            // positional pairing is correct by construction.
+            let mut label_counts: BTreeMap<&HsiOperation, usize> = BTreeMap::new();
+            for tr in transitions {
+                let count = label_counts.entry(&tr.operation).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    return Err(BisimulationError::NondeterministicTransitions {
+                        state: state_id,
+                        label: tr.operation.to_string(),
+                        count: *count,
+                    });
+                }
             }
         }
 
@@ -568,6 +629,11 @@ impl BisimulationChecker {
         lhs: &ObservableSemantics,
         rhs: &ObservableSemantics,
     ) -> Result<BisimulationResult, BisimulationError> {
+        // MAJOR-2: validate inputs at every public entry point so direct
+        // callers cannot bypass bounds checks.
+        lhs.validate()?;
+        rhs.validate()?;
+
         let mut relation: std::collections::HashSet<(StateId, StateId)> =
             std::collections::HashSet::new();
         let mut worklist: Vec<(StateId, StateId)> = Vec::new();
@@ -663,6 +729,10 @@ impl BisimulationChecker {
         nested: &ObservableSemantics,
         depth: usize,
     ) -> Result<BisimulationResult, BisimulationError> {
+        // MAJOR-2: validate inputs at every public entry point so direct
+        // callers cannot bypass bounds checks.
+        nested.validate()?;
+
         if depth > self.max_depth {
             return Err(BisimulationError::DepthExceeded {
                 depth,
@@ -1414,14 +1484,14 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn test_bisimulation_detects_divergent_duplicate_label_branches() {
-        // Regression test for soundness gap: when both sides have
-        // transitions with the same label but different target counts,
-        // the checker must detect the mismatch.
+    fn test_checker_rejects_nondeterministic_lhs() {
+        // Quality BLOCKER-1: the checker now calls validate() which rejects
+        // nondeterministic LTS (multiple transitions with the same label
+        // from the same state). This ensures the positional pairing in
+        // the bisimulation algorithm is correct by construction.
         let checker = BisimulationChecker::new(12).unwrap();
 
-        // LHS: state 0 --spawn(0)--> state 1
-        //      state 0 --spawn(0)--> state 2  (duplicate label, two branches)
+        // LHS: state 0 has two spawn(0) transitions (nondeterministic)
         let mut lhs = ObservableSemantics::new(0);
         let l1 = lhs.add_state().unwrap();
         let l2 = lhs.add_state().unwrap();
@@ -1429,83 +1499,26 @@ mod tests {
             .unwrap();
         lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l2)
             .unwrap();
-        // l1 stops, l2 escalates -- observably different successors
-        let l1_stop = lhs.add_state().unwrap();
-        lhs.add_transition(
-            l1,
-            HsiOperation::Stop {
-                kind: StopKind::GoalSatisfied,
-            },
-            l1_stop,
-        )
-        .unwrap();
-        let l2_esc = lhs.add_state().unwrap();
-        lhs.add_transition(
-            l2,
-            HsiOperation::Escalate {
-                reason: "overload".to_string(),
-            },
-            l2_esc,
-        )
-        .unwrap();
 
-        // RHS: state 0 --spawn(0)--> state 1  (only ONE branch)
-        let mut rhs = ObservableSemantics::new(0);
-        let r1 = rhs.add_state().unwrap();
-        rhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, r1)
-            .unwrap();
-        let r1_stop = rhs.add_state().unwrap();
-        rhs.add_transition(
-            r1,
-            HsiOperation::Stop {
-                kind: StopKind::GoalSatisfied,
-            },
-            r1_stop,
-        )
-        .unwrap();
+        let rhs = ObservableSemantics::new(0);
 
-        let result = checker.check(&lhs, &rhs).unwrap();
+        let err = checker.check(&lhs, &rhs).unwrap_err();
         assert!(
-            !result.passed(),
-            "Divergent duplicate-label branches must be detected as non-bisimilar"
+            matches!(
+                err,
+                BisimulationError::NondeterministicTransitions { state: 0, .. }
+            ),
+            "Nondeterministic LTS must be rejected: {err}"
         );
     }
 
     #[test]
-    fn test_bisimulation_same_label_same_count_different_targets() {
-        // Both sides have two spawn(0) transitions, but with observably
-        // different successor behavior.
+    fn test_checker_rejects_nondeterministic_rhs() {
+        // Same as above but the nondeterminism is on the RHS.
         let checker = BisimulationChecker::new(12).unwrap();
 
-        // LHS: 0 --spawn(0)--> 1 (stops), 0 --spawn(0)--> 2 (escalates)
-        let mut lhs = ObservableSemantics::new(0);
-        let l1 = lhs.add_state().unwrap();
-        let l2 = lhs.add_state().unwrap();
-        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l1)
-            .unwrap();
-        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l2)
-            .unwrap();
-        let l1_stop = lhs.add_state().unwrap();
-        lhs.add_transition(
-            l1,
-            HsiOperation::Stop {
-                kind: StopKind::GoalSatisfied,
-            },
-            l1_stop,
-        )
-        .unwrap();
-        let l2_esc = lhs.add_state().unwrap();
-        lhs.add_transition(
-            l2,
-            HsiOperation::Escalate {
-                reason: "err".to_string(),
-            },
-            l2_esc,
-        )
-        .unwrap();
+        let lhs = ObservableSemantics::new(0);
 
-        // RHS: 0 --spawn(0)--> 1 (escalates), 0 --spawn(0)--> 2 (stops)
-        // Same labels and count, but reversed target behavior.
         let mut rhs = ObservableSemantics::new(0);
         let r1 = rhs.add_state().unwrap();
         let r2 = rhs.add_state().unwrap();
@@ -1513,73 +1526,68 @@ mod tests {
             .unwrap();
         rhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, r2)
             .unwrap();
-        let r1_esc = rhs.add_state().unwrap();
-        rhs.add_transition(
-            r1,
-            HsiOperation::Escalate {
-                reason: "err".to_string(),
-            },
-            r1_esc,
-        )
-        .unwrap();
-        let r2_stop = rhs.add_state().unwrap();
-        rhs.add_transition(
-            r2,
-            HsiOperation::Stop {
-                kind: StopKind::GoalSatisfied,
-            },
-            r2_stop,
-        )
-        .unwrap();
 
-        // Positional matching pairs (l1,r1) and (l2,r2). l1 stops but
-        // r1 escalates, so the checker should detect the mismatch.
-        let result = checker.check(&lhs, &rhs).unwrap();
+        let err = checker.check(&lhs, &rhs).unwrap_err();
         assert!(
-            !result.passed(),
-            "Same-label transitions with positionally divergent targets must fail"
+            matches!(
+                err,
+                BisimulationError::NondeterministicTransitions { state: 0, .. }
+            ),
+            "Nondeterministic LTS must be rejected: {err}"
         );
     }
 
     #[test]
-    fn test_bisimulation_duplicate_labels_identical_targets_pass() {
-        // Both sides have identical duplicate-label structure: should pass.
-        let checker = BisimulationChecker::new(12).unwrap();
-
-        // Both: 0 --spawn(0)--> 1, 0 --spawn(0)--> 2
-        //       1 --stop--> 3,  2 --stop--> 4
-        let mut lhs = ObservableSemantics::new(0);
-        let l1 = lhs.add_state().unwrap();
-        let l2 = lhs.add_state().unwrap();
-        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l1)
+    fn test_validate_rejects_nondeterministic_lts() {
+        // Directly test validate() on a nondeterministic LTS constructed
+        // programmatically (add_transition allows it; only validate rejects).
+        let mut semantics = ObservableSemantics::new(0);
+        let s1 = semantics.add_state().unwrap();
+        let s2 = semantics.add_state().unwrap();
+        semantics
+            .add_transition(0, HsiOperation::Spawn { depth: 0 }, s1)
             .unwrap();
-        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l2)
+        semantics
+            .add_transition(0, HsiOperation::Spawn { depth: 0 }, s2)
             .unwrap();
-        let l3 = lhs.add_state().unwrap();
-        let l4 = lhs.add_state().unwrap();
-        lhs.add_transition(
-            l1,
-            HsiOperation::Stop {
-                kind: StopKind::GoalSatisfied,
-            },
-            l3,
-        )
-        .unwrap();
-        lhs.add_transition(
-            l2,
-            HsiOperation::Stop {
-                kind: StopKind::GoalSatisfied,
-            },
-            l4,
-        )
-        .unwrap();
 
-        let rhs = lhs.clone();
-
-        let result = checker.check(&lhs, &rhs).unwrap();
+        let err = semantics.validate().unwrap_err();
         assert!(
-            result.passed(),
-            "Identical duplicate-label structures must be bisimilar"
+            matches!(
+                err,
+                BisimulationError::NondeterministicTransitions {
+                    state: 0,
+                    count: 2,
+                    ..
+                }
+            ),
+            "Nondeterministic LTS must be rejected by validate(): {err}"
+        );
+    }
+
+    #[test]
+    fn test_deterministic_distinct_labels_pass_validation() {
+        // A state with multiple transitions is fine as long as each has
+        // a distinct label.
+        let mut semantics = ObservableSemantics::new(0);
+        let s1 = semantics.add_state().unwrap();
+        let s2 = semantics.add_state().unwrap();
+        semantics
+            .add_transition(0, HsiOperation::Spawn { depth: 0 }, s1)
+            .unwrap();
+        semantics
+            .add_transition(
+                0,
+                HsiOperation::Execute {
+                    output_tag: "ok".to_string(),
+                },
+                s2,
+            )
+            .unwrap();
+
+        assert!(
+            semantics.validate().is_ok(),
+            "Deterministic LTS with distinct labels must pass validation"
         );
     }
 
@@ -2013,10 +2021,12 @@ mod tests {
     #[test]
     fn test_validate_rejects_oversized_transitions_per_state() {
         // Construct a state with more transitions than MAX_TRANSITIONS_PER_STATE.
+        // Use distinct labels (different depths) so the nondeterminism check
+        // does not fire before the transitions-per-state bound.
         let mut transitions = Vec::new();
-        for _ in 0..=MAX_TRANSITIONS_PER_STATE {
+        for i in 0..=MAX_TRANSITIONS_PER_STATE {
             transitions.push(Transition {
-                operation: HsiOperation::Spawn { depth: 0 },
+                operation: HsiOperation::Spawn { depth: i },
                 target: 0,
             });
         }
@@ -2043,20 +2053,26 @@ mod tests {
     #[test]
     fn test_validate_rejects_oversized_output_tag() {
         let long_tag = "x".repeat(MAX_STRING_LENGTH + 1);
-        let mut semantics = ObservableSemantics::new(0);
-        let s1 = semantics.add_state().unwrap();
-        // Bypass validation by directly constructing via serde round-trip
-        // after adding the transition (add_transition does not check string
-        // lengths, so this simulates deserialized data).
-        semantics
-            .add_transition(
-                0,
-                HsiOperation::Execute {
+        // add_transition now validates string lengths (MAJOR-1), so we
+        // must bypass it via serde round-trip to simulate deserialized data.
+        let mut states = BTreeMap::new();
+        states.insert(
+            0u64,
+            vec![Transition {
+                operation: HsiOperation::Execute {
                     output_tag: long_tag,
                 },
-                s1,
-            )
-            .unwrap();
+                target: 1,
+            }],
+        );
+        states.insert(1, Vec::new());
+        let json = serde_json::to_string(&ObservableSemantics {
+            states,
+            initial_state: 0,
+            depth: 0,
+        })
+        .unwrap();
+        let semantics: ObservableSemantics = serde_json::from_str(&json).unwrap();
 
         let err = semantics.validate().unwrap_err();
         assert!(
@@ -2068,17 +2084,26 @@ mod tests {
     #[test]
     fn test_validate_rejects_oversized_reason() {
         let long_reason = "r".repeat(MAX_STRING_LENGTH + 1);
-        let mut semantics = ObservableSemantics::new(0);
-        let s1 = semantics.add_state().unwrap();
-        semantics
-            .add_transition(
-                0,
-                HsiOperation::Escalate {
+        // add_transition now validates string lengths (MAJOR-1), so we
+        // must bypass it via serde round-trip to simulate deserialized data.
+        let mut states = BTreeMap::new();
+        states.insert(
+            0u64,
+            vec![Transition {
+                operation: HsiOperation::Escalate {
                     reason: long_reason,
                 },
-                s1,
-            )
-            .unwrap();
+                target: 1,
+            }],
+        );
+        states.insert(1, Vec::new());
+        let json = serde_json::to_string(&ObservableSemantics {
+            states,
+            initial_state: 0,
+            depth: 0,
+        })
+        .unwrap();
+        let semantics: ObservableSemantics = serde_json::from_str(&json).unwrap();
 
         let err = semantics.validate().unwrap_err();
         assert!(
@@ -2106,6 +2131,109 @@ mod tests {
             .unwrap();
 
         assert!(semantics.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_missing_initial_state() {
+        // BLOCKER-1 regression: a crafted deserialized input with an
+        // initial_state that doesn't exist in the states map must be
+        // rejected. Without this check, transitions(initial_state)
+        // returns an empty slice, causing false PASS in bisimulation.
+        let mut states = BTreeMap::new();
+        states.insert(0u64, Vec::new());
+        let json = serde_json::to_string(&ObservableSemantics {
+            states,
+            initial_state: 999_999,
+            depth: 0,
+        })
+        .unwrap();
+        let semantics: ObservableSemantics = serde_json::from_str(&json).unwrap();
+
+        let err = semantics.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BisimulationError::InvalidInitialState {
+                    initial_state: 999_999,
+                    ..
+                }
+            ),
+            "Missing initial state must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_checker_rejects_missing_initial_state_via_check() {
+        // BLOCKER-1 + MAJOR-2 regression: check() must call validate()
+        // and reject inputs with nonexistent initial_state.
+        let checker = BisimulationChecker::new(12).unwrap();
+        let valid = ObservableSemantics::new(0);
+
+        // Construct an invalid LTS via serde with initial_state=42
+        let mut states = BTreeMap::new();
+        states.insert(0u64, Vec::new());
+        let json = serde_json::to_string(&ObservableSemantics {
+            states,
+            initial_state: 42,
+            depth: 0,
+        })
+        .unwrap();
+        let invalid: ObservableSemantics = serde_json::from_str(&json).unwrap();
+
+        let err = checker.check(&valid, &invalid).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BisimulationError::InvalidInitialState {
+                    initial_state: 42,
+                    ..
+                }
+            ),
+            "check() must reject invalid initial_state via validate(): {err}"
+        );
+    }
+
+    #[test]
+    fn test_add_transition_rejects_oversized_output_tag() {
+        // MAJOR-1: add_transition now validates string lengths as
+        // defense-in-depth, not just validate().
+        let mut semantics = ObservableSemantics::new(0);
+        let s1 = semantics.add_state().unwrap();
+        let long_tag = "x".repeat(MAX_STRING_LENGTH + 1);
+        let err = semantics
+            .add_transition(
+                0,
+                HsiOperation::Execute {
+                    output_tag: long_tag,
+                },
+                s1,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { ref field, .. } if field == "output_tag"),
+            "add_transition must reject oversized output_tag: {err}"
+        );
+    }
+
+    #[test]
+    fn test_add_transition_rejects_oversized_reason() {
+        // MAJOR-1: add_transition now validates string lengths.
+        let mut semantics = ObservableSemantics::new(0);
+        let s1 = semantics.add_state().unwrap();
+        let long_reason = "r".repeat(MAX_STRING_LENGTH + 1);
+        let err = semantics
+            .add_transition(
+                0,
+                HsiOperation::Escalate {
+                    reason: long_reason,
+                },
+                s1,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, BisimulationError::StringTooLong { ref field, .. } if field == "reason"),
+            "add_transition must reject oversized reason: {err}"
+        );
     }
 
     #[test]
@@ -2140,20 +2268,29 @@ mod tests {
     fn test_promotion_gate_rejects_oversized_deserialized_semantics() {
         // End-to-end: PromotionGate::evaluate must reject compositions
         // with oversized string fields via validate() before processing.
+        // add_transition now validates string lengths (MAJOR-1), so we
+        // must bypass it via serde round-trip to simulate deserialized data.
         let gate = PromotionGate::new(1).unwrap();
 
         let long_tag = "x".repeat(MAX_STRING_LENGTH + 1);
-        let mut semantics = ObservableSemantics::new(1);
-        let s1 = semantics.add_state().unwrap();
-        semantics
-            .add_transition(
-                0,
-                HsiOperation::Execute {
+        let mut states = BTreeMap::new();
+        states.insert(
+            0u64,
+            vec![Transition {
+                operation: HsiOperation::Execute {
                     output_tag: long_tag,
                 },
-                s1,
-            )
-            .unwrap();
+                target: 1,
+            }],
+        );
+        states.insert(1, Vec::new());
+        let json = serde_json::to_string(&ObservableSemantics {
+            states,
+            initial_state: 0,
+            depth: 1,
+        })
+        .unwrap();
+        let semantics: ObservableSemantics = serde_json::from_str(&json).unwrap();
 
         let result = gate.evaluate(&[semantics]);
         assert!(result.is_err(), "Gate must reject oversized string fields");
