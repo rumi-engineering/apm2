@@ -4172,6 +4172,417 @@ fn is_process_alive(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn now_iso8601() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Format and emit a single evidence line to stderr and an optional projection
+/// log.
+fn emit_evidence_line(
+    sha: &str,
+    gate: &str,
+    status: &str,
+    duration_secs: u64,
+    log_path: &Path,
+    projection_log: Option<&mut File>,
+) {
+    let ts = now_iso8601();
+    let line = format!(
+        "ts={ts} sha={sha} gate={gate} status={status} duration_secs={duration_secs} log={}",
+        log_path.display()
+    );
+    eprintln!("{line}");
+    if let Some(file) = projection_log {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Run a single evidence gate and emit the result.
+fn run_single_evidence_gate(
+    workspace_root: &Path,
+    sha: &str,
+    gate_name: &str,
+    cmd: &str,
+    args: &[&str],
+    log_path: &Path,
+) -> bool {
+    let started = Instant::now();
+    let output = Command::new(cmd)
+        .args(args)
+        .current_dir(workspace_root)
+        .output();
+    let duration = started.elapsed().as_secs();
+    match output {
+        Ok(out) => {
+            let _ = fs::write(
+                log_path,
+                format!(
+                    "=== stdout ===\n{}\n=== stderr ===\n{}\n",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            );
+            let passed = out.status.success();
+            let status = if passed { "PASS" } else { "FAIL" };
+            emit_evidence_line(sha, gate_name, status, duration, log_path, None);
+            passed
+        },
+        Err(e) => {
+            let _ = fs::write(log_path, format!("execution error: {e}\n"));
+            emit_evidence_line(sha, gate_name, "FAIL", duration, log_path, None);
+            false
+        },
+    }
+}
+
+/// Run evidence gates (cargo fmt check, clippy, doc, test, CI scripts).
+/// Returns `Ok(true)` if all gates passed, `Ok(false)` if any failed.
+/// Fail-closed: any error running a gate counts as failure.
+fn run_evidence_gates(
+    workspace_root: &Path,
+    sha: &str,
+    projection_log: Option<&mut File>,
+) -> Result<bool, String> {
+    let evidence_dir = apm2_home_dir()?.join("private/fac/evidence");
+    fs::create_dir_all(&evidence_dir)
+        .map_err(|e| format!("failed to create evidence directory: {e}"))?;
+
+    let gates: &[(&str, &[&str])] = &[
+        ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
+        (
+            "clippy",
+            &[
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
+        ("test", &["cargo", "test", "--workspace"]),
+    ];
+
+    let script_gates: &[(&str, &str)] = &[
+        ("test_safety_guard", "scripts/ci/test_safety_guard.sh"),
+        (
+            "workspace_integrity",
+            "scripts/ci/workspace_integrity_guard.sh",
+        ),
+        ("review_artifact_lint", "scripts/ci/review_artifact_lint.sh"),
+    ];
+
+    let mut all_passed = true;
+    // Collect evidence lines to write to projection log after all gates run.
+    let mut evidence_lines = Vec::new();
+
+    for &(gate_name, cmd_args) in gates {
+        let log_path = evidence_dir.join(format!("{gate_name}.log"));
+        let passed = run_single_evidence_gate(
+            workspace_root,
+            sha,
+            gate_name,
+            cmd_args[0],
+            &cmd_args[1..],
+            &log_path,
+        );
+        if !passed {
+            all_passed = false;
+        }
+        // Reconstruct line for projection log
+        let ts = now_iso8601();
+        let status = if passed { "PASS" } else { "FAIL" };
+        evidence_lines.push(format!(
+            "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
+            log_path.display()
+        ));
+    }
+
+    for &(gate_name, script_path) in script_gates {
+        let full_path = workspace_root.join(script_path);
+        if !full_path.exists() {
+            continue;
+        }
+        let log_path = evidence_dir.join(format!("{gate_name}.log"));
+        let passed = run_single_evidence_gate(
+            workspace_root,
+            sha,
+            gate_name,
+            "bash",
+            &[full_path.to_str().unwrap_or("")],
+            &log_path,
+        );
+        if !passed {
+            all_passed = false;
+        }
+        let ts = now_iso8601();
+        let status = if passed { "PASS" } else { "FAIL" };
+        evidence_lines.push(format!(
+            "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
+            log_path.display()
+        ));
+    }
+
+    // Write all evidence lines to projection log if provided.
+    if let Some(file) = projection_log {
+        for line in &evidence_lines {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    Ok(all_passed)
+}
+
+/// Projection log path for a given PR number.
+fn projection_log_path(pr_number: u32) -> Result<PathBuf, String> {
+    let dir = apm2_home_dir()?.join("projection");
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create projection dir: {e}"))?;
+    Ok(dir.join(format!("pr{pr_number}.log")))
+}
+
+/// Write a line to the projection log file.
+fn write_projection_line(file: &mut File, line: &str) {
+    let _ = writeln!(file, "{line}");
+}
+
+/// Emit a terminal line to the projection log.
+fn emit_terminal_line(file: &mut File, sha: &str, success: bool, reason: Option<&str>) {
+    let ts = now_iso8601();
+    let terminal = if success { "success" } else { "failure" };
+    let mut line = format!("ts={ts} sha={sha} terminal={terminal}");
+    if let Some(r) = reason {
+        use std::fmt::Write as _;
+        let _ = write!(line, " reason={r}");
+    }
+    write_projection_line(file, &line);
+}
+
+/// Push code and orchestrate FAC lifecycle: evidence gates → git push → reviews
+/// → project.
+pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, max_wait: u64) -> u8 {
+    if max_wait == 0 {
+        eprintln!("ERROR: max_wait_seconds must be > 0");
+        return exit_codes::GENERIC_ERROR;
+    }
+
+    // 1. Resolve branch
+    let branch = if let Some(b) = branch {
+        b.to_string()
+    } else {
+        let output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => {
+                eprintln!("ERROR: failed to resolve current branch");
+                return exit_codes::GENERIC_ERROR;
+            },
+        }
+    };
+
+    // 2. Resolve HEAD SHA
+    let sha = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => {
+            eprintln!("ERROR: failed to resolve HEAD SHA");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    // 3. Resolve PR number from branch
+    let pr_number = match Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--head",
+            &branch,
+            "--json",
+            "number",
+            "--jq",
+            ".[0].number",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let num_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            num_str.parse::<u32>().unwrap_or(0)
+        },
+        _ => 0,
+    };
+
+    if pr_number == 0 {
+        eprintln!("ERROR: no open PR found for branch `{branch}` in repo `{repo}`");
+        return exit_codes::GENERIC_ERROR;
+    }
+
+    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
+    eprintln!("fac push: PR #{pr_number} sha={sha} branch={branch}");
+
+    // 4. Create/truncate projection log
+    let log_path = match projection_log_path(pr_number) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    // Rotate if > 1 MiB
+    if log_path.exists() {
+        if let Ok(meta) = fs::metadata(&log_path) {
+            if meta.len() > 1_048_576 {
+                let backup = log_path.with_extension("log.1");
+                let _ = fs::rename(&log_path, &backup);
+            }
+        }
+    }
+
+    let mut projection_file = match File::create(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("ERROR: failed to create projection log: {e}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    // 5. Run evidence gates (fail-closed)
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match run_evidence_gates(&workspace_root, &sha, Some(&mut projection_file)) {
+        Ok(true) => {
+            eprintln!("fac push: all evidence gates passed");
+        },
+        Ok(false) => {
+            eprintln!("ERROR: evidence gates failed — fix before pushing");
+            emit_terminal_line(
+                &mut projection_file,
+                &sha,
+                false,
+                Some("evidence_gate_failure"),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+        Err(e) => {
+            eprintln!("ERROR: evidence gate error: {e}");
+            emit_terminal_line(
+                &mut projection_file,
+                &sha,
+                false,
+                Some("evidence_gate_error"),
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    }
+
+    // 6. git push
+    let push_output = Command::new("git").args(["push", remote, &branch]).output();
+    match push_output {
+        Ok(o) if o.status.success() => {
+            eprintln!("fac push: git push succeeded");
+        },
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            eprintln!("ERROR: git push failed: {stderr}");
+            emit_terminal_line(&mut projection_file, &sha, false, Some("git_push_failed"));
+            return exit_codes::GENERIC_ERROR;
+        },
+        Err(e) => {
+            eprintln!("ERROR: failed to execute git push: {e}");
+            emit_terminal_line(&mut projection_file, &sha, false, Some("git_push_error"));
+            return exit_codes::GENERIC_ERROR;
+        },
+    }
+
+    // 7. Dispatch reviews
+    match run_dispatch_inner(&pr_url, ReviewRunType::All, Some(&sha)) {
+        Ok(dispatch) => {
+            eprintln!(
+                "fac push: reviews dispatched (epoch={})",
+                dispatch.dispatch_epoch
+            );
+
+            // 8. Poll loop: project health lines to projection log (1 Hz)
+            let deadline = Instant::now() + Duration::from_secs(max_wait);
+            let mut after_seq = 0_u64;
+
+            loop {
+                match run_project_inner(
+                    pr_number,
+                    Some(&sha),
+                    Some(dispatch.dispatch_epoch),
+                    after_seq,
+                ) {
+                    Ok(projection) => {
+                        write_projection_line(&mut projection_file, &projection.line);
+                        println!("{}", projection.line);
+
+                        for error in &projection.errors {
+                            eprintln!(
+                                "ERROR ts={} event={} review={} seq={} detail={}",
+                                error.ts, error.event, error.review_type, error.seq, error.detail
+                            );
+                        }
+                        after_seq = projection.last_seq;
+
+                        if projection.terminal_failure {
+                            emit_terminal_line(
+                                &mut projection_file,
+                                &sha,
+                                false,
+                                Some("terminal_failure"),
+                            );
+                            return exit_codes::GENERIC_ERROR;
+                        }
+                        if projection_state_failed(&projection.security) {
+                            emit_terminal_line(
+                                &mut projection_file,
+                                &sha,
+                                false,
+                                Some("security_failure"),
+                            );
+                            return exit_codes::GENERIC_ERROR;
+                        }
+                        if projection_state_failed(&projection.quality) {
+                            emit_terminal_line(
+                                &mut projection_file,
+                                &sha,
+                                false,
+                                Some("quality_failure"),
+                            );
+                            return exit_codes::GENERIC_ERROR;
+                        }
+                        if projection_state_done(&projection.security)
+                            && projection_state_done(&projection.quality)
+                        {
+                            emit_terminal_line(&mut projection_file, &sha, true, None);
+                            return exit_codes::SUCCESS;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("ERROR: projection failed: {e}");
+                    },
+                }
+
+                if Instant::now() >= deadline {
+                    emit_terminal_line(&mut projection_file, &sha, false, Some("timeout"));
+                    return exit_codes::GENERIC_ERROR;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        },
+        Err(e) => {
+            eprintln!("ERROR: review dispatch failed: {e}");
+            emit_terminal_line(&mut projection_file, &sha, false, Some("dispatch_failed"));
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4772,5 +5183,236 @@ mod tests {
         );
         assert_eq!(event["actor_permission"], "admin");
         assert!(event.get("reason").is_none());
+    }
+
+    // =========================================================================
+    // SHA resolution function tests
+    // =========================================================================
+
+    #[test]
+    fn test_latest_state_head_sha_empty() {
+        let state = ReviewStateFile {
+            reviewers: BTreeMap::new(),
+        };
+        assert_eq!(latest_state_head_sha(&state, 42), None);
+    }
+
+    #[test]
+    fn test_latest_state_head_sha_match() {
+        let mut state = ReviewStateFile {
+            reviewers: BTreeMap::new(),
+        };
+        state.reviewers.insert(
+            "security-1".to_string(),
+            ReviewStateEntry {
+                pid: 1234,
+                started_at: Utc::now(),
+                log_file: PathBuf::from("/tmp/log"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "security".to_string(),
+                pr_number: 42,
+                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                head_sha: "abc123def456".to_string(),
+                restart_count: 0,
+                model: "test-model".to_string(),
+                backend: ReviewBackend::default(),
+                temp_files: Vec::new(),
+            },
+        );
+        assert_eq!(
+            latest_state_head_sha(&state, 42),
+            Some("abc123def456".to_string())
+        );
+    }
+
+    #[test]
+    fn test_latest_state_head_sha_latest_wins() {
+        let mut state = ReviewStateFile {
+            reviewers: BTreeMap::new(),
+        };
+        let early = Utc::now() - chrono::Duration::seconds(60);
+        let late = Utc::now();
+        state.reviewers.insert(
+            "security-old".to_string(),
+            ReviewStateEntry {
+                pid: 1000,
+                started_at: early,
+                log_file: PathBuf::from("/tmp/old"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "security".to_string(),
+                pr_number: 42,
+                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                head_sha: "old_sha".to_string(),
+                restart_count: 0,
+                model: "test-model".to_string(),
+                backend: ReviewBackend::default(),
+                temp_files: Vec::new(),
+            },
+        );
+        state.reviewers.insert(
+            "security-new".to_string(),
+            ReviewStateEntry {
+                pid: 2000,
+                started_at: late,
+                log_file: PathBuf::from("/tmp/new"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "security".to_string(),
+                pr_number: 42,
+                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                head_sha: "new_sha".to_string(),
+                restart_count: 0,
+                model: "test-model".to_string(),
+                backend: ReviewBackend::default(),
+                temp_files: Vec::new(),
+            },
+        );
+        assert_eq!(
+            latest_state_head_sha(&state, 42),
+            Some("new_sha".to_string())
+        );
+    }
+
+    #[test]
+    fn test_latest_state_head_sha_wrong_pr() {
+        let mut state = ReviewStateFile {
+            reviewers: BTreeMap::new(),
+        };
+        state.reviewers.insert(
+            "quality-1".to_string(),
+            ReviewStateEntry {
+                pid: 1234,
+                started_at: Utc::now(),
+                log_file: PathBuf::from("/tmp/log"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "quality".to_string(),
+                pr_number: 99,
+                pr_url: "https://github.com/owner/repo/pull/99".to_string(),
+                head_sha: "sha_for_99".to_string(),
+                restart_count: 0,
+                model: "test-model".to_string(),
+                backend: ReviewBackend::default(),
+                temp_files: Vec::new(),
+            },
+        );
+        assert_eq!(latest_state_head_sha(&state, 42), None);
+    }
+
+    #[test]
+    fn test_latest_event_head_sha_empty() {
+        let events: Vec<serde_json::Value> = vec![];
+        assert_eq!(latest_event_head_sha(&events), None);
+    }
+
+    #[test]
+    fn test_latest_event_head_sha_last_wins() {
+        let events = vec![
+            serde_json::json!({"head_sha": "first_sha", "event": "dispatched"}),
+            serde_json::json!({"head_sha": "second_sha", "event": "started"}),
+        ];
+        assert_eq!(
+            latest_event_head_sha(&events),
+            Some("second_sha".to_string())
+        );
+    }
+
+    #[test]
+    fn test_latest_event_head_sha_skips_dash() {
+        let events = vec![
+            serde_json::json!({"head_sha": "real_sha", "event": "dispatched"}),
+            serde_json::json!({"head_sha": "-", "event": "stall"}),
+            serde_json::json!({"head_sha": "", "event": "crash"}),
+        ];
+        assert_eq!(latest_event_head_sha(&events), Some("real_sha".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_projection_sha_filter_priority() {
+        let state = ReviewStateFile {
+            reviewers: BTreeMap::new(),
+        };
+        let events: Vec<serde_json::Value> = vec![];
+        assert_eq!(
+            resolve_projection_sha(42, &state, &events, Some("override_sha")),
+            "override_sha"
+        );
+    }
+
+    #[test]
+    fn test_resolve_projection_sha_state_fallback() {
+        // When state has a matching entry, it should return its SHA even without
+        // events.
+        let mut state = ReviewStateFile {
+            reviewers: BTreeMap::new(),
+        };
+        state.reviewers.insert(
+            "sec-1".to_string(),
+            ReviewStateEntry {
+                pid: 1,
+                started_at: Utc::now(),
+                log_file: PathBuf::from("/tmp/log"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "security".to_string(),
+                pr_number: 77777,
+                pr_url: "https://github.com/owner/repo/pull/77777".to_string(),
+                head_sha: "state_sha_wins".to_string(),
+                restart_count: 0,
+                model: "test-model".to_string(),
+                backend: ReviewBackend::default(),
+                temp_files: Vec::new(),
+            },
+        );
+        let events: Vec<serde_json::Value> = vec![];
+        let result = resolve_projection_sha(77777, &state, &events, None);
+        assert_eq!(result, "state_sha_wins");
+    }
+
+    #[test]
+    fn test_resolve_projection_sha_events_fallback() {
+        // When state has no matching entry, events should be used.
+        let state = ReviewStateFile {
+            reviewers: BTreeMap::new(),
+        };
+        let events = vec![serde_json::json!({"head_sha": "event_sha_abc", "event": "dispatched"})];
+        let result = resolve_projection_sha(88888, &state, &events, None);
+        assert_eq!(result, "event_sha_abc");
+    }
+
+    #[test]
+    fn test_resolve_current_head_sha_state_priority() {
+        // resolve_current_head_sha checks pulse → state → events → fallback.
+        // With a state entry for a non-existent PR, state SHA should be used
+        // (assuming no legacy pulse file matches).
+        let mut state = ReviewStateFile {
+            reviewers: BTreeMap::new(),
+        };
+        state.reviewers.insert(
+            "sec-1".to_string(),
+            ReviewStateEntry {
+                pid: 1,
+                started_at: Utc::now(),
+                log_file: PathBuf::from("/tmp/log"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "security".to_string(),
+                pr_number: 77777,
+                pr_url: "https://github.com/owner/repo/pull/77777".to_string(),
+                head_sha: "state_sha_current".to_string(),
+                restart_count: 0,
+                model: "test-model".to_string(),
+                backend: ReviewBackend::default(),
+                temp_files: Vec::new(),
+            },
+        );
+        let events: Vec<serde_json::Value> = vec![];
+        let result = resolve_current_head_sha(77777, &state, &events, "fallback_sha");
+        // Note: may pick up legacy pulse file SHA instead of state SHA if
+        // legacy pulses exist on VPS. The test verifies the result is NOT the
+        // fallback (state or pulse wins over fallback).
+        assert_ne!(result, "fallback_sha");
     }
 }

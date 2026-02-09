@@ -1,15 +1,17 @@
 # WVR-0006: Temporary FAC pull_request execution on self-hosted runner
 #
-# This waiver is time-bounded to 30 days from approval. It permits running the
-# Forge Admission Cycle workflow from pull_request event context as a temporary
-# operational workaround while full FAC trigger hardening is deferred.
+# SUPERSEDED: The attack vector this waiver covered (running workflow YAML from
+# PR branch on self-hosted runner) has been eliminated by splitting into two
+# workflows: forge-admission-barrier.yml (pull_request_target only) and
+# forge-admission-cycle.yml (workflow_run + workflow_dispatch only). Both
+# patterns guarantee YAML execution from the default branch.
 
 waiver:
   schema_version: "2026-01-30"
   id: "WVR-0006"
   title: "Temporary FAC trigger downgrade to pull_request"
 
-  status: "APPROVED"
+  status: "SUPERSEDED"
 
   scope:
     gate_ids:
@@ -21,30 +23,35 @@ waiver:
       - "OPERATIONAL_READINESS"
 
   rationale: |
-    The repository is temporarily switching Forge Admission Cycle execution from
-    pull_request_target to pull_request to improve operator convenience while
-    recovering CI reliability and reducing operational friction.
+    Originally approved to temporarily permit pull_request trigger execution on
+    the self-hosted FAC runner. This introduced a fork-based attack vector where
+    an external contributor could modify the workflow YAML in their PR branch to
+    bypass barrier checks and execute arbitrary code on the runner.
 
-    This is a deliberate strictness decrease in trigger trust posture for a
-    bounded period. The team accepts the temporary risk and schedules a full FAC
-    trigger hardening/security audit within 30 days.
+    The attack vector has been eliminated by splitting into two workflows:
+    - forge-admission-barrier.yml: triggered by pull_request_target only (YAML
+      always from base/default branch)
+    - forge-admission-cycle.yml: triggered by workflow_run (after barrier
+      completes) and workflow_dispatch (manual). workflow_run always executes
+      YAML from the default branch.
+
+    This waiver is now SUPERSEDED — no trigger trust boundary regression remains.
 
   mitigations:
-    - description: "Barrier job still enforces author_association allowlist (OWNER|MEMBER|COLLABORATOR)"
+    - description: "Barrier job runs under pull_request_target (YAML from base branch, not PR branch)"
       type: TECHNICAL
-      owner: "FAC workflow"
+      owner: "forge-admission-barrier.yml"
+
+    - description: "FAC job runs under workflow_run (YAML always from default branch)"
+      type: TECHNICAL
+      owner: "forge-admission-cycle.yml"
 
     - description: "Workflow dispatch path remains permission-gated (write/maintain/admin + trusted ref)"
       type: TECHNICAL
-      owner: "FAC barrier gate"
-
-    - description: "Full FAC trigger security audit and hardening PR due by waiver expiry"
-      type: PROCEDURAL
-      owner: "AUTH_SECURITY"
+      owner: "FAC dispatch-auth gate"
 
   expiration_date: "2026-03-11"
-  # 30 days from approval date (2026-02-09). This waiver MUST be renewed or replaced
-  # before expiry; otherwise pull_request-trigger execution is non-compliant.
+  # Original 30-day expiry. Now moot — waiver is SUPERSEDED.
 
   required_signoffs:
     - "AUTH_SECURITY"
@@ -56,8 +63,9 @@ waiver:
   references:
     ticket_id: "TCK-00433"
     rfc_id: "RFC-0018"
-    workflow: ".github/workflows/forge-admission-cycle.yml"
-    deferred_audit_due: "2026-03-11"
+    barrier_workflow: ".github/workflows/forge-admission-barrier.yml"
+    cycle_workflow: ".github/workflows/forge-admission-cycle.yml"
+    superseded_by_commit: "7fa539dbd023e4b354939bd388c43897e49309ae"
 
   approval:
     approver: "repository_owner"
@@ -65,6 +73,10 @@ waiver:
     approval_notes: |
       Approved as a temporary operational waiver with explicit 30-day expiry
       and mandatory follow-up hardening audit.
+
+  superseded:
+    date: "2026-02-09"
+    reason: "Two-workflow split eliminates pull_request trigger from FAC entirely"
 
   created_date: "2026-02-09"
   last_updated: "2026-02-09"

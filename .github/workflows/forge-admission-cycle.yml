@@ -1,9 +1,9 @@
 name: Forge Admission Cycle
 
 on:
-  pull_request_target:
-    branches: [main]
-    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_run:
+    workflows: ["Forge Admission Barrier"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -12,58 +12,14 @@ on:
         type: string
 
 concurrency:
-  group: forge-admission-cycle-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
+  group: forge-admission-cycle-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.event.inputs.pr_number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-  pull-requests: write
-  issues: write
-  statuses: write
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  RUSTFLAGS: -D warnings
-  RUST_BACKTRACE: 1
+  issues: read
 
 jobs:
-  barrier:
-    name: Guardian Intelligence / Barrier
-    if: ${{ github.event_name == 'pull_request_target' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Validate trigger trust boundary (fast path)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          fail() {
-            echo "barrier: $1" >&2
-            exit 1
-          }
-
-          event_name="$GITHUB_EVENT_NAME"
-          [[ "$event_name" == "pull_request_target" ]] || fail "barrier only supports pull_request_target"
-
-          pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
-          association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
-          [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
-          case "$association" in
-            OWNER|MEMBER|COLLABORATOR) ;;
-            *)
-              fail "unauthorized pull_request_target author_association=$association for PR #$pr_number"
-              ;;
-          esac
-          echo "barrier: authorized pull_request_target pr=$pr_number association=$association"
-
   dispatch-auth:
     name: Guardian Intelligence / Dispatch Auth
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -112,75 +68,115 @@ jobs:
 
   forge-admission-cycle:
     name: apm2 / Forge Admission Cycle
-    needs: [barrier, dispatch-auth]
+    needs: [dispatch-auth]
     if: >
       ${{
         always() &&
         (
-          (github.event_name == 'pull_request_target' && needs.barrier.result == 'success') ||
-          (github.event_name == 'workflow_dispatch' && needs.dispatch-auth.result == 'success')
+          (github.event_name == 'workflow_run' &&
+           github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.event == 'pull_request_target') ||
+          (github.event_name == 'workflow_dispatch' &&
+           needs.dispatch-auth.result == 'success')
         )
       }}
-    runs-on: [self-hosted, linux, x64, fac-ovh]
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-
-      - name: Kick off FAC and project health
+      - name: Resolve PR context
+        id: pr-context
         env:
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_REF: ${{ github.ref }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # SECURITY-CRITICAL LOGGING BOUNDARY:
-          # GitHub Actions logs are a public projection surface. Treat stdout as
-          # untrusted egress and fail closed if any non-health line appears.
-          private_log_dir="${HOME}/.apm2/private/fac"
-          mkdir -p "${private_log_dir}"
-          chmod 700 "${private_log_dir}"
-          private_log="${private_log_dir}/github-run-${GITHUB_RUN_ID:-unknown}-${GITHUB_RUN_ATTEMPT:-0}.log"
-          : >"${private_log}"
-          chmod 600 "${private_log}"
-
-          health_line_re='^ts=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z sha=[^[:space:]]+ current_head_sha=[^[:space:]]+ security=[^[:space:]]+ quality=[^[:space:]]+ events=.*$'
-
-          set +e
-          cargo run --locked --quiet -p apm2-cli -- fac kickoff \
-            --repo "${{ github.repository }}" \
-            --event "${{ github.event_path }}" \
-            --event-name "${{ github.event_name }}" \
-            --max-wait-seconds 3600 \
-            --public-projection-only \
-            2>>"${private_log}" | \
-            awk -v health_line_re="${health_line_re}" '
-              $0 ~ health_line_re {
-                print $0
-                fflush(stdout)
-                next
-              }
-              {
-                # SECURITY-CRITICAL: never echo rejected lines (possible secret egress).
-                print "ERROR: FAC output boundary violation (non-health line blocked)." > "/dev/stderr"
-                exit 42
-              }
-            '
-          pipe_status=("${PIPESTATUS[@]}")
-          fac_rc="${pipe_status[0]:-1}"
-          filter_rc="${pipe_status[1]:-1}"
-          set -e
-
-          if [[ "${filter_rc}" -ne 0 ]]; then
-            echo "ERROR: FAC projection boundary violation. See private runner log: ${private_log}" >&2
-            exit 1
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            head_sha="${{ github.event.workflow_run.head_sha }}"
+            pr_number="$(gh api "repos/${{ github.repository }}/commits/${head_sha}/pulls" --jq '.[0].number' 2>/dev/null || echo '')"
+            if [[ -z "$pr_number" || "$pr_number" == "null" ]]; then
+              echo "ERROR: could not resolve PR number from commit ${head_sha}" >&2
+              exit 1
+            fi
+          else
+            pr_number="${{ github.event.inputs.pr_number }}"
+            head_sha="$(gh api "repos/${{ github.repository }}/pulls/${pr_number}" --jq '.head.sha')"
           fi
-          if [[ "${fac_rc}" -ne 0 ]]; then
-            echo "ERROR: FAC failed. See private runner log: ${private_log}" >&2
-            exit "${fac_rc}"
-          fi
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "fac-context: pr=${pr_number} sha=${head_sha}"
+
+      - name: Poll review gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          repo="${{ github.repository }}"
+          pr_number="${{ steps.pr-context.outputs.pr_number }}"
+          head_sha="${{ steps.pr-context.outputs.head_sha }}"
+          max_wait=4800
+          poll_interval=30
+
+          # Load trusted reviewer logins from repo
+          trusted_json="$(gh api "repos/${repo}/contents/.github/review-gate/trusted-reviewers.json" \
+            --jq '.content' | base64 -d)"
+          security_logins="$(echo "$trusted_json" | jq -r '[.reviewers.security[].github_logins[]] | join("|")')"
+          quality_logins="$(echo "$trusted_json" | jq -r '[.reviewers.code_quality[].github_logins[]] | join("|")')"
+
+          # Extract the latest review verdict for a given type from PR comments.
+          # Validates: trusted author, correct head_sha, correct pr_number.
+          # Prints one of: PASS, FAIL, or pending.
+          check_verdict() {
+            local review_type="$1"
+            local trusted_re="$2"
+            local marker="apm2-review-metadata:v1:${review_type}"
+
+            # Get body of the latest comment from a trusted author containing the marker
+            local body
+            body="$(gh api "repos/${repo}/issues/${pr_number}/comments" --paginate --jq "
+              [.[] |
+               select(.user.login | test(\"^(${trusted_re})$\")) |
+               select(.body | test(\"${marker}\"))
+              ] | last | .body // empty")"
+
+            [[ -n "$body" ]] || { echo "pending"; return; }
+
+            # Extract the JSON metadata block following the marker
+            local json_block
+            json_block="$(echo "$body" | \
+              sed -n "/${marker}/,\$p" | \
+              sed -n '/```json/,/```/p' | sed '1d;$d')"
+
+            [[ -n "$json_block" ]] || { echo "pending"; return; }
+
+            # Validate SHA + PR binding, return verdict
+            echo "$json_block" | jq -r \
+              --arg sha "$head_sha" \
+              --argjson pr "$pr_number" \
+              'if .head_sha == $sha and .pr_number == $pr then .verdict
+               else "pending" end'
+          }
+
+          deadline=$((SECONDS + max_wait))
+          echo "fac-gate: polling pr=${pr_number} sha=${head_sha} deadline=${max_wait}s"
+
+          while [[ $SECONDS -lt $deadline ]]; do
+            sec_v="$(check_verdict "security" "$security_logins")"
+            qual_v="$(check_verdict "code-quality" "$quality_logins")"
+
+            ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "ts=${ts} sha=${head_sha} security=${sec_v} quality=${qual_v}"
+
+            if [[ "$sec_v" == "FAIL" || "$qual_v" == "FAIL" ]]; then
+              echo "fac-gate: FAIL security=${sec_v} quality=${qual_v}"
+              exit 1
+            fi
+            if [[ "$sec_v" == "PASS" && "$qual_v" == "PASS" ]]; then
+              echo "fac-gate: PASS security=PASS quality=PASS"
+              exit 0
+            fi
+
+            sleep "$poll_interval"
+          done
+
+          echo "fac-gate: FAIL reason=timeout after ${max_wait}s"
+          exit 1
