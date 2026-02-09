@@ -369,6 +369,14 @@ pub struct KickoffArgs {
     /// Maximum seconds to wait for FAC terminal state.
     #[arg(long, default_value_t = 3600)]
     pub max_wait_seconds: u64,
+
+    /// SECURITY-CRITICAL: limit stdout to one projection health line per
+    /// second.
+    ///
+    /// Use this mode for public log surfaces (for example GitHub Actions logs).
+    /// Any rich diagnostics must stay on private runner-local storage.
+    #[arg(long, default_value_t = false)]
+    pub public_projection_only: bool,
 }
 
 /// Arguments for `apm2 fac review`.
@@ -721,6 +729,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             &args.event_name,
             args.max_wait_seconds,
             json_output,
+            args.public_projection_only,
         ),
         FacSubcommand::Review(args) => match &args.subcommand {
             ReviewSubcommand::Run(run_args) => fac_review::run_review(
