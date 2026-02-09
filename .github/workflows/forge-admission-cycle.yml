@@ -55,7 +55,7 @@ jobs:
           case "$event_name" in
             pull_request_target)
               pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
-              association="$(jq -r '.pull_request.author_association // \"\"' "$GITHUB_EVENT_PATH")"
+              association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
               [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
               case "$association" in
                 OWNER|MEMBER|COLLABORATOR) ;;
