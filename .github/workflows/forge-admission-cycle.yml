@@ -1,9 +1,9 @@
 name: Forge Admission Cycle
 
 on:
-  workflow_run:
-    workflows: ["Forge Admission Barrier"]
-    types: [completed]
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -12,7 +12,7 @@ on:
         type: string
 
 concurrency:
-  group: forge-admission-cycle-${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || github.event.inputs.pr_number || github.run_id }}
+  group: forge-admission-cycle-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -20,6 +20,42 @@ permissions:
   issues: read
 
 jobs:
+  barrier:
+    name: Guardian Intelligence / Barrier
+    if: ${{ github.event_name == 'pull_request_target' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate trigger trust boundary (fast path)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "barrier: $1" >&2
+            exit 1
+          }
+
+          event_name="$GITHUB_EVENT_NAME"
+          [[ "$event_name" == "pull_request_target" ]] || fail "barrier only supports pull_request_target"
+
+          pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
+          association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
+          [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
+          case "$association" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *)
+              fail "unauthorized pull_request_target author_association=$association for PR #$pr_number"
+              ;;
+          esac
+          echo "barrier: authorized pull_request_target pr=$pr_number association=$association"
+
   dispatch-auth:
     name: Guardian Intelligence / Dispatch Auth
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -68,14 +104,13 @@ jobs:
 
   forge-admission-cycle:
     name: apm2 / Forge Admission Cycle
-    needs: [dispatch-auth]
+    needs: [barrier, dispatch-auth]
     if: >
       ${{
         always() &&
         (
-          (github.event_name == 'workflow_run' &&
-           github.event.workflow_run.conclusion == 'success' &&
-           github.event.workflow_run.event == 'pull_request_target') ||
+          (github.event_name == 'pull_request_target' &&
+           needs.barrier.result == 'success') ||
           (github.event_name == 'workflow_dispatch' &&
            needs.dispatch-auth.result == 'success')
         )
@@ -89,17 +124,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            pr_number="${{ github.event.workflow_run.pull_requests[0].number }}"
-            if [[ -z "$pr_number" || "$pr_number" == "null" || "$pr_number" == "0" ]]; then
-              echo "ERROR: workflow_run event has no associated pull_requests — cannot resolve PR context" >&2
-              exit 1
-            fi
-            head_sha="$(gh api "repos/${{ github.repository }}/pulls/${pr_number}" --jq '.head.sha')"
-            if [[ -z "$head_sha" || "$head_sha" == "null" ]]; then
-              echo "ERROR: could not resolve head SHA for PR #${pr_number}" >&2
-              exit 1
-            fi
+          if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
+            pr_number="${{ github.event.pull_request.number }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
           else
             pr_number="${{ github.event.inputs.pr_number }}"
             head_sha="$(gh api "repos/${{ github.repository }}/pulls/${pr_number}" --jq '.head.sha')"
