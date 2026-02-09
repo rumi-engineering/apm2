@@ -52,6 +52,7 @@ tempfile.workspace = true
 chrono.workspace = true
 regex.workspace = true
 fs2 = "0.4"
+rand.workspace = true
 
 # Cryptographic hashing
 blake3.workspace = true
