@@ -1,6 +1,6 @@
 title: Dev Ticket Command Reference
 
-commands[13]:
+commands[18]:
   - name: start-ticket-default
     command: "cargo xtask start-ticket"
     purpose: "Setup dev environment for next unblocked ticket. Expect an error for work already in progress."
@@ -31,9 +31,24 @@ commands[13]:
     command: "cargo xtask push --force-review"
     note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check` and `apm2 fac work status` for ledger-authoritative lifecycle state."
     purpose: "Force re-run reviews after addressing feedback."
+  - name: gate-status
+    command: "gh api repos/guardian-intelligence/apm2/commits/<HEAD_SHA>/status --jq '.statuses[] | select(.context == \"Review Gate Success\") | \"\\(.context)=\\(.state): \\(.description)\"'"
+    purpose: "Inspect required merge-gate status context bound to the exact commit SHA."
+  - name: fac-status
+    command: "apm2 fac review status --pr <PR_NUMBER>"
+    purpose: "Primary FAC-local reviewer lifecycle view (active runs, recent NDJSON events, pulse files)."
+  - name: fac-project
+    command: "apm2 fac review project --pr <PR_NUMBER> --head-sha <HEAD_SHA> --emit-errors"
+    purpose: "Primary FAC projection snapshot for one-line health plus structured ERROR lines."
+  - name: fac-retrigger-cli
+    command: "apm2 fac review retrigger --repo guardian-intelligence/apm2 --pr <PR_NUMBER>"
+    purpose: "Projection-native retrigger path: dispatch Forge Admission Cycle workflow from apm2 CLI."
+  - name: fac-rerun-all
+    command: "gh workflow run forge-admission-cycle.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
+    purpose: "Fallback: retrigger Forge Admission Cycle for a PR."
   - name: fetch-latest-feedback
     command: "gh pr view <PR_URL> --json reviews,reviewThreads --jq '{latest_review: (.reviews[-1].body // \"N/A\"), unresolved_threads: [.reviewThreads[]? | select(.isResolved == false) | {path: .path, body: .comments[-1].body}]}'"
-    purpose: "Get the most recent review body and all unresolved comment threads."
+    purpose: "Get full review/comment bodies from GitHub (fallback surface until FAC projection exposes full comment text)."
   - name: finish
     command: "cargo xtask finish"
     purpose: "Cleanup worktree and branch after PR merges."

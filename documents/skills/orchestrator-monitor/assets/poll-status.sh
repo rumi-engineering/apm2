@@ -7,6 +7,7 @@ set -euo pipefail
 
 REPO="guardian-intelligence/apm2"
 SCRATCHPAD="${SCRATCHPAD:-/tmp/claude-1000/-home-ubuntu-Projects-apm2/*/scratchpad}"
+EVENTS_FILE="${HOME}/.apm2/review_events.ndjson"
 
 # Resolve scratchpad glob to actual path
 SCRATCHPAD_DIR=$(echo $SCRATCHPAD)
@@ -71,8 +72,8 @@ done
 
 echo ""
 
-# --- Section 2: Review Gate Status ---
-echo -e "${BOLD}--- Review Gate Status ---${NC}"
+# --- Section 2: Forge Admission Cycle Status ---
+echo -e "${BOLD}--- Forge Admission Cycle Status ---${NC}"
 printf "%-6s %-30s %-10s %s\n" "PR" "Check" "State" "Description"
 
 for pr in "${PRS[@]}"; do
@@ -80,10 +81,10 @@ for pr in "${PRS[@]}"; do
   state=$(gh pr view "$pr" --repo "$REPO" --json state --jq '.state' 2>/dev/null)
   [[ "$state" == "MERGED" ]] && { printf "%-6s %s\n" "#$pr" "(merged)"; continue; }
 
-  gate_status=$(gh api "repos/$REPO/commits/$head/status" --jq '.statuses[] | select(.context == "Review Gate Success") | "\(.context)|\(.state)|\(.description)"' 2>/dev/null || true)
+  gate_status=$(gh api "repos/$REPO/commits/$head/status" --jq '.statuses[] | select(.context == "Forge Admission Cycle") | "\(.context)|\(.state)|\(.description)"' 2>/dev/null || true)
 
   if [[ -z "$gate_status" ]]; then
-    printf "%-6s %s\n" "#$pr" "(no Review Gate status posted)"
+    printf "%-6s %s\n" "#$pr" "(no Forge Admission Cycle status posted)"
   else
     while IFS='|' read -r ctx st desc; do
       if [[ "$st" == "success" ]]; then
@@ -113,13 +114,13 @@ done
 
 echo ""
 
-# --- Section 4: Running Codex Review Processes ---
-echo -e "${BOLD}--- Running Codex Processes ---${NC}"
-codex_procs=$(ps aux | grep 'codex exec' | grep -v grep | grep -v rfc || true)
-if [[ -z "$codex_procs" ]]; then
+# --- Section 4: Running Review Processes ---
+echo -e "${BOLD}--- Running Review Processes ---${NC}"
+review_procs=$(ps aux | grep -E '(codex exec|gemini -m|apm2 fac review)' | grep -v grep | grep -v poll-status || true)
+if [[ -z "$review_procs" ]]; then
   echo "(none)"
 else
-  echo "$codex_procs" | while read -r line; do
+  echo "$review_procs" | while read -r line; do
     pid=$(echo "$line" | awk '{print $2}')
     start=$(echo "$line" | awk '{print $9}')
     echo "  PID $pid (started $start)"
@@ -154,7 +155,35 @@ fi
 
 echo ""
 
-# --- Section 6: Background Claude Agents ---
+# --- Section 6: Review Events (NDJSON) ---
+echo -e "${BOLD}--- Review Events ---${NC}"
+if [[ ! -f "$EVENTS_FILE" ]]; then
+  echo "(no review event stream at ${EVENTS_FILE})"
+elif ! command -v jq >/dev/null 2>&1; then
+  echo "jq not available; showing raw tail:"
+  tail -n 20 "$EVENTS_FILE"
+else
+  for pr in "${PRS[@]}"; do
+    seq_done=$(tail -n 2000 "$EVENTS_FILE" | jq -c --argjson pr "$pr" 'select(.event == "sequence_done" and .pr_number == $pr)' | tail -n 1 || true)
+    sec_model=$(tail -n 2000 "$EVENTS_FILE" | jq -r --argjson pr "$pr" 'select(.event == "run_start" and .review_type == "security" and .pr_number == $pr) | .model // empty' | tail -n 1 || true)
+    qual_model=$(tail -n 2000 "$EVENTS_FILE" | jq -r --argjson pr "$pr" 'select(.event == "run_start" and .review_type == "quality" and .pr_number == $pr) | .model // empty' | tail -n 1 || true)
+
+    if [[ -z "$seq_done" ]]; then
+      echo "  PR #$pr: (no sequence_done event)"
+      continue
+    fi
+
+    total_secs=$(echo "$seq_done" | jq -r '.total_secs // 0')
+    sec_verdict=$(echo "$seq_done" | jq -r '.security_verdict // "UNKNOWN"')
+    qual_verdict=$(echo "$seq_done" | jq -r '.quality_verdict // "UNKNOWN"')
+    ts=$(echo "$seq_done" | jq -r '.ts // "n/a"')
+    echo "  PR #$pr @ ${ts}: total=${total_secs}s security=${sec_verdict}(${sec_model:-n/a}) quality=${qual_verdict}(${qual_model:-n/a})"
+  done
+fi
+
+echo ""
+
+# --- Section 7: Background Claude Agents ---
 echo -e "${BOLD}--- Background Claude Agents ---${NC}"
 agent_dir="/tmp/claude-1000/-home-ubuntu-Projects-apm2/tasks"
 if [[ -d "$agent_dir" ]]; then

@@ -48,6 +48,7 @@ pub mod event;
 pub mod evidence;
 pub mod export;
 pub mod fac;
+pub mod fac_review;
 pub mod factory;
 pub mod pack;
 pub mod process;

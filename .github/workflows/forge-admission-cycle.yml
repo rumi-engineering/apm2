@@ -1,0 +1,80 @@
+name: Forge Admission Cycle
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to process"
+        required: true
+        type: string
+
+concurrency:
+  group: forge-admission-cycle-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  barrier:
+    name: Barrier
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Validate trigger trust boundary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo run --locked --quiet -p apm2-cli -- fac barrier \
+            --repo "${{ github.repository }}" \
+            --event "${{ github.event_path }}" \
+            --event-name "${{ github.event_name }}"
+
+  forge-admission-cycle:
+    name: Forge Admission Cycle
+    needs: [barrier]
+    runs-on: [self-hosted, linux, x64, fac-ovh]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Kick off FAC and project health
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo run --locked --quiet -p apm2-cli -- fac kickoff \
+            --repo "${{ github.repository }}" \
+            --event "${{ github.event_path }}" \
+            --event-name "${{ github.event_name }}" \
+            --max-wait-seconds 3600

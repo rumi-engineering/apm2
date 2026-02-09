@@ -22,7 +22,7 @@ decision_tree:
       purpose: "Run bounded, evidence-first orchestration ticks until stop condition."
       steps[4]:
         - id: SNAPSHOT
-          action: "Run poll_dashboard, then capture per-PR pr_state_json + commit_statuses for current HEAD SHA."
+          action: "Run poll_dashboard, then capture per-PR fac_review_status + fac_review_project as primary lifecycle signals; use pr_state_json + commit_statuses for metadata/projection cross-checks."
         - id: CLASSIFY
           action: |
             For each PR, assign exactly one state:
@@ -48,7 +48,7 @@ decision_tree:
             For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent.
             Inject references/common-review-findings.md and references/daemon-implementation-patterns.md in its context.
         - id: REVIEW_PROGRESS_ACTION
-          action: "For PRs with active reviews, run check_review_progress; the Review Gate Success workflow handles gate status."
+          action: "For PRs with active reviews, run check_review_progress and fac_review_project; the Forge Admission Cycle workflow remains the GitHub projection path."
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
       next: STALL_AND_BACKPRESSURE
@@ -63,7 +63,7 @@ decision_tree:
         - id: IDLE_AGENT_RECOVERY
           action: "If an implementor has no progress signal beyond profile idle threshold, replace with fresh agent."
         - id: SATURATION_CHECK
-          action: "Use list_codex_processes to ensure process fanout remains within profile caps."
+          action: "Use list_review_processes to ensure process fanout remains within profile caps."
       next: EMIT_TICK_EVIDENCE
 
     - id: EMIT_TICK_EVIDENCE
@@ -130,6 +130,7 @@ decision_tree:
         - id: GATE_RULE
           action: |
             READY_TO_MERGE iff all are true on current HEAD SHA:
-            (1) CI checks pass, (2) Review Gate Success=success,
-            (3) PR mergeable state is not CONFLICTING, (4) PR is open and non-draft.
+            (1) Forge Admission Cycle=success,
+            (2) PR mergeable state is not CONFLICTING,
+            (3) PR is open and non-draft.
       next: HEARTBEAT_LOOP

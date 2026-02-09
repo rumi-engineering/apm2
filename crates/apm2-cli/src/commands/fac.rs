@@ -16,6 +16,18 @@
 //!   context
 //! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
 //!   anchor
+//! - `apm2 fac barrier --repo <OWNER/REPO> --event <EVENT_JSON>` - Validate
+//!   trigger trust boundary before any FAC execution
+//! - `apm2 fac kickoff --repo <OWNER/REPO> --event <EVENT_JSON>` - Dispatch and
+//!   observe FAC review lifecycle for GitHub projection
+//! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
+//!   multi-model)
+//! - `apm2 fac review dispatch <PR_URL>` - Idempotent detached review dispatch
+//! - `apm2 fac review retrigger --pr <PR_NUMBER>` - Dispatch FAC workflow from
+//!   local CLI
+//! - `apm2 fac review status` - Show FAC review state and recent events
+//! - `apm2 fac review project` - Render one projection status line
+//! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
 //!
 //! # Design
 //!
@@ -56,6 +68,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
+use crate::commands::fac_review;
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 // =============================================================================
@@ -145,6 +158,24 @@ pub enum FacSubcommand {
     /// Analyzes ledger to determine restart point for interrupted work.
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
+
+    /// Validate FAC trigger trust boundary for GitHub projection execution.
+    ///
+    /// Fails closed unless the trigger context is authorized.
+    Barrier(BarrierArgs),
+
+    /// Dispatch and observe FAC review lifecycle for GitHub projection.
+    ///
+    /// Runs idempotent detached review dispatch and emits 1Hz health/status
+    /// lines until a terminal outcome is reached.
+    Kickoff(KickoffArgs),
+
+    /// Run and observe FAC review orchestration for pull requests.
+    ///
+    /// Provides VPS-oriented review execution and observability with
+    /// parallel `security + quality` orchestration, model fallback, and
+    /// NDJSON telemetry under `~/.apm2`.
+    Review(ReviewArgs),
 }
 
 /// Arguments for `apm2 fac check`.
@@ -302,6 +333,172 @@ pub struct ResumeArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
+}
+
+/// Arguments for `apm2 fac barrier`.
+#[derive(Debug, Args)]
+pub struct BarrierArgs {
+    /// Repository in owner/repo format.
+    #[arg(long)]
+    pub repo: String,
+
+    /// Path to GitHub event payload JSON.
+    #[arg(long)]
+    pub event: PathBuf,
+
+    /// Event name (`pull_request_target` or `workflow_dispatch`).
+    #[arg(long)]
+    pub event_name: String,
+}
+
+/// Arguments for `apm2 fac kickoff`.
+#[derive(Debug, Args)]
+pub struct KickoffArgs {
+    /// Repository in owner/repo format.
+    #[arg(long)]
+    pub repo: String,
+
+    /// Path to GitHub event payload JSON.
+    #[arg(long)]
+    pub event: PathBuf,
+
+    /// Event name (`pull_request_target` or `workflow_dispatch`).
+    #[arg(long)]
+    pub event_name: String,
+
+    /// Maximum seconds to wait for FAC terminal state.
+    #[arg(long, default_value_t = 3600)]
+    pub max_wait_seconds: u64,
+}
+
+/// Arguments for `apm2 fac review`.
+#[derive(Debug, Args)]
+pub struct ReviewArgs {
+    #[command(subcommand)]
+    pub subcommand: ReviewSubcommand,
+}
+
+/// Review subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ReviewSubcommand {
+    /// Run FAC review orchestration for a pull request URL.
+    Run(ReviewRunArgs),
+    /// Idempotently dispatch detached FAC review workers.
+    Dispatch(ReviewDispatchArgs),
+    /// Retrigger FAC GitHub projection workflow via `workflow_dispatch`.
+    Retrigger(ReviewRetriggerArgs),
+    /// Show FAC review state/events from local operational artifacts.
+    Status(ReviewStatusArgs),
+    /// Render one condensed projection line for GitHub log surfaces.
+    Project(ReviewProjectArgs),
+    /// Tail FAC review NDJSON event stream.
+    Tail(ReviewTailArgs),
+}
+
+/// Arguments for `apm2 fac review run`.
+#[derive(Debug, Args)]
+pub struct ReviewRunArgs {
+    /// GitHub pull request URL.
+    pub pr_url: String,
+
+    /// Review selection (`all`, `security`, or `quality`).
+    #[arg(
+        long = "type",
+        alias = "review-type",
+        value_enum,
+        default_value_t = fac_review::ReviewRunType::All
+    )]
+    pub review_type: fac_review::ReviewRunType,
+
+    /// Optional expected head SHA (40 hex) to fail closed on stale review
+    /// start.
+    #[arg(long)]
+    pub expected_head_sha: Option<String>,
+}
+
+/// Arguments for `apm2 fac review dispatch`.
+#[derive(Debug, Args)]
+pub struct ReviewDispatchArgs {
+    /// GitHub pull request URL.
+    pub pr_url: String,
+
+    /// Review selection (`all`, `security`, or `quality`).
+    #[arg(
+        long = "type",
+        alias = "review-type",
+        value_enum,
+        default_value_t = fac_review::ReviewRunType::All
+    )]
+    pub review_type: fac_review::ReviewRunType,
+
+    /// Optional expected head SHA (40 hex) to fail closed on stale dispatch
+    /// start.
+    #[arg(long)]
+    pub expected_head_sha: Option<String>,
+}
+
+/// Arguments for `apm2 fac review retrigger`.
+#[derive(Debug, Args)]
+pub struct ReviewRetriggerArgs {
+    /// Repository in owner/repo format.
+    #[arg(long, default_value = "guardian-intelligence/apm2")]
+    pub repo: String,
+
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: u32,
+}
+
+/// Arguments for `apm2 fac review status`.
+#[derive(Debug, Args)]
+pub struct ReviewStatusArgs {
+    /// Optional pull request number filter.
+    #[arg(long)]
+    pub pr: Option<u32>,
+
+    /// Optional pull request URL filter.
+    #[arg(long)]
+    pub pr_url: Option<String>,
+}
+
+/// Arguments for `apm2 fac review project`.
+#[derive(Debug, Args)]
+pub struct ReviewProjectArgs {
+    /// Pull request number to project.
+    #[arg(long)]
+    pub pr: u32,
+
+    /// Optional head SHA filter (40 hex).
+    #[arg(long)]
+    pub head_sha: Option<String>,
+
+    /// Optional minimum event timestamp (unix seconds).
+    #[arg(long)]
+    pub since_epoch: Option<u64>,
+
+    /// Emit only errors with seq greater than this value.
+    #[arg(long, default_value_t = 0)]
+    pub after_seq: u64,
+
+    /// Also print ERROR lines in text mode.
+    #[arg(long, default_value_t = false)]
+    pub emit_errors: bool,
+
+    /// Return non-zero when terminal failure is detected.
+    #[arg(long, default_value_t = false)]
+    pub fail_on_terminal: bool,
+}
+
+/// Arguments for `apm2 fac review tail`.
+#[derive(Debug, Args)]
+pub struct ReviewTailArgs {
+    /// Number of lines to show from the end of the event stream.
+    #[arg(long, default_value_t = 20)]
+    pub lines: usize,
+
+    /// Follow mode (stream appended events).
+    #[arg(long, default_value_t = false)]
+    pub follow: bool,
 }
 
 // =============================================================================
@@ -515,6 +712,48 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             },
         },
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
+        FacSubcommand::Barrier(args) => {
+            fac_review::run_barrier(&args.repo, &args.event, &args.event_name, json_output)
+        },
+        FacSubcommand::Kickoff(args) => fac_review::run_kickoff(
+            &args.repo,
+            &args.event,
+            &args.event_name,
+            args.max_wait_seconds,
+            json_output,
+        ),
+        FacSubcommand::Review(args) => match &args.subcommand {
+            ReviewSubcommand::Run(run_args) => fac_review::run_review(
+                &run_args.pr_url,
+                run_args.review_type,
+                run_args.expected_head_sha.as_deref(),
+                json_output,
+            ),
+            ReviewSubcommand::Dispatch(dispatch_args) => fac_review::run_dispatch(
+                &dispatch_args.pr_url,
+                dispatch_args.review_type,
+                dispatch_args.expected_head_sha.as_deref(),
+                json_output,
+            ),
+            ReviewSubcommand::Retrigger(retrigger_args) => {
+                fac_review::run_retrigger(&retrigger_args.repo, retrigger_args.pr, json_output)
+            },
+            ReviewSubcommand::Status(status_args) => {
+                fac_review::run_status(status_args.pr, status_args.pr_url.as_deref(), json_output)
+            },
+            ReviewSubcommand::Project(project_args) => fac_review::run_project(
+                project_args.pr,
+                project_args.head_sha.as_deref(),
+                project_args.since_epoch,
+                project_args.after_seq,
+                project_args.emit_errors,
+                project_args.fail_on_terminal,
+                json_output,
+            ),
+            ReviewSubcommand::Tail(tail_args) => {
+                fac_review::run_tail(tail_args.lines, tail_args.follow)
+            },
+        },
     }
 }
 
