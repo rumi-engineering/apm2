@@ -54,6 +54,24 @@ fn valid_certificate() -> AuthorityJoinCertificateV1 {
     }
 }
 
+fn valid_consumed() -> AuthorityConsumedV1 {
+    AuthorityConsumedV1 {
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        consumed_time_envelope_ref: test_hash(0xDD),
+        consumed_at_tick: 1500,
+    }
+}
+
+fn valid_consume_record() -> AuthorityConsumeRecordV1 {
+    AuthorityConsumeRecordV1 {
+        ajc_id: test_hash(0xAA),
+        consumed_time_envelope_ref: test_hash(0xDD),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+    }
+}
+
 // =============================================================================
 // Schema presence tests
 // =============================================================================
@@ -86,16 +104,184 @@ fn authority_join_certificate_has_normative_fields() {
 
 #[test]
 fn consume_record_has_required_fields() {
-    let record = AuthorityConsumeRecordV1 {
-        ajc_id: test_hash(0xAA),
-        consumed_time_envelope_ref: test_hash(0xDD),
-        consumed_at_tick: 1500,
-        effect_selector_digest: test_hash(0xEE),
-    };
+    let record = valid_consume_record();
     assert_ne!(record.ajc_id, zero_hash());
     assert_ne!(record.consumed_time_envelope_ref, zero_hash());
     assert_ne!(record.effect_selector_digest, zero_hash());
     assert!(record.consumed_at_tick > 0);
+}
+
+// =============================================================================
+// Core boundary validator tests
+// =============================================================================
+
+#[test]
+fn authority_join_certificate_validate_happy_path() {
+    assert!(valid_certificate().validate().is_ok());
+}
+
+#[test]
+fn authority_join_certificate_validate_zero_ajc_id_rejected() {
+    let mut cert = valid_certificate();
+    cert.ajc_id = zero_hash();
+    let err = cert.validate().unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
+}
+
+#[test]
+fn authority_join_certificate_validate_zero_authority_join_hash_rejected() {
+    let mut cert = valid_certificate();
+    cert.authority_join_hash = zero_hash();
+    let err = cert.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "authority_join_hash")
+    );
+}
+
+#[test]
+fn authority_join_certificate_validate_zero_intent_digest_rejected() {
+    let mut cert = valid_certificate();
+    cert.intent_digest = zero_hash();
+    let err = cert.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "intent_digest")
+    );
+}
+
+#[test]
+fn authority_join_certificate_validate_zero_issued_time_envelope_ref_rejected() {
+    let mut cert = valid_certificate();
+    cert.issued_time_envelope_ref = zero_hash();
+    let err = cert.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "issued_time_envelope_ref")
+    );
+}
+
+#[test]
+fn authority_join_certificate_validate_zero_as_of_ledger_anchor_rejected() {
+    let mut cert = valid_certificate();
+    cert.as_of_ledger_anchor = zero_hash();
+    let err = cert.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "as_of_ledger_anchor")
+    );
+}
+
+#[test]
+fn authority_join_certificate_validate_zero_revocation_head_hash_rejected() {
+    let mut cert = valid_certificate();
+    cert.revocation_head_hash = zero_hash();
+    let err = cert.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "revocation_head_hash")
+    );
+}
+
+#[test]
+fn authority_join_certificate_validate_non_positive_tick_rejected() {
+    let mut cert = valid_certificate();
+    cert.expires_at_tick = 0;
+    let err = cert.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::NonPositiveTick { field } if field == "expires_at_tick")
+    );
+}
+
+#[test]
+fn authority_join_certificate_validate_zero_admission_capacity_token_rejected() {
+    let mut cert = valid_certificate();
+    cert.admission_capacity_token = Some(zero_hash());
+    let err = cert.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "admission_capacity_token")
+    );
+}
+
+#[test]
+fn authority_consumed_validate_happy_path() {
+    assert!(valid_consumed().validate().is_ok());
+}
+
+#[test]
+fn authority_consumed_validate_zero_ajc_id_rejected() {
+    let mut consumed = valid_consumed();
+    consumed.ajc_id = zero_hash();
+    let err = consumed.validate().unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
+}
+
+#[test]
+fn authority_consumed_validate_zero_intent_digest_rejected() {
+    let mut consumed = valid_consumed();
+    consumed.intent_digest = zero_hash();
+    let err = consumed.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "intent_digest")
+    );
+}
+
+#[test]
+fn authority_consumed_validate_zero_time_envelope_ref_rejected() {
+    let mut consumed = valid_consumed();
+    consumed.consumed_time_envelope_ref = zero_hash();
+    let err = consumed.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "consumed_time_envelope_ref")
+    );
+}
+
+#[test]
+fn authority_consumed_validate_non_positive_tick_rejected() {
+    let mut consumed = valid_consumed();
+    consumed.consumed_at_tick = 0;
+    let err = consumed.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::NonPositiveTick { field } if field == "consumed_at_tick")
+    );
+}
+
+#[test]
+fn authority_consume_record_validate_happy_path() {
+    assert!(valid_consume_record().validate().is_ok());
+}
+
+#[test]
+fn authority_consume_record_validate_zero_ajc_id_rejected() {
+    let mut record = valid_consume_record();
+    record.ajc_id = zero_hash();
+    let err = record.validate().unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
+}
+
+#[test]
+fn authority_consume_record_validate_zero_effect_selector_digest_rejected() {
+    let mut record = valid_consume_record();
+    record.effect_selector_digest = zero_hash();
+    let err = record.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "effect_selector_digest")
+    );
+}
+
+#[test]
+fn authority_consume_record_validate_zero_time_envelope_ref_rejected() {
+    let mut record = valid_consume_record();
+    record.consumed_time_envelope_ref = zero_hash();
+    let err = record.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::ZeroHash { field } if field == "consumed_time_envelope_ref")
+    );
+}
+
+#[test]
+fn authority_consume_record_validate_non_positive_tick_rejected() {
+    let mut record = valid_consume_record();
+    record.consumed_at_tick = 0;
+    let err = record.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::NonPositiveTick { field } if field == "consumed_at_tick")
+    );
 }
 
 // =============================================================================
@@ -362,6 +548,7 @@ fn deny_receipt_serde_roundtrip() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 1500,
         denied_at_stage: LifecycleStage::Consume,
+        authoritative_bindings: None,
     };
     let json = serde_json::to_string(&receipt).unwrap();
     let back: AuthorityDenyReceiptV1 = serde_json::from_str(&json).unwrap();
@@ -554,6 +741,16 @@ fn oversize_holon_id_denied_by_validator() {
     let err = input.validate().unwrap_err();
     assert!(
         matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "holon_id")
+    );
+}
+
+#[test]
+fn empty_holon_id_denied_by_validator() {
+    let mut input = valid_join_input();
+    input.holon_id = Some(String::new());
+    let err = input.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::EmptyRequiredField { field } if field == "holon_id")
     );
 }
 
@@ -877,6 +1074,7 @@ fn deny_unknown_fields_deny_receipt() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 1500,
         denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
     };
     let mut json: serde_json::Value = serde_json::to_value(&receipt).unwrap();
     json.as_object_mut()
@@ -1191,6 +1389,27 @@ fn pcac_validation_error_display() {
         err.to_string(),
         "delegated-path bindings incoherent: permeability_receipt_hash and delegation_chain_hash must co-occur"
     );
+
+    let err = types::PcacValidationError::MissingAuthoritativeBindings {
+        receipt_type: "authority_join_receipt_v1",
+    };
+    assert_eq!(
+        err.to_string(),
+        "missing authoritative bindings for receipt type: authority_join_receipt_v1"
+    );
+
+    let err = types::PcacValidationError::DigestMismatch;
+    assert_eq!(err.to_string(), "receipt digest mismatch");
+
+    let err = types::PcacValidationError::UnknownCanonicalizer {
+        id: "unknown".to_string(),
+    };
+    assert_eq!(err.to_string(), "unknown canonicalizer identifier: unknown");
+
+    let err = types::PcacValidationError::NonPositiveTick {
+        field: "consumed_at_tick",
+    };
+    assert_eq!(err.to_string(), "tick field 'consumed_at_tick' must be > 0");
 }
 
 // =============================================================================
@@ -1258,6 +1477,46 @@ fn zero_content_digest_rejected() {
     let err = meta.validate().unwrap_err();
     assert!(
         matches!(err, types::PcacValidationError::ZeroHash { field } if field == "content_digest")
+    );
+}
+
+#[test]
+fn verify_digest_accepts_matching_blake3_digest() {
+    use super::receipts::*;
+
+    let canonical_bytes = br#"{"receipt":"ok"}"#;
+    let meta = ReceiptDigestMeta {
+        canonicalizer_id: "blake3-canonical-v1".to_string(),
+        content_digest: *blake3::hash(canonical_bytes).as_bytes(),
+    };
+    assert!(meta.verify_digest(canonical_bytes).is_ok());
+}
+
+#[test]
+fn verify_digest_rejects_mismatched_digest() {
+    use super::receipts::*;
+
+    let canonical_bytes = br#"{"receipt":"ok"}"#;
+    let meta = ReceiptDigestMeta {
+        canonicalizer_id: "blake3-canonical-v1".to_string(),
+        content_digest: test_hash(0xAB),
+    };
+    let err = meta.verify_digest(canonical_bytes).unwrap_err();
+    assert!(matches!(err, types::PcacValidationError::DigestMismatch));
+}
+
+#[test]
+fn verify_digest_rejects_unknown_canonicalizer() {
+    use super::receipts::*;
+
+    let canonical_bytes = br#"{"receipt":"ok"}"#;
+    let meta = ReceiptDigestMeta {
+        canonicalizer_id: "unknown-canonicalizer".to_string(),
+        content_digest: *blake3::hash(canonical_bytes).as_bytes(),
+    };
+    let err = meta.verify_digest(canonical_bytes).unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::UnknownCanonicalizer { ref id } if id == "unknown-canonicalizer")
     );
 }
 
@@ -1577,6 +1836,7 @@ fn valid_join_receipt_passes_validation() {
         authoritative_bindings: Some(valid_bindings()),
     };
     assert!(receipt.validate().is_ok());
+    assert!(receipt.validate_authoritative().is_ok());
 }
 
 #[test]
@@ -1669,6 +1929,24 @@ fn join_receipt_propagates_binding_validation_errors() {
     );
 }
 
+#[test]
+fn join_receipt_validate_authoritative_requires_bindings() {
+    let receipt = AuthorityJoinReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        authority_join_hash: test_hash(0xBB),
+        risk_tier: types::RiskTier::Tier1,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        joined_at_tick: 1000,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate_authoritative().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::MissingAuthoritativeBindings { receipt_type } if receipt_type == "authority_join_receipt_v1")
+    );
+}
+
 // --- AuthorityConsumeReceiptV1 ---
 
 #[test]
@@ -1685,6 +1963,7 @@ fn valid_consume_receipt_passes_validation() {
         authoritative_bindings: Some(valid_bindings()),
     };
     assert!(receipt.validate().is_ok());
+    assert!(receipt.validate_authoritative().is_ok());
 }
 
 #[test]
@@ -1801,6 +2080,25 @@ fn consume_receipt_propagates_binding_validation_errors() {
     );
 }
 
+#[test]
+fn consume_receipt_validate_authoritative_requires_bindings() {
+    let receipt = AuthorityConsumeReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        intent_digest: test_hash(0x01),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        consumed_at_tick: 1500,
+        effect_selector_digest: test_hash(0xEE),
+        pre_actuation_receipt_hash: None,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate_authoritative().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::MissingAuthoritativeBindings { receipt_type } if receipt_type == "authority_consume_receipt_v1")
+    );
+}
+
 // --- AuthorityDenyReceiptV1 ---
 
 #[test]
@@ -1813,8 +2111,28 @@ fn valid_deny_receipt_passes_validation() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: Some(valid_bindings()),
     };
     assert!(receipt.validate().is_ok());
+    assert!(receipt.validate_authoritative().is_ok());
+}
+
+#[test]
+fn deny_receipt_validate_authoritative_requires_bindings() {
+    let receipt = AuthorityDenyReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        deny_class: AuthorityDenyClass::InvalidSessionId,
+        ajc_id: None,
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        denied_at_tick: 500,
+        denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate_authoritative().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::MissingAuthoritativeBindings { receipt_type } if receipt_type == "authority_deny_receipt_v1")
+    );
 }
 
 #[test]
@@ -1827,6 +2145,7 @@ fn deny_receipt_zero_time_envelope_ref_rejected() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
     assert!(
@@ -1844,6 +2163,7 @@ fn deny_receipt_zero_ledger_anchor_rejected() {
         ledger_anchor: zero_hash(),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
     assert!(
@@ -1864,6 +2184,7 @@ fn deny_receipt_zero_content_digest_rejected() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
     assert!(
@@ -1974,6 +2295,25 @@ fn valid_revalidate_receipt_passes_validation() {
         authoritative_bindings: Some(valid_bindings()),
     };
     assert!(receipt.validate().is_ok());
+    assert!(receipt.validate_authoritative().is_ok());
+}
+
+#[test]
+fn revalidate_receipt_validate_authoritative_requires_bindings() {
+    let receipt = AuthorityRevalidateReceiptV1 {
+        digest_meta: valid_digest_meta(),
+        ajc_id: test_hash(0xAA),
+        time_envelope_ref: test_hash(0x07),
+        ledger_anchor: test_hash(0x08),
+        revocation_head_hash: test_hash(0xCC),
+        revalidated_at_tick: 1200,
+        checkpoint: "before_broker".to_string(),
+        authoritative_bindings: None,
+    };
+    let err = receipt.validate_authoritative().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::MissingAuthoritativeBindings { receipt_type } if receipt_type == "authority_revalidate_receipt_v1")
+    );
 }
 
 // =============================================================================
@@ -2107,6 +2447,7 @@ fn deny_receipt_validates_deny_class_strings() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
     assert!(
@@ -2126,6 +2467,7 @@ fn deny_receipt_oversize_description_rejected() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
     assert!(
@@ -2145,6 +2487,7 @@ fn deny_receipt_oversize_reason_rejected() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Join,
+        authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
     assert!(
@@ -2164,6 +2507,7 @@ fn deny_receipt_zero_ajc_id_rejected() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Consume,
+        authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
     assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
@@ -2181,6 +2525,7 @@ fn deny_receipt_valid_ajc_id_passes() {
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
         denied_at_stage: LifecycleStage::Consume,
+        authoritative_bindings: None,
     };
     assert!(receipt.validate().is_ok());
 }

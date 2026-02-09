@@ -12,6 +12,7 @@
 //! - One admissible receipt authentication shape (direct or pointer/batched).
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use super::deny::AuthorityDenyClass;
 use super::types::{
@@ -22,6 +23,8 @@ use crate::crypto::Hash;
 
 /// Zero hash constant for comparison.
 const ZERO_HASH: Hash = [0u8; 32];
+/// Canonicalizer IDs that are currently admissible for digest verification.
+const ALLOWED_CANONICALIZER_IDS: &[&str] = &["blake3-canonical-v1", "apm2.canonicalizer.jcs"];
 
 // =============================================================================
 // Common receipt metadata
@@ -260,6 +263,10 @@ pub struct AuthorityDenyReceiptV1 {
 
     /// The lifecycle stage at which denial occurred.
     pub denied_at_stage: LifecycleStage,
+
+    /// Authoritative bindings (for authoritative mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoritative_bindings: Option<AuthoritativeBindings>,
 }
 
 /// Lifecycle stage at which a denial occurred.
@@ -316,6 +323,31 @@ impl ReceiptDigestMeta {
             return Err(PcacValidationError::ZeroHash {
                 field: "content_digest",
             });
+        }
+        Ok(())
+    }
+
+    /// Verify receipt digest against canonical bytes under an allowed
+    /// canonicalization regime.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` if the canonicalizer is not allowlisted
+    /// or if the digest does not match the BLAKE3 hash of `canonical_bytes`.
+    pub fn verify_digest(&self, canonical_bytes: &[u8]) -> Result<(), PcacValidationError> {
+        self.validate()?;
+        if !ALLOWED_CANONICALIZER_IDS
+            .iter()
+            .any(|id| self.canonicalizer_id == *id)
+        {
+            return Err(PcacValidationError::UnknownCanonicalizer {
+                id: self.canonicalizer_id.clone(),
+            });
+        }
+
+        let computed = blake3::hash(canonical_bytes);
+        if self.content_digest.ct_eq(computed.as_bytes()).unwrap_u8() != 1 {
+            return Err(PcacValidationError::DigestMismatch);
         }
         Ok(())
     }
@@ -509,6 +541,27 @@ impl AuthorityRevalidateReceiptV1 {
         }
         Ok(())
     }
+
+    /// Validate this receipt as an authoritative trust-admission artifact.
+    ///
+    /// This is stricter than [`Self::validate`] and requires authoritative
+    /// bindings to be present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError::MissingAuthoritativeBindings` when
+    /// authoritative bindings are absent, or propagates any structural/binding
+    /// validation error.
+    pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
+        self.validate()?;
+        let bindings = self.authoritative_bindings.as_ref().ok_or(
+            PcacValidationError::MissingAuthoritativeBindings {
+                receipt_type: "authority_revalidate_receipt_v1",
+            },
+        )?;
+        bindings.validate()?;
+        Ok(())
+    }
 }
 
 impl AuthorityJoinReceiptV1 {
@@ -549,6 +602,27 @@ impl AuthorityJoinReceiptV1 {
         if let Some(ref bindings) = self.authoritative_bindings {
             bindings.validate()?;
         }
+        Ok(())
+    }
+
+    /// Validate this receipt as an authoritative trust-admission artifact.
+    ///
+    /// This is stricter than [`Self::validate`] and requires authoritative
+    /// bindings to be present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError::MissingAuthoritativeBindings` when
+    /// authoritative bindings are absent, or propagates any structural/binding
+    /// validation error.
+    pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
+        self.validate()?;
+        let bindings = self.authoritative_bindings.as_ref().ok_or(
+            PcacValidationError::MissingAuthoritativeBindings {
+                receipt_type: "authority_join_receipt_v1",
+            },
+        )?;
+        bindings.validate()?;
         Ok(())
     }
 }
@@ -608,6 +682,27 @@ impl AuthorityConsumeReceiptV1 {
         }
         Ok(())
     }
+
+    /// Validate this receipt as an authoritative trust-admission artifact.
+    ///
+    /// This is stricter than [`Self::validate`] and requires authoritative
+    /// bindings to be present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError::MissingAuthoritativeBindings` when
+    /// authoritative bindings are absent, or propagates any structural/binding
+    /// validation error.
+    pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
+        self.validate()?;
+        let bindings = self.authoritative_bindings.as_ref().ok_or(
+            PcacValidationError::MissingAuthoritativeBindings {
+                receipt_type: "authority_consume_receipt_v1",
+            },
+        )?;
+        bindings.validate()?;
+        Ok(())
+    }
 }
 
 impl AuthorityDenyReceiptV1 {
@@ -642,6 +737,30 @@ impl AuthorityDenyReceiptV1 {
                 return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
             }
         }
+        if let Some(ref bindings) = self.authoritative_bindings {
+            bindings.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Validate this receipt as an authoritative trust-admission artifact.
+    ///
+    /// This is stricter than [`Self::validate`] and requires authoritative
+    /// bindings to be present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError::MissingAuthoritativeBindings` when
+    /// authoritative bindings are absent, or propagates any structural/binding
+    /// validation error.
+    pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
+        self.validate()?;
+        let bindings = self.authoritative_bindings.as_ref().ok_or(
+            PcacValidationError::MissingAuthoritativeBindings {
+                receipt_type: "authority_deny_receipt_v1",
+            },
+        )?;
+        bindings.validate()?;
         Ok(())
     }
 }

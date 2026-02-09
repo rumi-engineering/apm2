@@ -218,6 +218,23 @@ pub enum PcacValidationError {
     /// Delegated-path bindings are incoherent: both `permeability_receipt_hash`
     /// and `delegation_chain_hash` must be present or both absent.
     IncoherentDelegatedBindings,
+    /// Authoritative bindings are required for trust-admission validation.
+    MissingAuthoritativeBindings {
+        /// Receipt type that is missing required authoritative bindings.
+        receipt_type: &'static str,
+    },
+    /// Receipt digest does not match canonical bytes.
+    DigestMismatch,
+    /// Canonicalizer identifier is not in the allowlist.
+    UnknownCanonicalizer {
+        /// Unrecognized canonicalizer identifier.
+        id: String,
+    },
+    /// Tick field must be strictly positive.
+    NonPositiveTick {
+        /// Name of the invalid tick field.
+        field: &'static str,
+    },
 }
 
 impl std::fmt::Display for PcacValidationError {
@@ -249,6 +266,19 @@ impl std::fmt::Display for PcacValidationError {
                     f,
                     "delegated-path bindings incoherent: permeability_receipt_hash and delegation_chain_hash must co-occur"
                 )
+            },
+            Self::MissingAuthoritativeBindings { receipt_type } => {
+                write!(
+                    f,
+                    "missing authoritative bindings for receipt type: {receipt_type}"
+                )
+            },
+            Self::DigestMismatch => write!(f, "receipt digest mismatch"),
+            Self::UnknownCanonicalizer { id } => {
+                write!(f, "unknown canonicalizer identifier: {id}")
+            },
+            Self::NonPositiveTick { field } => {
+                write!(f, "tick field '{field}' must be > 0")
             },
         }
     }
@@ -282,6 +312,9 @@ impl AuthorityJoinInputV1 {
 
         // String field: holon_id (optional but bounded)
         if let Some(ref holon_id) = self.holon_id {
+            if holon_id.is_empty() {
+                return Err(PcacValidationError::EmptyRequiredField { field: "holon_id" });
+            }
             if holon_id.len() > MAX_STRING_LENGTH {
                 return Err(PcacValidationError::StringTooLong {
                     field: "holon_id",
@@ -556,4 +589,116 @@ pub struct AuthorityConsumeRecordV1 {
 
     /// Digest of the effect selector that was authorized.
     pub effect_selector_digest: Hash,
+}
+
+impl AuthorityJoinCertificateV1 {
+    /// Validate boundary constraints for authority join certificates.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.ajc_id == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
+        }
+        if self.authority_join_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "authority_join_hash",
+            });
+        }
+        if self.intent_digest == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "intent_digest",
+            });
+        }
+        if self.issued_time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "issued_time_envelope_ref",
+            });
+        }
+        if self.as_of_ledger_anchor == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "as_of_ledger_anchor",
+            });
+        }
+        if self.revocation_head_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "revocation_head_hash",
+            });
+        }
+        if let Some(token) = self.admission_capacity_token {
+            if token == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash {
+                    field: "admission_capacity_token",
+                });
+            }
+        }
+        if self.expires_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "expires_at_tick",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl AuthorityConsumedV1 {
+    /// Validate boundary constraints for consumed-authority witnesses.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.ajc_id == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
+        }
+        if self.intent_digest == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "intent_digest",
+            });
+        }
+        if self.consumed_time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "consumed_time_envelope_ref",
+            });
+        }
+        if self.consumed_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "consumed_at_tick",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl AuthorityConsumeRecordV1 {
+    /// Validate boundary constraints for durable consume records.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.ajc_id == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash { field: "ajc_id" });
+        }
+        if self.consumed_time_envelope_ref == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "consumed_time_envelope_ref",
+            });
+        }
+        if self.consumed_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "consumed_at_tick",
+            });
+        }
+        if self.effect_selector_digest == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "effect_selector_digest",
+            });
+        }
+        Ok(())
+    }
 }
