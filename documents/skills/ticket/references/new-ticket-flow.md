@@ -7,7 +7,7 @@ decision_tree:
       purpose: "Implement a ticket from scratch and open a new PR."
       steps[12]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "References do not interpolate variables; replace <TICKET_ID> and <RFC_ID> with values extracted from start-ticket output."
+          action: "References do not interpolate variables; replace <TICKET_ID> and <RFC_ID> with values extracted from the ticket YAML."
         - id: READ_TICKET_CONTEXT
           action: "Read ticket definition and requirements."
           context_files[2]:
@@ -61,12 +61,10 @@ decision_tree:
           run: "cargo fmt --all && cargo clippy --fix --allow-dirty --all-targets --all-features -- -D warnings && cargo fmt --all --check"
         - id: VERIFY_AND_COMMIT
           action: command
-          run: "cargo xtask commit \"Initial implementation of <TICKET_ID>\""
-          note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Use `apm2 fac check`/`apm2 fac work status` for ledger-authoritative lifecycle operations."
+          run: "git add -A && git commit -m \"Initial implementation of <TICKET_ID>\""
         - id: PUSH_CREATE_PR
           action: command
-          run: "cargo xtask push"
-          note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Use `apm2 fac check`/`apm2 fac work status` for ledger-authoritative lifecycle operations."
+          run: "apm2 fac push"
         - id: FINISH
           action: "Task complete. The ticket-queue will monitor for review feedback."
       decisions: []
