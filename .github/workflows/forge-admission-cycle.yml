@@ -148,8 +148,9 @@ jobs:
                 exit 42
               }
             '
-          fac_rc=${PIPESTATUS[0]}
-          filter_rc=${PIPESTATUS[1]}
+          pipe_status=("${PIPESTATUS[@]}")
+          fac_rc="${pipe_status[0]:-1}"
+          filter_rc="${pipe_status[1]:-1}"
           set -e
 
           if [[ "${filter_rc}" -ne 0 ]]; then
