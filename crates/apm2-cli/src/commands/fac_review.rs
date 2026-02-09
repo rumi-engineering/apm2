@@ -1845,6 +1845,20 @@ fn projection_state_for_type(
         .find(|event| event_name(event) == "run_crash" && event_is_terminal_crash(event));
 
     if let Some(done) = done {
+        let verdict = done
+            .get("verdict")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        match verdict.as_str() {
+            // Fail closed: terminal completion without a passing verdict must not
+            // be rendered as "done", otherwise FAC can project a green check for
+            // a failed reviewer verdict.
+            "FAIL" => return "failed:verdict_fail".to_string(),
+            "UNKNOWN" | "" => return "failed:verdict_unknown".to_string(),
+            _ => {},
+        }
+
         let model = start
             .and_then(|value| value.get("model"))
             .and_then(serde_json::Value::as_str)
@@ -4389,12 +4403,45 @@ mod tests {
                 "pr_number": 42,
                 "restart_count": 2,
                 "head_sha": "abcdef1234567890",
+                "verdict": "PASS",
                 "seq": 2
             }),
         ];
 
         let rendered = projection_state_for_type(&state, &events, 42, ReviewKind::Security, None);
         assert_eq!(rendered, "done:gpt-5.3-codex/codex:r2:abcdef1");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_fail_verdict_is_failed() {
+        let state = ReviewStateFile::default();
+        let events = vec![serde_json::json!({
+            "event": "run_complete",
+            "review_type": "security",
+            "pr_number": 42,
+            "head_sha": "abcdef1234567890",
+            "verdict": "FAIL",
+            "seq": 2
+        })];
+
+        let rendered = projection_state_for_type(&state, &events, 42, ReviewKind::Security, None);
+        assert_eq!(rendered, "failed:verdict_fail");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_unknown_verdict_is_failed() {
+        let state = ReviewStateFile::default();
+        let events = vec![serde_json::json!({
+            "event": "run_complete",
+            "review_type": "quality",
+            "pr_number": 17,
+            "head_sha": "abcdef1234567890",
+            "verdict": "UNKNOWN",
+            "seq": 2
+        })];
+
+        let rendered = projection_state_for_type(&state, &events, 17, ReviewKind::Quality, None);
+        assert_eq!(rendered, "failed:verdict_unknown");
     }
 
     #[test]
