@@ -260,10 +260,20 @@ pub enum FactRootError {
 ///
 /// # Content Addressing
 ///
-/// The `content_hash()` of a `FactRootV1` is deterministic and serves as
-/// the binding between the fact root and the QC's `block_hash`. A verifier
-/// checks that `fact_root.content_hash() == qc.block_hash` to confirm the
-/// QC certifies this specific fact root.
+/// The `content_hash()` of a `FactRootV1` is deterministic and covers only
+/// the certifiable data: `epoch`, `composed_root`, and the individual
+/// `batch_roots`. Critically, `content_hash()` does **not** include the
+/// `qc_anchor_hash`, because in RFC-0014 BFT validators must sign the
+/// `block_hash` (which equals `content_hash()`) **before** the QC exists.
+/// Including `qc_anchor_hash` would create a circular dependency:
+///
+/// ```text
+/// signatures -> qc_anchor_hash -> content_hash -> block_hash -> signatures
+/// ```
+///
+/// The QC binding is instead verified separately by the `FactRootVerifier`:
+/// `qc_anchor_hash` is checked against the canonical hash of the provided QC,
+/// while `content_hash` is checked against `qc.block_hash`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FactRootV1 {
     /// Batch root hashes bound into this checkpoint.
@@ -403,11 +413,16 @@ impl FactRootV1 {
 
     /// Compute the canonical byte representation for content-addressing.
     ///
+    /// **Important**: The canonical bytes intentionally **exclude**
+    /// `qc_anchor_hash` to break the circular dependency between
+    /// `content_hash` and QC signatures. Validators sign the `block_hash`
+    /// (= `content_hash()`) before the QC exists, so the content hash must
+    /// be computable without knowing the QC.
+    ///
     /// Layout:
     /// ```text
     /// domain_separator
     /// + epoch (8 bytes LE)
-    /// + qc_anchor_hash (32 bytes)
     /// + composed_root (32 bytes)
     /// + batch_count (4 bytes LE)
     /// + [batch_root (32 bytes)] * batch_count
@@ -416,7 +431,6 @@ impl FactRootV1 {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let total = FACT_ROOT_DOMAIN_SEPARATOR.len()
             + 8  // epoch
-            + 32 // qc_anchor_hash
             + 32 // composed_root
             + 4  // batch_count
             + self.batch_roots.len() * 32;
@@ -424,7 +438,6 @@ impl FactRootV1 {
         let mut out = Vec::with_capacity(total);
         out.extend_from_slice(FACT_ROOT_DOMAIN_SEPARATOR);
         out.extend_from_slice(&self.epoch.to_le_bytes());
-        out.extend_from_slice(&self.qc_anchor_hash);
         out.extend_from_slice(&self.composed_root);
         #[allow(clippy::cast_possible_truncation)]
         let batch_count = self.batch_roots.len() as u32;
@@ -437,7 +450,10 @@ impl FactRootV1 {
 
     /// Compute the content-address hash of this fact root.
     ///
-    /// This hash is used as the binding to the QC's `block_hash`.
+    /// This hash is used as the binding to the QC's `block_hash`. It covers
+    /// only the certifiable data (epoch, composed root, batch roots) and
+    /// **excludes** the `qc_anchor_hash` to avoid a circular dependency
+    /// with QC signatures.
     #[must_use]
     pub fn content_hash(&self) -> Hash {
         EventHasher::hash_content(&self.canonical_bytes())
@@ -1081,6 +1097,35 @@ mod tck_00370_unit_tests {
         assert_ne!(fr1.content_hash(), fr2.content_hash());
     }
 
+    /// Regression test: `content_hash()` must NOT depend on `qc_anchor_hash`.
+    ///
+    /// This is the key invariant that breaks the circular dependency between
+    /// `content_hash` and QC signatures (RFC-0014 BFT). Validators sign the
+    /// `block_hash` (= `content_hash()`) before the QC exists, so the
+    /// content hash must be identical regardless of which QC anchors it.
+    #[test]
+    fn fact_root_content_hash_independent_of_qc_anchor() {
+        let batch_roots = vec![test_hash(1), test_hash(2)];
+        let fr1 = FactRootV1::new(batch_roots.clone(), 1, test_hash(100)).unwrap();
+        let fr2 = FactRootV1::new(batch_roots.clone(), 1, test_hash(200)).unwrap();
+        let fr3 = FactRootV1::new(batch_roots, 1, test_hash(300)).unwrap();
+
+        // Same batch_roots + epoch => same content_hash, regardless of qc_anchor_hash
+        assert_eq!(
+            fr1.content_hash(),
+            fr2.content_hash(),
+            "content_hash must not depend on qc_anchor_hash"
+        );
+        assert_eq!(
+            fr2.content_hash(),
+            fr3.content_hash(),
+            "content_hash must not depend on qc_anchor_hash"
+        );
+
+        // But canonical_bytes should also be the same (since qc_anchor is excluded)
+        assert_eq!(fr1.canonical_bytes(), fr2.canonical_bytes());
+    }
+
     #[test]
     fn fact_root_single_batch_root() {
         let fr = FactRootV1::new(vec![test_hash(42)], 5, test_hash(200)).unwrap();
@@ -1169,15 +1214,30 @@ mod tck_00370_unit_tests {
     fn fact_root_verifier_valid_trusted_genesis_qc() {
         use crate::consensus::bft::QuorumCertificate;
 
-        // The anchor hash excludes block_hash, so all genesis QCs for the
-        // same epoch share the same anchor hash regardless of block_hash.
-        let qc_anchor = compute_qc_anchor_hash(&QuorumCertificate::genesis(0, [0u8; 32]));
+        // Step 1: Build the fact root with batch data.
+        // content_hash() is now independent of qc_anchor_hash, so we can
+        // compute it with any placeholder anchor, then build the real QC.
         let batch_roots = vec![test_hash(1), test_hash(2)];
-        let fact_root = FactRootV1::new(batch_roots, 0, qc_anchor).unwrap();
-        let content_hash = fact_root.content_hash();
+        // Use a placeholder anchor to compute content_hash first.
+        let placeholder_anchor = test_hash(9999);
+        let temp_fr = FactRootV1::new(batch_roots.clone(), 0, placeholder_anchor).unwrap();
+        let content_hash = temp_fr.content_hash();
 
-        // Build the real QC whose block_hash = fact root content hash.
+        // Step 2: Build the genesis QC whose block_hash = content_hash.
         let qc = QuorumCertificate::genesis(0, content_hash);
+
+        // Step 3: Compute the real anchor hash from the actual QC.
+        let qc_anchor = compute_qc_anchor_hash(&qc);
+
+        // Step 4: Build the final FactRootV1 with the correct anchor.
+        // Since content_hash excludes qc_anchor_hash, the content_hash
+        // is the same as from step 1.
+        let fact_root = FactRootV1::new(batch_roots, 0, qc_anchor).unwrap();
+        assert_eq!(
+            fact_root.content_hash(),
+            content_hash,
+            "content_hash must be stable across qc_anchor changes"
+        );
 
         let validators = create_test_validators(4);
         let context = QcVerificationContext::new(&validators, 3);
@@ -1582,8 +1642,11 @@ mod tck_00370_unit_tests {
     }
 
     /// Regression test: `FactRoot` verification via `verify_trusted_genesis`
-    /// succeeds regardless of how the anchor hash was computed, confirming
-    /// that canonicalization produces a stable binding. Combined with the
+    /// succeeds with the correct construction order, confirming that the
+    /// circular dependency is broken. The content hash is computed first
+    /// (without knowing the QC), then the QC is created with `block_hash =
+    /// content_hash`, and finally the fact root is re-constructed with the
+    /// real `qc_anchor_hash`. Combined with the
     /// `qc_anchor_hash_is_permutation_invariant` test above (which proves
     /// non-genesis QC anchor hashes are permutation-invariant with real
     /// Ed25519 signatures), this covers the full attack surface.
@@ -1604,12 +1667,18 @@ mod tck_00370_unit_tests {
             "genesis QCs for same epoch must have same anchor hash"
         );
 
-        // Build FactRoot and verify end-to-end.
+        // Build FactRoot: content_hash is independent of qc_anchor_hash,
+        // so we can compute it with any valid anchor.
         let batch_roots = vec![test_hash(1), test_hash(2)];
         let fact_root = FactRootV1::new(batch_roots, 5, anchor_a).unwrap();
         let content_hash = fact_root.content_hash();
 
+        // Now build the real QC whose block_hash = content_hash.
         let qc = QuorumCertificate::genesis(5, content_hash);
+        // Anchor hash for the real QC should be the same (same epoch/round).
+        let real_anchor = compute_qc_anchor_hash(&qc);
+        assert_eq!(real_anchor, anchor_a);
+
         let validators = create_test_validators(4);
         let context = QcVerificationContext::new(&validators, 3);
 
@@ -1619,6 +1688,100 @@ mod tck_00370_unit_tests {
             "FactRoot verification must succeed, got: {result:?}"
         );
         assert_eq!(result.unwrap().content_hash, content_hash);
+    }
+
+    /// Critical test: proves the circular dependency is broken for non-genesis
+    /// (production) QCs with real Ed25519 signatures.
+    ///
+    /// The construction flow is:
+    /// 1. Proposer builds `FactRootV1` with batch data and a placeholder anchor.
+    /// 2. Proposer computes `content_hash()` -> this becomes `block_hash`.
+    /// 3. Validators sign `block_hash` (= `content_hash()`).
+    /// 4. Aggregator collects 2f+1 signatures into a QC.
+    /// 5. `qc_anchor_hash` is computed from the real QC.
+    /// 6. `FactRootV1` is re-constructed with the real `qc_anchor_hash`.
+    /// 7. `content_hash()` is unchanged because it excludes `qc_anchor_hash`.
+    /// 8. Verifier checks: QC valid, anchor binding, content binding, epoch.
+    #[test]
+    fn fact_root_non_genesis_construction_breaks_circularity() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        use crate::consensus::bft::{QuorumCertificate, ValidatorInfo, ValidatorSignature};
+
+        // Create 4 validators, quorum = 3.
+        let keys: Vec<SigningKey> = (0..4).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let pk = k.verifying_key();
+                let id: [u8; 32] = *blake3::hash(pk.as_bytes()).as_bytes();
+                ValidatorInfo {
+                    id,
+                    index: i,
+                    public_key: pk.to_bytes(),
+                }
+            })
+            .collect();
+        let context = QcVerificationContext::new(&validators, 3);
+
+        let epoch = 1u64;
+        let round = 10u64;
+
+        // Step 1-2: Proposer builds fact root and computes content_hash.
+        // The placeholder anchor doesn't affect content_hash.
+        let batch_roots = vec![test_hash(1), test_hash(2), test_hash(3)];
+        let placeholder_anchor = test_hash(9999);
+        let proposer_fr = FactRootV1::new(batch_roots.clone(), epoch, placeholder_anchor).unwrap();
+        let block_hash = proposer_fr.content_hash();
+
+        // Step 3: Validators sign the block_hash.
+        let vote_message =
+            super::super::qc_aggregator::build_vote_message(epoch, round, &block_hash);
+        let sigs: Vec<ValidatorSignature> = keys
+            .iter()
+            .take(3)
+            .map(|k| {
+                use ed25519_dalek::Signer;
+                let pk = k.verifying_key();
+                let id: [u8; 32] = *blake3::hash(pk.as_bytes()).as_bytes();
+                let sig_bytes = k.sign(&vote_message);
+                ValidatorSignature::new(id, sig_bytes.to_bytes())
+            })
+            .collect();
+
+        // Step 4: Aggregator creates the QC.
+        let qc = QuorumCertificate {
+            epoch,
+            round,
+            block_hash,
+            signatures: sigs,
+        };
+
+        // Step 5: Compute the real qc_anchor_hash from the QC.
+        let real_anchor = compute_qc_anchor_hash(&qc);
+
+        // Step 6: Re-construct FactRootV1 with the real anchor.
+        let fact_root = FactRootV1::new(batch_roots, epoch, real_anchor).unwrap();
+
+        // Step 7: content_hash is unchanged because it excludes qc_anchor_hash.
+        assert_eq!(
+            fact_root.content_hash(),
+            block_hash,
+            "content_hash must be stable: it must not depend on qc_anchor_hash"
+        );
+
+        // Step 8: Full verification succeeds.
+        let result = FactRootVerifier::verify(&fact_root, &qc, &context);
+        assert!(
+            result.is_ok(),
+            "Full non-genesis verification must succeed, got: {result:?}"
+        );
+        let vr = result.unwrap();
+        assert_eq!(vr.content_hash, block_hash);
+        assert_eq!(vr.epoch, epoch);
+        assert_eq!(vr.batch_count, 3);
     }
 
     // ── Helper for creating test validators ──
