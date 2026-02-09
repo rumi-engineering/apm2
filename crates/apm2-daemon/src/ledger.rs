@@ -64,6 +64,14 @@ impl SqliteLedgerEventEmitter {
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_work_id ON ledger_events(work_id)",
             [],
         )?;
+        // QUALITY MAJOR 1 FIX: Index on timestamp_ns for O(log N) latest-event
+        // lookups in `get_latest_event()`. Without this, the
+        // `ORDER BY timestamp_ns DESC, rowid DESC LIMIT 1` query performs a
+        // full table scan (O(N) cost) on every PCAC ledger anchor derivation.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_events_timestamp ON ledger_events(timestamp_ns)",
+            [],
+        )?;
         // Index for LeaseValidator
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ledger_events_type_payload ON ledger_events(event_type)",
@@ -874,6 +882,30 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let count = count as usize;
         count
+    }
+
+    fn get_latest_event(&self) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events
+             ORDER BY timestamp_ns DESC, rowid DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .ok()
     }
 
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {

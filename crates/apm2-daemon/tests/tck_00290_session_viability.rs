@@ -530,11 +530,15 @@ fn session_event_evidence_persist_full_config_integration() {
             assert_eq!(
                 err.code,
                 SessionErrorCode::SessionErrorToolNotAllowed as i32,
-                "RequestTool should return TOOL_NOT_ALLOWED (broker unavailable)"
+                "RequestTool should return TOOL_NOT_ALLOWED"
             );
+            // TCK-00426: In authoritative mode (ledger+CAS wired), the PCAC gate
+            // fail-closed check fires before the broker check. Both are valid
+            // TOOL_NOT_ALLOWED denials.
             assert!(
-                err.message.contains("broker unavailable"),
-                "Error message should indicate broker unavailable: {}",
+                err.message.contains("broker unavailable")
+                    || err.message.contains("PCAC authority gate not wired"),
+                "Error should indicate broker unavailable or PCAC gate missing: {}",
                 err.message
             );
         },

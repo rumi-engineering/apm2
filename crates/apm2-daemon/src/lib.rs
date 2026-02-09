@@ -54,6 +54,7 @@ pub mod htf;
 pub mod identity;
 pub mod ledger;
 pub mod metrics;
+pub mod pcac;
 pub mod projection;
 pub mod protocol;
 pub mod session;

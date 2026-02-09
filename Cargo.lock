@@ -208,6 +208,7 @@ dependencies = [
  "ctrlc",
  "directories",
  "ed25519-dalek",
+ "fs2",
  "futures",
  "hex",
  "hmac",

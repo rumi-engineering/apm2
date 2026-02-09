@@ -112,6 +112,9 @@ axum.workspace = true
 # Futures traits (for framed streams)
 futures = "0.3"
 
+# File locking for durable consume index (TCK-00426)
+fs2 = "0.4"
+
 [dev-dependencies]
 # Testing utilities
 tempfile.workspace = true

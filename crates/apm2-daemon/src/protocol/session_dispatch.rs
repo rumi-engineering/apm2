@@ -65,6 +65,7 @@ use std::time::SystemTime;
 
 use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
+use apm2_core::crypto::Hash;
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 use apm2_core::tool::{self, tool_request as tool_req};
 use apm2_holon::defect::{
@@ -740,6 +741,23 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// This store is shared with `PrivilegedDispatcher` via `DispatcherState`
     /// so that `SpawnEpisode` can mint and register V1 manifests.
     v1_manifest_store: Option<SharedV1ManifestStore>,
+    /// PCAC lifecycle gate for authority lifecycle enforcement (TCK-00423).
+    ///
+    /// When set, every `RequestTool` invocation must pass through the
+    /// lifecycle:
+    /// `join -> revalidate-before-decision -> broker decision ->
+    ///  revalidate-before-execution -> consume -> effect`.
+    ///
+    /// In authoritative mode (`ledger` or `cas` configured), this gate is
+    /// mandatory and missing wiring causes deny (fail-closed).
+    pcac_lifecycle_gate: Option<Arc<crate::pcac::LifecycleGate>>,
+}
+
+#[derive(Clone)]
+struct PendingPcacAuthority {
+    gate: Arc<crate::pcac::LifecycleGate>,
+    certificate: apm2_core::pcac::AuthorityJoinCertificateV1,
+    intent_digest: Hash,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -773,6 +791,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 
@@ -798,6 +817,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 }
@@ -828,6 +848,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 
@@ -858,6 +879,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 
@@ -904,6 +926,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 
@@ -1078,6 +1101,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_v1_manifest_store(mut self, store: SharedV1ManifestStore) -> Self {
         self.v1_manifest_store = Some(store);
+        self
+    }
+
+    /// Sets the PCAC lifecycle gate for authority enforcement (TCK-00423).
+    ///
+    /// When set, every `RequestTool` invocation must pass through the
+    /// split lifecycle:
+    /// `join -> revalidate-before-decision -> broker decision ->
+    ///  revalidate-before-execution -> consume -> effect`.
+    #[must_use]
+    pub fn with_pcac_lifecycle_gate(mut self, gate: Arc<crate::pcac::LifecycleGate>) -> Self {
+        self.pcac_lifecycle_gate = Some(gate);
         self
     }
 
@@ -1501,6 +1536,114 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         Ok(token)
     }
 
+    #[inline]
+    const fn is_authoritative_mode(&self) -> bool {
+        self.ledger.is_some() || self.cas.is_some()
+    }
+
+    fn derive_pcac_risk_tier_from_policy(
+        &self,
+        session_id: &str,
+        tool_class: ToolClass,
+    ) -> Option<apm2_core::pcac::RiskTier> {
+        let manifest = self
+            .manifest_store
+            .as_ref()
+            .and_then(|store| store.get_manifest(session_id))?;
+        let capability = manifest.find_by_tool_class(tool_class).next()?;
+        Some(match capability.risk_tier_required {
+            RiskTier::Tier0 => apm2_core::pcac::RiskTier::Tier0,
+            RiskTier::Tier1 => apm2_core::pcac::RiskTier::Tier1,
+            RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4 => {
+                apm2_core::pcac::RiskTier::Tier2Plus
+            },
+        })
+    }
+
+    /// Derive a PCAC ledger anchor from bounded metadata (O(1) cost).
+    ///
+    /// Uses `get_event_count()` + `get_latest_event()` instead of
+    /// `get_all_events()` to avoid full-table materialization on every
+    /// PCAC-gated request. The anchor hash is computed from the event
+    /// count and latest event fields, providing equivalent collision
+    /// resistance without O(N) memory/CPU cost.
+    fn derive_pcac_ledger_anchor(ledger: &dyn LedgerEventEmitter) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcac-ledger-anchor-v1");
+        let count = ledger.get_event_count() as u64;
+        hasher.update(&count.to_le_bytes());
+        if let Some(last) = ledger.get_latest_event() {
+            hasher.update(last.event_id.as_bytes());
+            hasher.update(last.event_type.as_bytes());
+            hasher.update(last.work_id.as_bytes());
+            hasher.update(last.actor_id.as_bytes());
+            hasher.update(&last.timestamp_ns.to_le_bytes());
+            hasher.update(&last.signature);
+            hasher.update(blake3::hash(&last.payload).as_bytes());
+        } else {
+            hasher.update(b"genesis");
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    fn hash_preactuation_receipt(receipt: &PreActuationReceipt) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcac-preactuation-receipt-v1");
+        hasher.update(&receipt.timestamp_ns.to_le_bytes());
+        hasher.update(&[u8::from(receipt.stop_checked)]);
+        hasher.update(&[u8::from(receipt.budget_checked)]);
+        hasher.update(&[u8::from(receipt.budget_enforcement_deferred)]);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn derive_scope_witness_hashes(tool_class: ToolClass, request_arguments: &[u8]) -> Vec<Hash> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pcac-scope-witness-v1");
+        let tool_class_name = tool_class.to_string();
+        hasher.update(tool_class_name.as_bytes());
+        hasher.update(request_arguments);
+        vec![*hasher.finalize().as_bytes()]
+    }
+
+    fn derive_fresh_pcac_revalidation_inputs(
+        &self,
+        session_id: &str,
+    ) -> Result<(Hash, Hash, Hash), String> {
+        let clock = self
+            .clock
+            .as_ref()
+            .ok_or_else(|| "clock unavailable".to_string())?;
+        let hlc = clock
+            .now_hlc()
+            .map_err(|e| format!("clock read failed: {e}"))?;
+        let current_time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
+
+        let ledger = self
+            .ledger
+            .as_ref()
+            .ok_or_else(|| "ledger unavailable".to_string())?;
+        let current_ledger_anchor = Self::derive_pcac_ledger_anchor(ledger.as_ref());
+
+        let registry = self
+            .session_registry
+            .as_ref()
+            .ok_or_else(|| "session registry unavailable".to_string())?;
+        let fresh_session = registry
+            .get_session(session_id)
+            .ok_or_else(|| "session state unavailable".to_string())?;
+        if fresh_session.policy_resolved_ref.is_empty() {
+            return Err("revocation provider unavailable: empty policy_resolved_ref".to_string());
+        }
+        let current_revocation_head =
+            *blake3::hash(fresh_session.policy_resolved_ref.as_bytes()).as_bytes();
+
+        Ok((
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head,
+        ))
+    }
+
     /// Handles `RequestTool` requests (IPC-SESS-001).
     ///
     /// # TCK-00260: Capability Manifest Validation
@@ -1920,6 +2063,254 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
+        // TCK-00423/TCK-00426: Stage 1 and Stage 2 of PCAC lifecycle.
+        // join -> revalidate-before-decision
+        //
+        // Stage 3 and Stage 4 (revalidate-before-execution + consume) run in
+        // `handle_broker_decision` immediately before effect execution.
+        let pending_pcac = if let Some(ref pcac_gate) = self.pcac_lifecycle_gate {
+            // BLOCKER 2 FIX: All required authoritative dependencies must be
+            // available before building the join input.
+            let Some(clock) = self.clock.as_ref() else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: clock unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: clock unavailable (fail-closed)",
+                ));
+            };
+            let Some(session_registry) = self.session_registry.as_ref() else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: session registry unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: session registry unavailable (fail-closed)",
+                ));
+            };
+            let Some(stop_authority) = self.stop_authority.as_ref() else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: stop authority unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: stop authority unavailable (fail-closed)",
+                ));
+            };
+            let Some(ledger) = self.ledger.as_ref() else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: ledger unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: ledger unavailable (fail-closed)",
+                ));
+            };
+
+            let hlc = match clock.now_hlc() {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        error = %error,
+                        "PCAC denied: clock read failed (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("PCAC authority denied: clock read failed: {error}"),
+                    ));
+                },
+            };
+
+            let Some(session_state) = session_registry.get_session(&token.session_id) else {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: session state unavailable (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: session state unavailable (fail-closed)",
+                ));
+            };
+            if session_state.policy_resolved_ref.is_empty() {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: revocation provider unavailable (empty policy_resolved_ref)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: revocation provider unavailable (fail-closed)",
+                ));
+            }
+
+            let capability_manifest_hash: Hash =
+                if let Ok(hash) = session_state.capability_manifest_hash.as_slice().try_into() {
+                    hash
+                } else {
+                    warn!(
+                        session_id = %token.session_id,
+                        hash_len = session_state.capability_manifest_hash.len(),
+                        "PCAC denied: capability_manifest_hash missing or malformed"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        "PCAC authority denied: malformed capability manifest hash (fail-closed)",
+                    ));
+                };
+
+            let Some(risk_tier) =
+                self.derive_pcac_risk_tier_from_policy(&token.session_id, tool_class)
+            else {
+                warn!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    "PCAC denied: risk tier missing from validated capability policy"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: risk tier missing from capability policy (fail-closed)",
+                ));
+            };
+
+            let directory_head_hash =
+                *blake3::hash(session_state.policy_resolved_ref.as_bytes()).as_bytes();
+            let freshness_policy_hash = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"pcac-freshness-policy-v1");
+                hasher.update(session_state.policy_resolved_ref.as_bytes());
+                *hasher.finalize().as_bytes()
+            };
+            let freshness_witness_tick = hlc.wall_ns / 1_000_000_000;
+            if freshness_witness_tick == 0 {
+                warn!(
+                    session_id = %token.session_id,
+                    "PCAC denied: freshness witness tick is zero"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "PCAC authority denied: freshness witness tick is zero (fail-closed)",
+                ));
+            }
+
+            // BLOCKER 1 FIX: Advance the kernel tick from the HLC-derived
+            // freshness witness so that revalidation freshness checks operate
+            // on real monotonic time rather than a static starting tick.
+            pcac_gate.advance_tick(freshness_witness_tick);
+
+            let pre_actuation_receipt_hashes = preactuation_receipt
+                .as_ref()
+                .map(Self::hash_preactuation_receipt)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let stop_budget_profile_digest = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"pcac-stop-budget-profile-v1");
+                hasher.update(&[u8::from(stop_authority.emergency_stop_active())]);
+                hasher.update(&[u8::from(stop_authority.governance_stop_active())]);
+                let tool_class_name = tool_class.to_string();
+                hasher.update(tool_class_name.as_bytes());
+                for receipt_hash in &pre_actuation_receipt_hashes {
+                    hasher.update(receipt_hash);
+                }
+                *hasher.finalize().as_bytes()
+            };
+
+            let intent_digest = *blake3::hash(&request.arguments).as_bytes();
+            let time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
+            let as_of_ledger_anchor = Self::derive_pcac_ledger_anchor(ledger.as_ref());
+            let determinism_class = match tool_class {
+                ToolClass::Read | ToolClass::ListFiles => {
+                    apm2_core::pcac::DeterminismClass::Deterministic
+                },
+                _ => apm2_core::pcac::DeterminismClass::BoundedNondeterministic,
+            };
+
+            let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
+                session_id: token.session_id.clone(),
+                holon_id: None,
+                intent_digest,
+                capability_manifest_hash,
+                scope_witness_hashes: Self::derive_scope_witness_hashes(
+                    tool_class,
+                    &request.arguments,
+                ),
+                lease_id: token.lease_id.clone(),
+                permeability_receipt_hash: None,
+                identity_proof_hash: *blake3::hash(token.session_id.as_bytes()).as_bytes(),
+                identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                directory_head_hash,
+                freshness_policy_hash,
+                freshness_witness_tick,
+                stop_budget_profile_digest,
+                pre_actuation_receipt_hashes,
+                risk_tier,
+                determinism_class,
+                time_envelope_ref,
+                as_of_ledger_anchor,
+            };
+
+            let (current_time_envelope_ref, current_ledger_anchor, current_revocation_head) =
+                match self.derive_fresh_pcac_revalidation_inputs(&token.session_id) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        warn!(
+                            session_id = %token.session_id,
+                            error = %error,
+                            "PCAC denied: authoritative revalidation inputs unavailable"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!(
+                                "PCAC authority denied: authoritative revalidation unavailable: {error}"
+                            ),
+                        ));
+                    },
+                };
+
+            let certificate = match pcac_gate.join_and_revalidate(
+                &pcac_input,
+                current_time_envelope_ref,
+                current_ledger_anchor,
+                current_revocation_head,
+            ) {
+                Ok(cert) => cert,
+                Err(deny) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        deny_class = %deny.deny_class,
+                        "RequestTool denied by PCAC join/revalidate lifecycle gate"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("PCAC authority denied: {}", deny.deny_class),
+                    ));
+                },
+            };
+
+            Some(PendingPcacAuthority {
+                gate: Arc::clone(pcac_gate),
+                certificate,
+                intent_digest,
+            })
+        } else if self.is_authoritative_mode() {
+            // BLOCKER 4 FIX: Authoritative mode requires mandatory PCAC gate wiring.
+            warn!(
+                session_id = %token.session_id,
+                "RequestTool denied: PCAC authority gate not wired in authoritative mode (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                "PCAC authority gate not wired in authoritative mode (fail-closed)",
+            ));
+        } else {
+            None
+        };
+
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
         let Some(broker) = broker else {
@@ -1962,12 +2353,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         let dedupe_key = DedupeKey::new(&request.dedupe_key);
         let args_hash = *blake3::hash(&request.arguments).as_bytes();
 
-        // BLOCKER 2 FIX (TCK-00290): Derive risk tier from capability manifest.
-        // Per the security review, we must not hardcode Tier0. Get the risk tier
-        // from the manifest's capability for this tool class, or default to Tier0
-        // if no specific tier is configured (fail-open for tier, fail-closed for
-        // access).
-        let risk_tier = self
+        // Derive risk tier from validated capability policy (fail-closed).
+        let Some(risk_tier) = self
             .manifest_store
             .as_ref()
             .and_then(|store| store.get_manifest(&token.session_id))
@@ -1977,7 +2364,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     .next()
                     .map(|cap| cap.risk_tier_required)
             })
-            .unwrap_or(RiskTier::Tier0);
+        else {
+            warn!(
+                session_id = %token.session_id,
+                tool_class = %tool_class,
+                "RequestTool denied: missing risk tier in capability policy (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                "capability policy missing risk tier for tool class (fail-closed)",
+            ));
+        };
 
         // Clone arguments for execution before they are moved into BrokerToolRequest
         let request_arguments = request.arguments.clone();
@@ -2274,6 +2671,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             preactuation_receipt.as_ref(),
             verified_content,
             toctou_verification_required,
+            pending_pcac,
         );
 
         if !defects.is_empty() {
@@ -2380,6 +2778,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         preactuation_receipt: Option<&PreActuationReceipt>,
         mut verified_content: Option<VerifiedToolContent>,
         toctou_verification_required: bool,
+        pending_pcac: Option<PendingPcacAuthority>,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -2414,6 +2813,150 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         SessionErrorCode::SessionErrorInternal,
                         format!("replay ordering verification failed: {violation}"),
                     ));
+                }
+
+                if let Some(pending_pcac) = pending_pcac {
+                    // TCK-00426 BLOCKER 3 + QUALITY BLOCKER 2:
+                    // revalidate and consume from fresh authoritative sources
+                    // immediately before effect execution.
+                    let (current_time_envelope_ref, current_ledger_anchor, current_revocation_head) =
+                        match self.derive_fresh_pcac_revalidation_inputs(session_id) {
+                            Ok(values) => values,
+                            Err(error) => {
+                                warn!(
+                                    session_id = %session_id,
+                                    request_id = %request_id,
+                                    error = %error,
+                                    "PCAC denied: authoritative revalidation unavailable before execution"
+                                );
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorToolNotAllowed,
+                                    format!(
+                                        "PCAC authority denied before execution: authoritative revalidation unavailable: {error}"
+                                    ),
+                                ));
+                            },
+                        };
+
+                    // SECURITY BLOCKER 1 FIX (round 2): Advance the kernel tick
+                    // from fresh HLC wall time BEFORE revalidation. Without this,
+                    // the kernel retains the tick from the join phase (before the
+                    // broker call). If the broker takes significant time, an AJC
+                    // that expires during the broker phase would be incorrectly
+                    // accepted because revalidate_before_execution uses the stale
+                    // join-phase tick. This closes the TOCTOU window.
+                    if let Some(ref clock) = self.clock {
+                        if let Ok(hlc) = clock.now_hlc() {
+                            let fresh_tick = hlc.wall_ns / 1_000_000_000;
+                            if fresh_tick > 0 {
+                                pending_pcac.gate.advance_tick(fresh_tick);
+                            }
+                        }
+                    }
+
+                    if let Err(deny) = pending_pcac.gate.revalidate_before_execution(
+                        &pending_pcac.certificate,
+                        current_time_envelope_ref,
+                        current_ledger_anchor,
+                        current_revocation_head,
+                    ) {
+                        warn!(
+                            session_id = %session_id,
+                            request_id = %request_id,
+                            deny_class = %deny.deny_class,
+                            "RequestTool denied by PCAC revalidate-before-execution"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!(
+                                "PCAC authority denied before execution: {}",
+                                deny.deny_class
+                            ),
+                        ));
+                    }
+
+                    let (consumed_witness, consume_record) = match pending_pcac
+                        .gate
+                        .consume_before_effect(
+                            &pending_pcac.certificate,
+                            pending_pcac.intent_digest,
+                            current_time_envelope_ref,
+                            current_revocation_head,
+                        ) {
+                        Ok(receipts) => receipts,
+                        Err(deny) => {
+                            warn!(
+                                session_id = %session_id,
+                                request_id = %request_id,
+                                deny_class = %deny.deny_class,
+                                "RequestTool denied by PCAC consume-before-effect"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!("PCAC authority denied before effect: {}", deny.deny_class),
+                            ));
+                        },
+                    };
+
+                    // QUALITY BLOCKER 1 & 2 FIX (RFC-0027 §6.1 step 9):
+                    // Emit a ToolActuation ledger event that binds the PCAC
+                    // lifecycle receipts to the tool actuation. This persists
+                    // the authority chain evidence (ajc_id, join_tick,
+                    // consume_tick, intent_digest) before effect execution.
+                    let consume_record_hash = {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(&consume_record.ajc_id);
+                        hasher.update(&consume_record.consumed_time_envelope_ref);
+                        hasher.update(&consume_record.consumed_at_tick.to_le_bytes());
+                        hasher.update(&consume_record.effect_selector_digest);
+                        *hasher.finalize().as_bytes()
+                    };
+
+                    if let Some(ref ledger) = self.ledger {
+                        let tool_actuation_payload = serde_json::json!({
+                            "event_kind": "ToolActuation",
+                            "ajc_id": hex::encode(pending_pcac.certificate.ajc_id),
+                            "tool_class": tool_class.to_string(),
+                            "intent_digest": hex::encode(pending_pcac.intent_digest),
+                            "join_tick": pending_pcac.certificate.expires_at_tick.saturating_sub(300),
+                            "consume_tick": consumed_witness.consumed_at_tick,
+                            "time_envelope_ref": hex::encode(current_time_envelope_ref),
+                            "ledger_anchor": hex::encode(current_ledger_anchor),
+                            "consume_record_hash": hex::encode(consume_record_hash),
+                        });
+                        let payload_bytes =
+                            serde_json::to_vec(&tool_actuation_payload).unwrap_or_default();
+                        if let Err(e) = ledger.emit_session_event(
+                            session_id,
+                            "pcac_tool_actuation",
+                            &payload_bytes,
+                            "pcac:lifecycle",
+                            timestamp_ns,
+                        ) {
+                            // Fail-closed: if the ToolActuation event cannot be
+                            // persisted, deny the effect. The authority chain
+                            // evidence MUST be durable before any side effect.
+                            warn!(
+                                session_id = %session_id,
+                                request_id = %request_id,
+                                error = %e,
+                                "ToolActuation ledger event persistence failed (fail-closed)"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInternal,
+                                format!("PCAC tool actuation evidence persistence failed: {e}"),
+                            ));
+                        }
+                    }
+
+                    info!(
+                        session_id = %session_id,
+                        request_id = %request_id,
+                        ajc_id = %hex::encode(pending_pcac.certificate.ajc_id),
+                        consumed_tick = consumed_witness.consumed_at_tick,
+                        consume_record_hash = %hex::encode(consume_record_hash),
+                        "PCAC consume completed and ToolActuation event persisted before effect execution"
+                    );
                 }
 
                 // TCK-00316: Execute tool via EpisodeRuntime
@@ -5087,9 +5630,20 @@ mod tests {
     // TCK-00316: Tool Execution Integration Tests
     // ========================================================================
     mod tool_execution {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use apm2_core::crypto::Hash;
+        use apm2_core::pcac::{
+            AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyClass, AuthorityDenyV1,
+            AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
+        };
+
         use super::*;
-        use crate::episode::{ToolBroker, ToolBrokerConfig, ToolClass};
-        use crate::htf::ClockConfig;
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
+        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
 
         /// TCK-00316: Verify fail-closed behavior when broker is configured but
         /// holonic clock is missing.
@@ -5235,6 +5789,7 @@ mod tests {
                     Some(&receipt),
                     None,
                     false,
+                    None,
                 )
                 .expect("dispatch should return application-level error response");
 
@@ -5249,6 +5804,240 @@ mod tests {
                 },
                 other => panic!("expected replay-verifier error response, got: {other:?}"),
             }
+        }
+
+        #[derive(Clone)]
+        struct SequencingKernel {
+            joins: Arc<AtomicUsize>,
+            revalidations: Arc<AtomicUsize>,
+            consumes: Arc<AtomicUsize>,
+        }
+
+        impl SequencingKernel {
+            fn new(
+                joins: Arc<AtomicUsize>,
+                revalidations: Arc<AtomicUsize>,
+                consumes: Arc<AtomicUsize>,
+            ) -> Self {
+                Self {
+                    joins,
+                    revalidations,
+                    consumes,
+                }
+            }
+        }
+
+        impl AuthorityJoinKernel for SequencingKernel {
+            fn join(
+                &self,
+                input: &AuthorityJoinInputV1,
+            ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+                self.joins.fetch_add(1, Ordering::SeqCst);
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"pcac-sequencing-test-ajc-v1");
+                hasher.update(&input.intent_digest);
+                hasher.update(input.session_id.as_bytes());
+                let ajc_id = *hasher.finalize().as_bytes();
+
+                Ok(AuthorityJoinCertificateV1 {
+                    ajc_id,
+                    authority_join_hash: *blake3::hash(&input.intent_digest).as_bytes(),
+                    intent_digest: input.intent_digest,
+                    risk_tier: input.risk_tier,
+                    issued_time_envelope_ref: input.time_envelope_ref,
+                    as_of_ledger_anchor: input.as_of_ledger_anchor,
+                    expires_at_tick: u64::MAX,
+                    revocation_head_hash: input.directory_head_hash,
+                    identity_evidence_level: input.identity_evidence_level,
+                    admission_capacity_token: None,
+                })
+            }
+
+            fn revalidate(
+                &self,
+                cert: &AuthorityJoinCertificateV1,
+                current_time_envelope_ref: Hash,
+                current_ledger_anchor: Hash,
+                current_revocation_head_hash: Hash,
+            ) -> Result<(), Box<AuthorityDenyV1>> {
+                self.revalidations.fetch_add(1, Ordering::SeqCst);
+                if current_revocation_head_hash != cert.revocation_head_hash {
+                    return Err(Box::new(AuthorityDenyV1 {
+                        deny_class: AuthorityDenyClass::RevocationFrontierAdvanced,
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: current_ledger_anchor,
+                        denied_at_tick: 0,
+                    }));
+                }
+                Ok(())
+            }
+
+            fn consume(
+                &self,
+                cert: &AuthorityJoinCertificateV1,
+                intent_digest: Hash,
+                current_time_envelope_ref: Hash,
+                _current_revocation_head_hash: Hash,
+            ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
+            {
+                self.consumes.fetch_add(1, Ordering::SeqCst);
+                if intent_digest != cert.intent_digest {
+                    return Err(Box::new(AuthorityDenyV1 {
+                        deny_class: AuthorityDenyClass::IntentDigestMismatch {
+                            expected: cert.intent_digest,
+                            actual: intent_digest,
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: cert.as_of_ledger_anchor,
+                        denied_at_tick: 0,
+                    }));
+                }
+
+                let witness = AuthorityConsumedV1 {
+                    ajc_id: cert.ajc_id,
+                    intent_digest,
+                    consumed_time_envelope_ref: current_time_envelope_ref,
+                    consumed_at_tick: 1,
+                };
+                let record = AuthorityConsumeRecordV1 {
+                    ajc_id: cert.ajc_id,
+                    consumed_time_envelope_ref: current_time_envelope_ref,
+                    consumed_at_tick: 1,
+                    effect_selector_digest: *blake3::hash(&intent_digest).as_bytes(),
+                };
+                Ok((witness, record))
+            }
+        }
+
+        #[test]
+        fn test_pcac_consume_occurs_after_broker_decision() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async {
+                let minter = test_minter();
+                let joins = Arc::new(AtomicUsize::new(0));
+                let revalidations = Arc::new(AtomicUsize::new(0));
+                let consumes = Arc::new(AtomicUsize::new(0));
+
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+                manifest_store.register(
+                    "session-001",
+                    super::tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]),
+                );
+
+                let broker = Arc::new(ToolBroker::new(
+                    ToolBrokerConfig::default().without_policy_check(),
+                ));
+                broker
+                    .initialize_with_manifest(
+                        super::tck_00260_manifest_validation::make_test_manifest(vec![
+                            ToolClass::Search,
+                        ]),
+                    )
+                    .await
+                    .expect("broker manifest initialization");
+
+                let registry = Arc::new(InMemorySessionRegistry::new());
+                registry
+                    .register_session(SessionState {
+                        session_id: "session-001".to_string(),
+                        work_id: "W-PCAC-ORDER".to_string(),
+                        role: crate::protocol::messages::WorkRole::Implementer.into(),
+                        lease_id: "lease-001".to_string(),
+                        ephemeral_handle: "handle-pcac-order".to_string(),
+                        policy_resolved_ref: "policy-head-ref".to_string(),
+                        capability_manifest_hash: blake3::hash(b"pcac-order-manifest")
+                            .as_bytes()
+                            .to_vec(),
+                        episode_id: Some("session-001".to_string()),
+                    })
+                    .expect("session registration");
+                let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let started_at_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|duration| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let value = duration.as_nanos() as u64;
+                        value
+                    })
+                    .unwrap_or(1);
+                telemetry_store
+                    .register("session-001", started_at_ns)
+                    .expect("telemetry registration");
+
+                let clock =
+                    Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+                let stop_authority = Arc::new(StopAuthority::new());
+                let preactuation_gate = Arc::new(PreActuationGate::production_gate(
+                    Arc::clone(&stop_authority),
+                    None,
+                ));
+                let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+
+                let kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(SequencingKernel::new(
+                    Arc::clone(&joins),
+                    Arc::clone(&revalidations),
+                    Arc::clone(&consumes),
+                ));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_clock(clock)
+                        .with_ledger(ledger)
+                        .with_session_registry(registry_dyn)
+                        .with_telemetry_store(telemetry_store)
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate);
+
+                let token = test_token(&minter);
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).expect("token serialization"),
+                    tool_id: "read".to_string(),
+                    arguments: serde_json::to_vec(&serde_json::json!({"path": "/tmp/input"}))
+                        .expect("arguments serialization"),
+                    dedupe_key: "pcac-ordering-deny".to_string(),
+                    epoch_seal: None,
+                };
+                let frame = encode_request_tool_request(&request);
+                let response = dispatcher
+                    .dispatch(&frame, &make_session_ctx())
+                    .expect("dispatch should return application-level response");
+
+                match response {
+                    SessionResponse::RequestTool(resp) => {
+                        assert_eq!(
+                            resp.decision,
+                            i32::from(DecisionType::Deny),
+                            "broker should deny read when only search is allowed"
+                        );
+                    },
+                    other => panic!("expected broker deny response, got: {other:?}"),
+                }
+
+                assert!(
+                    joins.load(Ordering::SeqCst) > 0,
+                    "join should run before broker decision"
+                );
+                assert!(
+                    revalidations.load(Ordering::SeqCst) > 0,
+                    "revalidate-before-decision should run before broker decision"
+                );
+                assert_eq!(
+                    consumes.load(Ordering::SeqCst),
+                    0,
+                    "consume must not run on broker deny; it is executed only on allow/effect path"
+                );
+            });
         }
 
         /// TCK-00336: Verify fail-closed behavior when no broker is configured.
@@ -5407,8 +6196,10 @@ mod tests {
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
                     lease_id: "L-TCK-00375".to_string(),
                     ephemeral_handle: "handle-tck-00375".to_string(),
-                    policy_resolved_ref: String::new(),
-                    capability_manifest_hash: vec![],
+                    // TCK-00426: PCAC gate requires non-empty manifest hash
+                    // and policy_resolved_ref in authoritative mode.
+                    policy_resolved_ref: "test-policy-ref".to_string(),
+                    capability_manifest_hash: blake3::hash(b"test-manifest").as_bytes().to_vec(),
                     episode_id: Some(session_id.to_string()),
                 })
                 .expect("session registration should succeed");
@@ -5580,6 +6371,10 @@ mod tests {
                 let ledger = Arc::new(StubLedgerEventEmitter::new());
                 let ledger_dyn: Arc<dyn LedgerEventEmitter> = ledger.clone();
 
+                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                    Arc::new(crate::pcac::InProcessKernel::new(1));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -5589,7 +6384,8 @@ mod tests {
                         .with_session_registry(registry_dyn)
                         .with_telemetry_store(Arc::clone(&telemetry_store))
                         .with_preactuation_gate(preactuation_gate)
-                        .with_stop_authority(stop_authority);
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate);
 
                 let spawn_time = std::time::SystemTime::now();
                 let token = minter
@@ -5802,6 +6598,10 @@ mod tests {
                 let ledger_dyn: Arc<dyn LedgerEventEmitter> =
                     Arc::new(StubLedgerEventEmitter::new());
 
+                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                    Arc::new(crate::pcac::InProcessKernel::new(1));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -5811,7 +6611,8 @@ mod tests {
                         .with_session_registry(registry_dyn)
                         .with_telemetry_store(Arc::clone(&telemetry_store))
                         .with_preactuation_gate(preactuation_gate)
-                        .with_stop_authority(stop_authority);
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate);
 
                 let spawn_time = std::time::SystemTime::now();
                 let token = minter
@@ -6779,8 +7580,12 @@ mod tests {
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
                     lease_id: "L-E2E-001".to_string(),
                     ephemeral_handle: "handle-e2e".to_string(),
-                    policy_resolved_ref: String::new(),
-                    capability_manifest_hash: vec![],
+                    // TCK-00426: PCAC gate requires non-empty manifest hash and
+                    // policy_resolved_ref in authoritative mode.
+                    policy_resolved_ref: "test-policy-ref".to_string(),
+                    capability_manifest_hash: blake3::hash(b"e2e-read-manifest")
+                        .as_bytes()
+                        .to_vec(),
                     episode_id: Some(session_id.clone()),
                 };
                 registry
@@ -6811,6 +7616,10 @@ mod tests {
                         None,
                     ),
                 );
+                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                    Arc::new(crate::pcac::InProcessKernel::new(1));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -6820,7 +7629,8 @@ mod tests {
                         .with_session_registry(Arc::clone(&registry))
                         .with_telemetry_store(Arc::clone(&telemetry_store))
                         .with_preactuation_gate(preactuation_gate)
-                        .with_stop_authority(stop_authority);
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate);
 
                 // Mint token with the episode-derived session_id
                 let spawn_time = std::time::SystemTime::now();

@@ -12,7 +12,7 @@
 //! - `FailClosedManifestStore` that denies all tools by default
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -169,6 +169,56 @@ fn build_adapter_selection_policy(
     }
 
     Ok((policy, available_profile_hashes))
+}
+
+/// Derives the durable PCAC consume-log path from the `SQLite` main database.
+///
+/// Authoritative persistence mode must bind durable consume state to the
+/// daemon's durable runtime storage, not a temporary directory.
+fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<PathBuf, String> {
+    let conn = sqlite_conn
+        .lock()
+        .map_err(|e| format!("sqlite connection lock poisoned while deriving PCAC path: {e}"))?;
+
+    let mut stmt = conn
+        .prepare("PRAGMA database_list")
+        .map_err(|e| format!("failed to query sqlite database list for PCAC path: {e}"))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("failed to iterate sqlite database list for PCAC path: {e}"))?;
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("failed to read sqlite database row for PCAC path: {e}"))?
+    {
+        let name: String = row
+            .get(1)
+            .map_err(|e| format!("failed to read sqlite database name for PCAC path: {e}"))?;
+        if name != "main" {
+            continue;
+        }
+
+        let file: String = row
+            .get(2)
+            .map_err(|e| format!("failed to read sqlite database file for PCAC path: {e}"))?;
+        if file.is_empty() || file == ":memory:" {
+            return Err(
+                "authoritative PCAC requires file-backed sqlite; in-memory main database has no durable path"
+                    .to_string(),
+            );
+        }
+
+        let db_path = PathBuf::from(file);
+        let Some(parent) = db_path.parent() else {
+            return Err(format!(
+                "sqlite main database has no parent directory for PCAC path: {}",
+                db_path.display()
+            ));
+        };
+        return Ok(parent.join("pcac_consume.log"));
+    }
+
+    Err("sqlite main database entry not found while deriving PCAC path".to_string())
 }
 
 const GITHUB_PROFILE_PREFIX: &str = "github-installation:";
@@ -740,6 +790,7 @@ impl DispatcherState {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
+        let sqlite_conn_for_pcac = sqlite_conn.clone();
 
         // TCK-00303: Create shared subscription registry for HEF resource governance
         let subscription_registry: SharedSubscriptionRegistry =
@@ -941,7 +992,9 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         // TCK-00351: Wire pre-actuation gate, stop authority, and stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
-        let session_dispatcher =
+        // TCK-00426: Authoritative persistence mode requires durable consume
+        // enforcement and lifecycle gate wiring.
+        let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
@@ -950,6 +1003,42 @@ impl DispatcherState {
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store);
+
+        if let Some(conn) = sqlite_conn_for_pcac {
+            match derive_pcac_consume_log_path(&conn) {
+                Ok(consume_log_path) => {
+                    let durable_index = crate::pcac::FileBackedConsumeIndex::open(
+                        &consume_log_path,
+                        Some(crate::pcac::DurableConsumeMetrics::global()),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "failed to open durable consume index at {}: {e}",
+                            consume_log_path.display()
+                        )
+                    })?;
+                    let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+                    let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
+                        Arc::clone(&tick_kernel),
+                        Box::new(durable_index),
+                    );
+                    let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
+                        Arc::new(durable_kernel);
+                    let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_tick_kernel(
+                        pcac_kernel,
+                        tick_kernel,
+                    ));
+                    session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
+                },
+                Err(error) if error.contains("in-memory main database has no durable path") => {
+                    tracing::warn!(
+                        reason = %error,
+                        "Skipping PCAC durable consume wiring for in-memory sqlite (non-authoritative mode)"
+                    );
+                },
+                Err(error) => return Err(error),
+            }
+        }
 
         Ok(Self {
             privileged_dispatcher,
@@ -1273,6 +1362,30 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         // TCK-00351: Wire pre-actuation gate, stop authority, stop conditions store
         // TCK-00352: Wire V1 manifest store for scope enforcement
+        // TCK-00426 BLOCKER 1 FIX: Wire DurableKernel + FileBackedConsumeIndex
+        // in production constructor. The consume log path is co-located inside
+        // the CAS directory to ensure per-instance isolation.
+        let consume_log_path = cas_path.as_ref().join("pcac_consume.log");
+        let durable_index = crate::pcac::FileBackedConsumeIndex::open(
+            &consume_log_path,
+            Some(crate::pcac::DurableConsumeMetrics::global()),
+        )
+        .map_err(|e| crate::cas::DurableCasError::InitializationFailed {
+            message: format!(
+                "failed to open durable consume index at {}: {e}",
+                consume_log_path.display()
+            ),
+        })?;
+        let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
+            Arc::clone(&tick_kernel),
+            Box::new(durable_index),
+        );
+        let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(durable_kernel);
+        let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_tick_kernel(
+            pcac_kernel,
+            tick_kernel,
+        ));
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -1286,7 +1399,8 @@ impl DispatcherState {
                 .with_preactuation_gate(preactuation_gate)
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
-                .with_v1_manifest_store(v1_manifest_store);
+                .with_v1_manifest_store(v1_manifest_store)
+                .with_pcac_lifecycle_gate(pcac_gate);
 
         Ok(Self {
             privileged_dispatcher,
