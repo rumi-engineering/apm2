@@ -37,6 +37,7 @@
 //! All types enforce fail-closed semantics: missing required fields, unknown
 //! enum variants, and ambiguous authority states produce deterministic denials.
 
+pub mod auth_verifier;
 mod deny;
 mod kernel;
 mod receipts;
@@ -45,11 +46,14 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use auth_verifier::{
+    FactClass, classify_fact, validate_authoritative_bindings, verify_receipt_authentication,
+};
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
 pub use kernel::AuthorityJoinKernel;
 pub use receipts::{
-    AuthorityConsumeReceiptV1, AuthorityDenyReceiptV1, AuthorityJoinReceiptV1,
-    AuthorityRevalidateReceiptV1,
+    AuthoritativeBindings, AuthorityConsumeReceiptV1, AuthorityDenyReceiptV1,
+    AuthorityJoinReceiptV1, AuthorityRevalidateReceiptV1, ReceiptAuthentication,
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,

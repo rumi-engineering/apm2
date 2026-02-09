@@ -1,5 +1,6 @@
 // AGENT-AUTHORED
-//! Tests for PCAC core schemas and deny taxonomy (TCK-00422).
+//! Tests for PCAC core schemas, deny taxonomy (TCK-00422), and
+//! receipt authentication verification (TCK-00425).
 
 use super::*;
 use crate::crypto::Hash;
@@ -531,4 +532,366 @@ fn deny_taxonomy_is_deterministic() {
         serde_json::to_string(&class1).unwrap(),
         serde_json::to_string(&class2).unwrap()
     );
+}
+
+// =============================================================================
+// Auth verifier helpers (TCK-00425)
+// =============================================================================
+
+fn valid_direct_auth(seal: Hash) -> ReceiptAuthentication {
+    ReceiptAuthentication::Direct {
+        authority_seal_hash: seal,
+    }
+}
+
+fn valid_pointer_auth(seal: Hash) -> ReceiptAuthentication {
+    ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: seal,
+        merkle_inclusion_proof: Some(vec![test_hash(0xE3), test_hash(0xE4)]),
+        receipt_batch_root_hash: Some(test_hash(0xE5)),
+    }
+}
+
+fn valid_bindings(seal: Hash) -> AuthoritativeBindings {
+    AuthoritativeBindings {
+        episode_envelope_hash: test_hash(0xA1),
+        view_commitment_hash: test_hash(0xA2),
+        time_envelope_ref: test_hash(0xA3),
+        authentication: valid_direct_auth(seal),
+        permeability_receipt_hash: None,
+        delegation_chain_hash: None,
+    }
+}
+
+const SEAL: Hash = [0xDD; 32];
+const TIME_REF: Hash = [0x07; 32];
+const LEDGER: Hash = [0x08; 32];
+const TICK: u64 = 1000;
+
+// =============================================================================
+// Direct authentication tests (TCK-00425)
+// =============================================================================
+
+#[test]
+fn direct_auth_happy_path() {
+    let auth = valid_direct_auth(SEAL);
+    let result = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn direct_auth_zero_seal_hash_denied() {
+    let auth = ReceiptAuthentication::Direct {
+        authority_seal_hash: zero_hash(),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "authority_seal_hash")
+    );
+}
+
+#[test]
+fn direct_auth_seal_mismatch_denied() {
+    let wrong_seal = test_hash(0xFF);
+    let auth = valid_direct_auth(wrong_seal);
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { .. }
+    ));
+}
+
+// =============================================================================
+// Pointer authentication tests (TCK-00425)
+// =============================================================================
+
+#[test]
+fn pointer_auth_happy_path_with_merkle_proof() {
+    let auth = valid_pointer_auth(SEAL);
+    let result = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn pointer_auth_happy_path_without_batching() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: None,
+        receipt_batch_root_hash: None,
+    };
+    let result = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn pointer_auth_zero_receipt_hash_denied() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: zero_hash(),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: None,
+        receipt_batch_root_hash: None,
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "receipt_hash")
+    );
+}
+
+#[test]
+fn pointer_auth_zero_seal_hash_denied() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: zero_hash(),
+        merkle_inclusion_proof: None,
+        receipt_batch_root_hash: None,
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "authority_seal_hash")
+    );
+}
+
+#[test]
+fn pointer_auth_seal_mismatch_denied() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: test_hash(0xFF),
+        merkle_inclusion_proof: None,
+        receipt_batch_root_hash: None,
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { .. }
+    ));
+}
+
+#[test]
+fn pointer_auth_empty_merkle_proof_denied() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![]),
+        receipt_batch_root_hash: Some(test_hash(0xE5)),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { .. }
+    ));
+}
+
+#[test]
+fn pointer_auth_zero_hash_in_merkle_proof_denied() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![test_hash(0xE3), zero_hash()]),
+        receipt_batch_root_hash: Some(test_hash(0xE5)),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "merkle_inclusion_proof[1]")
+    );
+}
+
+#[test]
+fn pointer_auth_zero_batch_root_denied() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![test_hash(0xE3)]),
+        receipt_batch_root_hash: Some(zero_hash()),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "receipt_batch_root_hash")
+    );
+}
+
+#[test]
+fn pointer_auth_proof_without_batch_root_denied() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: Some(vec![test_hash(0xE3)]),
+        receipt_batch_root_hash: None,
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { .. }
+    ));
+}
+
+#[test]
+fn pointer_auth_batch_root_without_proof_denied() {
+    let auth = ReceiptAuthentication::Pointer {
+        receipt_hash: test_hash(0xE1),
+        authority_seal_hash: SEAL,
+        merkle_inclusion_proof: None,
+        receipt_batch_root_hash: Some(test_hash(0xE5)),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::UnknownState { .. }
+    ));
+}
+
+// =============================================================================
+// Authoritative bindings validation tests (TCK-00425)
+// =============================================================================
+
+#[test]
+fn valid_bindings_pass() {
+    let bindings = valid_bindings(SEAL);
+    let result = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn zero_episode_envelope_hash_denied() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.episode_envelope_hash = zero_hash();
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "episode_envelope_hash")
+    );
+}
+
+#[test]
+fn zero_view_commitment_hash_denied() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.view_commitment_hash = zero_hash();
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "view_commitment_hash")
+    );
+}
+
+#[test]
+fn zero_time_envelope_ref_denied() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.time_envelope_ref = zero_hash();
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "time_envelope_ref")
+    );
+}
+
+#[test]
+fn zero_permeability_receipt_hash_denied() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.permeability_receipt_hash = Some(zero_hash());
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "permeability_receipt_hash")
+    );
+}
+
+#[test]
+fn zero_delegation_chain_hash_denied() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.delegation_chain_hash = Some(zero_hash());
+    let err = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert!(
+        matches!(err.deny_class, AuthorityDenyClass::ZeroHash { ref field_name } if field_name == "delegation_chain_hash")
+    );
+}
+
+#[test]
+fn valid_delegation_bindings_pass() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.permeability_receipt_hash = Some(test_hash(0xB1));
+    bindings.delegation_chain_hash = Some(test_hash(0xB2));
+    let result = validate_authoritative_bindings(&bindings, TIME_REF, LEDGER, TICK);
+    assert!(result.is_ok());
+}
+
+// =============================================================================
+// Fact classification tests (TCK-00425)
+// =============================================================================
+
+#[test]
+fn classify_acceptance_fact_with_direct_auth() {
+    let bindings = valid_bindings(SEAL);
+    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    assert_eq!(class, FactClass::AcceptanceFact);
+}
+
+#[test]
+fn classify_acceptance_fact_with_pointer_auth() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.authentication = valid_pointer_auth(SEAL);
+    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    assert_eq!(class, FactClass::AcceptanceFact);
+}
+
+#[test]
+fn classify_routing_fact_no_bindings() {
+    let class = classify_fact(None, &SEAL, TIME_REF, LEDGER, TICK);
+    assert_eq!(class, FactClass::RoutingFact);
+}
+
+#[test]
+fn classify_routing_fact_zero_envelope() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.episode_envelope_hash = zero_hash();
+    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    assert_eq!(class, FactClass::RoutingFact);
+}
+
+#[test]
+fn classify_routing_fact_bad_auth() {
+    let mut bindings = valid_bindings(SEAL);
+    bindings.authentication = ReceiptAuthentication::Direct {
+        authority_seal_hash: zero_hash(),
+    };
+    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    assert_eq!(class, FactClass::RoutingFact);
+}
+
+#[test]
+fn classify_routing_fact_seal_mismatch() {
+    let bindings = valid_bindings(test_hash(0xFF));
+    let class = classify_fact(Some(&bindings), &SEAL, TIME_REF, LEDGER, TICK);
+    assert_eq!(class, FactClass::RoutingFact);
+}
+
+// =============================================================================
+// FactClass serde and display tests (TCK-00425)
+// =============================================================================
+
+#[test]
+fn fact_class_display() {
+    assert_eq!(FactClass::AcceptanceFact.to_string(), "acceptance_fact");
+    assert_eq!(FactClass::RoutingFact.to_string(), "routing_fact");
+}
+
+#[test]
+fn fact_class_serde_roundtrip() {
+    for class in [FactClass::AcceptanceFact, FactClass::RoutingFact] {
+        let json = serde_json::to_string(&class).unwrap();
+        let back: FactClass = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, class);
+    }
+}
+
+// =============================================================================
+// Fail-closed on unknown state (TCK-00425)
+// =============================================================================
+
+#[test]
+fn deny_carries_correct_context() {
+    let auth = ReceiptAuthentication::Direct {
+        authority_seal_hash: zero_hash(),
+    };
+    let err = verify_receipt_authentication(&auth, &SEAL, TIME_REF, LEDGER, TICK).unwrap_err();
+    assert_eq!(err.time_envelope_ref, TIME_REF);
+    assert_eq!(err.ledger_anchor, LEDGER);
+    assert_eq!(err.denied_at_tick, TICK);
+    assert!(err.ajc_id.is_none());
 }
