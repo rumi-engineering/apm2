@@ -263,6 +263,8 @@ struct ProjectionError {
 #[derive(Debug, Clone, Serialize)]
 struct ProjectionStatus {
     line: String,
+    sha: String,
+    current_head_sha: String,
     security: String,
     quality: String,
     recent_events: String,
@@ -701,8 +703,8 @@ pub fn run_kickoff(
     event_path: &Path,
     event_name: &str,
     max_wait_seconds: u64,
-    json_output: bool,
     public_projection_only: bool,
+    json_output: bool,
 ) -> u8 {
     // SECURITY BOUNDARY: GitHub Action logs are publicly visible.
     // `public_projection_only` is intentionally fail-closed and must never emit
@@ -711,7 +713,6 @@ pub fn run_kickoff(
     if public_projection_only && json_output {
         return exit_codes::GENERIC_ERROR;
     }
-
     if !json_output && !public_projection_only {
         println!(
             "details=~/.apm2/review_events.ndjson state=~/.apm2/reviewer_state.json dispatch_logs=~/.apm2/review_dispatch/"
@@ -956,8 +957,13 @@ fn run_kickoff_inner(
             after_seq,
         )?;
         println!("{}", projection.line);
-        if !public_projection_only {
-            for error in &projection.errors {
+        for error in &projection.errors {
+            if public_projection_only {
+                eprintln!(
+                    "ERROR ts={} event={} review={} seq={} detail={}",
+                    error.ts, error.event, error.review_type, error.seq, error.detail
+                );
+            } else {
                 println!(
                     "ERROR ts={} event={} review={} seq={} detail={}",
                     error.ts, error.event, error.review_type, error.seq, error.detail
@@ -1060,6 +1066,69 @@ fn projection_state_from_sequence_verdict(verdict: Option<&str>, head_short: &st
     }
 }
 
+fn resolve_projection_sha(
+    pr_number: u32,
+    state: &ReviewStateFile,
+    events: &[serde_json::Value],
+    head_filter: Option<&str>,
+) -> String {
+    if let Some(head) = head_filter {
+        return head.to_string();
+    }
+    latest_state_head_sha(state, pr_number)
+        .or_else(|| latest_event_head_sha(events))
+        .or_else(|| latest_pulse_head_sha(pr_number))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn resolve_current_head_sha(
+    pr_number: u32,
+    state: &ReviewStateFile,
+    events: &[serde_json::Value],
+    fallback_sha: &str,
+) -> String {
+    latest_pulse_head_sha(pr_number)
+        .or_else(|| latest_state_head_sha(state, pr_number))
+        .or_else(|| latest_event_head_sha(events))
+        .unwrap_or_else(|| fallback_sha.to_string())
+}
+
+fn latest_state_head_sha(state: &ReviewStateFile, pr_number: u32) -> Option<String> {
+    state
+        .reviewers
+        .values()
+        .filter(|entry| entry_pr_number(entry).is_some_and(|value| value == pr_number))
+        .max_by_key(|entry| entry.started_at)
+        .map(|entry| entry.head_sha.clone())
+}
+
+fn latest_event_head_sha(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        event
+            .get("head_sha")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty() && *value != "-")
+            .map(ToString::to_string)
+    })
+}
+
+fn latest_pulse_head_sha(pr_number: u32) -> Option<String> {
+    let security = read_pulse_file(pr_number, "security").ok().flatten();
+    let quality = read_pulse_file(pr_number, "quality").ok().flatten();
+    match (security, quality) {
+        (Some(sec), Some(qual)) => {
+            if sec.written_at >= qual.written_at {
+                Some(sec.head_sha)
+            } else {
+                Some(qual.head_sha)
+            }
+        },
+        (Some(sec), None) => Some(sec.head_sha),
+        (None, Some(qual)) => Some(qual.head_sha),
+        (None, None) => None,
+    }
+}
+
 fn ensure_gh_cli_ready() -> Result<(), String> {
     let output = Command::new("gh")
         .args(["auth", "status"])
@@ -1090,10 +1159,12 @@ fn resolve_fac_event_context(
         serde_json::from_str(&payload_text).map_err(|err| format!("invalid event JSON: {err}"))?;
 
     match event_name {
-        "pull_request_target" => resolve_pull_request_target_context(repo, &payload),
+        "pull_request" | "pull_request_target" => {
+            resolve_pull_request_context(repo, event_name, &payload)
+        },
         "workflow_dispatch" => resolve_workflow_dispatch_context(repo, &payload),
         other => Err(format!(
-            "unsupported event_name `{other}`; expected pull_request_target or workflow_dispatch"
+            "unsupported event_name `{other}`; expected pull_request, pull_request_target, or workflow_dispatch"
         )),
     }
 }
@@ -1185,8 +1256,9 @@ fn build_barrier_decision_event(
     serde_json::Value::Object(envelope)
 }
 
-fn resolve_pull_request_target_context(
+fn resolve_pull_request_context(
     repo: &str,
+    event_name: &str,
     payload: &serde_json::Value,
 ) -> Result<FacEventContext, String> {
     let event_repo = payload
@@ -1240,7 +1312,7 @@ fn resolve_pull_request_target_context(
 
     Ok(FacEventContext {
         repo: repo.to_string(),
-        event_name: "pull_request_target".to_string(),
+        event_name: event_name.to_string(),
         pr_number,
         pr_url,
         head_sha,
@@ -1511,6 +1583,8 @@ fn run_project_inner(
         normalized_head.as_deref(),
     );
     apply_sequence_done_fallback(&events, &mut security, &mut quality);
+    let sha = resolve_projection_sha(pr_number, &state, &events, normalized_head.as_deref());
+    let current_head_sha = resolve_current_head_sha(pr_number, &state, &events, &sha);
 
     let recent_events = events
         .iter()
@@ -1585,8 +1659,10 @@ fn run_project_inner(
     }
 
     let line = format!(
-        "ts={} security={} quality={} events={}",
+        "ts={} sha={} current_head_sha={} security={} quality={} events={}",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        sha,
+        current_head_sha,
         security,
         quality,
         recent_events
@@ -1594,6 +1670,8 @@ fn run_project_inner(
 
     Ok(ProjectionStatus {
         line,
+        sha,
+        current_head_sha,
         security,
         quality,
         recent_events,
@@ -1778,6 +1856,15 @@ fn projection_state_for_type(
     review_kind: ReviewKind,
     head_filter: Option<&str>,
 ) -> String {
+    let mut latest_entry_for_kind = state
+        .reviewers
+        .values()
+        .filter(|entry| entry_pr_number(entry).is_some_and(|number| number == pr_number))
+        .filter(|entry| entry.review_type.eq_ignore_ascii_case(review_kind.as_str()))
+        .filter(|entry| head_filter.is_none_or(|head| entry.head_sha.eq_ignore_ascii_case(head)))
+        .collect::<Vec<_>>();
+    latest_entry_for_kind.sort_by_key(|entry| entry.started_at);
+
     let mut active_entries = state
         .reviewers
         .values()
@@ -1822,6 +1909,20 @@ fn projection_state_for_type(
         .find(|event| event_name(event) == "run_crash" && event_is_terminal_crash(event));
 
     if let Some(done) = done {
+        let verdict = done
+            .get("verdict")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        match verdict.as_str() {
+            // Fail closed: terminal completion without a passing verdict must not
+            // be rendered as "done", otherwise FAC can project a green check for
+            // a failed reviewer verdict.
+            "FAIL" => return "failed:verdict_fail".to_string(),
+            "UNKNOWN" | "" => return "failed:verdict_unknown".to_string(),
+            _ => {},
+        }
+
         let model = start
             .and_then(|value| value.get("model"))
             .and_then(serde_json::Value::as_str)
@@ -1858,6 +1959,17 @@ fn projection_state_for_type(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("run_crash");
         return format!("failed:{reason}");
+    }
+
+    let has_current_activity = !events_for_kind.is_empty();
+
+    // Fail closed only after current-run activity is observed for this review
+    // type. This avoids false failures from stale entries left by prior runs
+    // before the new dispatch emits its first event in the current window.
+    if let Some(stale) = latest_entry_for_kind.last() {
+        if has_current_activity && !is_process_alive(stale.pid) {
+            return "failed:stale_process_state".to_string();
+        }
     }
 
     "none".to_string()
@@ -2900,6 +3012,8 @@ fn run_status_inner(
             })
         })
         .collect::<Vec<_>>();
+    let current_head_sha =
+        filter_pr.map(|number| resolve_current_head_sha(number, &state, &filtered_events, "-"));
 
     if json_output {
         let payload = serde_json::json!({
@@ -2907,6 +3021,7 @@ fn run_status_inner(
             "recent_events": filtered_events,
             "pulse_security": pulse_security,
             "pulse_quality": pulse_quality,
+            "current_head_sha": current_head_sha,
         });
         println!(
             "{}",
@@ -2919,6 +3034,10 @@ fn run_status_inner(
     println!("FAC Review Status");
     if let Some(number) = filter_pr {
         println!("  Filter PR: #{number}");
+        println!(
+            "  Current Head SHA: {}",
+            current_head_sha.as_deref().unwrap_or("-")
+        );
     }
     if filtered_state.is_empty() {
         println!("  Active Runs: none");
@@ -2926,7 +3045,7 @@ fn run_status_inner(
         println!("  Active Runs:");
         for entry in filtered_state {
             println!(
-                "    - {} | pid={} alive={} model={} backend={} sha={} restarts={}",
+                "    - {} | pid={} alive={} model={} backend={} reviewed_sha={} restarts={}",
                 entry["review_type"].as_str().unwrap_or("unknown"),
                 entry["pid"].as_u64().unwrap_or(0),
                 entry["alive"].as_bool().unwrap_or(false),
@@ -2944,7 +3063,7 @@ fn run_status_inner(
     } else {
         for event in filtered_events.iter().rev().take(20).rev() {
             println!(
-                "    [{}] {} {} pr=#{} sha={}",
+                "    [{}] {} {} pr=#{} event_sha={}",
                 event["ts"].as_str().unwrap_or("-"),
                 event["event"].as_str().unwrap_or("-"),
                 event["review_type"].as_str().unwrap_or("-"),
@@ -4057,6 +4176,16 @@ fn is_process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    fn dead_pid_for_test() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .args(["-lc", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
     #[test]
     fn test_select_review_model_random_returns_pool_member() {
         let models = MODEL_POOL
@@ -4416,12 +4545,45 @@ mod tests {
                 "pr_number": 42,
                 "restart_count": 2,
                 "head_sha": "abcdef1234567890",
+                "verdict": "PASS",
                 "seq": 2
             }),
         ];
 
         let rendered = projection_state_for_type(&state, &events, 42, ReviewKind::Security, None);
         assert_eq!(rendered, "done:gpt-5.3-codex/codex:r2:abcdef1");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_fail_verdict_is_failed() {
+        let state = ReviewStateFile::default();
+        let events = vec![serde_json::json!({
+            "event": "run_complete",
+            "review_type": "security",
+            "pr_number": 42,
+            "head_sha": "abcdef1234567890",
+            "verdict": "FAIL",
+            "seq": 2
+        })];
+
+        let rendered = projection_state_for_type(&state, &events, 42, ReviewKind::Security, None);
+        assert_eq!(rendered, "failed:verdict_fail");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_unknown_verdict_is_failed() {
+        let state = ReviewStateFile::default();
+        let events = vec![serde_json::json!({
+            "event": "run_complete",
+            "review_type": "quality",
+            "pr_number": 17,
+            "head_sha": "abcdef1234567890",
+            "verdict": "UNKNOWN",
+            "seq": 2
+        })];
+
+        let rendered = projection_state_for_type(&state, &events, 17, ReviewKind::Quality, None);
+        assert_eq!(rendered, "failed:verdict_unknown");
     }
 
     #[test]
@@ -4438,6 +4600,80 @@ mod tests {
 
         let rendered = projection_state_for_type(&state, &events, 17, ReviewKind::Quality, None);
         assert_eq!(rendered, "failed:comment_post_permission_denied");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_stale_without_current_events_is_none() {
+        let dead_pid = dead_pid_for_test();
+        let mut state = ReviewStateFile::default();
+        state.reviewers.insert(
+            "stale-security".to_string(),
+            ReviewStateEntry {
+                pid: dead_pid,
+                started_at: Utc::now(),
+                log_file: PathBuf::from("/tmp/stale.log"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "security".to_string(),
+                pr_number: 42,
+                pr_url: "https://github.com/owner/repo/pull/42".to_string(),
+                head_sha: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+                restart_count: 0,
+                model: default_model(),
+                backend: ReviewBackend::Codex,
+                temp_files: Vec::new(),
+            },
+        );
+        let events = Vec::<serde_json::Value>::new();
+
+        let rendered = projection_state_for_type(
+            &state,
+            &events,
+            42,
+            ReviewKind::Security,
+            Some("abcdef1234567890abcdef1234567890abcdef12"),
+        );
+        assert_eq!(rendered, "none");
+    }
+
+    #[test]
+    fn test_projection_state_for_type_stale_with_current_events_is_failed() {
+        let dead_pid = dead_pid_for_test();
+        let mut state = ReviewStateFile::default();
+        state.reviewers.insert(
+            "stale-quality".to_string(),
+            ReviewStateEntry {
+                pid: dead_pid,
+                started_at: Utc::now(),
+                log_file: PathBuf::from("/tmp/stale.log"),
+                prompt_file: None,
+                last_message_file: None,
+                review_type: "quality".to_string(),
+                pr_number: 17,
+                pr_url: "https://github.com/owner/repo/pull/17".to_string(),
+                head_sha: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+                restart_count: 0,
+                model: default_model(),
+                backend: ReviewBackend::Codex,
+                temp_files: Vec::new(),
+            },
+        );
+        let events = vec![serde_json::json!({
+            "event": "run_start",
+            "review_type": "quality",
+            "pr_number": 17,
+            "head_sha": "abcdef1234567890abcdef1234567890abcdef12",
+            "seq": 1
+        })];
+
+        let rendered = projection_state_for_type(
+            &state,
+            &events,
+            17,
+            ReviewKind::Quality,
+            Some("abcdef1234567890abcdef1234567890abcdef12"),
+        );
+        assert_eq!(rendered, "failed:stale_process_state");
     }
 
     #[test]

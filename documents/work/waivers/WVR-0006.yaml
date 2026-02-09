@@ -1,0 +1,70 @@
+# WVR-0006: Temporary FAC pull_request execution on self-hosted runner
+#
+# This waiver is time-bounded to 30 days from approval. It permits running the
+# Forge Admission Cycle workflow from pull_request event context as a temporary
+# operational workaround while full FAC trigger hardening is deferred.
+
+waiver:
+  schema_version: "2026-01-30"
+  id: "WVR-0006"
+  title: "Temporary FAC trigger downgrade to pull_request"
+
+  status: "APPROVED"
+
+  scope:
+    gate_ids:
+      - "GATE-FAC-TRIGGER-TRUST-BOUNDARY"
+    requirement_ids:
+      - "REQ-HEF-0016"
+    quality_dimension_ids:
+      - "DEFAULT_DENY_SECURITY"
+      - "OPERATIONAL_READINESS"
+
+  rationale: |
+    The repository is temporarily switching Forge Admission Cycle execution from
+    pull_request_target to pull_request to improve operator convenience while
+    recovering CI reliability and reducing operational friction.
+
+    This is a deliberate strictness decrease in trigger trust posture for a
+    bounded period. The team accepts the temporary risk and schedules a full FAC
+    trigger hardening/security audit within 30 days.
+
+  mitigations:
+    - description: "Barrier job still enforces author_association allowlist (OWNER|MEMBER|COLLABORATOR)"
+      type: TECHNICAL
+      owner: "FAC workflow"
+
+    - description: "Workflow dispatch path remains permission-gated (write/maintain/admin + trusted ref)"
+      type: TECHNICAL
+      owner: "FAC barrier gate"
+
+    - description: "Full FAC trigger security audit and hardening PR due by waiver expiry"
+      type: PROCEDURAL
+      owner: "AUTH_SECURITY"
+
+  expiration_date: "2026-03-11"
+  # 30 days from approval date (2026-02-09). This waiver MUST be renewed or replaced
+  # before expiry; otherwise pull_request-trigger execution is non-compliant.
+
+  required_signoffs:
+    - "AUTH_SECURITY"
+    - "AUTH_RELIABILITY"
+
+  evidence_ids:
+    - "EVID-WVR-0006-WORKFLOW-CHANGE"
+
+  references:
+    ticket_id: "TCK-00433"
+    rfc_id: "RFC-0018"
+    workflow: ".github/workflows/forge-admission-cycle.yml"
+    deferred_audit_due: "2026-03-11"
+
+  approval:
+    approver: "repository_owner"
+    approval_date: "2026-02-09"
+    approval_notes: |
+      Approved as a temporary operational waiver with explicit 30-day expiry
+      and mandatory follow-up hardening audit.
+
+  created_date: "2026-02-09"
+  last_updated: "2026-02-09"

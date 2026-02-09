@@ -98,12 +98,12 @@ run_projection_window() {
 
     if [[ -z "$project_json" ]] || ! jq -e . >/dev/null 2>&1 <<<"$project_json"; then
       now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-      echo "ts=${now} security=unknown quality=unknown events=-"
+      echo "ts=${now} sha=- current_head_sha=- security=unknown quality=unknown events=-"
       sleep 1
       continue
     fi
 
-    jq -r --arg now "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" '.line // ("ts=" + $now + " security=unknown quality=unknown events=-")' <<<"$project_json"
+    jq -r --arg now "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" '.line // ("ts=" + $now + " sha=- current_head_sha=- security=unknown quality=unknown events=-")' <<<"$project_json"
     jq -r '.errors[]? | "ERROR ts=\(.ts) event=\(.event) review=\(.review_type) seq=\(.seq) detail=\(.detail)"' <<<"$project_json"
 
     next_seq=$(jq -r '.last_seq // 0' <<<"$project_json")
