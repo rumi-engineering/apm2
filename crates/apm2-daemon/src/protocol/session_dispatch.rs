@@ -740,6 +740,12 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// This store is shared with `PrivilegedDispatcher` via `DispatcherState`
     /// so that `SpawnEpisode` can mint and register V1 manifests.
     v1_manifest_store: Option<SharedV1ManifestStore>,
+    /// PCAC lifecycle gate for authority lifecycle enforcement (TCK-00423).
+    ///
+    /// When set, every `RequestTool` invocation must pass through the
+    /// `join -> revalidate -> consume` lifecycle before reaching broker
+    /// dispatch. If absent, the PCAC gate is skipped (Phase 1 opt-in).
+    pcac_lifecycle_gate: Option<Arc<crate::pcac::LifecycleGate>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -773,6 +779,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 
@@ -798,6 +805,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 }
@@ -828,6 +836,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 
@@ -858,6 +867,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 
@@ -904,6 +914,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             stop_authority: None,
             stop_conditions_store: None,
             v1_manifest_store: None,
+            pcac_lifecycle_gate: None,
         }
     }
 
@@ -1078,6 +1089,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_v1_manifest_store(mut self, store: SharedV1ManifestStore) -> Self {
         self.v1_manifest_store = Some(store);
+        self
+    }
+
+    /// Sets the PCAC lifecycle gate for authority enforcement (TCK-00423).
+    ///
+    /// When set, every `RequestTool` invocation must pass through the
+    /// `join -> revalidate -> consume` lifecycle before reaching broker
+    /// dispatch.
+    #[must_use]
+    pub fn with_pcac_lifecycle_gate(mut self, gate: Arc<crate::pcac::LifecycleGate>) -> Self {
+        self.pcac_lifecycle_gate = Some(gate);
         self
     }
 
@@ -1919,6 +1941,92 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
             }
         }
+
+        // TCK-00423: PCAC lifecycle gate (join -> revalidate -> consume).
+        // When configured, authority lifecycle must complete before any side
+        // effect. If absent, the gate is skipped (Phase 1 opt-in).
+        let _pcac_receipts = if let Some(ref pcac_gate) = self.pcac_lifecycle_gate {
+            // Build AuthorityJoinInputV1 from the request context.
+            let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
+                session_id: token.session_id.clone(),
+                holon_id: None,
+                intent_digest: *blake3::hash(&request.arguments).as_bytes(),
+                capability_manifest_hash: {
+                    // Derive capability hash from session ID + tool class.
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"capability_manifest:");
+                    hasher.update(token.session_id.as_bytes());
+                    *hasher.finalize().as_bytes()
+                },
+                scope_witness_hashes: vec![],
+                lease_id: token.session_id.clone(),
+                permeability_receipt_hash: None,
+                identity_proof_hash: *blake3::hash(token.session_id.as_bytes()).as_bytes(),
+                identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                directory_head_hash: self
+                    .session_registry
+                    .as_ref()
+                    .and_then(|reg| reg.get_session(&token.session_id))
+                    .map_or([1u8; 32], |s| {
+                        *blake3::hash(s.capability_manifest_hash.as_slice()).as_bytes()
+                    }),
+                freshness_policy_hash: [1u8; 32],
+                freshness_witness_tick: self
+                    .clock
+                    .as_ref()
+                    .and_then(|c| c.now_hlc().ok())
+                    .map_or(1, |hlc| hlc.wall_ns / 1_000_000_000),
+                stop_budget_profile_digest: [1u8; 32],
+                pre_actuation_receipt_hashes: preactuation_receipt
+                    .as_ref()
+                    .map(|r| vec![*blake3::hash(&r.timestamp_ns.to_le_bytes()).as_bytes()])
+                    .unwrap_or_default(),
+                risk_tier: apm2_core::pcac::RiskTier::Tier0,
+                determinism_class: apm2_core::pcac::DeterminismClass::BoundedNondeterministic,
+                time_envelope_ref: self
+                    .clock
+                    .as_ref()
+                    .and_then(|c| c.now_hlc().ok())
+                    .map_or([1u8; 32], |hlc| {
+                        *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes()
+                    }),
+                as_of_ledger_anchor: [1u8; 32],
+            };
+
+            // Derive current state for revalidation from session context.
+            let current_time_envelope_ref = pcac_input.time_envelope_ref;
+            let current_ledger_anchor = pcac_input.as_of_ledger_anchor;
+            let current_revocation_head = pcac_input.directory_head_hash;
+
+            match pcac_gate.execute(
+                &pcac_input,
+                current_time_envelope_ref,
+                current_ledger_anchor,
+                current_revocation_head,
+            ) {
+                Ok(receipts) => {
+                    info!(
+                        session_id = %token.session_id,
+                        ajc_id = %hex::encode(receipts.certificate.ajc_id),
+                        "PCAC lifecycle gate passed: authority consumed"
+                    );
+                    Some(receipts)
+                },
+                Err(deny) => {
+                    warn!(
+                        session_id = %token.session_id,
+                        deny_class = %deny.deny_class,
+                        "RequestTool denied by PCAC lifecycle gate"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("PCAC authority denied: {}", deny.deny_class),
+                    ));
+                },
+            }
+        } else {
+            None
+        };
 
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"

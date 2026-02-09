@@ -53,5 +53,5 @@ pub use receipts::{
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, IdentityEvidenceLevel,
+    AuthorityJoinInputV1, DeterminismClass, IdentityEvidenceLevel, RiskTier,
 };
