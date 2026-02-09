@@ -3841,6 +3841,72 @@ impl PolicyResolver for StubPolicyResolver {
 }
 
 // ============================================================================
+// Permeability Receipt Resolver (TCK-00373)
+// ============================================================================
+
+/// Resolves an optional permeability receipt for a work claim.
+///
+/// During `ClaimWork`, the dispatcher calls this resolver to determine
+/// whether the actor's claim is subject to delegated authority constraints.
+/// When the resolver returns `Some(receipt)`, the receipt is stored on the
+/// `WorkClaim` and enforced by the delegated spawn gate in `SpawnEpisode`.
+///
+/// # Contract
+///
+/// * If the actor operates under a delegation, the resolver **MUST** return a
+///   valid receipt whose `delegate_actor_id` matches `actor_id` and whose
+///   `policy_root_hash` matches `resolved_policy_hash`.
+/// * If the actor is a root (non-delegated) operator, the resolver returns
+///   `None` and no delegated spawn gate is entered.
+/// * Errors from the resolver are surfaced as `CapabilityRequestRejected` to
+///   the caller (fail-closed).
+pub trait PermeabilityReceiptResolver: Send + Sync {
+    /// Resolves a permeability receipt for the given claim context.
+    ///
+    /// # Arguments
+    ///
+    /// * `actor_id` - The authoritative actor ID (derived from credential).
+    /// * `work_id` - The work ID being claimed.
+    /// * `resolved_policy_hash` - The policy hash from governance resolution.
+    ///
+    /// # Returns
+    ///
+    /// `Some(receipt)` if the actor operates under delegated authority,
+    /// `None` for root (non-delegated) operators.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error description if the receipt cannot be resolved
+    /// (e.g., store unavailable, receipt invalid). Callers MUST treat
+    /// errors as fail-closed.
+    fn resolve_receipt(
+        &self,
+        actor_id: &str,
+        work_id: &str,
+        resolved_policy_hash: &[u8; 32],
+    ) -> Result<Option<apm2_core::policy::permeability::PermeabilityReceipt>, String>;
+}
+
+/// Stub receipt resolver that always returns `None` (no delegation).
+///
+/// Used in tests and non-delegated deployments. In production, this
+/// would be replaced with a governance-backed resolver that queries
+/// active delegation receipts for the actor.
+#[derive(Debug, Clone, Default)]
+pub struct StubPermeabilityReceiptResolver;
+
+impl PermeabilityReceiptResolver for StubPermeabilityReceiptResolver {
+    fn resolve_receipt(
+        &self,
+        _actor_id: &str,
+        _work_id: &str,
+        _resolved_policy_hash: &[u8; 32],
+    ) -> Result<Option<apm2_core::policy::permeability::PermeabilityReceipt>, String> {
+        Ok(None)
+    }
+}
+
+// ============================================================================
 // Work Registry Interface (TCK-00253)
 // ============================================================================
 
@@ -3876,6 +3942,15 @@ pub struct WorkClaim {
     /// Per TCK-00258, these are the domains of the actors who authored the
     /// changeset being reviewed.
     pub author_custody_domains: Vec<String>,
+
+    /// TCK-00373: Optional permeability receipt for delegated spawns.
+    ///
+    /// When present, `handle_spawn_episode` routes through the
+    /// delegated spawn gate for full consumption-binding verification
+    /// before allowing the spawn. The receipt is resolved during
+    /// `ClaimWork` and bound to the policy resolution context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permeability_receipt: Option<apm2_core::policy::permeability::PermeabilityReceipt>,
 }
 
 mod work_role_serde {
@@ -5803,6 +5878,14 @@ pub struct PrivilegedDispatcher {
     /// without inadvertently enabling `PublishChangeSet` (TCK-00412
     /// fail-closed).
     adapter_profile_cas: Option<Arc<dyn ContentAddressedStore>>,
+
+    /// TCK-00373: Permeability receipt resolver for delegated claim binding.
+    ///
+    /// During `ClaimWork`, the dispatcher queries this resolver to determine
+    /// whether the actor operates under a delegated authority. When the
+    /// resolver returns a receipt, it is stored on the `WorkClaim` and
+    /// subsequently enforced by the delegated spawn gate.
+    permeability_receipt_resolver: Arc<dyn PermeabilityReceiptResolver>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -5960,6 +6043,7 @@ impl PrivilegedDispatcher {
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
+            permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
         }
     }
 
@@ -6038,6 +6122,7 @@ impl PrivilegedDispatcher {
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
+            permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
         }
     }
 
@@ -6133,6 +6218,7 @@ impl PrivilegedDispatcher {
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
+            permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
         }
     }
 
@@ -6206,6 +6292,7 @@ impl PrivilegedDispatcher {
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
             adapter_profile_cas: None,
+            permeability_receipt_resolver: Arc::new(StubPermeabilityReceiptResolver),
         }
     }
 
@@ -6339,6 +6426,17 @@ impl PrivilegedDispatcher {
         store: crate::protocol::session_dispatch::SharedV1ManifestStore,
     ) -> Self {
         self.v1_manifest_store = Some(store);
+        self
+    }
+
+    /// Sets the permeability receipt resolver for delegated claim binding
+    /// (TCK-00373).
+    #[must_use]
+    pub fn with_permeability_receipt_resolver(
+        mut self,
+        resolver: Arc<dyn PermeabilityReceiptResolver>,
+    ) -> Self {
+        self.permeability_receipt_resolver = resolver;
         self
     }
 
@@ -7195,6 +7293,40 @@ impl PrivilegedDispatcher {
             },
         };
 
+        // TCK-00373 CQ MAJOR fix: Resolve permeability receipt for delegated
+        // claims. The resolver queries governance/store for active delegations
+        // bound to this actor and policy root. When a receipt is returned, it
+        // is stored on the WorkClaim and subsequently enforced by the delegated
+        // spawn gate in handle_spawn_episode. Errors are fail-closed.
+        let permeability_receipt = match self.permeability_receipt_resolver.resolve_receipt(
+            &actor_id,
+            &work_id,
+            &policy_resolution.resolved_policy_hash,
+        ) {
+            Ok(receipt) => {
+                if receipt.is_some() {
+                    debug!(
+                        work_id = %work_id,
+                        actor_id = %actor_id,
+                        "Permeability receipt resolved for delegated claim"
+                    );
+                }
+                receipt
+            },
+            Err(e) => {
+                warn!(
+                    work_id = %work_id,
+                    actor_id = %actor_id,
+                    error = %e,
+                    "ClaimWork rejected: permeability receipt resolution failed (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("permeability receipt resolution failed: {e}"),
+                ));
+            },
+        };
+
         // TCK-00395: Clone actor_id before it is moved into WorkClaim,
         // as we need it later for emit_work_transitioned.
         let actor_id_for_transition = actor_id.clone();
@@ -7208,6 +7340,7 @@ impl PrivilegedDispatcher {
             policy_resolution: policy_resolution.clone(),
             executor_custody_domains,
             author_custody_domains,
+            permeability_receipt,
         };
 
         // =====================================================================
@@ -8236,6 +8369,207 @@ impl PrivilegedDispatcher {
                     ));
                 }
             }
+        }
+
+        // =====================================================================
+        // TCK-00373: Delegated spawn gate — consumption binding verification
+        //
+        // BLOCKER 1: Mandatory binding both directions:
+        //   - claim has receipt but request omits hash => reject
+        //   - request has hash but claim has no receipt => reject
+        // This prevents delegated-path bypass by omission.
+        //
+        // BLOCKER 2: Full ConsumptionContext enforcement:
+        //   - actor_id from claim (scope binding)
+        //   - policy_root_hash from resolved policy (cross-policy replay)
+        //   - authority_ceiling from risk tier (authority bounds)
+        //   - parent_chain_commitment for chain commitment verification
+        // =====================================================================
+
+        // BLOCKER 1 (reverse direction): If the claim carries a permeability
+        // receipt, the request MUST also carry the receipt hash. A delegated
+        // claim processed without mandatory permeability_receipt_hash envelope
+        // binding violates RFC-0020 section 8.3.3 consumption rules.
+        if claim.permeability_receipt.is_some() && request.permeability_receipt_hash.is_none() {
+            warn!(
+                work_id = %request.work_id,
+                "SpawnEpisode rejected: claim has permeability_receipt but request omits permeability_receipt_hash"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "claim carries permeability_receipt but request omits permeability_receipt_hash \
+                 (mandatory binding required, fail-closed)",
+            ));
+        }
+
+        if let Some(ref receipt_hash_bytes) = request.permeability_receipt_hash {
+            use apm2_core::policy::permeability::ConsumptionContext;
+
+            if receipt_hash_bytes.len() != 32 {
+                warn!(
+                    work_id = %request.work_id,
+                    receipt_hash_len = receipt_hash_bytes.len(),
+                    "SpawnEpisode rejected: permeability_receipt_hash must be 32 bytes"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "permeability_receipt_hash must be 32 bytes, got {}",
+                        receipt_hash_bytes.len()
+                    ),
+                ));
+            }
+
+            let mut receipt_hash = [0u8; 32];
+            receipt_hash.copy_from_slice(receipt_hash_bytes);
+
+            // Fail-closed: receipt hash must be non-zero.
+            if receipt_hash == [0u8; 32] {
+                warn!(
+                    work_id = %request.work_id,
+                    "SpawnEpisode rejected: permeability_receipt_hash is zero"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "permeability_receipt_hash is zero (fail-closed)",
+                ));
+            }
+
+            // The claim MUST carry the actual receipt for consumption
+            // binding verification. Without the receipt object, we cannot
+            // verify the hash or authority — fail closed.
+            let Some(receipt) = &claim.permeability_receipt else {
+                warn!(
+                    work_id = %request.work_id,
+                    "SpawnEpisode rejected: permeability_receipt_hash present but claim has no receipt"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "permeability_receipt_hash present but claim has no associated receipt (fail-closed)",
+                ));
+            };
+
+            // Verify the receipt content hash matches the declared hash.
+            let actual_hash = receipt.content_hash();
+            if actual_hash != receipt_hash {
+                warn!(
+                    work_id = %request.work_id,
+                    expected = %hex::encode(receipt_hash),
+                    actual = %hex::encode(actual_hash),
+                    "SpawnEpisode rejected: permeability receipt hash mismatch"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "permeability receipt hash mismatch: expected {}, got {}",
+                        hex::encode(receipt_hash),
+                        hex::encode(actual_hash)
+                    ),
+                ));
+            }
+
+            // BLOCKER 2 (Security): Derive authority ceiling from the
+            // resolved risk tier through the SINGLE canonical mapping.
+            // Invalid/unknown tier values are **denied** (fail-closed),
+            // NOT mapped to `AuthorityVector::top()`.
+            let Some(authority_ceiling_vec) =
+                apm2_core::policy::permeability::authority_ceiling_for_risk_tier(
+                    claim.policy_resolution.resolved_risk_tier,
+                )
+            else {
+                warn!(
+                    work_id = %request.work_id,
+                    resolved_risk_tier = claim.policy_resolution.resolved_risk_tier,
+                    "SpawnEpisode rejected: invalid resolved_risk_tier (fail-closed deny)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!(
+                        "invalid resolved_risk_tier {} -- fail-closed deny \
+                         (valid range 0-4)",
+                        claim.policy_resolution.resolved_risk_tier,
+                    ),
+                ));
+            };
+
+            // BLOCKER 1 (Security): The `required_authority` is the
+            // risk-tier ceiling itself. The subsequent
+            // `validate_consumption_binding` checks that
+            // `required_authority.is_subset_of(&receipt.delegated)`,
+            // which enforces that the receipt carries AT LEAST the
+            // authority demanded by the spawn's risk tier.
+            //
+            // Using `lattice_meet(ceiling, delegated)` here would be
+            // tautological — the meet is always <= delegated, so the
+            // subset check would always pass.  By using the ceiling
+            // directly, a low-authority receipt attempting a
+            // high-risk-tier spawn is correctly rejected.
+            let required_authority = authority_ceiling_vec;
+
+            // Use HTF timestamp for consumption time verification.
+            let now_ms = match self.get_htf_timestamp_ns() {
+                Ok(ts_ns) => ts_ns / 1_000_000, // convert ns -> ms
+                Err(e) => {
+                    warn!(
+                        work_id = %request.work_id,
+                        error = %e,
+                        "SpawnEpisode rejected: HTF timestamp error for permeability gate"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("HTF timestamp error for permeability gate: {e}"),
+                    ));
+                },
+            };
+
+            // Construct ConsumptionContext from dispatch state.
+            //
+            // The context provides:
+            //   - actor_id: from the claim's authenticated actor identity
+            //   - policy_root_hash: from the claim's resolved policy hash
+            //   - authority_ceiling: derived from the canonical risk tier mapping
+            //   - parent_chain_commitment: None (root receipts are self-verifiable;
+            //     delegated receipts at depth > 0 will fail-closed if parent chain
+            //     commitment is unavailable)
+            let consumption_ctx = ConsumptionContext {
+                actor_id: &claim.actor_id,
+                policy_root_hash: &claim.policy_resolution.resolved_policy_hash,
+                authority_ceiling: Some(&authority_ceiling_vec),
+                parent_chain_commitment: None,
+            };
+
+            // Full consumption binding verification. This checks:
+            // - Receipt admission (expired, revoked, issuance-time)
+            // - Hash binding
+            // - Policy root provenance (against claim's policy_root_hash)
+            // - Scope binding (against claim's actor_id)
+            // - Delegation chain continuity
+            // - Chain commitment (cryptographic verification)
+            // - Authority ceiling (against risk-tier-derived ceiling)
+            // - Authority subset (against ceil-constrained required_authority)
+            if let Err(e) = apm2_core::policy::permeability::validate_consumption_binding(
+                receipt,
+                &receipt_hash,
+                &required_authority,
+                now_ms,
+                Some(&consumption_ctx),
+            ) {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: permeability consumption binding failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("permeability consumption binding failed: {e}"),
+                ));
+            }
+
+            info!(
+                work_id = %request.work_id,
+                receipt_hash = %hex::encode(receipt_hash),
+                "Delegated spawn gate passed: permeability receipt verified"
+            );
         }
 
         // TCK-00351 BLOCKER 2: Validate caller-supplied stop conditions
@@ -13935,6 +14269,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
 
@@ -14143,6 +14478,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
 
@@ -14183,6 +14519,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -14263,6 +14600,7 @@ mod tests {
                     adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
+                    permeability_receipt_hash: None,
                 }),
                 encode_issue_capability_request(&IssueCapabilityRequest {
                     session_id: "S-001".to_string(),
@@ -14347,6 +14685,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -14460,6 +14799,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -14506,6 +14846,7 @@ mod tests {
             },
             author_custody_domains: vec![],
             executor_custody_domains: vec![],
+            permeability_receipt: None,
         };
         dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -15134,6 +15475,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15182,6 +15524,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15235,6 +15578,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15292,6 +15636,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15344,6 +15689,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15390,6 +15736,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -15445,6 +15792,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15490,6 +15838,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15536,6 +15885,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15676,6 +16026,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -15734,6 +16085,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -15803,6 +16155,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -15863,6 +16216,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -15915,6 +16269,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             registry.register_claim(claim).unwrap();
         }
@@ -15950,6 +16305,7 @@ mod tests {
             },
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
 
         // First registration succeeds
@@ -16022,6 +16378,7 @@ mod tests {
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()],
+            permeability_receipt: None,
         };
 
         // Register the claim directly
@@ -16041,6 +16398,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -16097,6 +16455,7 @@ mod tests {
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
+            permeability_receipt: None,
         };
 
         // Register the claim
@@ -16118,6 +16477,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -16166,6 +16526,7 @@ mod tests {
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec![], // Empty - resolution failed
+            permeability_receipt: None,
         };
 
         // Register the claim
@@ -16187,6 +16548,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -16242,6 +16604,7 @@ mod tests {
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
+            permeability_receipt: None,
         };
 
         // Register the claim
@@ -16256,6 +16619,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_request);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -17046,6 +17410,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -17273,6 +17638,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -17376,6 +17742,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18094,6 +18461,7 @@ mod tests {
                     adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
+                    permeability_receipt_hash: None,
                 };
                 let spawn_frame = encode_spawn_episode_request(&spawn_request);
                 let spawn_resp = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -18539,6 +18907,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
@@ -18958,6 +19327,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: Some(0),
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&tampered_spawn);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -19019,6 +19389,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: Some(oversized_predicate),
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -19143,6 +19514,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -19310,6 +19682,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -19508,6 +19881,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -19592,6 +19966,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -19804,6 +20179,7 @@ mod tests {
                         },
                         executor_custody_domains: vec![],
                         author_custody_domains: vec![],
+                        permeability_receipt: None,
                     },
                     ts,
                 )
@@ -19886,6 +20262,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
 
             let result = emitter.emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000);
@@ -19932,6 +20309,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             emitter
                 .emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000)
@@ -20003,6 +20381,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -20093,6 +20472,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -20163,6 +20543,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -20226,6 +20607,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -20309,6 +20691,7 @@ mod tests {
                     adapter_profile_hash: None,
                     max_episodes: None,
                     escalation_predicate: None,
+                    permeability_receipt_hash: None,
                 };
                 let spawn_frame = encode_spawn_episode_request(&spawn_request);
                 let spawn_response = d.dispatch(&spawn_frame, &ctx).unwrap();
@@ -20500,6 +20883,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -20605,6 +20989,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let spawn_response = dispatcher.dispatch(&spawn_frame, &valid_ctx).unwrap();
@@ -20700,6 +21085,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let result = dispatcher.dispatch(&spawn_frame, &no_creds_ctx);
@@ -20953,6 +21339,7 @@ mod tests {
                 adapter_profile_hash: Some(vec![0x55; 32]),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -20999,6 +21386,7 @@ mod tests {
                 adapter_profile_hash: Some(adapter_hash.to_vec()),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -21048,6 +21436,7 @@ mod tests {
                 adapter_profile_hash: Some(adapter_hash.to_vec()),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -21104,6 +21493,7 @@ mod tests {
                 adapter_profile_hash: Some(adapter_hash.to_vec()),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -21188,6 +21578,7 @@ mod tests {
                 adapter_profile_hash: Some(adapter_hash.to_vec()),
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let spawn_frame = encode_spawn_episode_request(&spawn_request);
             let response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
@@ -22053,6 +22444,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
             let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
@@ -23419,6 +23811,7 @@ mod tests {
                     },
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
+                    permeability_receipt: None,
                 })
                 .expect("second work claim registration should succeed");
 
@@ -23516,6 +23909,7 @@ mod tests {
                     },
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
+                    permeability_receipt: None,
                 })
                 .expect("work claim registration should succeed");
 
@@ -24683,6 +25077,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -24769,6 +25164,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -25052,6 +25448,7 @@ mod tests {
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             state
                 .privileged_dispatcher()
@@ -25172,6 +25569,7 @@ mod tests {
                 policy_resolution,
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
+                permeability_receipt: None,
             };
             state
                 .privileged_dispatcher()
@@ -25630,6 +26028,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -25641,6 +26040,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -25701,6 +26101,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -25712,6 +26113,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -25776,6 +26178,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -25787,6 +26190,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -25849,6 +26253,7 @@ mod tests {
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
+                permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
 
@@ -25860,6 +26265,7 @@ mod tests {
                 adapter_profile_hash: None,
                 max_episodes: None,
                 escalation_predicate: None,
+                permeability_receipt_hash: None,
             };
             let frame = encode_spawn_episode_request(&request);
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -26140,6 +26546,681 @@ mod tests {
                 result.is_ok(),
                 "unknown placeholder not in known set should be accepted, got error: {result:?}"
             );
+        }
+    }
+
+    // =========================================================================
+    // TCK-00373: Delegated spawn gate dispatcher-level tests
+    // =========================================================================
+    mod delegated_spawn_gate {
+        use super::*;
+
+        /// Helper: create a privileged connection context.
+        fn priv_ctx() -> ConnectionContext {
+            ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }))
+        }
+
+        /// Helper: build a valid permeability receipt for testing.
+        ///
+        /// The receipt's delegated authority is `(Med, ReadWrite,
+        /// Capped(10M), Extend, Untrusted, Secret)` which satisfies
+        /// tier-0 and tier-1 ceilings.
+        fn build_test_receipt(
+            delegate_actor_id: &str,
+            policy_root_hash: [u8; 32],
+        ) -> apm2_core::policy::permeability::PermeabilityReceipt {
+            use apm2_core::policy::permeability::{
+                AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+                PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+            };
+
+            let parent = AuthorityVector::top();
+            // Authority that satisfies tier-0 ceiling (Low, ReadOnly,
+            // Capped(1M), Inherit, Attested, Confidential) and tier-1
+            // ceiling (Med, ReadWrite, Capped(10M), Extend, Untrusted,
+            // Secret):
+            let overlay = AuthorityVector::new(
+                RiskLevel::Med,
+                CapabilityLevel::ReadWrite,
+                BudgetLevel::Capped(10_000_000),
+                StopPredicateLevel::Extend,
+                TaintCeiling::Untrusted,
+                ClassificationLevel::Secret,
+            );
+            PermeabilityReceiptBuilder::new("test-receipt-001", parent, overlay)
+                .delegator_actor_id("root-delegator")
+                .delegate_actor_id(delegate_actor_id)
+                .issued_at_ms(1_000_000)
+                .expires_at_ms(u64::MAX / 2) // far-future expiry for tests
+                .policy_root_hash(policy_root_hash)
+                .build()
+                .unwrap()
+        }
+
+        /// TCK-00373 BLOCKER 1: Claim carries `permeability_receipt` but
+        /// request omits `permeability_receipt_hash` => MUST reject.
+        #[test]
+        fn delegated_claim_missing_request_receipt_hash_rejected() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = priv_ctx();
+
+            let policy_hash = [0xAA; 32];
+            let receipt = build_test_receipt("actor:delegated-user", policy_hash);
+
+            let claim = WorkClaim {
+                work_id: "W-DELEGATED-NO-HASH".to_string(),
+                lease_id: "L-DELEGATED-001".to_string(),
+                actor_id: "actor:delegated-user".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-delegated".to_string(),
+                    resolved_policy_hash: policy_hash,
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: Some(receipt),
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            // Request WITHOUT permeability_receipt_hash
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-DELEGATED-NO-HASH".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-DELEGATED-001".to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: None, // Missing!
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for missing receipt hash"
+                    );
+                    assert!(
+                        err.message.contains("mandatory binding")
+                            || err.message.contains("permeability_receipt_hash"),
+                        "Error should mention mandatory binding or receipt hash: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected rejection when claim has receipt but request omits hash, got: {other:?}"
+                ),
+            }
+        }
+
+        /// TCK-00373 BLOCKER 2: Context mismatch -- wrong `actor_id` in
+        /// consumption context causes scope binding rejection.
+        #[test]
+        fn delegated_claim_actor_mismatch_rejected() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = priv_ctx();
+
+            let policy_hash = [0xBB; 32];
+            // Receipt is bound to "actor:receipted-user" but claim has different actor_id
+            let receipt = build_test_receipt("actor:receipted-user", policy_hash);
+            let receipt_hash = receipt.content_hash().to_vec();
+
+            let claim = WorkClaim {
+                work_id: "W-DELEGATED-MISMATCH".to_string(),
+                lease_id: "L-DELEGATED-002".to_string(),
+                actor_id: "actor:different-user".to_string(), // Different from receipt!
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-delegated-2".to_string(),
+                    resolved_policy_hash: policy_hash,
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: Some(receipt),
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-DELEGATED-MISMATCH".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-DELEGATED-002".to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for actor mismatch"
+                    );
+                    assert!(
+                        err.message.contains("consumption binding failed")
+                            || err.message.contains("scope")
+                            || err.message.contains("actor"),
+                        "Error should mention consumption binding or scope or actor: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected rejection for actor mismatch in delegated path, got: {other:?}"
+                ),
+            }
+        }
+
+        /// TCK-00373 MAJOR: Valid delegated claim with matching receipt hash,
+        /// correct actor, and correct policy root => MUST accept (pass
+        /// through to subsequent validation stages).
+        #[test]
+        fn delegated_claim_valid_receipt_accepted() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = priv_ctx();
+
+            let policy_hash = blake3::hash(
+                format!("policy:{}:{}", "W-DELEGATED-VALID", "actor:valid-delegate").as_bytes(),
+            );
+            let policy_hash_bytes: [u8; 32] = *policy_hash.as_bytes();
+            let receipt = build_test_receipt("actor:valid-delegate", policy_hash_bytes);
+            let receipt_hash = receipt.content_hash().to_vec();
+
+            let claim = WorkClaim {
+                work_id: "W-DELEGATED-VALID".to_string(),
+                lease_id: "L-DELEGATED-003".to_string(),
+                actor_id: "actor:valid-delegate".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-delegated-3".to_string(),
+                    resolved_policy_hash: policy_hash_bytes,
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: Some(receipt),
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-DELEGATED-VALID".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-DELEGATED-003".to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // The delegated gate should pass; the response may still be an
+            // error from a LATER validation stage (e.g., scope baseline
+            // validation, V1 manifest check, etc.) but NOT from the
+            // permeability gate. We verify it is NOT a permeability error.
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        !err.message.contains("permeability"),
+                        "Valid delegated receipt should not be rejected by permeability gate, \
+                         but got permeability error: {}",
+                        err.message
+                    );
+                    // It's OK to get a later-stage error (e.g., scope
+                    // baseline), confirming the delegated
+                    // gate passed.
+                },
+                PrivilegedResponse::SpawnEpisode(_) => {
+                    // Success is also acceptable.
+                },
+                other => {
+                    // Any non-error, non-spawn response is unexpected.
+                    panic!("Unexpected response type: {other:?}");
+                },
+            }
+        }
+
+        /// Helper: build a low-authority permeability receipt for testing.
+        ///
+        /// The receipt's delegated authority is minimal (Low/ReadOnly/Public).
+        /// Used by the authority-insufficient rejection test.
+        fn build_low_authority_receipt(
+            delegate_actor_id: &str,
+            policy_root_hash: [u8; 32],
+        ) -> apm2_core::policy::permeability::PermeabilityReceipt {
+            use apm2_core::policy::permeability::{
+                AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+                PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+            };
+
+            let parent = AuthorityVector::new(
+                RiskLevel::Low,
+                CapabilityLevel::ReadOnly,
+                BudgetLevel::Capped(100),
+                StopPredicateLevel::Inherit,
+                TaintCeiling::Attested,
+                ClassificationLevel::Public,
+            );
+            let overlay = parent; // overlay == parent => delegated == parent
+            PermeabilityReceiptBuilder::new("test-receipt-low-auth", parent, overlay)
+                .delegator_actor_id("root-delegator")
+                .delegate_actor_id(delegate_actor_id)
+                .issued_at_ms(1_000_000)
+                .expires_at_ms(u64::MAX / 2)
+                .policy_root_hash(policy_root_hash)
+                .build()
+                .unwrap()
+        }
+
+        /// TCK-00373 BLOCKER 1: Low-authority receipt used with a
+        /// high-risk-tier spawn MUST be rejected.
+        ///
+        /// The receipt carries `(Low, ReadOnly, Capped(100), ...)` but the
+        /// spawn's risk tier 3 demands `(High, Full, Unlimited, ...)`.
+        /// Because `required_authority = ceiling` and the receipt's delegated
+        /// authority is NOT a superset of the ceiling, the
+        /// `validate_consumption_binding` subset check rejects the spawn.
+        #[test]
+        fn low_authority_receipt_rejected_for_high_risk_tier_spawn() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = priv_ctx();
+
+            let policy_hash = [0xEE; 32];
+            let receipt = build_low_authority_receipt("actor:low-auth-user", policy_hash);
+            let receipt_hash = receipt.content_hash().to_vec();
+
+            let claim = WorkClaim {
+                work_id: "W-DELEGATED-LOWAUTH".to_string(),
+                lease_id: "L-DELEGATED-LOWAUTH".to_string(),
+                actor_id: "actor:low-auth-user".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-low-auth".to_string(),
+                    resolved_policy_hash: policy_hash,
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 3, // High risk tier
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: Some(receipt),
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-DELEGATED-LOWAUTH".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-DELEGATED-LOWAUTH".to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for insufficient authority"
+                    );
+                    assert!(
+                        err.message.contains("consumption binding failed")
+                            || err.message.contains("DelegationWidening")
+                            || err.message.contains("authority"),
+                        "Error should mention consumption binding failure or authority: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected rejection for low-authority receipt with high risk tier, got: {other:?}"
+                ),
+            }
+        }
+
+        /// TCK-00373: Policy root mismatch between receipt and claim's
+        /// resolved policy hash => MUST reject.
+        #[test]
+        fn delegated_claim_policy_root_mismatch_rejected() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = priv_ctx();
+
+            // Receipt bound to policy_hash_a, claim has policy_hash_b
+            let policy_hash_a = [0xCC; 32];
+            let policy_hash_b = [0xDD; 32];
+            let receipt = build_test_receipt("actor:policy-test", policy_hash_a);
+            let receipt_hash = receipt.content_hash().to_vec();
+
+            let claim = WorkClaim {
+                work_id: "W-DELEGATED-POLICY".to_string(),
+                lease_id: "L-DELEGATED-004".to_string(),
+                actor_id: "actor:policy-test".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-delegated-4".to_string(),
+                    resolved_policy_hash: policy_hash_b, // Different from receipt!
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: Some(receipt),
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-DELEGATED-POLICY".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-DELEGATED-004".to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for policy root mismatch"
+                    );
+                    assert!(
+                        err.message.contains("consumption binding failed")
+                            || err.message.contains("policy")
+                            || err.message.contains("PolicyRootMismatch"),
+                        "Error should mention consumption binding or policy: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected rejection for policy root mismatch in delegated path, got: {other:?}"
+                ),
+            }
+        }
+
+        /// TCK-00373 MAJOR 1: End-to-end claim->spawn success using
+        /// `PermeabilityReceiptResolver` wiring.
+        ///
+        /// A dynamic resolver builds a valid receipt at claim-time using
+        /// the actual `resolved_policy_hash` and `actor_id` provided by
+        /// the claim handler. The subsequent `SpawnEpisode` carries the
+        /// receipt hash and the delegated gate passes. This proves the
+        /// production path is wired (non-dead code) and that claim-level
+        /// receipt binding flows into the spawn gate.
+        #[test]
+        fn claim_to_spawn_delegated_success_via_resolver() {
+            use std::sync::{Arc, Mutex};
+
+            use apm2_core::policy::permeability::{
+                AuthorityVector, BudgetLevel, CapabilityLevel, ClassificationLevel,
+                PermeabilityReceiptBuilder, RiskLevel, StopPredicateLevel, TaintCeiling,
+            };
+
+            // Dynamic resolver: builds a receipt at resolve time using
+            // the actual policy hash from the governance stub. This avoids
+            // the chicken-and-egg problem of needing the policy hash before
+            // ClaimWork generates it.
+            struct DynamicReceiptResolver {
+                /// Capture the built receipt so the test can read the hash.
+                built_receipt: Mutex<Option<apm2_core::policy::permeability::PermeabilityReceipt>>,
+            }
+
+            impl PermeabilityReceiptResolver for DynamicReceiptResolver {
+                fn resolve_receipt(
+                    &self,
+                    actor_id: &str,
+                    _work_id: &str,
+                    resolved_policy_hash: &[u8; 32],
+                ) -> Result<Option<apm2_core::policy::permeability::PermeabilityReceipt>, String>
+                {
+                    let parent = AuthorityVector::top();
+                    // Authority that satisfies tier-0 ceiling.
+                    let overlay = AuthorityVector::new(
+                        RiskLevel::Low,
+                        CapabilityLevel::ReadOnly,
+                        BudgetLevel::Capped(1_000_000),
+                        StopPredicateLevel::Inherit,
+                        TaintCeiling::Attested,
+                        ClassificationLevel::Confidential,
+                    );
+                    let receipt =
+                        PermeabilityReceiptBuilder::new("resolver-e2e-receipt", parent, overlay)
+                            .delegator_actor_id("root-delegator")
+                            .delegate_actor_id(actor_id)
+                            .issued_at_ms(1_000_000)
+                            .expires_at_ms(u64::MAX / 2)
+                            .policy_root_hash(*resolved_policy_hash)
+                            .build()
+                            .map_err(|e| format!("receipt build failed: {e}"))?;
+
+                    *self.built_receipt.lock().unwrap() = Some(receipt.clone());
+                    Ok(Some(receipt))
+                }
+            }
+
+            let resolver = Arc::new(DynamicReceiptResolver {
+                built_receipt: Mutex::new(None),
+            });
+
+            let resolver_dyn: Arc<dyn PermeabilityReceiptResolver> = resolver;
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_permeability_receipt_resolver(Arc::clone(&resolver_dyn));
+            let ctx = priv_ctx();
+
+            // Step 1: ClaimWork -- resolver dynamically builds and attaches receipt
+            let claim_request = ClaimWorkRequest {
+                actor_id: "delegated-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("Expected ClaimWork response, got: {other:?}"),
+            };
+
+            // Verify the claim now carries the receipt
+            let stored_claim = dispatcher.work_registry.get_claim(&work_id).unwrap();
+            assert!(
+                stored_claim.permeability_receipt.is_some(),
+                "Claim MUST carry permeability_receipt after resolver wiring"
+            );
+
+            // Get the receipt hash from the stored claim for the spawn request
+            let receipt_hash_vec = stored_claim
+                .permeability_receipt
+                .as_ref()
+                .unwrap()
+                .content_hash()
+                .to_vec();
+
+            // Step 2: SpawnEpisode with receipt hash
+            let spawn_request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id,
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash_vec),
+            };
+            let spawn_frame = encode_spawn_episode_request(&spawn_request);
+            let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+
+            // The delegated gate should pass. The response may be a later-stage
+            // error (e.g., scope baseline) but NOT a permeability rejection.
+            match spawn_response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        !err.message.contains("permeability"),
+                        "Delegated gate should pass for valid resolver-wired claim, \
+                         but got permeability error: {}",
+                        err.message
+                    );
+                },
+                PrivilegedResponse::SpawnEpisode(_) => {
+                    // Full success is also acceptable.
+                },
+                other => {
+                    panic!("Unexpected response type: {other:?}");
+                },
+            }
+        }
+
+        /// TCK-00373 MAJOR 1 (failure path): When the receipt resolver
+        /// returns an error during `ClaimWork`, the claim MUST be rejected
+        /// (fail-closed).
+        #[test]
+        fn claim_rejected_when_receipt_resolver_fails() {
+            use std::sync::Arc;
+
+            struct FailingReceiptResolver;
+            impl PermeabilityReceiptResolver for FailingReceiptResolver {
+                fn resolve_receipt(
+                    &self,
+                    _actor_id: &str,
+                    _work_id: &str,
+                    _resolved_policy_hash: &[u8; 32],
+                ) -> Result<Option<apm2_core::policy::permeability::PermeabilityReceipt>, String>
+                {
+                    Err("governance store unavailable (simulated)".to_string())
+                }
+            }
+
+            let resolver = Arc::new(FailingReceiptResolver);
+            let dispatcher =
+                PrivilegedDispatcher::new().with_permeability_receipt_resolver(resolver);
+            let ctx = priv_ctx();
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "test-actor-fail".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+            match claim_response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for resolver failure"
+                    );
+                    assert!(
+                        err.message
+                            .contains("permeability receipt resolution failed")
+                            || err.message.contains("governance store unavailable"),
+                        "Error should mention resolution failure: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected claim rejection when resolver fails, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00373 BLOCKER 1: Invalid risk tier (out of range 0-4) MUST
+        /// be rejected fail-closed, not mapped to a permissive ceiling.
+        #[test]
+        fn invalid_risk_tier_rejected_fail_closed() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = priv_ctx();
+
+            let policy_hash = [0xFF; 32];
+            let receipt = build_test_receipt("actor:invalid-tier", policy_hash);
+            let receipt_hash = receipt.content_hash().to_vec();
+
+            let claim = WorkClaim {
+                work_id: "W-DELEGATED-BADTIER".to_string(),
+                lease_id: "L-DELEGATED-BADTIER".to_string(),
+                actor_id: "actor:invalid-tier".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-bad-tier".to_string(),
+                    resolved_policy_hash: policy_hash,
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 255, // Invalid!
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: Some(receipt),
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-DELEGATED-BADTIER".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-DELEGATED-BADTIER".to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: Some(receipt_hash),
+            };
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                        "Expected CapabilityRequestRejected for invalid risk tier"
+                    );
+                    assert!(
+                        err.message.contains("invalid resolved_risk_tier")
+                            || err.message.contains("fail-closed deny"),
+                        "Error should mention invalid risk tier: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected rejection for invalid risk tier, got: {other:?}"),
+            }
         }
     }
 }

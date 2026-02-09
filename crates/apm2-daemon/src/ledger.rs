@@ -2474,6 +2474,7 @@ mod tests {
             policy_resolution: test_policy_resolution(),
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
 
         emitter.emit_work_claimed(&claim, ts).unwrap();
@@ -2550,6 +2551,7 @@ mod tests {
             policy_resolution: test_policy_resolution(),
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
         emitter.emit_work_claimed(&claim, 1_000).unwrap();
 
@@ -2633,6 +2635,7 @@ mod tests {
             policy_resolution: test_policy_resolution(),
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
 
         let result = emitter.emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000);
@@ -2668,6 +2671,7 @@ mod tests {
             policy_resolution: test_policy_resolution(),
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
         emitter
             .emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000)
@@ -2733,6 +2737,7 @@ mod tests {
             policy_resolution: test_policy_resolution(),
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
         let result = emitter.emit_claim_lifecycle(&claim, "uid:1000", 1_000);
         assert!(result.is_ok());
@@ -2758,6 +2763,7 @@ mod tests {
             policy_resolution: test_policy_resolution(),
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
         let result2 = emitter.emit_claim_lifecycle(&claim2, "uid:1000", 2_000);
         assert!(result2.is_err(), "Should fail when table is dropped");
@@ -3000,6 +3006,7 @@ mod tests {
             policy_resolution: test_policy_resolution(),
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
+            permeability_receipt: None,
         };
         emitter
             .emit_claim_lifecycle(&claim, "uid:1000", 1_000_000_000)

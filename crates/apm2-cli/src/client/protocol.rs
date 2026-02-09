@@ -509,6 +509,7 @@ impl OperatorClient {
             adapter_profile_hash: adapter_profile_hash.map(<[u8]>::to_vec),
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let request_bytes = encode_spawn_episode_request(&request);
 
@@ -2772,6 +2773,7 @@ mod tests {
             adapter_profile_hash: None,
             max_episodes: None,
             escalation_predicate: None,
+            permeability_receipt_hash: None,
         };
         let encoded = encode_spawn_episode_request(&request);
 

@@ -774,6 +774,7 @@ async fn test_out_of_order_spawn_rejected() {
         adapter_profile_hash: None,
         max_episodes: None,
         escalation_predicate: None,
+        permeability_receipt_hash: None,
     };
     let frame = encode_spawn_episode_request(&req);
 

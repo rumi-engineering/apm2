@@ -607,6 +607,7 @@ mod tests {
             },
             executor_custody_domains: Vec::new(),
             author_custody_domains: Vec::new(),
+            permeability_receipt: None,
         };
         registry.register_claim(claim).expect("register claim");
     }
