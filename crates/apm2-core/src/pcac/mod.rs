@@ -54,8 +54,9 @@ pub use receipts::{
 };
 pub use types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, DeterminismClass, IdentityEvidenceLevel, MAX_CANONICALIZER_ID_LENGTH,
-    MAX_CHECKPOINT_LENGTH, MAX_DESCRIPTION_LENGTH, MAX_FIELD_NAME_LENGTH, MAX_MERKLE_PROOF_STEPS,
-    MAX_OPERATION_LENGTH, MAX_PRE_ACTUATION_RECEIPT_HASHES, MAX_REASON_LENGTH,
-    MAX_SCOPE_WITNESS_HASHES, MAX_STRING_LENGTH, PcacValidationError, RiskTier,
+    AuthorityJoinInputV1, AutonomyCeiling, DeterminismClass, FreezeAction, IdentityEvidenceLevel,
+    MAX_CANONICALIZER_ID_LENGTH, MAX_CHECKPOINT_LENGTH, MAX_DESCRIPTION_LENGTH,
+    MAX_FIELD_NAME_LENGTH, MAX_MERKLE_PROOF_STEPS, MAX_OPERATION_LENGTH,
+    MAX_PRE_ACTUATION_RECEIPT_HASHES, MAX_REASON_LENGTH, MAX_SCOPE_WITNESS_HASHES,
+    MAX_STRING_LENGTH, PcacValidationError, RiskTier, SovereigntyEpoch,
 };

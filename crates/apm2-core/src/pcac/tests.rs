@@ -405,9 +405,17 @@ fn deny_class_serde_roundtrip() {
             expected: test_hash(0x01),
             actual: test_hash(0x02),
         },
-        AuthorityDenyClass::StaleSovereigntyEpoch,
-        AuthorityDenyClass::UnknownRevocationHead,
-        AuthorityDenyClass::ActiveSovereignFreeze,
+        AuthorityDenyClass::StaleSovereigntyEpoch {
+            epoch_id: "epoch-001".to_string(),
+            last_known_tick: 100,
+            current_tick: 300,
+        },
+        AuthorityDenyClass::UnknownRevocationHead {
+            principal_id: "principal-001".to_string(),
+        },
+        AuthorityDenyClass::ActiveSovereignFreeze {
+            freeze_action: types::FreezeAction::HardFreeze,
+        },
         AuthorityDenyClass::DelegationWidening,
         AuthorityDenyClass::PointerOnlyDeniedAtTier2Plus,
         AuthorityDenyClass::PolicyDeny {
@@ -843,10 +851,24 @@ fn deny_taxonomy_covers_all_lifecycle_failures() {
     ];
 
     let _sovereignty_failures = [
-        AuthorityDenyClass::StaleSovereigntyEpoch,
-        AuthorityDenyClass::UnknownRevocationHead,
-        AuthorityDenyClass::IncompatibleAutonomyCeiling,
-        AuthorityDenyClass::ActiveSovereignFreeze,
+        AuthorityDenyClass::StaleSovereigntyEpoch {
+            epoch_id: "epoch-001".to_string(),
+            last_known_tick: 100,
+            current_tick: 300,
+        },
+        AuthorityDenyClass::UnknownRevocationHead {
+            principal_id: "principal-001".to_string(),
+        },
+        AuthorityDenyClass::IncompatibleAutonomyCeiling {
+            required: types::RiskTier::Tier2Plus,
+            actual: types::RiskTier::Tier2Plus,
+        },
+        AuthorityDenyClass::ActiveSovereignFreeze {
+            freeze_action: types::FreezeAction::HardFreeze,
+        },
+        AuthorityDenyClass::SovereigntyUncertainty {
+            reason: "test".to_string(),
+        },
     ];
 
     let _policy_failures = [

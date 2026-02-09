@@ -128,18 +128,42 @@ pub enum AuthorityDenyClass {
         description: String,
     },
 
-    // ---- Tier2+ sovereignty failures (RFC-0027 §6.6) ----
+    // ---- Tier2+ sovereignty failures (RFC-0027 §6.6, TCK-00427) ----
     /// Sovereignty epoch evidence is stale for Tier2+ operations.
-    StaleSovereigntyEpoch,
+    StaleSovereigntyEpoch {
+        /// The epoch that was checked.
+        epoch_id: String,
+        /// Last known freshness tick for this epoch.
+        last_known_tick: u64,
+        /// Current tick at check time.
+        current_tick: u64,
+    },
 
     /// Principal revocation head state is unknown or ambiguous.
-    UnknownRevocationHead,
+    UnknownRevocationHead {
+        /// The principal whose revocation head is unknown.
+        principal_id: String,
+    },
 
     /// Autonomy ceiling is incompatible with requested risk tier.
-    IncompatibleAutonomyCeiling,
+    IncompatibleAutonomyCeiling {
+        /// The required maximum risk tier (ceiling).
+        required: RiskTier,
+        /// The actual risk tier requested.
+        actual: RiskTier,
+    },
 
     /// Active sovereign freeze state for the target scope.
-    ActiveSovereignFreeze,
+    ActiveSovereignFreeze {
+        /// The freeze action that is active.
+        freeze_action: super::types::FreezeAction,
+    },
+
+    /// Sovereignty uncertainty triggered a freeze action.
+    SovereigntyUncertainty {
+        /// Reason for the sovereignty uncertainty.
+        reason: String,
+    },
 
     // ---- Policy failures ----
     /// Tier2+ denies `PointerOnly` identity evidence without waiver.
@@ -214,10 +238,27 @@ impl std::fmt::Display for AuthorityDenyClass {
             Self::BoundaryMonotonicityViolation { description } => {
                 write!(f, "boundary monotonicity violation: {description}")
             },
-            Self::StaleSovereigntyEpoch => write!(f, "stale sovereignty epoch"),
-            Self::UnknownRevocationHead => write!(f, "unknown revocation head"),
-            Self::IncompatibleAutonomyCeiling => write!(f, "incompatible autonomy ceiling"),
-            Self::ActiveSovereignFreeze => write!(f, "active sovereign freeze"),
+            Self::StaleSovereigntyEpoch {
+                epoch_id,
+                last_known_tick,
+                current_tick,
+            } => write!(
+                f,
+                "stale sovereignty epoch {epoch_id} (last: {last_known_tick}, current: {current_tick})"
+            ),
+            Self::UnknownRevocationHead { principal_id } => {
+                write!(f, "unknown revocation head for principal {principal_id}")
+            },
+            Self::IncompatibleAutonomyCeiling { required, actual } => write!(
+                f,
+                "incompatible autonomy ceiling (required: {required}, actual: {actual})"
+            ),
+            Self::ActiveSovereignFreeze { freeze_action } => {
+                write!(f, "active sovereign freeze: {freeze_action}")
+            },
+            Self::SovereigntyUncertainty { reason } => {
+                write!(f, "sovereignty uncertainty: {reason}")
+            },
             Self::PointerOnlyDeniedAtTier2Plus => {
                 write!(f, "pointer-only identity denied at Tier2+")
             },

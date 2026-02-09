@@ -580,6 +580,66 @@ pub struct AuthorityConsumedV1 {
 }
 
 // =============================================================================
+// Sovereignty types (RFC-0027 §6.6, TCK-00427)
+// =============================================================================
+
+/// Sovereignty epoch evidence for Tier2+ authority paths.
+///
+/// Captures the epoch identifier, last known freshness tick, and a
+/// cryptographic signature binding the epoch to the authority scope.
+/// Tier2+ consume and revalidate check that the epoch is current (not stale).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SovereigntyEpoch {
+    /// Unique epoch identifier.
+    pub epoch_id: String,
+
+    /// The freshness tick at which this epoch was last observed.
+    pub freshness_tick: u64,
+
+    /// Cryptographic signature binding the epoch to the authority scope.
+    pub signature: Hash,
+}
+
+/// Freeze action emitted on sovereignty uncertainty conditions.
+///
+/// When sovereignty state is uncertain, policy may require a freeze to
+/// prevent authority consumption until the uncertainty is resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FreezeAction {
+    /// No freeze action required.
+    NoAction,
+    /// Soft freeze: deny new authority joins but allow in-flight consumes.
+    SoftFreeze,
+    /// Hard freeze: deny all authority operations immediately.
+    HardFreeze,
+}
+
+impl std::fmt::Display for FreezeAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAction => write!(f, "no_action"),
+            Self::SoftFreeze => write!(f, "soft_freeze"),
+            Self::HardFreeze => write!(f, "hard_freeze"),
+        }
+    }
+}
+
+/// Autonomy ceiling representing the maximum authority level for a scope.
+///
+/// Consume checks verify that the requested risk tier does not exceed the
+/// autonomy ceiling for the principal's scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomyCeiling {
+    /// Maximum risk tier allowed under this ceiling.
+    pub max_risk_tier: RiskTier,
+
+    /// Hash binding the ceiling to the policy that established it.
+    pub policy_binding_hash: Hash,
+}
+
+// =============================================================================
 // AuthorityConsumeRecordV1
 // =============================================================================
 
