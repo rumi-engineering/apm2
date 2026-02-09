@@ -66,6 +66,7 @@
 //! ```
 
 pub mod anti_entropy;
+pub mod batch_epoch;
 pub mod bft;
 pub mod bft_machine;
 pub mod crdt;
@@ -91,6 +92,11 @@ pub use anti_entropy::{
     MAX_SYNC_BATCH_SIZE, RATE_LIMIT_INTERVAL, RangeDigestResult, RangeQuery, SyncEvent,
     SyncRateLimiter, SyncSession, event_record_to_sync_event, verify_events_with_proof,
     verify_sync_events,
+};
+// BatchEpochRootV1 hierarchical batch forests (TCK-00371)
+pub use batch_epoch::{
+    BatchEpochError, BatchEpochRootV1, EpochAntiEntropyPointer, EpochRootBuilder, EpochTraverser,
+    MAX_EPOCH_BATCH_ROOTS, MAX_TRAVERSAL_EPOCHS,
 };
 pub use bft::{
     BftError, DEFAULT_ROUND_TIMEOUT, HotStuffConfig, HotStuffConfigBuilder, HotStuffState,
