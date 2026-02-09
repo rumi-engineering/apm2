@@ -1,4 +1,5 @@
-//! `ReviewStateFile` persistence, pulse files, file locking, and process checks.
+//! `ReviewStateFile` persistence, pulse files, file locking, and process
+//! checks.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};

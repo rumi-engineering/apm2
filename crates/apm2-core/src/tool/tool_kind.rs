@@ -779,8 +779,9 @@ fn validate_refspec_or_url(arg: &str, index: usize) -> Result<(), ToolKindError>
 /// (e.g., `FileHashMatch` by reading current file content,
 /// `GitCleanWorkingTree` by inspecting index/worktree state) **before**
 /// executing the side-effectful operation.  When no evaluator is configured,
-/// preconditions are advisory: the broker logs a warning and allows the
-/// request to proceed.
+/// the broker **denies** the request outright (fail-closed).  Production
+/// brokers must always wire an evaluator to avoid hard denial of every
+/// precondition-bearing request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IdempotencyPrecondition {

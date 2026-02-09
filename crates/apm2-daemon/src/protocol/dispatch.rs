@@ -137,10 +137,10 @@ use super::session_dispatch::InMemoryManifestStore;
 use super::session_token::TokenMinter;
 use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
-    CapabilityManifest, CustodyDomainError, CustodyDomainId, DefaultPreconditionEvaluator,
-    EpisodeId, EpisodeRuntime, EpisodeRuntimeConfig, InMemoryCasManifestLoader,
-    LeaseIssueDenialReason, ManifestLoader, SharedSessionBrokerRegistry, SharedToolBroker,
-    TerminationClass, ToolBroker, ToolBrokerConfig, validate_custody_domain_overlap,
+    CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
+    EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
+    RuntimePreconditionEvaluator, SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass,
+    ToolBroker, ToolBrokerConfig, validate_custody_domain_overlap,
 };
 use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 use crate::governance::GovernanceFreshnessMonitor;
@@ -6307,12 +6307,12 @@ impl PrivilegedDispatcher {
             broker = broker.with_cas(Arc::clone(cas));
         }
 
-        // TCK-00377: Wire a default precondition evaluator so the broker is
-        // never in the fail-closed "no evaluator" state. The
-        // DefaultPreconditionEvaluator stub always returns Ok (preconditions
-        // satisfied). Once a real filesystem/git-aware evaluator is
-        // implemented, it replaces this via with_precondition_evaluator().
-        broker = broker.with_precondition_evaluator(Arc::new(DefaultPreconditionEvaluator));
+        // TCK-00377: Wire the runtime precondition evaluator so the broker
+        // performs real filesystem/git checks (FileExists, FileNotExists,
+        // FileHashMatch via BLAKE3, GitCleanWorkingTree, GitRefAtCommit).
+        // The evaluator is fail-closed: I/O errors and mismatches both
+        // produce PreconditionFailed denials.
+        broker = broker.with_precondition_evaluator(Arc::new(RuntimePreconditionEvaluator));
 
         broker
             .set_policy_from_tool_allowlist(

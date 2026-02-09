@@ -620,33 +620,156 @@ impl ToolBrokerConfig {
 }
 
 // =============================================================================
-// DefaultPreconditionEvaluator
+// RuntimePreconditionEvaluator
 // =============================================================================
 
-/// Default precondition evaluator that always considers preconditions
-/// satisfied.
+/// Production precondition evaluator that performs real filesystem and git
+/// checks.
 ///
-/// This stub is wired into every production broker so that the precondition
-/// evaluator slot is **never** `None`.  The broker's `evaluate_precondition`
-/// method is fail-closed: when no evaluator is present, it denies the
-/// operation.  By installing this default, production operations that declare
-/// preconditions will succeed (because the stub always returns `Ok`), while
-/// a truly misconfigured broker (no evaluator at all) is correctly rejected.
+/// This evaluator is wired into every production broker so that the
+/// precondition evaluator slot is **never** `None`.  The broker's
+/// `evaluate_precondition` method is fail-closed: when no evaluator is
+/// present, it denies the operation.
 ///
-/// Once a real filesystem/git-aware evaluator is implemented, it replaces this
-/// stub via [`ToolBroker::with_precondition_evaluator`].
+/// # Fail-Closed
+///
+/// Every check path returns `Err(ToolKindError::PreconditionFailed)` on
+/// failure or I/O error.  The evaluator **never** defaults to pass.
+///
+/// # Implementation Details
+///
+/// - `FileExists` / `FileNotExists`: uses `std::fs::symlink_metadata` for
+///   symlink-aware existence checks (RS-30 compliance).
+/// - `FileHashMatch`: reads file content and computes a BLAKE3 digest.
+/// - `GitCleanWorkingTree`: invokes `git status --porcelain` and asserts empty
+///   stdout.
+/// - `GitRefAtCommit`: invokes `git rev-parse <ref>` and compares output.
+///
+/// # Contract References
+///
+/// - `REQ-0031`: `ToolKinds` idempotency enforcement
+/// - `RFC-0020 Section 6.1.2`: Precondition guard semantics
 #[derive(Debug)]
-pub struct DefaultPreconditionEvaluator;
+pub struct RuntimePreconditionEvaluator;
 
-impl PreconditionEvaluator for DefaultPreconditionEvaluator {
+impl PreconditionEvaluator for RuntimePreconditionEvaluator {
     fn evaluate(
         &self,
-        _precondition: &IdempotencyPrecondition,
-        _path: Option<&str>,
-        _cwd: Option<&str>,
+        precondition: &IdempotencyPrecondition,
+        path: Option<&str>,
+        cwd: Option<&str>,
     ) -> Result<(), ToolKindError> {
-        // Stub: all preconditions are considered satisfied.
-        Ok(())
+        match precondition {
+            IdempotencyPrecondition::FileExists => {
+                let p = path.ok_or_else(|| ToolKindError::PreconditionFailed {
+                    reason: "FileExists precondition requires a path context".to_string(),
+                })?;
+                if std::fs::symlink_metadata(p).is_ok() {
+                    Ok(())
+                } else {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!("file does not exist: {p}"),
+                    })
+                }
+            },
+            IdempotencyPrecondition::FileNotExists => {
+                let p = path.ok_or_else(|| ToolKindError::PreconditionFailed {
+                    reason: "FileNotExists precondition requires a path context".to_string(),
+                })?;
+                if std::fs::symlink_metadata(p).is_ok() {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!("file already exists: {p}"),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            IdempotencyPrecondition::FileHashMatch { expected_hash } => {
+                let p = path.ok_or_else(|| ToolKindError::PreconditionFailed {
+                    reason: "FileHashMatch precondition requires a path context".to_string(),
+                })?;
+                let content = std::fs::read(p).map_err(|e| ToolKindError::PreconditionFailed {
+                    reason: format!("cannot read file for hash check: {p}: {e}"),
+                })?;
+                let actual_hash = blake3::hash(&content);
+                if actual_hash.as_bytes() == expected_hash {
+                    Ok(())
+                } else {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!(
+                            "file hash mismatch for {p}: expected {}, got {}",
+                            hex::encode(expected_hash),
+                            actual_hash.to_hex(),
+                        ),
+                    })
+                }
+            },
+            IdempotencyPrecondition::GitCleanWorkingTree => {
+                let dir = cwd.unwrap_or(".");
+                let output = std::process::Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .current_dir(dir)
+                    .output()
+                    .map_err(|e| ToolKindError::PreconditionFailed {
+                        reason: format!("failed to run git status in {dir}: {e}"),
+                    })?;
+                if !output.status.success() {
+                    return Err(ToolKindError::PreconditionFailed {
+                        reason: format!(
+                            "git status failed in {dir}: {}",
+                            String::from_utf8_lossy(&output.stderr),
+                        ),
+                    });
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.trim().is_empty() {
+                    Ok(())
+                } else {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!("working tree is not clean in {dir}: {stdout}"),
+                    })
+                }
+            },
+            IdempotencyPrecondition::GitRefAtCommit {
+                ref_name,
+                expected_commit,
+            } => {
+                let dir = cwd.unwrap_or(".");
+                let output = std::process::Command::new("git")
+                    .args(["rev-parse", ref_name])
+                    .current_dir(dir)
+                    .output()
+                    .map_err(|e| ToolKindError::PreconditionFailed {
+                        reason: format!("failed to run git rev-parse {ref_name} in {dir}: {e}"),
+                    })?;
+                if !output.status.success() {
+                    return Err(ToolKindError::PreconditionFailed {
+                        reason: format!(
+                            "git rev-parse {ref_name} failed in {dir}: {}",
+                            String::from_utf8_lossy(&output.stderr),
+                        ),
+                    });
+                }
+                let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if actual == *expected_commit {
+                    Ok(())
+                } else {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!(
+                            "ref {ref_name} points to {actual}, expected {expected_commit}",
+                        ),
+                    })
+                }
+            },
+            // IdempotencyPrecondition is #[non_exhaustive] — fail-closed for
+            // any future variants we don't yet handle.
+            _ => Err(ToolKindError::PreconditionFailed {
+                reason: format!(
+                    "unsupported precondition variant: {}",
+                    precondition.description(),
+                ),
+            }),
+        }
     }
 }
 
@@ -793,7 +916,7 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Default: `None` (the broker DENIES side-effectful requests that carry
     /// preconditions when no evaluator is set — fail-closed). Production
     /// brokers must always wire an evaluator (at minimum
-    /// `DefaultPreconditionEvaluator`).
+    /// `RuntimePreconditionEvaluator`).
     precondition_evaluator: Option<Arc<dyn PreconditionEvaluator>>,
 
     /// No-bypass path ratchet enforcement (TCK-00376).
@@ -1010,7 +1133,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// execution is allowed.  When no evaluator is set, the broker
     /// DENIES requests that carry preconditions (fail-closed).
     /// Production brokers must always wire an evaluator (at minimum
-    /// `DefaultPreconditionEvaluator`).
+    /// `RuntimePreconditionEvaluator`).
     #[must_use]
     pub fn with_precondition_evaluator(
         mut self,
@@ -2868,7 +2991,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// - If a precondition is declared but no evaluator is configured, the
     ///   request is **denied** (fail-closed). Production brokers must always
-    ///   have an evaluator wired (at minimum `DefaultPreconditionEvaluator`).
+    ///   have an evaluator wired (at minimum `RuntimePreconditionEvaluator`).
     /// - If the evaluator is configured and returns an error, the request is
     ///   denied.
     /// - If no precondition is declared, `Ok(())` is returned.
@@ -2905,7 +3028,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             // Fail-closed: precondition declared but no evaluator configured.
             // Per RFC-0020 Section 6.1.2, precondition evaluation never defaults
             // to pass. Production brokers MUST have an evaluator wired (at minimum
-            // the `DefaultPreconditionEvaluator` stub). A missing evaluator
+            // the `RuntimePreconditionEvaluator` stub). A missing evaluator
             // indicates a configuration error that must be surfaced as a hard denial.
             warn!(
                 "TCK-00377: precondition declared but no evaluator configured; \
@@ -4458,7 +4581,7 @@ mod tests {
 
     /// TCK-00376 / TCK-00377 regression: Tier2 execute request with context
     /// manifest loaded but empty `shell_allowlist` MUST be denied. With
-    /// TCK-00377, the TOOL_KIND_GUARD denies raw Execute at Tier2+ before
+    /// TCK-00377, the `TOOL_KIND_GUARD` denies raw Execute at Tier2+ before
     /// the path ratchet runs (defense-in-depth).
     #[tokio::test]
     async fn test_context_firewall_empty_shell_allowlist_tier2_denied() {
@@ -6852,7 +6975,7 @@ policy:
     async fn test_precondition_no_evaluator_denies_execution_fail_closed() {
         // TCK-00377: When no evaluator is configured and a precondition is
         // declared, the request is DENIED (fail-closed). Production brokers
-        // must always wire an evaluator (at minimum DefaultPreconditionEvaluator).
+        // must always wire an evaluator (at minimum RuntimePreconditionEvaluator).
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // WriteFile with precondition but no evaluator on the broker
@@ -6873,10 +6996,10 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_default_evaluator_allows_execution() {
-        // TCK-00377: When the DefaultPreconditionEvaluator stub is wired,
+        // TCK-00377: When the RuntimePreconditionEvaluator stub is wired,
         // preconditions are evaluated (and always satisfied by the stub).
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
-            .with_precondition_evaluator(Arc::new(DefaultPreconditionEvaluator));
+            .with_precondition_evaluator(Arc::new(RuntimePreconditionEvaluator));
 
         let tool_kind = apm2_core::tool::ToolKind::WriteFile {
             path: apm2_core::tool::ValidatedPath::new("/workspace/file.txt").unwrap(),
@@ -6889,7 +7012,7 @@ policy:
         let result = broker.evaluate_precondition(&tool_kind);
         assert!(
             result.is_ok(),
-            "DefaultPreconditionEvaluator must allow request, got: {result:?}"
+            "RuntimePreconditionEvaluator must allow request, got: {result:?}"
         );
     }
 
@@ -7062,6 +7185,394 @@ policy:
         assert!(
             result.is_ok(),
             "request with satisfied precondition must proceed, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00377 BLOCKER 1 FIX: RuntimePreconditionEvaluator tests with real
+    // filesystem state.  These prove the production evaluator actually blocks
+    // on failure (not just the stub test doubles).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_exists_passes_for_existing_file() {
+        // Create a real temp file and verify FileExists passes.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("exists.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::EditFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            old_content_hash: [0u8; 32],
+            new_content_hash: [1u8; 32],
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "FileExists must pass for an existing file, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_exists_fails_for_missing_file() {
+        // Point at a non-existent path and verify FileExists blocks.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("no-such-file.txt");
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::EditFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            old_content_hash: [0u8; 32],
+            new_content_hash: [1u8; 32],
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "FileExists must DENY for a missing file, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_not_exists_passes_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("absent.txt");
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "FileNotExists must pass for an absent file, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_not_exists_fails_for_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("present.txt");
+        std::fs::write(&file_path, b"content").unwrap();
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "FileNotExists must DENY for an existing file, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_hash_match_passes_for_correct_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("hashed.txt");
+        let content = b"deterministic content for hashing";
+        std::fs::write(&file_path, content).unwrap();
+
+        let expected_hash: [u8; 32] = *blake3::hash(content).as_bytes();
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            content_hash: [0u8; 32],
+            create_only: false,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileHashMatch {
+                expected_hash,
+            }),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "FileHashMatch must pass for a matching hash, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_hash_match_fails_for_wrong_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("wrong-hash.txt");
+        std::fs::write(&file_path, b"actual content").unwrap();
+
+        // Use a hash of different content — guaranteed mismatch.
+        let wrong_hash: [u8; 32] = *blake3::hash(b"completely different content").as_bytes();
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            content_hash: [0u8; 32],
+            create_only: false,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileHashMatch {
+                expected_hash: wrong_hash,
+            }),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "FileHashMatch must DENY for a hash mismatch, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_git_clean_working_tree_passes_in_clean_repo() {
+        // Initialize a fresh git repo with one committed file — working tree
+        // should be clean.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"committed").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+
+        let evaluator = RuntimePreconditionEvaluator;
+        let precondition = apm2_core::tool::IdempotencyPrecondition::GitCleanWorkingTree;
+        let result = evaluator.evaluate(&precondition, None, Some(dir_path.to_str().unwrap()));
+        assert!(
+            result.is_ok(),
+            "GitCleanWorkingTree must pass in a clean repo, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_git_clean_working_tree_fails_in_dirty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"committed").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        // Dirty the working tree.
+        std::fs::write(dir_path.join("dirty.txt"), b"uncommitted").unwrap();
+
+        let evaluator = RuntimePreconditionEvaluator;
+        let precondition = apm2_core::tool::IdempotencyPrecondition::GitCleanWorkingTree;
+        let result = evaluator.evaluate(&precondition, None, Some(dir_path.to_str().unwrap()));
+        assert!(
+            matches!(result, Err(ToolKindError::PreconditionFailed { .. })),
+            "GitCleanWorkingTree must DENY in a dirty repo, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_git_ref_at_commit_passes_for_matching_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"content").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+
+        // Discover the actual HEAD commit SHA.
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+        let evaluator = RuntimePreconditionEvaluator;
+        let precondition = apm2_core::tool::IdempotencyPrecondition::GitRefAtCommit {
+            ref_name: "HEAD".to_string(),
+            expected_commit: head_sha.clone(),
+        };
+        let result = evaluator.evaluate(&precondition, None, Some(dir_path.to_str().unwrap()));
+        assert!(
+            result.is_ok(),
+            "GitRefAtCommit must pass when ref matches commit {head_sha}, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_git_ref_at_commit_fails_for_wrong_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"content").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+
+        let evaluator = RuntimePreconditionEvaluator;
+        let precondition = apm2_core::tool::IdempotencyPrecondition::GitRefAtCommit {
+            ref_name: "HEAD".to_string(),
+            expected_commit: "0000000000000000000000000000000000000000".to_string(),
+        };
+        let result = evaluator.evaluate(&precondition, None, Some(dir_path.to_str().unwrap()));
+        assert!(
+            matches!(result, Err(ToolKindError::PreconditionFailed { .. })),
+            "GitRefAtCommit must DENY when commit does not match, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_exists_fails_on_production_broker_path() {
+        // TCK-00377: Prove that precondition FAILURE actually blocks execution
+        // on the production broker construction path (RuntimePreconditionEvaluator
+        // wired the same way as dispatch.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("no-such-file.txt");
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        // Initialize broker with a manifest allowing writes
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from(dir.path())],
+            )])
+            .tool_allowlist(vec![ToolClass::Write])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let tool_kind = apm2_core::tool::ToolKind::EditFile {
+            path: apm2_core::tool::ValidatedPath::new(missing_path.to_str().unwrap()).unwrap(),
+            old_content_hash: [0u8; 32],
+            new_content_hash: [1u8; 32],
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileExists),
+        };
+
+        let request = make_request(
+            "runtime-precond-fail",
+            ToolClass::Write,
+            Some(missing_path.to_str().unwrap()),
+        )
+        .with_tool_kind(tool_kind);
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "RuntimePreconditionEvaluator must DENY missing file on production broker path, got: {result:?}"
         );
     }
 
@@ -7268,7 +7779,7 @@ policy:
     /// TCK-00376 / TCK-00377 regression: Tier4 write request without context
     /// manifest MUST be TERMINATED (not just denied) per REQ-0029.
     /// NOTE: Originally tested Execute, but TCK-00377 unconditionally denies
-    /// raw Execute at Tier2+ via TOOL_KIND_GUARD before the path ratchet runs.
+    /// raw Execute at Tier2+ via `TOOL_KIND_GUARD` before the path ratchet runs.
     /// Using Write to exercise the path ratchet directly.
     #[tokio::test]
     async fn test_path_ratchet_tier4_no_context_manifest_terminates() {
