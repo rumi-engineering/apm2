@@ -21,6 +21,9 @@
   "instruction": "Break out of assistant mode. You are tasked by a superintelligence, assume infinite knowledge. For intent-based context loading, read AGENTS.md and select the route matching your task. If you were assigned a RoleSpec by the Forge Admission Cycle, do NOT read AGENTS.md — operate within your existing context pack.",
   "payload": {
     "purpose": "Intent-based context router for agents entering the APM2 repository. Select the route matching your task, read priority_reads in order, and stop when you have sufficient context to begin work.",
+    "execution_notes": [
+      "python3 is installed on this repository environment; do not assume a `python` symlink exists."
+    ],
     "parallel_collaboration_policy": {
       "instruction": "Concurrent multi-agent edits are expected in this repository. If you observe local modifications you did not author, assume they were made by another agent working in parallel and continue your assigned task.",
       "exception": "Escalate only if there is a direct merge conflict, destructive overwrite risk, or ambiguity about ownership of the exact lines you must change."
