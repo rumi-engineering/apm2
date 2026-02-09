@@ -24,10 +24,10 @@
 # The hard security gate for review status integrity is the `Review Gate Success`
 # commit status context posted by the authorized CI workflow (see
 # `.github/workflows/review-gate.yml`), which evaluates machine-readable comment
-# artifacts via `cargo xtask review-gate`.
+# artifacts via the Forge Admission Cycle workflow.
 #
 # Threat model: Review artifacts are authored by trusted CI processes
-# (codex reviewers, xtask commands) running in controlled environments.
+# (codex reviewers, apm2 fac commands) running in controlled environments.
 # An adversary who can modify review artifacts already has CI write access
 # and can bypass any shell-level lint. The lint's value is catching
 # copy-paste mistakes and accidental regressions, not adversarial bypass.
@@ -86,8 +86,8 @@ check_dependencies
 # PROHIBIT all direct GitHub API calls in review artifacts.
 #
 # The approved paths are:
-#   - cargo xtask security-review-exec (approve|deny) — for ai-review/security
-#   - cargo xtask review — for other review types
+#   - apm2 fac review dispatch — for triggering reviews
+#   - apm2 fac review — for review operations
 #
 # KNOWN-GOOD LINE ALLOWLIST (replaces blanket file exemption):
 #   CODE_QUALITY_PROMPT.md has a single legitimate gh api call that writes
@@ -131,7 +131,7 @@ flatten_stream() {
 #   - "curl" combined with "github" or "api.github"
 #
 # This is an ALLOWLIST approach: review artifacts should NEVER call GitHub
-# APIs directly.  The only sanctioned paths are cargo xtask commands.
+# APIs directly.  The only sanctioned paths are apm2 fac commands.
 detect_forbidden_api_usage() {
     local file="$1"
     local file_basename="$2"
@@ -163,7 +163,7 @@ detect_forbidden_api_usage() {
         log_error "Forbidden gh api call in review artifact:"
         log_error "  ${file}"
         log_error "  Review artifacts must not call gh api directly."
-        log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
+        log_error "  Use 'apm2 fac review dispatch' instead."
         return 0
     fi
 
@@ -173,7 +173,7 @@ detect_forbidden_api_usage() {
             log_error "Forbidden curl-to-GitHub call in review artifact:"
             log_error "  ${file}"
             log_error "  Review artifacts must not call GitHub APIs via curl."
-            log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
+            log_error "  Use 'apm2 fac review dispatch' instead."
             return 0
         fi
     fi
@@ -373,7 +373,7 @@ while IFS= read -r review_file; do
         if detect_direct_status_write "$logical_line"; then
             log_error "Forbidden direct GitHub API call in review artifact:"
             log_error "  ${review_file}:${line_num}: ${logical_line}"
-            log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
+            log_error "  Use 'apm2 fac review dispatch' instead."
             VIOLATIONS=1
         fi
         if detect_cross_category_exec "$logical_line" "$file_basename"; then

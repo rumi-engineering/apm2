@@ -22,6 +22,7 @@ mod common;
 
 use std::time::Duration;
 
+use apm2_core::tool::ShellBridgePolicy;
 use apm2_daemon::episode::{
     BrokerToolRequest, BudgetDelta, BudgetTracker, Capability, CapabilityManifest, CapabilityScope,
     DedupeKey, EpisodeBudget, EpisodeId, RiskTier, ToolBroker, ToolBrokerConfig, ToolClass,
@@ -206,9 +207,16 @@ async fn test_allow_multiple_tool_classes() {
         execute_capability(),
     ]);
     // NOTE: Use without_policy_check() because this test focuses on capability
-    // validation, not policy engine integration (TCK-00292 default-deny behavior)
-    let broker: TestToolBroker =
-        ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
+    // validation, not policy engine integration (TCK-00292 default-deny behavior).
+    // Configure a ShellBridgePolicy that allows "ls" so the Execute request passes
+    // the shell bridge allowlist check (the default is deny_all per TCK-00377).
+    let shell_policy =
+        ShellBridgePolicy::new(vec!["ls".to_string()], false).expect("valid shell policy");
+    let broker: TestToolBroker = ToolBroker::new(
+        ToolBrokerConfig::default()
+            .without_policy_check()
+            .with_shell_bridge_policy(shell_policy),
+    );
     broker
         .initialize_with_manifest(manifest)
         .await

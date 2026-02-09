@@ -11,15 +11,18 @@ rfc_evidence_artifact:
     commands:
       - id: "CMD-HEF-0017"
         shell: "bash"
-        command: "cargo test -p xtask -- --nocapture && bash scripts/lint/check_lifecycle_instruction_surface.sh"
+        command: "bash scripts/lint/check_lifecycle_instruction_surface.sh && bash scripts/lint/no_direct_status_write_commands.sh && cargo test --workspace"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 1800
         network_access: "DISALLOWED"
         allowlist_hosts: []
         constraints:
-          - "Stage-2 default must not execute direct lifecycle write paths."
+          - "xtask crate fully removed (Stage-3 complete); lifecycle authority resides in apm2 fac CLI."
           - "Instruction/prompt surfaces must not include deprecated lifecycle control commands."
+          - "CI lint guards prevent reintroduction of cargo xtask lifecycle strings."
+    notes:
+      - "Original command `cargo test -p xtask` superseded by xtask crate removal (PR #516). Workspace tests and lint scripts now constitute the verification surface."
   data:
     classification: "INTERNAL"
     redaction:

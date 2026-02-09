@@ -58,6 +58,7 @@
 //! - `category` must be non-empty and ≤256 characters
 //! - Each metadata entry must be ≤32KB and contain exactly one `=`
 
+use super::tool_kind::tool_kind_from_proto;
 use super::{
     ArtifactFetch, ArtifactPublish, FileEdit, FileRead, FileWrite, GitOperation, InferenceCall,
     ListFiles, Search, ShellExec, ToolRequest, ValidationError, tool_request,
@@ -164,11 +165,48 @@ impl Validator for ToolRequest {
             },
         }
 
+        // Typed ToolKind validation: convert to ToolKind and run typed
+        // validation (metacharacter injection, git ref safety, shell bridge
+        // policy). This is defense-in-depth on top of the structural checks
+        // above. Only run if no structural errors so far and the tool variant
+        // is one of the ToolKind-covered types (FileRead, FileWrite, FileEdit,
+        // GitOp, ShellExec).
+        if errors.is_empty() {
+            if let Some(tool) = &self.tool {
+                validate_tool_kind(tool, &mut errors);
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
         }
+    }
+}
+
+/// Run typed `ToolKind` validation on a proto tool variant.
+///
+/// Converts the proto tool to a [`ToolKind`] which enforces shell
+/// metacharacter rejection, path traversal checks, git ref safety, and
+/// structured argument validation. Tool variants not covered by `ToolKind`
+/// (e.g., Inference, Artifact) pass through without error.
+fn validate_tool_kind(tool: &tool_request::Tool, errors: &mut Vec<ValidationError>) {
+    // Only FileRead, FileWrite, FileEdit, GitOp, ShellExec are covered by
+    // tool_kind_from_proto. Other variants return MissingToolVariant which
+    // we treat as a pass-through (not an error).
+    match tool_kind_from_proto(tool) {
+        // Typed validation passed, or variant not covered by ToolKind
+        // (e.g. Inference, Artifact) — pass through since structural
+        // validation above already handled it.
+        Ok(_) | Err(super::tool_kind::ToolKindError::MissingToolVariant) => {},
+        Err(e) => {
+            errors.push(ValidationError {
+                field: "tool".to_string(),
+                rule: "tool_kind_typed_validation".to_string(),
+                message: e.to_string(),
+            });
+        },
     }
 }
 
@@ -1253,5 +1291,115 @@ mod list_files_tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.rule == "no_path_traversal"));
+    }
+}
+
+#[cfg(test)]
+mod tool_kind_wiring_tests {
+    use super::*;
+
+    /// Verify that the Validator flow invokes typed `ToolKind` validation,
+    /// catching shell metacharacters that the structural validator misses.
+    #[test]
+    fn test_validator_catches_shell_metachar_via_tool_kind() {
+        // The structural validator for ShellExec does NOT check for shell
+        // metacharacters in the command string. The typed ToolKind layer
+        // does. This test proves the wiring is live.
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ShellExec(ShellExec {
+                command: "echo hello | grep world".to_string(),
+                cwd: String::new(),
+                timeout_ms: 1000,
+                network_access: false,
+                env: vec![],
+            })),
+        };
+        let result = req.validate();
+        assert!(
+            result.is_err(),
+            "validator should reject pipe metacharacter"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.rule == "tool_kind_typed_validation"),
+            "error should come from tool_kind_typed_validation rule: {errors:?}"
+        );
+    }
+
+    /// Verify that the Validator catches path traversal through `ToolKind`
+    /// typed validation (defense-in-depth with the structural check).
+    #[test]
+    fn test_validator_catches_path_traversal_via_tool_kind() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::FileRead(FileRead {
+                path: "/workspace/../etc/passwd".to_string(),
+                offset: 0,
+                limit: 0,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+    }
+
+    /// Verify that non-ToolKind variants (e.g. Inference) still pass
+    /// validation.
+    #[test]
+    fn test_validator_passes_non_tool_kind_variants() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::Inference(InferenceCall {
+                provider: "anthropic".to_string(),
+                model: "claude-3-opus".to_string(),
+                prompt_hash: vec![0u8; 32],
+                max_tokens: 4096,
+                temperature_scaled: 70,
+                system_prompt_hash: vec![],
+            })),
+        };
+        assert!(
+            req.validate().is_ok(),
+            "Inference should pass through ToolKind validation"
+        );
+    }
+
+    /// Verify that git ref injection is caught through the Validator.
+    #[test]
+    fn test_validator_catches_git_ref_injection_via_tool_kind() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::GitOp(GitOperation {
+                operation: "CHECKOUT".to_string(),
+                args: vec!["refs/../HEAD".to_string()],
+                cwd: String::new(),
+            })),
+        };
+        let result = req.validate();
+        assert!(
+            result.is_err(),
+            "validator should reject traversal in git ref"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.rule == "tool_kind_typed_validation"),
+            "error should come from tool_kind_typed_validation: {errors:?}"
+        );
     }
 }

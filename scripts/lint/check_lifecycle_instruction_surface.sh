@@ -14,6 +14,8 @@ mapfile -t FILES < <(find "$TARGET_ROOT" -type f -name '*.md' | sort)
 VIOLATIONS=0
 MATCHES=0
 
+# Guard against reintroduction of removed xtask lifecycle commands.
+# xtask was removed; this pattern should match zero lines going forward.
 command_pattern='cargo[[:space:]]+xtask[[:space:]]+(push|review|security-review-exec|commit|aat)([^[:alnum:]_-]|$)'
 
 for file in "${FILES[@]}"; do

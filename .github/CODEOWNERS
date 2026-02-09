@@ -17,7 +17,3 @@
 # Credentials and security modules
 /crates/apm2-core/src/credentials/ @Anveio
 /crates/apm2-core/src/log/redact.rs @Anveio
-
-# Release configuration
-/release-plz.toml @Anveio
-/.github/workflows/release.yml @Anveio

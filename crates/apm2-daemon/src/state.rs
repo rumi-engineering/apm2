@@ -477,6 +477,15 @@ pub struct DispatcherState {
     /// When present, explicit governance probe paths can toggle
     /// `governance_uncertain` fail-closed behavior in pre-actuation.
     governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
+
+    /// Shared evidence CAS backend (TCK-00418).
+    ///
+    /// When present, this is the same `DurableCas` (or `MemoryCas` in tests)
+    /// that backs the `PrivilegedDispatcher`'s `validate_lease_time_authority`.
+    /// The gate orchestrator MUST share this instance so that
+    /// `time_envelope_ref` hashes stored during `issue_gate_lease` are
+    /// resolvable by the dispatcher during receipt ingestion.
+    evidence_cas: Option<Arc<dyn apm2_core::evidence::ContentAddressedStore>>,
 }
 
 impl DispatcherState {
@@ -585,6 +594,7 @@ impl DispatcherState {
             merge_executor: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            evidence_cas: None,
         }
     }
 
@@ -671,6 +681,7 @@ impl DispatcherState {
             merge_executor: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            evidence_cas: None,
         }
     }
 
@@ -949,6 +960,9 @@ impl DispatcherState {
             // runtime mutation by operator/governance control plane.
             stop_authority: Some(stop_authority),
             governance_freshness_monitor: Some(governance_freshness_monitor),
+            // TCK-00418: No evidence CAS in non-durable path; gate
+            // orchestrator will need a fallback MemoryCas if wired here.
+            evidence_cas: None,
         })
     }
 
@@ -1211,7 +1225,7 @@ impl DispatcherState {
             adapter_selection_policy,
             available_profile_hashes,
             profile_hashes,
-            evidence_cas,
+            Arc::clone(&evidence_cas),
         );
 
         let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
@@ -1283,6 +1297,10 @@ impl DispatcherState {
             // runtime mutation by operator/governance control plane.
             stop_authority: Some(stop_authority),
             governance_freshness_monitor: Some(governance_freshness_monitor),
+            // TCK-00418: Share the durable evidence CAS so the gate
+            // orchestrator writes time-envelope artifacts into the same
+            // store the dispatcher reads during `validate_lease_time_authority`.
+            evidence_cas: Some(evidence_cas),
         })
     }
 
@@ -1410,6 +1428,16 @@ impl DispatcherState {
     #[must_use]
     pub const fn gate_orchestrator(&self) -> Option<&Arc<GateOrchestrator>> {
         self.gate_orchestrator.as_ref()
+    }
+
+    /// Returns the shared evidence CAS, if configured (TCK-00418).
+    ///
+    /// The gate orchestrator MUST use this CAS so that
+    /// `time_envelope_ref` hashes it stores are resolvable by the
+    /// dispatcher during `validate_lease_time_authority`.
+    #[must_use]
+    pub fn evidence_cas(&self) -> Option<Arc<dyn apm2_core::evidence::ContentAddressedStore>> {
+        self.evidence_cas.clone()
     }
 
     /// Sets the merge executor for autonomous merge after gate approval

@@ -1183,6 +1183,7 @@ fn test_emit_review_receipt_includes_outcome_fields() {
             "actor:reviewer",
             2_000_000,
             &identity_proof_hash,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .expect("emit_review_receipt should succeed");
 
@@ -1241,6 +1242,7 @@ fn test_emit_review_blocked_receipt_includes_outcome_fields() {
             "actor:reviewer",
             3_000_000,
             &identity_proof_hash,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         )
         .expect("emit_review_blocked_receipt should succeed");
 
