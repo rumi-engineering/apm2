@@ -11,7 +11,7 @@ rfc_evidence_artifact:
     commands:
       - id: "CMD-HEF-0016"
         shell: "bash"
-        command: "cargo test -p apm2-daemon --tests fac_htf_authority_gates -- --nocapture"
+        command: "cargo test -p apm2-daemon --test tck_00418_fac_htf_authority_gates -- --nocapture"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 1800

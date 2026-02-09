@@ -41,6 +41,7 @@ use apm2_core::fac::{
     REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, SelectionDecision,
     builtin_profiles, validate_receipt_attestation,
 };
+use apm2_core::htf::{Canonicalizable, ClockProfile, TimeEnvelope, WallTimeSource};
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
 use prost::Message;
@@ -138,8 +139,8 @@ use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
     EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
-    SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass, ToolBroker, ToolBrokerConfig,
-    validate_custody_domain_overlap,
+    RuntimePreconditionEvaluator, SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass,
+    ToolBroker, ToolBrokerConfig, validate_custody_domain_overlap,
 };
 use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 use crate::governance::GovernanceFreshnessMonitor;
@@ -547,6 +548,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `reviewer_actor_id` - Actor ID of the reviewer
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
     /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
+    /// * `time_envelope_ref` - CAS hash reference of the authoritative
+    ///   `TimeEnvelopeV1` binding this receipt
     ///
     /// # Returns
     ///
@@ -566,6 +569,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
+        time_envelope_ref: &str,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a `ReviewBlockedRecorded` ledger event (TCK-00389).
@@ -585,6 +589,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `reviewer_actor_id` - Actor ID of the reviewer
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
     /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
+    /// * `time_envelope_ref` - CAS hash reference of the authoritative
+    ///   `TimeEnvelopeV1` binding this receipt
     ///
     /// # Returns
     ///
@@ -605,6 +611,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
+        time_envelope_ref: &str,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Returns the number of `work_transitioned` events for a given work ID.
@@ -911,6 +918,8 @@ pub trait LedgerEventEmitter: Send + Sync {
                 message: format!("envelope binding validation failed: {e}"),
             })?;
 
+        let (envelope_hash_hex, _, _) = bindings.to_hex_map();
+
         // Default implementation delegates to emit_review_receipt.
         // Implementations that persist bindings should override this.
         self.emit_review_receipt(
@@ -921,6 +930,7 @@ pub trait LedgerEventEmitter: Send + Sync {
             reviewer_actor_id,
             timestamp_ns,
             identity_proof_hash,
+            &envelope_hash_hex,
         )
     }
 }
@@ -1884,6 +1894,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
+        time_envelope_ref: &str,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -1909,6 +1920,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
             "identity_proof_hash": hex::encode(identity_proof_hash),
+            "time_envelope_ref": time_envelope_ref,
         });
 
         // Use JCS (RFC 8785) canonicalization for deterministic signing
@@ -1994,6 +2006,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
+        time_envelope_ref: &str,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -2016,6 +2029,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
             "identity_proof_hash": hex::encode(identity_proof_hash),
+            "time_envelope_ref": time_envelope_ref,
         });
 
         let payload_string = payload_json.to_string();
@@ -3103,6 +3117,14 @@ pub fn generate_lease_id() -> String {
     format!("L-{uuid}")
 }
 
+fn decode_hash32_hex(field: &str, value: &str) -> Result<[u8; 32], String> {
+    let decoded = hex::decode(value).map_err(|e| format!("{field} is not valid hex: {e}"))?;
+    decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("{field} must decode to 32 bytes, got {}", decoded.len()))
+}
+
 /// Extracts replay-critical fields from a persisted `SubleaseIssued` payload.
 ///
 /// Supports both payload shapes used by emitters:
@@ -3186,13 +3208,6 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
             .or_else(|| wrapper.get(field))
     };
     let lookup_field = |field: &str| lookup_value(field).and_then(serde_json::Value::as_str);
-    let decode_hash32 = |field: &str, value: &str| -> Result<[u8; 32], String> {
-        let decoded = hex::decode(value).map_err(|e| format!("{field} is not valid hex: {e}"))?;
-        decoded
-            .as_slice()
-            .try_into()
-            .map_err(|_| format!("{field} must decode to 32 bytes, got {}", decoded.len()))
-    };
 
     let lease_id = lookup_field("lease_id")
         .or_else(|| lookup_field("episode_id"))
@@ -3204,7 +3219,7 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
 
     let changeset_digest_hex =
         lookup_field("changeset_digest").ok_or_else(|| "missing changeset_digest".to_string())?;
-    let changeset_digest = decode_hash32("changeset_digest", changeset_digest_hex)?;
+    let changeset_digest = decode_hash32_hex("changeset_digest", changeset_digest_hex)?;
 
     let verdict_value = lookup_field("verdict")
         .map(str::to_owned)
@@ -3231,7 +3246,7 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
 
     let artifact_bundle_hash_hex = lookup_field("artifact_bundle_hash")
         .ok_or_else(|| "missing artifact_bundle_hash".to_string())?;
-    let artifact_bundle_hash = decode_hash32("artifact_bundle_hash", artifact_bundle_hash_hex)?;
+    let artifact_bundle_hash = decode_hash32_hex("artifact_bundle_hash", artifact_bundle_hash_hex)?;
 
     let blocked_reason_code = lookup_value("blocked_reason_code")
         .or_else(|| lookup_value("reason_code"))
@@ -3253,7 +3268,7 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
         .transpose()?;
 
     let blocked_log_hash = lookup_field("blocked_log_hash")
-        .map(|value| decode_hash32("blocked_log_hash", value))
+        .map(|value| decode_hash32_hex("blocked_log_hash", value))
         .transpose()?;
 
     Ok(ReceiptReplayBindings {
@@ -5256,7 +5271,7 @@ impl PrivilegedDispatcher {
 
     /// Sets the per-session broker configuration template.
     #[must_use]
-    pub const fn with_broker_config(mut self, config: ToolBrokerConfig) -> Self {
+    pub fn with_broker_config(mut self, config: ToolBrokerConfig) -> Self {
         self.broker_config = config;
         self
     }
@@ -5632,6 +5647,161 @@ impl PrivilegedDispatcher {
                 })
             },
         }
+    }
+
+    /// Resolves the risk tier and policy hash associated with a lease.
+    ///
+    /// Fail-closed behavior:
+    /// - Missing lease->work mapping => Tier4, fallback policy hash.
+    /// - Missing work claim => Tier4, fallback policy hash.
+    /// - Invalid risk tier value => Tier4, keep resolved policy hash.
+    #[allow(clippy::option_if_let_else)]
+    fn resolve_risk_tier_for_lease(
+        &self,
+        lease_id: &str,
+        fallback_policy_hash: [u8; 32],
+    ) -> (RiskTier, [u8; 32]) {
+        if let Some(work_id) = self.lease_validator.get_lease_work_id(lease_id) {
+            if let Some(claim) = self.work_registry.get_claim(&work_id) {
+                let tier = RiskTier::try_from(claim.policy_resolution.resolved_risk_tier)
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            lease_id = %lease_id,
+                            work_id = %work_id,
+                            tier_value = claim.policy_resolution.resolved_risk_tier,
+                            "invalid risk tier value in policy resolution — \
+                             defaulting to Tier4 (fail-closed)"
+                        );
+                        RiskTier::Tier4
+                    });
+                (tier, claim.policy_resolution.resolved_policy_hash)
+            } else {
+                warn!(
+                    lease_id = %lease_id,
+                    work_id = %work_id,
+                    "work claim not found for lease — defaulting to Tier4 (fail-closed)"
+                );
+                (RiskTier::Tier4, fallback_policy_hash)
+            }
+        } else {
+            warn!(
+                lease_id = %lease_id,
+                "could not resolve work_id from lease — defaulting to Tier4 (fail-closed)"
+            );
+            (RiskTier::Tier4, fallback_policy_hash)
+        }
+    }
+
+    /// Returns whether a resolved clock profile is admissible for a risk tier.
+    ///
+    /// Policy is fail-closed and intentionally conservative:
+    /// - Tier0/Tier1: broad profile source compatibility.
+    /// - Tier2: disallow weaker wall-time sources (`BEST_EFFORT_NTP`,
+    ///   `MANUAL_OPERATOR`), attestation optional.
+    /// - Tier3/Tier4: same source restrictions as Tier2 and require attestation
+    ///   presence.
+    #[allow(clippy::missing_const_for_fn)]
+    fn is_clock_profile_admissible_for_risk_tier(
+        risk_tier: RiskTier,
+        profile: &ClockProfile,
+    ) -> bool {
+        let source_allowed = match risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 => matches!(
+                profile.wall_time_source,
+                WallTimeSource::None
+                    | WallTimeSource::BestEffortNtp
+                    | WallTimeSource::AuthenticatedNts
+                    | WallTimeSource::Roughtime
+                    | WallTimeSource::CloudBounded
+            ),
+            RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4 => matches!(
+                profile.wall_time_source,
+                WallTimeSource::None
+                    | WallTimeSource::AuthenticatedNts
+                    | WallTimeSource::Roughtime
+                    | WallTimeSource::CloudBounded
+            ),
+        };
+
+        if !source_allowed {
+            return false;
+        }
+
+        match risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 | RiskTier::Tier2 => true,
+            RiskTier::Tier3 | RiskTier::Tier4 => profile.attestation.is_some(),
+        }
+    }
+
+    /// Validates authoritative HTF binding for a lease's `time_envelope_ref`.
+    ///
+    /// This enforces:
+    /// 1. `time_envelope_ref` is present and hex-decodable to a CAS hash.
+    /// 2. Envelope exists in CAS and deserializes to `TimeEnvelope`.
+    /// 3. Envelope canonical hash matches the referenced hash.
+    /// 4. `clock_profile_hash` is pinned, CAS-resolvable, and canonical-hash
+    ///    verified.
+    /// 5. Clock profile is admissible for the resolved risk tier.
+    fn validate_lease_time_authority(
+        &self,
+        lease: &apm2_core::fac::GateLease,
+        risk_tier: RiskTier,
+    ) -> Result<(), String> {
+        if lease.time_envelope_ref.is_empty() {
+            return Err("lease time_envelope_ref is missing".to_string());
+        }
+
+        let envelope_hash = decode_hash32_hex("time_envelope_ref", &lease.time_envelope_ref)?;
+        let cas = self
+            .cas
+            .as_ref()
+            .ok_or_else(|| "CAS is not configured; cannot resolve time_envelope_ref".to_string())?;
+
+        let envelope_bytes = cas
+            .retrieve(&envelope_hash)
+            .map_err(|e| format!("failed to resolve time_envelope_ref from CAS: {e}"))?;
+
+        let envelope: TimeEnvelope = serde_json::from_slice(&envelope_bytes)
+            .map_err(|e| format!("time_envelope_ref payload is not TimeEnvelopeV1 JSON: {e}"))?;
+
+        let envelope_canonical_hash = envelope
+            .canonical_hash()
+            .map_err(|e| format!("failed to canonicalize time envelope: {e}"))?;
+        if envelope_canonical_hash != envelope_hash {
+            return Err(format!(
+                "time_envelope_ref hash mismatch: ref={} actual={}",
+                hex::encode(envelope_hash),
+                hex::encode(envelope_canonical_hash)
+            ));
+        }
+
+        let clock_profile_hash =
+            decode_hash32_hex("clock_profile_hash", &envelope.clock_profile_hash)?;
+        let clock_profile_bytes = cas
+            .retrieve(&clock_profile_hash)
+            .map_err(|e| format!("failed to resolve clock_profile_hash from CAS: {e}"))?;
+        let clock_profile: ClockProfile = serde_json::from_slice(&clock_profile_bytes)
+            .map_err(|e| format!("clock_profile_hash payload is not ClockProfileV1 JSON: {e}"))?;
+
+        let profile_canonical_hash = clock_profile
+            .canonical_hash()
+            .map_err(|e| format!("failed to canonicalize clock profile: {e}"))?;
+        if profile_canonical_hash != clock_profile_hash {
+            return Err(format!(
+                "clock_profile_hash mismatch: envelope={} actual={}",
+                hex::encode(clock_profile_hash),
+                hex::encode(profile_canonical_hash)
+            ));
+        }
+
+        if !Self::is_clock_profile_admissible_for_risk_tier(risk_tier, &clock_profile) {
+            return Err(format!(
+                "clock_profile_hash {} is not admissible for risk tier {:?}",
+                envelope.clock_profile_hash, risk_tier
+            ));
+        }
+
+        Ok(())
     }
 
     // =========================================================================
@@ -6136,6 +6306,13 @@ impl PrivilegedDispatcher {
         if let Some(ref cas) = self.broker_cas {
             broker = broker.with_cas(Arc::clone(cas));
         }
+
+        // TCK-00377: Wire the runtime precondition evaluator so the broker
+        // performs real filesystem/git checks (FileExists, FileNotExists,
+        // FileHashMatch via BLAKE3, GitCleanWorkingTree, GitRefAtCommit).
+        // The evaluator is fail-closed: I/O errors and mismatches both
+        // produce PreconditionFailed denials.
+        broker = broker.with_precondition_evaluator(Arc::new(RuntimePreconditionEvaluator));
 
         broker
             .set_policy_from_tool_allowlist(
@@ -9333,112 +9510,100 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // ---- Phase 1b (TCK-00340): Attestation ratchet validation ----
+        // ---- Phase 1b: Resolve risk tier + enforce HTF envelope/profile authority
+        // ----
+        let changeset_digest: [u8; 32] = request
+            .changeset_digest
+            .as_slice()
+            .try_into()
+            .expect("validated to be 32 bytes above");
+        let (risk_tier, resolved_policy_hash) =
+            self.resolve_risk_tier_for_lease(&request.lease_id, changeset_digest);
+
+        // Authoritative terminal receipts MUST bind an authoritative lease
+        // envelope. Fail closed if the lease cannot be resolved with full HTF
+        // bindings.
+        let Some(lease_for_receipt) = self.lease_validator.get_gate_lease(&request.lease_id) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "gate lease '{}' is missing authoritative time_envelope_ref binding",
+                    request.lease_id
+                ),
+            ));
+        };
+
+        if let Err(e) = self.validate_lease_time_authority(&lease_for_receipt, risk_tier) {
+            warn!(
+                lease_id = %request.lease_id,
+                risk_tier = ?risk_tier,
+                error = %e,
+                "HTF lease time authority validation failed for review receipt ingestion"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("HTF authority validation failed: {e}"),
+            ));
+        }
+        let lease_time_envelope_ref = lease_for_receipt.time_envelope_ref;
+
+        // ---- Phase 1c (TCK-00340): Attestation ratchet validation ----
         //
-        // SECURITY: Resolve the real risk tier from the work item's policy
-        // resolution state. Higher tiers require stronger attestation
-        // (CounterSigned / ThresholdSigned). Fail-closed: if risk tier
-        // cannot be resolved, default to Tier4 (most restrictive).
-        {
-            let changeset_digest: [u8; 32] = request
-                .changeset_digest
-                .as_slice()
-                .try_into()
-                .expect("validated to be 32 bytes above");
+        // SECURITY (v5 Finding 4): Instead of hard-rejecting all non-Tier0
+        // requests, consult the ratchet table first. The ratchet table
+        // explicitly allows Tier1 with SelfSigned attestation. Only reject
+        // if the tier's required attestation level exceeds what this
+        // endpoint can provide (SelfSigned). This restores Tier1 throughput
+        // while maintaining fail-closed semantics for higher tiers.
+        let requirements = AttestationRequirements::new();
+        let required_level = requirements.required_level(ReceiptKind::Review, risk_tier);
+        if !AttestationLevel::SelfSigned.satisfies(required_level) {
+            warn!(
+                receipt_id = %request.receipt_id,
+                risk_tier = ?risk_tier,
+                required_level = %required_level,
+                "Risk tier requires attestation stronger than SelfSigned — \
+                 rejecting (fail-closed)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "review receipt endpoint provides SelfSigned attestation; \
+                     {risk_tier:?} requires {required_level} which this endpoint cannot produce"
+                ),
+            ));
+        }
 
-            // Resolve risk tier via: lease_id -> work_id -> work_claim -> policy_resolution
-            let (risk_tier, resolved_policy_hash) =
-                if let Some(wid) = self.lease_validator.get_lease_work_id(&request.lease_id) {
-                    if let Some(claim) = self.work_registry.get_claim(&wid) {
-                        let tier_u8 = claim.policy_resolution.resolved_risk_tier;
-                        let tier = RiskTier::try_from(tier_u8).unwrap_or_else(|_| {
-                            // FAIL-CLOSED: invalid tier value -> Tier4 (most restrictive)
-                            warn!(
-                                lease_id = %request.lease_id,
-                                work_id = %wid,
-                                tier_value = tier_u8,
-                                "Invalid risk tier value in policy resolution — \
-                                 defaulting to Tier4 (fail-closed)"
-                            );
-                            RiskTier::Tier4
-                        });
-                        (tier, claim.policy_resolution.resolved_policy_hash)
-                    } else {
-                        // FAIL-CLOSED: no work claim -> Tier4
-                        warn!(
-                            lease_id = %request.lease_id,
-                            work_id = %wid,
-                            "Work claim not found for lease — \
-                             defaulting to Tier4 (fail-closed)"
-                        );
-                        (RiskTier::Tier4, changeset_digest)
-                    }
-                } else {
-                    // FAIL-CLOSED: no work_id from lease -> Tier4
-                    warn!(
-                        lease_id = %request.lease_id,
-                        "Could not resolve work_id from lease — \
-                         defaulting to Tier4 (fail-closed)"
-                    );
-                    (RiskTier::Tier4, changeset_digest)
-                };
+        // SECURITY (v6 Finding 1): Use authenticated reviewer identity
+        // for attestation signer, not the caller-supplied value.
+        let attestation = ReceiptAttestation {
+            kind: ReceiptKind::Review,
+            level: AttestationLevel::SelfSigned,
+            policy_hash: resolved_policy_hash,
+            signer_identity: authenticated_reviewer_id.clone(),
+            counter_signer_identity: None,
+            threshold_signer_count: None,
+        };
 
-            // SECURITY (v5 Finding 4): Instead of hard-rejecting all non-Tier0
-            // requests, consult the ratchet table first. The ratchet table
-            // explicitly allows Tier1 with SelfSigned attestation. Only reject
-            // if the tier's required attestation level exceeds what this
-            // endpoint can provide (SelfSigned). This restores Tier1 throughput
-            // while maintaining fail-closed semantics for higher tiers.
-            let requirements = AttestationRequirements::new();
-            let required_level = requirements.required_level(ReceiptKind::Review, risk_tier);
-            if !AttestationLevel::SelfSigned.satisfies(required_level) {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    risk_tier = ?risk_tier,
-                    required_level = %required_level,
-                    "Risk tier requires attestation stronger than SelfSigned — \
-                     rejecting (fail-closed)"
-                );
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!(
-                        "review receipt endpoint provides SelfSigned attestation; \
-                         {risk_tier:?} requires {required_level} which this endpoint cannot produce"
-                    ),
-                ));
-            }
-
-            // SECURITY (v6 Finding 1): Use authenticated reviewer identity
-            // for attestation signer, not the caller-supplied value.
-            let attestation = ReceiptAttestation {
-                kind: ReceiptKind::Review,
-                level: AttestationLevel::SelfSigned,
-                policy_hash: resolved_policy_hash,
-                signer_identity: authenticated_reviewer_id.clone(),
-                counter_signer_identity: None,
-                threshold_signer_count: None,
-            };
-
-            // Validate attestation against requirements using the resolved
-            // policy hash from the work item's policy resolution (not the
-            // raw changeset_digest). This binds the attestation to the
-            // governance-resolved policy state.
-            if let Err(e) = validate_receipt_attestation(
-                &attestation,
-                risk_tier,
-                &resolved_policy_hash,
-                &requirements,
-            ) {
-                warn!(
-                    receipt_id = %request.receipt_id,
-                    error = %e,
-                    "Receipt attestation validation failed - rejecting (fail-closed)"
-                );
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("attestation validation failed: {e}"),
-                ));
-            }
+        // Validate attestation against requirements using the resolved
+        // policy hash from the work item's policy resolution (not the
+        // raw changeset_digest). This binds the attestation to the
+        // governance-resolved policy state.
+        if let Err(e) = validate_receipt_attestation(
+            &attestation,
+            risk_tier,
+            &resolved_policy_hash,
+            &requirements,
+        ) {
+            warn!(
+                receipt_id = %request.receipt_id,
+                error = %e,
+                "Receipt attestation validation failed - rejecting (fail-closed)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("attestation validation failed: {e}"),
+            ));
         }
 
         let request_changeset_digest_arr: [u8; 32] = request
@@ -9671,6 +9836,7 @@ impl PrivilegedDispatcher {
                     &authenticated_reviewer_id,
                     timestamp_ns,
                     &request_identity_proof_hash_arr,
+                    &lease_time_envelope_ref,
                 ),
                 "review receipt emission failed",
             ),
@@ -9689,6 +9855,7 @@ impl PrivilegedDispatcher {
                         &authenticated_reviewer_id,
                         timestamp_ns,
                         &request_identity_proof_hash_arr,
+                        &lease_time_envelope_ref,
                     ),
                     "review blocked emission failed",
                 )
@@ -10782,7 +10949,27 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // ---- Phase 2b: Sublease ID uniqueness check (admission before mutation) ----
+        // ---- Phase 2b: Parent lease HTF authority validation ----
+        //
+        // Authoritative sublease delegation is denied unless the parent lease
+        // has a resolvable CAS-hosted time envelope with an admissible pinned
+        // clock profile for the lease's risk tier.
+        let (parent_risk_tier, _) =
+            self.resolve_risk_tier_for_lease(&request.parent_lease_id, parent_lease.policy_hash);
+        if let Err(e) = self.validate_lease_time_authority(&parent_lease, parent_risk_tier) {
+            warn!(
+                parent_lease_id = %request.parent_lease_id,
+                risk_tier = ?parent_risk_tier,
+                error = %e,
+                "Parent lease HTF authority validation failed"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("parent lease HTF authority validation failed: {e}"),
+            ));
+        }
+
+        // ---- Phase 2c: Sublease ID uniqueness check (admission before mutation) ----
         //
         // SECURITY (v10 — Defense-in-Depth Uniqueness):
         //
@@ -20425,6 +20612,113 @@ mod tests {
             result.hash.to_vec()
         }
 
+        /// Stores a canonical `ClockProfileV1` + `TimeEnvelopeV1` in CAS and
+        /// returns the envelope hash reference (`time_envelope_ref`).
+        pub(super) fn store_time_authority_artifacts(
+            cas: &dyn ContentAddressedStore,
+            wall_time_source: WallTimeSource,
+            include_attestation: bool,
+        ) -> String {
+            let clock_profile = ClockProfile {
+                attestation: include_attestation.then(|| serde_json::json!({"kind": "test"})),
+                build_fingerprint: "apm2-daemon/test".to_string(),
+                hlc_enabled: true,
+                max_wall_uncertainty_ns: 1_000_000,
+                monotonic_source: apm2_core::htf::MonotonicSource::ClockMonotonic,
+                profile_policy_id: "test-policy".to_string(),
+                tick_rate_hz: 1_000_000_000,
+                wall_time_source,
+            };
+
+            let profile_bytes = clock_profile
+                .canonical_bytes()
+                .expect("clock profile canonicalization should succeed");
+            let profile_hash = clock_profile
+                .canonical_hash()
+                .expect("clock profile hash should succeed");
+            let stored_profile = cas
+                .store(&profile_bytes)
+                .expect("clock profile should store");
+            assert_eq!(
+                stored_profile.hash, profile_hash,
+                "stored profile hash must match canonical hash"
+            );
+
+            let envelope = TimeEnvelope {
+                clock_profile_hash: hex::encode(profile_hash),
+                hlc: apm2_core::htf::Hlc {
+                    logical: 0,
+                    wall_ns: 1_700_000_000_000_000_000,
+                },
+                ledger_anchor: apm2_core::htf::LedgerTime::new("test-ledger", 0, 1),
+                mono: apm2_core::htf::MonotonicReading {
+                    end_tick: Some(10_000_000_000),
+                    source: apm2_core::htf::MonotonicSource::ClockMonotonic,
+                    start_tick: 0,
+                    tick_rate_hz: 1_000_000_000,
+                },
+                notes: Some("ingest-review-receipt-test".to_string()),
+                wall: apm2_core::htf::BoundedWallInterval::new(
+                    1_700_000_000_000_000_000,
+                    1_700_000_000_100_000_000,
+                    wall_time_source,
+                    "95%",
+                )
+                .expect("bounded wall interval should be valid"),
+            };
+
+            let envelope_bytes = envelope
+                .canonical_bytes()
+                .expect("time envelope canonicalization should succeed");
+            let envelope_hash = envelope
+                .canonical_hash()
+                .expect("time envelope hash should succeed");
+            let stored_envelope = cas
+                .store(&envelope_bytes)
+                .expect("time envelope should store");
+            assert_eq!(
+                stored_envelope.hash, envelope_hash,
+                "stored envelope hash must match canonical hash"
+            );
+
+            hex::encode(envelope_hash)
+        }
+
+        pub(super) struct TestLeaseConfig<'a> {
+            pub dispatcher: &'a PrivilegedDispatcher,
+            pub cas: &'a dyn ContentAddressedStore,
+            pub lease_id: &'a str,
+            pub work_id: &'a str,
+            pub gate_id: &'a str,
+            pub executor_actor_id: &'a str,
+            pub policy_hash: [u8; 32],
+            pub wall_time_source: WallTimeSource,
+            pub include_attestation: bool,
+        }
+
+        pub(super) fn register_full_test_lease(cfg: &TestLeaseConfig<'_>) {
+            let time_envelope_ref = store_time_authority_artifacts(
+                cfg.cas,
+                cfg.wall_time_source,
+                cfg.include_attestation,
+            );
+            let signer = apm2_core::crypto::Signer::generate();
+            let full_lease =
+                apm2_core::fac::GateLeaseBuilder::new(cfg.lease_id, cfg.work_id, cfg.gate_id)
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id(cfg.executor_actor_id)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash(cfg.policy_hash)
+                    .issuer_actor_id("issuer-test")
+                    .time_envelope_ref(&time_envelope_ref)
+                    .build_and_sign(&signer);
+            cfg.dispatcher
+                .lease_validator
+                .register_full_lease(&full_lease)
+                .expect("full lease registration should succeed");
+        }
+
         /// Creates a dispatcher with CAS, a registered lease, and Tier0 work
         /// claim for testing. CAS is pre-populated with the standard test
         /// artifact bundle so that CAS existence checks pass on success paths.
@@ -20475,6 +20769,17 @@ mod tests {
                 gate_id,
                 &executor_actor_id,
             );
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id,
+                work_id,
+                gate_id,
+                executor_actor_id: &executor_actor_id,
+                policy_hash: [0u8; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
             // Register work claim so risk-tier resolution succeeds
             let claim = WorkClaim {
                 work_id: work_id.to_string(),
@@ -21480,6 +21785,17 @@ mod tests {
                 "gate-001",
                 &executor_actor_id,
             );
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: "lease-no-claim",
+                work_id: "W-NO-CLAIM",
+                gate_id: "gate-001",
+                executor_actor_id: &executor_actor_id,
+                policy_hash: [0x42; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
             let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
 
             let request = IngestReviewReceiptRequest {
@@ -21814,6 +22130,21 @@ mod tests {
                 "gate-002",
                 &executor_actor_id,
             );
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: "lease-B",
+                work_id: "W-DUP-LEASE-B",
+                gate_id: "gate-002",
+                executor_actor_id: &executor_actor_id,
+                policy_hash: [0u8; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
             dispatcher
                 .work_registry
                 .register_claim(WorkClaim {
@@ -21900,6 +22231,17 @@ mod tests {
                 "gate-cas-001",
                 &executor_actor_id,
             );
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id,
+                work_id,
+                gate_id: "gate-cas-001",
+                executor_actor_id: &executor_actor_id,
+                policy_hash: [0u8; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
             dispatcher
                 .work_registry
                 .register_claim(WorkClaim {
@@ -21973,7 +22315,7 @@ mod tests {
             let signer = Arc::new(apm2_core::crypto::Signer::generate());
             let orch = Arc::new(crate::gate::GateOrchestrator::new(
                 crate::gate::GateOrchestratorConfig::default(),
-                signer.clone(),
+                signer,
             ));
 
             // Derive the actor ID from the test peer credentials (uid=1000,
@@ -21984,29 +22326,31 @@ mod tests {
                 pid: Some(12345),
             };
             let caller_actor = derive_actor_id(&test_creds);
-
-            let parent_lease =
-                apm2_core::fac::GateLeaseBuilder::new(parent_lease_id, work_id, gate_id)
-                    .changeset_digest([0x42; 32])
-                    .executor_actor_id(&caller_actor)
-                    .issued_at(1_000_000)
-                    .expires_at(2_000_000)
-                    .policy_hash([0xAB; 32])
-                    .issuer_actor_id("issuer-001")
-                    .time_envelope_ref("htf:tick:100")
-                    .build_and_sign(&signer);
-
-            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
-            dispatcher
-                .lease_validator
-                .register_full_lease(&parent_lease)
-                .expect("register_full_lease should succeed in test");
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_gate_orchestrator(orch)
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: parent_lease_id,
+                work_id,
+                gate_id,
+                executor_actor_id: &caller_actor,
+                policy_hash: [0xAB; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
             dispatcher.lease_validator.register_lease_with_executor(
                 parent_lease_id,
                 work_id,
                 gate_id,
                 &caller_actor,
             );
+            let parent_lease = dispatcher
+                .lease_validator
+                .get_gate_lease(parent_lease_id)
+                .expect("registered parent lease should be retrievable");
 
             let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
@@ -22359,27 +22703,26 @@ mod tests {
             let signer = Arc::new(apm2_core::crypto::Signer::generate());
             let orch = Arc::new(crate::gate::GateOrchestrator::new(
                 crate::gate::GateOrchestratorConfig::default(),
-                signer.clone(),
+                signer,
             ));
 
             // Register parent lease with executor_actor_id that does NOT
             // match the caller (uid=1000, gid=1000).
-            let parent_lease =
-                apm2_core::fac::GateLeaseBuilder::new("parent-authz", "W-AUTHZ", "gate-authz")
-                    .changeset_digest([0x42; 32])
-                    .executor_actor_id("totally-different-actor")
-                    .issued_at(1_000_000)
-                    .expires_at(2_000_000)
-                    .policy_hash([0xAB; 32])
-                    .issuer_actor_id("also-different-issuer")
-                    .time_envelope_ref("htf:tick:100")
-                    .build_and_sign(&signer);
-
-            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
-            dispatcher
-                .lease_validator
-                .register_full_lease(&parent_lease)
-                .expect("register_full_lease should succeed in test");
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_gate_orchestrator(orch)
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: "parent-authz",
+                work_id: "W-AUTHZ",
+                gate_id: "gate-authz",
+                executor_actor_id: "totally-different-actor",
+                policy_hash: [0xAB; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
             dispatcher.lease_validator.register_lease_with_executor(
                 "parent-authz",
                 "W-AUTHZ",
@@ -22645,7 +22988,7 @@ mod tests {
             let signer = Arc::new(apm2_core::crypto::Signer::generate());
             let orch = Arc::new(crate::gate::GateOrchestrator::new(
                 crate::gate::GateOrchestratorConfig::default(),
-                signer.clone(),
+                signer,
             ));
 
             // Derive the actor ID from the test peer credentials so the
@@ -22657,37 +23000,32 @@ mod tests {
             };
             let caller_actor = derive_actor_id(&test_creds);
 
-            // Create parent lease in gate "gate-A"
-            let parent_a = apm2_core::fac::GateLeaseBuilder::new("parent-A", "W-A", "gate-A")
-                .changeset_digest([0x42; 32])
-                .executor_actor_id(&caller_actor)
-                .issued_at(1_000_000)
-                .expires_at(2_000_000)
-                .policy_hash([0xAB; 32])
-                .issuer_actor_id("issuer-001")
-                .time_envelope_ref("htf:tick:100")
-                .build_and_sign(&signer);
-
-            // Create parent lease in gate "gate-B" (different parameters)
-            let parent_b = apm2_core::fac::GateLeaseBuilder::new("parent-B", "W-B", "gate-B")
-                .changeset_digest([0x42; 32])
-                .executor_actor_id(&caller_actor)
-                .issued_at(1_000_000)
-                .expires_at(2_000_000)
-                .policy_hash([0xAB; 32])
-                .issuer_actor_id("issuer-001")
-                .time_envelope_ref("htf:tick:200")
-                .build_and_sign(&signer);
-
-            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
-            dispatcher
-                .lease_validator
-                .register_full_lease(&parent_a)
-                .expect("register_full_lease should succeed in test");
-            dispatcher
-                .lease_validator
-                .register_full_lease(&parent_b)
-                .expect("register_full_lease should succeed in test");
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_gate_orchestrator(orch)
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: "parent-A",
+                work_id: "W-A",
+                gate_id: "gate-A",
+                executor_actor_id: &caller_actor,
+                policy_hash: [0xAB; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: "parent-B",
+                work_id: "W-B",
+                gate_id: "gate-B",
+                executor_actor_id: &caller_actor,
+                policy_hash: [0xAB; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
             dispatcher.lease_validator.register_lease_with_executor(
                 "parent-A",
                 "W-A",
@@ -22807,7 +23145,7 @@ mod tests {
             let signer = Arc::new(apm2_core::crypto::Signer::generate());
             let orch = Arc::new(crate::gate::GateOrchestrator::new(
                 crate::gate::GateOrchestratorConfig::default(),
-                signer.clone(),
+                signer,
             ));
 
             let test_creds = PeerCredentials {
@@ -22821,36 +23159,32 @@ mod tests {
             // (changeset_digest, policy_hash) but different lease IDs.
             // This is the edge case where the changeset_digest/policy_hash
             // comparison alone would incorrectly treat them as equivalent.
-            let parent_a =
-                apm2_core::fac::GateLeaseBuilder::new("parent-lin-A", "W-LIN", "gate-lin")
-                    .changeset_digest([0x42; 32])
-                    .executor_actor_id(&caller_actor)
-                    .issued_at(1_000_000)
-                    .expires_at(2_000_000)
-                    .policy_hash([0xAB; 32])
-                    .issuer_actor_id("issuer-001")
-                    .time_envelope_ref("htf:tick:100")
-                    .build_and_sign(&signer);
-
-            let parent_b = apm2_core::fac::GateLeaseBuilder::new("parent-lin-B", "W-LIN", "gate-lin")
-                    .changeset_digest([0x42; 32]) // Same digest
-                    .executor_actor_id(&caller_actor)
-                    .issued_at(1_000_000)
-                    .expires_at(2_000_000)
-                    .policy_hash([0xAB; 32]) // Same policy hash
-                    .issuer_actor_id("issuer-001")
-                    .time_envelope_ref("htf:tick:200")
-                    .build_and_sign(&signer);
-
-            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
-            dispatcher
-                .lease_validator
-                .register_full_lease(&parent_a)
-                .expect("register_full_lease should succeed in test");
-            dispatcher
-                .lease_validator
-                .register_full_lease(&parent_b)
-                .expect("register_full_lease should succeed in test");
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_gate_orchestrator(orch)
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: "parent-lin-A",
+                work_id: "W-LIN",
+                gate_id: "gate-lin",
+                executor_actor_id: &caller_actor,
+                policy_hash: [0xAB; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: "parent-lin-B",
+                work_id: "W-LIN",
+                gate_id: "gate-lin",
+                executor_actor_id: &caller_actor,
+                policy_hash: [0xAB; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
             dispatcher.lease_validator.register_lease_with_executor(
                 "parent-lin-A",
                 "W-LIN",
@@ -23057,12 +23391,23 @@ mod tests {
                 pid: Some(12345),
             });
 
-            // Register lease via SqliteLeaseValidator (production path)
-            dispatcher.lease_validator.register_lease_with_executor(
-                "sqlite-lease-001",
-                "W-SQL-001",
-                "gate-sql",
-                &executor_actor_id,
+            // Register full lease with HTF bindings via SqliteLeaseValidator
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: "sqlite-lease-001",
+                    work_id: "W-SQL-001",
+                    gate_id: "gate-sql",
+                    executor_actor_id: &executor_actor_id,
+                    policy_hash: [0u8; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
             );
 
             // Register work claim via SqliteWorkRegistry (production path)
@@ -23132,12 +23477,23 @@ mod tests {
                 pid: Some(12345),
             });
 
-            // Register lease via SqliteLeaseValidator
-            dispatcher.lease_validator.register_lease_with_executor(
-                "sqlite-lease-t2",
-                "W-SQL-T2",
-                "gate-sql",
-                &executor_actor_id,
+            // Register full lease with HTF bindings via SqliteLeaseValidator
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: "sqlite-lease-t2",
+                    work_id: "W-SQL-T2",
+                    gate_id: "gate-sql",
+                    executor_actor_id: &executor_actor_id,
+                    policy_hash: [0u8; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
             );
 
             // Register work claim at Tier2 (should be rejected)
@@ -23208,27 +23564,22 @@ mod tests {
                 pid: Some(12345),
             });
 
-            let parent_lease =
-                apm2_core::fac::GateLeaseBuilder::new("sql-parent", "W-SQL-DS", "gate-sql-ds")
-                    .changeset_digest([0x42; 32])
-                    .executor_actor_id(&caller_actor)
-                    .issued_at(1_000_000)
-                    .expires_at(2_000_000)
-                    .policy_hash([0xAB; 32])
-                    .issuer_actor_id("issuer-001")
-                    .time_envelope_ref("htf:tick:100")
-                    .build_and_sign(&signer);
-
-            // Use production SqliteLeaseValidator path to register full lease
-            dispatcher
-                .lease_validator
-                .register_full_lease(&parent_lease)
-                .expect("register_full_lease should succeed in test");
-            dispatcher.lease_validator.register_lease_with_executor(
-                "sql-parent",
-                "W-SQL-DS",
-                "gate-sql-ds",
-                &caller_actor,
+            let cas = dispatcher
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by setup helper");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id: "sql-parent",
+                    work_id: "W-SQL-DS",
+                    gate_id: "gate-sql-ds",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xAB; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
             );
 
             // Wire orchestrator after construction (mimics DispatcherState flow)
@@ -23355,31 +23706,24 @@ mod tests {
             let caller_actor = derive_actor_id(&test_creds);
 
             // Register parent lease in the sqlite-backed dispatcher
-            let parent_lease =
-                apm2_core::fac::GateLeaseBuilder::new("ds-parent-prod", "W-PROD-001", "gate-prod")
-                    .changeset_digest([0x42; 32])
-                    .executor_actor_id(&caller_actor)
-                    .issued_at(1_000_000)
-                    .expires_at(2_000_000)
-                    .policy_hash([0xAB; 32])
-                    .issuer_actor_id("issuer-prod")
-                    .time_envelope_ref("htf:tick:100")
-                    .build_and_sign(&signer);
-
-            state
+            let cas = state
                 .privileged_dispatcher()
-                .lease_validator
-                .register_full_lease(&parent_lease)
-                .expect("register_full_lease should succeed in test");
-            state
-                .privileged_dispatcher()
-                .lease_validator
-                .register_lease_with_executor(
-                    "ds-parent-prod",
-                    "W-PROD-001",
-                    "gate-prod",
-                    &caller_actor,
-                );
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by DispatcherState");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: state.privileged_dispatcher(),
+                    cas: cas.as_ref(),
+                    lease_id: "ds-parent-prod",
+                    work_id: "W-PROD-001",
+                    gate_id: "gate-prod",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0xAB; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
 
             let ctx = ConnectionContext::privileged_session_open(Some(test_creds));
 
@@ -23422,15 +23766,19 @@ mod tests {
             // v6 Finding 1: The lease executor must be the derived actor_id
             // from peer credentials, since the handler now authenticates the
             // reviewer identity via peer credentials (not the request field).
-            state
-                .privileged_dispatcher()
-                .lease_validator
-                .register_lease_with_executor(
-                    "review-lease-prod",
-                    "W-REVIEW-001",
-                    "gate-review",
-                    &caller_actor,
-                );
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: state.privileged_dispatcher(),
+                    cas: cas.as_ref(),
+                    lease_id: "review-lease-prod",
+                    work_id: "W-REVIEW-001",
+                    gate_id: "gate-review",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0u8; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
 
             let claim = WorkClaim {
                 work_id: "W-REVIEW-001".to_string(),
@@ -23576,15 +23924,24 @@ mod tests {
                 .expect("Claim registration must succeed");
 
             // Step 3: Register the lease for reviewer identity validation
-            state
+            let cas = state
                 .privileged_dispatcher()
-                .lease_validator
-                .register_lease_with_executor(
-                    "lease-gov-001",
-                    "W-GOV-001",
-                    "gate-gov",
-                    &caller_actor,
-                );
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by DispatcherState");
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: state.privileged_dispatcher(),
+                    cas: cas.as_ref(),
+                    lease_id: "lease-gov-001",
+                    work_id: "W-GOV-001",
+                    gate_id: "gate-gov",
+                    executor_actor_id: &caller_actor,
+                    policy_hash: [0u8; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
 
             // Step 4: Submit IngestReviewReceipt with SelfSigned attestation
             let review_request = IngestReviewReceiptRequest {

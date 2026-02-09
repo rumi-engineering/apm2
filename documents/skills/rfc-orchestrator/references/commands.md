@@ -70,15 +70,17 @@ check-review-gate-status:
       --jq '.statuses[] | select(.context == "Review Gate Success") | "\(.context): \(.state)"'
   purpose: Check Review Gate Success commit status
 
+trigger-reviews:
+  command: apm2 fac review dispatch <PR_URL> --type all
+  purpose: Dispatch all AI reviews for a PR
+
 trigger-security-review:
-  command: cargo xtask review security <PR_URL>
-  note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
-  purpose: Run security review (SYNCHRONOUS - no &)
+  command: apm2 fac review dispatch <PR_URL> --type security
+  purpose: Run security review
 
 trigger-quality-review:
-  command: cargo xtask review quality <PR_URL>
-  note: "Stage-2 demotion (TCK-00419): projection-only by default. Direct writes require XTASK_CUTOVER_POLICY=legacy. Prefer `apm2 fac check`/`apm2 fac work status` for authoritative lifecycle and gate state."
-  purpose: Run quality review (SYNCHRONOUS - no &)
+  command: apm2 fac review dispatch <PR_URL> --type quality
+  purpose: Run quality review
 ```
 
 ## Process Management

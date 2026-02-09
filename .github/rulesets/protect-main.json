@@ -24,10 +24,10 @@
       "parameters": {
         "required_status_checks": [
           {
-            "context": "Guardian Intelligence - Barrier"
+            "context": "Guardian Intelligence / Barrier"
           },
           {
-            "context": "Forge Admission Cycle"
+            "context": "apm2 / Forge Admission Cycle"
           }
         ],
         "strict_required_status_checks_policy": true
