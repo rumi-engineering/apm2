@@ -46,6 +46,9 @@ use apm2_core::context::firewall::{
 };
 use apm2_core::htf::{EpochSealV1, EpochSealVerifier, SignatureVerifier};
 use apm2_core::policy::{Decision as CoreDecision, LoadedPolicy, PolicyEngine};
+use apm2_core::tool::{
+    IdempotencyPrecondition, PreconditionEvaluator, ShellBridgePolicy, ToolKindError,
+};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, instrument, warn};
@@ -170,6 +173,17 @@ pub enum BrokerError {
         /// Human-readable reason for rejection.
         reason: String,
     },
+
+    /// Idempotency precondition failed (TCK-00377).
+    ///
+    /// Per RFC-0020 Section 6.1.2, a side-effectful operation declared a
+    /// precondition that was not satisfied at evaluation time.  The
+    /// operation is denied without partial execution.
+    #[error("precondition failed: {reason}")]
+    PreconditionFailed {
+        /// Why the precondition failed.
+        reason: String,
+    },
 }
 
 impl BrokerError {
@@ -190,6 +204,7 @@ impl BrokerError {
             Self::ContextPackDeserializationFailed { .. } => "context_pack_deserialization_failed",
             Self::ContextPackIntegrityMismatch { .. } => "context_pack_integrity_mismatch",
             Self::EpochSealRejected { .. } => "epoch_seal_rejected",
+            Self::PreconditionFailed { .. } => "precondition_failed",
         }
     }
 
@@ -577,6 +592,17 @@ pub struct ToolBrokerConfig {
 
     /// Whether to use dedupe cache (default: true).
     pub use_dedupe_cache: bool,
+
+    /// Optional shell bridge policy for runtime configuration (TCK-00377).
+    ///
+    /// When `Some`, the broker uses this policy for shell bridge allowlist
+    /// enforcement instead of the default `ShellBridgePolicy::deny_all()`.
+    /// This allows the allowlist to be configured at runtime via config
+    /// without requiring builder-pattern chaining.
+    ///
+    /// Default: `None` (broker falls back to `ShellBridgePolicy::deny_all()`
+    /// unless overridden via [`ToolBroker::with_shell_bridge_policy`]).
+    pub shell_bridge_policy: Option<ShellBridgePolicy>,
 }
 
 impl Default for ToolBrokerConfig {
@@ -585,6 +611,7 @@ impl Default for ToolBrokerConfig {
             dedupe_config: DedupeCacheConfig::default(),
             check_policy: true,
             use_dedupe_cache: true,
+            shell_bridge_policy: None,
         }
     }
 }
@@ -609,6 +636,170 @@ impl ToolBrokerConfig {
     pub const fn without_dedupe_cache(mut self) -> Self {
         self.use_dedupe_cache = false;
         self
+    }
+
+    /// Sets the shell bridge policy for runtime configuration (TCK-00377).
+    ///
+    /// When set, the broker uses this policy for shell bridge allowlist
+    /// enforcement instead of the default `ShellBridgePolicy::deny_all()`.
+    #[must_use]
+    pub fn with_shell_bridge_policy(mut self, policy: ShellBridgePolicy) -> Self {
+        self.shell_bridge_policy = Some(policy);
+        self
+    }
+}
+
+// =============================================================================
+// RuntimePreconditionEvaluator
+// =============================================================================
+
+/// Production precondition evaluator that performs real filesystem and git
+/// checks.
+///
+/// This evaluator is wired into every production broker so that the
+/// precondition evaluator slot is **never** `None`.  The broker's
+/// `evaluate_precondition` method is fail-closed: when no evaluator is
+/// present, it denies the operation.
+///
+/// # Fail-Closed
+///
+/// Every check path returns `Err(ToolKindError::PreconditionFailed)` on
+/// failure or I/O error.  The evaluator **never** defaults to pass.
+///
+/// # Implementation Details
+///
+/// - `FileExists` / `FileNotExists`: uses `std::fs::symlink_metadata` for
+///   symlink-aware existence checks (RS-30 compliance).
+/// - `FileHashMatch`: reads file content and computes a BLAKE3 digest.
+/// - `GitCleanWorkingTree`: invokes `git status --porcelain` and asserts empty
+///   stdout.
+/// - `GitRefAtCommit`: invokes `git rev-parse <ref>` and compares output.
+///
+/// # Contract References
+///
+/// - `REQ-0031`: `ToolKinds` idempotency enforcement
+/// - `RFC-0020 Section 6.1.2`: Precondition guard semantics
+#[derive(Debug)]
+pub struct RuntimePreconditionEvaluator;
+
+impl PreconditionEvaluator for RuntimePreconditionEvaluator {
+    fn evaluate(
+        &self,
+        precondition: &IdempotencyPrecondition,
+        path: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<(), ToolKindError> {
+        match precondition {
+            IdempotencyPrecondition::FileExists => {
+                let p = path.ok_or_else(|| ToolKindError::PreconditionFailed {
+                    reason: "FileExists precondition requires a path context".to_string(),
+                })?;
+                if std::fs::symlink_metadata(p).is_ok() {
+                    Ok(())
+                } else {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!("file does not exist: {p}"),
+                    })
+                }
+            },
+            IdempotencyPrecondition::FileNotExists => {
+                let p = path.ok_or_else(|| ToolKindError::PreconditionFailed {
+                    reason: "FileNotExists precondition requires a path context".to_string(),
+                })?;
+                if std::fs::symlink_metadata(p).is_ok() {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!("file already exists: {p}"),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            IdempotencyPrecondition::FileHashMatch { expected_hash } => {
+                let p = path.ok_or_else(|| ToolKindError::PreconditionFailed {
+                    reason: "FileHashMatch precondition requires a path context".to_string(),
+                })?;
+                let content = std::fs::read(p).map_err(|e| ToolKindError::PreconditionFailed {
+                    reason: format!("cannot read file for hash check: {p}: {e}"),
+                })?;
+                let actual_hash = blake3::hash(&content);
+                if actual_hash.as_bytes() == expected_hash {
+                    Ok(())
+                } else {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!(
+                            "file hash mismatch for {p}: expected {}, got {}",
+                            hex::encode(expected_hash),
+                            actual_hash.to_hex(),
+                        ),
+                    })
+                }
+            },
+            IdempotencyPrecondition::GitCleanWorkingTree => {
+                let dir = cwd.unwrap_or(".");
+                let output = std::process::Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .current_dir(dir)
+                    .output()
+                    .map_err(|e| ToolKindError::PreconditionFailed {
+                        reason: format!("failed to run git status in {dir}: {e}"),
+                    })?;
+                if !output.status.success() {
+                    return Err(ToolKindError::PreconditionFailed {
+                        reason: format!(
+                            "git status failed in {dir}: {}",
+                            String::from_utf8_lossy(&output.stderr),
+                        ),
+                    });
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.trim().is_empty() {
+                    Ok(())
+                } else {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!("working tree is not clean in {dir}: {stdout}"),
+                    })
+                }
+            },
+            IdempotencyPrecondition::GitRefAtCommit {
+                ref_name,
+                expected_commit,
+            } => {
+                let dir = cwd.unwrap_or(".");
+                let output = std::process::Command::new("git")
+                    .args(["rev-parse", ref_name])
+                    .current_dir(dir)
+                    .output()
+                    .map_err(|e| ToolKindError::PreconditionFailed {
+                        reason: format!("failed to run git rev-parse {ref_name} in {dir}: {e}"),
+                    })?;
+                if !output.status.success() {
+                    return Err(ToolKindError::PreconditionFailed {
+                        reason: format!(
+                            "git rev-parse {ref_name} failed in {dir}: {}",
+                            String::from_utf8_lossy(&output.stderr),
+                        ),
+                    });
+                }
+                let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if actual == *expected_commit {
+                    Ok(())
+                } else {
+                    Err(ToolKindError::PreconditionFailed {
+                        reason: format!(
+                            "ref {ref_name} points to {actual}, expected {expected_commit}",
+                        ),
+                    })
+                }
+            },
+            // IdempotencyPrecondition is #[non_exhaustive] — fail-closed for
+            // any future variants we don't yet handle.
+            _ => Err(ToolKindError::PreconditionFailed {
+                reason: format!(
+                    "unsupported precondition variant: {}",
+                    precondition.description(),
+                ),
+            }),
+        }
     }
 }
 
@@ -746,6 +937,29 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// mutates internal monotonicity state. Access is serialized per-request.
     epoch_seal_verifier: tokio::sync::Mutex<EpochSealVerifier>,
 
+    /// Shell bridge policy for `ToolKinds` typed enforcement (TCK-00377).
+    ///
+    /// Per REQ-0031, authoritative routes must not accept raw untyped
+    /// command strings. This policy gates shell execution through an
+    /// explicit allowlist. The broker enforces the allowlist in
+    /// `request_with_response` Step 1c for all Execute-class requests.
+    ///
+    /// Default: `ShellBridgePolicy::deny_all()` (fail-closed).
+    shell_bridge_policy: ShellBridgePolicy,
+
+    /// Precondition evaluator for idempotency enforcement (TCK-00377).
+    ///
+    /// Per RFC-0020 Section 6.1.2, side-effectful `ToolKind` operations
+    /// declare preconditions that must be evaluated **before** execution.
+    /// This evaluator is called in the broker's request path when a
+    /// `ToolKind` is available and carries a precondition.
+    ///
+    /// Default: `None` (the broker DENIES side-effectful requests that carry
+    /// preconditions when no evaluator is set -- fail-closed). Production
+    /// brokers must always wire an evaluator (at minimum
+    /// `RuntimePreconditionEvaluator`).
+    precondition_evaluator: Option<Arc<dyn PreconditionEvaluator>>,
+
     /// No-bypass path ratchet enforcement (TCK-00376).
     ///
     /// Ensures every actuation path passes through all required enforcement
@@ -759,6 +973,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     #[must_use]
     pub fn new(config: ToolBrokerConfig) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -773,6 +991,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
             epoch_seal_verifier: tokio::sync::Mutex::new(EpochSealVerifier::new()),
+            shell_bridge_policy,
+            precondition_evaluator: None,
             path_ratchet: super::path_ratchet::PathRatchet::new(),
         }
     }
@@ -781,6 +1001,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     #[must_use]
     pub fn with_loader(config: ToolBrokerConfig, loader: Arc<L>) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -795,6 +1019,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
             epoch_seal_verifier: tokio::sync::Mutex::new(EpochSealVerifier::new()),
+            shell_bridge_policy,
+            precondition_evaluator: None,
             path_ratchet: super::path_ratchet::PathRatchet::new(),
         }
     }
@@ -809,6 +1035,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         github_store: Arc<dyn GitHubCredentialStore>,
     ) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -823,6 +1053,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
             epoch_seal_verifier: tokio::sync::Mutex::new(EpochSealVerifier::new()),
+            shell_bridge_policy,
+            precondition_evaluator: None,
             path_ratchet: super::path_ratchet::PathRatchet::new(),
         }
     }
@@ -838,6 +1070,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         ssh_store: Arc<dyn SshCredentialStore>,
     ) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -852,6 +1088,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
             epoch_seal_verifier: tokio::sync::Mutex::new(EpochSealVerifier::new()),
+            shell_bridge_policy,
+            precondition_evaluator: None,
             path_ratchet: super::path_ratchet::PathRatchet::new(),
         }
     }
@@ -868,6 +1106,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         ssh_store: Arc<dyn SshCredentialStore>,
     ) -> Self {
         let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+        let shell_bridge_policy = config
+            .shell_bridge_policy
+            .clone()
+            .unwrap_or(ShellBridgePolicy::deny_all());
 
         Self {
             config,
@@ -882,6 +1124,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             metrics: None,
             firewall_policy: RiskTierFirewallPolicy::default(),
             epoch_seal_verifier: tokio::sync::Mutex::new(EpochSealVerifier::new()),
+            shell_bridge_policy,
+            precondition_evaluator: None,
             path_ratchet: super::path_ratchet::PathRatchet::new(),
         }
     }
@@ -953,6 +1197,37 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             .map_err(|e| BrokerError::EpochSealRejected {
                 reason: e.to_string(),
             })
+    }
+
+    /// Sets the shell bridge policy for Execute-class requests (TCK-00377).
+    ///
+    /// Per REQ-0031, Execute-class tool requests are checked against this
+    /// policy's allowlist. If the executable basename is not in the
+    /// allowlist, the request is denied (fail-closed).
+    ///
+    /// Default is `ShellBridgePolicy::deny_all()`.
+    #[must_use]
+    pub fn with_shell_bridge_policy(mut self, policy: ShellBridgePolicy) -> Self {
+        self.shell_bridge_policy = policy;
+        self
+    }
+
+    /// Sets the precondition evaluator for idempotency enforcement
+    /// (TCK-00377).
+    ///
+    /// Per RFC-0020 Section 6.1.2, the evaluator checks declared
+    /// preconditions on side-effectful `ToolKind` operations before
+    /// execution is allowed.  When no evaluator is set, the broker
+    /// DENIES requests that carry preconditions (fail-closed).
+    /// Production brokers must always wire an evaluator (at minimum
+    /// `RuntimePreconditionEvaluator`).
+    #[must_use]
+    pub fn with_precondition_evaluator(
+        mut self,
+        evaluator: Arc<dyn PreconditionEvaluator>,
+    ) -> Self {
+        self.precondition_evaluator = Some(evaluator);
+        self
     }
 
     /// Verifies TOCTOU hash consistency for file content (TCK-00375).
@@ -1976,6 +2251,130 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // Step 1: Validate request structure
         request.validate()?;
 
+        // Step 1b: ToolKind typed safety guard (TCK-00377).
+        //
+        // Enforce shell metacharacter rejection, unconditional Tier2+
+        // raw-shell denial, and shell-bridge allowlist enforcement at the
+        // broker layer.  This is defense-in-depth: the proto-level
+        // `Validator` (in `validation.rs`) already calls
+        // `tool_kind_from_proto` which performs the same metacharacter
+        // check, but the broker operates on `BrokerToolRequest` which is
+        // constructed independently.  We guard here to close any path
+        // that bypasses proto-level validation.
+        //
+        // Enforcement order (fail-closed at each stage):
+        //   1. Tier2+ raw-shell unconditional denial
+        //   2. Shell metacharacter injection rejection
+        //   3. Shell bridge allowlist enforcement via `self.shell_bridge_policy`
+        if request.tool_class == super::tool_class::ToolClass::Execute {
+            // Tier2+ raw shell execution is unconditionally denied.
+            if request.risk_tier.tier() >= 2 {
+                warn!(
+                    request_id = %request.request_id,
+                    risk_tier = request.risk_tier.tier(),
+                    "TCK-00377: Tier2+ raw shell execution unconditionally denied"
+                );
+                respond!(ToolDecision::Deny {
+                    request_id: request.request_id.clone(),
+                    reason: DenyReason::PolicyDenied {
+                        rule_id: "TOOL_KIND_GUARD".to_string(),
+                        reason: "raw shell execution is unconditionally denied on \
+                                 Tier2+ authoritative routes"
+                            .to_string(),
+                    },
+                    rule_id: Some("TOOL_KIND_GUARD".to_string()),
+                    policy_hash: self.policy.policy_hash(),
+                });
+            }
+
+            // Reject shell metacharacters in shell commands.
+            if let Some(ref command) = request.shell_command {
+                if let Err(e) = apm2_core::tool::reject_shell_metacharacters(command) {
+                    warn!(
+                        request_id = %request.request_id,
+                        error = %e,
+                        "TCK-00377: shell metacharacter injection rejected"
+                    );
+                    respond!(ToolDecision::Deny {
+                        request_id: request.request_id.clone(),
+                        reason: DenyReason::PolicyDenied {
+                            rule_id: "TOOL_KIND_GUARD".to_string(),
+                            reason: e.to_string(),
+                        },
+                        rule_id: Some("TOOL_KIND_GUARD".to_string()),
+                        policy_hash: self.policy.policy_hash(),
+                    });
+                }
+            }
+
+            // Step 1c: Shell bridge allowlist enforcement (TCK-00377).
+            //
+            // Every Execute-class request MUST have its executable checked
+            // against `self.shell_bridge_policy`.  Fail-closed: if
+            // `shell_command` is `None`, deny (no ambient shell authority).
+            // If the executable is not in the allowlist, deny.
+            let is_tier2_plus = request.risk_tier.tier() >= 2;
+            if let Some(ref command) = request.shell_command {
+                if let Err(e) = apm2_core::tool::guard_authoritative_route_command(
+                    command,
+                    &self.shell_bridge_policy,
+                    is_tier2_plus,
+                ) {
+                    warn!(
+                        request_id = %request.request_id,
+                        error = %e,
+                        "TCK-00377: shell bridge allowlist denied"
+                    );
+                    respond!(ToolDecision::Deny {
+                        request_id: request.request_id.clone(),
+                        reason: DenyReason::PolicyDenied {
+                            rule_id: "SHELL_BRIDGE_POLICY".to_string(),
+                            reason: e.to_string(),
+                        },
+                        rule_id: Some("SHELL_BRIDGE_POLICY".to_string()),
+                        policy_hash: self.policy.policy_hash(),
+                    });
+                }
+            } else {
+                // Fail-closed: no shell_command means no executable to
+                // check against the allowlist.  Deny unconditionally.
+                warn!(
+                    request_id = %request.request_id,
+                    "TCK-00377: Execute request missing shell_command, denied by shell bridge policy"
+                );
+                respond!(ToolDecision::Deny {
+                    request_id: request.request_id.clone(),
+                    reason: DenyReason::PolicyDenied {
+                        rule_id: "SHELL_BRIDGE_POLICY".to_string(),
+                        reason: "Execute request missing shell_command; \
+                                 cannot verify against shell bridge allowlist"
+                            .to_string(),
+                    },
+                    rule_id: Some("SHELL_BRIDGE_POLICY".to_string()),
+                    policy_hash: self.policy.policy_hash(),
+                });
+            }
+        }
+
+        // Step 1d: Idempotency precondition enforcement (TCK-00377 BLOCKER).
+        //
+        // If the request carries a typed `ToolKind` with a precondition, evaluate
+        // it **before** capability/policy checks.  This ensures that stale or
+        // invalid preconditions are rejected before any side effects occur.
+        //
+        // When no evaluator is configured, preconditions are fail-closed: the
+        // request is denied. Production brokers must always wire an evaluator.
+        if let Some(ref tool_kind) = request.tool_kind {
+            self.evaluate_precondition(tool_kind).map_err(|e| {
+                warn!(
+                    request_id = %request.request_id,
+                    error = %e,
+                    "TCK-00377: idempotency precondition evaluation failed"
+                );
+                e
+            })?;
+        }
+
         // Step 2: Validate against context firewall (TCK-00261, TCK-00286)
         // This must happen before capability checks because a firewall violation
         // triggers session termination, which is more severe than a capability denial.
@@ -2707,6 +3106,73 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
         debug!("recorded tool result");
         Ok(())
+    }
+
+    /// Evaluates idempotency preconditions for a typed tool operation
+    /// (TCK-00377).
+    ///
+    /// This method MUST be called after `request()` returns
+    /// `ToolDecision::Allow` and before the tool is actually executed.
+    /// It checks all declared preconditions on the `ToolKind` and returns
+    /// an error if any precondition is not satisfied.
+    ///
+    /// # Evaluation Behavior
+    ///
+    /// - If a precondition is declared but no evaluator is configured, the
+    ///   request is **denied** (fail-closed). Production brokers must always
+    ///   have an evaluator wired (at minimum `RuntimePreconditionEvaluator`).
+    /// - If the evaluator is configured and returns an error, the request is
+    ///   denied.
+    /// - If no precondition is declared, `Ok(())` is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PreconditionFailed`] if precondition
+    /// evaluation fails.
+    pub fn evaluate_precondition(
+        &self,
+        tool_kind: &apm2_core::tool::ToolKind,
+    ) -> Result<(), BrokerError> {
+        // Extract whether a precondition is declared.
+        let has_precondition = match tool_kind {
+            apm2_core::tool::ToolKind::WriteFile {
+                precondition: Some(_),
+                ..
+            }
+            | apm2_core::tool::ToolKind::EditFile {
+                precondition: Some(_),
+                ..
+            } => true,
+            // TCK-00377 MAJOR FIX: GitOp now carries preconditions for
+            // side-effectful operations.
+            apm2_core::tool::ToolKind::GitOp { preconditions, .. } => !preconditions.is_empty(),
+            _ => false,
+        };
+
+        if !has_precondition {
+            return Ok(());
+        }
+
+        let Some(ref evaluator) = self.precondition_evaluator else {
+            // Fail-closed: precondition declared but no evaluator configured.
+            // Per RFC-0020 Section 6.1.2, precondition evaluation never defaults
+            // to pass. Production brokers MUST have an evaluator wired (at minimum
+            // the `RuntimePreconditionEvaluator` stub). A missing evaluator
+            // indicates a configuration error that must be surfaced as a hard denial.
+            warn!(
+                "TCK-00377: precondition declared but no evaluator configured; \
+                 denying request (fail-closed)"
+            );
+            return Err(BrokerError::PreconditionFailed {
+                reason: "no precondition evaluator configured (fail-closed)".to_string(),
+            });
+        };
+
+        apm2_core::tool::evaluate_preconditions(tool_kind, evaluator.as_ref()).map_err(|e| {
+            BrokerError::PreconditionFailed {
+                reason: e.to_string(),
+            }
+        })
     }
 
     /// Looks up a cached result by dedupe key for a specific episode.
@@ -3930,7 +4396,12 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_terminates_on_denied_execute() {
         // TCK-00286 [HIGH]: Execute request outside shell_allowlist returns Terminate
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+        // NOTE: shell_bridge_policy is set to allow "rm" so we can test the
+        // context firewall (which is more restrictive and only allows cargo).
+        let shell_policy =
+            ShellBridgePolicy::new(vec!["rm".to_string(), "cargo".to_string()], false).unwrap();
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_shell_bridge_policy(shell_policy);
 
         // Set up capability manifest allowing execute with broad shell allowlist
         // The context firewall should then terminate on commands outside ITS allowlist.
@@ -3976,7 +4447,11 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_allows_permitted_execute() {
         // TCK-00286: Execute request matching shell_allowlist proceeds
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+        // NOTE: shell_bridge_policy allows "cargo" so the context firewall test
+        // exercises its own allowlist enforcement.
+        let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_shell_bridge_policy(shell_policy);
 
         // Set up capability manifest allowing execute with matching shell allowlist
         // Both capability and context manifests must allow the command.
@@ -4014,14 +4489,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_execute_no_command() {
-        // TCK-00286: Execute request without shell_command when shell_allowlist
-        // configured returns Terminate (fail-closed)
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+        // TCK-00286 / TCK-00377: Execute request without shell_command is
+        // now caught by the shell bridge policy (Step 1c) before the
+        // context firewall (Step 2).  The shell bridge policy denies
+        // requests missing shell_command (fail-closed).
+        let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_shell_bridge_policy(shell_policy);
 
         // Set up capability manifest allowing execute
-        // NOTE: We need to configure capability manifest's shell_allowlist too
-        // but the context firewall check happens FIRST, so it should terminate
-        // before capability validation.
         let tool_classes = vec![ToolClass::Execute];
         let manifest = CapabilityManifest::builder("test-manifest")
             .delegator("test-delegator")
@@ -4040,7 +4516,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Request without shell_command should terminate
+        // Request without shell_command should be denied by shell bridge policy
         let request = make_request("req-exec-no-cmd", ToolClass::Execute, None);
         // Note: not calling with_shell_command
         let decision = broker
@@ -4049,14 +4525,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            decision.is_terminate(),
-            "execute request without shell_command should terminate when shell_allowlist configured, got: {decision:?}"
+            decision.is_denied(),
+            "execute request without shell_command should be denied by shell bridge policy, got: {decision:?}"
         );
-        if let ToolDecision::Terminate {
-            termination_info, ..
-        } = decision
-        {
-            assert_eq!(termination_info.rationale_code, "CONTEXT_EXEC_NO_CMD");
+        if let ToolDecision::Deny { rule_id, .. } = &decision {
+            assert_eq!(rule_id.as_deref(), Some("SHELL_BRIDGE_POLICY"));
         }
     }
 
@@ -4114,10 +4587,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_empty_allowlist_tier0_allowed() {
-        // TCK-00286 / TCK-00376: When context's write_allowlist/shell_allowlist
-        // are empty, no per-request firewall check runs. At Tier0 this is
-        // allowed because enforcement components are optional at Tier0-1.
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+        // TCK-00286 / TCK-00376 / TCK-00377: When context's
+        // write_allowlist/shell_allowlist are empty, no per-request firewall
+        // check runs. At Tier0 this is allowed because enforcement components
+        // are optional at Tier0-1. NOTE: shell_bridge_policy allows "any" so
+        // the Execute-class test exercises context firewall bypass logic for
+        // empty allowlists.
+        let shell_policy = ShellBridgePolicy::new(vec!["any".to_string()], false).unwrap();
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_shell_bridge_policy(shell_policy);
 
         // Set up capability manifest allowing writes and execute
         // The capability manifest needs its own allowlists configured.
@@ -4230,9 +4708,10 @@ mod tests {
         }
     }
 
-    /// TCK-00376 regression: Tier2 execute request with context manifest loaded
-    /// but empty `shell_allowlist` MUST be denied because the context firewall
-    /// check did not execute.
+    /// TCK-00376 / TCK-00377 regression: Tier2 execute request with context
+    /// manifest loaded but empty `shell_allowlist` MUST be denied. With
+    /// TCK-00377, the `TOOL_KIND_GUARD` denies raw Execute at Tier2+ before
+    /// the path ratchet runs (defense-in-depth).
     #[tokio::test]
     async fn test_context_firewall_empty_shell_allowlist_tier2_denied() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
@@ -4257,7 +4736,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Tier2 execute: firewall not checked → ratchet denies
+        // Tier2 execute: TOOL_KIND_GUARD denies raw shell at Tier2+
+        // (TCK-00377 defense-in-depth, runs before path ratchet)
         let mut request = make_tiered_request(
             "req-exec-empty-t2",
             ToolClass::Execute,
@@ -4271,13 +4751,13 @@ mod tests {
             .unwrap();
         assert!(
             decision.is_denied(),
-            "Tier2 execute with empty context shell_allowlist must be denied by path ratchet, got: {decision:?}"
+            "Tier2 execute with empty context shell_allowlist must be denied, got: {decision:?}"
         );
         if let ToolDecision::Deny { rule_id, .. } = &decision {
             assert_eq!(
                 rule_id.as_deref(),
-                Some("PATH_RATCHET"),
-                "denial must come from PATH_RATCHET"
+                Some("TOOL_KIND_GUARD"),
+                "denial must come from TOOL_KIND_GUARD (TCK-00377 Tier2+ raw-shell denial)"
             );
         }
     }
@@ -6642,6 +7122,928 @@ policy:
     }
 
     // =========================================================================
+    // TCK-00377 BLOCKER 1: Shell bridge allowlist enforcement tests
+    //
+    // These tests verify that `ToolBroker::request()` enforces the
+    // `shell_bridge_policy` allowlist for Execute-class requests.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_shell_bridge_deny_all_rejects_execute() {
+        // TCK-00377 BLOCKER 1: Default deny-all policy must reject
+        // Execute-class requests even when no context firewall is active.
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        // Set up capability manifest allowing execute
+        let tool_classes = vec![ToolClass::Execute];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(tool_classes)
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // No context firewall configured — shell_bridge_policy default is deny_all
+        let mut request = make_request("req-sbp-deny", ToolClass::Execute, None);
+        request = request.with_shell_command("cargo build");
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(
+            decision.is_denied(),
+            "Execute request must be denied by default deny-all shell bridge policy, got: {decision:?}"
+        );
+        if let ToolDecision::Deny {
+            reason, rule_id, ..
+        } = &decision
+        {
+            assert_eq!(rule_id.as_deref(), Some("SHELL_BRIDGE_POLICY"));
+            assert!(
+                matches!(reason, DenyReason::PolicyDenied { .. }),
+                "deny reason must be PolicyDenied, got: {reason:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shell_bridge_rejects_non_allowlisted_executable() {
+        // TCK-00377 BLOCKER 1: Allowlisted policy must reject executables
+        // not in the list.
+        let shell_policy =
+            ShellBridgePolicy::new(vec!["cargo".to_string(), "rustfmt".to_string()], false)
+                .unwrap();
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_shell_bridge_policy(shell_policy);
+
+        // Set up capability manifest allowing execute
+        let tool_classes = vec![ToolClass::Execute];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(tool_classes)
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Execute request for non-allowlisted executable
+        let mut request = make_request("req-sbp-notallowed", ToolClass::Execute, None);
+        request = request.with_shell_command("rm -rf /");
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(
+            decision.is_denied(),
+            "Non-allowlisted executable must be denied by shell bridge policy, got: {decision:?}"
+        );
+        if let ToolDecision::Deny { rule_id, .. } = &decision {
+            assert_eq!(rule_id.as_deref(), Some("SHELL_BRIDGE_POLICY"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shell_bridge_allows_allowlisted_executable() {
+        // TCK-00377 BLOCKER 1: When executable is in the allowlist at
+        // Tier0, the request should proceed past the shell bridge check.
+        let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_shell_bridge_policy(shell_policy);
+
+        // Set up capability manifest allowing execute
+        let tool_classes = vec![ToolClass::Execute];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(tool_classes)
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Execute request for allowlisted executable at Tier0
+        let mut request = make_request("req-sbp-allowed", ToolClass::Execute, None);
+        request = request.with_shell_command("cargo test --release");
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(
+            decision.is_allowed(),
+            "Allowlisted executable at Tier0 must be allowed, got: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_bridge_denies_missing_command() {
+        // TCK-00377 BLOCKER 1: Execute request without shell_command must
+        // be denied by the shell bridge policy (fail-closed).
+        let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_shell_bridge_policy(shell_policy);
+
+        let tool_classes = vec![ToolClass::Execute];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(tool_classes)
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Execute request WITHOUT shell_command
+        let request = make_request("req-sbp-nocmd", ToolClass::Execute, None);
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(
+            decision.is_denied(),
+            "Execute request without shell_command must be denied (fail-closed), got: {decision:?}"
+        );
+        if let ToolDecision::Deny { rule_id, .. } = &decision {
+            assert_eq!(rule_id.as_deref(), Some("SHELL_BRIDGE_POLICY"));
+        }
+    }
+
+    // =========================================================================
+    // TCK-00377 BLOCKER 2: Precondition evaluation tests
+    //
+    // These tests verify that `ToolBroker::evaluate_precondition()` enforces
+    // `IdempotencyPrecondition` before side-effectful tool execution.
+    // =========================================================================
+
+    /// Stub evaluator that always succeeds.
+    #[derive(Debug)]
+    struct AlwaysSatisfiedEvaluator;
+
+    impl apm2_core::tool::PreconditionEvaluator for AlwaysSatisfiedEvaluator {
+        fn evaluate(
+            &self,
+            _precondition: &apm2_core::tool::IdempotencyPrecondition,
+            _path: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<(), apm2_core::tool::ToolKindError> {
+            Ok(())
+        }
+    }
+
+    /// Stub evaluator that always fails.
+    #[derive(Debug)]
+    struct AlwaysFailedEvaluator;
+
+    impl apm2_core::tool::PreconditionEvaluator for AlwaysFailedEvaluator {
+        fn evaluate(
+            &self,
+            precondition: &apm2_core::tool::IdempotencyPrecondition,
+            _path: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<(), apm2_core::tool::ToolKindError> {
+            Err(apm2_core::tool::ToolKindError::PreconditionFailed {
+                reason: format!("precondition not satisfied: {}", precondition.description()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_precondition_satisfied_allows_execution() {
+        // TCK-00377 BLOCKER 2: When the evaluator reports satisfied,
+        // evaluate_precondition returns Ok.
+        let evaluator = Arc::new(AlwaysSatisfiedEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        // WriteFile with FileNotExists precondition
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/new.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "satisfied precondition must allow execution, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precondition_failed_denies_execution() {
+        // TCK-00377 BLOCKER 2: When the evaluator reports failure,
+        // evaluate_precondition returns Err.
+        let evaluator = Arc::new(AlwaysFailedEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        // EditFile with FileExists precondition
+        let tool_kind = apm2_core::tool::ToolKind::EditFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/code.rs").unwrap(),
+            old_content_hash: [0u8; 32],
+            new_content_hash: [1u8; 32],
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(result.is_err(), "failed precondition must deny execution");
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "error must be PreconditionFailed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precondition_no_evaluator_denies_execution_fail_closed() {
+        // TCK-00377: When no evaluator is configured and a precondition is
+        // declared, the request is DENIED (fail-closed). Production brokers
+        // must always wire an evaluator (at minimum RuntimePreconditionEvaluator).
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        // WriteFile with precondition but no evaluator on the broker
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/file.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "precondition with no evaluator must DENY request (fail-closed), got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precondition_default_evaluator_allows_execution() {
+        // TCK-00377: When the RuntimePreconditionEvaluator stub is wired,
+        // preconditions are evaluated (and always satisfied by the stub).
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
+            .with_precondition_evaluator(Arc::new(RuntimePreconditionEvaluator));
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/file.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "RuntimePreconditionEvaluator must allow request, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precondition_none_allows_execution() {
+        // TCK-00377: Tool operations without preconditions should succeed
+        // even when no evaluator is configured.
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        // WriteFile with NO precondition (overwrite mode)
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/out.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: false,
+            append: false,
+            precondition: None,
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "no precondition should pass, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precondition_stale_hash_denies_execution() {
+        // TCK-00377 BLOCKER 2: Stale precondition (e.g., FileHashMatch
+        // with wrong hash) must produce a deny receipt.
+        let evaluator = Arc::new(AlwaysFailedEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/config.toml").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: false,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileHashMatch {
+                expected_hash: [0xABu8; 32],
+            }),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_err(),
+            "stale FileHashMatch precondition must deny execution"
+        );
+        if let Err(BrokerError::PreconditionFailed { reason }) = &result {
+            assert!(
+                reason.contains("not satisfied"),
+                "error reason must describe the failed precondition, got: {reason}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_precondition_read_file_skipped() {
+        // TCK-00377: ReadFile never has preconditions, should always pass.
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        let tool_kind = apm2_core::tool::ToolKind::ReadFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/file.rs").unwrap(),
+            offset: 0,
+            limit: 0,
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "ReadFile should skip precondition evaluation"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00377 BLOCKER: Integration test — precondition-fail rejects in the
+    // production `request_with_response` pipeline.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_precondition_fail_rejects_in_request_pipeline() {
+        // TCK-00377 BLOCKER: Build a full BrokerToolRequest with a ToolKind
+        // carrying a precondition that fails.  The request pipeline must
+        // reject it before reaching capability or firewall checks.
+        let evaluator = Arc::new(AlwaysFailedEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        // Initialize broker with a manifest allowing writes
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(vec![ToolClass::Write])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // WriteFile with FileNotExists precondition (evaluator always fails)
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/new-file.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let request = make_request(
+            "precond-fail-req",
+            ToolClass::Write,
+            Some("/workspace/new-file.txt"),
+        )
+        .with_tool_kind(tool_kind);
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+
+        // The request must fail with PreconditionFailed — not proceed to
+        // capability checks or return Allow.
+        assert!(
+            result.is_err(),
+            "request with failing precondition must be rejected, got: {result:?}"
+        );
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "error must be PreconditionFailed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precondition_pass_allows_through_pipeline() {
+        // TCK-00377: When precondition passes, the request should proceed
+        // through the normal pipeline (not be blocked by precondition check).
+        let evaluator = Arc::new(AlwaysSatisfiedEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        // Initialize broker with a manifest allowing writes
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(vec![ToolClass::Write])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new("/workspace/new-file.txt").unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let request = make_request(
+            "precond-pass-req",
+            ToolClass::Write,
+            Some("/workspace/new-file.txt"),
+        )
+        .with_tool_kind(tool_kind);
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+
+        // The request must NOT fail with PreconditionFailed.
+        // It should proceed to capability checks (and succeed if capabilities allow).
+        assert!(
+            result.is_ok(),
+            "request with satisfied precondition must proceed, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00377 BLOCKER 1 FIX: RuntimePreconditionEvaluator tests with real
+    // filesystem state.  These prove the production evaluator actually blocks
+    // on failure (not just the stub test doubles).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_exists_passes_for_existing_file() {
+        // Create a real temp file and verify FileExists passes.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("exists.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::EditFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            old_content_hash: [0u8; 32],
+            new_content_hash: [1u8; 32],
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "FileExists must pass for an existing file, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_exists_fails_for_missing_file() {
+        // Point at a non-existent path and verify FileExists blocks.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("no-such-file.txt");
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::EditFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            old_content_hash: [0u8; 32],
+            new_content_hash: [1u8; 32],
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "FileExists must DENY for a missing file, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_not_exists_passes_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("absent.txt");
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "FileNotExists must pass for an absent file, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_not_exists_fails_for_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("present.txt");
+        std::fs::write(&file_path, b"content").unwrap();
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            content_hash: [0u8; 32],
+            create_only: true,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileNotExists),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "FileNotExists must DENY for an existing file, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_hash_match_passes_for_correct_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("hashed.txt");
+        let content = b"deterministic content for hashing";
+        std::fs::write(&file_path, content).unwrap();
+
+        let expected_hash: [u8; 32] = *blake3::hash(content).as_bytes();
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            content_hash: [0u8; 32],
+            create_only: false,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileHashMatch {
+                expected_hash,
+            }),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            result.is_ok(),
+            "FileHashMatch must pass for a matching hash, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_hash_match_fails_for_wrong_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("wrong-hash.txt");
+        std::fs::write(&file_path, b"actual content").unwrap();
+
+        // Use a hash of different content — guaranteed mismatch.
+        let wrong_hash: [u8; 32] = *blake3::hash(b"completely different content").as_bytes();
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        let tool_kind = apm2_core::tool::ToolKind::WriteFile {
+            path: apm2_core::tool::ValidatedPath::new(file_path.to_str().unwrap()).unwrap(),
+            content_hash: [0u8; 32],
+            create_only: false,
+            append: false,
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileHashMatch {
+                expected_hash: wrong_hash,
+            }),
+        };
+
+        let result = broker.evaluate_precondition(&tool_kind);
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "FileHashMatch must DENY for a hash mismatch, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_git_clean_working_tree_passes_in_clean_repo() {
+        // Initialize a fresh git repo with one committed file — working tree
+        // should be clean.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"committed").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+
+        let evaluator = RuntimePreconditionEvaluator;
+        let precondition = apm2_core::tool::IdempotencyPrecondition::GitCleanWorkingTree;
+        let result = evaluator.evaluate(&precondition, None, Some(dir_path.to_str().unwrap()));
+        assert!(
+            result.is_ok(),
+            "GitCleanWorkingTree must pass in a clean repo, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_git_clean_working_tree_fails_in_dirty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"committed").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        // Dirty the working tree.
+        std::fs::write(dir_path.join("dirty.txt"), b"uncommitted").unwrap();
+
+        let evaluator = RuntimePreconditionEvaluator;
+        let precondition = apm2_core::tool::IdempotencyPrecondition::GitCleanWorkingTree;
+        let result = evaluator.evaluate(&precondition, None, Some(dir_path.to_str().unwrap()));
+        assert!(
+            matches!(result, Err(ToolKindError::PreconditionFailed { .. })),
+            "GitCleanWorkingTree must DENY in a dirty repo, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_git_ref_at_commit_passes_for_matching_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"content").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+
+        // Discover the actual HEAD commit SHA.
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+        let evaluator = RuntimePreconditionEvaluator;
+        let precondition = apm2_core::tool::IdempotencyPrecondition::GitRefAtCommit {
+            ref_name: "HEAD".to_string(),
+            expected_commit: head_sha.clone(),
+        };
+        let result = evaluator.evaluate(&precondition, None, Some(dir_path.to_str().unwrap()));
+        assert!(
+            result.is_ok(),
+            "GitRefAtCommit must pass when ref matches commit {head_sha}, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_git_ref_at_commit_fails_for_wrong_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::fs::write(dir_path.join("file.txt"), b"content").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir_path)
+            .output()
+            .unwrap();
+
+        let evaluator = RuntimePreconditionEvaluator;
+        let precondition = apm2_core::tool::IdempotencyPrecondition::GitRefAtCommit {
+            ref_name: "HEAD".to_string(),
+            expected_commit: "0000000000000000000000000000000000000000".to_string(),
+        };
+        let result = evaluator.evaluate(&precondition, None, Some(dir_path.to_str().unwrap()));
+        assert!(
+            matches!(result, Err(ToolKindError::PreconditionFailed { .. })),
+            "GitRefAtCommit must DENY when commit does not match, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_evaluator_file_exists_fails_on_production_broker_path() {
+        // TCK-00377: Prove that precondition FAILURE actually blocks execution
+        // on the production broker construction path (RuntimePreconditionEvaluator
+        // wired the same way as dispatch.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("no-such-file.txt");
+
+        let evaluator = Arc::new(RuntimePreconditionEvaluator);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_precondition_evaluator(evaluator);
+
+        // Initialize broker with a manifest allowing writes
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from(dir.path())],
+            )])
+            .tool_allowlist(vec![ToolClass::Write])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let tool_kind = apm2_core::tool::ToolKind::EditFile {
+            path: apm2_core::tool::ValidatedPath::new(missing_path.to_str().unwrap()).unwrap(),
+            old_content_hash: [0u8; 32],
+            new_content_hash: [1u8; 32],
+            precondition: Some(apm2_core::tool::IdempotencyPrecondition::FileExists),
+        };
+
+        let request = make_request(
+            "runtime-precond-fail",
+            ToolClass::Write,
+            Some(missing_path.to_str().unwrap()),
+        )
+        .with_tool_kind(tool_kind);
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+
+        assert!(
+            matches!(result, Err(BrokerError::PreconditionFailed { .. })),
+            "RuntimePreconditionEvaluator must DENY missing file on production broker path, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00377 MAJOR 2: Shell bridge policy from config test
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_shell_bridge_policy_from_config() {
+        // TCK-00377: ToolBrokerConfig can carry a shell_bridge_policy that
+        // the broker uses at construction time. This proves the allowlist
+        // is runtime-configurable via config.
+        let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let config = ToolBrokerConfig::default()
+            .without_policy_check()
+            .with_shell_bridge_policy(shell_policy);
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(config);
+
+        // Initialize broker with execute capability
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Request with allowlisted command should pass the shell bridge check
+        let request = make_request("config-policy-req", ToolClass::Execute, None)
+            .with_shell_command("cargo test --release");
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+        assert!(
+            result.is_ok(),
+            "config-sourced shell_bridge_policy must be respected, got: {result:?}"
+        );
+        let decision = result.unwrap();
+        assert!(
+            decision.is_allowed(),
+            "allowlisted command via config policy must be allowed, got: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_bridge_policy_from_config_denies_unlisted() {
+        // TCK-00377: Config policy that allows only "cargo" must deny "rm".
+        let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
+        let config = ToolBrokerConfig::default()
+            .without_policy_check()
+            .with_shell_bridge_policy(shell_policy);
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(config);
+
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["*".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // "rm" is not in the config-sourced allowlist
+        let request = make_request("config-deny-req", ToolClass::Execute, None)
+            .with_shell_command("rm -rf /tmp/data");
+
+        let result = broker.request(&request, timestamp_ns(0), None).await;
+        assert!(
+            result.is_ok(),
+            "request should return a decision, not error"
+        );
+        let decision = result.unwrap();
+        assert!(
+            decision.is_denied(),
+            "unlisted command via config policy must be denied, got: {decision:?}"
+        );
+    }
+
+    // =========================================================================
     // Path Ratchet Integration Tests (TCK-00376)
     //
     // These tests verify that the path ratchet is integrated into the broker
@@ -6764,24 +8166,33 @@ policy:
         );
     }
 
-    /// TCK-00376 regression: Tier4 execute request without context manifest
-    /// MUST be TERMINATED (not just denied) per REQ-0029.
+    /// TCK-00376 / TCK-00377 regression: Tier4 write request without context
+    /// manifest MUST be TERMINATED (not just denied) per REQ-0029.
+    /// NOTE: Originally tested Execute, but TCK-00377 unconditionally denies
+    /// raw Execute at Tier2+ via `TOOL_KIND_GUARD` before the path ratchet
+    /// runs. Using Write to exercise the path ratchet directly.
     #[tokio::test]
     async fn test_path_ratchet_tier4_no_context_manifest_terminates() {
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = CapabilityManifest::builder("test-manifest")
             .delegator("test-delegator")
-            .capabilities(vec![make_execute_capability("cap-exec")])
-            .tool_allowlist(vec![ToolClass::Execute])
-            .shell_allowlist(vec!["*".to_string()])
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(vec![ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
             .build()
             .unwrap();
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        let mut request =
-            make_tiered_request("req-ratchet-3", ToolClass::Execute, None, RiskTier::Tier4);
-        request = request.with_shell_command("ls -la");
+        let request = make_tiered_request(
+            "req-ratchet-3",
+            ToolClass::Write,
+            Some("/workspace/file.rs"),
+            RiskTier::Tier4,
+        );
         let response = broker
             .request_with_response(&request, timestamp_ns(0), None)
             .await

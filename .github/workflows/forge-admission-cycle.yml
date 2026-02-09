@@ -12,23 +12,17 @@ on:
         type: string
 
 concurrency:
-  group: forge-admission-cycle-${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
+  group: forge-admission-cycle-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-  pull-requests: read
-  statuses: write
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  RUSTFLAGS: -D warnings
-  RUST_BACKTRACE: 1
+  issues: read
 
 jobs:
   barrier:
     name: Guardian Intelligence / Barrier
+    if: ${{ github.event_name == 'pull_request_target' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -49,74 +43,171 @@ jobs:
           }
 
           event_name="$GITHUB_EVENT_NAME"
-          repo="$GITHUB_REPOSITORY"
-          actor="$GITHUB_ACTOR"
+          [[ "$event_name" == "pull_request_target" ]] || fail "barrier only supports pull_request_target"
 
-          case "$event_name" in
-            pull_request_target)
-              pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
-              association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
-              [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
-              case "$association" in
-                OWNER|MEMBER|COLLABORATOR) ;;
-                *)
-                  fail "unauthorized pull_request_target author_association=$association for PR #$pr_number"
-                  ;;
-              esac
-              echo "barrier: authorized pull_request_target pr=$pr_number association=$association"
-              ;;
-            workflow_dispatch)
-              pr_number="$(jq -r '.inputs.pr_number // .client_payload.pr_number // empty' "$GITHUB_EVENT_PATH")"
-              [[ -n "$pr_number" ]] || fail "workflow_dispatch requires inputs.pr_number"
-
-              pr_json="$(gh api "repos/$repo/pulls/$pr_number")" || fail "failed to load PR #$pr_number"
-              base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
-              [[ -n "$base_ref" ]] || fail "PR #$pr_number missing base.ref"
-
-              default_branch="$(gh api "repos/$repo" --jq '.default_branch')"
-              dispatch_ref="${GITHUB_REF_NAME:-}"
-              [[ -n "$dispatch_ref" ]] || fail "missing GITHUB_REF_NAME for workflow_dispatch"
-              if [[ "$dispatch_ref" != "$base_ref" && "$dispatch_ref" != "$default_branch" ]]; then
-                fail "workflow_dispatch ref=$dispatch_ref is not trusted (base=$base_ref default=$default_branch)"
-              fi
-
-              permission="$(gh api "repos/$repo/collaborators/$actor/permission" --jq '.permission // empty' 2>/dev/null || true)"
-              case "$permission" in
-                admin|maintain|write) ;;
-                *)
-                  fail "workflow_dispatch actor=$actor lacks permission (need write|maintain|admin, got ${permission:-none})"
-                  ;;
-              esac
-              echo "barrier: authorized workflow_dispatch pr=$pr_number ref=$dispatch_ref actor_permission=$permission"
-              ;;
+          pr_number="$(jq -r '.pull_request.number // 0' "$GITHUB_EVENT_PATH")"
+          association="$(jq -r '.pull_request.author_association // ""' "$GITHUB_EVENT_PATH")"
+          [[ "$pr_number" != "0" ]] || fail "missing pull_request.number in event payload"
+          case "$association" in
+            OWNER|MEMBER|COLLABORATOR) ;;
             *)
-              fail "unsupported event_name=$event_name"
+              fail "unauthorized pull_request_target author_association=$association for PR #$pr_number"
               ;;
           esac
+          echo "barrier: authorized pull_request_target pr=$pr_number association=$association"
+
+  dispatch-auth:
+    name: Guardian Intelligence / Dispatch Auth
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate workflow_dispatch trust boundary (fast path)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "dispatch-auth: $1" >&2
+            exit 1
+          }
+
+          repo="$GITHUB_REPOSITORY"
+          actor="$GITHUB_ACTOR"
+          pr_number="$(jq -r '.inputs.pr_number // .client_payload.pr_number // empty' "$GITHUB_EVENT_PATH")"
+          [[ -n "$pr_number" ]] || fail "workflow_dispatch requires inputs.pr_number"
+
+          pr_json="$(gh api "repos/$repo/pulls/$pr_number")" || fail "failed to load PR #$pr_number"
+          base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
+          [[ -n "$base_ref" ]] || fail "PR #$pr_number missing base.ref"
+
+          default_branch="$(gh api "repos/$repo" --jq '.default_branch')"
+          dispatch_ref="${GITHUB_REF_NAME:-}"
+          [[ -n "$dispatch_ref" ]] || fail "missing GITHUB_REF_NAME for workflow_dispatch"
+          if [[ "$dispatch_ref" != "$base_ref" && "$dispatch_ref" != "$default_branch" ]]; then
+            fail "workflow_dispatch ref=$dispatch_ref is not trusted (base=$base_ref default=$default_branch)"
+          fi
+
+          permission="$(gh api "repos/$repo/collaborators/$actor/permission" --jq '.permission // empty' 2>/dev/null || true)"
+          case "$permission" in
+            admin|maintain|write) ;;
+            *)
+              fail "workflow_dispatch actor=$actor lacks permission (need write|maintain|admin, got ${permission:-none})"
+              ;;
+          esac
+          echo "dispatch-auth: authorized workflow_dispatch pr=$pr_number ref=$dispatch_ref actor_permission=$permission"
 
   forge-admission-cycle:
     name: apm2 / Forge Admission Cycle
-    needs: [barrier]
-    runs-on: [self-hosted, linux, x64, fac-ovh]
+    needs: [barrier, dispatch-auth]
+    if: >
+      ${{
+        always() &&
+        (
+          (github.event_name == 'pull_request_target' &&
+           needs.barrier.result == 'success') ||
+          (github.event_name == 'workflow_dispatch' &&
+           needs.dispatch-auth.result == 'success')
+        )
+      }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # stable
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
-
-      - name: Kick off FAC and project health
+      - name: Resolve PR context
+        id: pr-context
         env:
-          GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_REF: ${{ github.ref }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cargo run --locked --quiet -p apm2-cli -- fac kickoff \
-            --repo "${{ github.repository }}" \
-            --event "${{ github.event_path }}" \
-            --event-name "${{ github.event_name }}" \
-            --max-wait-seconds 3600
+          if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
+            pr_number="${{ github.event.pull_request.number }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
+          else
+            pr_number="${{ github.event.inputs.pr_number }}"
+            head_sha="$(gh api "repos/${{ github.repository }}/pulls/${pr_number}" --jq '.head.sha')"
+          fi
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "fac-context: pr=${pr_number} sha=${head_sha}"
+
+      - name: Poll review gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          repo="${{ github.repository }}"
+          pr_number="${{ steps.pr-context.outputs.pr_number }}"
+          head_sha="${{ steps.pr-context.outputs.head_sha }}"
+          max_wait=4800
+          poll_interval=30
+
+          # Load trusted reviewer logins from repo
+          trusted_json="$(gh api "repos/${repo}/contents/.github/review-gate/trusted-reviewers.json" \
+            --jq '.content' | base64 -d)"
+          security_logins="$(echo "$trusted_json" | jq -r '[.reviewers.security[].github_logins[]] | join("|")')"
+          quality_logins="$(echo "$trusted_json" | jq -r '[.reviewers.code_quality[].github_logins[]] | join("|")')"
+
+          # Extract the latest review verdict for a given type from PR comments.
+          # Validates: trusted author, correct head_sha, correct pr_number.
+          # Prints one of: PASS, FAIL, or pending.
+          check_verdict() {
+            local review_type="$1"
+            local trusted_re="$2"
+            local marker="apm2-review-metadata:v1:${review_type}"
+
+            # Get body of the latest comment from a trusted author containing the marker
+            local body
+            body="$(gh api "repos/${repo}/issues/${pr_number}/comments" --paginate --jq "
+              [.[] |
+               select(.user.login | test(\"^(${trusted_re})$\")) |
+               select(.body | test(\"${marker}\"))
+              ] | last | .body // empty")"
+
+            [[ -n "$body" ]] || { echo "pending"; return; }
+
+            # Extract the JSON metadata block following the marker
+            local json_block
+            json_block="$(echo "$body" | \
+              sed -n "/${marker}/,\$p" | \
+              sed -n '/```json/,/```/p' | sed '1d;$d')"
+
+            [[ -n "$json_block" ]] || { echo "pending"; return; }
+
+            # Validate SHA + PR binding, return verdict
+            echo "$json_block" | jq -r \
+              --arg sha "$head_sha" \
+              --argjson pr "$pr_number" \
+              'if .head_sha == $sha and .pr_number == $pr then .verdict
+               else "pending" end'
+          }
+
+          deadline=$((SECONDS + max_wait))
+          echo "fac-gate: polling pr=${pr_number} sha=${head_sha} deadline=${max_wait}s"
+
+          while [[ $SECONDS -lt $deadline ]]; do
+            sec_v="$(check_verdict "security" "$security_logins")"
+            qual_v="$(check_verdict "code-quality" "$quality_logins")"
+
+            ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "ts=${ts} sha=${head_sha} security=${sec_v} quality=${qual_v}"
+
+            if [[ "$sec_v" == "FAIL" || "$qual_v" == "FAIL" ]]; then
+              echo "fac-gate: FAIL security=${sec_v} quality=${qual_v}"
+              exit 1
+            fi
+            if [[ "$sec_v" == "PASS" && "$qual_v" == "PASS" ]]; then
+              echo "fac-gate: PASS security=PASS quality=PASS"
+              exit 0
+            fi
+
+            sleep "$poll_interval"
+          done
+
+          echo "fac-gate: FAIL reason=timeout after ${max_wait}s"
+          exit 1

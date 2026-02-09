@@ -196,6 +196,18 @@ pub struct BrokerToolRequest {
     /// through without one. Providing a seal at any tier enables the verifier
     /// to track monotonicity and detect equivocation.
     pub epoch_seal: Option<EpochSealV1>,
+
+    /// Optional typed tool operation for precondition enforcement (TCK-00377).
+    ///
+    /// When present, the broker evaluates idempotency preconditions declared
+    /// on this `ToolKind` **before** proceeding with capability/policy checks.
+    /// If the `ToolKind` carries a precondition and it fails, the request is
+    /// denied without executing the tool (fail-closed).
+    ///
+    /// Callers that construct `BrokerToolRequest` from proto-level
+    /// `tool_request::Tool` should populate this via
+    /// [`with_tool_kind`](Self::with_tool_kind).
+    pub tool_kind: Option<apm2_core::tool::ToolKind>,
 }
 
 /// Error type for request validation.
@@ -351,6 +363,7 @@ impl BrokerToolRequest {
             artifact_hash: None,
             risk_tier,
             epoch_seal: None,
+            tool_kind: None,
         }
     }
 
@@ -438,6 +451,17 @@ impl BrokerToolRequest {
     #[must_use]
     pub fn with_epoch_seal(mut self, seal: EpochSealV1) -> Self {
         self.epoch_seal = Some(seal);
+        self
+    }
+
+    /// Sets the typed tool operation for precondition enforcement (TCK-00377).
+    ///
+    /// When set, the broker evaluates idempotency preconditions declared on
+    /// this `ToolKind` before executing the tool. If the precondition fails,
+    /// the request is denied (fail-closed).
+    #[must_use]
+    pub fn with_tool_kind(mut self, tool_kind: apm2_core::tool::ToolKind) -> Self {
+        self.tool_kind = Some(tool_kind);
         self
     }
 
