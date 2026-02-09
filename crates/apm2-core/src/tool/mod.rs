@@ -66,10 +66,17 @@ mod generated {
 pub mod fs;
 pub mod inference;
 pub mod shell;
+pub mod tool_kind;
 mod validation;
 
 #[cfg(test)]
 mod tests;
 
 pub use generated::*;
+pub use tool_kind::{
+    GitOpKind, IdempotencyPrecondition, PreconditionEvaluator, SHELL_METACHAR_DENY_LIST,
+    ShellBridgePolicy, ToolKind, ToolKindError, ValidatedArg, ValidatedPath,
+    evaluate_preconditions, guard_authoritative_route, guard_authoritative_route_command,
+    reject_shell_metacharacters, tool_kind_from_proto, validate_git_ref,
+};
 pub use validation::{ValidationResult, Validator};

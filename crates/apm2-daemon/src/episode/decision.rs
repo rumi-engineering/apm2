@@ -188,6 +188,18 @@ pub struct BrokerToolRequest {
 
     /// The risk tier of the current episode.
     pub risk_tier: RiskTier,
+
+    /// Optional typed tool operation for precondition enforcement (TCK-00377).
+    ///
+    /// When present, the broker evaluates idempotency preconditions declared
+    /// on this `ToolKind` **before** proceeding with capability/policy checks.
+    /// If the `ToolKind` carries a precondition and it fails, the request is
+    /// denied without executing the tool (fail-closed).
+    ///
+    /// Callers that construct `BrokerToolRequest` from proto-level
+    /// `tool_request::Tool` should populate this via
+    /// [`with_tool_kind`](Self::with_tool_kind).
+    pub tool_kind: Option<apm2_core::tool::ToolKind>,
 }
 
 /// Error type for request validation.
@@ -342,6 +354,7 @@ impl BrokerToolRequest {
             query: None,
             artifact_hash: None,
             risk_tier,
+            tool_kind: None,
         }
     }
 
@@ -418,6 +431,17 @@ impl BrokerToolRequest {
     #[must_use]
     pub const fn with_artifact_hash(mut self, hash: Hash) -> Self {
         self.artifact_hash = Some(hash);
+        self
+    }
+
+    /// Sets the typed tool operation for precondition enforcement (TCK-00377).
+    ///
+    /// When set, the broker evaluates idempotency preconditions declared on
+    /// this `ToolKind` before executing the tool. If the precondition fails,
+    /// the request is denied (fail-closed).
+    #[must_use]
+    pub fn with_tool_kind(mut self, tool_kind: apm2_core::tool::ToolKind) -> Self {
+        self.tool_kind = Some(tool_kind);
         self
     }
 

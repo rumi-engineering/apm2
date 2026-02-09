@@ -139,8 +139,8 @@ use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
     EpisodeRuntimeConfig, InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
-    SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass, ToolBroker, ToolBrokerConfig,
-    validate_custody_domain_overlap,
+    RuntimePreconditionEvaluator, SharedSessionBrokerRegistry, SharedToolBroker, TerminationClass,
+    ToolBroker, ToolBrokerConfig, validate_custody_domain_overlap,
 };
 use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 use crate::governance::GovernanceFreshnessMonitor;
@@ -5271,7 +5271,7 @@ impl PrivilegedDispatcher {
 
     /// Sets the per-session broker configuration template.
     #[must_use]
-    pub const fn with_broker_config(mut self, config: ToolBrokerConfig) -> Self {
+    pub fn with_broker_config(mut self, config: ToolBrokerConfig) -> Self {
         self.broker_config = config;
         self
     }
@@ -6306,6 +6306,13 @@ impl PrivilegedDispatcher {
         if let Some(ref cas) = self.broker_cas {
             broker = broker.with_cas(Arc::clone(cas));
         }
+
+        // TCK-00377: Wire the runtime precondition evaluator so the broker
+        // performs real filesystem/git checks (FileExists, FileNotExists,
+        // FileHashMatch via BLAKE3, GitCleanWorkingTree, GitRefAtCommit).
+        // The evaluator is fail-closed: I/O errors and mismatches both
+        // produce PreconditionFailed denials.
+        broker = broker.with_precondition_evaluator(Arc::new(RuntimePreconditionEvaluator));
 
         broker
             .set_policy_from_tool_allowlist(

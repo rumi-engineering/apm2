@@ -162,8 +162,8 @@ pub use adapter::{
 // Re-export broker types (TCK-00164, TCK-00292, TCK-00293)
 pub use broker::{
     BrokerError, BrokerPolicyEngine, NO_POLICY_RATIONALE, NO_POLICY_RULE_ID, PolicyDecision,
-    SessionBrokerRegistry, SharedSessionBrokerRegistry, SharedToolBroker,
-    StubContentAddressedStore, ToolBroker, ToolBrokerConfig, new_shared_broker,
+    RuntimePreconditionEvaluator, SessionBrokerRegistry, SharedSessionBrokerRegistry,
+    SharedToolBroker, StubContentAddressedStore, ToolBroker, ToolBrokerConfig, new_shared_broker,
     new_shared_broker_with_cas,
 };
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
