@@ -1280,7 +1280,7 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(PrivilegedMessageType::from_tag(18).is_some()); // UpdateStopFlags
     // Tag 19: TCK-00415 WorkList
     assert!(PrivilegedMessageType::from_tag(19).is_some()); // WorkList
-    assert!(PrivilegedMessageType::from_tag(20).is_none()); // Invalid (gap)
+    assert!(PrivilegedMessageType::from_tag(20).is_some()); // AuditorLaunchProjection
     // Tags 21-26: Credential management (CTR-PROTO-012, TCK-00343)
     assert!(PrivilegedMessageType::from_tag(21).is_some()); // ListCredentials
     assert!(PrivilegedMessageType::from_tag(22).is_some()); // AddCredential
@@ -1288,7 +1288,7 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(PrivilegedMessageType::from_tag(24).is_some()); // RefreshCredential
     assert!(PrivilegedMessageType::from_tag(25).is_some()); // SwitchCredential
     assert!(PrivilegedMessageType::from_tag(26).is_some()); // LoginCredential
-    assert!(PrivilegedMessageType::from_tag(27).is_none()); // Invalid (gap before HEF range)
+    assert!(PrivilegedMessageType::from_tag(27).is_some()); // OrchestratorLaunchProjection
     assert!(PrivilegedMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
     assert!(PrivilegedMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
 

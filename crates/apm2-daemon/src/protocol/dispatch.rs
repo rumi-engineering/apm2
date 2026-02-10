@@ -41,10 +41,11 @@ use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, DefectSource, Validate};
 use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::fac::{
-    AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, CHANGESET_PUBLISHED_PREFIX,
-    DenyCondition, DenyReasonCode, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID,
+    AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, AuditorLaunchProjectionV1,
+    CHANGESET_PUBLISHED_PREFIX, DenyCondition, DenyReasonCode,
+    FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID, OrchestratorLaunchProjectionV1, ProjectionUncertainty,
     REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, SelectionDecision,
-    builtin_profiles, fac_workobject_implementor_v2_role_contract,
+    builtin_profiles, digest_first_projection, fac_workobject_implementor_v2_role_contract,
     seed_builtin_role_contracts_v2_in_cas, validate_receipt_attestation,
 };
 use apm2_core::htf::{Canonicalizable, ClockProfile, TimeEnvelope, WallTimeSource};
@@ -67,6 +68,8 @@ use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     AddCredentialRequest,
     AddCredentialResponse,
+    AuditorLaunchProjectionRequest,
+    AuditorLaunchProjectionResponse,
     BoundedDecode,
     ClaimWorkRequest,
     ClaimWorkResponse,
@@ -98,6 +101,8 @@ use super::messages::{
     ListProcessesResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
+    OrchestratorLaunchProjectionRequest,
+    OrchestratorLaunchProjectionResponse,
     PatternRejection,
     PrivilegedError,
     PrivilegedErrorCode,
@@ -105,6 +110,7 @@ use super::messages::{
     ProcessStateEnum,
     ProcessStatusRequest,
     ProcessStatusResponse,
+    ProjectionUncertaintyFlag,
     // TCK-00394: ChangeSet publishing types
     PublishChangeSetRequest,
     PublishChangeSetResponse,
@@ -542,6 +548,35 @@ pub trait LedgerEventEmitter: Send + Sync {
     fn get_event_by_receipt_id(&self, receipt_id: &str) -> Option<SignedLedgerEvent> {
         let _ = receipt_id;
         None
+    }
+
+    /// Queries authoritative receipt events used by launch projections.
+    ///
+    /// Implementations should return events in deterministic replay order.
+    fn get_authoritative_receipt_events(&self) -> Vec<SignedLedgerEvent> {
+        self.get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "review_receipt_recorded"
+                    || event.event_type == "review_blocked_recorded"
+            })
+            .collect()
+    }
+
+    /// Queries liveness-relevant launch events used by orchestrator
+    /// projections.
+    ///
+    /// Implementations should return events in deterministic replay order.
+    fn get_launch_liveness_projection_events(&self) -> Vec<SignedLedgerEvent> {
+        self.get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "session_started"
+                    || event.event_type == "session_terminated"
+                    || event.event_type == "review_receipt_recorded"
+                    || event.event_type == "review_blocked_recorded"
+            })
+            .collect()
     }
 
     /// Emits an episode lifecycle event to the ledger (TCK-00321).
@@ -1250,6 +1285,10 @@ fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
 
 fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 fn build_permeability_receipt_payload(
@@ -5078,6 +5117,8 @@ pub enum PrivilegedMessageType {
     UpdateStopFlags     = 18,
     /// `WorkList` request (IPC-PRIV-019, TCK-00415)
     WorkList            = 19,
+    /// `AuditorLaunchProjection` request (IPC-PRIV-020, TCK-00452)
+    AuditorLaunchProjection = 20,
     // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
     /// `ListCredentials` request (IPC-PRIV-021)
     ListCredentials     = 21,
@@ -5091,6 +5132,8 @@ pub enum PrivilegedMessageType {
     SwitchCredential    = 25,
     /// `LoginCredential` request (IPC-PRIV-026)
     LoginCredential     = 26,
+    /// `OrchestratorLaunchProjection` request (IPC-PRIV-027, TCK-00452)
+    OrchestratorLaunchProjection = 27,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
     SubscribePulse      = 64,
@@ -5137,6 +5180,8 @@ impl PrivilegedMessageType {
             18 => Some(Self::UpdateStopFlags),
             // TCK-00415: projection-backed work listing
             19 => Some(Self::WorkList),
+            // TCK-00452: auditor projection
+            20 => Some(Self::AuditorLaunchProjection),
             // Credential management tags (21-26, TCK-00343)
             21 => Some(Self::ListCredentials),
             22 => Some(Self::AddCredential),
@@ -5144,6 +5189,8 @@ impl PrivilegedMessageType {
             24 => Some(Self::RefreshCredential),
             25 => Some(Self::SwitchCredential),
             26 => Some(Self::LoginCredential),
+            // TCK-00452: orchestrator projection
+            27 => Some(Self::OrchestratorLaunchProjection),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -5190,12 +5237,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt,
             Self::UpdateStopFlags,
             Self::WorkList,
+            Self::AuditorLaunchProjection,
             Self::ListCredentials,
             Self::AddCredential,
             Self::RemoveCredential,
             Self::RefreshCredential,
             Self::SwitchCredential,
             Self::LoginCredential,
+            Self::OrchestratorLaunchProjection,
             Self::SubscribePulse,
             Self::UnsubscribePulse,
             Self::PublishChangeSet,
@@ -5236,12 +5285,14 @@ impl PrivilegedMessageType {
             | Self::IngestReviewReceipt
             | Self::UpdateStopFlags
             | Self::WorkList
+            | Self::AuditorLaunchProjection
             | Self::ListCredentials
             | Self::AddCredential
             | Self::RemoveCredential
             | Self::RefreshCredential
             | Self::SwitchCredential
             | Self::LoginCredential
+            | Self::OrchestratorLaunchProjection
             | Self::SubscribePulse
             | Self::UnsubscribePulse
             | Self::PublishChangeSet
@@ -5278,12 +5329,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt => "hsi.review.ingest_receipt",
             Self::UpdateStopFlags => "hsi.stop.update_flags",
             Self::WorkList => "hsi.work.list",
+            Self::AuditorLaunchProjection => "hsi.launch.auditor_projection",
             Self::ListCredentials => "hsi.credential.list",
             Self::AddCredential => "hsi.credential.add",
             Self::RemoveCredential => "hsi.credential.remove",
             Self::RefreshCredential => "hsi.credential.refresh",
             Self::SwitchCredential => "hsi.credential.switch",
             Self::LoginCredential => "hsi.credential.login",
+            Self::OrchestratorLaunchProjection => "hsi.launch.orchestrator_projection",
             Self::SubscribePulse => "hsi.pulse.subscribe",
             Self::UnsubscribePulse => "hsi.pulse.unsubscribe",
             Self::PublishChangeSet => "hsi.changeset.publish",
@@ -5315,12 +5368,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt => "INGEST_REVIEW_RECEIPT",
             Self::UpdateStopFlags => "UPDATE_STOP_FLAGS",
             Self::WorkList => "WORK_LIST",
+            Self::AuditorLaunchProjection => "AUDITOR_LAUNCH_PROJECTION",
             Self::ListCredentials => "LIST_CREDENTIALS",
             Self::AddCredential => "ADD_CREDENTIAL",
             Self::RemoveCredential => "REMOVE_CREDENTIAL",
             Self::RefreshCredential => "REFRESH_CREDENTIAL",
             Self::SwitchCredential => "SWITCH_CREDENTIAL",
             Self::LoginCredential => "LOGIN_CREDENTIAL",
+            Self::OrchestratorLaunchProjection => "ORCHESTRATOR_LAUNCH_PROJECTION",
             Self::SubscribePulse => "SUBSCRIBE_PULSE",
             Self::UnsubscribePulse => "UNSUBSCRIBE_PULSE",
             Self::PublishChangeSet => "PUBLISH_CHANGESET",
@@ -5352,12 +5407,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_request.v1",
             Self::UpdateStopFlags => "apm2.update_stop_flags_request.v1",
             Self::WorkList => "apm2.work_list_request.v1",
+            Self::AuditorLaunchProjection => "apm2.auditor_launch_projection_request.v1",
             Self::ListCredentials => "apm2.list_credentials_request.v1",
             Self::AddCredential => "apm2.add_credential_request.v1",
             Self::RemoveCredential => "apm2.remove_credential_request.v1",
             Self::RefreshCredential => "apm2.refresh_credential_request.v1",
             Self::SwitchCredential => "apm2.switch_credential_request.v1",
             Self::LoginCredential => "apm2.login_credential_request.v1",
+            Self::OrchestratorLaunchProjection => "apm2.orchestrator_launch_projection_request.v1",
             Self::SubscribePulse => "apm2.subscribe_pulse_request.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_request.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_request.v1",
@@ -5389,12 +5446,14 @@ impl PrivilegedMessageType {
             Self::IngestReviewReceipt => "apm2.ingest_review_receipt_response.v1",
             Self::UpdateStopFlags => "apm2.update_stop_flags_response.v1",
             Self::WorkList => "apm2.work_list_response.v1",
+            Self::AuditorLaunchProjection => "apm2.auditor_launch_projection_response.v1",
             Self::ListCredentials => "apm2.list_credentials_response.v1",
             Self::AddCredential => "apm2.add_credential_response.v1",
             Self::RemoveCredential => "apm2.remove_credential_response.v1",
             Self::RefreshCredential => "apm2.refresh_credential_response.v1",
             Self::SwitchCredential => "apm2.switch_credential_response.v1",
             Self::LoginCredential => "apm2.login_credential_response.v1",
+            Self::OrchestratorLaunchProjection => "apm2.orchestrator_launch_projection_response.v1",
             Self::SubscribePulse => "apm2.subscribe_pulse_response.v1",
             Self::UnsubscribePulse => "apm2.unsubscribe_pulse_response.v1",
             Self::PublishChangeSet => "apm2.publish_changeset_response.v1",
@@ -5438,6 +5497,10 @@ pub enum PrivilegedResponse {
     WorkStatus(WorkStatusResponse),
     /// Successful `WorkList` response (TCK-00415).
     WorkList(WorkListResponse),
+    /// Successful `AuditorLaunchProjection` response (TCK-00452).
+    AuditorLaunchProjection(AuditorLaunchProjectionResponse),
+    /// Successful `OrchestratorLaunchProjection` response (TCK-00452).
+    OrchestratorLaunchProjection(OrchestratorLaunchProjectionResponse),
     /// Successful `EndSession` response (TCK-00395).
     EndSession(EndSessionResponse),
     /// Successful `IngestReviewReceipt` response (TCK-00389).
@@ -5555,6 +5618,14 @@ impl PrivilegedResponse {
             },
             Self::WorkList(resp) => {
                 buf.push(PrivilegedMessageType::WorkList.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::AuditorLaunchProjection(resp) => {
+                buf.push(PrivilegedMessageType::AuditorLaunchProjection.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::OrchestratorLaunchProjection(resp) => {
+                buf.push(PrivilegedMessageType::OrchestratorLaunchProjection.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::EndSession(resp) => {
@@ -7919,6 +7990,14 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::WorkStatus => self.handle_work_status(payload, ctx),
             // TCK-00415: Projection-backed work listing
             PrivilegedMessageType::WorkList => self.handle_work_list(payload, ctx),
+            // TCK-00452: Launch lineage projection for auditor consumers
+            PrivilegedMessageType::AuditorLaunchProjection => {
+                self.handle_auditor_launch_projection(payload, ctx)
+            },
+            // TCK-00452: Launch liveness projection for orchestrator consumers
+            PrivilegedMessageType::OrchestratorLaunchProjection => {
+                self.handle_orchestrator_launch_projection(payload, ctx)
+            },
             // TCK-00395: EndSession for session termination with ledger event
             PrivilegedMessageType::EndSession => self.handle_end_session(payload, ctx),
             // TCK-00389: IngestReviewReceipt for external reviewer results
@@ -7973,6 +8052,11 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::WorkStatus => "WorkStatus",
                 // TCK-00415
                 PrivilegedMessageType::WorkList => "WorkList",
+                // TCK-00452
+                PrivilegedMessageType::AuditorLaunchProjection => "AuditorLaunchProjection",
+                PrivilegedMessageType::OrchestratorLaunchProjection => {
+                    "OrchestratorLaunchProjection"
+                },
                 // TCK-00395
                 PrivilegedMessageType::EndSession => "EndSession",
                 // TCK-00389
@@ -11562,6 +11646,284 @@ impl PrivilegedDispatcher {
                 }))
             },
             Err(error) => Ok(Self::map_work_authority_error(error)),
+        }
+    }
+
+    /// Handles `AuditorLaunchProjection` requests (IPC-PRIV-020, TCK-00452).
+    ///
+    /// Returns launch-lineage completeness and boundary-conformance indicators
+    /// backed by authoritative receipt events.
+    fn handle_auditor_launch_projection(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        AuditorLaunchProjectionRequest::decode_bounded(payload, &self.decode_config).map_err(
+            |error| ProtocolError::Serialization {
+                reason: format!("invalid AuditorLaunchProjectionRequest: {error}"),
+            },
+        )?;
+
+        let projection = self.build_auditor_launch_projection();
+        let envelope = match digest_first_projection(&projection) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                warn!(error = %error, "auditor projection digest generation failed closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("auditor projection digest generation failed: {error}"),
+                ));
+            },
+        };
+
+        Ok(PrivilegedResponse::AuditorLaunchProjection(
+            AuditorLaunchProjectionResponse {
+                projection_digest: envelope.projection_digest.to_vec(),
+                canonical_projection_json: envelope.canonical_projection_json,
+                lineage_complete: projection.lineage_complete,
+                boundary_conformant: projection.boundary_conformant,
+                authoritative_receipt_count: projection.authoritative_receipt_count,
+                complete_lineage_receipt_count: projection.complete_lineage_receipt_count,
+                boundary_conformant_receipt_count: projection.boundary_conformant_receipt_count,
+                uncertainty_flags: projection
+                    .uncertainty_flags
+                    .into_iter()
+                    .map(Self::projection_uncertainty_to_proto)
+                    .collect(),
+                admissible: projection.admissible,
+            },
+        ))
+    }
+
+    /// Handles `OrchestratorLaunchProjection` requests (IPC-PRIV-027,
+    /// TCK-00452).
+    ///
+    /// Returns active-run/liveness projection fields for orchestrator control
+    /// loops.
+    fn handle_orchestrator_launch_projection(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        OrchestratorLaunchProjectionRequest::decode_bounded(payload, &self.decode_config).map_err(
+            |error| ProtocolError::Serialization {
+                reason: format!("invalid OrchestratorLaunchProjectionRequest: {error}"),
+            },
+        )?;
+
+        let projection = self.build_orchestrator_launch_projection();
+        let envelope = match digest_first_projection(&projection) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                warn!(error = %error, "orchestrator projection digest generation failed closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("orchestrator projection digest generation failed: {error}"),
+                ));
+            },
+        };
+
+        Ok(PrivilegedResponse::OrchestratorLaunchProjection(
+            OrchestratorLaunchProjectionResponse {
+                projection_digest: envelope.projection_digest.to_vec(),
+                canonical_projection_json: envelope.canonical_projection_json,
+                active_runs: projection.active_runs,
+                last_authoritative_receipt_tick: projection.last_authoritative_receipt_tick,
+                restart_count: projection.restart_count,
+                uncertainty_flags: projection
+                    .uncertainty_flags
+                    .into_iter()
+                    .map(Self::projection_uncertainty_to_proto)
+                    .collect(),
+                admissible: projection.admissible,
+            },
+        ))
+    }
+
+    fn build_auditor_launch_projection(&self) -> AuditorLaunchProjectionV1 {
+        let receipt_events = self.event_emitter.get_authoritative_receipt_events();
+        let total_receipts = receipt_events.len();
+        let mut complete_lineage_receipt_count = 0usize;
+        let mut boundary_conformant_receipt_count = 0usize;
+        let mut uncertainty_flags = Vec::new();
+
+        for event in &receipt_events {
+            let Some(payload) = Self::parse_event_payload_json(event) else {
+                uncertainty_flags.push(ProjectionUncertainty::MissingLineageEvidence);
+                uncertainty_flags.push(ProjectionUncertainty::BoundaryConformanceUnverifiable);
+                continue;
+            };
+
+            if Self::payload_has_complete_lineage(&payload) {
+                complete_lineage_receipt_count += 1;
+            } else {
+                uncertainty_flags.push(ProjectionUncertainty::MissingLineageEvidence);
+            }
+
+            if Self::payload_has_boundary_conformance(&payload) {
+                boundary_conformant_receipt_count += 1;
+            } else {
+                uncertainty_flags.push(ProjectionUncertainty::BoundaryConformanceUnverifiable);
+            }
+        }
+
+        if total_receipts == 0 {
+            uncertainty_flags.push(ProjectionUncertainty::MissingLineageEvidence);
+            uncertainty_flags.push(ProjectionUncertainty::BoundaryConformanceUnverifiable);
+        }
+
+        let lineage_complete =
+            total_receipts > 0 && complete_lineage_receipt_count == total_receipts;
+        let boundary_conformant =
+            total_receipts > 0 && boundary_conformant_receipt_count == total_receipts;
+
+        AuditorLaunchProjectionV1::new(
+            saturating_u32(total_receipts),
+            saturating_u32(complete_lineage_receipt_count),
+            saturating_u32(boundary_conformant_receipt_count),
+            lineage_complete,
+            boundary_conformant,
+            uncertainty_flags,
+        )
+    }
+
+    fn build_orchestrator_launch_projection(&self) -> OrchestratorLaunchProjectionV1 {
+        let events = self.event_emitter.get_launch_liveness_projection_events();
+        let mut uncertainty_flags = Vec::new();
+        let mut active_sessions = BTreeSet::new();
+        let mut restart_count = 0u32;
+        let mut has_liveness_evidence = false;
+        let mut has_receipt_event = false;
+        let mut last_authoritative_receipt_tick: Option<u64> = None;
+
+        for event in &events {
+            match event.event_type.as_str() {
+                "session_started" => {
+                    let Some(payload) = Self::parse_event_payload_json(event) else {
+                        uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+                        continue;
+                    };
+                    if let Some(session_id) = Self::payload_nonempty_string(&payload, "session_id")
+                    {
+                        has_liveness_evidence = true;
+                        active_sessions.insert(session_id.to_string());
+                    } else {
+                        uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+                    }
+                },
+                "session_terminated" => {
+                    let Some(payload) = Self::parse_event_payload_json(event) else {
+                        uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+                        continue;
+                    };
+
+                    if let Some(session_id) = Self::payload_nonempty_string(&payload, "session_id")
+                    {
+                        has_liveness_evidence = true;
+                        active_sessions.remove(session_id);
+                    } else {
+                        uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+                    }
+
+                    if payload
+                        .get("exit_code")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|exit_code| exit_code != 0)
+                    {
+                        restart_count = restart_count.saturating_add(1);
+                    }
+                },
+                "review_receipt_recorded" | "review_blocked_recorded" => {
+                    has_receipt_event = true;
+
+                    let Some(payload) = Self::parse_event_payload_json(event) else {
+                        uncertainty_flags
+                            .push(ProjectionUncertainty::MissingAuthoritativeReceiptTick);
+                        continue;
+                    };
+
+                    if let Some(tick) = payload
+                        .get("consume_tick")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        last_authoritative_receipt_tick = Some(
+                            last_authoritative_receipt_tick
+                                .map_or(tick, |current| current.max(tick)),
+                        );
+                    }
+                },
+                _ => {},
+            }
+        }
+
+        if !has_liveness_evidence {
+            uncertainty_flags.push(ProjectionUncertainty::MissingLivenessEvidence);
+        }
+        if !has_receipt_event || last_authoritative_receipt_tick.is_none() {
+            uncertainty_flags.push(ProjectionUncertainty::MissingAuthoritativeReceiptTick);
+        }
+
+        OrchestratorLaunchProjectionV1::new(
+            saturating_u32(active_sessions.len()),
+            last_authoritative_receipt_tick,
+            restart_count,
+            uncertainty_flags,
+        )
+    }
+
+    fn parse_event_payload_json(event: &SignedLedgerEvent) -> Option<serde_json::Value> {
+        serde_json::from_slice::<serde_json::Value>(&event.payload).ok()
+    }
+
+    fn payload_has_complete_lineage(payload: &serde_json::Value) -> bool {
+        const REQUIRED_HASH_FIELDS: [&str; 5] = [
+            "changeset_digest",
+            "artifact_bundle_hash",
+            "capability_manifest_hash",
+            "context_pack_hash",
+            "role_spec_hash",
+        ];
+
+        REQUIRED_HASH_FIELDS
+            .iter()
+            .all(|field| Self::payload_has_hash32(payload, field))
+            && Self::payload_nonempty_string(payload, "receipt_id").is_some()
+    }
+
+    fn payload_has_boundary_conformance(payload: &serde_json::Value) -> bool {
+        Self::payload_has_hash32(payload, "identity_proof_hash")
+            && Self::payload_nonempty_string(payload, "time_envelope_ref").is_some()
+            && Self::payload_nonempty_string(payload, "lease_id").is_some()
+    }
+
+    fn payload_has_hash32(payload: &serde_json::Value, field: &str) -> bool {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| decode_hash32_hex(field, value).is_ok())
+    }
+
+    fn payload_nonempty_string<'a>(payload: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    const fn projection_uncertainty_to_proto(flag: ProjectionUncertainty) -> i32 {
+        match flag {
+            ProjectionUncertainty::MissingLineageEvidence => {
+                ProjectionUncertaintyFlag::MissingLineageEvidence as i32
+            },
+            ProjectionUncertainty::BoundaryConformanceUnverifiable => {
+                ProjectionUncertaintyFlag::BoundaryConformanceUnverifiable as i32
+            },
+            ProjectionUncertainty::MissingLivenessEvidence => {
+                ProjectionUncertaintyFlag::MissingLivenessEvidence as i32
+            },
+            ProjectionUncertainty::MissingAuthoritativeReceiptTick => {
+                ProjectionUncertaintyFlag::MissingAuthoritativeReceiptTick as i32
+            },
         }
     }
 
@@ -15797,6 +16159,26 @@ pub fn encode_work_status_request(request: &WorkStatusRequest) -> Bytes {
 #[must_use]
 pub fn encode_work_list_request(request: &WorkListRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::WorkList.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes an `AuditorLaunchProjection` request to bytes for sending
+/// (TCK-00452).
+#[must_use]
+pub fn encode_auditor_launch_projection_request(request: &AuditorLaunchProjectionRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::AuditorLaunchProjection.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes an `OrchestratorLaunchProjection` request to bytes for sending
+/// (TCK-00452).
+#[must_use]
+pub fn encode_orchestrator_launch_projection_request(
+    request: &OrchestratorLaunchProjectionRequest,
+) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::OrchestratorLaunchProjection.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
