@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
-    AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass,
-    DeterminismClass, IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier, SovereigntyEnforcementMode,
+    ArbitrationOutcome, AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel,
+    BoundaryIntentClass, DeterminismClass, EvaluatorTuple, IdentityEvidenceLevel, PcacPolicyKnobs,
+    RiskTier, SovereigntyEnforcementMode, TemporalArbitrationReceiptV1, TemporalPredicateId,
 };
 
 use super::durable_consume::DurableConsumeIndex;
@@ -96,6 +97,41 @@ fn strict_sovereignty_policy() -> PcacPolicyKnobs {
         min_tier2_identity_evidence: IdentityEvidenceLevel::Verified,
         freshness_max_age_ticks: 300,
         tier2_sovereignty_mode: SovereigntyEnforcementMode::Strict,
+    }
+}
+
+fn temporal_receipt(
+    outcome: ArbitrationOutcome,
+    predicate_id: TemporalPredicateId,
+    deadline_tick: Option<u64>,
+    arbitrated_at_tick: u64,
+) -> TemporalArbitrationReceiptV1 {
+    let deny_reason =
+        (outcome != ArbitrationOutcome::AgreedAllow).then(|| "stale freshness witness".to_string());
+
+    let tuple_a = EvaluatorTuple {
+        evaluator_id: "eval-a".to_string(),
+        predicate_id,
+        contract_digest_set: test_hash(0xA1),
+        canonicalizer_tuple: test_hash(0xA2),
+        time_authority_ref: test_hash(0xA3),
+        window_ref: test_hash(0xA4),
+        verdict: outcome,
+        deny_reason,
+    };
+    let tuple_b = EvaluatorTuple {
+        evaluator_id: "eval-b".to_string(),
+        ..tuple_a.clone()
+    };
+
+    TemporalArbitrationReceiptV1 {
+        predicate_id,
+        evaluators: vec![tuple_a, tuple_b],
+        aggregate_outcome: outcome,
+        time_envelope_ref: test_hash(0xA5),
+        arbitrated_at_tick,
+        deadline_tick,
+        content_digest: test_hash(0xA6),
     }
 }
 
@@ -492,6 +528,93 @@ fn lifecycle_gate_denies_at_revalidate_stage() {
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::RevocationFrontierAdvanced
+    ));
+}
+
+#[test]
+fn test_revalidate_denies_on_agreed_deny_arbitration() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let input = valid_input();
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before arbitration check");
+
+    let receipt = temporal_receipt(
+        ArbitrationOutcome::AgreedDeny,
+        TemporalPredicateId::TpEio29001,
+        None,
+        100,
+    );
+    let err = gate
+        .revalidate_before_execution_with_sovereignty(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            None,
+            Some(&receipt),
+        )
+        .expect_err("agreed deny arbitration must fail revalidate boundary");
+
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            ref predicate_id,
+            ref outcome,
+        } if predicate_id == "TP-EIO29-001" && outcome == "agreed_deny"
+    ));
+}
+
+#[test]
+fn test_consume_denies_on_stale_freshness() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let input = valid_input();
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before consume boundary");
+
+    let receipt = temporal_receipt(
+        ArbitrationOutcome::AgreedDeny,
+        TemporalPredicateId::TpEio29001,
+        None,
+        100,
+    );
+    let err = gate
+        .consume_before_effect_with_sovereignty(
+            &cert,
+            input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            None,
+            Some(&receipt),
+        )
+        .expect_err("stale freshness arbitration must fail consume boundary");
+
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            ref predicate_id,
+            ref outcome,
+        } if predicate_id == "TP-EIO29-001" && outcome == "agreed_deny"
     ));
 }
 
@@ -914,6 +1037,7 @@ fn lifecycle_gate_missing_checker_denies_consume_in_strict_mode() {
             None,
             100,
             Some(&strict_policy),
+            None,
         )
         .unwrap_err();
 

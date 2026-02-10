@@ -24,5 +24,7 @@ pub use durable_consume::{
     ConsumeError, DurableConsumeIndex, DurableConsumeMetrics, DurableKernel, DurableKernelShared,
     FileBackedConsumeIndex,
 };
-pub use lifecycle_gate::{InProcessKernel, LifecycleGate, LifecycleReceipts};
+pub use lifecycle_gate::{
+    InProcessKernel, LifecycleGate, LifecycleReceipts, TemporalArbitrationError,
+};
 pub use sovereignty::{SovereigntyChecker, SovereigntyState};
