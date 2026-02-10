@@ -7,6 +7,7 @@
 //! - protobuf-typed work variants (`WorkTransitioned`, companions)
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -265,12 +266,13 @@ impl ReplayEquivalenceChecker {
                 continue;
             }
 
-            let state_before = self.reducer.state().clone();
+            let state_before = state_change_fingerprint(self.reducer.state());
             let ctx = ReducerContext::new(event.seq_id.unwrap_or(0));
             self.reducer.apply(event, &ctx)?;
 
             if event.event_type.starts_with("work.") {
-                if self.reducer.state() == &state_before {
+                let state_after = state_change_fingerprint(self.reducer.state());
+                if state_after == state_before {
                     // Event has a unique fingerprint but did not mutate state.
                     // This indicates a duplicate side effect - the same logical
                     // transition was already applied from a different event source.
@@ -1642,6 +1644,30 @@ fn event_fingerprint(event: &EventRecord) -> [u8; 32] {
     hasher.update(&event.payload);
     hasher.update(&event.timestamp_ns.to_le_bytes());
     *hasher.finalize().as_bytes()
+}
+
+fn state_change_fingerprint(state: &WorkReducerState) -> (usize, u64, u64, u64) {
+    let mut transition_count_sum = 0u64;
+    let mut pr_number_sum = 0u64;
+    let mut commit_sha_hash_sum = 0u64;
+
+    for work in state.work_items.values() {
+        transition_count_sum = transition_count_sum.wrapping_add(u64::from(work.transition_count));
+        pr_number_sum = pr_number_sum.wrapping_add(work.pr_number.unwrap_or(0));
+
+        if let Some(commit_sha) = &work.commit_sha {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            commit_sha.hash(&mut hasher);
+            commit_sha_hash_sum = commit_sha_hash_sum.wrapping_add(hasher.finish());
+        }
+    }
+
+    (
+        state.work_items.len(),
+        transition_count_sum,
+        pr_number_sum,
+        commit_sha_hash_sum,
+    )
 }
 
 fn parity_defect_to_record(defect: &ParityDefect, detected_at: u64) -> DefectRecorded {
