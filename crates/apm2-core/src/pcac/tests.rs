@@ -400,6 +400,34 @@ fn deny_class_certificate_expired() {
 }
 
 #[test]
+fn test_deny_class_display() {
+    let denied = AuthorityDenyClass::TemporalArbitrationDenied {
+        predicate_id: "TP-EIO29-001".to_string(),
+        outcome: "agreed_deny".to_string(),
+    };
+    assert_eq!(
+        denied.to_string(),
+        "temporal arbitration denied for predicate TP-EIO29-001 (agreed_deny)"
+    );
+
+    let persistent = AuthorityDenyClass::TemporalArbitrationPersistentDisagreement {
+        predicate_id: "TP-EIO29-008".to_string(),
+    };
+    assert_eq!(
+        persistent.to_string(),
+        "temporal arbitration persistent disagreement for predicate TP-EIO29-008"
+    );
+
+    let membership = AuthorityDenyClass::IdentityMembershipUnverifiable {
+        detail: "membership witness not found".to_string(),
+    };
+    assert_eq!(
+        membership.to_string(),
+        "identity membership unverifiable: membership witness not found"
+    );
+}
+
+#[test]
 fn deny_class_serde_roundtrip() {
     let classes = vec![
         AuthorityDenyClass::MissingRequiredField {
@@ -412,6 +440,16 @@ fn deny_class_serde_roundtrip() {
         AuthorityDenyClass::InvalidLeaseId,
         AuthorityDenyClass::RevocationFrontierAdvanced,
         AuthorityDenyClass::StaleFreshnessAtRevalidate,
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            predicate_id: "TP-EIO29-001".to_string(),
+            outcome: "agreed_deny".to_string(),
+        },
+        AuthorityDenyClass::TemporalArbitrationPersistentDisagreement {
+            predicate_id: "TP-EIO29-008".to_string(),
+        },
+        AuthorityDenyClass::IdentityMembershipUnverifiable {
+            detail: "membership proof missing".to_string(),
+        },
         AuthorityDenyClass::AlreadyConsumed {
             ajc_id: test_hash(0xAA),
         },
@@ -853,6 +891,9 @@ fn deny_taxonomy_covers_all_lifecycle_failures() {
         AuthorityDenyClass::InvalidIntentDigest,
         AuthorityDenyClass::InvalidCapabilityManifest,
         AuthorityDenyClass::InvalidIdentityProof,
+        AuthorityDenyClass::IdentityMembershipUnverifiable {
+            detail: "identity proof missing".to_string(),
+        },
         AuthorityDenyClass::StaleFreshnessAtJoin,
         AuthorityDenyClass::InvalidTimeEnvelope,
         AuthorityDenyClass::InvalidLedgerAnchor,
@@ -861,6 +902,13 @@ fn deny_taxonomy_covers_all_lifecycle_failures() {
     let _revalidate_failures = [
         AuthorityDenyClass::RevocationFrontierAdvanced,
         AuthorityDenyClass::StaleFreshnessAtRevalidate,
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            predicate_id: "TP-EIO29-001".to_string(),
+            outcome: "agreed_deny".to_string(),
+        },
+        AuthorityDenyClass::TemporalArbitrationPersistentDisagreement {
+            predicate_id: "TP-EIO29-008".to_string(),
+        },
         AuthorityDenyClass::CertificateExpired {
             expired_at: 0,
             current_tick: 0,
