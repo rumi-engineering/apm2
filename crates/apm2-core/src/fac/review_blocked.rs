@@ -789,6 +789,7 @@ impl From<ReviewBlockedRecorded> for ReviewBlockedRecordedProto {
             context_pack_hash: event
                 .context_pack_hash
                 .map_or_else(Vec::new, |h| h.to_vec()),
+            role_spec_hash: Vec::new(),
         }
     }
 }

@@ -656,6 +656,8 @@ fn test_derive_claim_bindings_matches_manual() {
             resolved_policy_hash: [0xAA; 32],
             capability_manifest_hash: cap_hash,
             context_pack_hash: ctx_hash,
+            role_spec_hash: [0u8; 32],
+            context_pack_recipe_hash: [0u8; 32],
             resolved_risk_tier: 1,
             resolved_scope_baseline: None,
             expected_adapter_profile_hash: None,
@@ -1129,6 +1131,8 @@ fn test_emit_work_claimed_includes_authority_fields() {
             resolved_policy_hash: [0xAA; 32],
             capability_manifest_hash: cap_hash,
             context_pack_hash: ctx_hash,
+            role_spec_hash: [0u8; 32],
+            context_pack_recipe_hash: [0u8; 32],
             resolved_risk_tier: 1,
             resolved_scope_baseline: None,
             expected_adapter_profile_hash: None,
@@ -1176,6 +1180,9 @@ fn test_emit_review_receipt_includes_outcome_fields() {
 
     let changeset_digest = [0x11; 32];
     let artifact_bundle_hash = [0x22; 32];
+    let capability_manifest_hash = [0x23; 32];
+    let context_pack_hash = [0x24; 32];
+    let role_spec_hash = [0x25; 32];
     let identity_proof_hash = [0x33; 32];
     let receipt_id = "receipt-emit-001";
 
@@ -1186,6 +1193,9 @@ fn test_emit_review_receipt_includes_outcome_fields() {
             receipt_id,
             &changeset_digest,
             &artifact_bundle_hash,
+            &capability_manifest_hash,
+            &context_pack_hash,
+            &role_spec_hash,
             "actor:reviewer",
             2_000_000,
             &identity_proof_hash,
@@ -1233,6 +1243,9 @@ fn test_emit_review_blocked_receipt_includes_outcome_fields() {
 
     let changeset_digest = [0x44; 32];
     let artifact_bundle_hash = [0x55; 32];
+    let capability_manifest_hash = [0x56; 32];
+    let context_pack_hash = [0x57; 32];
+    let role_spec_hash = [0x58; 32];
     let blocked_log_hash = [0x66; 32];
     let identity_proof_hash = [0x77; 32];
     let receipt_id = "receipt-blocked-001";
@@ -1244,6 +1257,9 @@ fn test_emit_review_blocked_receipt_includes_outcome_fields() {
             receipt_id,
             &changeset_digest,
             &artifact_bundle_hash,
+            &capability_manifest_hash,
+            &context_pack_hash,
+            &role_spec_hash,
             1, // reason_code
             &blocked_log_hash,
             "actor:reviewer",

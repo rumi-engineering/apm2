@@ -375,6 +375,7 @@ impl FacV0TestHarness {
             // TCK-00326: Authority binding fields
             capability_manifest_hash: vec![0x55; 32],
             context_pack_hash: vec![0x66; 32],
+            role_spec_hash: vec![0x77; 32],
         };
 
         let payload = event.encode_to_vec();

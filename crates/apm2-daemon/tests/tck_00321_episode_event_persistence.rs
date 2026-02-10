@@ -140,6 +140,9 @@ async fn test_atomic_receipt_emission() {
     let receipt_id = "rcpt-456";
     let changeset_digest = [0x42u8; 32];
     let artifact_bundle_hash = [0x43u8; 32];
+    let capability_manifest_hash = [0x44u8; 32];
+    let context_pack_hash = [0x45u8; 32];
+    let role_spec_hash = [0x46u8; 32];
     let reviewer_actor_id = "reviewer-agent";
     let timestamp_ns = test_timestamp();
 
@@ -150,6 +153,9 @@ async fn test_atomic_receipt_emission() {
             receipt_id,
             &changeset_digest,
             &artifact_bundle_hash,
+            &capability_manifest_hash,
+            &context_pack_hash,
+            &role_spec_hash,
             reviewer_actor_id,
             timestamp_ns,
             &identity_proof_hash,

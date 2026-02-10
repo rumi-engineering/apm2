@@ -52,11 +52,13 @@
 //! operation and MUST NOT be carried forward into multi-tenant or cross-node
 //! federation without full RFC-0019 governance resolution.
 
+use apm2_core::fac::fac_workobject_implementor_v2_role_contract;
 use tracing::warn;
 
 use crate::episode::capability::PolicyMintToken;
 use crate::protocol::dispatch::{
     PolicyResolution, PolicyResolutionError, PolicyResolver, build_policy_context_pack,
+    policy_context_pack_recipe_hash,
 };
 use crate::protocol::messages::WorkRole;
 
@@ -135,6 +137,16 @@ impl PolicyResolver for GovernancePolicyResolver {
                 .map_err(|e| PolicyResolutionError::GovernanceFailed {
                     message: format!("context pack sealing failed: {e}"),
                 })?;
+        let role_spec_hash = fac_workobject_implementor_v2_role_contract()
+            .compute_cas_hash()
+            .map_err(|e| PolicyResolutionError::GovernanceFailed {
+                message: format!("role spec hash computation failed: {e}"),
+            })?;
+        let context_pack_recipe_hash =
+            policy_context_pack_recipe_hash(work_id, actor_id, role_spec_hash, context_pack_hash)
+                .map_err(|e| PolicyResolutionError::GovernanceFailed {
+                message: format!("context recipe hash computation failed: {e}"),
+            })?;
 
         // TODO(RFC-0019): Resolve from real governance policy evaluation.
         //
@@ -194,6 +206,8 @@ impl PolicyResolver for GovernancePolicyResolver {
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: *manifest_hash.as_bytes(),
             context_pack_hash,
+            role_spec_hash,
+            context_pack_recipe_hash,
             resolved_risk_tier,
             resolved_scope_baseline,
             expected_adapter_profile_hash: None,
