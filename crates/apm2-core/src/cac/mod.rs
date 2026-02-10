@@ -180,6 +180,7 @@ pub mod manifest;
 pub mod pack_spec;
 pub mod patch_engine;
 pub mod target_profile;
+pub mod traceability_overlay;
 mod validator;
 
 // Compiler exports
@@ -204,10 +205,11 @@ pub use conformance::{
 pub use contract_registry::{
     CAC_CANONICALIZER_VECTORS_REF, CAC_DIGEST_ALGORITHM_BLAKE3, CAC_DIGEST_FIELD_OBJECT,
     CAC_VALIDATION_ORDER, CacCompatibilityState, CacDefect, CacDefectClass, CacFreshnessStatus,
-    CacObject, CacPredicateStatus, CacSignatureStatus, CacValidationResult, CacValidationStep,
-    ContractObjectRegistry, ContractObjectRegistryEntry, EscalationAction, MAX_CAC_DEFECTS,
-    MAX_CONTRACT_REGISTRY_ENTRIES, RegistryDefect, RoleSpecContextBinding,
-    RoleSpecContextBindingError, Tier2EscalationPolicy, validate_cac_contract,
+    CacObject, CacPredicateStatus, CacSignatureStatus, CacSnapshotValidationResult,
+    CacValidationResult, CacValidationStep, ContractObjectRegistry, ContractObjectRegistryEntry,
+    EscalationAction, MAX_CAC_DEFECTS, MAX_CONTRACT_REGISTRY_ENTRIES, RegistryDefect,
+    RoleSpecContextBinding, RoleSpecContextBindingError, Tier2EscalationPolicy,
+    validate_cac_contract, validate_cac_snapshot,
 };
 pub use dcp_index::{
     DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,
@@ -247,6 +249,10 @@ pub use target_profile::{
     MAX_PROFILE_ID_LENGTH, MAX_VERSION_LENGTH, OutputFormat, ProvenanceEmbed, RenderingPolicy,
     RenderingPolicyBuilder, RetrievalPolicy, RetrievalPolicyBuilder, Stage, TargetProfile,
     TargetProfileBuilder, TargetProfileError,
+};
+pub use traceability_overlay::{
+    CacOverlayRequirement, OverlayDefect, OverlayDefectClass, Tier2FailClosedBehavior, TrcFacClaim,
+    default_overlay_requirements, validate_overlay_requirements,
 };
 pub use validator::{
     CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
