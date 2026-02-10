@@ -24,12 +24,12 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use apm2_core::crypto::Hash;
+use apm2_core::crypto::{Hash, Signer};
 use apm2_core::pcac::{
     ArbitrationAction, ArbitrationOutcome, AuthorityConsumeRecordV1, AuthorityConsumedV1,
     AuthorityDenyV1, AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel,
     BoundaryIntentClass, FreezeAction, MAX_REASON_LENGTH, RiskTier, TemporalArbitrationReceiptV1,
-    map_arbitration_outcome,
+    TemporalPredicateId, map_arbitration_outcome,
 };
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
@@ -839,6 +839,12 @@ pub struct LifecycleGate {
     /// `HardFreeze` triggers an emergency stop (persistent, all sessions).
     /// `SoftFreeze` triggers a governance stop (session-scoped restriction).
     stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
+    /// Daemon signer identity used for temporal arbitration receipts.
+    ///
+    /// Session dispatch derives receipts using this signer and lifecycle
+    /// validation trusts the corresponding public key as part of its
+    /// signer trust-root set.
+    temporal_arbitration_signer: Arc<Signer>,
 }
 
 impl LifecycleGate {
@@ -862,6 +868,7 @@ impl LifecycleGate {
             tick_kernel: None,
             sovereignty_checker: None,
             stop_authority: None,
+            temporal_arbitration_signer: Arc::new(Signer::generate()),
         }
     }
 
@@ -880,6 +887,7 @@ impl LifecycleGate {
             tick_kernel: Some(tick_kernel),
             sovereignty_checker: None,
             stop_authority: None,
+            temporal_arbitration_signer: Arc::new(Signer::generate()),
         }
     }
 
@@ -897,6 +905,7 @@ impl LifecycleGate {
             tick_kernel: Some(tick_kernel),
             sovereignty_checker: Some(checker),
             stop_authority: Some(stop_authority),
+            temporal_arbitration_signer: Arc::new(Signer::generate()),
         }
     }
 
@@ -914,6 +923,7 @@ impl LifecycleGate {
             tick_kernel: None,
             sovereignty_checker: Some(checker),
             stop_authority: None,
+            temporal_arbitration_signer: Arc::new(Signer::generate()),
         }
     }
 
@@ -935,7 +945,36 @@ impl LifecycleGate {
             tick_kernel: None,
             sovereignty_checker: Some(checker),
             stop_authority: Some(stop_authority),
+            temporal_arbitration_signer: Arc::new(Signer::generate()),
         }
+    }
+
+    /// Overrides the lifecycle gate's temporal arbitration signer.
+    #[must_use]
+    pub fn with_temporal_arbitration_signer(mut self, signer: Arc<Signer>) -> Self {
+        self.temporal_arbitration_signer = signer;
+        self
+    }
+
+    /// Returns the lifecycle gate signer used for temporal arbitration
+    /// receipts.
+    #[must_use]
+    pub(crate) fn temporal_arbitration_signer(&self) -> &Signer {
+        self.temporal_arbitration_signer.as_ref()
+    }
+
+    fn temporal_arbitration_allowed_signers(&self) -> Vec<[u8; 32]> {
+        let mut allowed_signers = vec![self.temporal_arbitration_signer.public_key_bytes()];
+        if let Some(checker) = &self.sovereignty_checker {
+            let trusted_sovereignty_signer = checker.trusted_signer_key();
+            if !allowed_signers
+                .iter()
+                .any(|key| hashes_equal(key, &trusted_sovereignty_signer))
+            {
+                allowed_signers.push(trusted_sovereignty_signer);
+            }
+        }
+        allowed_signers
     }
 
     /// Advances the attached tick kernel (if configured) monotonically.
@@ -965,9 +1004,10 @@ impl LifecycleGate {
     pub fn check_temporal_arbitration(
         &self,
         receipt: &TemporalArbitrationReceiptV1,
+        allowed_signers: &[[u8; 32]],
     ) -> Result<ArbitrationAction, TemporalArbitrationError> {
         receipt
-            .validate()
+            .validate(allowed_signers)
             .map_err(TemporalArbitrationError::InvalidReceipt)?;
         let current_tick = self.temporal_arbitration_tick()?;
         Ok(map_arbitration_outcome(
@@ -985,6 +1025,10 @@ impl LifecycleGate {
         requires_temporal_arbitration: bool,
         stage: &'static str,
     ) -> Result<(), Box<AuthorityDenyV1>> {
+        let allowed_signers = self.temporal_arbitration_allowed_signers();
+        let mut seen_predicates = HashSet::new();
+        let mut actions = Vec::new();
+
         if temporal_arbitration_receipts.is_empty() {
             if !requires_temporal_arbitration {
                 return Ok(());
@@ -1008,6 +1052,22 @@ impl LifecycleGate {
         for receipt in temporal_arbitration_receipts {
             let denied_at_tick = self.temporal_arbitration_tick().unwrap_or(u64::MAX);
 
+            if !seen_predicates.insert(receipt.predicate_id) {
+                let deny = Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationDenied {
+                        predicate_id: receipt.predicate_id.to_string(),
+                        outcome: "duplicate_predicate".to_string(),
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick,
+                    containment_action: Some(FreezeAction::HardFreeze),
+                });
+                self.actuate_containment(stage, &deny);
+                return Err(deny);
+            }
+
             // Verify receipt is cryptographically bound to the current temporal
             // context.
             if !hashes_equal(&receipt.time_envelope_ref, &current_time_envelope_ref) {
@@ -1026,7 +1086,7 @@ impl LifecycleGate {
                 return Err(deny);
             }
 
-            let action = match self.check_temporal_arbitration(receipt) {
+            let action = match self.check_temporal_arbitration(receipt, &allowed_signers) {
                 Ok(action) => action,
                 Err(error) => {
                     warn!(
@@ -1051,14 +1111,43 @@ impl LifecycleGate {
                     return Err(deny);
                 },
             };
+            actions.push((receipt.predicate_id, action, denied_at_tick));
+        }
 
+        if requires_temporal_arbitration {
+            let required_predicates = [
+                TemporalPredicateId::TpEio29001,
+                TemporalPredicateId::TpEio29008,
+            ];
+            for required in required_predicates {
+                if !seen_predicates.contains(&required) {
+                    let denied_at_tick = self.temporal_arbitration_tick().unwrap_or(u64::MAX);
+                    let deny = Box::new(AuthorityDenyV1 {
+                        deny_class:
+                            apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationDenied {
+                                predicate_id: required.to_string(),
+                                outcome: "missing_required_predicate".to_string(),
+                            },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: current_ledger_anchor,
+                        denied_at_tick,
+                        containment_action: Some(FreezeAction::HardFreeze),
+                    });
+                    self.actuate_containment(stage, &deny);
+                    return Err(deny);
+                }
+            }
+        }
+
+        for (predicate_id, action, denied_at_tick) in actions {
             match action {
                 ArbitrationAction::Continue => {},
                 ArbitrationAction::Deny { .. } => {
                     return Err(Box::new(AuthorityDenyV1 {
                         deny_class:
                             apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationDenied {
-                                predicate_id: receipt.predicate_id.to_string(),
+                                predicate_id: predicate_id.to_string(),
                                 outcome: ArbitrationOutcome::AgreedDeny.to_string(),
                             },
                         ajc_id: Some(cert.ajc_id),
@@ -1072,7 +1161,7 @@ impl LifecycleGate {
                     let deny = Box::new(AuthorityDenyV1 {
                         deny_class:
                             apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationDenied {
-                                predicate_id: receipt.predicate_id.to_string(),
+                                predicate_id: predicate_id.to_string(),
                                 outcome: ArbitrationOutcome::DisagreementTransient.to_string(),
                             },
                         ajc_id: Some(cert.ajc_id),
@@ -1087,7 +1176,7 @@ impl LifecycleGate {
                 ArbitrationAction::DenyAndRebaseline { .. } => {
                     let deny = Box::new(AuthorityDenyV1 {
                         deny_class: apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationPersistentDisagreement {
-                            predicate_id: receipt.predicate_id.to_string(),
+                            predicate_id: predicate_id.to_string(),
                         },
                         ajc_id: Some(cert.ajc_id),
                         time_envelope_ref: current_time_envelope_ref,

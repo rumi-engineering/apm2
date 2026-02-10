@@ -107,8 +107,8 @@ fn temporal_receipt(
     deadline_tick: Option<u64>,
     arbitrated_at_tick: u64,
     time_envelope_ref: Hash,
+    signer: &Signer,
 ) -> TemporalArbitrationReceiptV1 {
-    let signer = Signer::from_bytes(&[0x5A; 32]).expect("deterministic temporal signer");
     let deny_reason =
         (outcome != ArbitrationOutcome::AgreedAllow).then(|| "stale freshness witness".to_string());
 
@@ -138,13 +138,14 @@ fn temporal_receipt(
         signer_id: [0u8; 32],
         signature: [0u8; 64],
     };
-    receipt.sign(&signer);
+    receipt.sign(signer);
     receipt
 }
 
 fn temporal_receipts_both_allow(
     time_envelope_ref: Hash,
     tick: u64,
+    signer: &Signer,
 ) -> Vec<TemporalArbitrationReceiptV1> {
     vec![
         temporal_receipt(
@@ -153,6 +154,7 @@ fn temporal_receipts_both_allow(
             None,
             tick,
             time_envelope_ref,
+            signer,
         ),
         temporal_receipt(
             ArbitrationOutcome::AgreedAllow,
@@ -160,6 +162,7 @@ fn temporal_receipts_both_allow(
             None,
             tick,
             time_envelope_ref,
+            signer,
         ),
     ]
 }
@@ -581,9 +584,18 @@ fn test_revalidate_denies_on_agreed_deny_arbitration() {
         None,
         100,
         input.time_envelope_ref,
+        gate.temporal_arbitration_signer(),
+    );
+    let companion_receipt = temporal_receipt(
+        ArbitrationOutcome::AgreedAllow,
+        TemporalPredicateId::TpEio29008,
+        None,
+        100,
+        input.time_envelope_ref,
+        gate.temporal_arbitration_signer(),
     );
     let err = gate
-        .revalidate_before_execution_with_sovereignty(
+        .revalidate_before_execution_with_sovereignty_receipts(
             &cert,
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
@@ -591,7 +603,7 @@ fn test_revalidate_denies_on_agreed_deny_arbitration() {
             None,
             100,
             None,
-            Some(&receipt),
+            &[receipt, companion_receipt],
         )
         .expect_err("agreed deny arbitration must fail revalidate boundary");
 
@@ -625,9 +637,18 @@ fn test_consume_denies_on_stale_freshness() {
         None,
         100,
         input.time_envelope_ref,
+        gate.temporal_arbitration_signer(),
+    );
+    let companion_receipt = temporal_receipt(
+        ArbitrationOutcome::AgreedAllow,
+        TemporalPredicateId::TpEio29008,
+        None,
+        100,
+        input.time_envelope_ref,
+        gate.temporal_arbitration_signer(),
     );
     let err = gate
-        .consume_before_effect_with_sovereignty(
+        .consume_before_effect_with_sovereignty_receipts(
             &cert,
             input.intent_digest,
             input.boundary_intent_class,
@@ -638,7 +659,7 @@ fn test_consume_denies_on_stale_freshness() {
             None,
             100,
             None,
-            Some(&receipt),
+            &[receipt, companion_receipt],
         )
         .expect_err("stale freshness arbitration must fail consume boundary");
 
@@ -672,6 +693,7 @@ fn test_arbitration_rejects_mismatched_time_envelope() {
         None,
         100,
         test_hash(0xE1),
+        gate.temporal_arbitration_signer(),
     );
     let err = gate
         .revalidate_before_execution_with_sovereignty(
@@ -715,6 +737,7 @@ fn test_tick_derivation_failure_does_not_trust_receipt() {
         None,
         12345,
         input.time_envelope_ref,
+        gate.temporal_arbitration_signer(),
     );
     let err = gate
         .revalidate_before_execution_with_sovereignty(
@@ -819,6 +842,169 @@ fn test_tier2_denies_without_temporal_receipt() {
             ref outcome, ..
         } if outcome == "missing_receipt"
     ));
+}
+
+#[test]
+fn test_missing_predicate_denied() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&kernel));
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before predicate coverage check");
+
+    let only_tp_eio29_001 = temporal_receipt(
+        ArbitrationOutcome::AgreedAllow,
+        TemporalPredicateId::TpEio29001,
+        None,
+        100,
+        input.time_envelope_ref,
+        gate.temporal_arbitration_signer(),
+    );
+    let policy = PcacPolicyKnobs {
+        lifecycle_enforcement: true,
+        min_tier2_identity_evidence: IdentityEvidenceLevel::Verified,
+        freshness_max_age_ticks: 300,
+        tier2_sovereignty_mode: SovereigntyEnforcementMode::Disabled,
+    };
+
+    let err = gate
+        .revalidate_before_execution_with_sovereignty_receipts(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            Some(&policy),
+            &[only_tp_eio29_001],
+        )
+        .expect_err("missing required TP-EIO29-008 receipt must deny");
+
+    match err.deny_class {
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            predicate_id,
+            outcome,
+        } => {
+            assert_eq!(predicate_id, "TP-EIO29-008");
+            assert_eq!(outcome, "missing_required_predicate");
+        },
+        other => panic!("expected TemporalArbitrationDenied, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_duplicate_predicate_denied() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&kernel));
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before duplicate predicate check");
+
+    let tp_eio29_001_a = temporal_receipt(
+        ArbitrationOutcome::AgreedAllow,
+        TemporalPredicateId::TpEio29001,
+        None,
+        100,
+        input.time_envelope_ref,
+        gate.temporal_arbitration_signer(),
+    );
+    let tp_eio29_001_b = temporal_receipt(
+        ArbitrationOutcome::AgreedAllow,
+        TemporalPredicateId::TpEio29001,
+        None,
+        100,
+        input.time_envelope_ref,
+        gate.temporal_arbitration_signer(),
+    );
+    let policy = PcacPolicyKnobs {
+        lifecycle_enforcement: true,
+        min_tier2_identity_evidence: IdentityEvidenceLevel::Verified,
+        freshness_max_age_ticks: 300,
+        tier2_sovereignty_mode: SovereigntyEnforcementMode::Disabled,
+    };
+
+    let err = gate
+        .revalidate_before_execution_with_sovereignty_receipts(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            Some(&policy),
+            &[tp_eio29_001_a, tp_eio29_001_b],
+        )
+        .expect_err("duplicate temporal predicate receipt must deny");
+
+    match err.deny_class {
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            predicate_id,
+            outcome,
+        } => {
+            assert_eq!(predicate_id, "TP-EIO29-001");
+            assert_eq!(outcome, "duplicate_predicate");
+        },
+        other => panic!("expected TemporalArbitrationDenied, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_complete_predicate_set_accepted() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&kernel));
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before complete predicate set check");
+
+    let receipts = temporal_receipts_both_allow(
+        input.time_envelope_ref,
+        100,
+        gate.temporal_arbitration_signer(),
+    );
+    let policy = PcacPolicyKnobs {
+        lifecycle_enforcement: true,
+        min_tier2_identity_evidence: IdentityEvidenceLevel::Verified,
+        freshness_max_age_ticks: 300,
+        tier2_sovereignty_mode: SovereigntyEnforcementMode::Disabled,
+    };
+    let result = gate.revalidate_before_execution_with_sovereignty_receipts(
+        &cert,
+        input.time_envelope_ref,
+        input.as_of_ledger_anchor,
+        input.directory_head_hash,
+        None,
+        100,
+        Some(&policy),
+        &receipts,
+    );
+    assert!(
+        result.is_ok(),
+        "complete TP-EIO29 predicate set must pass revalidate boundary"
+    );
 }
 
 #[test]
@@ -1050,7 +1236,11 @@ fn lifecycle_gate_with_sovereignty_passes_tier2_valid_state() {
         }),
         active_freeze: FreezeAction::NoAction,
     };
-    let temporal_receipts = temporal_receipts_both_allow(input.time_envelope_ref, 100);
+    let temporal_receipts = temporal_receipts_both_allow(
+        input.time_envelope_ref,
+        100,
+        gate.temporal_arbitration_signer(),
+    );
 
     let result = gate.execute_with_sovereignty(
         &input,
@@ -1395,7 +1585,11 @@ fn lifecycle_gate_with_sovereignty_denies_incompatible_ceiling() {
         }),
         active_freeze: FreezeAction::NoAction,
     };
-    let temporal_receipts = temporal_receipts_both_allow(input.time_envelope_ref, 100);
+    let temporal_receipts = temporal_receipts_both_allow(
+        input.time_envelope_ref,
+        100,
+        gate.temporal_arbitration_signer(),
+    );
 
     let err = gate
         .execute_with_sovereignty(
@@ -1749,7 +1943,11 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
         }),
         active_freeze: FreezeAction::NoAction,
     };
-    let temporal_receipts = temporal_receipts_both_allow(input.time_envelope_ref, 100);
+    let temporal_receipts = temporal_receipts_both_allow(
+        input.time_envelope_ref,
+        100,
+        gate.temporal_arbitration_signer(),
+    );
 
     // First attempt: denied by sovereignty consume check.
     let err = gate
@@ -2283,7 +2481,11 @@ fn production_signer_key_accepts_valid_epoch() {
 
     let mut input = valid_input();
     input.risk_tier = RiskTier::Tier2Plus;
-    let temporal_receipts = temporal_receipts_both_allow(input.time_envelope_ref, 100);
+    let temporal_receipts = temporal_receipts_both_allow(
+        input.time_envelope_ref,
+        100,
+        gate.temporal_arbitration_signer(),
+    );
 
     let result = gate.execute_with_sovereignty(
         &input,

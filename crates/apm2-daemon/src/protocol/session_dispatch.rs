@@ -1780,11 +1780,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             && requesting_principal_id == state.principal_id
     }
 
-    fn temporal_arbitration_signer() -> CryptoSigner {
-        CryptoSigner::from_bytes(&[0xA7; 32])
-            .expect("deterministic session temporal arbitration signer")
-    }
-
     fn evaluate_tp_eio29_001(
         cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
         _current_time_envelope_ref: Hash,
@@ -1891,6 +1886,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         current_revocation_head: Hash,
         time_envelope_ref: Hash,
         arbitrated_at_tick: u64,
+        signer: &CryptoSigner,
     ) -> TemporalArbitrationReceiptV1 {
         let deny_reason = if verdict == ArbitrationOutcome::AgreedAllow {
             None
@@ -1973,7 +1969,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             signer_id: [0u8; 32],
             signature: [0u8; 64],
         };
-        receipt.sign(&Self::temporal_arbitration_signer());
+        receipt.sign(signer);
         receipt
     }
 
@@ -1984,6 +1980,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         current_revocation_head: Hash,
         time_envelope_ref: Hash,
         arbitrated_at_tick: u64,
+        signer: &CryptoSigner,
     ) -> Vec<TemporalArbitrationReceiptV1> {
         if !Self::requires_temporal_arbitration(cert.risk_tier) {
             return Vec::new();
@@ -2008,6 +2005,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 current_revocation_head,
                 time_envelope_ref,
                 arbitrated_at_tick,
+                signer,
             ),
             Self::build_temporal_arbitration_receipt(
                 TemporalPredicateId::TpEio29008,
@@ -2017,6 +2015,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 current_revocation_head,
                 time_envelope_ref,
                 arbitrated_at_tick,
+                signer,
             ),
         ]
     }
@@ -3494,6 +3493,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                 current_revocation_head,
                                 current_time_envelope_ref,
                                 fresh_tick,
+                                pending_pcac.gate.temporal_arbitration_signer(),
                             );
                             for receipt in derived {
                                 match receipt.predicate_id {
@@ -7371,6 +7371,7 @@ mod tests {
                     current_revocation_head,
                     [0xEE; 32],
                     100,
+                    pcac_gate.temporal_arbitration_signer(),
                 );
             let pending_pcac = PendingPcacAuthority {
                 gate: pcac_gate,

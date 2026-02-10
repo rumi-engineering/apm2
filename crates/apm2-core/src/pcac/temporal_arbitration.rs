@@ -310,7 +310,10 @@ impl TemporalArbitrationReceiptV1 {
     /// Returns an error string when evaluator tuples are missing/invalid,
     /// ordering is non-deterministic, hash references are zero, or aggregate
     /// outcome is inconsistent with tuple verdicts.
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// `allowed_signers` defines the trust-root for receipt signer identities.
+    /// Receipts signed by keys outside this set are rejected fail-closed.
+    pub fn validate(&self, allowed_signers: &[[u8; 32]]) -> Result<(), String> {
         if self.evaluators.is_empty() {
             return Err("at least one evaluator tuple is required".to_string());
         }
@@ -352,6 +355,12 @@ impl TemporalArbitrationReceiptV1 {
         }
         if self.signature == [0u8; 64] {
             return Err("signature must not be zero".to_string());
+        }
+        if !allowed_signers
+            .iter()
+            .any(|trusted_signer| hashes_equal(trusted_signer, &self.signer_id))
+        {
+            return Err("signer not in trusted set".to_string());
         }
 
         let first = &self.evaluators[0];
@@ -738,6 +747,10 @@ mod tests {
         Signer::from_bytes(&[0x5A; 32]).expect("deterministic temporal arbitration signer")
     }
 
+    fn trusted_signers() -> [[u8; 32]; 1] {
+        [test_signer().public_key_bytes()]
+    }
+
     fn valid_tuple() -> EvaluatorTuple {
         EvaluatorTuple {
             evaluator_id: "eval-a".to_string(),
@@ -860,12 +873,29 @@ mod tests {
     fn test_arbitration_receipt_serialization() {
         let receipt = valid_receipt();
 
-        assert!(receipt.validate().is_ok());
+        assert!(receipt.validate(&trusted_signers()).is_ok());
 
         let json = serde_json::to_string(&receipt).unwrap();
         let decoded: TemporalArbitrationReceiptV1 = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, receipt);
-        assert!(decoded.validate().is_ok());
+        assert!(decoded.validate(&trusted_signers()).is_ok());
+    }
+
+    #[test]
+    fn test_unknown_signer_rejected() {
+        let unknown_signer =
+            Signer::from_bytes(&[0x6B; 32]).expect("deterministic unknown temporal signer");
+        let mut receipt = valid_receipt();
+        receipt.sign(&unknown_signer);
+
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
+        assert!(err.contains("signer not in trusted set"));
+    }
+
+    #[test]
+    fn test_trusted_signer_accepted() {
+        let receipt = valid_receipt();
+        assert!(receipt.validate(&trusted_signers()).is_ok());
     }
 
     #[test]
@@ -884,7 +914,7 @@ mod tests {
     fn test_mismatched_contract_digest_rejected() {
         let mut receipt = valid_receipt();
         receipt.evaluators[1].contract_digest_set = hash(0xFE);
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("contract_digest_set mismatch"));
     }
 
@@ -892,7 +922,7 @@ mod tests {
     fn test_mismatched_canonicalizer_tuple_rejected() {
         let mut receipt = valid_receipt();
         receipt.evaluators[1].canonicalizer_tuple = hash(0xFE);
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("canonicalizer_tuple mismatch"));
     }
 
@@ -900,7 +930,7 @@ mod tests {
     fn test_mismatched_time_authority_rejected() {
         let mut receipt = valid_receipt();
         receipt.evaluators[1].time_authority_ref = hash(0xFE);
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("time_authority_ref mismatch"));
     }
 
@@ -908,7 +938,7 @@ mod tests {
     fn test_mismatched_window_ref_rejected() {
         let mut receipt = valid_receipt();
         receipt.evaluators[1].window_ref = hash(0xFE);
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("window_ref mismatch"));
     }
 
@@ -933,7 +963,7 @@ mod tests {
             signature: [0u8; 64],
         };
 
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("evaluators length"));
 
         let json = serde_json::to_string(&receipt).unwrap();
@@ -964,7 +994,7 @@ mod tests {
         };
         receipt.sign(&test_signer());
 
-        assert!(receipt.validate().is_ok());
+        assert!(receipt.validate(&trusted_signers()).is_ok());
         assert!(receipt.check_deadline_miss(101));
         let action = map_arbitration_outcome(
             receipt.effective_outcome(101),
@@ -998,7 +1028,7 @@ mod tests {
             signature: [0u8; 64],
         };
 
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("DisagreementTransient requires deadline_tick"));
     }
 
@@ -1024,7 +1054,7 @@ mod tests {
             signature: [0u8; 64],
         };
 
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("deadline_tick must be strictly greater than arbitrated_at_tick"));
     }
 
@@ -1042,7 +1072,7 @@ mod tests {
     fn test_tampered_receipt_fails_validation() {
         let mut receipt = valid_receipt();
         receipt.arbitrated_at_tick += 1;
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("signature verification failed"));
     }
 
@@ -1050,7 +1080,7 @@ mod tests {
     fn test_unsigned_receipt_fails_validation() {
         let mut receipt = valid_receipt();
         receipt.signature = [0u8; 64];
-        let err = receipt.validate().unwrap_err();
+        let err = receipt.validate(&trusted_signers()).unwrap_err();
         assert!(err.contains("signature must not be zero"));
     }
 }
