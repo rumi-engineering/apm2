@@ -96,7 +96,11 @@ impl LivenessGateDenial {
     pub fn new(reason: LivenessDenialReason, detail: impl Into<String>) -> Self {
         let mut detail = detail.into();
         if detail.len() > MAX_LIVENESS_DENIAL_DETAIL_LENGTH {
-            detail.truncate(MAX_LIVENESS_DENIAL_DETAIL_LENGTH);
+            let mut truncation_index = MAX_LIVENESS_DENIAL_DETAIL_LENGTH;
+            while !detail.is_char_boundary(truncation_index) {
+                truncation_index = truncation_index.saturating_sub(1);
+            }
+            detail.truncate(truncation_index);
         }
         Self { reason, detail }
     }
