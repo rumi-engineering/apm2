@@ -172,6 +172,7 @@ pub mod admission;
 pub mod capability_gate;
 pub mod compiler;
 pub mod conformance;
+pub mod contract_registry;
 pub mod dcp_index;
 pub mod export;
 pub mod freeze_check;
@@ -198,6 +199,15 @@ pub use conformance::{
     ConformanceTestResult, EXPORT_RECEIPT_SCHEMA, ExportReceipt, MAX_CONFORMANCE_TESTS,
     OutputFormat as ConformanceOutputFormat, run_conformance_suite, verify_determinism,
     verify_provenance, verify_schema,
+};
+// Snapshot contract registry exports
+pub use contract_registry::{
+    CAC_CANONICALIZER_VECTORS_REF, CAC_DIGEST_ALGORITHM_BLAKE3, CAC_DIGEST_FIELD_OBJECT,
+    CAC_VALIDATION_ORDER, CacCompatibilityState, CacDefect, CacDefectClass, CacFreshnessStatus,
+    CacObject, CacPredicateStatus, CacSignatureStatus, CacValidationResult, CacValidationStep,
+    ContractObjectRegistry, ContractObjectRegistryEntry, EscalationAction, MAX_CAC_DEFECTS,
+    MAX_CONTRACT_REGISTRY_ENTRIES, RegistryDefect, RoleSpecContextBinding,
+    RoleSpecContextBindingError, Tier2EscalationPolicy, validate_cac_contract,
 };
 pub use dcp_index::{
     DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,
