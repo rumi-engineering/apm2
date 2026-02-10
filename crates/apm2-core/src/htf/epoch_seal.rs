@@ -35,13 +35,18 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 // Re-export `is_seal_required_tier` so callers can query tier requirements
 // independently if needed, but the primary verification path now integrates
 // the tier-based seal-required check via `verify_with_policy`.
 use crate::fac::RiskTier;
+use crate::htf::vdf_profile::{
+    MIN_VDF_DIFFICULTY, VdfPolicy, VdfPolicyResolver, VdfProfileError, VdfProfileV1, VdfVerifier,
+};
 
 // =============================================================================
 // Constants
@@ -67,6 +72,9 @@ const EPOCH_SEAL_AUDIT_DOMAIN: &[u8] = b"apm2:epoch_seal_v1:audit:v1\0";
 
 /// Signature byte length (Ed25519).
 const SIGNATURE_SIZE: usize = 64;
+
+/// Prior-epoch root for the first observed seal in a monotonic chain.
+const GENESIS_PRIOR_EPOCH_ROOT: [u8; 32] = [0u8; 32];
 
 // =============================================================================
 // SignatureVerifier trait (fail-closed signature verification)
@@ -215,6 +223,7 @@ mod signature_serde {
 /// - `receipt_batch_epoch`: Receipt-batch epoch bound to this seal
 /// - `htf_time_envelope_ref`: Content-hash reference to the HTF time envelope
 /// - `quorum_anchor`: Quorum-anchor hash for consensus binding
+/// - `vdf_profile`: OPTIONAL VDF delay profile for adversarial federation links
 /// - `authority_seal_hash`: Hash of the authority seal that authorized this
 ///   epoch
 /// - `signature`: Cryptographic signature over the canonical content
@@ -228,6 +237,7 @@ mod signature_serde {
 /// - `cell_id` must be non-empty and bounded
 /// - `htf_time_envelope_ref` must be non-zero
 /// - `quorum_anchor` must be non-zero
+/// - If present, `vdf_profile` must satisfy all VDF profile invariants
 /// - `authority_seal_hash` must be non-zero
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -255,6 +265,10 @@ pub struct EpochSealV1 {
 
     /// Quorum-anchor hash for consensus binding.
     quorum_anchor: [u8; 32],
+
+    /// Optional VDF delay profile for adversarial federation links.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vdf_profile: Option<VdfProfileV1>,
 
     /// Hash of the authority seal that authorized this epoch.
     authority_seal_hash: [u8; 32],
@@ -285,6 +299,7 @@ impl EpochSealV1 {
         receipt_batch_epoch: u64,
         htf_time_envelope_ref: [u8; 32],
         quorum_anchor: [u8; 32],
+        vdf_profile: Option<VdfProfileV1>,
         authority_seal_hash: [u8; 32],
     ) -> Result<Self, EpochSealError> {
         if epoch_number == 0 {
@@ -329,6 +344,12 @@ impl EpochSealV1 {
             return Err(EpochSealError::ZeroQuorumAnchor);
         }
 
+        if let Some(profile) = &vdf_profile {
+            profile
+                .validate()
+                .map_err(EpochSealError::InvalidVdfProfile)?;
+        }
+
         if authority_seal_hash == [0u8; 32] {
             return Err(EpochSealError::ZeroAuthoritySealHash);
         }
@@ -342,6 +363,7 @@ impl EpochSealV1 {
             receipt_batch_epoch,
             htf_time_envelope_ref,
             quorum_anchor,
+            vdf_profile,
             authority_seal_hash,
             signature,
             content_hash,
@@ -408,6 +430,12 @@ impl EpochSealV1 {
         &self.quorum_anchor
     }
 
+    /// Returns the optional VDF delay profile.
+    #[must_use]
+    pub const fn vdf_profile(&self) -> Option<&VdfProfileV1> {
+        self.vdf_profile.as_ref()
+    }
+
     /// Returns the authority seal hash.
     #[must_use]
     pub const fn authority_seal_hash(&self) -> &[u8; 32] {
@@ -457,6 +485,11 @@ impl EpochSealV1 {
         if self.quorum_anchor == [0u8; 32] {
             return Err(EpochSealError::ZeroQuorumAnchor);
         }
+        if let Some(profile) = &self.vdf_profile {
+            profile
+                .validate()
+                .map_err(EpochSealError::InvalidVdfProfile)?;
+        }
         if self.authority_seal_hash == [0u8; 32] {
             return Err(EpochSealError::ZeroAuthoritySealHash);
         }
@@ -478,6 +511,8 @@ impl EpochSealV1 {
     /// - `receipt_batch_epoch` (8 bytes LE)
     /// - `htf_time_envelope_ref` (32 bytes)
     /// - `quorum_anchor` (32 bytes)
+    /// - OPTIONAL `vdf_profile` (scheme + `input_hash` + `output` +
+    ///   `difficulty`)
     /// - `authority_seal_hash` (32 bytes)
     #[must_use]
     pub fn compute_content_hash(&self) -> [u8; 32] {
@@ -496,6 +531,7 @@ impl EpochSealV1 {
         hasher.update(&self.receipt_batch_epoch.to_le_bytes());
         hasher.update(&self.htf_time_envelope_ref);
         hasher.update(&self.quorum_anchor);
+        hash_optional_vdf_profile(&mut hasher, self.vdf_profile.as_ref());
         hasher.update(&self.authority_seal_hash);
         *hasher.finalize().as_bytes()
     }
@@ -513,6 +549,8 @@ impl EpochSealV1 {
     /// - `receipt_batch_epoch` (8 bytes LE)
     /// - `htf_time_envelope_ref` (32 bytes)
     /// - `quorum_anchor` (32 bytes)
+    /// - OPTIONAL `vdf_profile` (scheme + `input_hash` + `output` +
+    ///   `difficulty`)
     /// - `authority_seal_hash` (32 bytes)
     /// - `content_hash` (32 bytes)
     #[must_use]
@@ -532,6 +570,7 @@ impl EpochSealV1 {
         hasher.update(&self.receipt_batch_epoch.to_le_bytes());
         hasher.update(&self.htf_time_envelope_ref);
         hasher.update(&self.quorum_anchor);
+        hash_optional_vdf_profile(&mut hasher, self.vdf_profile.as_ref());
         hasher.update(&self.authority_seal_hash);
         hasher.update(&self.content_hash);
         *hasher.finalize().as_bytes()
@@ -564,6 +603,29 @@ impl EpochSealV1 {
             reason: e.to_string(),
         })
     }
+}
+
+/// Hashes optional VDF profile fields into a seal hash preimage.
+///
+/// For backward compatibility with pre-VDF seals, no bytes are added when
+/// `profile` is `None`.
+fn hash_optional_vdf_profile(hasher: &mut blake3::Hasher, profile: Option<&VdfProfileV1>) {
+    if let Some(vdf_profile) = profile {
+        hasher.update(b"apm2:epoch_seal_v1:vdf_profile:v1\0");
+        let scheme = vdf_profile.scheme().to_string();
+        hasher.update(&(scheme.len() as u64).to_le_bytes());
+        hasher.update(scheme.as_bytes());
+        hasher.update(vdf_profile.input_hash());
+        hasher.update(&(vdf_profile.output().len() as u64).to_le_bytes());
+        hasher.update(vdf_profile.output());
+        hasher.update(&vdf_profile.difficulty().to_le_bytes());
+    }
+}
+
+/// Constant-time equality for 32-byte digests.
+#[must_use]
+fn ct_eq_32(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.ct_eq(right).unwrap_u8() == 1
 }
 
 impl std::fmt::Display for EpochSealV1 {
@@ -635,6 +697,10 @@ pub enum EpochSealError {
     /// Quorum anchor must be non-zero.
     #[error("quorum anchor must be non-zero")]
     ZeroQuorumAnchor,
+
+    /// Optional VDF profile is invalid.
+    #[error("invalid vdf profile: {0}")]
+    InvalidVdfProfile(VdfProfileError),
 
     /// Authority seal hash must be non-zero.
     #[error("authority seal hash must be non-zero")]
@@ -725,6 +791,7 @@ impl EpochSealIssuer {
     /// * `receipt_batch_epoch` - Receipt-batch epoch
     /// * `htf_time_envelope_ref` - Time envelope content-hash reference
     /// * `quorum_anchor` - Quorum-anchor hash
+    /// * `vdf_profile` - Optional VDF delay profile
     /// * `authority_seal_hash` - Authority seal hash
     ///
     /// # Errors
@@ -744,6 +811,7 @@ impl EpochSealIssuer {
         receipt_batch_epoch: u64,
         htf_time_envelope_ref: [u8; 32],
         quorum_anchor: [u8; 32],
+        vdf_profile: Option<VdfProfileV1>,
         authority_seal_hash: [u8; 32],
     ) -> Result<EpochSealV1, EpochSealIssuanceError> {
         let next_epoch = self
@@ -762,6 +830,7 @@ impl EpochSealIssuer {
             receipt_batch_epoch,
             htf_time_envelope_ref,
             quorum_anchor,
+            vdf_profile,
             authority_seal_hash,
         )
         .map_err(EpochSealIssuanceError::Validation)?;
@@ -880,6 +949,54 @@ pub enum EpochSealAuditEvent {
         epoch_number: u64,
     },
 
+    /// Seal rejected: VDF profile is required by policy but missing.
+    VdfRequiredByPolicy {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// The rejected seal epoch.
+        epoch_number: u64,
+        /// Minimum policy difficulty for this link/cell.
+        min_difficulty: u64,
+    },
+
+    /// Seal rejected: VDF difficulty is below policy minimum.
+    VdfDifficultyBelowPolicy {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// The rejected seal epoch.
+        epoch_number: u64,
+        /// Profile difficulty.
+        difficulty: u64,
+        /// Minimum policy difficulty.
+        min_difficulty: u64,
+    },
+
+    /// Seal rejected: no VDF verifier configured (fail-closed).
+    NoVdfVerifier {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// The epoch number of the rejected seal.
+        epoch_number: u64,
+    },
+
+    /// Seal rejected: VDF challenge does not bind to expected prior root.
+    VdfInputHashMismatch {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// The epoch number of the rejected seal.
+        epoch_number: u64,
+    },
+
+    /// Seal rejected: VDF proof verification failed.
+    VdfRejected {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// The epoch number of the rejected seal.
+        epoch_number: u64,
+        /// Reason for VDF rejection.
+        reason: String,
+    },
+
     /// Seal rejected: deserialization invariant validation failed.
     ValidationFailed {
         /// Description of the validation failure.
@@ -910,6 +1027,11 @@ impl EpochSealAuditEvent {
             Self::InvalidSeal { .. } => "epoch_seal.invalid_seal",
             Self::SignatureRejected { .. } => "epoch_seal.signature_rejected",
             Self::NoSignatureVerifier { .. } => "epoch_seal.no_signature_verifier",
+            Self::VdfRequiredByPolicy { .. } => "epoch_seal.vdf_required_by_policy",
+            Self::VdfDifficultyBelowPolicy { .. } => "epoch_seal.vdf_difficulty_below_policy",
+            Self::NoVdfVerifier { .. } => "epoch_seal.no_vdf_verifier",
+            Self::VdfInputHashMismatch { .. } => "epoch_seal.vdf_input_hash_mismatch",
+            Self::VdfRejected { .. } => "epoch_seal.vdf_rejected",
             Self::ValidationFailed { .. } => "epoch_seal.validation_failed",
             Self::EvictionReplayRejected { .. } => "epoch_seal.eviction_replay_rejected",
         }
@@ -918,6 +1040,7 @@ impl EpochSealAuditEvent {
     /// Computes a deterministic BLAKE3 hash of this audit event for
     /// CAS-addressable storage.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn canonical_hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(EPOCH_SEAL_AUDIT_DOMAIN);
@@ -971,6 +1094,11 @@ impl EpochSealAuditEvent {
                 issuer_cell_id,
                 epoch_number,
                 reason,
+            }
+            | Self::VdfRejected {
+                issuer_cell_id,
+                epoch_number,
+                reason,
             } => {
                 hash_lp(&mut hasher, issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
@@ -979,9 +1107,37 @@ impl EpochSealAuditEvent {
             Self::NoSignatureVerifier {
                 issuer_cell_id,
                 epoch_number,
+            }
+            | Self::NoVdfVerifier {
+                issuer_cell_id,
+                epoch_number,
+            }
+            | Self::VdfInputHashMismatch {
+                issuer_cell_id,
+                epoch_number,
             } => {
                 hash_lp(&mut hasher, issuer_cell_id.as_bytes());
                 hasher.update(&epoch_number.to_le_bytes());
+            },
+            Self::VdfRequiredByPolicy {
+                issuer_cell_id,
+                epoch_number,
+                min_difficulty,
+            } => {
+                hash_lp(&mut hasher, issuer_cell_id.as_bytes());
+                hasher.update(&epoch_number.to_le_bytes());
+                hasher.update(&min_difficulty.to_le_bytes());
+            },
+            Self::VdfDifficultyBelowPolicy {
+                issuer_cell_id,
+                epoch_number,
+                difficulty,
+                min_difficulty,
+            } => {
+                hash_lp(&mut hasher, issuer_cell_id.as_bytes());
+                hasher.update(&epoch_number.to_le_bytes());
+                hasher.update(&difficulty.to_le_bytes());
+                hasher.update(&min_difficulty.to_le_bytes());
             },
             Self::EvictionReplayRejected {
                 issuer_cell_id,
@@ -1058,6 +1214,58 @@ pub enum EpochSealVerificationError {
     #[error("no signature verifier configured (fail-closed): all seals rejected")]
     NoSignatureVerifier,
 
+    /// Missing VDF profile when policy requires one.
+    #[error(
+        "vdf profile required by policy for issuer {issuer_cell_id} epoch {epoch_number} (min_difficulty={min_difficulty})"
+    )]
+    VdfRequiredByPolicy {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// Rejected epoch number.
+        epoch_number: u64,
+        /// Minimum required policy difficulty.
+        min_difficulty: u64,
+    },
+
+    /// VDF profile difficulty below policy floor.
+    #[error(
+        "vdf difficulty {difficulty} below policy minimum {min_difficulty} for issuer {issuer_cell_id} epoch {epoch_number}"
+    )]
+    VdfDifficultyBelowPolicy {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// Rejected epoch number.
+        epoch_number: u64,
+        /// Difficulty declared by seal.
+        difficulty: u64,
+        /// Minimum required difficulty.
+        min_difficulty: u64,
+    },
+
+    /// No VDF verifier configured (fail-closed when VDF profile is present).
+    #[error("no vdf verifier configured (fail-closed): vdf-backed seals rejected")]
+    NoVdfVerifier,
+
+    /// Deterministic challenge mismatch for VDF profile.
+    #[error(
+        "vdf challenge mismatch for issuer {issuer_cell_id} epoch {epoch_number}: profile input hash does not match derived challenge"
+    )]
+    VdfInputHashMismatch {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// Rejected epoch number.
+        epoch_number: u64,
+    },
+
+    /// VDF proof rejected.
+    #[error("vdf verification failed for issuer {issuer_cell_id}: {reason}")]
+    VdfRejected {
+        /// Issuer cell ID.
+        issuer_cell_id: String,
+        /// Reason for rejection.
+        reason: String,
+    },
+
     /// Seal field validation failed (deserialization bypass).
     #[error("seal validation failed: {reason}")]
     ValidationFailed {
@@ -1122,6 +1330,9 @@ struct CellState {
     /// Authority seal hash of the last accepted seal.
     authority_seal_hash: [u8; 32],
 
+    /// Optional VDF delay profile of the last accepted seal.
+    vdf_profile: Option<VdfProfileV1>,
+
     /// Issuer cell ID of the last accepted seal.
     issuer_cell_id: String,
 
@@ -1130,13 +1341,34 @@ struct CellState {
     last_access: u64,
 }
 
+/// Tombstone persisted for an evicted monotonicity key.
+///
+/// Stores enough state to preserve both:
+/// - replay-after-eviction high-water enforcement (`last_epoch`), and
+/// - VDF challenge continuity (`last_root_hash`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvictionTombstone {
+    /// Last accepted epoch for the evicted key.
+    last_epoch: u64,
+    /// Root hash from the last accepted seal for the evicted key.
+    last_root_hash: [u8; 32],
+}
+
 // =============================================================================
 // EpochSealVerifier
 // =============================================================================
 
-/// Maximum number of evicted high-water marks retained. Bounded to prevent
-/// unbounded memory growth if many keys are evicted over time.
-pub const MAX_EVICTION_HIGH_WATER_MARKS: usize = 4096;
+/// Maximum number of eviction tombstones retained.
+///
+/// Bounded to prevent unbounded memory growth if many keys are evicted over
+/// time.
+pub const MAX_EVICTED_TOMBSTONES: usize = 256;
+
+/// Backward-compatible alias for eviction tombstone capacity.
+pub const MAX_EVICTION_TOMBSTONES: usize = MAX_EVICTED_TOMBSTONES;
+
+/// Backward-compatible alias for eviction tombstone capacity.
+pub const MAX_EVICTION_HIGH_WATER_MARKS: usize = MAX_EVICTED_TOMBSTONES;
 
 /// Verifies epoch seals for monotonicity, rollback rejection,
 /// equivocation detection, and signature authenticity.
@@ -1170,27 +1402,47 @@ pub struct EpochSealVerifier {
     /// without cryptographic authenticity checks.
     signature_verifier: Option<Box<dyn SignatureVerifier>>,
 
+    /// Optional VDF verifier. When a seal carries a VDF profile and this is
+    /// `None`, the seal is rejected (fail-closed).
+    vdf_verifier: Option<Box<dyn VdfVerifier>>,
+
+    /// Per-link/per-cell VDF enforcement policy.
+    vdf_policy: VdfPolicy,
+
+    /// Optional resolver for per-key VDF policy.
+    ///
+    /// When set, this resolver is authoritative and is used instead of
+    /// `vdf_policy` for enforcement decisions.
+    vdf_policy_resolver: Option<Arc<dyn VdfPolicyResolver>>,
+
     /// Monotonically increasing counter for LRU access ordering.
     access_counter: u64,
 
-    /// High-water epoch marks for evicted keys.
+    /// Tombstones for evicted keys.
     ///
-    /// When a key is evicted from `cells`, its last-known epoch is stored
-    /// here. On re-introduction, the seal's epoch must be strictly greater
-    /// than this high-water mark to prevent replay-after-eviction attacks.
-    /// This map is itself bounded by [`MAX_EVICTION_HIGH_WATER_MARKS`].
-    evicted_high_water: HashMap<MonotonicityKey, u64>,
+    /// When a key is evicted from `cells`, both its last-known epoch and root
+    /// hash are stored here. On re-introduction:
+    /// - the seal epoch must be strictly greater than `last_epoch`
+    ///   (replay-after-eviction defense), and
+    /// - `last_root_hash` is used to derive the expected VDF challenge input
+    ///   for continuity.
+    ///
+    /// This map is bounded by [`MAX_EVICTION_TOMBSTONES`].
+    evicted_tombstones: HashMap<MonotonicityKey, EvictionTombstone>,
 }
 
 impl Clone for EpochSealVerifier {
     fn clone(&self) -> Self {
-        // The signature verifier is not cloneable; cloned verifiers
-        // start without a verifier (fail-closed).
+        // Verifier trait objects are not cloneable; cloned verifiers start
+        // without signature/VDF verifiers (fail-closed).
         Self {
             cells: self.cells.clone(),
             signature_verifier: None,
+            vdf_verifier: None,
+            vdf_policy: self.vdf_policy.clone(),
+            vdf_policy_resolver: self.vdf_policy_resolver.clone(),
             access_counter: self.access_counter,
-            evicted_high_water: self.evicted_high_water.clone(),
+            evicted_tombstones: self.evicted_tombstones.clone(),
         }
     }
 }
@@ -1209,8 +1461,11 @@ impl EpochSealVerifier {
         Self {
             cells: HashMap::new(),
             signature_verifier: None,
+            vdf_verifier: None,
+            vdf_policy: VdfPolicy::Optional,
+            vdf_policy_resolver: None,
             access_counter: 0,
-            evicted_high_water: HashMap::new(),
+            evicted_tombstones: HashMap::new(),
         }
     }
 
@@ -1220,8 +1475,11 @@ impl EpochSealVerifier {
         Self {
             cells: HashMap::new(),
             signature_verifier: Some(signature_verifier),
+            vdf_verifier: None,
+            vdf_policy: VdfPolicy::Optional,
+            vdf_policy_resolver: None,
             access_counter: 0,
-            evicted_high_water: HashMap::new(),
+            evicted_tombstones: HashMap::new(),
         }
     }
 
@@ -1230,10 +1488,57 @@ impl EpochSealVerifier {
         self.signature_verifier = Some(verifier);
     }
 
+    /// Sets the VDF verifier.
+    pub fn set_vdf_verifier(&mut self, verifier: Box<dyn VdfVerifier>) {
+        self.vdf_verifier = Some(verifier);
+    }
+
+    /// Sets the per-link/per-cell VDF policy.
+    pub const fn set_vdf_policy(&mut self, policy: VdfPolicy) {
+        self.vdf_policy = policy;
+    }
+
+    /// Sets the per-key VDF policy resolver.
+    pub fn set_vdf_policy_resolver(&mut self, resolver: Arc<dyn VdfPolicyResolver>) {
+        self.vdf_policy_resolver = Some(resolver);
+    }
+
+    /// Clears the per-key VDF policy resolver.
+    pub fn clear_vdf_policy_resolver(&mut self) {
+        self.vdf_policy_resolver = None;
+    }
+
     /// Returns whether a signature verifier is configured.
     #[must_use]
     pub fn has_signature_verifier(&self) -> bool {
         self.signature_verifier.is_some()
+    }
+
+    /// Returns whether a VDF verifier is configured.
+    #[must_use]
+    pub fn has_vdf_verifier(&self) -> bool {
+        self.vdf_verifier.is_some()
+    }
+
+    /// Returns whether a VDF policy resolver is configured.
+    #[must_use]
+    pub fn has_vdf_policy_resolver(&self) -> bool {
+        self.vdf_policy_resolver.is_some()
+    }
+
+    /// Returns the active VDF policy.
+    #[must_use]
+    pub const fn vdf_policy(&self) -> &VdfPolicy {
+        &self.vdf_policy
+    }
+
+    /// Resolves the active VDF policy for a monotonicity key.
+    #[must_use]
+    fn effective_vdf_policy_for(&self, key: &MonotonicityKey) -> VdfPolicy {
+        self.vdf_policy_resolver.as_ref().map_or_else(
+            || self.vdf_policy.clone(),
+            |resolver| resolver.resolve_policy(&key.cell_id),
+        )
     }
 
     /// Increments and returns the next access counter value.
@@ -1256,8 +1561,9 @@ impl EpochSealVerifier {
 
     /// Evicts the least recently used entry from the verifier state.
     ///
-    /// The evicted key's epoch is persisted in [`evicted_high_water`] so
-    /// that replay-after-eviction attacks are detected on re-introduction.
+    /// The evicted key's tombstone is persisted in [`evicted_tombstones`] so
+    /// replay-after-eviction and VDF continuity are preserved on
+    /// re-introduction.
     /// Returns `true` if an entry was evicted, `false` if the map is empty.
     fn evict_lru(&mut self) -> bool {
         if let Some(lru_key) = self
@@ -1267,7 +1573,7 @@ impl EpochSealVerifier {
             .map(|(key, _)| key.clone())
         {
             if let Some(state) = self.cells.remove(&lru_key) {
-                self.persist_eviction_high_water(&lru_key, state.epoch);
+                self.persist_eviction_tombstone(&lru_key, &state);
             }
             true
         } else {
@@ -1277,8 +1583,9 @@ impl EpochSealVerifier {
 
     /// Evicts the least recently used entry for a specific `cell_id`.
     ///
-    /// The evicted key's epoch is persisted in [`evicted_high_water`] so
-    /// that replay-after-eviction attacks are detected on re-introduction.
+    /// The evicted key's tombstone is persisted in [`evicted_tombstones`] so
+    /// replay-after-eviction and VDF continuity are preserved on
+    /// re-introduction.
     /// Returns `true` if an entry was evicted.
     fn evict_lru_for_cell(&mut self, cell_id: &str) -> bool {
         if let Some(lru_key) = self
@@ -1289,7 +1596,7 @@ impl EpochSealVerifier {
             .map(|(key, _)| key.clone())
         {
             if let Some(state) = self.cells.remove(&lru_key) {
-                self.persist_eviction_high_water(&lru_key, state.epoch);
+                self.persist_eviction_tombstone(&lru_key, &state);
             }
             true
         } else {
@@ -1297,35 +1604,49 @@ impl EpochSealVerifier {
         }
     }
 
-    /// Persists a high-water epoch mark for an evicted key.
+    /// Persists an eviction tombstone for an evicted key.
     ///
-    /// If the high-water map is at capacity, the entry with the lowest
-    /// epoch is evicted to make room (the oldest high-water mark is the
-    /// least useful for replay protection).
-    fn persist_eviction_high_water(&mut self, key: &MonotonicityKey, epoch: u64) {
-        // Update existing entry to max (never decrease high-water mark).
-        let entry = self.evicted_high_water.entry(key.clone()).or_insert(0);
-        if epoch > *entry {
-            *entry = epoch;
+    /// If the tombstone map is at capacity, the entry with the lowest
+    /// `last_epoch` is evicted to make room.
+    fn persist_eviction_tombstone(&mut self, key: &MonotonicityKey, state: &CellState) {
+        let tombstone = EvictionTombstone {
+            last_epoch: state.epoch,
+            last_root_hash: state.root_hash,
+        };
+
+        match self.evicted_tombstones.get(key).copied() {
+            Some(existing) if existing.last_epoch > tombstone.last_epoch => {},
+            _ => {
+                self.evicted_tombstones.insert(key.clone(), tombstone);
+            },
         }
 
-        // Bound the high-water map: evict the entry with the lowest epoch.
-        if self.evicted_high_water.len() > MAX_EVICTION_HIGH_WATER_MARKS {
+        // Bound the tombstone map: evict the entry with the lowest epoch.
+        if self.evicted_tombstones.len() > MAX_EVICTION_TOMBSTONES {
             if let Some(min_key) = self
-                .evicted_high_water
+                .evicted_tombstones
                 .iter()
-                .min_by_key(|(_, e)| **e)
+                .min_by_key(|(_, t)| t.last_epoch)
                 .map(|(k, _)| k.clone())
             {
-                self.evicted_high_water.remove(&min_key);
+                self.evicted_tombstones.remove(&min_key);
             }
         }
     }
 
+    /// Returns the number of eviction tombstones tracked.
+    #[must_use]
+    pub fn evicted_tombstone_count(&self) -> usize {
+        self.evicted_tombstones.len()
+    }
+
     /// Returns the number of evicted high-water marks tracked.
+    ///
+    /// Kept for backward compatibility. Equivalent to
+    /// [`Self::evicted_tombstone_count`].
     #[must_use]
     pub fn evicted_high_water_count(&self) -> usize {
-        self.evicted_high_water.len()
+        self.evicted_tombstone_count()
     }
 
     /// Returns the last accepted epoch for the given issuer cell ID.
@@ -1348,7 +1669,9 @@ impl EpochSealVerifier {
     /// 1. Validate seal fields (deserialization invariants).
     /// 2. Verify content hash (recompute canonical hash and compare).
     /// 3. Verify cryptographic signature (fail-closed when no verifier).
-    /// 4. Check monotonicity and equivocation.
+    /// 4. Verify optional VDF profile + policy (fail-closed on configured VDF
+    ///    requirements).
+    /// 5. Check monotonicity and equivocation.
     ///
     /// # Returns
     ///
@@ -1369,7 +1692,7 @@ impl EpochSealVerifier {
 
         // Step 2: Verify content hash (recompute and compare).
         let recomputed = seal.compute_content_hash();
-        if recomputed != seal.content_hash {
+        if !ct_eq_32(&recomputed, seal.content_hash()) {
             return EpochSealVerdict {
                 accepted: false,
                 risk_tier,
@@ -1390,7 +1713,12 @@ impl EpochSealVerifier {
             return verdict;
         }
 
-        // Step 4: Monotonicity and equivocation checks.
+        // Step 4: Verify optional VDF profile + policy.
+        if let Some(verdict) = self.verify_vdf(seal, risk_tier) {
+            return verdict;
+        }
+
+        // Step 5: Monotonicity and equivocation checks.
         self.verify_monotonicity(seal, risk_tier)
     }
 
@@ -1432,6 +1760,155 @@ impl EpochSealVerifier {
         }
     }
 
+    /// Builds the monotonicity key used for state tracking and VDF challenge
+    /// derivation.
+    #[must_use]
+    fn monotonicity_key_for(seal: &EpochSealV1) -> MonotonicityKey {
+        MonotonicityKey {
+            cell_id: seal.cell_id().to_string(),
+            htf_time_envelope_ref: *seal.htf_time_envelope_ref(),
+            quorum_anchor: *seal.quorum_anchor(),
+        }
+    }
+
+    /// Verifies optional VDF policy and proof constraints.
+    ///
+    /// Returns `Some(verdict)` on rejection, `None` on success.
+    #[allow(clippy::option_if_let_else)]
+    #[allow(clippy::too_many_lines)]
+    fn verify_vdf(&self, seal: &EpochSealV1, risk_tier: RiskTier) -> Option<EpochSealVerdict> {
+        let issuer = seal.issuer_cell_id().to_string();
+        let epoch_number = seal.epoch_number();
+        let profile = seal.vdf_profile();
+        let key = Self::monotonicity_key_for(seal);
+        let tombstone = self.evicted_tombstones.get(&key).copied();
+
+        // For same-or-lower epochs, defer to monotonicity handling. This
+        // preserves rollback/equivocation semantics as the primary replay
+        // defect signal.
+        if let Some(state) = self.cells.get(&key) {
+            if seal.epoch_number() <= state.epoch {
+                return None;
+            }
+        } else if let Some(evicted) = tombstone {
+            if seal.epoch_number() <= evicted.last_epoch {
+                return None;
+            }
+        }
+
+        let policy_min_difficulty = match self.effective_vdf_policy_for(&key) {
+            VdfPolicy::Optional => None,
+            VdfPolicy::Required { min_difficulty } => Some(min_difficulty),
+        };
+
+        if let Some(min_difficulty) = policy_min_difficulty {
+            if min_difficulty < MIN_VDF_DIFFICULTY {
+                return Some(EpochSealVerdict {
+                    accepted: false,
+                    risk_tier,
+                    epoch_number,
+                    issuer_cell_id: issuer.clone(),
+                    audit_event: EpochSealAuditEvent::VdfDifficultyBelowPolicy {
+                        issuer_cell_id: issuer,
+                        epoch_number,
+                        difficulty: 0,
+                        min_difficulty,
+                    },
+                });
+            }
+        }
+
+        match profile {
+            None => {
+                if let Some(min_difficulty) = policy_min_difficulty {
+                    return Some(EpochSealVerdict {
+                        accepted: false,
+                        risk_tier,
+                        epoch_number,
+                        issuer_cell_id: issuer.clone(),
+                        audit_event: EpochSealAuditEvent::VdfRequiredByPolicy {
+                            issuer_cell_id: issuer,
+                            epoch_number,
+                            min_difficulty,
+                        },
+                    });
+                }
+                None
+            },
+            Some(vdf_profile) => {
+                if let Some(min_difficulty) = policy_min_difficulty {
+                    if vdf_profile.difficulty() < min_difficulty {
+                        return Some(EpochSealVerdict {
+                            accepted: false,
+                            risk_tier,
+                            epoch_number,
+                            issuer_cell_id: issuer.clone(),
+                            audit_event: EpochSealAuditEvent::VdfDifficultyBelowPolicy {
+                                issuer_cell_id: issuer,
+                                epoch_number,
+                                difficulty: vdf_profile.difficulty(),
+                                min_difficulty,
+                            },
+                        });
+                    }
+                }
+
+                let prior_epoch_root = self
+                    .cells
+                    .get(&key)
+                    .map(|state| state.root_hash)
+                    .or_else(|| tombstone.map(|entry| entry.last_root_hash))
+                    .unwrap_or(GENESIS_PRIOR_EPOCH_ROOT);
+                let expected_input_hash = VdfProfileV1::derive_challenge(
+                    seal.cell_id(),
+                    &prior_epoch_root,
+                    seal.quorum_anchor(),
+                );
+
+                if !ct_eq_32(&expected_input_hash, vdf_profile.input_hash()) {
+                    return Some(EpochSealVerdict {
+                        accepted: false,
+                        risk_tier,
+                        epoch_number,
+                        issuer_cell_id: issuer.clone(),
+                        audit_event: EpochSealAuditEvent::VdfInputHashMismatch {
+                            issuer_cell_id: issuer,
+                            epoch_number,
+                        },
+                    });
+                }
+
+                if let Some(verifier) = &self.vdf_verifier {
+                    verifier
+                        .verify_vdf(vdf_profile)
+                        .err()
+                        .map(|error| EpochSealVerdict {
+                            accepted: false,
+                            risk_tier,
+                            epoch_number,
+                            issuer_cell_id: issuer.clone(),
+                            audit_event: EpochSealAuditEvent::VdfRejected {
+                                issuer_cell_id: issuer,
+                                epoch_number,
+                                reason: error.to_string(),
+                            },
+                        })
+                } else {
+                    Some(EpochSealVerdict {
+                        accepted: false,
+                        risk_tier,
+                        epoch_number,
+                        issuer_cell_id: issuer.clone(),
+                        audit_event: EpochSealAuditEvent::NoVdfVerifier {
+                            issuer_cell_id: issuer,
+                            epoch_number,
+                        },
+                    })
+                }
+            },
+        }
+    }
+
     /// Checks monotonicity and equivocation against per-cell state,
     /// updating state on acceptance.
     ///
@@ -1439,11 +1916,7 @@ impl EpochSealVerifier {
     /// HSI section 1.9 rule 4.
     fn verify_monotonicity(&mut self, seal: &EpochSealV1, risk_tier: RiskTier) -> EpochSealVerdict {
         let issuer = seal.issuer_cell_id();
-        let key = MonotonicityKey {
-            cell_id: seal.cell_id().to_string(),
-            htf_time_envelope_ref: *seal.htf_time_envelope_ref(),
-            quorum_anchor: *seal.quorum_anchor(),
-        };
+        let key = Self::monotonicity_key_for(seal);
         // Compute access counter before borrowing `cells` mutably to
         // satisfy the borrow checker.
         let access = self.next_access_counter();
@@ -1476,6 +1949,7 @@ impl EpochSealVerifier {
             state.directory_epoch = seal.directory_epoch();
             state.receipt_batch_epoch = seal.receipt_batch_epoch();
             state.authority_seal_hash = *seal.authority_seal_hash();
+            state.vdf_profile = seal.vdf_profile().cloned();
             state.issuer_cell_id = issuer.to_string();
             EpochSealVerdict {
                 accepted: true,
@@ -1510,10 +1984,10 @@ impl EpochSealVerifier {
     ) -> EpochSealVerdict {
         let issuer = seal.issuer_cell_id();
 
-        // Check evicted high-water mark for replay-after-eviction.
+        // Check evicted tombstone for replay-after-eviction.
         // Fail-closed for Tier2+: reject if epoch <= evicted high-water.
-        if let Some(&hw_epoch) = self.evicted_high_water.get(key) {
-            if seal.epoch_number() <= hw_epoch {
+        if let Some(tombstone) = self.evicted_tombstones.get(key).copied() {
+            if seal.epoch_number() <= tombstone.last_epoch {
                 return EpochSealVerdict {
                     accepted: false,
                     risk_tier,
@@ -1522,13 +1996,13 @@ impl EpochSealVerifier {
                     audit_event: EpochSealAuditEvent::EvictionReplayRejected {
                         issuer_cell_id: issuer.to_string(),
                         epoch_number: seal.epoch_number(),
-                        evicted_high_water_epoch: hw_epoch,
+                        evicted_high_water_epoch: tombstone.last_epoch,
                     },
                 };
             }
             // Seal passes high-water check: remove the high-water entry
             // since this key is being re-introduced with a valid epoch.
-            self.evicted_high_water.remove(key);
+            self.evicted_tombstones.remove(key);
         }
 
         // Per-cell-id limit: prevent a single cell_id from exhausting
@@ -1552,6 +2026,7 @@ impl EpochSealVerifier {
                 directory_epoch: seal.directory_epoch(),
                 receipt_batch_epoch: seal.receipt_batch_epoch(),
                 authority_seal_hash: *seal.authority_seal_hash(),
+                vdf_profile: seal.vdf_profile().cloned(),
                 issuer_cell_id: issuer.to_string(),
                 last_access: access,
             },
@@ -1621,6 +2096,44 @@ impl EpochSealVerifier {
                 EpochSealAuditEvent::NoSignatureVerifier { .. } => {
                     Err(EpochSealVerificationError::NoSignatureVerifier)
                 },
+                EpochSealAuditEvent::VdfRequiredByPolicy {
+                    issuer_cell_id,
+                    epoch_number,
+                    min_difficulty,
+                } => Err(EpochSealVerificationError::VdfRequiredByPolicy {
+                    issuer_cell_id: issuer_cell_id.clone(),
+                    epoch_number: *epoch_number,
+                    min_difficulty: *min_difficulty,
+                }),
+                EpochSealAuditEvent::VdfDifficultyBelowPolicy {
+                    issuer_cell_id,
+                    epoch_number,
+                    difficulty,
+                    min_difficulty,
+                } => Err(EpochSealVerificationError::VdfDifficultyBelowPolicy {
+                    issuer_cell_id: issuer_cell_id.clone(),
+                    epoch_number: *epoch_number,
+                    difficulty: *difficulty,
+                    min_difficulty: *min_difficulty,
+                }),
+                EpochSealAuditEvent::NoVdfVerifier { .. } => {
+                    Err(EpochSealVerificationError::NoVdfVerifier)
+                },
+                EpochSealAuditEvent::VdfInputHashMismatch {
+                    issuer_cell_id,
+                    epoch_number,
+                } => Err(EpochSealVerificationError::VdfInputHashMismatch {
+                    issuer_cell_id: issuer_cell_id.clone(),
+                    epoch_number: *epoch_number,
+                }),
+                EpochSealAuditEvent::VdfRejected {
+                    issuer_cell_id,
+                    reason,
+                    ..
+                } => Err(EpochSealVerificationError::VdfRejected {
+                    issuer_cell_id: issuer_cell_id.clone(),
+                    reason: reason.clone(),
+                }),
                 EpochSealAuditEvent::EvictionReplayRejected {
                     epoch_number,
                     evicted_high_water_epoch,
@@ -1695,7 +2208,8 @@ impl EpochSealVerifier {
 ///
 /// Identity for same-epoch idempotence requires ALL seal fields to match:
 /// `sealed_root_hash`, `content_hash`, `directory_epoch`,
-/// `receipt_batch_epoch`, `authority_seal_hash`, and `issuer_cell_id`.
+/// `receipt_batch_epoch`, `authority_seal_hash`, `vdf_profile`, and
+/// `issuer_cell_id`.
 /// Any field difference is equivocation (distinct seals at the same epoch).
 ///
 /// Note: `cell_id`, `htf_time_envelope_ref`, and `quorum_anchor` are
@@ -1706,11 +2220,12 @@ fn verify_same_epoch(
     risk_tier: RiskTier,
 ) -> EpochSealVerdict {
     let issuer = seal.issuer_cell_id();
-    let all_match = seal.sealed_root_hash() == &state.root_hash
-        && seal.content_hash() == &state.content_hash
+    let all_match = ct_eq_32(seal.sealed_root_hash(), &state.root_hash)
+        && ct_eq_32(seal.content_hash(), &state.content_hash)
         && seal.directory_epoch() == state.directory_epoch
         && seal.receipt_batch_epoch() == state.receipt_batch_epoch
-        && seal.authority_seal_hash() == &state.authority_seal_hash
+        && ct_eq_32(seal.authority_seal_hash(), &state.authority_seal_hash)
+        && seal.vdf_profile() == state.vdf_profile.as_ref()
         && seal.issuer_cell_id() == state.issuer_cell_id;
 
     if all_match {
@@ -1763,7 +2278,13 @@ pub const fn is_seal_required_tier(risk_tier: RiskTier) -> bool {
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::htf::vdf_profile::{
+        DefaultVdfVerifier, MAX_VDF_DIFFICULTY, MAX_VDF_OUTPUT_LENGTH, SlothV1Verifier,
+        VdfProfileV1, VdfScheme,
+    };
 
     // =========================================================================
     // Helper functions
@@ -1800,6 +2321,18 @@ mod tests {
     }
     fn fixed_auth() -> [u8; 32] {
         test_anchor_hash(0xC0)
+    }
+
+    fn make_vdf_profile(
+        cell_id: &str,
+        prior_epoch_root: [u8; 32],
+        quorum_anchor: [u8; 32],
+        difficulty: u64,
+    ) -> VdfProfileV1 {
+        let input_hash = VdfProfileV1::derive_challenge(cell_id, &prior_epoch_root, &quorum_anchor);
+        let output = SlothV1Verifier::evaluate(&input_hash, difficulty).to_vec();
+        VdfProfileV1::new(VdfScheme::SlothV1, input_hash, output, difficulty)
+            .expect("valid vdf profile")
     }
 
     /// Builds a seal whose `content_hash` equals `compute_content_hash()`.
@@ -1849,6 +2382,7 @@ mod tests {
             receipt_batch_epoch,
             htf_time_envelope_ref,
             quorum_anchor,
+            None,
             authority_seal_hash,
         )
         .expect("valid seal (placeholder pass)");
@@ -1865,6 +2399,7 @@ mod tests {
             receipt_batch_epoch,
             htf_time_envelope_ref,
             quorum_anchor,
+            None,
             authority_seal_hash,
         )
         .expect("valid seal (final pass)")
@@ -1890,9 +2425,61 @@ mod tests {
             epoch,
             fixed_htf_ref(),
             fixed_quorum(),
+            None,
             fixed_auth(),
         )
         .expect("valid seal")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_seal_full_with_vdf(
+        epoch: u64,
+        issuer: &str,
+        root_hash: [u8; 32],
+        cell_id: &str,
+        directory_epoch: u64,
+        receipt_batch_epoch: u64,
+        htf_time_envelope_ref: [u8; 32],
+        quorum_anchor: [u8; 32],
+        authority_seal_hash: [u8; 32],
+        prior_epoch_root: [u8; 32],
+        vdf_difficulty: u64,
+    ) -> EpochSealV1 {
+        let vdf_profile =
+            make_vdf_profile(cell_id, prior_epoch_root, quorum_anchor, vdf_difficulty);
+
+        let placeholder = EpochSealV1::new(
+            epoch,
+            root_hash,
+            issuer,
+            test_signature(),
+            [0xEE; 32], // placeholder content hash
+            cell_id,
+            directory_epoch,
+            receipt_batch_epoch,
+            htf_time_envelope_ref,
+            quorum_anchor,
+            Some(vdf_profile.clone()),
+            authority_seal_hash,
+        )
+        .expect("valid seal (vdf placeholder pass)");
+
+        let content_hash = placeholder.compute_content_hash();
+        EpochSealV1::new(
+            epoch,
+            root_hash,
+            issuer,
+            test_signature(),
+            content_hash,
+            cell_id,
+            directory_epoch,
+            receipt_batch_epoch,
+            htf_time_envelope_ref,
+            quorum_anchor,
+            Some(vdf_profile),
+            authority_seal_hash,
+        )
+        .expect("valid seal (vdf final pass)")
     }
 
     /// A test signature verifier that accepts all seals.
@@ -1933,9 +2520,41 @@ mod tests {
         }
     }
 
+    /// Test resolver for per-cell VDF policy selection.
+    #[derive(Debug)]
+    struct StaticPolicyResolver {
+        default_policy: VdfPolicy,
+        by_cell: HashMap<String, VdfPolicy>,
+    }
+
+    impl StaticPolicyResolver {
+        fn new(default_policy: VdfPolicy, by_cell: HashMap<String, VdfPolicy>) -> Self {
+            Self {
+                default_policy,
+                by_cell,
+            }
+        }
+    }
+
+    impl VdfPolicyResolver for StaticPolicyResolver {
+        fn resolve_policy(&self, key: &str) -> VdfPolicy {
+            self.by_cell
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| self.default_policy.clone())
+        }
+    }
+
     /// Creates a verifier with the accept-all test signature verifier.
     fn test_verifier() -> EpochSealVerifier {
         EpochSealVerifier::with_signature_verifier(Box::new(AcceptAllVerifier))
+    }
+
+    fn test_verifier_with_vdf(policy: VdfPolicy) -> EpochSealVerifier {
+        let mut verifier = test_verifier();
+        verifier.set_vdf_verifier(Box::new(DefaultVdfVerifier::default()));
+        verifier.set_vdf_policy(policy);
+        verifier
     }
 
     // =========================================================================
@@ -1955,6 +2574,7 @@ mod tests {
             20,
             test_anchor_hash(0x50),
             test_anchor_hash(0x60),
+            None,
             test_anchor_hash(0x70),
         )
         .unwrap();
@@ -1991,6 +2611,7 @@ mod tests {
             1,
             test_anchor_hash(0xA0),
             test_anchor_hash(0xB0),
+            None,
             test_anchor_hash(0xC0),
         )
     }
@@ -2048,6 +2669,7 @@ mod tests {
             1,
             test_anchor_hash(0xA0),
             test_anchor_hash(0xB0),
+            None,
             test_anchor_hash(0xC0),
         );
         assert!(matches!(result, Err(EpochSealError::EmptyCellId)));
@@ -2066,6 +2688,7 @@ mod tests {
             1,
             [0u8; 32], // zero time envelope ref
             test_anchor_hash(0xB0),
+            None,
             test_anchor_hash(0xC0),
         );
         assert!(matches!(result, Err(EpochSealError::ZeroTimeEnvelopeRef)));
@@ -2084,6 +2707,7 @@ mod tests {
             1,
             test_anchor_hash(0xA0),
             [0u8; 32], // zero quorum anchor
+            None,
             test_anchor_hash(0xC0),
         );
         assert!(matches!(result, Err(EpochSealError::ZeroQuorumAnchor)));
@@ -2102,6 +2726,7 @@ mod tests {
             1,
             test_anchor_hash(0xA0),
             test_anchor_hash(0xB0),
+            None,
             [0u8; 32], // zero authority seal hash
         );
         assert!(matches!(result, Err(EpochSealError::ZeroAuthoritySealHash)));
@@ -2177,6 +2802,7 @@ mod tests {
                 20,
                 test_anchor_hash(0xA1),
                 test_anchor_hash(0xB1),
+                None,
                 test_anchor_hash(0xC1),
             )
             .unwrap();
@@ -2193,6 +2819,7 @@ mod tests {
                 21,
                 test_anchor_hash(0xA2),
                 test_anchor_hash(0xB2),
+                None,
                 test_anchor_hash(0xC2),
             )
             .unwrap();
@@ -2209,6 +2836,7 @@ mod tests {
                 22,
                 test_anchor_hash(0xA3),
                 test_anchor_hash(0xB3),
+                None,
                 test_anchor_hash(0xC3),
             )
             .unwrap();
@@ -2228,6 +2856,7 @@ mod tests {
             1,
             test_anchor_hash(0xA0),
             test_anchor_hash(0xB0),
+            None,
             test_anchor_hash(0xC0),
         );
         assert!(matches!(
@@ -3573,6 +4202,7 @@ mod tests {
             3,
             test_anchor_hash(0x42_u8.wrapping_add(0x20)),
             test_anchor_hash(0x42_u8.wrapping_add(0x30)),
+            None,
             test_anchor_hash(0x42_u8.wrapping_add(0x40)),
         )
         .unwrap();
@@ -3594,6 +4224,7 @@ mod tests {
             3,
             test_anchor_hash(0x42_u8.wrapping_add(0x20)),
             test_anchor_hash(0xFF), // different quorum anchor
+            None,
             test_anchor_hash(0x42_u8.wrapping_add(0x40)),
         )
         .unwrap();
@@ -3678,6 +4309,443 @@ mod tests {
         // --- Phase 5: Tier2+ requires seal (fail-closed) ---
         assert!(EpochSealVerifier::require_seal_for_tier(RiskTier::Tier3).is_err());
         assert!(EpochSealVerifier::require_seal_for_tier(RiskTier::Tier0).is_ok());
+    }
+
+    // =========================================================================
+    // VDF profile + policy tests (TCK-00366)
+    // =========================================================================
+
+    #[test]
+    fn seal_without_vdf_is_accepted_when_policy_optional() {
+        let mut verifier = test_verifier();
+        verifier.set_vdf_policy(VdfPolicy::Optional);
+
+        let seal = make_seal(1, "cell-optional", 0x21);
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(verdict.accepted);
+        assert!(seal.vdf_profile().is_none());
+    }
+
+    #[test]
+    fn verifier_configuration_tracks_vdf_settings() {
+        let mut verifier = test_verifier();
+        assert!(!verifier.has_vdf_verifier());
+        assert_eq!(*verifier.vdf_policy(), VdfPolicy::Optional);
+
+        verifier.set_vdf_policy(VdfPolicy::Required { min_difficulty: 7 });
+        verifier.set_vdf_verifier(Box::new(DefaultVdfVerifier::default()));
+
+        assert!(verifier.has_vdf_verifier());
+        assert_eq!(
+            *verifier.vdf_policy(),
+            VdfPolicy::Required { min_difficulty: 7 }
+        );
+    }
+
+    #[test]
+    fn mixed_policy_enforcement_works_in_single_verifier_instance() {
+        let mut verifier = test_verifier();
+        verifier.set_vdf_verifier(Box::new(DefaultVdfVerifier::default()));
+        verifier.set_vdf_policy(VdfPolicy::Required { min_difficulty: 99 });
+
+        let resolver = StaticPolicyResolver::new(
+            VdfPolicy::Optional,
+            HashMap::from([
+                (
+                    "cell-required-valid".to_string(),
+                    VdfPolicy::Required { min_difficulty: 4 },
+                ),
+                (
+                    "cell-required-missing".to_string(),
+                    VdfPolicy::Required { min_difficulty: 4 },
+                ),
+                ("cell-optional-missing".to_string(), VdfPolicy::Optional),
+            ]),
+        );
+        verifier.set_vdf_policy_resolver(Arc::new(resolver));
+        assert!(verifier.has_vdf_policy_resolver());
+
+        let required_valid = make_seal_full_with_vdf(
+            1,
+            "issuer-required-valid",
+            test_root_hash(0x34),
+            "cell-required-valid",
+            10,
+            10,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+        let required_missing = make_seal_full(
+            1,
+            "issuer-required-missing",
+            test_root_hash(0x35),
+            "cell-required-missing",
+            11,
+            11,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+        );
+        let optional_missing = make_seal_full(
+            1,
+            "issuer-optional-missing",
+            test_root_hash(0x36),
+            "cell-optional-missing",
+            12,
+            12,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+        );
+
+        let required_valid_verdict = verifier.verify(&required_valid, RiskTier::Tier2);
+        assert!(required_valid_verdict.accepted);
+
+        let required_missing_verdict = verifier.verify(&required_missing, RiskTier::Tier2);
+        assert!(!required_missing_verdict.accepted);
+        assert!(matches!(
+            required_missing_verdict.audit_event,
+            EpochSealAuditEvent::VdfRequiredByPolicy {
+                min_difficulty: 4,
+                ..
+            }
+        ));
+
+        let optional_missing_verdict = verifier.verify(&optional_missing, RiskTier::Tier2);
+        assert!(optional_missing_verdict.accepted);
+    }
+
+    #[test]
+    fn valid_sloth_vdf_profile_passes_verification() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
+        let seal = make_seal_full_with_vdf(
+            1,
+            "issuer-vdf",
+            test_root_hash(0x31),
+            "cell-vdf",
+            10,
+            20,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(verdict.accepted);
+        assert!(seal.vdf_profile().is_some());
+    }
+
+    #[test]
+    fn required_policy_accepts_vdf_when_min_difficulty_satisfied() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Required { min_difficulty: 4 });
+        let seal = make_seal_full_with_vdf(
+            1,
+            "issuer-required",
+            test_root_hash(0x41),
+            "cell-required",
+            30,
+            40,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+
+        let verdict = verifier.verify(&seal, RiskTier::Tier3);
+        assert!(verdict.accepted);
+    }
+
+    #[test]
+    fn vdf_present_without_vdf_verifier_is_rejected_fail_closed() {
+        let mut verifier = test_verifier();
+        verifier.set_vdf_policy(VdfPolicy::Optional);
+
+        let seal = make_seal_full_with_vdf(
+            1,
+            "issuer-no-vdf-verifier",
+            test_root_hash(0x51),
+            "cell-no-vdf-verifier",
+            1,
+            1,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            3,
+        );
+
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(!verdict.accepted);
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::NoVdfVerifier {
+                epoch_number: 1,
+                ..
+            }
+        ));
+        let err = verifier.verify_or_reject(&seal, RiskTier::Tier2);
+        assert!(matches!(
+            err,
+            Err(EpochSealVerificationError::NoVdfVerifier)
+        ));
+    }
+
+    #[test]
+    fn required_policy_rejects_missing_vdf_profile() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Required {
+            min_difficulty: MIN_VDF_DIFFICULTY,
+        });
+        let seal = make_seal(1, "cell-required-no-vdf", 0x61);
+
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(!verdict.accepted);
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::VdfRequiredByPolicy {
+                min_difficulty: MIN_VDF_DIFFICULTY,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn required_policy_rejects_vdf_below_minimum_difficulty() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Required { min_difficulty: 8 });
+        let seal = make_seal_full_with_vdf(
+            1,
+            "issuer-low-vdf",
+            test_root_hash(0x71),
+            "cell-low-vdf",
+            5,
+            6,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(!verdict.accepted);
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::VdfDifficultyBelowPolicy {
+                difficulty: 4,
+                min_difficulty: 8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn forged_vdf_output_is_rejected_deterministically() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
+        let input_hash = VdfProfileV1::derive_challenge(
+            "cell-forged-vdf",
+            &GENESIS_PRIOR_EPOCH_ROOT,
+            &fixed_quorum(),
+        );
+        let mut forged_output = SlothV1Verifier::evaluate(&input_hash, 5).to_vec();
+        forged_output[0] ^= 0x01;
+        let forged_profile = VdfProfileV1::new(VdfScheme::SlothV1, input_hash, forged_output, 5)
+            .expect("forged profile remains structurally valid");
+
+        let placeholder = EpochSealV1::new(
+            1,
+            test_root_hash(0x81),
+            "issuer-forged-vdf",
+            test_signature(),
+            [0xEF; 32],
+            "cell-forged-vdf",
+            1,
+            1,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            Some(forged_profile.clone()),
+            fixed_auth(),
+        )
+        .expect("placeholder seal must be valid");
+        let content_hash = placeholder.compute_content_hash();
+
+        let seal = EpochSealV1::new(
+            1,
+            test_root_hash(0x81),
+            "issuer-forged-vdf",
+            test_signature(),
+            content_hash,
+            "cell-forged-vdf",
+            1,
+            1,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            Some(forged_profile),
+            fixed_auth(),
+        )
+        .expect("final seal must be valid");
+
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(!verdict.accepted);
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::VdfRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn vdf_challenge_mismatch_is_rejected() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
+        let wrong_input = VdfProfileV1::derive_challenge(
+            "wrong-cell",
+            &GENESIS_PRIOR_EPOCH_ROOT,
+            &fixed_quorum(),
+        );
+        let output = SlothV1Verifier::evaluate(&wrong_input, 3).to_vec();
+        let mismatched_profile =
+            VdfProfileV1::new(VdfScheme::SlothV1, wrong_input, output, 3).expect("valid profile");
+
+        let placeholder = EpochSealV1::new(
+            1,
+            test_root_hash(0x91),
+            "issuer-input-mismatch",
+            test_signature(),
+            [0xCD; 32],
+            "cell-input-mismatch",
+            1,
+            1,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            Some(mismatched_profile.clone()),
+            fixed_auth(),
+        )
+        .expect("placeholder seal must be valid");
+        let content_hash = placeholder.compute_content_hash();
+        let seal = EpochSealV1::new(
+            1,
+            test_root_hash(0x91),
+            "issuer-input-mismatch",
+            test_signature(),
+            content_hash,
+            "cell-input-mismatch",
+            1,
+            1,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            Some(mismatched_profile),
+            fixed_auth(),
+        )
+        .expect("final seal must be valid");
+
+        let verdict = verifier.verify(&seal, RiskTier::Tier2);
+        assert!(!verdict.accepted);
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::VdfInputHashMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn non_monotone_vdf_sealed_epochs_are_rejected() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
+        let seal1 = make_seal_full_with_vdf(
+            1,
+            "issuer-vdf-monotone",
+            test_root_hash(0xA1),
+            "cell-vdf-monotone",
+            1,
+            1,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            2,
+        );
+        let seal2 = make_seal_full_with_vdf(
+            2,
+            "issuer-vdf-monotone",
+            test_root_hash(0xA2),
+            "cell-vdf-monotone",
+            2,
+            2,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            *seal1.sealed_root_hash(),
+            2,
+        );
+
+        let verdict1 = verifier.verify(&seal1, RiskTier::Tier2);
+        let verdict2 = verifier.verify(&seal2, RiskTier::Tier2);
+        let verdict3 = verifier.verify(&seal1, RiskTier::Tier2);
+
+        let events = [
+            verdict1.audit_event.kind(),
+            verdict2.audit_event.kind(),
+            verdict3.audit_event.kind(),
+        ];
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], "epoch_seal.accepted");
+        assert_eq!(events[1], "epoch_seal.accepted");
+        assert_eq!(events[2], "epoch_seal.rollback_rejected");
+        assert!(!verdict3.accepted);
+    }
+
+    #[test]
+    fn vdf_profile_none_is_skipped_during_serialization() {
+        let seal = make_seal(1, "cell-no-vdf-serde", 0x33);
+        let json = serde_json::to_value(&seal).unwrap();
+        assert!(json.get("vdf_profile").is_none());
+    }
+
+    #[test]
+    fn vdf_profile_validation_rejects_bounded_violations() {
+        let result_zero_hash = VdfProfileV1::new(VdfScheme::SlothV1, [0u8; 32], vec![0xAA; 32], 1);
+        let result_empty_output =
+            VdfProfileV1::new(VdfScheme::SlothV1, test_anchor_hash(0x01), Vec::new(), 1);
+        let result_oversized_output = VdfProfileV1::new(
+            VdfScheme::SlothV1,
+            test_anchor_hash(0x01),
+            vec![0xAA; MAX_VDF_OUTPUT_LENGTH + 1],
+            1,
+        );
+        let result_zero_difficulty = VdfProfileV1::new(
+            VdfScheme::SlothV1,
+            test_anchor_hash(0x01),
+            vec![0xAA; 32],
+            0,
+        );
+        let result_over_max_difficulty = VdfProfileV1::new(
+            VdfScheme::SlothV1,
+            test_anchor_hash(0x01),
+            vec![0xAA; 32],
+            MAX_VDF_DIFFICULTY + 1,
+        );
+
+        assert!(matches!(
+            result_zero_hash,
+            Err(VdfProfileError::ZeroInputHash)
+        ));
+        assert!(matches!(
+            result_empty_output,
+            Err(VdfProfileError::EmptyOutput)
+        ));
+        assert!(matches!(
+            result_oversized_output,
+            Err(VdfProfileError::OutputTooLong { .. })
+        ));
+        assert!(matches!(
+            result_zero_difficulty,
+            Err(VdfProfileError::DifficultyTooLow { .. })
+        ));
+        assert!(matches!(
+            result_over_max_difficulty,
+            Err(VdfProfileError::DifficultyTooHigh { .. })
+        ));
     }
 
     // =========================================================================
@@ -3937,6 +5005,140 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn evicted_key_valid_next_vdf_seal_uses_tombstone_root() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
+
+        let target = make_seal_full_with_vdf(
+            10,
+            "issuer-evict-vdf",
+            test_root_hash(0x71),
+            "cell-evict-vdf",
+            10,
+            10,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+        assert!(verifier.verify(&target, RiskTier::Tier2).accepted);
+
+        for i in 1..=MAX_TRACKED_ISSUERS {
+            let cell_id = format!("fill-cell-vdf-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x22),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash((i & 0xFF) as u8),
+                test_anchor_hash(((i >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xC2),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+
+        assert_eq!(verifier.evicted_tombstone_count(), 1);
+
+        let next_epoch = make_seal_full_with_vdf(
+            11,
+            "issuer-evict-vdf",
+            test_root_hash(0x72),
+            "cell-evict-vdf",
+            11,
+            11,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            *target.sealed_root_hash(),
+            4,
+        );
+        let verdict = verifier.verify(&next_epoch, RiskTier::Tier2);
+        assert!(verdict.accepted);
+
+        // Promotion check: after re-admission from tombstone state, the key
+        // must continue as a normal monotonic chain.
+        let next_next = make_seal_full_with_vdf(
+            12,
+            "issuer-evict-vdf",
+            test_root_hash(0x73),
+            "cell-evict-vdf",
+            12,
+            12,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            *next_epoch.sealed_root_hash(),
+            4,
+        );
+        let next_next_verdict = verifier.verify(&next_next, RiskTier::Tier2);
+        assert!(next_next_verdict.accepted);
+    }
+
+    #[test]
+    fn evicted_key_replay_with_vdf_is_rejected_by_tombstone_epoch() {
+        let mut verifier = test_verifier_with_vdf(VdfPolicy::Optional);
+
+        let target = make_seal_full_with_vdf(
+            8,
+            "issuer-evict-replay",
+            test_root_hash(0x81),
+            "cell-evict-replay",
+            8,
+            8,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+        assert!(verifier.verify(&target, RiskTier::Tier2).accepted);
+
+        for i in 1..=MAX_TRACKED_ISSUERS {
+            let cell_id = format!("fill-cell-replay-{i}");
+            let seal = make_seal_full(
+                1,
+                &cell_id,
+                test_root_hash(0x44),
+                &cell_id,
+                1,
+                1,
+                test_anchor_hash((i & 0xFF) as u8),
+                test_anchor_hash(((i >> 8) & 0xFF) as u8 | 0x01),
+                test_anchor_hash(0xD2),
+            );
+            verifier.verify(&seal, RiskTier::Tier0);
+        }
+
+        assert_eq!(verifier.evicted_tombstone_count(), 1);
+
+        let replay = make_seal_full_with_vdf(
+            8,
+            "issuer-evict-replay",
+            test_root_hash(0x81),
+            "cell-evict-replay",
+            8,
+            8,
+            fixed_htf_ref(),
+            fixed_quorum(),
+            fixed_auth(),
+            GENESIS_PRIOR_EPOCH_ROOT,
+            4,
+        );
+        let verdict = verifier.verify(&replay, RiskTier::Tier2);
+        assert!(!verdict.accepted);
+        assert!(matches!(
+            verdict.audit_event,
+            EpochSealAuditEvent::EvictionReplayRejected {
+                epoch_number: 8,
+                evicted_high_water_epoch: 8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn eviction_replay_rejected_after_lru_eviction() {
         // Fill verifier to capacity, evict, then replay the evicted
         // issuer with the same epoch. The replayed seal must be rejected.
@@ -4065,7 +5267,7 @@ mod tests {
 
     #[test]
     fn eviction_high_water_count_bounded() {
-        // Verify that the evicted high-water map doesn't grow unbounded.
+        // Verify that the eviction tombstone map doesn't grow unbounded.
         let mut verifier = test_verifier();
 
         // Create and evict many keys.
@@ -4103,7 +5305,7 @@ mod tests {
 
         assert!(
             verifier.evicted_high_water_count() <= MAX_EVICTION_HIGH_WATER_MARKS,
-            "evicted high-water map must be bounded at {}, got {}",
+            "eviction tombstone map must be bounded at {}, got {}",
             MAX_EVICTION_HIGH_WATER_MARKS,
             verifier.evicted_high_water_count()
         );

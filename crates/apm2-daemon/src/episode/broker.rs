@@ -44,7 +44,9 @@ use apm2_core::context::firewall::{
     ContextAwareValidator, ContextRiskTier, DefaultContextFirewall, FirewallViolationDefect,
     RiskTierFirewallPolicy, ToctouVerifier, ValidationResult,
 };
-use apm2_core::htf::{EpochSealV1, EpochSealVerifier, SignatureVerifier};
+use apm2_core::htf::{
+    EpochSealV1, EpochSealVerifier, SignatureVerifier, VdfPolicy, VdfPolicyResolver, VdfVerifier,
+};
 use apm2_core::policy::{Decision as CoreDecision, LoadedPolicy, PolicyEngine};
 use apm2_core::tool::{
     IdempotencyPrecondition, PreconditionEvaluator, ShellBridgePolicy, ToolKindError,
@@ -1158,6 +1160,40 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         self
     }
 
+    /// Configures the epoch seal VDF policy used during admission.
+    ///
+    /// This allows callers to require VDF proofs (for adversarial links) or
+    /// keep them optional (local mode), instead of hardcoding broker defaults.
+    #[must_use]
+    pub fn with_vdf_policy(mut self, policy: VdfPolicy) -> Self {
+        self.epoch_seal_verifier.get_mut().set_vdf_policy(policy);
+        self
+    }
+
+    /// Configures the epoch seal VDF verifier used during admission.
+    ///
+    /// Without a configured verifier, any seal that carries a VDF profile is
+    /// rejected fail-closed.
+    #[must_use]
+    pub fn with_vdf_verifier(mut self, verifier: Box<dyn VdfVerifier>) -> Self {
+        self.epoch_seal_verifier
+            .get_mut()
+            .set_vdf_verifier(verifier);
+        self
+    }
+
+    /// Configures a per-key VDF policy resolver for epoch seal admission.
+    ///
+    /// When configured, this resolver is authoritative and is used instead of
+    /// the broker's global VDF policy.
+    #[must_use]
+    pub fn with_vdf_policy_resolver(mut self, resolver: Arc<dyn VdfPolicyResolver>) -> Self {
+        self.epoch_seal_verifier
+            .get_mut()
+            .set_vdf_policy_resolver(resolver);
+        self
+    }
+
     /// Configures the epoch seal signature verifier (TCK-00365).
     ///
     /// Per REQ-0019, Tier2+ authority claims require cryptographic
@@ -1168,6 +1204,27 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             .lock()
             .await
             .set_signature_verifier(verifier);
+    }
+
+    /// Configures the epoch seal VDF verifier at runtime.
+    pub async fn set_epoch_seal_vdf_verifier(&self, verifier: Box<dyn VdfVerifier>) {
+        self.epoch_seal_verifier
+            .lock()
+            .await
+            .set_vdf_verifier(verifier);
+    }
+
+    /// Configures the epoch seal VDF policy at runtime.
+    pub async fn set_epoch_seal_vdf_policy(&self, policy: VdfPolicy) {
+        self.epoch_seal_verifier.lock().await.set_vdf_policy(policy);
+    }
+
+    /// Configures the epoch seal VDF policy resolver at runtime.
+    pub async fn set_epoch_seal_vdf_policy_resolver(&self, resolver: Arc<dyn VdfPolicyResolver>) {
+        self.epoch_seal_verifier
+            .lock()
+            .await
+            .set_vdf_policy_resolver(resolver);
     }
 
     /// Verifies an epoch seal against the broker's verifier (TCK-00365).
@@ -6891,6 +6948,7 @@ policy:
             epoch,
             htf_ref,
             quorum,
+            None,
             auth,
         )
         .expect("valid seal placeholder");
@@ -6907,9 +6965,68 @@ policy:
             epoch,
             htf_ref,
             quorum,
+            None,
             auth,
         )
         .expect("valid seal")
+    }
+
+    /// Helper: builds a valid `EpochSealV1` with an attached valid Sloth VDF
+    /// profile.
+    fn make_epoch_seal_with_vdf(
+        epoch: u64,
+        prior_epoch_root: [u8; 32],
+        difficulty: u64,
+    ) -> apm2_core::htf::EpochSealV1 {
+        let root_hash = [0x11u8; 32];
+        let htf_ref = [0xA0u8; 32];
+        let quorum = [0xB0u8; 32];
+        let auth = [0xC0u8; 32];
+        let sig = [0xFFu8; 64];
+
+        let input_hash =
+            apm2_core::htf::VdfProfileV1::derive_challenge("test-cell", &prior_epoch_root, &quorum);
+        let output = apm2_core::htf::SlothV1Verifier::evaluate(&input_hash, difficulty).to_vec();
+        let vdf_profile = apm2_core::htf::VdfProfileV1::new(
+            apm2_core::htf::VdfScheme::SlothV1,
+            input_hash,
+            output,
+            difficulty,
+        )
+        .expect("valid VDF profile");
+
+        let placeholder = apm2_core::htf::EpochSealV1::new(
+            epoch,
+            root_hash,
+            "test-issuer",
+            sig,
+            [0x01u8; 32], // placeholder content hash
+            "test-cell",
+            epoch,
+            epoch,
+            htf_ref,
+            quorum,
+            Some(vdf_profile.clone()),
+            auth,
+        )
+        .expect("valid seal placeholder (vdf)");
+        let content_hash = placeholder.compute_content_hash();
+
+        apm2_core::htf::EpochSealV1::new(
+            epoch,
+            root_hash,
+            "test-issuer",
+            sig,
+            content_hash,
+            "test-cell",
+            epoch,
+            epoch,
+            htf_ref,
+            quorum,
+            Some(vdf_profile),
+            auth,
+        )
+        .expect("valid seal (vdf)")
     }
 
     /// A test signature verifier that accepts all seals.
@@ -7097,6 +7214,113 @@ policy:
             decision.is_allowed(),
             "Tier2 with valid epoch seal must be allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn broker_epoch_seal_required_vdf_policy_rejects_missing_and_accepts_valid_vdf() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("file.rs");
+        let file_content = b"// required vdf policy test\n";
+        std::fs::write(&file_path, file_content).unwrap();
+        let content_hash = *blake3::hash(file_content).as_bytes();
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let dir_path_str = temp_dir.path().to_string_lossy().to_string();
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
+            .with_vdf_policy(apm2_core::htf::VdfPolicy::Required { min_difficulty: 4 })
+            .with_vdf_verifier(Box::new(apm2_core::htf::DefaultVdfVerifier::default()));
+
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from(&dir_path_str)],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let context_manifest = make_context_manifest(
+            vec![(file_path_str.as_str(), content_hash)],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        broker
+            .set_epoch_seal_signature_verifier(Box::new(AcceptAllVerifier))
+            .await;
+
+        // Missing VDF profile must be rejected when policy is Required.
+        let no_vdf_request = make_request_at_tier_with_path(
+            "req-seal-vdf-required-1",
+            RiskTier::Tier2,
+            Some(make_epoch_seal(1)),
+            &file_path_str,
+        );
+        let no_vdf_decision = broker
+            .request(&no_vdf_request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+        assert!(
+            no_vdf_decision.is_denied(),
+            "Tier2 seal without VDF must be denied when VDF policy is Required"
+        );
+        if let ToolDecision::Deny { rule_id, .. } = &no_vdf_decision {
+            assert_eq!(rule_id.as_deref(), Some("EPOCH_SEAL"));
+        }
+
+        // Valid VDF profile must be accepted when policy is Required.
+        let with_vdf_request = make_request_at_tier_with_path(
+            "req-seal-vdf-required-2",
+            RiskTier::Tier2,
+            Some(make_epoch_seal_with_vdf(1, [0u8; 32], 4)),
+            &file_path_str,
+        );
+        let with_vdf_decision = broker
+            .request(&with_vdf_request, timestamp_ns(1), None)
+            .await
+            .unwrap();
+        assert!(
+            with_vdf_decision.is_allowed(),
+            "Tier2 seal with valid VDF must be allowed when VDF policy is Required"
+        );
+    }
+
+    #[derive(Debug)]
+    struct OptionalPolicyResolver;
+
+    impl apm2_core::htf::VdfPolicyResolver for OptionalPolicyResolver {
+        fn resolve_policy(&self, _key: &str) -> apm2_core::htf::VdfPolicy {
+            apm2_core::htf::VdfPolicy::Optional
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_with_vdf_policy_resolver_wires_epoch_seal_verifier() {
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
+            .with_vdf_policy_resolver(std::sync::Arc::new(OptionalPolicyResolver));
+
+        let has_resolver = broker
+            .epoch_seal_verifier
+            .lock()
+            .await
+            .has_vdf_policy_resolver();
+        assert!(has_resolver);
+    }
+
+    #[tokio::test]
+    async fn broker_set_vdf_policy_resolver_wires_epoch_seal_verifier() {
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+        broker
+            .set_epoch_seal_vdf_policy_resolver(std::sync::Arc::new(OptionalPolicyResolver))
+            .await;
+
+        let has_resolver = broker
+            .epoch_seal_verifier
+            .lock()
+            .await
+            .has_vdf_policy_resolver();
+        assert!(has_resolver);
     }
 
     #[tokio::test]
