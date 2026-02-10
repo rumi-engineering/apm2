@@ -12,6 +12,10 @@
 //! in split stages from `handle_request_tool`:
 //! `join -> revalidate-before-decision -> broker decision ->
 //!  revalidate-before-execution -> consume-before-effect`.
+//!
+//! Anti-entropy economics is exposed through
+//! [`LifecycleGate::enforce_anti_entropy_economics`] as a runtime hook for
+//! daemon catch-up sync paths.
 
 pub mod durable_consume;
 mod lifecycle_gate;

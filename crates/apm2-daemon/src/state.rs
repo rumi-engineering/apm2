@@ -1061,7 +1061,11 @@ impl DispatcherState {
                             consume_log_path.display()
                         )
                     })?;
-                    let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+                    let tick_kernel = Arc::new(
+                        crate::pcac::InProcessKernel::new(1).with_verifier_economics(
+                            apm2_core::pcac::VerifierEconomicsProfile::default(),
+                        ),
+                    );
                     let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
                         Arc::clone(&tick_kernel),
                         Box::new(durable_index),
@@ -1080,6 +1084,9 @@ impl DispatcherState {
                             Arc::clone(&stop_authority),
                         ),
                     );
+                    // TODO(TCK-ANTI-ENTROPY-RUNTIME): when daemon anti-entropy
+                    // catch-up is wired, route verification through
+                    // `pcac_gate.enforce_anti_entropy_economics(...)`.
                     privileged_dispatcher =
                         privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
                     session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
@@ -1438,7 +1445,10 @@ impl DispatcherState {
                 consume_log_path.display()
             ),
         })?;
-        let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+        let tick_kernel = Arc::new(
+            crate::pcac::InProcessKernel::new(1)
+                .with_verifier_economics(apm2_core::pcac::VerifierEconomicsProfile::default()),
+        );
         let durable_kernel = crate::pcac::DurableKernel::new_with_shared_kernel(
             Arc::clone(&tick_kernel),
             Box::new(durable_index),
@@ -1456,6 +1466,9 @@ impl DispatcherState {
                 Arc::clone(&stop_authority),
             ),
         );
+        // TODO(TCK-ANTI-ENTROPY-RUNTIME): when daemon anti-entropy catch-up is
+        // wired, route verification through
+        // `pcac_gate.enforce_anti_entropy_economics(...)`.
         privileged_dispatcher =
             privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
         let mut session_dispatcher =
