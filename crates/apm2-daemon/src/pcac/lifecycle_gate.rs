@@ -42,6 +42,17 @@ fn hashes_equal(left: &Hash, right: &Hash) -> bool {
     left.ct_eq(right).unwrap_u8() == 1
 }
 
+fn truncate_to_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // =============================================================================
 // InProcessKernel
 // =============================================================================
@@ -1281,7 +1292,7 @@ impl LifecycleGate {
             hex::encode(&cert.ajc_id[..8])
         );
         let detail = if detail.len() > MAX_REASON_LENGTH {
-            detail[..MAX_REASON_LENGTH].to_string()
+            truncate_to_boundary(&detail, MAX_REASON_LENGTH).to_string()
         } else {
             detail
         };
