@@ -14,14 +14,14 @@ evidence_artifact:
       PolicyRootCertificate)
     - Admission evaluation produces per-artifact decisions (Admitted/Rejected)
       with full receipt binding
-    - Receipt IDs are deterministic and change with different inputs
+    - Receipt hashes (via JCS canonical_hash) are deterministic and change with different inputs
     - Rejection reasons are safely truncated at char boundaries
     - Import receipts carry category metadata and optional source ranges
     - Non-import message classes are denied at the gate (fail-closed)
     - All structural bounds from the parent HMP module are enforced
 
     Covers digest-first fetch policy, import classification, admission
-    evaluation, receipt issuance, deterministic receipt IDs, rejection
+    evaluation, receipt issuance, deterministic receipt hashes, rejection
     truncation, and fail-closed gate behavior.
   requirement_ids:
     - "REQ-0034"
@@ -48,9 +48,9 @@ evidence_artifact:
         Import receipt:
         - issue_import_receipt_with_range: receipt with source range
         - issue_import_receipt_non_import_class_fails: non-import denied
-        Receipt determinism:
-        - receipt_id_deterministic: same inputs produce same receipt ID
-        - receipt_id_changes_with_different_input: different inputs differ
+        Receipt hash determinism:
+        - receipt_hash_deterministic: same inputs produce same receipt hash
+        - receipt_hash_changes_with_different_input: different inputs differ
         Rejection handling:
         - rejection_reason_truncated_safely: char-boundary-safe truncation
         Gate accessors:

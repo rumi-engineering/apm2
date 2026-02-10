@@ -36,6 +36,13 @@
 //! bound imported truth) are operationally distinct: routing facts determine
 //! delivery, acceptance facts determine truth-plane admission.
 //!
+//! # Canonical Hashing
+//!
+//! All hash commitments use the [`Canonicalizable`] trait (RFC 8785 / JCS)
+//! from `apm2_core::htf::canonical` for collision-resistant, deterministic
+//! hash computation. Manual delimiter-based hashing is forbidden to prevent
+//! canonicalization ambiguity attacks.
+//!
 //! # Admission Receipt Semantics (RFC-0020 §2.4.0b)
 //!
 //! Cross-cell ingestion of ledger event ranges, policy root/cell
@@ -49,11 +56,16 @@
 //!   required fields produce errors.
 //! - **Bounded**: All string fields, parent lists, and envelope sizes are
 //!   bounded by explicit constants.
+//! - **Control-char-free**: All string fields reject control characters
+//!   (including newlines) to prevent canonicalization ambiguity.
 //! - **Digest-first**: Body content is never inlined in the envelope wire
 //!   shape.
-//! - **Deterministic**: All hash computations use domain-separated preimages.
+//! - **Deterministic**: All hash computations use JCS-canonical JSON via
+//!   [`Canonicalizable`].
 //! - **Strict deserialization**: `#[serde(deny_unknown_fields)]` on all
 //!   boundary structs.
+//! - **Channel-class binding**: `message_class` prefix must be consistent with
+//!   `channel_class` to prevent authority bypass attacks.
 //!
 //! # Contract References
 //!
@@ -67,6 +79,7 @@
 pub mod admission;
 
 use apm2_core::crypto::Hash;
+use apm2_core::htf::Canonicalizable;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -108,12 +121,6 @@ pub const MAX_REJECTION_REASON_LEN: usize = 1_024;
 
 /// Maximum number of admitted hashes in an admission receipt.
 pub const MAX_ADMITTED_HASHES: usize = 100_000;
-
-/// Domain separator for HMP envelope hash computation.
-const ENVELOPE_DOMAIN_SEPARATOR: &[u8] = b"apm2:hmp_envelope:v1\0";
-
-/// Domain separator for admission receipt hash computation.
-const ADMISSION_RECEIPT_DOMAIN_SEPARATOR: &[u8] = b"apm2:admission_receipt:v1\0";
 
 // =============================================================================
 // Channel Classes
@@ -165,12 +172,43 @@ impl ChannelClass {
             Self::Governance => "GOVERNANCE",
         }
     }
+
+    /// Returns the required `message_class` prefixes for this channel class.
+    ///
+    /// Used by [`HmpMessageV1::validate`] to enforce channel-class/message-
+    /// class consistency.
+    #[must_use]
+    pub const fn allowed_message_class_prefixes(&self) -> &'static [&'static str] {
+        match self {
+            Self::Discovery => &["HSI.DIRECTORY."],
+            Self::Handshake => &["HSI.PERMEABILITY."],
+            Self::Work => &["FAC."],
+            Self::Evidence => &["HSI.ANTI_ENTROPY.", "HSI.CAS."],
+            Self::Governance => &["HSI.GOVERNANCE."],
+        }
+    }
 }
 
 impl std::fmt::Display for ChannelClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+// =============================================================================
+// String Validation
+// =============================================================================
+
+/// Check that a string field contains no control characters (ASCII < 0x20).
+///
+/// Control characters (including newlines, tabs, carriage returns) in
+/// identifier and metadata fields could create canonicalization ambiguity
+/// in hash preimages. Reject them at ingress.
+fn reject_control_chars(field_name: &'static str, value: &str) -> Result<(), HmpError> {
+    if value.bytes().any(|b| b < 0x20) {
+        return Err(HmpError::ControlCharInField { field: field_name });
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -207,6 +245,7 @@ impl BodyRef {
                 max: MAX_CONTENT_TYPE_LEN,
             });
         }
+        reject_control_chars("content_type", &content_type)?;
         Ok(Self {
             cas_hash,
             content_type,
@@ -286,7 +325,9 @@ impl HmpMessageV1 {
     /// This performs structural validation without verifying signatures or
     /// resolving CAS references. It enforces:
     /// - Field length bounds
+    /// - Control character rejection
     /// - Parent list cardinality bounds
+    /// - Channel-class / message-class consistency
     /// - Authority-bearing channel class constraints
     ///
     /// # Errors
@@ -294,68 +335,38 @@ impl HmpMessageV1 {
     /// Returns [`HmpError`] for any constraint violation.
     pub fn validate(&self) -> Result<(), HmpError> {
         // Field length bounds
-        if self.protocol_id.len() > MAX_PROTOCOL_ID_LEN {
-            return Err(HmpError::FieldTooLong {
-                field: "protocol_id",
-                len: self.protocol_id.len(),
-                max: MAX_PROTOCOL_ID_LEN,
-            });
-        }
-        if self.message_class.len() > MAX_MESSAGE_CLASS_LEN {
-            return Err(HmpError::FieldTooLong {
-                field: "message_class",
-                len: self.message_class.len(),
-                max: MAX_MESSAGE_CLASS_LEN,
-            });
-        }
-        if self.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_LEN {
-            return Err(HmpError::FieldTooLong {
-                field: "idempotency_key",
-                len: self.idempotency_key.len(),
-                max: MAX_IDEMPOTENCY_KEY_LEN,
-            });
-        }
-        if self.sender_holon_id.len() > MAX_ID_LEN {
-            return Err(HmpError::FieldTooLong {
-                field: "sender_holon_id",
-                len: self.sender_holon_id.len(),
-                max: MAX_ID_LEN,
-            });
-        }
-        if self.sender_actor_id.len() > MAX_ID_LEN {
-            return Err(HmpError::FieldTooLong {
-                field: "sender_actor_id",
-                len: self.sender_actor_id.len(),
-                max: MAX_ID_LEN,
-            });
-        }
-        if self.sender_cell_id.len() > MAX_ID_LEN {
-            return Err(HmpError::FieldTooLong {
-                field: "sender_cell_id",
-                len: self.sender_cell_id.len(),
-                max: MAX_ID_LEN,
-            });
-        }
-        if self.receiver_cell_id.len() > MAX_ID_LEN {
-            return Err(HmpError::FieldTooLong {
-                field: "receiver_cell_id",
-                len: self.receiver_cell_id.len(),
-                max: MAX_ID_LEN,
-            });
-        }
-        if self.sender_policy_root_key_id.len() > MAX_ID_LEN {
-            return Err(HmpError::FieldTooLong {
-                field: "sender_policy_root_key_id",
-                len: self.sender_policy_root_key_id.len(),
-                max: MAX_ID_LEN,
-            });
-        }
-        if self.body_ref.content_type.len() > MAX_CONTENT_TYPE_LEN {
-            return Err(HmpError::ContentTypeTooLong {
-                len: self.body_ref.content_type.len(),
-                max: MAX_CONTENT_TYPE_LEN,
-            });
-        }
+        Self::check_field_len("protocol_id", &self.protocol_id, MAX_PROTOCOL_ID_LEN)?;
+        Self::check_field_len("message_class", &self.message_class, MAX_MESSAGE_CLASS_LEN)?;
+        Self::check_field_len(
+            "idempotency_key",
+            &self.idempotency_key,
+            MAX_IDEMPOTENCY_KEY_LEN,
+        )?;
+        Self::check_field_len("sender_holon_id", &self.sender_holon_id, MAX_ID_LEN)?;
+        Self::check_field_len("sender_actor_id", &self.sender_actor_id, MAX_ID_LEN)?;
+        Self::check_field_len("sender_cell_id", &self.sender_cell_id, MAX_ID_LEN)?;
+        Self::check_field_len("receiver_cell_id", &self.receiver_cell_id, MAX_ID_LEN)?;
+        Self::check_field_len(
+            "sender_policy_root_key_id",
+            &self.sender_policy_root_key_id,
+            MAX_ID_LEN,
+        )?;
+        Self::check_field_len(
+            "content_type",
+            &self.body_ref.content_type,
+            MAX_CONTENT_TYPE_LEN,
+        )?;
+
+        // Control character rejection for all string fields
+        reject_control_chars("protocol_id", &self.protocol_id)?;
+        reject_control_chars("message_class", &self.message_class)?;
+        reject_control_chars("idempotency_key", &self.idempotency_key)?;
+        reject_control_chars("sender_holon_id", &self.sender_holon_id)?;
+        reject_control_chars("sender_actor_id", &self.sender_actor_id)?;
+        reject_control_chars("sender_cell_id", &self.sender_cell_id)?;
+        reject_control_chars("receiver_cell_id", &self.receiver_cell_id)?;
+        reject_control_chars("sender_policy_root_key_id", &self.sender_policy_root_key_id)?;
+        reject_control_chars("content_type", &self.body_ref.content_type)?;
 
         // Parent list bound
         if self.parents.len() > MAX_PARENTS {
@@ -365,13 +376,24 @@ impl HmpMessageV1 {
             });
         }
 
+        // Channel-class / message-class consistency check.
+        // This prevents authority bypass by mismatching channel_class and
+        // message_class (e.g., sending HSI.PERMEABILITY.GRANT on EVIDENCE).
+        let prefixes = self.channel_class.allowed_message_class_prefixes();
+        if !prefixes.iter().any(|p| self.message_class.starts_with(p)) {
+            return Err(HmpError::ChannelClassMismatch {
+                channel_class: self.channel_class,
+                message_class: self.message_class.clone(),
+            });
+        }
+
         // Authority-bearing channel constraint: permeability receipt required
-        if self.channel_class.is_authority_bearing()
-            && self.permeability_receipt_hash.is_none()
-            && self.channel_class != ChannelClass::Work
+        // for HANDSHAKE and GOVERNANCE. WORK operates under session authority.
+        if matches!(
+            self.channel_class,
+            ChannelClass::Handshake | ChannelClass::Governance
+        ) && self.permeability_receipt_hash.is_none()
         {
-            // HANDSHAKE and GOVERNANCE require permeability receipt per §8.3
-            // WORK messages may operate under existing session authority
             return Err(HmpError::MissingPermeabilityReceipt {
                 channel: self.channel_class,
             });
@@ -380,64 +402,32 @@ impl HmpMessageV1 {
         Ok(())
     }
 
-    /// Compute the deterministic envelope hash using domain separation.
+    /// Compute the deterministic envelope hash using JCS canonicalization.
     ///
-    /// The hash is computed over a canonical preimage that includes all
-    /// envelope fields in a deterministic order.
+    /// Uses the [`Canonicalizable`] trait (RFC 8785 / JCS) for collision-
+    /// resistant, deterministic hashing. Since `HmpMessageV1` derives
+    /// `Serialize`, the blanket impl provides `canonical_hash()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization fails, which should never happen for a
+    /// validated `HmpMessageV1`.
     #[must_use]
     pub fn compute_envelope_hash(&self) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(ENVELOPE_DOMAIN_SEPARATOR);
-        hasher.update(self.protocol_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.message_class.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(&self.message_id);
-        hasher.update(self.idempotency_key.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(&self.hlc_timestamp.to_le_bytes());
-        hasher.update(b"\n");
-        for parent in &self.parents {
-            hasher.update(parent);
-        }
-        hasher.update(b"\n");
-        hasher.update(self.sender_holon_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.sender_actor_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.channel_class.as_str().as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.sender_cell_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.receiver_cell_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.sender_policy_root_key_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(&self.body_ref.cas_hash);
-        hasher.update(self.body_ref.content_type.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(&self.ledger_head_hash);
-
-        // Optional fields: use presence marker to ensure canonical ordering
-        Self::hash_optional_field(&mut hasher, self.context_pack_hash.as_ref());
-        Self::hash_optional_field(&mut hasher, self.manifest_hash.as_ref());
-        Self::hash_optional_field(&mut hasher, self.view_commitment_hash.as_ref());
-        Self::hash_optional_field(&mut hasher, self.permeability_receipt_hash.as_ref());
-
-        *hasher.finalize().as_bytes()
+        self.canonical_hash()
+            .expect("validated HmpMessageV1 must serialize")
     }
 
-    /// Hash an optional field with a presence tag for canonical ordering.
-    fn hash_optional_field(hasher: &mut blake3::Hasher, field: Option<&Hash>) {
-        match field {
-            Some(hash) => {
-                hasher.update(&[0x01]);
-                hasher.update(hash);
-            },
-            None => {
-                hasher.update(&[0x00]);
-            },
+    /// Check a field's length bound.
+    const fn check_field_len(field: &'static str, value: &str, max: usize) -> Result<(), HmpError> {
+        if value.len() > max {
+            return Err(HmpError::FieldTooLong {
+                field,
+                len: value.len(),
+                max,
+            });
         }
+        Ok(())
     }
 }
 
@@ -545,6 +535,10 @@ impl std::fmt::Display for VerificationMethod {
 /// ranges, policy root/cell certificates, or permeability grants is
 /// admitted. Without this receipt, replicated bytes are untrusted cache.
 ///
+/// The authoritative identifier for this receipt is its `canonical_hash()`,
+/// computed via JCS canonicalization (RFC 8785). There is no separate
+/// `receipt_id` field; the content hash IS the identity.
+///
 /// # Required Bindings
 ///
 /// - `sender_cell_id`: source cell identity (observed).
@@ -556,9 +550,6 @@ impl std::fmt::Display for VerificationMethod {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionReceiptV1 {
-    /// Unique receipt identifier (BLAKE3 hash).
-    pub receipt_id: Hash,
-
     /// Source cell ID (canonical text form).
     pub sender_cell_id: String,
 
@@ -635,35 +626,19 @@ impl AdmissionReceiptV1 {
         Ok(())
     }
 
-    /// Compute the deterministic receipt hash using domain separation.
+    /// Compute the deterministic receipt hash using JCS canonicalization.
+    ///
+    /// This is the authoritative identity hash for the receipt. Use this
+    /// for CAS indexing and ledger references.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization fails, which should never happen for a
+    /// validated `AdmissionReceiptV1`.
     #[must_use]
     pub fn compute_receipt_hash(&self) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(ADMISSION_RECEIPT_DOMAIN_SEPARATOR);
-        hasher.update(&self.receipt_id);
-        hasher.update(self.sender_cell_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.sender_policy_root_key_id.as_bytes());
-        hasher.update(b"\n");
-        // Hash admitted hashes in order (deterministic).
-        let count = self.admitted_hashes.len() as u64;
-        hasher.update(&count.to_le_bytes());
-        for hash in &self.admitted_hashes {
-            hasher.update(hash);
-        }
-        hasher.update(self.verification_method.to_string().as_bytes());
-        hasher.update(b"\n");
-        hasher.update(&self.local_ledger_anchor);
-        hasher.update(&self.admitted_at_hlc.to_le_bytes());
-        // Rejection reasons also hashed for integrity.
-        let reason_count = self.rejection_reasons.len() as u64;
-        hasher.update(&reason_count.to_le_bytes());
-        for reason in &self.rejection_reasons {
-            hasher.update(&reason.artifact_hash);
-            hasher.update(reason.reason.as_bytes());
-            hasher.update(b"\n");
-        }
-        *hasher.finalize().as_bytes()
+        self.canonical_hash()
+            .expect("validated AdmissionReceiptV1 must serialize")
     }
 
     /// Returns `true` if all elements were admitted (no rejections).
@@ -786,6 +761,13 @@ pub enum HmpError {
         max: usize,
     },
 
+    /// A string field contains control characters (ASCII < 0x20).
+    #[error("field `{field}` contains control characters")]
+    ControlCharInField {
+        /// Field name.
+        field: &'static str,
+    },
+
     /// Too many causal parent references.
     #[error("too many parents: {count} exceeds max {max}")]
     TooManyParents {
@@ -793,6 +775,15 @@ pub enum HmpError {
         count: usize,
         /// Maximum allowed.
         max: usize,
+    },
+
+    /// `message_class` prefix does not match `channel_class`.
+    #[error("message_class '{message_class}' is inconsistent with channel_class {channel_class}")]
+    ChannelClassMismatch {
+        /// The channel class.
+        channel_class: ChannelClass,
+        /// The offending message class.
+        message_class: String,
     },
 
     /// Authority-bearing channel missing permeability receipt hash.
@@ -959,6 +950,12 @@ mod tests {
         assert!(matches!(br, Err(HmpError::ContentTypeTooLong { .. })));
     }
 
+    #[test]
+    fn body_ref_rejects_control_chars() {
+        let br = BodyRef::new(test_hash(0x01), "text/plain\n".to_string());
+        assert!(matches!(br, Err(HmpError::ControlCharInField { .. })));
+    }
+
     // ─── HmpMessageV1 validation tests ─────────────────────────
 
     #[test]
@@ -972,6 +969,7 @@ mod tests {
         // WORK messages may operate under existing session authority.
         let mut env = valid_envelope();
         env.channel_class = ChannelClass::Work;
+        env.message_class = "FAC.PULSE".to_string();
         env.permeability_receipt_hash = None;
         assert!(env.validate().is_ok());
     }
@@ -980,6 +978,7 @@ mod tests {
     fn handshake_without_permeability_receipt_fails() {
         let mut env = valid_envelope();
         env.channel_class = ChannelClass::Handshake;
+        env.message_class = "HSI.PERMEABILITY.GRANT".to_string();
         env.permeability_receipt_hash = None;
         assert!(matches!(
             env.validate(),
@@ -991,6 +990,7 @@ mod tests {
     fn governance_without_permeability_receipt_fails() {
         let mut env = valid_envelope();
         env.channel_class = ChannelClass::Governance;
+        env.message_class = "HSI.GOVERNANCE.STOP".to_string();
         env.permeability_receipt_hash = None;
         assert!(matches!(
             env.validate(),
@@ -1002,6 +1002,7 @@ mod tests {
     fn handshake_with_permeability_receipt_passes() {
         let mut env = valid_envelope();
         env.channel_class = ChannelClass::Handshake;
+        env.message_class = "HSI.PERMEABILITY.GRANT".to_string();
         env.permeability_receipt_hash = Some(test_hash(0xFF));
         assert!(env.validate().is_ok());
     }
@@ -1029,6 +1030,101 @@ mod tests {
         ));
     }
 
+    // ─── Channel-class / message-class consistency ──────────────
+
+    #[test]
+    fn channel_class_mismatch_permeability_on_evidence_fails() {
+        // Security blocker: HSI.PERMEABILITY.GRANT must not be accepted
+        // on the EVIDENCE channel, which would bypass receipt checks.
+        let mut env = valid_envelope();
+        env.channel_class = ChannelClass::Evidence;
+        env.message_class = "HSI.PERMEABILITY.GRANT".to_string();
+        assert!(matches!(
+            env.validate(),
+            Err(HmpError::ChannelClassMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn channel_class_mismatch_anti_entropy_on_handshake_fails() {
+        let mut env = valid_envelope();
+        env.channel_class = ChannelClass::Handshake;
+        env.message_class = "HSI.ANTI_ENTROPY.OFFER".to_string();
+        env.permeability_receipt_hash = Some(test_hash(0xFF));
+        assert!(matches!(
+            env.validate(),
+            Err(HmpError::ChannelClassMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn channel_class_mismatch_cas_on_governance_fails() {
+        let mut env = valid_envelope();
+        env.channel_class = ChannelClass::Governance;
+        env.message_class = "HSI.CAS.DELIVER".to_string();
+        env.permeability_receipt_hash = Some(test_hash(0xFF));
+        assert!(matches!(
+            env.validate(),
+            Err(HmpError::ChannelClassMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn consistent_discovery_channel_passes() {
+        let mut env = valid_envelope();
+        env.channel_class = ChannelClass::Discovery;
+        env.message_class = "HSI.DIRECTORY.ANNOUNCE".to_string();
+        assert!(env.validate().is_ok());
+    }
+
+    #[test]
+    fn consistent_evidence_cas_passes() {
+        let mut env = valid_envelope();
+        env.channel_class = ChannelClass::Evidence;
+        env.message_class = "HSI.CAS.DELIVER".to_string();
+        assert!(env.validate().is_ok());
+    }
+
+    // ─── Control character rejection ────────────────────────────
+
+    #[test]
+    fn newline_in_protocol_id_rejected() {
+        let mut env = valid_envelope();
+        env.protocol_id = "hsi:v1\ninjected".to_string();
+        assert!(matches!(
+            env.validate(),
+            Err(HmpError::ControlCharInField {
+                field: "protocol_id"
+            })
+        ));
+    }
+
+    #[test]
+    fn tab_in_idempotency_key_rejected() {
+        let mut env = valid_envelope();
+        env.idempotency_key = "idem\t001".to_string();
+        assert!(matches!(
+            env.validate(),
+            Err(HmpError::ControlCharInField {
+                field: "idempotency_key"
+            })
+        ));
+    }
+
+    #[test]
+    fn null_byte_in_sender_cell_id_rejected() {
+        let mut env = valid_envelope();
+        env.sender_cell_id = "cell:v1:blake3:aa\0bb".to_string();
+        assert!(matches!(
+            env.validate(),
+            Err(HmpError::ControlCharInField {
+                field: "sender_cell_id"
+            })
+        ));
+    }
+
+    // ─── Canonical hash tests ───────────────────────────────────
+
     #[test]
     fn envelope_hash_deterministic() {
         let env = valid_envelope();
@@ -1050,6 +1146,24 @@ mod tests {
         let env1 = valid_envelope();
         let mut env2 = valid_envelope();
         env2.view_commitment_hash = Some(test_hash(0xAA));
+        assert_ne!(env1.compute_envelope_hash(), env2.compute_envelope_hash());
+    }
+
+    #[test]
+    fn canonicalization_collision_resistance() {
+        // Verify that two logically distinct envelopes with field content
+        // that could collide under naive delimiter concatenation produce
+        // different hashes under JCS canonicalization.
+        let mut env1 = valid_envelope();
+        env1.protocol_id = "hsi:v1X".to_string();
+        env1.message_class = "HSI.ANTI_ENTROPY.OFFER".to_string();
+
+        let mut env2 = valid_envelope();
+        env2.protocol_id = "hsi:v1".to_string();
+        env2.message_class = "XHSI.ANTI_ENTROPY.OFFER".to_string();
+
+        // Under naive \n delimiters these could collide. With JCS they
+        // cannot because JSON key-value pairs are unambiguous.
         assert_ne!(env1.compute_envelope_hash(), env2.compute_envelope_hash());
     }
 
@@ -1085,7 +1199,6 @@ mod tests {
 
     fn valid_admission_receipt() -> AdmissionReceiptV1 {
         AdmissionReceiptV1 {
-            receipt_id: test_hash(0x10),
             sender_cell_id: "cell:v1:blake3:aabb".to_string(),
             sender_policy_root_key_id: "pkid:v1:ed25519:blake3:ccdd".to_string(),
             admitted_hashes: vec![test_hash(0x20), test_hash(0x21)],
@@ -1166,6 +1279,20 @@ mod tests {
         let r1 = valid_admission_receipt();
         let mut r2 = valid_admission_receipt();
         r2.admitted_at_hlc = 9999;
+        assert_ne!(r1.compute_receipt_hash(), r2.compute_receipt_hash());
+    }
+
+    #[test]
+    fn admission_receipt_canonical_collision_resistance() {
+        // Two receipts with different logical content must hash differently.
+        let mut r1 = valid_admission_receipt();
+        r1.sender_cell_id = "cell:v1:blake3:aaXbb".to_string();
+        r1.sender_policy_root_key_id = "pkid".to_string();
+
+        let mut r2 = valid_admission_receipt();
+        r2.sender_cell_id = "cell:v1:blake3:aa".to_string();
+        r2.sender_policy_root_key_id = "Xbbpkid".to_string();
+
         assert_ne!(r1.compute_receipt_hash(), r2.compute_receipt_hash());
     }
 

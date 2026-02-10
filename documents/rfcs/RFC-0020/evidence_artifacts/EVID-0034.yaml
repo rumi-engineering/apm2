@@ -15,13 +15,18 @@ evidence_artifact:
       class constraints)
     - Authority-bearing channels (HANDSHAKE, GOVERNANCE) require permeability
       receipt hash; WORK operates under session authority
-    - Deterministic domain-separated envelope hashing with optional field
-      presence markers
+    - JCS-canonical (RFC 8785) deterministic envelope hashing via
+      Canonicalizable trait, collision-resistant against delimiter injection
+    - Channel-class / message-class consistency enforcement prevents authority
+      bypass (e.g., HSI.PERMEABILITY.GRANT on EVIDENCE channel is rejected)
+    - Control character rejection for all string fields prevents
+      canonicalization ambiguity attacks
     - Unsolicited large payloads dropped with bounded resource use
     - Fail-closed deserialization: unknown fields rejected via
       deny_unknown_fields
     - AdmissionReceiptV1 binds sender cell ID, policy root key ID, admitted
-      hashes, verification method, local ledger anchor, and rejection reasons
+      hashes, verification method, local ledger anchor, and rejection reasons;
+      canonical_hash() is the sole authoritative identity (no separate receipt_id)
     - ImportReceiptV1 wraps admission receipt with import category metadata
     - Routing facts (envelope metadata) and acceptance facts (admission
       receipts) are operationally distinct
@@ -46,6 +51,7 @@ evidence_artifact:
         Body reference:
         - body_ref_valid: valid body reference accepted
         - body_ref_content_type_too_long: oversized content type rejected
+        - body_ref_rejects_control_chars: control chars in content_type rejected
         Envelope validation:
         - valid_evidence_envelope_passes: well-formed envelope passes
         - work_channel_without_permeability_receipt_passes: WORK under session authority
@@ -54,10 +60,21 @@ evidence_artifact:
         - handshake_with_permeability_receipt_passes: valid HANDSHAKE accepted
         - too_many_parents_fails: parent list bounded
         - oversized_protocol_id_fails: field length bounded
-        Envelope hashing:
+        Channel-class / message-class consistency:
+        - channel_class_mismatch_permeability_on_evidence_fails: authority bypass blocked
+        - channel_class_mismatch_anti_entropy_on_handshake_fails: wrong prefix rejected
+        - channel_class_mismatch_cas_on_governance_fails: wrong prefix rejected
+        - consistent_discovery_channel_passes: matching prefix accepted
+        - consistent_evidence_cas_passes: matching prefix accepted
+        Control character rejection:
+        - newline_in_protocol_id_rejected: newline in string field rejected
+        - tab_in_idempotency_key_rejected: tab in string field rejected
+        - null_byte_in_sender_cell_id_rejected: null byte in string field rejected
+        Canonical hashing (JCS):
         - envelope_hash_deterministic: same input produces same hash
         - envelope_hash_changes_with_field_mutation: field changes hash
         - envelope_hash_changes_with_optional_field: optional field changes hash
+        - canonicalization_collision_resistance: delimiter-injection-safe hashing
         Envelope admission gate:
         - gate_rejects_oversized_envelope: pre-decode size bound
         - gate_rejects_invalid_json: malformed input rejected
@@ -70,6 +87,7 @@ evidence_artifact:
         - admission_receipt_rejection_reason_too_long: bounded reason length
         - admission_receipt_hash_deterministic: deterministic receipt hash
         - admission_receipt_hash_changes_with_mutation: mutation changes hash
+        - admission_receipt_canonical_collision_resistance: JCS collision-safe
         Import receipt:
         - import_receipt_valid: valid import receipt passes
         - import_receipt_invalid_range: inverted range rejected

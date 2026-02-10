@@ -292,16 +292,7 @@ impl ImportAdmissionGate {
             }
         }
 
-        // Compute receipt ID from content hash of all admitted + rejected.
-        let receipt_id = Self::compute_receipt_id(
-            &message.sender_cell_id,
-            &admitted_hashes,
-            &rejection_reasons,
-            admitted_at_hlc,
-        );
-
         let receipt = AdmissionReceiptV1 {
-            receipt_id,
             sender_cell_id: message.sender_cell_id.clone(),
             sender_policy_root_key_id: message.sender_policy_root_key_id.clone(),
             admitted_hashes,
@@ -374,32 +365,6 @@ impl ImportAdmissionGate {
     #[must_use]
     pub fn local_cell_id(&self) -> &str {
         &self.local_cell_id
-    }
-
-    /// Compute a deterministic receipt ID from admission content.
-    fn compute_receipt_id(
-        sender_cell_id: &str,
-        admitted_hashes: &[Hash],
-        rejection_reasons: &[RejectionReason],
-        admitted_at_hlc: u64,
-    ) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"apm2:admission_receipt_id:v1\0");
-        hasher.update(sender_cell_id.as_bytes());
-        hasher.update(b"\n");
-        let count = admitted_hashes.len() as u64;
-        hasher.update(&count.to_le_bytes());
-        for hash in admitted_hashes {
-            hasher.update(hash);
-        }
-        let rej_count = rejection_reasons.len() as u64;
-        hasher.update(&rej_count.to_le_bytes());
-        for reason in rejection_reasons {
-            hasher.update(&reason.artifact_hash);
-            hasher.update(reason.reason.as_bytes());
-        }
-        hasher.update(&admitted_at_hlc.to_le_bytes());
-        *hasher.finalize().as_bytes()
     }
 }
 
@@ -643,10 +608,10 @@ mod tests {
         assert!(matches!(result, Err(HmpError::AdmissionDenied { .. })));
     }
 
-    // ─── Receipt ID determinism ─────────────────────────────────
+    // ─── Receipt hash determinism ────────────────────────────────
 
     #[test]
-    fn receipt_id_deterministic() {
+    fn receipt_hash_deterministic() {
         let gate = test_gate();
         let msg = test_message("HSI.ANTI_ENTROPY.OFFER");
         let hashes = vec![test_hash(0x10), test_hash(0x11)];
@@ -673,11 +638,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(r1.receipt_id, r2.receipt_id);
+        assert_eq!(r1.compute_receipt_hash(), r2.compute_receipt_hash());
     }
 
     #[test]
-    fn receipt_id_changes_with_different_input() {
+    fn receipt_hash_changes_with_different_input() {
         let gate = test_gate();
         let msg = test_message("HSI.ANTI_ENTROPY.OFFER");
 
@@ -703,7 +668,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_ne!(r1.receipt_id, r2.receipt_id);
+        assert_ne!(r1.compute_receipt_hash(), r2.compute_receipt_hash());
     }
 
     // ─── Rejection reason truncation ────────────────────────────
