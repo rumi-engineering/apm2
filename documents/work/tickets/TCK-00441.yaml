@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00441"
     title: "FAC review CLI contract and deterministic run-state schema"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"
