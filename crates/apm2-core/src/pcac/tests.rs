@@ -1337,6 +1337,20 @@ fn sovereignty_epoch_deserialize_rejects_oversize_signature() {
 }
 
 #[test]
+fn pointer_only_waiver_deserialize_rejects_oversize_waiver_id() {
+    let mut value = serde_json::to_value(PointerOnlyWaiver {
+        waiver_id: "WVR-0001".to_string(),
+        expires_at_tick: 1234,
+        scope_binding_hash: test_hash(0xAB),
+    })
+    .unwrap();
+    value["waiver_id"] = serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+
+    let result: Result<PointerOnlyWaiver, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized waiver_id must be rejected");
+}
+
+#[test]
 fn deny_class_deserialize_rejects_oversize_stale_sovereignty_epoch_epoch_id() {
     let mut value = serde_json::to_value(AuthorityDenyClass::StaleSovereigntyEpoch {
         epoch_id: "epoch-001".to_string(),

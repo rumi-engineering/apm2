@@ -187,7 +187,7 @@ impl InProcessKernel {
             ledger_anchor,
             // Prefer last-known kernel tick; use MAX as unknown sentinel.
             denied_at_tick,
-            containment_action: None,
+            containment_action: Some(apm2_core::pcac::FreezeAction::HardFreeze),
         })
     }
 
@@ -229,89 +229,123 @@ impl InProcessKernel {
     ///
     /// # Framing
     ///
-    /// All variable-length fields are prefixed with `(len as
-    /// u64).to_le_bytes()` to prevent concatenation ambiguity attacks. Vec
-    /// fields additionally include a count prefix.
+    /// Every field is domain-separated with an explicit field tag. Variable-
+    /// length fields are prefixed with `(len as u64).to_le_bytes()` to
+    /// prevent concatenation ambiguity attacks. Vec fields additionally
+    /// include a count prefix.
     fn compute_join_hash(input: &AuthorityJoinInputV1) -> Hash {
         use apm2_core::pcac::{DeterminismClass, IdentityEvidenceLevel};
         use blake3::Hasher;
         let mut hasher = Hasher::new();
 
-        // Helper: length-prefixed variable-length field.
-        let update_var = |h: &mut Hasher, data: &[u8]| {
+        // Helper: domain-separated fixed-width field.
+        let update_tagged_fixed = |h: &mut Hasher, tag: &[u8], data: &[u8]| {
+            h.update(tag);
+            h.update(data);
+        };
+        // Helper: domain-separated length-prefixed variable-length field.
+        let update_tagged_var = |h: &mut Hasher, tag: &[u8], data: &[u8]| {
+            h.update(tag);
             h.update(&(data.len() as u64).to_le_bytes());
             h.update(data);
         };
+        // Helper: domain-separated u64 field.
+        let update_tagged_u64 = |h: &mut Hasher, tag: &[u8], value: u64| {
+            h.update(tag);
+            h.update(&value.to_le_bytes());
+        };
 
         // Subject bindings (length-prefixed strings)
-        update_var(&mut hasher, input.session_id.as_bytes());
-        match input.holon_id {
-            Some(ref holon_id) => {
-                hasher.update(&[1u8]); // present marker
-                update_var(&mut hasher, holon_id.as_bytes());
-            },
-            None => {
-                hasher.update(&[0u8]); // absent marker
-            },
+        update_tagged_var(&mut hasher, b"session_id", input.session_id.as_bytes());
+        hasher.update(b"holon_id");
+        if let Some(ref holon_id) = input.holon_id {
+            hasher.update(&[1u8]); // present marker
+            update_tagged_var(&mut hasher, b"holon_id_value", holon_id.as_bytes());
+        } else {
+            hasher.update(&[0u8]); // absent marker
         }
         // Intent binding (fixed-length hash, no prefix needed)
-        hasher.update(&input.intent_digest);
+        update_tagged_fixed(&mut hasher, b"intent_digest", &input.intent_digest);
         // Capability bindings
-        hasher.update(&input.capability_manifest_hash);
+        update_tagged_fixed(
+            &mut hasher,
+            b"capability_manifest_hash",
+            &input.capability_manifest_hash,
+        );
         // Scope witnesses: count prefix + each hash (canonical set ordering).
         // Security: sorting prevents order-dependent AJC IDs for semantically
         // identical witness sets.
         let mut sorted_scope_witness_hashes = input.scope_witness_hashes.clone();
         sorted_scope_witness_hashes.sort_unstable();
+        hasher.update(b"scope_witness_hashes");
         hasher.update(&(sorted_scope_witness_hashes.len() as u64).to_le_bytes());
         for scope_hash in &sorted_scope_witness_hashes {
-            hasher.update(scope_hash);
+            update_tagged_fixed(&mut hasher, b"scope_witness_hash", scope_hash);
         }
         // Delegation bindings (length-prefixed strings)
-        update_var(&mut hasher, input.lease_id.as_bytes());
-        match input.permeability_receipt_hash {
-            Some(ref perm_hash) => {
-                hasher.update(&[1u8]);
-                hasher.update(perm_hash);
-            },
-            None => {
-                hasher.update(&[0u8]);
-            },
+        update_tagged_var(&mut hasher, b"lease_id", input.lease_id.as_bytes());
+        hasher.update(b"permeability_receipt_hash");
+        if let Some(ref perm_hash) = input.permeability_receipt_hash {
+            hasher.update(&[1u8]);
+            update_tagged_fixed(&mut hasher, b"permeability_receipt_hash_value", perm_hash);
+        } else {
+            hasher.update(&[0u8]);
         }
         // Identity bindings
-        hasher.update(&input.identity_proof_hash);
+        update_tagged_fixed(
+            &mut hasher,
+            b"identity_proof_hash",
+            &input.identity_proof_hash,
+        );
         // MAJOR 2 FIX: Include identity_evidence_level in hash.
+        hasher.update(b"identity_evidence_level");
         hasher.update(&[match input.identity_evidence_level {
             IdentityEvidenceLevel::Verified => 0u8,
             IdentityEvidenceLevel::PointerOnly => 1u8,
             _ => u8::MAX, // fail-closed: unknown levels
         }]);
         // Pointer-only waiver binding
-        match input.pointer_only_waiver_hash {
-            Some(ref waiver_hash) => {
-                hasher.update(&[1u8]); // present marker
-                hasher.update(waiver_hash);
-            },
-            None => {
-                hasher.update(&[0u8]); // absent marker
-            },
+        hasher.update(b"pointer_only_waiver_hash");
+        if let Some(ref waiver_hash) = input.pointer_only_waiver_hash {
+            hasher.update(&[1u8]); // present marker
+            update_tagged_fixed(&mut hasher, b"pointer_only_waiver_hash_value", waiver_hash);
+        } else {
+            hasher.update(&[0u8]); // absent marker
         }
         // Freshness bindings
-        hasher.update(&input.directory_head_hash);
-        hasher.update(&input.freshness_policy_hash);
-        hasher.update(&input.freshness_witness_tick.to_le_bytes());
+        update_tagged_fixed(
+            &mut hasher,
+            b"directory_head_hash",
+            &input.directory_head_hash,
+        );
+        update_tagged_fixed(
+            &mut hasher,
+            b"freshness_policy_hash",
+            &input.freshness_policy_hash,
+        );
+        update_tagged_u64(
+            &mut hasher,
+            b"freshness_witness_tick",
+            input.freshness_witness_tick,
+        );
         // Stop/budget bindings
-        hasher.update(&input.stop_budget_profile_digest);
+        update_tagged_fixed(
+            &mut hasher,
+            b"stop_budget_profile_digest",
+            &input.stop_budget_profile_digest,
+        );
         // Pre-actuation receipts: count prefix + each hash (canonical set
         // ordering). Security: sorting prevents replay amplification by receipt
         // permutation.
         let mut sorted_pre_actuation_receipt_hashes = input.pre_actuation_receipt_hashes.clone();
         sorted_pre_actuation_receipt_hashes.sort_unstable();
+        hasher.update(b"pre_actuation_receipt_hashes");
         hasher.update(&(sorted_pre_actuation_receipt_hashes.len() as u64).to_le_bytes());
         for receipt_hash in &sorted_pre_actuation_receipt_hashes {
-            hasher.update(receipt_hash);
+            update_tagged_fixed(&mut hasher, b"pre_actuation_receipt_hash", receipt_hash);
         }
         // Risk classification
+        hasher.update(b"risk_tier");
         hasher.update(&[match input.risk_tier {
             RiskTier::Tier0 => 0u8,
             RiskTier::Tier1 => 1u8,
@@ -319,14 +353,19 @@ impl InProcessKernel {
             _ => u8::MAX, // fail-closed: unknown tiers get maximum ordinal
         }]);
         // MAJOR 2 FIX: Include determinism_class in hash.
+        hasher.update(b"determinism_class");
         hasher.update(&[match input.determinism_class {
             DeterminismClass::Deterministic => 0u8,
             DeterminismClass::BoundedNondeterministic => 1u8,
             _ => u8::MAX, // fail-closed: unknown classes
         }]);
         // Time/ledger anchors
-        hasher.update(&input.time_envelope_ref);
-        hasher.update(&input.as_of_ledger_anchor);
+        update_tagged_fixed(&mut hasher, b"time_envelope_ref", &input.time_envelope_ref);
+        update_tagged_fixed(
+            &mut hasher,
+            b"as_of_ledger_anchor",
+            &input.as_of_ledger_anchor,
+        );
         *hasher.finalize().as_bytes()
     }
 

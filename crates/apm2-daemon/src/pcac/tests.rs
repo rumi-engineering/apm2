@@ -2030,6 +2030,11 @@ fn clock_error_deny_uses_sovereignty_uncertainty_class() {
     assert_eq!(deny.time_envelope_ref, test_hash(0x07));
     assert_eq!(deny.ledger_anchor, test_hash(0x08));
     assert!(deny.ajc_id.is_none());
+    assert_eq!(
+        deny.containment_action,
+        Some(apm2_core::pcac::FreezeAction::HardFreeze),
+        "clock regression deny must request hard freeze containment"
+    );
     assert!(
         deny.denied_at_tick > 0,
         "clock error deny must carry a non-zero denied_at_tick"
@@ -2058,6 +2063,11 @@ fn clock_error_deny_carries_ajc_id_when_provided() {
         "deny class must be SovereigntyUncertainty, got: {:?}",
         deny.deny_class
     );
+    assert_eq!(
+        deny.containment_action,
+        Some(apm2_core::pcac::FreezeAction::HardFreeze),
+        "clock regression deny must request hard freeze containment"
+    );
 }
 
 #[test]
@@ -2070,6 +2080,11 @@ fn clock_error_deny_uses_unknown_tick_sentinel_when_tick_unavailable() {
         test_hash(0x08),
     );
     assert_eq!(deny.denied_at_tick, u64::MAX);
+    assert_eq!(
+        deny.containment_action,
+        Some(apm2_core::pcac::FreezeAction::HardFreeze),
+        "clock regression deny must request hard freeze containment"
+    );
 }
 
 // =============================================================================

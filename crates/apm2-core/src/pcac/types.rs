@@ -895,6 +895,7 @@ impl std::fmt::Display for SovereigntyEnforcementMode {
 #[serde(deny_unknown_fields)]
 pub struct PointerOnlyWaiver {
     /// Unique waiver identifier (WVR-XXXX).
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub waiver_id: String,
 
     /// Expiry tick for the waiver.
