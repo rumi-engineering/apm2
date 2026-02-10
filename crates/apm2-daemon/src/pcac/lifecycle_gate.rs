@@ -2665,7 +2665,7 @@ impl LifecycleGate {
             Self::requires_temporal_arbitration(cert),
             "consume-before-effect",
         )?;
-        self.consume_before_effect(
+        let consume_result = self.consume_before_effect(
             cert,
             intent_digest,
             boundary_intent_class,
@@ -2673,7 +2673,24 @@ impl LifecycleGate {
             current_time_envelope_ref,
             current_revocation_head_hash,
             resolved_policy,
-        )
+        )?;
+
+        if let Err(error) = apm2_core::pcac::maybe_export_runtime_pass_bundle() {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::UnknownState {
+                    description: format!(
+                        "pcac objective/gate evidence export failed (fail-closed): {error}"
+                    ),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: current_tick,
+                containment_action: None,
+            }));
+        }
+
+        Ok(consume_result)
     }
 
     /// Executes the full lifecycle:
