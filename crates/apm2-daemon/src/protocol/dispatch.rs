@@ -1561,7 +1561,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 4. Validate permeability_receipt_hash is non-zero and CAS-resolvable
-    if bindings.permeability_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.permeability_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("permeability_receipt_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.permeability_receipt_hash) {
@@ -1575,7 +1575,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 5. Validate capability_manifest_hash is non-zero and CAS-resolvable
-    if bindings.capability_manifest_hash == [0u8; 32] {
+    if bool::from(bindings.capability_manifest_hash.ct_eq(&[0u8; 32])) {
         violations.push("capability_manifest_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.capability_manifest_hash) {
@@ -1589,7 +1589,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 6. Validate context_pack_hash is non-zero and CAS-resolvable
-    if bindings.context_pack_hash == [0u8; 32] {
+    if bool::from(bindings.context_pack_hash.ct_eq(&[0u8; 32])) {
         violations.push("context_pack_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.context_pack_hash) {
@@ -1603,7 +1603,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 7. Validate stop_condition_hash is non-zero and CAS-resolvable
-    if bindings.stop_condition_hash == [0u8; 32] {
+    if bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32])) {
         violations.push("stop_condition_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.stop_condition_hash) {
@@ -1617,7 +1617,7 @@ pub fn validate_transition_authority_bindings(
     }
 
     // 8. Validate typed_budget_hash is non-zero and CAS-resolvable
-    if bindings.typed_budget_hash == [0u8; 32] {
+    if bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32])) {
         violations.push("typed_budget_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.typed_budget_hash) {
@@ -1640,8 +1640,8 @@ pub fn validate_transition_authority_bindings(
 
     // 10. Re-derive hashes and verify they match (tamper detection)
     let recomputed_stop_hash = hash_bytes(&bindings.stop_conditions.canonical_bytes());
-    if bindings.stop_condition_hash != [0u8; 32]
-        && bindings.stop_condition_hash != recomputed_stop_hash
+    if !bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32]))
+        && !bool::from(bindings.stop_condition_hash.ct_eq(&recomputed_stop_hash))
     {
         violations.push(format!(
             "stop_condition_hash mismatch: declared={} recomputed={}",
@@ -1654,8 +1654,8 @@ pub fn validate_transition_authority_bindings(
         canonical_json_bytes(&build_typed_budget_payload(&bindings.typed_budgets))
     {
         let recomputed_budget_hash = hash_bytes(&budget_payload);
-        if bindings.typed_budget_hash != [0u8; 32]
-            && bindings.typed_budget_hash != recomputed_budget_hash
+        if !bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32]))
+            && !bool::from(bindings.typed_budget_hash.ct_eq(&recomputed_budget_hash))
         {
             violations.push(format!(
                 "typed_budget_hash mismatch: declared={} recomputed={}",
@@ -1704,7 +1704,7 @@ pub fn validate_review_outcome_bindings(
     let mut violations: Vec<String> = Vec::new();
 
     // 1. view_commitment_hash
-    if bindings.view_commitment_hash == [0u8; 32] {
+    if bool::from(bindings.view_commitment_hash.ct_eq(&[0u8; 32])) {
         violations.push("view_commitment_hash is zero (unset)".to_string());
     } else {
         match cas.exists(&bindings.view_commitment_hash) {
@@ -1718,7 +1718,7 @@ pub fn validate_review_outcome_bindings(
     }
 
     // 2. tool_log_index_hash
-    if bindings.tool_log_index_hash == [0u8; 32] {
+    if bool::from(bindings.tool_log_index_hash.ct_eq(&[0u8; 32])) {
         violations.push("tool_log_index_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.tool_log_index_hash) {
@@ -1732,7 +1732,7 @@ pub fn validate_review_outcome_bindings(
     }
 
     // 3. summary_receipt_hash
-    if bindings.summary_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.summary_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("summary_receipt_hash is zero (unset)".to_string());
     } else if violations.len() < MAX_BINDING_VIOLATIONS {
         match cas.exists(&bindings.summary_receipt_hash) {
@@ -2289,19 +2289,19 @@ pub fn validate_and_store_transition_authority(
     // capability_manifest_hash and context_pack_hash are mandatory per
     // REQ-HEF-0013 -- zero values indicate missing policy resolution and
     // MUST be rejected (fail-closed).
-    if bindings.permeability_receipt_hash == [0u8; 32] {
+    if bool::from(bindings.permeability_receipt_hash.ct_eq(&[0u8; 32])) {
         violations.push("permeability_receipt_hash is zero (unset)".to_string());
     }
-    if bindings.capability_manifest_hash == [0u8; 32] {
+    if bool::from(bindings.capability_manifest_hash.ct_eq(&[0u8; 32])) {
         violations.push("capability_manifest_hash is zero (unset)".to_string());
     }
-    if bindings.context_pack_hash == [0u8; 32] {
+    if bool::from(bindings.context_pack_hash.ct_eq(&[0u8; 32])) {
         violations.push("context_pack_hash is zero (unset)".to_string());
     }
-    if bindings.stop_condition_hash == [0u8; 32] {
+    if bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32])) {
         violations.push("stop_condition_hash is zero (unset)".to_string());
     }
-    if bindings.typed_budget_hash == [0u8; 32] {
+    if bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32])) {
         violations.push("typed_budget_hash is zero (unset)".to_string());
     }
 
@@ -2324,7 +2324,7 @@ pub fn validate_and_store_transition_authority(
         ("stop_condition_hash", bindings.stop_condition_hash),
         ("typed_budget_hash", bindings.typed_budget_hash),
     ] {
-        if hash != [0u8; 32] && violations.len() < MAX_BINDING_VIOLATIONS {
+        if !bool::from(hash.ct_eq(&[0u8; 32])) && violations.len() < MAX_BINDING_VIOLATIONS {
             match cas.exists(&hash) {
                 Ok(true) => {},
                 Ok(false) => violations.push(format!(
@@ -2346,8 +2346,8 @@ pub fn validate_and_store_transition_authority(
 
     // Hash integrity: re-derive and verify
     let recomputed_stop_hash = hash_bytes(&bindings.stop_conditions.canonical_bytes());
-    if bindings.stop_condition_hash != [0u8; 32]
-        && bindings.stop_condition_hash != recomputed_stop_hash
+    if !bool::from(bindings.stop_condition_hash.ct_eq(&[0u8; 32]))
+        && !bool::from(bindings.stop_condition_hash.ct_eq(&recomputed_stop_hash))
     {
         violations.push(format!(
             "stop_condition_hash mismatch: declared={} recomputed={}",
@@ -2360,8 +2360,8 @@ pub fn validate_and_store_transition_authority(
         canonical_json_bytes(&build_typed_budget_payload(&bindings.typed_budgets))
     {
         let recomputed_budget_hash = hash_bytes(&budget_payload);
-        if bindings.typed_budget_hash != [0u8; 32]
-            && bindings.typed_budget_hash != recomputed_budget_hash
+        if !bool::from(bindings.typed_budget_hash.ct_eq(&[0u8; 32]))
+            && !bool::from(bindings.typed_budget_hash.ct_eq(&recomputed_budget_hash))
         {
             violations.push(format!(
                 "typed_budget_hash mismatch: declared={} recomputed={}",
@@ -5097,7 +5097,7 @@ impl ConnectionContext {
         &mut self,
         profile_hash: [u8; 32],
     ) -> Result<(), crate::identity::IdentityProofError> {
-        if profile_hash == [0u8; 32] {
+        if bool::from(profile_hash.ct_eq(&[0u8; 32])) {
             return Err(crate::identity::IdentityProofError::InvalidField {
                 field: "identity_proof_profile_hash",
                 reason: "must be non-zero".to_string(),
@@ -7931,7 +7931,7 @@ impl PrivilegedDispatcher {
         let envelope_canonical_hash = envelope
             .canonical_hash()
             .map_err(|e| format!("failed to canonicalize time envelope: {e}"))?;
-        if envelope_canonical_hash != envelope_hash {
+        if !bool::from(envelope_canonical_hash.ct_eq(&envelope_hash)) {
             return Err(format!(
                 "time_envelope_ref hash mismatch: ref={} actual={}",
                 hex::encode(envelope_hash),
@@ -7950,7 +7950,7 @@ impl PrivilegedDispatcher {
         let profile_canonical_hash = clock_profile
             .canonical_hash()
             .map_err(|e| format!("failed to canonicalize clock profile: {e}"))?;
-        if profile_canonical_hash != clock_profile_hash {
+        if !bool::from(profile_canonical_hash.ct_eq(&clock_profile_hash)) {
             return Err(format!(
                 "clock_profile_hash mismatch: envelope={} actual={}",
                 hex::encode(clock_profile_hash),
@@ -9681,6 +9681,12 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        let mut delegated_gate_inputs: Option<(
+            [u8; 32],
+            apm2_core::policy::permeability::AuthorityVector,
+            u64,
+        )> = None;
+
         if let Some(ref receipt_hash_bytes) = request.permeability_receipt_hash {
             use apm2_core::policy::permeability::ConsumptionContext;
 
@@ -9703,7 +9709,7 @@ impl PrivilegedDispatcher {
             receipt_hash.copy_from_slice(receipt_hash_bytes);
 
             // Fail-closed: receipt hash must be non-zero.
-            if receipt_hash == [0u8; 32] {
+            if bool::from(receipt_hash.ct_eq(&[0u8; 32])) {
                 warn!(
                     work_id = %request.work_id,
                     "SpawnEpisode rejected: permeability_receipt_hash is zero"
@@ -9730,7 +9736,7 @@ impl PrivilegedDispatcher {
 
             // Verify the receipt content hash matches the declared hash.
             let actual_hash = receipt.content_hash();
-            if actual_hash != receipt_hash {
+            if !bool::from(actual_hash.ct_eq(&receipt_hash)) {
                 warn!(
                     work_id = %request.work_id,
                     expected = %hex::encode(receipt_hash),
@@ -9843,6 +9849,8 @@ impl PrivilegedDispatcher {
                     format!("permeability consumption binding failed: {e}"),
                 ));
             }
+
+            delegated_gate_inputs = Some((receipt_hash, required_authority, now_ms));
 
             info!(
                 work_id = %request.work_id,
@@ -10280,6 +10288,153 @@ impl PrivilegedDispatcher {
         // Generate session ID and ephemeral handle
         let session_id = format!("S-{}", uuid::Uuid::new_v4());
         let ephemeral_handle = EphemeralHandle::generate();
+
+        // TCK-00406: Build authoritative V1 envelope and enforce spawn gate
+        // in the production dispatch path BEFORE any session-state mutation.
+        let Some(envelope_risk_tier) =
+            crate::episode::RiskTier::from_u8(claim.policy_resolution.resolved_risk_tier)
+        else {
+            warn!(
+                work_id = %request.work_id,
+                resolved_risk_tier = claim.policy_resolution.resolved_risk_tier,
+                "SpawnEpisode rejected: invalid resolved_risk_tier for envelope gate (fail-closed)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "invalid resolved_risk_tier {} for envelope gate (fail-closed)",
+                    claim.policy_resolution.resolved_risk_tier
+                ),
+            ));
+        };
+
+        let mut view_commitment_hasher = blake3::Hasher::new();
+        view_commitment_hasher.update(b"apm2.spawn.view_commitment.v1");
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(session_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(claim.work_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(claim.lease_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(claim.actor_id.as_bytes());
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&claim.policy_resolution.resolved_policy_hash);
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&claim.policy_resolution.capability_manifest_hash);
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&claim.policy_resolution.context_pack_hash);
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&claim.policy_resolution.context_pack_recipe_hash);
+        view_commitment_hasher.update(b"\0");
+        view_commitment_hasher.update(&adapter_profile_hash);
+        view_commitment_hasher.update(b"\0");
+        if let Some(hash) = role_spec_hash {
+            view_commitment_hasher.update(&hash);
+            view_commitment_hasher.update(b"\0");
+        }
+        let view_commitment_hash: [u8; 32] = view_commitment_hasher.finalize().into();
+
+        let mut freshness_pinset_hasher = blake3::Hasher::new();
+        freshness_pinset_hasher.update(b"apm2.spawn.freshness_pinset.v1");
+        freshness_pinset_hasher.update(b"\0");
+        freshness_pinset_hasher.update(claim.work_id.as_bytes());
+        freshness_pinset_hasher.update(b"\0");
+        freshness_pinset_hasher.update(claim.lease_id.as_bytes());
+        freshness_pinset_hasher.update(b"\0");
+        freshness_pinset_hasher.update(&claim.policy_resolution.context_pack_hash);
+        freshness_pinset_hasher.update(b"\0");
+        freshness_pinset_hasher.update(&claim.policy_resolution.context_pack_recipe_hash);
+        freshness_pinset_hasher.update(b"\0");
+        let freshness_pinset_hash: [u8; 32] = freshness_pinset_hasher.finalize().into();
+
+        let pinned_snapshot = crate::episode::PinnedSnapshot::builder()
+            .repo_hash(claim.policy_resolution.context_pack_hash)
+            .policy_hash(claim.policy_resolution.resolved_policy_hash)
+            .model_profile_hash(adapter_profile_hash)
+            .build();
+
+        let context_refs = crate::episode::ContextRefs {
+            context_pack_hash: claim.policy_resolution.context_pack_hash.to_vec(),
+            dcp_refs: vec![claim.policy_resolution.policy_resolved_ref.clone()],
+        };
+
+        let mut envelope_builder = crate::episode::EpisodeEnvelopeV1::builder()
+            .episode_id(&session_id)
+            .actor_id(&claim.actor_id)
+            .work_id(&claim.work_id)
+            .lease_id(&claim.lease_id)
+            .capability_manifest_hash(claim.policy_resolution.capability_manifest_hash)
+            .budget(crate::episode::EpisodeBudget::default())
+            .stop_conditions(resolved_stop_conditions.clone())
+            .pinned_snapshot(pinned_snapshot)
+            .risk_tier(envelope_risk_tier)
+            .context_refs(context_refs)
+            .view_commitment_hash(view_commitment_hash)
+            .freshness_pinset_hash(freshness_pinset_hash);
+
+        if let Some((receipt_hash, _, _)) = delegated_gate_inputs.as_ref() {
+            envelope_builder = envelope_builder.permeability_receipt_hash(*receipt_hash);
+        }
+
+        let authoritative_envelope = match envelope_builder.build() {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: failed to build authoritative envelope (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("authoritative envelope build failed: {e}"),
+                ));
+            },
+        };
+
+        if let Some((_, required_authority, now_ms)) = delegated_gate_inputs.as_ref() {
+            let Some(receipt) = claim.permeability_receipt.as_ref() else {
+                warn!(
+                    work_id = %request.work_id,
+                    "SpawnEpisode rejected: delegated gate inputs present without receipt (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "delegated gate inputs present without claim permeability receipt (fail-closed)",
+                ));
+            };
+
+            if let Err(e) = crate::episode::validate_delegated_spawn_gate(
+                Some(&authoritative_envelope),
+                receipt,
+                required_authority,
+                *now_ms,
+            ) {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: delegated envelope gate failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("delegated envelope gate failed: {e}"),
+                ));
+            }
+        } else if let Err(e) =
+            crate::episode::validate_spawn_gate(Some(&authoritative_envelope), false)
+        {
+            warn!(
+                work_id = %request.work_id,
+                error = %e,
+                "SpawnEpisode rejected: envelope gate failed"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("envelope gate failed: {e}"),
+            ));
+        }
+
+        let authoritative_envelope_hash = authoritative_envelope.envelope_hash();
 
         // TCK-00384 security fix: Transactional session + telemetry registration
         // with guaranteed rollback on any failure path.
@@ -10885,23 +11040,7 @@ impl PrivilegedDispatcher {
         // workspace directory. The episode must be started BEFORE returning
         // to the client so that tool handlers are properly initialized.
         //
-        // Generate envelope hash from session_id + work_id + lease_id for uniqueness.
-        // Null-byte delimiters prevent collision between fields (MAJOR-2 security fix).
-        // adapter/role/context lineage hashes are included in the envelope hash
-        // so runtime identity reflects authoritative policy bindings.
-        // TODO(TCK-00397): migrate to EpisodeEnvelopeBuilder for structured
-        // envelope construction once the full EpisodeEnvelope lifecycle is wired.
-        let envelope_data = format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
-            session_id,
-            request.work_id,
-            claim.lease_id,
-            hex::encode(adapter_profile_hash),
-            role_spec_hash_log,
-            context_pack_hash_component,
-            context_pack_recipe_hash_component,
-        );
-        let envelope_hash: [u8; 32] = blake3::hash(envelope_data.as_bytes()).into();
+        let envelope_hash = authoritative_envelope_hash;
 
         // Try to create and start the episode. This requires a Tokio runtime.
         // In unit tests without a runtime, we skip episode creation but still
@@ -12939,17 +13078,18 @@ impl PrivilegedDispatcher {
         } else {
             None
         };
-        let request_blocked_log_hash_arr = if verdict == ReviewReceiptVerdict::Blocked {
-            Some(
-                request
-                    .blocked_log_hash
-                    .as_slice()
-                    .try_into()
-                    .expect("validated to be 32 bytes above"),
-            )
-        } else {
-            None
-        };
+        let request_blocked_log_hash_arr: Option<[u8; 32]> =
+            if verdict == ReviewReceiptVerdict::Blocked {
+                Some(
+                    request
+                        .blocked_log_hash
+                        .as_slice()
+                        .try_into()
+                        .expect("validated to be 32 bytes above"),
+                )
+            } else {
+                None
+            };
 
         let to_response_event_type = |event_type: &str| -> String {
             match event_type {
@@ -13014,7 +13154,11 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if original.changeset_digest != request_changeset_digest_arr {
+            if !bool::from(
+                original
+                    .changeset_digest
+                    .ct_eq(&request_changeset_digest_arr),
+            ) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     existing_event_id = %existing.event_id,
@@ -13044,7 +13188,11 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            if original.artifact_bundle_hash != request_artifact_bundle_hash_arr {
+            if !bool::from(
+                original
+                    .artifact_bundle_hash
+                    .ct_eq(&request_artifact_bundle_hash_arr),
+            ) {
                 warn!(
                     receipt_id = %request.receipt_id,
                     existing_event_id = %existing.event_id,
@@ -13083,7 +13231,11 @@ impl PrivilegedDispatcher {
             if let Some(original_blocked_log_hash) = original.blocked_log_hash {
                 let requested_blocked_log_hash = request_blocked_log_hash_arr
                     .map_or_else(|| "<missing>".to_string(), hex::encode);
-                if Some(original_blocked_log_hash) != request_blocked_log_hash_arr {
+                let blocked_log_hash_matches =
+                    request_blocked_log_hash_arr.is_some_and(|request_blocked_log_hash| {
+                        bool::from(original_blocked_log_hash.ct_eq(&request_blocked_log_hash))
+                    });
+                if !blocked_log_hash_matches {
                     warn!(
                         receipt_id = %request.receipt_id,
                         existing_event_id = %existing.event_id,
@@ -14178,7 +14330,7 @@ impl PrivilegedDispatcher {
         // digest mismatches before any side effects.
         let computed_changeset_digest = bundle.compute_digest();
         let provided_changeset_digest = bundle.changeset_digest();
-        if computed_changeset_digest != provided_changeset_digest {
+        if !bool::from(computed_changeset_digest.ct_eq(&provided_changeset_digest)) {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!(
@@ -14779,7 +14931,9 @@ impl PrivilegedDispatcher {
         }
 
         // Lineage binding prerequisites for delegated paths.
-        if parent_lease.changeset_digest == [0u8; 32] || parent_lease.policy_hash == [0u8; 32] {
+        if bool::from(parent_lease.changeset_digest.ct_eq(&[0u8; 32]))
+            || bool::from(parent_lease.policy_hash.ct_eq(&[0u8; 32]))
+        {
             let deny_class = AuthorityDenyClass::InvalidDelegationChain;
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -15048,8 +15202,8 @@ impl PrivilegedDispatcher {
                     && existing.gate_id == sublease.gate_id
                     && existing.executor_actor_id == sublease.executor_actor_id
                     && existing.expires_at == sublease.expires_at
-                    && existing.changeset_digest == sublease.changeset_digest
-                    && existing.policy_hash == sublease.policy_hash
+                    && bool::from(existing.changeset_digest.ct_eq(&sublease.changeset_digest))
+                    && bool::from(existing.policy_hash.ct_eq(&sublease.policy_hash))
                     && existing.issuer_actor_id == sublease.issuer_actor_id;
 
                 if !fields_match {

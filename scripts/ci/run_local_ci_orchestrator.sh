@@ -195,6 +195,7 @@ run_parallel_group "static-guardrails" \
     "test_refs_lint::./scripts/ci/test_refs_lint.sh" \
     "proto_enum_drift::./scripts/ci/proto_enum_drift.sh" \
     "review_artifact_lint::./scripts/ci/review_artifact_lint.sh" \
+    "runtime_closure::./scripts/ci/check_runtime_closure.sh" \
     "status_write_cmd_lint::./scripts/lint/no_direct_status_write_commands.sh" \
     "safety_proof_coverage::./scripts/ci/safety_proof_coverage.sh"
 

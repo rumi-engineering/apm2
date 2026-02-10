@@ -1,0 +1,36 @@
+{
+  "schema": "apm2.runtime_closure_checklist.v1",
+  "schema_version": "1.0.0",
+  "gate_id": "GATE-RUNTIME-CLOSURE-TCK-00406",
+  "description": "Security/QCP runtime-closure checklist. Security-module diffs must include authoritative production callsite diffs unless an active waiver is present.",
+  "applies_when": {
+    "label_set": ["SECURITY", "QCP=YES"],
+    "env_flags": ["APM2_SECURITY_QCP", "SECURITY_QCP"]
+  },
+  "security_modules": [
+    {
+      "path": "crates/apm2-core/src/fac/taint.rs",
+      "required_production_callsites": [
+        "crates/apm2-daemon/src/protocol/session_dispatch.rs"
+      ]
+    },
+    {
+      "path": "crates/apm2-daemon/src/episode/envelope.rs",
+      "required_production_callsites": [
+        "crates/apm2-daemon/src/protocol/dispatch.rs"
+      ]
+    },
+    {
+      "path": "crates/apm2-daemon/src/projection/divergence_watchdog.rs",
+      "required_production_callsites": [
+        "crates/apm2-daemon/src/main.rs"
+      ]
+    }
+  ],
+  "waiver": {
+    "directory": "documents/work/waivers",
+    "required_gate_id": "GATE-RUNTIME-CLOSURE-TCK-00406",
+    "allowed_status": ["ACTIVE", "APPROVED"],
+    "expiry_fields": ["expires", "expiration_date"]
+  }
+}

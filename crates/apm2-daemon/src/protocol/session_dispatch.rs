@@ -67,6 +67,9 @@ use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::crypto::{Hash, Signer as CryptoSigner};
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
+#[cfg(test)]
+use apm2_core::fac::taint::{FlowRule, TaintSource, TargetContext};
+use apm2_core::fac::taint::{TaintPolicy, TaintViolation, evaluate_tool_argument_ingress};
 use apm2_core::pcac::{
     ArbitrationOutcome, EvaluatorTuple, PcacPolicyKnobs, TemporalArbitrationReceiptV1,
     TemporalPredicateId, check_freshness_dominance, check_revocation_dominance,
@@ -771,6 +774,11 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// checking, Tier2+ revalidation/consume stages enforce sovereignty epoch,
     /// revocation certainty, autonomy ceiling, and freeze state.
     sovereignty_state: Option<Arc<crate::pcac::SovereigntyState>>,
+    /// Runtime taint policy for ingress checks on tool request arguments.
+    ///
+    /// TCK-00406: Production ingress paths must evaluate taint flow and deny
+    /// forbidden flows before actuation.
+    taint_policy: Arc<TaintPolicy>,
 }
 
 #[derive(Clone)]
@@ -786,6 +794,24 @@ struct PendingPcacAuthority {
     temporal_arbitration_receipts: Vec<TemporalArbitrationReceiptV1>,
     pre_actuation_required: bool,
     pre_actuation_receipt_hashes: Vec<Hash>,
+}
+
+#[cfg(not(test))]
+fn default_runtime_taint_policy() -> TaintPolicy {
+    TaintPolicy::default()
+}
+
+#[cfg(test)]
+fn default_runtime_taint_policy() -> TaintPolicy {
+    TaintPolicy::default().with_rule(FlowRule {
+        rule_id: "TEST_ALLOW_USER_PROMPT_TOOL_ARGUMENT".to_string(),
+        source: Some(TaintSource::UserPrompt),
+        level: None,
+        target: Some(TargetContext::ToolArgument),
+        allow: true,
+        rationale: "Unit-test harness override for downstream RequestTool path coverage"
+            .to_string(),
+    })
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -824,6 +850,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 
@@ -854,6 +881,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 }
@@ -889,6 +917,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 
@@ -924,6 +953,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 
@@ -975,6 +1005,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 
@@ -1202,6 +1233,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
+    /// Sets the taint policy used for runtime tool-argument ingress checks.
+    #[must_use]
+    pub fn with_taint_policy(mut self, policy: TaintPolicy) -> Self {
+        self.taint_policy = Arc::new(policy);
+        self
+    }
+
     fn emit_htf_regression_defect(&self, current: u64, previous: u64) {
         if let Some(ref ledger) = self.ledger {
             let defect_id = format!("DEF-REGRESSION-{}", uuid::Uuid::new_v4());
@@ -1358,6 +1396,88 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 error!("Failed to emit context miss defect: {}", e);
             }
         }
+    }
+
+    fn emit_taint_violation_defect(
+        &self,
+        session_id: &str,
+        tool_id: &str,
+        violation: &TaintViolation,
+        fallback_timestamp_ns: u64,
+    ) -> Result<(), String> {
+        let Some(ref ledger) = self.ledger else {
+            return Err("ledger unavailable for taint violation defect emission".to_string());
+        };
+
+        let defect_id = format!("DEF-TAINT-{}", uuid::Uuid::new_v4());
+        let timestamp_ns = self
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
+            .unwrap_or(fallback_timestamp_ns);
+        let severity = if matches!(
+            violation.tag.level,
+            apm2_core::fac::taint::TaintLevel::Adversarial
+        ) {
+            DefectSeverity::S1
+        } else {
+            DefectSeverity::S2
+        };
+
+        let defect_record = DefectRecord::builder(&defect_id, "TAINT_POLICY_DENY")
+            .severity(severity)
+            .work_id(session_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::UnplannedToolCall,
+                format!(
+                    "tool_id={} source={} level={} target={} rule_id={} description={}",
+                    tool_id,
+                    violation.tag.source,
+                    violation.tag.level,
+                    violation.target,
+                    violation.rule_id,
+                    violation.description
+                ),
+            ))
+            .context(
+                HolonDefectContext::new()
+                    .with_session_id(session_id)
+                    .with_requested_stable_id(tool_id.to_string()),
+            )
+            .build()
+            .map_err(|e| format!("failed to build taint DefectRecord: {e}"))?;
+
+        let defect_json = serde_json::to_vec(&defect_record)
+            .map_err(|e| format!("failed to serialize taint DefectRecord: {e}"))?;
+        let cas_hash = self.cas.as_ref().map_or_else(
+            || blake3::hash(&defect_json).as_bytes().to_vec(),
+            |cas| cas.store(&defect_json).to_vec(),
+        );
+
+        let time_envelope_uri = format!("htf:taint:{}:{}", timestamp_ns, violation.rule_id);
+        let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+            .as_bytes()
+            .to_vec();
+
+        let defect_event = DefectRecorded {
+            defect_id,
+            defect_type: "TAINT_POLICY_DENY".to_string(),
+            cas_hash,
+            source: DefectSource::ContextMiss as i32,
+            work_id: session_id.to_string(),
+            severity: severity.as_str().to_string(),
+            detected_at: timestamp_ns,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_envelope_hash,
+            }),
+        };
+
+        ledger
+            .emit_defect_recorded(&defect_event, timestamp_ns)
+            .map_err(|e| format!("failed to emit taint defect: {e}"))?;
+
+        Ok(())
     }
 
     fn emit_firewall_violation_defect(
@@ -2197,6 +2317,51 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 format!("unknown tool class: {}", request.tool_id),
             ));
         };
+
+        // TCK-00406: Runtime taint ingress enforcement on production request
+        // path. Deny and emit durable defect evidence for forbidden flows.
+        let taint_assessment =
+            evaluate_tool_argument_ingress(&request.arguments, self.taint_policy.as_ref());
+        if !taint_assessment.is_allowed() {
+            let violation = TaintViolation::from_decision(&taint_assessment.decision);
+            let timestamp_ns = self
+                .clock
+                .as_ref()
+                .and_then(|clock| clock.now_hlc().ok().map(|hlc| hlc.wall_ns))
+                .unwrap_or(0);
+
+            warn!(
+                session_id = %token.session_id,
+                tool_id = %request.tool_id,
+                taint_source = %violation.tag.source,
+                taint_level = %violation.tag.level,
+                taint_rule_id = %violation.rule_id,
+                "RequestTool denied by taint ingress policy"
+            );
+
+            if let Err(e) = self.emit_taint_violation_defect(
+                &token.session_id,
+                &request.tool_id,
+                &violation,
+                timestamp_ns,
+            ) {
+                error!(
+                    session_id = %token.session_id,
+                    tool_id = %request.tool_id,
+                    error = %e,
+                    "taint defect emission failed"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    format!("taint defect emission failed: {e}"),
+                ));
+            }
+
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!("taint ingress denied: {}", violation.summary()),
+            ));
+        }
 
         let broker = if let Some(ref brokers) = self.session_brokers {
             brokers.get(&token.session_id)
