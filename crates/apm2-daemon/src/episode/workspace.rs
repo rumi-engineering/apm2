@@ -828,6 +828,8 @@ pub fn validate_commit_ref(commit_ref: &str) -> Result<(), WorkspaceError> {
 ///   (TCK-00326, optional for backward compatibility)
 /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in effect
 ///   (TCK-00326, optional for backward compatibility)
+/// * `role_spec_hash` - Hash of the authoritative `RoleSpecV2` in effect
+///   (TCK-00448, optional for backward compatibility)
 /// * `signer` - Signer to authorize the event
 ///
 /// # Errors
@@ -843,6 +845,7 @@ pub fn create_blocked_event(
     recorder_actor_id: String,
     capability_manifest_hash: Option<[u8; 32]>,
     context_pack_hash: Option<[u8; 32]>,
+    role_spec_hash: Option<[u8; 32]>,
     signer: &Signer,
 ) -> Result<ReviewBlockedRecorded, ReviewBlockedError> {
     let mut builder = ReviewBlockedRecordedBuilder::new()
@@ -858,6 +861,9 @@ pub fn create_blocked_event(
     }
     if let Some(hash) = context_pack_hash {
         builder = builder.context_pack_hash(hash);
+    }
+    if let Some(hash) = role_spec_hash {
+        builder = builder.role_spec_hash(hash);
     }
 
     builder.build_and_sign(signer)

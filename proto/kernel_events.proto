@@ -855,6 +855,10 @@ message PolicyResolvedForChangeSet {
   string resolver_version = 10;
   // Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: domain (64 bytes)
   bytes resolver_signature = 11;
+  // BLAKE3 hash of the authoritative RoleSpecV2 contract (32 bytes, TCK-00448).
+  bytes role_spec_hash = 12;
+  // BLAKE3 hash of the compiled ContextPackRecipe lineage artifact (32 bytes, TCK-00448).
+  bytes context_pack_recipe_hash = 13;
 }
 
 // GateReceipt envelope with versioning support.
@@ -1712,6 +1716,9 @@ message ReviewBlockedRecorded {
   // BLAKE3 hash of the sealed ContextPackManifest in effect (32 bytes, TCK-00326).
   // Binds the blocked event to the context firewall configuration.
   bytes context_pack_hash = 9;
+  // BLAKE3 hash of the RoleSpecV2 used during review (32 bytes, TCK-00448).
+  // Binds the blocked event to the role specification used for the attempted run.
+  bytes role_spec_hash = 10;
 }
 
 // ============================================================
@@ -1803,4 +1810,3 @@ message ProjectionReceiptRecorded {
   // Ed25519 signature over canonical bytes with PROJECTION_RECEIPT_RECORDED: domain (64 bytes).
   bytes projector_signature = 6;
 }
-

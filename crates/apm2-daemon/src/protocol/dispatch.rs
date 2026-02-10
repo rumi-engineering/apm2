@@ -26,7 +26,7 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -38,8 +38,10 @@ use apm2_core::events::{DefectRecorded, DefectSource, Validate};
 use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::fac::{
     AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, CHANGESET_PUBLISHED_PREFIX,
+    DenyCondition, DenyReasonCode, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID,
     REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, SelectionDecision,
-    builtin_profiles, validate_receipt_attestation,
+    builtin_profiles, fac_workobject_implementor_v2_role_contract,
+    seed_builtin_role_contracts_v2_in_cas, validate_receipt_attestation,
 };
 use apm2_core::htf::{Canonicalizable, ClockProfile, TimeEnvelope, WallTimeSource};
 use apm2_core::pcac::{
@@ -618,6 +620,9 @@ pub trait LedgerEventEmitter: Send + Sync {
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
+        capability_manifest_hash: &[u8; 32],
+        context_pack_hash: &[u8; 32],
+        role_spec_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
@@ -661,6 +666,9 @@ pub trait LedgerEventEmitter: Send + Sync {
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
+        capability_manifest_hash: &[u8; 32],
+        context_pack_hash: &[u8; 32],
+        role_spec_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
@@ -958,37 +966,20 @@ pub trait LedgerEventEmitter: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn emit_receipt_with_bindings(
         &self,
-        episode_id: &str,
-        receipt_id: &str,
-        changeset_digest: &[u8; 32],
-        artifact_bundle_hash: &[u8; 32],
-        reviewer_actor_id: &str,
-        timestamp_ns: u64,
-        bindings: &crate::episode::EnvelopeBindings,
-        identity_proof_hash: &[u8; 32],
+        _episode_id: &str,
+        _receipt_id: &str,
+        _changeset_digest: &[u8; 32],
+        _artifact_bundle_hash: &[u8; 32],
+        _reviewer_actor_id: &str,
+        _timestamp_ns: u64,
+        _bindings: &crate::episode::EnvelopeBindings,
+        _identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Fail-closed: validate bindings before emission
-        bindings
-            .validate()
-            .map_err(|e| LedgerEventError::ValidationFailed {
-                message: format!("envelope binding validation failed: {e}"),
-            })?;
-
-        let (envelope_hash_hex, _, _) = bindings.to_hex_map();
-
-        // Default implementation delegates to emit_review_receipt.
-        // Implementations that persist bindings should override this.
-        self.emit_review_receipt(
-            episode_id,
-            receipt_id,
-            changeset_digest,
-            artifact_bundle_hash,
-            reviewer_actor_id,
-            timestamp_ns,
-            identity_proof_hash,
-            &envelope_hash_hex,
-            None,
-        )
+        Err(LedgerEventError::ValidationFailed {
+            message: "emit_receipt_with_bindings default is fail-closed; implementers must \
+                      override to persist envelope bindings correctly"
+                .to_string(),
+        })
     }
 }
 
@@ -1863,7 +1854,7 @@ pub fn build_policy_context_pack(
     ContextPackManifestBuilder::new(format!("manifest:{work_id}"), format!("profile:{actor_id}"))
         .add_entry(
             ManifestEntryBuilder::new(
-                format!("/work/{work_id}/context.yaml"),
+                format!("work/{work_id}/context.yaml"),
                 *content_hash.as_bytes(),
             )
             .stable_id("work-context")
@@ -1897,6 +1888,148 @@ pub fn policy_context_pack_hash(work_id: &str, actor_id: &str) -> [u8; 32] {
     context_pack.manifest_hash()
 }
 
+/// Maps FAC deny reason codes to daemon privileged error codes.
+const fn map_deny_reason_code_to_privileged_error(code: DenyReasonCode) -> PrivilegedErrorCode {
+    match code {
+        DenyReasonCode::MissingAuthority => PrivilegedErrorCode::PolicyResolutionMissing,
+        DenyReasonCode::StaleAuthority
+        | DenyReasonCode::UnknownRole
+        | DenyReasonCode::UnverifiableContext => PrivilegedErrorCode::CapabilityRequestRejected,
+    }
+}
+
+/// Builds a standardized fail-closed response for authority-context denials.
+fn deny_response_for_authority_context(
+    condition: DenyCondition,
+    detail: impl Into<String>,
+) -> PrivilegedResponse {
+    let deny_reason = fac_workobject_implementor_v2_role_contract().deny_reason_for(condition);
+    let detail = detail.into();
+    PrivilegedResponse::error(
+        map_deny_reason_code_to_privileged_error(deny_reason.code),
+        format!(
+            "{} ({condition}): {}; {detail}",
+            deny_reason.code, deny_reason.message
+        ),
+    )
+}
+
+/// Resolves and seeds the authoritative `RoleSpecV2` hash for `WorkObject`
+/// execution.
+///
+/// Returns an error when the built-in role registry cannot be seeded, the
+/// role id is missing, or the resulting hash is not CAS-resolvable.
+pub fn resolve_workobject_role_spec_hash(
+    cas: &dyn ContentAddressedStore,
+) -> Result<[u8; 32], String> {
+    let registry = seed_builtin_role_contracts_v2_in_cas(cas)
+        .map_err(|e| format!("failed to seed builtin RoleSpecV2 contracts in CAS: {e}"))?;
+    let role_spec_hash = registry
+        .get(FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "missing role contract hash for role_id='{FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID}'"
+            )
+        })?;
+
+    if bool::from(role_spec_hash.ct_eq(&[0u8; 32])) {
+        return Err("resolved role_spec_hash is zero".to_string());
+    }
+
+    match cas.exists(&role_spec_hash) {
+        Ok(true) => Ok(role_spec_hash),
+        Ok(false) => Err(format!(
+            "resolved role_spec_hash {} is not present in CAS",
+            hex::encode(role_spec_hash)
+        )),
+        Err(e) => Err(format!(
+            "CAS existence check for role_spec_hash failed: {e}"
+        )),
+    }
+}
+
+fn compute_policy_required_read_digest_set_hash(
+    required_read_digests: &BTreeMap<String, [u8; 32]>,
+) -> Result<[u8; 32], String> {
+    let mut payload = Vec::new();
+    for (path, digest) in required_read_digests {
+        let path_len = u32::try_from(path.len())
+            .map_err(|_| "required read path length exceeds u32 range".to_string())?;
+        payload.extend_from_slice(&path_len.to_be_bytes());
+        payload.extend_from_slice(path.as_bytes());
+        payload.extend_from_slice(digest);
+    }
+    Ok(*blake3::hash(&payload).as_bytes())
+}
+
+/// Builds a deterministic `CompiledContextPackRecipe` for policy lineage.
+///
+/// The compiled recipe binds role/context/budget hashes to the deterministic
+/// policy context materialization used by `ClaimWork` and `SpawnEpisode`.
+pub fn build_policy_context_pack_recipe(
+    work_id: &str,
+    actor_id: &str,
+    role_spec_hash: [u8; 32],
+    context_pack_hash: [u8; 32],
+) -> Result<apm2_core::context::CompiledContextPackRecipe, String> {
+    let required_read_path = format!("work/{work_id}/context.yaml");
+    let required_read_digest =
+        *blake3::hash(format!("content:{work_id}:{actor_id}").as_bytes()).as_bytes();
+    let required_read_paths = vec![required_read_path.clone()];
+    let mut required_read_digests = BTreeMap::new();
+    required_read_digests.insert(required_read_path, required_read_digest);
+    let required_read_digest_set_hash =
+        compute_policy_required_read_digest_set_hash(&required_read_digests)?;
+    let budget_profile_hash =
+        *blake3::hash(format!("budget:{work_id}:{actor_id}").as_bytes()).as_bytes();
+
+    let recipe = apm2_core::context::ContextPackRecipe::new(
+        role_spec_hash,
+        required_read_paths,
+        required_read_digests,
+        required_read_digest_set_hash,
+        context_pack_hash,
+        budget_profile_hash,
+    )
+    .map_err(|e| format!("failed to build ContextPackRecipe: {e}"))?;
+    let recipe_hash = recipe
+        .recipe_hash()
+        .map_err(|e| format!("failed to compute ContextPackRecipe hash: {e}"))?;
+    let fingerprint = apm2_core::context::DriftFingerprint {
+        role_hash: role_spec_hash,
+        required_read_digest_set_hash,
+        context_manifest_hash: context_pack_hash,
+        budget_profile_hash,
+        recipe_hash,
+        compiled_at_tick: 0,
+    };
+
+    Ok(apm2_core::context::CompiledContextPackRecipe {
+        recipe,
+        fingerprint,
+    })
+}
+
+/// Returns the deterministic `ContextPackRecipe` hash for policy lineage.
+///
+/// # Errors
+///
+/// Returns an error if recipe materialization or hashing fails.
+pub fn policy_context_pack_recipe_hash(
+    work_id: &str,
+    actor_id: &str,
+    role_spec_hash: [u8; 32],
+    context_pack_hash: [u8; 32],
+) -> Result<[u8; 32], String> {
+    let compiled =
+        build_policy_context_pack_recipe(work_id, actor_id, role_spec_hash, context_pack_hash)?;
+    compiled
+        .recipe
+        .recipe_hash()
+        .map_err(|e| format!("failed to compute policy context recipe hash: {e}"))
+}
+
 /// Seeds CAS with the preimages of policy-provided hashes so they become
 /// CAS-resolvable at validation time (REQ-HEF-0013).
 ///
@@ -1910,10 +2043,18 @@ pub fn policy_context_pack_hash(work_id: &str, actor_id: &str) -> [u8; 32] {
 /// For the **context pack**, the preimage is the
 /// [`canonical_seal_bytes`](apm2_core::context::ContextPackManifest::canonical_seal_bytes)
 /// of the deterministic context pack built from `(work_id, actor_id)`.
+///
+/// For the **role spec**, built-in v2 contracts are seeded into CAS and the
+/// policy-provided `role_spec_hash` must match the canonical built-in hash.
+///
+/// For the **context recipe**, deterministic canonical recipe bytes are stored
+/// and must match the policy-provided `context_pack_recipe_hash`.
 pub fn seed_policy_artifacts_in_cas(
     work_id: &str,
     actor_id: &str,
     role: WorkRole,
+    role_spec_hash: [u8; 32],
+    context_pack_recipe_hash: [u8; 32],
     cas: &dyn ContentAddressedStore,
 ) -> Result<(), String> {
     // ---- capability manifest preimage ----
@@ -1933,6 +2074,44 @@ pub fn seed_policy_artifacts_in_cas(
     let seal_bytes = context_pack.canonical_seal_bytes();
     cas.store(&seal_bytes)
         .map_err(|e| format!("CAS store context pack failed: {e}"))?;
+
+    // ---- role spec contract preimage ----
+    if bool::from(role_spec_hash.ct_eq(&[0u8; 32])) {
+        return Err("role_spec_hash is zero (missing authority context)".to_string());
+    }
+    let cas_role_spec_hash = resolve_workobject_role_spec_hash(cas)?;
+    if !bool::from(role_spec_hash.ct_eq(&cas_role_spec_hash)) {
+        return Err(format!(
+            "role_spec_hash mismatch: policy={} cas={}",
+            hex::encode(role_spec_hash),
+            hex::encode(cas_role_spec_hash),
+        ));
+    }
+
+    // ---- context-pack recipe preimage ----
+    if bool::from(context_pack_recipe_hash.ct_eq(&[0u8; 32])) {
+        return Err("context_pack_recipe_hash is zero (missing authority context)".to_string());
+    }
+    let compiled = build_policy_context_pack_recipe(
+        work_id,
+        actor_id,
+        role_spec_hash,
+        context_pack.manifest_hash(),
+    )?;
+    let recipe_bytes = compiled
+        .recipe
+        .canonical_bytes()
+        .map_err(|e| format!("failed to canonicalize policy context recipe: {e}"))?;
+    let computed_recipe_hash = *blake3::hash(&recipe_bytes).as_bytes();
+    if !bool::from(context_pack_recipe_hash.ct_eq(&computed_recipe_hash)) {
+        return Err(format!(
+            "context_pack_recipe_hash mismatch: policy={} computed={}",
+            hex::encode(context_pack_recipe_hash),
+            hex::encode(computed_recipe_hash),
+        ));
+    }
+    cas.store(&recipe_bytes)
+        .map_err(|e| format!("CAS store context pack recipe failed: {e}"))?;
 
     Ok(())
 }
@@ -2235,6 +2414,16 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         payload_map.insert(
             "context_pack_hash".to_string(),
             serde_json::json!(hex::encode(claim.policy_resolution.context_pack_hash)),
+        );
+        payload_map.insert(
+            "role_spec_hash".to_string(),
+            serde_json::json!(hex::encode(claim.policy_resolution.role_spec_hash)),
+        );
+        payload_map.insert(
+            "context_pack_recipe_hash".to_string(),
+            serde_json::json!(hex::encode(
+                claim.policy_resolution.context_pack_recipe_hash
+            )),
         );
 
         // TCK-00416 BLOCKER 3: Append transition authority binding fields
@@ -2896,6 +3085,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
+        capability_manifest_hash: &[u8; 32],
+        context_pack_hash: &[u8; 32],
+        role_spec_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
@@ -2903,6 +3095,18 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
+
+        for (name, hash) in [
+            ("capability_manifest_hash", capability_manifest_hash),
+            ("context_pack_hash", context_pack_hash),
+            ("role_spec_hash", role_spec_hash),
+        ] {
+            if bool::from(hash.ct_eq(&[0u8; 32])) {
+                return Err(LedgerEventError::ValidationFailed {
+                    message: format!("{name} is zero (fail-closed)"),
+                });
+            }
+        }
 
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
@@ -2930,6 +3134,18 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         payload_map.insert(
             "artifact_bundle_hash".to_string(),
             serde_json::json!(hex::encode(artifact_bundle_hash)),
+        );
+        payload_map.insert(
+            "capability_manifest_hash".to_string(),
+            serde_json::json!(hex::encode(capability_manifest_hash)),
+        );
+        payload_map.insert(
+            "context_pack_hash".to_string(),
+            serde_json::json!(hex::encode(context_pack_hash)),
+        );
+        payload_map.insert(
+            "role_spec_hash".to_string(),
+            serde_json::json!(hex::encode(role_spec_hash)),
         );
         payload_map.insert("verdict".to_string(), serde_json::json!("APPROVE"));
         payload_map.insert(
@@ -3035,6 +3251,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
+        capability_manifest_hash: &[u8; 32],
+        context_pack_hash: &[u8; 32],
+        role_spec_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
@@ -3044,6 +3263,18 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
+
+        for (name, hash) in [
+            ("capability_manifest_hash", capability_manifest_hash),
+            ("context_pack_hash", context_pack_hash),
+            ("role_spec_hash", role_spec_hash),
+        ] {
+            if bool::from(hash.ct_eq(&[0u8; 32])) {
+                return Err(LedgerEventError::ValidationFailed {
+                    message: format!("{name} is zero (fail-closed)"),
+                });
+            }
+        }
 
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
@@ -3064,6 +3295,18 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         payload_map.insert(
             "artifact_bundle_hash".to_string(),
             serde_json::json!(hex::encode(artifact_bundle_hash)),
+        );
+        payload_map.insert(
+            "capability_manifest_hash".to_string(),
+            serde_json::json!(hex::encode(capability_manifest_hash)),
+        );
+        payload_map.insert(
+            "context_pack_hash".to_string(),
+            serde_json::json!(hex::encode(context_pack_hash)),
+        );
+        payload_map.insert(
+            "role_spec_hash".to_string(),
+            serde_json::json!(hex::encode(role_spec_hash)),
         );
         payload_map.insert("verdict".to_string(), serde_json::json!("BLOCKED"));
         payload_map.insert(
@@ -3683,6 +3926,20 @@ pub struct PolicyResolution {
     /// BLAKE3 hash of the sealed context pack.
     pub context_pack_hash: [u8; 32],
 
+    /// BLAKE3 hash of the authoritative `RoleSpecV2` contract.
+    ///
+    /// This hash is resolved from CAS-addressed role profiles and MUST be
+    /// non-zero/cas-resolvable in production execution paths.
+    #[serde(default = "zero_hash32")]
+    pub role_spec_hash: [u8; 32],
+
+    /// BLAKE3 hash of the compiled context-pack recipe bound to this policy.
+    ///
+    /// This hash closes lineage between role/context/budget selectors and the
+    /// sealed context pack used during execution.
+    #[serde(default = "zero_hash32")]
+    pub context_pack_recipe_hash: [u8; 32],
+
     /// Resolved risk tier (0-4) from `PolicyResolvedForChangeSet`.
     ///
     /// Used by `handle_ingest_review_receipt` to enforce attestation
@@ -3736,6 +3993,11 @@ pub struct PolicyResolution {
 /// via schema drift or tampered persistence.
 const fn risk_tier_fail_closed() -> u8 {
     4
+}
+
+/// Serde default helper for 32-byte hashes.
+const fn zero_hash32() -> [u8; 32] {
+    [0u8; 32]
 }
 
 /// Error type for policy resolution operations.
@@ -3899,6 +4161,16 @@ impl PolicyResolver for StubPolicyResolver {
                 .map_err(|e| PolicyResolutionError::GovernanceFailed {
                     message: format!("context pack sealing failed: {e}"),
                 })?;
+        let role_spec_hash = fac_workobject_implementor_v2_role_contract()
+            .compute_cas_hash()
+            .map_err(|e| PolicyResolutionError::GovernanceFailed {
+                message: format!("role spec hash computation failed: {e}"),
+            })?;
+        let context_pack_recipe_hash =
+            policy_context_pack_recipe_hash(work_id, actor_id, role_spec_hash, context_pack_hash)
+                .map_err(|e| PolicyResolutionError::GovernanceFailed {
+                message: format!("context recipe hash computation failed: {e}"),
+            })?;
 
         Ok(PolicyResolution {
             policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
@@ -3907,6 +4179,8 @@ impl PolicyResolver for StubPolicyResolver {
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: manifest_hash,
             context_pack_hash,
+            role_spec_hash,
+            context_pack_recipe_hash,
             resolved_risk_tier: 0, // Stub resolver: Tier0 default
             resolved_scope_baseline,
             expected_adapter_profile_hash: None, // TODO(TCK-00399): populate from governance
@@ -7618,7 +7892,7 @@ impl PrivilegedDispatcher {
 
         // TCK-00253: Query governance for policy resolution
         // Per DD-002: "Daemon calls HOLON-KERNEL-GOVERNANCE for policy resolution"
-        let policy_resolution = match self
+        let mut policy_resolution = match self
             .policy_resolver
             .resolve_for_claim(&work_id, role, &actor_id)
         {
@@ -7643,6 +7917,98 @@ impl PrivilegedDispatcher {
         // Successful policy resolution is a direct governance-path health
         // signal, so refresh the governance probe watermark.
         self.record_governance_probe_success();
+
+        // TCK-00448: Resolve authoritative role/context lineage from CAS.
+        // Fail-closed on missing/unverifiable authority context.
+        {
+            let fallback_cas = MemoryCas::default();
+            let cas: &dyn ContentAddressedStore = if let Some(ref c) = self.cas {
+                c.as_ref()
+            } else {
+                &fallback_cas
+            };
+
+            let role_spec_hash = match resolve_workobject_role_spec_hash(cas) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    warn!(
+                        work_id = %work_id,
+                        error = %e,
+                        "ClaimWork rejected: role spec hash is not CAS-resolvable"
+                    );
+                    return Ok(deny_response_for_authority_context(
+                        DenyCondition::UnverifiableContextHash,
+                        format!("role spec resolution failed: {e}"),
+                    ));
+                },
+            };
+            if bool::from(role_spec_hash.ct_eq(&[0u8; 32])) {
+                warn!(
+                    work_id = %work_id,
+                    "ClaimWork rejected: resolved role spec hash is zero"
+                );
+                return Ok(deny_response_for_authority_context(
+                    DenyCondition::MissingAuthorityContext,
+                    "resolved role_spec_hash is zero",
+                ));
+            }
+            policy_resolution.role_spec_hash = role_spec_hash;
+
+            let context_pack_recipe_hash = match policy_context_pack_recipe_hash(
+                &work_id,
+                &actor_id,
+                role_spec_hash,
+                policy_resolution.context_pack_hash,
+            ) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    warn!(
+                        work_id = %work_id,
+                        error = %e,
+                        "ClaimWork rejected: context pack recipe hash derivation failed"
+                    );
+                    return Ok(deny_response_for_authority_context(
+                        DenyCondition::UnverifiableContextHash,
+                        format!("context recipe derivation failed: {e}"),
+                    ));
+                },
+            };
+            if bool::from(context_pack_recipe_hash.ct_eq(&[0u8; 32])) {
+                warn!(
+                    work_id = %work_id,
+                    "ClaimWork rejected: context pack recipe hash is zero"
+                );
+                return Ok(deny_response_for_authority_context(
+                    DenyCondition::MissingAuthorityContext,
+                    "resolved context_pack_recipe_hash is zero",
+                ));
+            }
+            policy_resolution.context_pack_recipe_hash = context_pack_recipe_hash;
+
+            if let Err(e) = seed_policy_artifacts_in_cas(
+                &work_id,
+                &actor_id,
+                role,
+                role_spec_hash,
+                context_pack_recipe_hash,
+                cas,
+            ) {
+                let condition = if e.contains("zero (missing authority context)") {
+                    DenyCondition::MissingAuthorityContext
+                } else {
+                    DenyCondition::UnverifiableContextHash
+                };
+                warn!(
+                    work_id = %work_id,
+                    error = %e,
+                    "ClaimWork rejected: authority lineage CAS seeding failed"
+                );
+                return Ok(deny_response_for_authority_context(
+                    condition,
+                    format!("authority lineage CAS seeding failed: {e}"),
+                ));
+            }
+        }
 
         // SEC-SCP-FAC-0020: lease_id is redacted from logs to prevent capability
         // leakage
@@ -7770,9 +8136,14 @@ impl PrivilegedDispatcher {
             // REQ-HEF-0013: Seed policy-provided CAS artifacts so
             // capability_manifest_hash and context_pack_hash are
             // CAS-resolvable during validation.
-            if let Err(e) =
-                seed_policy_artifacts_in_cas(&claim.work_id, &claim.actor_id, claim.role, cas)
-            {
+            if let Err(e) = seed_policy_artifacts_in_cas(
+                &claim.work_id,
+                &claim.actor_id,
+                claim.role,
+                claim.policy_resolution.role_spec_hash,
+                claim.policy_resolution.context_pack_recipe_hash,
+                cas,
+            ) {
                 warn!(
                     work_id = %claim.work_id,
                     error = %e,
@@ -8341,12 +8712,118 @@ impl PrivilegedDispatcher {
         )
     }
 
-    /// Derives role spec attribution from daemon-controlled claim context.
+    /// Validates role/context lineage on the authoritative claim path.
     ///
-    /// During rollout waiver WVR-0002, policy claims do not always carry an
-    /// authoritative role spec binding yet, so this may return `None`.
-    const fn derive_role_spec_hash(_claim: &WorkClaim) -> Option<[u8; 32]> {
-        None
+    /// Returns the validated role spec hash when all lineage checks pass.
+    fn validate_claim_authority_context_lineage(
+        claim: &WorkClaim,
+        cas: &dyn ContentAddressedStore,
+    ) -> Result<[u8; 32], (DenyCondition, String)> {
+        let role_spec_hash = claim.policy_resolution.role_spec_hash;
+        if bool::from(role_spec_hash.ct_eq(&[0u8; 32])) {
+            return Err((
+                DenyCondition::MissingAuthorityContext,
+                "claim role_spec_hash is zero".to_string(),
+            ));
+        }
+
+        let context_pack_hash = claim.policy_resolution.context_pack_hash;
+        if bool::from(context_pack_hash.ct_eq(&[0u8; 32])) {
+            return Err((
+                DenyCondition::MissingAuthorityContext,
+                "claim context_pack_hash is zero".to_string(),
+            ));
+        }
+
+        let context_pack_recipe_hash = claim.policy_resolution.context_pack_recipe_hash;
+        if bool::from(context_pack_recipe_hash.ct_eq(&[0u8; 32])) {
+            return Err((
+                DenyCondition::MissingAuthorityContext,
+                "claim context_pack_recipe_hash is zero".to_string(),
+            ));
+        }
+
+        let cas_role_spec_hash = resolve_workobject_role_spec_hash(cas).map_err(|e| {
+            (
+                DenyCondition::UnverifiableContextHash,
+                format!("failed to resolve authoritative role spec hash: {e}"),
+            )
+        })?;
+        if !bool::from(role_spec_hash.ct_eq(&cas_role_spec_hash)) {
+            return Err((
+                DenyCondition::UnknownRoleProfile,
+                format!(
+                    "claim role_spec_hash {} does not match authoritative hash {}",
+                    hex::encode(role_spec_hash),
+                    hex::encode(cas_role_spec_hash)
+                ),
+            ));
+        }
+
+        match cas.exists(&role_spec_hash) {
+            Ok(true) => {},
+            Ok(false) => {
+                return Err((
+                    DenyCondition::UnverifiableContextHash,
+                    format!(
+                        "claim role_spec_hash {} is not resolvable in CAS",
+                        hex::encode(role_spec_hash)
+                    ),
+                ));
+            },
+            Err(e) => {
+                return Err((
+                    DenyCondition::UnverifiableContextHash,
+                    format!("CAS lookup failed for role_spec_hash: {e}"),
+                ));
+            },
+        }
+
+        for (name, hash) in [
+            ("context_pack_hash", context_pack_hash),
+            ("context_pack_recipe_hash", context_pack_recipe_hash),
+        ] {
+            match cas.exists(&hash) {
+                Ok(true) => {},
+                Ok(false) => {
+                    return Err((
+                        DenyCondition::StaleAuthorityContext,
+                        format!("{name} {} is not resolvable in CAS", hex::encode(hash)),
+                    ));
+                },
+                Err(e) => {
+                    return Err((
+                        DenyCondition::UnverifiableContextHash,
+                        format!("CAS lookup failed for {name}: {e}"),
+                    ));
+                },
+            }
+        }
+
+        let expected_context_recipe_hash = policy_context_pack_recipe_hash(
+            &claim.work_id,
+            &claim.actor_id,
+            role_spec_hash,
+            context_pack_hash,
+        )
+        .map_err(|e| {
+            (
+                DenyCondition::UnverifiableContextHash,
+                format!("failed to derive authoritative context recipe hash: {e}"),
+            )
+        })?;
+        if !bool::from(context_pack_recipe_hash.ct_eq(&expected_context_recipe_hash)) {
+            return Err((
+                DenyCondition::StaleAuthorityContext,
+                format!(
+                    "claim context_pack_recipe_hash {} does not match authoritative hash {}",
+                    hex::encode(context_pack_recipe_hash),
+                    hex::encode(expected_context_recipe_hash)
+                ),
+            ));
+        }
+
+        Ok(role_spec_hash)
     }
 
     /// Builds a `HarnessConfig` from an adapter profile and spawn parameters
@@ -9120,9 +9597,14 @@ impl PrivilegedDispatcher {
             // REQ-HEF-0013: Seed policy-provided CAS artifacts so
             // capability_manifest_hash and context_pack_hash are
             // CAS-resolvable during validation.
-            if let Err(e) =
-                seed_policy_artifacts_in_cas(&claim.work_id, &claim.actor_id, claim.role, cas)
-            {
+            if let Err(e) = seed_policy_artifacts_in_cas(
+                &claim.work_id,
+                &claim.actor_id,
+                claim.role,
+                claim.policy_resolution.role_spec_hash,
+                claim.policy_resolution.context_pack_recipe_hash,
+                cas,
+            ) {
                 warn!(
                     work_id = %request.work_id,
                     error = %e,
@@ -9278,6 +9760,66 @@ impl PrivilegedDispatcher {
             }
         }
 
+        let fallback_cas = MemoryCas::default();
+        let cas: &dyn ContentAddressedStore = if let Some(ref c) = self.cas {
+            c.as_ref()
+        } else {
+            &fallback_cas
+        };
+        let mut role_spec_hash: Option<[u8; 32]> = None;
+        let (context_pack_hash_component, context_pack_recipe_hash_component) =
+            if claim.role == WorkRole::Implementer {
+                if let Err(e) = seed_policy_artifacts_in_cas(
+                    &claim.work_id,
+                    &claim.actor_id,
+                    claim.role,
+                    claim.policy_resolution.role_spec_hash,
+                    claim.policy_resolution.context_pack_recipe_hash,
+                    cas,
+                ) {
+                    let condition = if e.contains("zero (missing authority context)") {
+                        DenyCondition::MissingAuthorityContext
+                    } else if e.contains("context_pack_recipe_hash mismatch") {
+                        DenyCondition::StaleAuthorityContext
+                    } else {
+                        DenyCondition::UnverifiableContextHash
+                    };
+                    warn!(
+                        work_id = %request.work_id,
+                        deny_condition = %condition,
+                        error = %e,
+                        "SpawnEpisode rejected: authority lineage CAS seeding failed"
+                    );
+                    return Ok(deny_response_for_authority_context(
+                        condition,
+                        format!("spawn authority lineage CAS seeding failed: {e}"),
+                    ));
+                }
+                let validated_role_spec_hash =
+                    match Self::validate_claim_authority_context_lineage(&claim, cas) {
+                        Ok(hash) => hash,
+                        Err((condition, detail)) => {
+                            warn!(
+                                work_id = %request.work_id,
+                                deny_condition = %condition,
+                                error = %detail,
+                                "SpawnEpisode rejected: authority context lineage validation failed"
+                            );
+                            return Ok(deny_response_for_authority_context(
+                                condition,
+                                format!("spawn authority context validation failed: {detail}"),
+                            ));
+                        },
+                    };
+                role_spec_hash = Some(validated_role_spec_hash);
+                (
+                    hex::encode(claim.policy_resolution.context_pack_hash),
+                    hex::encode(claim.policy_resolution.context_pack_recipe_hash),
+                )
+            } else {
+                ("WVR-0002".to_string(), "WVR-0002".to_string())
+            };
+
         let (adapter_profile_hash, selection_decision) = match self
             .resolve_spawn_adapter_profile_hash(
                 request.adapter_profile_hash.as_deref(),
@@ -9298,7 +9840,6 @@ impl PrivilegedDispatcher {
             },
         };
 
-        let role_spec_hash = Self::derive_role_spec_hash(&claim);
         let resolved_profile_id = selection_decision
             .as_ref()
             .map(|decision| decision.selected_profile_id.as_str())
@@ -9307,13 +9848,16 @@ impl PrivilegedDispatcher {
                     .get(&adapter_profile_hash)
                     .map(String::as_str)
             });
+        let role_spec_hash_log = role_spec_hash.map_or_else(|| "WVR-0002".to_string(), hex::encode);
 
         info!(
             work_id = %request.work_id,
             policy_resolved_ref = %claim.policy_resolution.policy_resolved_ref,
             adapter_profile_hash = %hex::encode(adapter_profile_hash),
             selected_profile_id = ?resolved_profile_id,
-            role_spec_hash_present = role_spec_hash.is_some(),
+            role_spec_hash = %role_spec_hash_log,
+            context_pack_hash = %context_pack_hash_component,
+            context_pack_recipe_hash = %context_pack_recipe_hash_component,
             "SpawnEpisode authorized with policy resolution"
         );
 
@@ -9927,19 +10471,19 @@ impl PrivilegedDispatcher {
         //
         // Generate envelope hash from session_id + work_id + lease_id for uniqueness.
         // Null-byte delimiters prevent collision between fields (MAJOR-2 security fix).
-        // adapter_profile_hash and role_spec_hash are included in the envelope
-        // hash to ensure the envelope identity reflects the adapter binding.
+        // adapter/role/context lineage hashes are included in the envelope hash
+        // so runtime identity reflects authoritative policy bindings.
         // TODO(TCK-00397): migrate to EpisodeEnvelopeBuilder for structured
         // envelope construction once the full EpisodeEnvelope lifecycle is wired.
-        let role_spec_hash_component =
-            role_spec_hash.map_or_else(|| "WVR-0002".to_string(), hex::encode);
         let envelope_data = format!(
-            "{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
             session_id,
             request.work_id,
             claim.lease_id,
             hex::encode(adapter_profile_hash),
-            role_spec_hash_component
+            role_spec_hash_log,
+            context_pack_hash_component,
+            context_pack_recipe_hash_component,
         );
         let envelope_hash: [u8; 32] = blake3::hash(envelope_data.as_bytes()).into();
 
@@ -11561,6 +12105,31 @@ impl PrivilegedDispatcher {
             ));
         }
         let lease_time_envelope_ref = lease_for_receipt.time_envelope_ref;
+        let Some(claim_for_receipt) = self.work_registry.get_claim(&lease_for_receipt.work_id)
+        else {
+            return Ok(deny_response_for_authority_context(
+                DenyCondition::MissingAuthorityContext,
+                format!(
+                    "work claim not found for lease work_id={}",
+                    lease_for_receipt.work_id
+                ),
+            ));
+        };
+        let claim_role_spec_hash = match Self::validate_claim_authority_context_lineage(
+            &claim_for_receipt,
+            cas.as_ref(),
+        ) {
+            Ok(hash) => hash,
+            Err((condition, detail)) => {
+                return Ok(deny_response_for_authority_context(
+                    condition,
+                    format!("review receipt authority lineage validation failed: {detail}"),
+                ));
+            },
+        };
+        let claim_capability_manifest_hash =
+            claim_for_receipt.policy_resolution.capability_manifest_hash;
+        let claim_context_pack_hash = claim_for_receipt.policy_resolution.context_pack_hash;
 
         // ---- Phase 1c (TCK-00340): Attestation ratchet validation ----
         //
@@ -12060,6 +12629,9 @@ impl PrivilegedDispatcher {
                     &request.receipt_id,
                     &request_changeset_digest_arr,
                     &request_artifact_bundle_hash_arr,
+                    &claim_capability_manifest_hash,
+                    &claim_context_pack_hash,
+                    &claim_role_spec_hash,
                     &authenticated_reviewer_id,
                     timestamp_ns,
                     &request_identity_proof_hash_arr,
@@ -12078,6 +12650,9 @@ impl PrivilegedDispatcher {
                         &request.receipt_id,
                         &request_changeset_digest_arr,
                         &request_artifact_bundle_hash_arr,
+                        &claim_capability_manifest_hash,
+                        &claim_context_pack_hash,
+                        &claim_role_spec_hash,
                         request.blocked_reason_code,
                         &blocked_log_hash_arr,
                         &authenticated_reviewer_id,
@@ -15390,6 +15965,8 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -15521,6 +16098,92 @@ mod tests {
             }),
             Some("test-session".to_string()),
         )
+    }
+
+    fn test_policy_resolution_with_lineage(
+        work_id: &str,
+        actor_id: &str,
+        role: WorkRole,
+        resolved_risk_tier: u8,
+    ) -> PolicyResolution {
+        let role_spec_hash = fac_workobject_implementor_v2_role_contract()
+            .compute_cas_hash()
+            .expect("test helper should compute role spec hash");
+        let context_pack_hash = policy_context_pack_hash(work_id, actor_id);
+        let context_pack_recipe_hash =
+            policy_context_pack_recipe_hash(work_id, actor_id, role_spec_hash, context_pack_hash)
+                .expect("test helper should compute context pack recipe hash");
+
+        PolicyResolution {
+            policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
+            resolved_policy_hash: *blake3::hash(format!("policy:{work_id}:{actor_id}").as_bytes())
+                .as_bytes(),
+            capability_manifest_hash: policy_capability_manifest_hash(work_id, actor_id, role),
+            context_pack_hash,
+            role_spec_hash,
+            context_pack_recipe_hash,
+            resolved_risk_tier,
+            resolved_scope_baseline: None,
+            expected_adapter_profile_hash: None,
+            pcac_policy: None,
+            pointer_only_waiver: None,
+        }
+    }
+
+    fn seed_policy_lineage_for_test(
+        cas: &dyn apm2_core::evidence::ContentAddressedStore,
+        work_id: &str,
+        actor_id: &str,
+        role: WorkRole,
+        policy_resolution: &PolicyResolution,
+    ) {
+        seed_policy_artifacts_in_cas(
+            work_id,
+            actor_id,
+            role,
+            policy_resolution.role_spec_hash,
+            policy_resolution.context_pack_recipe_hash,
+            cas,
+        )
+        .expect("test helper should seed policy lineage artifacts");
+    }
+
+    #[test]
+    fn test_policy_context_manifest_and_recipe_path_formats_are_consistent() {
+        let work_id = "W-001";
+        let actor_id = "actor-001";
+        let role_spec_hash = [0x11; 32];
+
+        let context_pack = build_policy_context_pack(work_id, actor_id);
+        let manifest_path = context_pack
+            .entries()
+            .first()
+            .expect("context pack should include one deterministic entry")
+            .path();
+        let manifest_relative = manifest_path
+            .strip_prefix('/')
+            .expect("manifest entry path should be absolute");
+
+        let compiled = build_policy_context_pack_recipe(
+            work_id,
+            actor_id,
+            role_spec_hash,
+            context_pack.manifest_hash(),
+        )
+        .expect("recipe should compile");
+        let recipe_path = compiled
+            .recipe
+            .required_read_paths
+            .first()
+            .expect("recipe should include one required read path");
+
+        assert_eq!(recipe_path, manifest_relative);
+        assert!(
+            compiled
+                .recipe
+                .required_read_digests
+                .contains_key(recipe_path)
+        );
     }
 
     // ========================================================================
@@ -15721,6 +16384,8 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                role_spec_hash: [0u8; 32],
+                context_pack_recipe_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -17148,6 +17813,8 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -17188,6 +17855,8 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                role_spec_hash: [0u8; 32],
+                context_pack_recipe_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -17263,6 +17932,8 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                role_spec_hash: [0u8; 32],
+                context_pack_recipe_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -17328,24 +17999,12 @@ mod tests {
             lease_id: "L-non-overlap-123".to_string(),
             actor_id: "team-review:alice".to_string(),
             role: WorkRole::GateExecutor,
-            policy_resolution: PolicyResolution {
-                policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-                pcac_policy: None,
-                pointer_only_waiver: None,
-                resolved_policy_hash: [0xAA; 32],
-                capability_manifest_hash: policy_capability_manifest_hash(
-                    "W-team-dev-test456",
-                    "team-review:alice",
-                    WorkRole::GateExecutor,
-                ),
-                context_pack_hash: policy_context_pack_hash(
-                    "W-team-dev-test456",
-                    "team-review:alice",
-                ),
-                resolved_risk_tier: 0,
-                resolved_scope_baseline: None,
-                expected_adapter_profile_hash: None,
-            },
+            policy_resolution: test_policy_resolution_with_lineage(
+                "W-team-dev-test456",
+                "team-review:alice",
+                WorkRole::GateExecutor,
+                0,
+            ),
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
             permeability_receipt: None,
@@ -17413,6 +18072,8 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                role_spec_hash: [0u8; 32],
+                context_pack_recipe_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -17481,24 +18142,12 @@ mod tests {
             lease_id: "L-implementer-789".to_string(),
             actor_id: "team-alpha:developer".to_string(),
             role: WorkRole::Implementer,
-            policy_resolution: PolicyResolution {
-                policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-                pcac_policy: None,
-                pointer_only_waiver: None,
-                resolved_policy_hash: [0xAA; 32],
-                capability_manifest_hash: policy_capability_manifest_hash(
-                    "W-team-alpha-impl123",
-                    "team-alpha:developer",
-                    WorkRole::Implementer,
-                ),
-                context_pack_hash: policy_context_pack_hash(
-                    "W-team-alpha-impl123",
-                    "team-alpha:developer",
-                ),
-                resolved_risk_tier: 0,
-                resolved_scope_baseline: None,
-                expected_adapter_profile_hash: None,
-            },
+            policy_resolution: test_policy_resolution_with_lineage(
+                "W-team-alpha-impl123",
+                "team-alpha:developer",
+                WorkRole::Implementer,
+                0,
+            ),
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
             permeability_receipt: None,
@@ -18303,6 +18952,8 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -20512,15 +21163,24 @@ mod tests {
             let expected_adapter_hash = apm2_core::fac::builtin_profiles::claude_code_profile()
                 .compute_cas_hash()
                 .expect("builtin adapter hash should compute");
+            let expected_role_hash = fac_workobject_implementor_v2_role_contract()
+                .compute_cas_hash()
+                .expect("builtin role spec hash should compute");
             assert_eq!(
                 session_payload["adapter_profile_hash"],
                 hex::encode(expected_adapter_hash)
             );
-            assert_eq!(session_payload["waiver_id"], "WVR-0002");
-            assert_eq!(session_payload["role_spec_hash_absent"], true);
+            assert_eq!(
+                session_payload["role_spec_hash"],
+                hex::encode(expected_role_hash)
+            );
             assert!(
-                session_payload.get("role_spec_hash").is_none(),
-                "role_spec_hash should be absent during WVR-0002 rollout path"
+                session_payload.get("waiver_id").is_none(),
+                "implementer path must not emit WVR-0002 waiver"
+            );
+            assert!(
+                session_payload.get("role_spec_hash_absent").is_none(),
+                "implementer path must not mark role_spec_hash_absent"
             );
         }
 
@@ -21118,6 +21778,8 @@ mod tests {
                             resolved_policy_hash: [0u8; 32],
                             capability_manifest_hash: [0u8; 32],
                             context_pack_hash: [0u8; 32],
+                            role_spec_hash: [0u8; 32],
+                            context_pack_recipe_hash: [0u8; 32],
                             resolved_risk_tier: 0,
                             resolved_scope_baseline: None,
                             expected_adapter_profile_hash: None,
@@ -21203,6 +21865,8 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -21252,6 +21916,8 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -22365,9 +23031,19 @@ mod tests {
 
             let payload: serde_json::Value =
                 serde_json::from_slice(&session_started[0].payload).expect("valid JSON payload");
+            let expected_role_hash = fac_workobject_implementor_v2_role_contract()
+                .compute_cas_hash()
+                .expect("builtin role spec hash should compute");
             assert_eq!(payload["adapter_profile_hash"], hex::encode(adapter_hash));
-            assert_eq!(payload["waiver_id"], "WVR-0002");
-            assert_eq!(payload["role_spec_hash_absent"], true);
+            assert_eq!(payload["role_spec_hash"], hex::encode(expected_role_hash));
+            assert!(
+                payload.get("waiver_id").is_none(),
+                "implementer path must not emit WVR-0002 waiver"
+            );
+            assert!(
+                payload.get("role_spec_hash_absent").is_none(),
+                "implementer path must not mark role_spec_hash_absent"
+            );
         }
 
         #[test]
@@ -23400,23 +24076,26 @@ mod tests {
                 wall_time_source: WallTimeSource::AuthenticatedNts,
                 include_attestation: true,
             });
-            // Register work claim so risk-tier resolution succeeds
+            // Register work claim so risk-tier resolution succeeds.
+            let policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                risk_tier,
+            );
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
             let claim = WorkClaim {
                 work_id: work_id.to_string(),
                 lease_id: lease_id.to_string(),
                 actor_id: executor_actor_id,
                 role: WorkRole::Reviewer,
-                policy_resolution: PolicyResolution {
-                    policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
-                    resolved_policy_hash: [0u8; 32],
-                    capability_manifest_hash: [0u8; 32],
-                    context_pack_hash: [0u8; 32],
-                    resolved_risk_tier: risk_tier,
-                    resolved_scope_baseline: None,
-                    expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
-                },
+                policy_resolution,
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
                 permeability_receipt: None,
@@ -24438,10 +25117,13 @@ mod tests {
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
-                        err.message.contains("SelfSigned")
+                        err.message.contains("MISSING_AUTHORITY")
+                            || err.message.contains("work claim not found")
+                            || err.message.contains("missing_authority_context")
+                            || err.message.contains("SelfSigned")
                             || err.message.contains("requires")
                             || err.message.contains("Tier4"),
-                        "Unresolvable risk tier must fail-closed (Tier4 rejection), got: {}",
+                        "Unresolvable risk tier / missing claim must fail-closed, got: {}",
                         err.message
                     );
                 },
@@ -24768,6 +25450,19 @@ mod tests {
                 wall_time_source: WallTimeSource::AuthenticatedNts,
                 include_attestation: true,
             });
+            let policy_resolution = test_policy_resolution_with_lineage(
+                "W-DUP-LEASE-B",
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                0,
+            );
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-DUP-LEASE-B",
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
             dispatcher
                 .work_registry
                 .register_claim(WorkClaim {
@@ -24775,17 +25470,7 @@ mod tests {
                     lease_id: "lease-B".to_string(),
                     actor_id: executor_actor_id,
                     role: WorkRole::Reviewer,
-                    policy_resolution: PolicyResolution {
-                        policy_resolved_ref: "PolicyResolvedForChangeSet:W-DUP-LEASE-B".to_string(),
-                        resolved_policy_hash: [0u8; 32],
-                        capability_manifest_hash: [0u8; 32],
-                        context_pack_hash: [0u8; 32],
-                        resolved_risk_tier: 0,
-                        resolved_scope_baseline: None,
-                        expected_adapter_profile_hash: None,
-                        pcac_policy: None,
-                        pointer_only_waiver: None,
-                    },
+                    policy_resolution,
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
                     permeability_receipt: None,
@@ -24868,6 +25553,19 @@ mod tests {
                 wall_time_source: WallTimeSource::AuthenticatedNts,
                 include_attestation: true,
             });
+            let policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                0,
+            );
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
             dispatcher
                 .work_registry
                 .register_claim(WorkClaim {
@@ -24875,17 +25573,7 @@ mod tests {
                     lease_id: lease_id.to_string(),
                     actor_id: executor_actor_id,
                     role: WorkRole::Reviewer,
-                    policy_resolution: PolicyResolution {
-                        policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
-                        resolved_policy_hash: [0u8; 32],
-                        capability_manifest_hash: [0u8; 32],
-                        context_pack_hash: [0u8; 32],
-                        resolved_risk_tier: 0,
-                        resolved_scope_baseline: None,
-                        expected_adapter_profile_hash: None,
-                        pcac_policy: None,
-                        pointer_only_waiver: None,
-                    },
+                    policy_resolution,
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
                     permeability_receipt: None,
@@ -25879,6 +26567,488 @@ mod tests {
     }
 
     // ========================================================================
+    // TCK-00448: Adversarial lineage denial tests
+    // ========================================================================
+    mod tck_00448_lineage_denials {
+        use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
+
+        use super::*;
+
+        const LINEAGE_TEST_ARTIFACT_CONTENT: &[u8] = b"tck-00448-lineage-artifact";
+
+        fn test_peer_credentials() -> PeerCredentials {
+            PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }
+        }
+
+        fn setup_spawn_lineage_fixture(
+            work_id: &str,
+            lease_id: &str,
+            mutate_policy: impl FnOnce(&Arc<MemoryCas>, &mut PolicyResolution),
+        ) -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            SpawnEpisodeRequest,
+            String,
+        ) {
+            let peer_creds = test_peer_credentials();
+            let actor_id = derive_actor_id(&peer_creds);
+            let cas = Arc::new(MemoryCas::default());
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage(work_id, &actor_id, WorkRole::Implementer, 0);
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &actor_id,
+                WorkRole::Implementer,
+                &policy_resolution,
+            );
+            mutate_policy(&cas, &mut policy_resolution);
+
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    actor_id,
+                    role: WorkRole::Implementer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("lineage test claim registration must succeed");
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id.to_string()),
+                adapter_profile_hash: None,
+                max_episodes: None,
+                escalation_predicate: None,
+                permeability_receipt_hash: None,
+            };
+
+            (dispatcher, ctx, request, work_id.to_string())
+        }
+
+        fn setup_receipt_lineage_fixture(
+            work_id: &str,
+            lease_id: &str,
+            receipt_id: &str,
+            mutate_policy: impl FnOnce(&Arc<MemoryCas>, &mut PolicyResolution),
+        ) -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            IngestReviewReceiptRequest,
+            String,
+        ) {
+            let peer_creds = test_peer_credentials();
+            let actor_id = derive_actor_id(&peer_creds);
+            let cas = Arc::new(MemoryCas::default());
+            let artifact_bundle_hash = cas
+                .store(LINEAGE_TEST_ARTIFACT_CONTENT)
+                .expect("lineage test artifact bundle should store in CAS")
+                .hash
+                .to_vec();
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                work_id,
+                "gate-tck-00448-lineage",
+                &actor_id,
+            );
+            super::ingest_review_receipt::register_full_test_lease(
+                &super::ingest_review_receipt::TestLeaseConfig {
+                    dispatcher: &dispatcher,
+                    cas: cas.as_ref(),
+                    lease_id,
+                    work_id,
+                    gate_id: "gate-tck-00448-lineage",
+                    executor_actor_id: &actor_id,
+                    policy_hash: [0u8; 32],
+                    wall_time_source: WallTimeSource::AuthenticatedNts,
+                    include_attestation: true,
+                },
+            );
+
+            let mut policy_resolution =
+                test_policy_resolution_with_lineage(work_id, &actor_id, WorkRole::Reviewer, 0);
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &actor_id,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+            mutate_policy(&cas, &mut policy_resolution);
+
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    actor_id: actor_id.clone(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("lineage test review claim registration must succeed");
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+            let request = IngestReviewReceiptRequest {
+                lease_id: lease_id.to_string(),
+                receipt_id: receipt_id.to_string(),
+                reviewer_actor_id: actor_id,
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash,
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+
+            (dispatcher, ctx, request, work_id.to_string())
+        }
+
+        fn review_receipt_event_count(dispatcher: &PrivilegedDispatcher, work_id: &str) -> usize {
+            dispatcher
+                .event_emitter
+                .get_events_by_work_id(work_id)
+                .into_iter()
+                .filter(|event| event.event_type == "review_receipt_recorded")
+                .count()
+        }
+
+        #[test]
+        fn test_missing_role_spec_hash_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-MISSING-ROLE",
+                "lease-tck-00448-missing-role",
+                "RR-TCK-00448-MISSING-ROLE",
+                |_cas, policy| {
+                    policy.role_spec_hash = [0u8; 32];
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::PolicyResolutionMissing as i32
+                    );
+                    assert!(
+                        err.message.contains("missing_authority_context"),
+                        "deny message should include missing_authority_context, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("claim role_spec_hash is zero"),
+                        "deny message should include claim role_spec_hash zero detail, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected authority-context deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "missing role_spec_hash denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "missing role_spec_hash denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_mismatched_role_spec_hash_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-MISMATCH-ROLE",
+                "lease-tck-00448-mismatch-role",
+                "RR-TCK-00448-MISMATCH-ROLE",
+                |cas, policy| {
+                    let wrong_hash = cas
+                        .store(b"tck-00448-mismatched-role-spec")
+                        .expect("mismatched role hash preimage should store in CAS")
+                        .hash;
+                    policy.role_spec_hash = wrong_hash;
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("unknown_role_profile"),
+                        "deny message should include unknown_role_profile, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("does not match authoritative hash"),
+                        "deny message should include authoritative hash mismatch, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected unknown-role-profile deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "mismatched role_spec_hash denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "mismatched role_spec_hash denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_missing_context_pack_recipe_hash_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-MISSING-RECIPE",
+                "lease-tck-00448-missing-recipe",
+                "RR-TCK-00448-MISSING-RECIPE",
+                |_cas, policy| {
+                    policy.context_pack_recipe_hash = [0u8; 32];
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::PolicyResolutionMissing as i32
+                    );
+                    assert!(
+                        err.message.contains("missing_authority_context"),
+                        "deny message should include missing_authority_context, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message
+                            .contains("claim context_pack_recipe_hash is zero"),
+                        "deny message should include claim context_pack_recipe_hash zero detail, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected authority-context deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "missing context_pack_recipe_hash denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "missing context_pack_recipe_hash denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_stale_context_pack_recipe_hash_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-STALE-RECIPE",
+                "lease-tck-00448-stale-recipe",
+                "RR-TCK-00448-STALE-RECIPE",
+                |cas, policy| {
+                    let stale_recipe = build_policy_context_pack_recipe(
+                        "W-TCK-00448-LEGACY",
+                        "actor:legacy",
+                        policy.role_spec_hash,
+                        policy.context_pack_hash,
+                    )
+                    .expect("stale recipe should compile");
+                    let stale_recipe_bytes = stale_recipe
+                        .recipe
+                        .canonical_bytes()
+                        .expect("stale recipe canonicalization should succeed");
+                    let stale_hash = *blake3::hash(&stale_recipe_bytes).as_bytes();
+                    cas.store(&stale_recipe_bytes)
+                        .expect("stale recipe preimage should store in CAS");
+                    assert_ne!(
+                        stale_hash, policy.context_pack_recipe_hash,
+                        "precondition: stale hash must differ from authoritative recipe hash"
+                    );
+                    policy.context_pack_recipe_hash = stale_hash;
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("stale_authority_context"),
+                        "deny message should include stale_authority_context, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("does not match authoritative hash"),
+                        "deny message should include stale recipe authoritative mismatch detail, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected stale-authority deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "stale context_pack_recipe_hash denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "stale context_pack_recipe_hash denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_unknown_role_profile_denied() {
+            let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
+                "W-TCK-00448-UNKNOWN-ROLE",
+                "lease-tck-00448-unknown-role",
+                "RR-TCK-00448-UNKNOWN-ROLE",
+                |_cas, policy| {
+                    policy.role_spec_hash =
+                        *blake3::hash(b"tck-00448-unknown-role-profile").as_bytes();
+                },
+            );
+            let baseline_review_event_count = review_receipt_event_count(&dispatcher, &work_id);
+
+            let frame = encode_ingest_review_receipt_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("unknown_role_profile"),
+                        "deny message should include unknown_role_profile, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("does not match authoritative hash"),
+                        "deny message should include role hash mismatch detail, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected unknown-role-profile deny error, got {other:?}"),
+            }
+
+            assert_eq!(
+                review_receipt_event_count(&dispatcher, &work_id),
+                baseline_review_event_count,
+                "unknown role profile denial must not emit review_receipt_recorded"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_event_by_receipt_id(&request.receipt_id)
+                    .is_none(),
+                "unknown role profile denial must not persist receipt_id event state"
+            );
+        }
+
+        #[test]
+        fn test_valid_lineage_accepted() {
+            let (dispatcher, ctx, request, work_id) = setup_spawn_lineage_fixture(
+                "W-TCK-00448-VALID",
+                "L-TCK-00448-VALID",
+                |_cas, _policy| {},
+            );
+            let baseline_event_count = dispatcher
+                .event_emitter
+                .get_events_by_work_id(&work_id)
+                .len();
+
+            let frame = encode_spawn_episode_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::SpawnEpisode(resp) => {
+                    assert!(
+                        !resp.session_id.is_empty(),
+                        "valid lineage acceptance must return a session_id"
+                    );
+                    assert!(
+                        !resp.ephemeral_handle.is_empty(),
+                        "valid lineage acceptance must return an ephemeral_handle"
+                    );
+                },
+                other => panic!("expected SpawnEpisode success, got {other:?}"),
+            }
+
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session_by_work_id(&work_id)
+                    .is_some(),
+                "valid lineage acceptance must persist a session"
+            );
+            assert!(
+                dispatcher
+                    .event_emitter
+                    .get_events_by_work_id(&work_id)
+                    .len()
+                    > baseline_event_count,
+                "valid lineage acceptance must emit spawn lifecycle ledger events"
+            );
+        }
+    }
+
+    // ========================================================================
     // TCK-00340: Serde fail-closed default tests
     // ========================================================================
     mod serde_fail_closed {
@@ -26098,6 +27268,21 @@ mod tests {
                 },
             );
 
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                executor_actor_id,
+                WorkRole::Reviewer,
+                resolved_risk_tier,
+            );
+            policy_resolution.resolved_policy_hash = policy_hash;
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                executor_actor_id,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+
             state
                 .privileged_dispatcher()
                 .work_registry
@@ -26106,17 +27291,7 @@ mod tests {
                     lease_id: lease_id.to_string(),
                     actor_id: executor_actor_id.to_string(),
                     role: WorkRole::Reviewer,
-                    policy_resolution: PolicyResolution {
-                        policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
-                        resolved_policy_hash: policy_hash,
-                        capability_manifest_hash: [0x01; 32],
-                        context_pack_hash: [0x02; 32],
-                        resolved_risk_tier,
-                        resolved_scope_baseline: None,
-                        expected_adapter_profile_hash: None,
-                        pcac_policy: None,
-                        pointer_only_waiver: None,
-                    },
+                    policy_resolution,
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
                     permeability_receipt: None,
@@ -26156,22 +27331,25 @@ mod tests {
             );
 
             // Register work claim via SqliteWorkRegistry (production path)
+            let policy_resolution = test_policy_resolution_with_lineage(
+                "W-SQL-001",
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                0,
+            );
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-SQL-001",
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
             let claim = WorkClaim {
                 work_id: "W-SQL-001".to_string(),
                 lease_id: "sqlite-lease-001".to_string(),
                 actor_id: executor_actor_id,
                 role: WorkRole::Reviewer,
-                policy_resolution: PolicyResolution {
-                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-SQL-001".to_string(),
-                    resolved_policy_hash: [0u8; 32],
-                    capability_manifest_hash: [0u8; 32],
-                    context_pack_hash: [0u8; 32],
-                    resolved_risk_tier: 0, // Tier0
-                    resolved_scope_baseline: None,
-                    expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
-                },
+                policy_resolution,
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
                 permeability_receipt: None,
@@ -26245,22 +27423,25 @@ mod tests {
             );
 
             // Register work claim at Tier2 (should be rejected)
+            let policy_resolution = test_policy_resolution_with_lineage(
+                "W-SQL-T2",
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                2,
+            );
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-SQL-T2",
+                &executor_actor_id,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
             let claim = WorkClaim {
                 work_id: "W-SQL-T2".to_string(),
                 lease_id: "sqlite-lease-t2".to_string(),
                 actor_id: executor_actor_id,
                 role: WorkRole::Reviewer,
-                policy_resolution: PolicyResolution {
-                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-SQL-T2".to_string(),
-                    resolved_policy_hash: [0u8; 32],
-                    capability_manifest_hash: [0u8; 32],
-                    context_pack_hash: [0u8; 32],
-                    resolved_risk_tier: 2, // Tier2
-                    resolved_scope_baseline: None,
-                    expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
-                },
+                policy_resolution,
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
                 permeability_receipt: None,
@@ -26531,22 +27712,25 @@ mod tests {
                 },
             );
 
+            let policy_resolution = test_policy_resolution_with_lineage(
+                "W-REVIEW-001",
+                &caller_actor,
+                WorkRole::Reviewer,
+                0,
+            );
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-REVIEW-001",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
             let claim = WorkClaim {
                 work_id: "W-REVIEW-001".to_string(),
                 lease_id: "review-lease-prod".to_string(),
                 actor_id: caller_actor,
                 role: WorkRole::Reviewer,
-                policy_resolution: PolicyResolution {
-                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-REVIEW-001".to_string(),
-                    resolved_policy_hash: [0u8; 32],
-                    capability_manifest_hash: [0u8; 32],
-                    context_pack_hash: [0u8; 32],
-                    resolved_risk_tier: 0, // Tier0
-                    resolved_scope_baseline: None,
-                    expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
-                },
+                policy_resolution,
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
                 permeability_receipt: None,
@@ -27013,6 +28197,20 @@ mod tests {
                     include_attestation: true,
                 },
             );
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-PCAC-RR-PO-OBSERVE",
+                &caller_actor,
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_policy_hash = [0xC2; 32];
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-PCAC-RR-PO-OBSERVE",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
             dispatcher
                 .work_registry
                 .register_claim(WorkClaim {
@@ -27020,18 +28218,7 @@ mod tests {
                     lease_id: "pcac-review-pointer-only-observe".to_string(),
                     actor_id: caller_actor.clone(),
                     role: WorkRole::Reviewer,
-                    policy_resolution: PolicyResolution {
-                        policy_resolved_ref: "PolicyResolvedForChangeSet:W-PCAC-RR-PO-OBSERVE"
-                            .to_string(),
-                        resolved_policy_hash: [0xC2; 32],
-                        capability_manifest_hash: [0x01; 32],
-                        context_pack_hash: [0x02; 32],
-                        resolved_risk_tier: 0,
-                        resolved_scope_baseline: None,
-                        expected_adapter_profile_hash: None,
-                        pcac_policy: None,
-                        pointer_only_waiver: None,
-                    },
+                    policy_resolution,
                     executor_custody_domains: vec![],
                     author_custody_domains: vec![],
                     permeability_receipt: None,
@@ -27491,6 +28678,19 @@ mod tests {
                 "GovernancePolicyResolver must return Tier1 for transitional mapping"
             );
 
+            let cas = state
+                .privileged_dispatcher()
+                .cas
+                .as_ref()
+                .expect("CAS should be configured by DispatcherState");
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                "W-GOV-001",
+                &caller_actor,
+                WorkRole::Reviewer,
+                &policy_resolution,
+            );
+
             // Step 2: Register the work claim with the governance-produced resolution
             let claim = WorkClaim {
                 work_id: "W-GOV-001".to_string(),
@@ -27509,11 +28709,6 @@ mod tests {
                 .expect("Claim registration must succeed");
 
             // Step 3: Register the lease for reviewer identity validation
-            let cas = state
-                .privileged_dispatcher()
-                .cas
-                .as_ref()
-                .expect("CAS should be configured by DispatcherState");
             super::ingest_review_receipt::register_full_test_lease(
                 &super::ingest_review_receipt::TestLeaseConfig {
                     dispatcher: state.privileged_dispatcher(),
@@ -27830,6 +29025,8 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                role_spec_hash: [0u8; 32],
+                context_pack_recipe_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
@@ -27861,6 +29058,8 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                role_spec_hash: [0u8; 32],
+                context_pack_recipe_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: Some(baseline),
                 expected_adapter_profile_hash: None,
@@ -27940,29 +29139,18 @@ mod tests {
 
             // Pre-register claim with NO scope baseline
             // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
+            let policy_resolution = test_policy_resolution_with_lineage(
+                "W-V3-SCOPE-NONE",
+                "actor:test-impl",
+                WorkRole::Implementer,
+                1,
+            );
             let claim = WorkClaim {
                 work_id: "W-V3-SCOPE-NONE".to_string(),
                 lease_id: "L-V3-001".to_string(),
                 actor_id: "actor:test-impl".to_string(),
                 role: WorkRole::Implementer,
-                policy_resolution: PolicyResolution {
-                    policy_resolved_ref: "resolved-v3-none".to_string(),
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
-                    resolved_policy_hash: [0xAA; 32],
-                    capability_manifest_hash: policy_capability_manifest_hash(
-                        "W-V3-SCOPE-NONE",
-                        "actor:test-impl",
-                        WorkRole::Implementer,
-                    ),
-                    context_pack_hash: policy_context_pack_hash(
-                        "W-V3-SCOPE-NONE",
-                        "actor:test-impl",
-                    ),
-                    resolved_risk_tier: 1,
-                    resolved_scope_baseline: None,
-                    expected_adapter_profile_hash: None,
-                },
+                policy_resolution,
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
                 permeability_receipt: None,
@@ -28015,29 +29203,19 @@ mod tests {
                 shell_patterns: Vec::new(),
             };
             // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-V3-SCOPE-NARROW",
+                "actor:test-reviewer",
+                WorkRole::Reviewer,
+                1,
+            );
+            policy_resolution.resolved_scope_baseline = Some(narrow_baseline);
             let claim = WorkClaim {
                 work_id: "W-V3-SCOPE-NARROW".to_string(),
                 lease_id: "L-V3-002".to_string(),
                 actor_id: "actor:test-reviewer".to_string(),
                 role: WorkRole::Reviewer,
-                policy_resolution: PolicyResolution {
-                    policy_resolved_ref: "resolved-v3-narrow".to_string(),
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
-                    resolved_policy_hash: [0xAA; 32],
-                    capability_manifest_hash: policy_capability_manifest_hash(
-                        "W-V3-SCOPE-NARROW",
-                        "actor:test-reviewer",
-                        WorkRole::Reviewer,
-                    ),
-                    context_pack_hash: policy_context_pack_hash(
-                        "W-V3-SCOPE-NARROW",
-                        "actor:test-reviewer",
-                    ),
-                    resolved_risk_tier: 1,
-                    resolved_scope_baseline: Some(narrow_baseline),
-                    expected_adapter_profile_hash: None,
-                },
+                policy_resolution,
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
                 permeability_receipt: None,
@@ -28094,29 +29272,19 @@ mod tests {
 
             // Policy says Tier0 -- the V1 ceiling must be Tier0
             // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-V3-RISK-CEIL",
+                "actor:test-reviewer",
+                WorkRole::Reviewer,
+                0,
+            );
+            policy_resolution.resolved_scope_baseline = Some(matching_baseline);
             let claim = WorkClaim {
                 work_id: "W-V3-RISK-CEIL".to_string(),
                 lease_id: "L-V3-003".to_string(),
                 actor_id: "actor:test-reviewer".to_string(),
                 role: WorkRole::Reviewer,
-                policy_resolution: PolicyResolution {
-                    policy_resolved_ref: "resolved-v3-risk".to_string(),
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
-                    resolved_policy_hash: [0xAA; 32],
-                    capability_manifest_hash: policy_capability_manifest_hash(
-                        "W-V3-RISK-CEIL",
-                        "actor:test-reviewer",
-                        WorkRole::Reviewer,
-                    ),
-                    context_pack_hash: policy_context_pack_hash(
-                        "W-V3-RISK-CEIL",
-                        "actor:test-reviewer",
-                    ),
-                    resolved_risk_tier: 0,
-                    resolved_scope_baseline: Some(matching_baseline),
-                    expected_adapter_profile_hash: None,
-                },
+                policy_resolution,
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
                 permeability_receipt: None,
@@ -28170,30 +29338,19 @@ mod tests {
             };
 
             // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
+            let mut policy_resolution = test_policy_resolution_with_lineage(
+                "W-V3-RISK-INV",
+                "actor:test-reviewer",
+                WorkRole::Reviewer,
+                255,
+            );
+            policy_resolution.resolved_scope_baseline = Some(matching_baseline);
             let claim = WorkClaim {
                 work_id: "W-V3-RISK-INV".to_string(),
                 lease_id: "L-V3-004".to_string(),
                 actor_id: "actor:test-reviewer".to_string(),
                 role: WorkRole::Reviewer,
-                policy_resolution: PolicyResolution {
-                    policy_resolved_ref: "resolved-v3-invalid".to_string(),
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
-                    resolved_policy_hash: [0xAA; 32],
-                    capability_manifest_hash: policy_capability_manifest_hash(
-                        "W-V3-RISK-INV",
-                        "actor:test-reviewer",
-                        WorkRole::Reviewer,
-                    ),
-                    context_pack_hash: policy_context_pack_hash(
-                        "W-V3-RISK-INV",
-                        "actor:test-reviewer",
-                    ),
-                    // Invalid tier value
-                    resolved_risk_tier: 255,
-                    resolved_scope_baseline: Some(matching_baseline),
-                    expected_adapter_profile_hash: None,
-                },
+                policy_resolution,
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
                 permeability_receipt: None,
@@ -28566,6 +29723,8 @@ mod tests {
                     resolved_policy_hash: policy_hash,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -28634,6 +29793,8 @@ mod tests {
                     resolved_policy_hash: policy_hash,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -28705,6 +29866,8 @@ mod tests {
                     resolved_policy_hash: policy_hash_bytes,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -28815,6 +29978,8 @@ mod tests {
                     resolved_policy_hash: policy_hash,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 3, // High risk tier
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -28884,6 +30049,8 @@ mod tests {
                     resolved_policy_hash: policy_hash_b, // Different from receipt!
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
@@ -29137,6 +30304,8 @@ mod tests {
                     resolved_policy_hash: policy_hash,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
                     resolved_risk_tier: 255, // Invalid!
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,

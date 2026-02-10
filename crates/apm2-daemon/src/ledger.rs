@@ -20,6 +20,7 @@ use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::{REVIEW_RECEIPT_RECORDED_PREFIX, SelectionDecision};
 use ed25519_dalek::Signer;
 use rusqlite::{Connection, OptionalExtension, params};
+use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
 use crate::protocol::dispatch::{
@@ -389,6 +390,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "policy_resolved_ref": claim.policy_resolution.policy_resolved_ref,
             "capability_manifest_hash": hex::encode(claim.policy_resolution.capability_manifest_hash),
             "context_pack_hash": hex::encode(claim.policy_resolution.context_pack_hash),
+            "role_spec_hash": hex::encode(claim.policy_resolution.role_spec_hash),
+            "context_pack_recipe_hash": hex::encode(claim.policy_resolution.context_pack_recipe_hash),
         });
 
         // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
@@ -1053,6 +1056,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
+        capability_manifest_hash: &[u8; 32],
+        context_pack_hash: &[u8; 32],
+        role_spec_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         identity_proof_hash: &[u8; 32],
@@ -1062,6 +1068,18 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
         // protocol compatibility across daemon/core boundary.
         // (Previously used daemon-local prefix; now aligned with core.)
+
+        for (name, hash) in [
+            ("capability_manifest_hash", capability_manifest_hash),
+            ("context_pack_hash", context_pack_hash),
+            ("role_spec_hash", role_spec_hash),
+        ] {
+            if bool::from(hash.ct_eq(&[0u8; 32])) {
+                return Err(LedgerEventError::ValidationFailed {
+                    message: format!("{name} is zero (fail-closed)"),
+                });
+            }
+        }
 
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
@@ -1089,6 +1107,18 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         payload_map.insert(
             "artifact_bundle_hash".to_string(),
             serde_json::json!(hex::encode(artifact_bundle_hash)),
+        );
+        payload_map.insert(
+            "capability_manifest_hash".to_string(),
+            serde_json::json!(hex::encode(capability_manifest_hash)),
+        );
+        payload_map.insert(
+            "context_pack_hash".to_string(),
+            serde_json::json!(hex::encode(context_pack_hash)),
+        );
+        payload_map.insert(
+            "role_spec_hash".to_string(),
+            serde_json::json!(hex::encode(role_spec_hash)),
         );
         payload_map.insert("verdict".to_string(), serde_json::json!("APPROVE"));
         payload_map.insert(
@@ -1179,6 +1209,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
+        capability_manifest_hash: &[u8; 32],
+        context_pack_hash: &[u8; 32],
+        role_spec_hash: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
@@ -1188,6 +1221,18 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use crate::protocol::dispatch::REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX;
+
+        for (name, hash) in [
+            ("capability_manifest_hash", capability_manifest_hash),
+            ("context_pack_hash", context_pack_hash),
+            ("role_spec_hash", role_spec_hash),
+        ] {
+            if bool::from(hash.ct_eq(&[0u8; 32])) {
+                return Err(LedgerEventError::ValidationFailed {
+                    message: format!("{name} is zero (fail-closed)"),
+                });
+            }
+        }
 
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
@@ -1208,6 +1253,18 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         payload_map.insert(
             "artifact_bundle_hash".to_string(),
             serde_json::json!(hex::encode(artifact_bundle_hash)),
+        );
+        payload_map.insert(
+            "capability_manifest_hash".to_string(),
+            serde_json::json!(hex::encode(capability_manifest_hash)),
+        );
+        payload_map.insert(
+            "context_pack_hash".to_string(),
+            serde_json::json!(hex::encode(context_pack_hash)),
+        );
+        payload_map.insert(
+            "role_spec_hash".to_string(),
+            serde_json::json!(hex::encode(role_spec_hash)),
         );
         payload_map.insert("verdict".to_string(), serde_json::json!("BLOCKED"));
         payload_map.insert(
@@ -1596,6 +1653,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "policy_resolved_ref": claim.policy_resolution.policy_resolved_ref,
             "capability_manifest_hash": hex::encode(claim.policy_resolution.capability_manifest_hash),
             "context_pack_hash": hex::encode(claim.policy_resolution.context_pack_hash),
+            "role_spec_hash": hex::encode(claim.policy_resolution.role_spec_hash),
+            "context_pack_recipe_hash": hex::encode(claim.policy_resolution.context_pack_recipe_hash),
         });
         let claimed_payload_json = claimed_payload.to_string();
         let claimed_canonical = canonicalize_json(&claimed_payload_json).map_err(|e| {
@@ -2539,6 +2598,8 @@ mod tests {
             resolved_policy_hash: [0u8; 32],
             capability_manifest_hash: [0u8; 32],
             context_pack_hash: [0u8; 32],
+            role_spec_hash: [0u8; 32],
+            context_pack_recipe_hash: [0u8; 32],
             resolved_risk_tier: 0,
             resolved_scope_baseline: None,
             expected_adapter_profile_hash: None,
@@ -3170,6 +3231,9 @@ mod tests {
                 "RR-IDEMP-001",
                 &changeset,
                 &artifact,
+                &[0x11; 32],
+                &[0x22; 32],
+                &[0x33; 32],
                 "reviewer-actor-x",
                 1_000_000_000,
                 &identity_proof,
@@ -3216,6 +3280,9 @@ mod tests {
                 "RR-BLOCKED-001",
                 &changeset_digest,
                 &artifact_bundle_hash,
+                &[0x11; 32],
+                &[0x22; 32],
+                &[0x33; 32],
                 42,
                 &blocked_log_hash,
                 "reviewer-actor-y",
@@ -3481,6 +3548,9 @@ mod tests {
                 "RR-BLOCKED-IPH",
                 &changeset_digest,
                 &artifact_bundle_hash,
+                &[0x11; 32],
+                &[0x22; 32],
+                &[0x33; 32],
                 99,
                 &blocked_log_hash,
                 "reviewer-actor-z",

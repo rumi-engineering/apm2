@@ -516,8 +516,9 @@ impl MergeExecutor {
             *blocked_log_hash.as_bytes(),
             [0u8; 32], // time_envelope_ref placeholder
             self.actor_id.clone(),
-            None, // capability_manifest_hash not applicable at merge boundary
-            None, // context_pack_hash not applicable at merge boundary
+            None,       // capability_manifest_hash not applicable at merge boundary
+            None,       // context_pack_hash not applicable at merge boundary
+            Vec::new(), // role_spec_hash not applicable at merge boundary
             &self.signer,
         )
         .expect("ReviewBlockedRecorded creation should not fail with valid inputs");

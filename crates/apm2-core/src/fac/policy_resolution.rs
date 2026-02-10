@@ -77,6 +77,9 @@ pub const MAX_VERIFIER_POLICIES: usize = 256;
 /// Maximum length of any string field in a policy resolution.
 /// This prevents denial-of-service attacks via oversized strings.
 pub const MAX_STRING_LENGTH: usize = 4096;
+
+/// Fixed byte length for lineage hashes when present.
+pub const LINEAGE_HASH_LENGTH: usize = 32;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -289,7 +292,7 @@ pub enum PolicyResolutionError {
 /// changeset. All subsequent lease issuance and receipt validation must
 /// reference this anchor.
 ///
-/// # Fields (11 total)
+/// # Fields (13 total)
 ///
 /// - `work_id`: Work item this policy resolution applies to
 /// - `changeset_digest`: Hash binding to specific changeset
@@ -302,6 +305,9 @@ pub enum PolicyResolutionError {
 /// - `resolved_verifier_policy_hashes`: Hashes of resolved verifier policies
 /// - `resolver_actor_id`: Actor who performed the policy resolution
 /// - `resolver_version`: Version of the resolver component
+/// - `role_spec_hash`: BLAKE3 hash of the authoritative `RoleSpecV2` contract
+/// - `context_pack_recipe_hash`: BLAKE3 hash of the context recipe lineage
+///   artifact
 /// - `resolver_signature`: Ed25519 signature with domain separation
 ///
 /// # Security
@@ -348,6 +354,16 @@ pub struct PolicyResolvedForChangeSet {
 
     /// Version of the resolver component.
     pub resolver_version: String,
+
+    /// BLAKE3 hash of the authoritative `RoleSpecV2` contract (32 bytes,
+    /// TCK-00448).
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
+    pub role_spec_hash: Vec<u8>,
+
+    /// BLAKE3 hash of the compiled context recipe lineage artifact (32 bytes,
+    /// TCK-00448).
+    #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
+    pub context_pack_recipe_hash: Vec<u8>,
 
     /// Ed25519 signature over canonical bytes with domain separation.
     #[serde(with = "serde_bytes")]
@@ -481,6 +497,15 @@ impl PolicyResolvedForChangeSet {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Collection sizes are validated by MAX_RCP_PROFILES
     pub fn canonical_bytes(&self) -> Vec<u8> {
+        assert!(
+            is_empty_or_fixed_lineage_hash(&self.role_spec_hash),
+            "BUG: role_spec_hash must be empty or 32 bytes"
+        );
+        assert!(
+            is_empty_or_fixed_lineage_hash(&self.context_pack_recipe_hash),
+            "BUG: context_pack_recipe_hash must be empty or 32 bytes"
+        );
+
         // Capacity includes:
         // - 4 bytes for work_id length + work_id content
         // - 32 bytes for changeset_digest
@@ -493,6 +518,8 @@ impl PolicyResolvedForChangeSet {
         // - 1 byte section separator
         // - 4 bytes for resolver_actor_id length + content
         // - 4 bytes for resolver_version length + content
+        // - 4 bytes role_spec_hash length + role_spec_hash bytes
+        // - 4 bytes context_pack_recipe_hash length + context_pack_recipe_hash bytes
         let capacity = 4
             + self.work_id.len()
             + 32 // changeset_digest
@@ -505,7 +532,11 @@ impl PolicyResolvedForChangeSet {
             + self.resolved_verifier_policy_hashes.len() * 32
             + 1  // section separator
             + 4 + self.resolver_actor_id.len()
-            + 4 + self.resolver_version.len();
+            + 4 + self.resolver_version.len()
+            + 4
+            + self.role_spec_hash.len()
+            + 4
+            + self.context_pack_recipe_hash.len();
 
         let mut bytes = Vec::with_capacity(capacity);
 
@@ -570,6 +601,14 @@ impl PolicyResolvedForChangeSet {
         // 10. resolver_version (length-prefixed)
         bytes.extend_from_slice(&(self.resolver_version.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.resolver_version.as_bytes());
+
+        // 11. role_spec_hash (TCK-00448, length-prefixed)
+        bytes.extend_from_slice(&(self.role_spec_hash.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.role_spec_hash);
+
+        // 12. context_pack_recipe_hash (TCK-00448, length-prefixed)
+        bytes.extend_from_slice(&(self.context_pack_recipe_hash.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.context_pack_recipe_hash);
 
         bytes
     }
@@ -740,6 +779,24 @@ fn hex_encode(bytes: &[u8]) -> String {
         })
 }
 
+const fn is_empty_or_fixed_lineage_hash(hash: &[u8]) -> bool {
+    hash.is_empty() || hash.len() == LINEAGE_HASH_LENGTH
+}
+
+fn validate_lineage_hash_length(
+    field: &'static str,
+    hash: &[u8],
+) -> Result<(), PolicyResolutionError> {
+    if is_empty_or_fixed_lineage_hash(hash) {
+        Ok(())
+    } else {
+        Err(PolicyResolutionError::InvalidData(format!(
+            "{field} must be empty or {LINEAGE_HASH_LENGTH} bytes, got {}",
+            hash.len()
+        )))
+    }
+}
+
 // =============================================================================
 // Builder
 // =============================================================================
@@ -756,6 +813,8 @@ pub struct PolicyResolvedForChangeSetBuilder {
     resolved_verifier_policy_hashes: Vec<[u8; 32]>,
     resolver_actor_id: Option<String>,
     resolver_version: Option<String>,
+    role_spec_hash: Vec<u8>,
+    context_pack_recipe_hash: Vec<u8>,
 }
 
 impl PolicyResolvedForChangeSetBuilder {
@@ -836,6 +895,20 @@ impl PolicyResolvedForChangeSetBuilder {
     #[must_use]
     pub fn resolver_version(mut self, version: impl Into<String>) -> Self {
         self.resolver_version = Some(version.into());
+        self
+    }
+
+    /// Sets the authoritative `RoleSpecV2` hash (TCK-00448).
+    #[must_use]
+    pub fn role_spec_hash(mut self, hash: [u8; 32]) -> Self {
+        self.role_spec_hash = hash.to_vec();
+        self
+    }
+
+    /// Sets the authoritative context recipe lineage hash (TCK-00448).
+    #[must_use]
+    pub fn context_pack_recipe_hash(mut self, hash: [u8; 32]) -> Self {
+        self.context_pack_recipe_hash = hash.to_vec();
         self
     }
 
@@ -950,6 +1023,9 @@ impl PolicyResolvedForChangeSetBuilder {
             }
         }
 
+        validate_lineage_hash_length("role_spec_hash", &self.role_spec_hash)?;
+        validate_lineage_hash_length("context_pack_recipe_hash", &self.context_pack_recipe_hash)?;
+
         // Zip profile IDs with manifest hashes, sort by ID, then unzip
         // This maintains alignment between IDs and their corresponding hashes
         let mut pairs: Vec<(String, [u8; 32])> = self
@@ -986,6 +1062,8 @@ impl PolicyResolvedForChangeSetBuilder {
             resolved_verifier_policy_hashes,
             resolver_actor_id,
             resolver_version,
+            role_spec_hash: self.role_spec_hash,
+            context_pack_recipe_hash: self.context_pack_recipe_hash,
             resolver_signature: [0u8; 64],
         };
 
@@ -1157,6 +1235,9 @@ impl TryFrom<PolicyResolvedForChangeSetProto> for PolicyResolvedForChangeSet {
         let mut resolved_verifier_policy_hashes = resolved_verifier_policy_hashes;
         resolved_verifier_policy_hashes.sort_unstable();
 
+        validate_lineage_hash_length("role_spec_hash", &proto.role_spec_hash)?;
+        validate_lineage_hash_length("context_pack_recipe_hash", &proto.context_pack_recipe_hash)?;
+
         // CRITICAL: Verify resolved_policy_hash matches computed hash
         // This prevents a compromised resolver from binding leases to a different
         // policy than what the audit fields indicate
@@ -1184,6 +1265,8 @@ impl TryFrom<PolicyResolvedForChangeSetProto> for PolicyResolvedForChangeSet {
             resolved_verifier_policy_hashes,
             resolver_actor_id: proto.resolver_actor_id,
             resolver_version: proto.resolver_version,
+            role_spec_hash: proto.role_spec_hash,
+            context_pack_recipe_hash: proto.context_pack_recipe_hash,
             resolver_signature,
         })
     }
@@ -1210,6 +1293,8 @@ impl From<PolicyResolvedForChangeSet> for PolicyResolvedForChangeSetProto {
                 .collect(),
             resolver_actor_id: resolution.resolver_actor_id,
             resolver_version: resolution.resolver_version,
+            role_spec_hash: resolution.role_spec_hash,
+            context_pack_recipe_hash: resolution.context_pack_recipe_hash,
             resolver_signature: resolution.resolver_signature.to_vec(),
         }
     }
@@ -1236,6 +1321,8 @@ pub mod tests {
             .add_verifier_policy_hash([0x22; 32])
             .resolver_actor_id("resolver-001")
             .resolver_version("1.0.0")
+            .role_spec_hash([0x77; 32])
+            .context_pack_recipe_hash([0x88; 32])
             .build_and_sign(signer)
     }
 
@@ -1256,6 +1343,8 @@ pub mod tests {
         assert_eq!(resolution.resolved_verifier_policy_hashes, vec![[0x22; 32]]);
         assert_eq!(resolution.resolver_actor_id, "resolver-001");
         assert_eq!(resolution.resolver_version, "1.0.0");
+        assert_eq!(resolution.role_spec_hash, vec![0x77; 32]);
+        assert_eq!(resolution.context_pack_recipe_hash, vec![0x88; 32]);
     }
 
     #[test]
@@ -1303,6 +1392,29 @@ pub mod tests {
 
         // Same content should produce same canonical bytes
         assert_eq!(resolution1.canonical_bytes(), resolution2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_canonical_bytes_bind_lineage_hashes() {
+        let signer = Signer::generate();
+        let resolution1 = create_test_resolution(&signer);
+        let resolution2 = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .add_rcp_profile_id("rcp-profile-001")
+            .add_rcp_manifest_hash([0x11; 32])
+            .add_verifier_policy_hash([0x22; 32])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .role_spec_hash([0x99; 32]) // changed lineage
+            .context_pack_recipe_hash([0x88; 32])
+            .build_and_sign(&signer);
+
+        assert_ne!(resolution1.canonical_bytes(), resolution2.canonical_bytes());
+        assert_ne!(
+            resolution1.resolver_signature,
+            resolution2.resolver_signature
+        );
     }
 
     #[test]
@@ -1501,6 +1613,11 @@ pub mod tests {
         );
         assert_eq!(original.resolver_actor_id, recovered.resolver_actor_id);
         assert_eq!(original.resolver_version, recovered.resolver_version);
+        assert_eq!(original.role_spec_hash, recovered.role_spec_hash);
+        assert_eq!(
+            original.context_pack_recipe_hash,
+            recovered.context_pack_recipe_hash
+        );
         assert_eq!(original.resolver_signature, recovered.resolver_signature);
 
         // Signature should still be valid
@@ -1522,6 +1639,8 @@ pub mod tests {
             resolved_rcp_profile_ids: vec![],
             resolved_rcp_manifest_hashes: vec![],
             resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: Vec::new(),
+            context_pack_recipe_hash: Vec::new(),
             resolver_actor_id: "resolver-001".to_string(),
             resolver_version: "1.0.0".to_string(),
             resolver_signature: vec![0u8; 64],
@@ -1542,6 +1661,8 @@ pub mod tests {
             resolved_rcp_profile_ids: vec![],
             resolved_rcp_manifest_hashes: vec![],
             resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: Vec::new(),
+            context_pack_recipe_hash: Vec::new(),
             resolver_actor_id: "resolver-001".to_string(),
             resolver_version: "1.0.0".to_string(),
             resolver_signature: vec![0u8; 64],
@@ -1562,6 +1683,8 @@ pub mod tests {
             resolved_rcp_profile_ids: vec![],
             resolved_rcp_manifest_hashes: vec![],
             resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: Vec::new(),
+            context_pack_recipe_hash: Vec::new(),
             resolver_actor_id: "resolver-001".to_string(),
             resolver_version: "1.0.0".to_string(),
             resolver_signature: vec![0u8; 32], // Wrong length - should be 64
@@ -1743,6 +1866,8 @@ pub mod tests {
             resolved_rcp_profile_ids: vec![],
             resolved_rcp_manifest_hashes: vec![],
             resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: Vec::new(),
+            context_pack_recipe_hash: Vec::new(),
             resolver_actor_id: "resolver-001".to_string(),
             resolver_version: "1.0.0".to_string(),
             resolver_signature: vec![0u8; 64],
@@ -1775,6 +1900,8 @@ pub mod tests {
             resolved_rcp_profile_ids: vec!["profile-1".to_string()],
             resolved_rcp_manifest_hashes: vec![vec![0x00; 32], vec![0x11; 32]], // Mismatch: 1 vs 2
             resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: Vec::new(),
+            context_pack_recipe_hash: Vec::new(),
             resolver_actor_id: "resolver-001".to_string(),
             resolver_version: "1.0.0".to_string(),
             resolver_signature: vec![0u8; 64],
@@ -2021,6 +2148,8 @@ pub mod tests {
             ],
             resolved_rcp_manifest_hashes: vec![vec![0x00; 32], vec![0x11; 32]],
             resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: Vec::new(),
+            context_pack_recipe_hash: Vec::new(),
             resolver_actor_id: "resolver-001".to_string(),
             resolver_version: "1.0.0".to_string(),
             resolver_signature: vec![0u8; 64],
@@ -2045,6 +2174,8 @@ pub mod tests {
             resolved_rcp_profile_ids: vec![],
             resolved_rcp_manifest_hashes: vec![],
             resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: Vec::new(),
+            context_pack_recipe_hash: Vec::new(),
             resolver_actor_id: "resolver-001".to_string(),
             resolver_version: "1.0.0".to_string(),
             resolver_signature: vec![0u8; 64],
@@ -2057,6 +2188,116 @@ pub mod tests {
                 field: "work_id",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn test_builder_rejects_non_empty_non_32_role_spec_hash() {
+        let signer = Signer::generate();
+        let result = PolicyResolvedForChangeSetBuilder {
+            work_id: "work-001".to_string(),
+            changeset_digest: [0x42; 32],
+            resolved_risk_tier: Some(1),
+            resolved_determinism_class: Some(0),
+            resolved_rcp_profile_ids: Vec::new(),
+            resolved_rcp_manifest_hashes: Vec::new(),
+            resolved_verifier_policy_hashes: Vec::new(),
+            resolver_actor_id: Some("resolver-001".to_string()),
+            resolver_version: Some("1.0.0".to_string()),
+            role_spec_hash: vec![0xAA; 31],
+            context_pack_recipe_hash: vec![0xBB; 32],
+        }
+        .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::InvalidData(message))
+                if message.contains("role_spec_hash must be empty or 32 bytes")
+        ));
+    }
+
+    #[test]
+    fn test_builder_rejects_non_empty_non_32_context_pack_recipe_hash() {
+        let signer = Signer::generate();
+        let result = PolicyResolvedForChangeSetBuilder {
+            work_id: "work-001".to_string(),
+            changeset_digest: [0x42; 32],
+            resolved_risk_tier: Some(1),
+            resolved_determinism_class: Some(0),
+            resolved_rcp_profile_ids: Vec::new(),
+            resolved_rcp_manifest_hashes: Vec::new(),
+            resolved_verifier_policy_hashes: Vec::new(),
+            resolver_actor_id: Some("resolver-001".to_string()),
+            resolver_version: Some("1.0.0".to_string()),
+            role_spec_hash: vec![0xAA; 32],
+            context_pack_recipe_hash: vec![0xBB; 33],
+        }
+        .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::InvalidData(message))
+                if message.contains("context_pack_recipe_hash must be empty or 32 bytes")
+        ));
+    }
+
+    #[test]
+    fn test_proto_rejects_split_collision_lineage_hash_lengths() {
+        let split_31_33 = [vec![0xAB; 31], vec![0xAB; 33]].concat();
+        let split_32_32 = [vec![0xAB; 32], vec![0xAB; 32]].concat();
+        assert_eq!(split_31_33, split_32_32);
+
+        let resolved_policy_hash =
+            PolicyResolvedForChangeSet::compute_policy_hash(0, 0, &[], &[], &[]).to_vec();
+        let proto = PolicyResolvedForChangeSetProto {
+            work_id: "work-001".to_string(),
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash,
+            resolved_risk_tier: 0,
+            resolved_determinism_class: 0,
+            resolved_rcp_profile_ids: vec![],
+            resolved_rcp_manifest_hashes: vec![],
+            resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: vec![0xAB; 31],
+            context_pack_recipe_hash: vec![0xAB; 33],
+            resolver_actor_id: "resolver-001".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        let result = PolicyResolvedForChangeSet::try_from(proto);
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::InvalidData(message))
+                if message.contains("role_spec_hash must be empty or 32 bytes")
+        ));
+    }
+
+    #[test]
+    fn test_proto_rejects_non_empty_non_32_context_pack_recipe_hash() {
+        let resolved_policy_hash =
+            PolicyResolvedForChangeSet::compute_policy_hash(0, 0, &[], &[], &[]).to_vec();
+        let proto = PolicyResolvedForChangeSetProto {
+            work_id: "work-001".to_string(),
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash,
+            resolved_risk_tier: 0,
+            resolved_determinism_class: 0,
+            resolved_rcp_profile_ids: vec![],
+            resolved_rcp_manifest_hashes: vec![],
+            resolved_verifier_policy_hashes: vec![],
+            role_spec_hash: vec![0xAB; 32],
+            context_pack_recipe_hash: vec![0xAB; 33],
+            resolver_actor_id: "resolver-001".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        let result = PolicyResolvedForChangeSet::try_from(proto);
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::InvalidData(message))
+                if message.contains("context_pack_recipe_hash must be empty or 32 bytes")
         ));
     }
 

@@ -1192,6 +1192,12 @@ pub struct PolicyResolvedForChangeSet {
     /// Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: domain (64 bytes)
     #[prost(bytes = "vec", tag = "11")]
     pub resolver_signature: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the authoritative RoleSpecV2 contract (32 bytes, TCK-00448).
+    #[prost(bytes = "vec", tag = "12")]
+    pub role_spec_hash: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the compiled ContextPackRecipe lineage artifact (32 bytes, TCK-00448).
+    #[prost(bytes = "vec", tag = "13")]
+    pub context_pack_recipe_hash: ::prost::alloc::vec::Vec<u8>,
 }
 /// GateReceipt envelope with versioning support.
 /// This is the canonical receipt envelope that wraps gate-specific payloads.
@@ -1893,6 +1899,10 @@ pub struct ReviewBlockedRecorded {
     /// Binds the blocked event to the context firewall configuration.
     #[prost(bytes = "vec", tag = "9")]
     pub context_pack_hash: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the RoleSpecV2 used during review (32 bytes, TCK-00448).
+    /// Binds the blocked event to the role specification used for the attempted run.
+    #[prost(bytes = "vec", tag = "10")]
+    pub role_spec_hash: ::prost::alloc::vec::Vec<u8>,
 }
 /// Emitted when a review is successfully completed.
 ///
