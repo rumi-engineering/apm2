@@ -91,6 +91,7 @@ pub mod frame;
 pub mod handle;
 pub mod policy;
 pub mod proc_fallback;
+pub mod reviewer;
 pub mod stats;
 
 // Re-export cgroup types
@@ -112,6 +113,15 @@ pub use policy::{
 };
 // Re-export proc fallback types
 pub use proc_fallback::{MAX_PROC_FILE_SIZE, ProcError, ProcReader, ProcResult};
+pub use reviewer::{
+    DEFAULT_PROJECTION_SUMMARY_INTERVAL, DEFAULT_REVIEWER_ROTATE_BYTES, ProjectionSummary,
+    ProjectionSummaryEmitter, REVIEWER_TELEMETRY_SCHEMA, REVIEWER_TELEMETRY_SCHEMA_VERSION,
+    ReviewerLifecycleEvent, ReviewerLifecycleEventKind, ReviewerProjectionEvent,
+    ReviewerProjectionFilter, ReviewerProjectionRead, ReviewerTelemetryError,
+    ReviewerTelemetryHealth, ReviewerTelemetryWriter, append_reviewer_event_ndjson,
+    canonicalize_reviewer_event_value, read_reviewer_projection_events, reviewer_events_lock_path,
+    reviewer_events_rotated_path,
+};
 // Re-export stats types
 pub use stats::{
     CpuStats, IoStats, MAX_BYTES, MAX_NS, MAX_OPS, MAX_PAGE_FAULTS, MemoryStats, MetricSource,
