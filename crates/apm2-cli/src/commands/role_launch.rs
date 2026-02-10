@@ -3,7 +3,9 @@
 //! This command enforces fail-closed launch admission using explicit hash
 //! bindings and emits a replay-verifiable launch receipt.
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
@@ -70,6 +72,22 @@ pub enum LaunchDenyReason {
     MissingPolicyHash,
     /// `policy_hash` could not be resolved in CAS.
     UnresolvablePolicy,
+    /// Policy artifact does not declare a required `work_id` binding.
+    MissingPolicyWorkIdBinding,
+    /// Policy `work_id` binding does not match the requested work id.
+    WorkIdBindingMismatch,
+    /// Policy `capability_manifest_hash` binding does not match request.
+    CapabilityManifestHashBindingMismatch,
+    /// Capability manifest artifact is malformed or missing declarations.
+    InvalidCapabilityManifest {
+        /// Validation detail.
+        detail: String,
+    },
+    /// Capability manifest misses role-required capabilities.
+    MissingRequiredCapabilities {
+        /// Missing capability identifiers.
+        missing: Vec<String>,
+    },
     /// A hash input is malformed.
     InvalidHashFormat {
         /// Input field name.
@@ -277,6 +295,7 @@ fn execute_role_launch(
     let ledger = open_ledger(ledger_path)?;
 
     validate_launch_bindings(
+        &args.work_id,
         &args.role,
         hashes.role_spec,
         hashes.context_pack,
@@ -565,7 +584,10 @@ fn cas_object_path(cas_path: &Path, hash: &[u8; 32]) -> PathBuf {
 
 fn read_cas_object(cas_path: &Path, hash: &[u8; 32]) -> std::result::Result<Vec<u8>, String> {
     let path = cas_object_path(cas_path, hash);
-    let metadata = fs::metadata(&path)
+    let mut file = fs::File::open(&path)
+        .map_err(|error| format!("failed to open CAS object '{}': {error}", path.display()))?;
+    let metadata = file
+        .metadata()
         .map_err(|error| format!("failed to read CAS metadata '{}': {error}", path.display()))?;
     if metadata.len() == 0 {
         return Err(format!("CAS object '{}' is empty", path.display()));
@@ -579,8 +601,23 @@ fn read_cas_object(cas_path: &Path, hash: &[u8; 32]) -> std::result::Result<Vec<
         ));
     }
 
-    let bytes = fs::read(&path)
+    let mut bytes = Vec::new();
+    let mut limited_reader = (&mut file).take(MAX_CAS_FILE_SIZE + 1);
+    limited_reader
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("failed to read CAS object '{}': {error}", path.display()))?;
+    if bytes.is_empty() {
+        return Err(format!("CAS object '{}' is empty", path.display()));
+    }
+    if bytes.len() as u64 > MAX_CAS_FILE_SIZE {
+        return Err(format!(
+            "CAS object '{}' exceeds limit ({} > {})",
+            path.display(),
+            bytes.len(),
+            MAX_CAS_FILE_SIZE
+        ));
+    }
+
     let computed_hash = *blake3::hash(&bytes).as_bytes();
     if computed_hash != *hash {
         return Err(format!(
@@ -607,6 +644,7 @@ fn resolve_required_hash(
 }
 
 fn validate_launch_bindings(
+    work_id: &str,
     role: &str,
     role_spec_hash: [u8; 32],
     context_pack_hash: [u8; 32],
@@ -626,7 +664,7 @@ fn validate_launch_bindings(
         LaunchDenyReason::MissingContextPackHash,
         LaunchDenyReason::UnresolvableContextPack,
     )?;
-    let _capability_manifest_bytes = resolve_required_hash(
+    let capability_manifest_bytes = resolve_required_hash(
         cas_path,
         capability_manifest_hash,
         LaunchDenyReason::MissingCapabilityManifestHash,
@@ -640,21 +678,26 @@ fn validate_launch_bindings(
     )?;
 
     validate_cross_binding_consistency(
+        work_id,
         role,
-        role_spec_hash,
-        context_pack_hash,
-        policy_hash,
+        ParsedHashes {
+            role_spec: role_spec_hash,
+            context_pack: context_pack_hash,
+            capability_manifest: capability_manifest_hash,
+            policy: policy_hash,
+        },
         &role_spec_bytes,
+        &capability_manifest_bytes,
         &policy_bytes,
     )
 }
 
 fn validate_cross_binding_consistency(
+    work_id: &str,
     role: &str,
-    role_spec_hash: [u8; 32],
-    context_pack_hash: [u8; 32],
-    policy_hash: [u8; 32],
+    hashes: ParsedHashes,
     role_spec_bytes: &[u8],
+    capability_manifest_bytes: &[u8],
     policy_bytes: &[u8],
 ) -> std::result::Result<(), LaunchDenyReason> {
     let role_spec: RoleSpecV2 = serde_json::from_slice(role_spec_bytes).map_err(|error| {
@@ -706,25 +749,26 @@ fn validate_cross_binding_consistency(
             .ok_or_else(|| LaunchDenyReason::StaleBindingContext {
                 detail: "policy artifact must be a JSON object".to_string(),
             })?;
+    validate_policy_work_binding(policy_object, work_id)?;
 
     let policy_role_spec_hash = extract_policy_hash(policy_object, "role_spec_hash")?;
-    if policy_role_spec_hash != role_spec_hash {
+    if policy_role_spec_hash != hashes.role_spec {
         return Err(LaunchDenyReason::StaleBindingContext {
             detail: format!(
                 "policy role_spec_hash {} does not match requested role_spec_hash {}",
                 hex::encode(policy_role_spec_hash),
-                hex::encode(role_spec_hash)
+                hex::encode(hashes.role_spec)
             ),
         });
     }
 
     let policy_context_pack_hash = extract_policy_hash(policy_object, "context_pack_hash")?;
-    if policy_context_pack_hash != context_pack_hash {
+    if policy_context_pack_hash != hashes.context_pack {
         return Err(LaunchDenyReason::StaleBindingContext {
             detail: format!(
                 "policy context_pack_hash {} does not match requested context_pack_hash {}",
                 hex::encode(policy_context_pack_hash),
-                hex::encode(context_pack_hash)
+                hex::encode(hashes.context_pack)
             ),
         });
     }
@@ -748,18 +792,253 @@ fn validate_cross_binding_consistency(
     {
         let embedded_policy_hash = parse_hex_hash_literal("policy.policy_hash", policy_hash_value)
             .map_err(|detail| LaunchDenyReason::StaleBindingContext { detail })?;
-        if embedded_policy_hash != policy_hash {
+        if embedded_policy_hash != hashes.policy {
             return Err(LaunchDenyReason::StaleBindingContext {
                 detail: format!(
                     "embedded policy_hash {} does not match requested policy_hash {}",
                     hex::encode(embedded_policy_hash),
-                    hex::encode(policy_hash)
+                    hex::encode(hashes.policy)
                 ),
             });
         }
     }
+    validate_policy_capability_manifest_binding(policy_object, hashes.capability_manifest)?;
+    validate_role_required_capabilities(&role_spec, capability_manifest_bytes)?;
 
     Ok(())
+}
+
+fn validate_policy_work_binding(
+    policy_object: &serde_json::Map<String, serde_json::Value>,
+    work_id: &str,
+) -> std::result::Result<(), LaunchDenyReason> {
+    let policy_work_id = policy_object
+        .get("work_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(LaunchDenyReason::MissingPolicyWorkIdBinding)?;
+    if policy_work_id != work_id {
+        return Err(LaunchDenyReason::WorkIdBindingMismatch);
+    }
+    Ok(())
+}
+
+fn validate_policy_capability_manifest_binding(
+    policy_object: &serde_json::Map<String, serde_json::Value>,
+    capability_manifest_hash: [u8; 32],
+) -> std::result::Result<(), LaunchDenyReason> {
+    let Some(policy_capability_manifest_hash) = policy_object
+        .get("capability_manifest_hash")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let policy_hash =
+        parse_hex_hash_literal("capability_manifest_hash", policy_capability_manifest_hash)
+            .map_err(|detail| LaunchDenyReason::StaleBindingContext {
+                detail: format!("invalid 'capability_manifest_hash' in policy artifact: {detail}"),
+            })?;
+    if policy_hash != capability_manifest_hash {
+        return Err(LaunchDenyReason::CapabilityManifestHashBindingMismatch);
+    }
+    Ok(())
+}
+
+fn validate_role_required_capabilities(
+    role_spec: &RoleSpecV2,
+    capability_manifest_bytes: &[u8],
+) -> std::result::Result<(), LaunchDenyReason> {
+    if role_spec.required_capabilities.is_empty() {
+        return Ok(());
+    }
+
+    let declared_capabilities = collect_declared_capabilities(capability_manifest_bytes)?;
+    let mut missing = Vec::new();
+    for required_capability in role_spec.required_capabilities.keys() {
+        let aliases = capability_aliases(required_capability);
+        if !aliases
+            .iter()
+            .any(|alias| declared_capabilities.contains(alias))
+        {
+            missing.push(required_capability.clone());
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(LaunchDenyReason::MissingRequiredCapabilities { missing })
+    }
+}
+
+fn collect_declared_capabilities(
+    capability_manifest_bytes: &[u8],
+) -> std::result::Result<BTreeSet<String>, LaunchDenyReason> {
+    let manifest_value: serde_json::Value = serde_json::from_slice(capability_manifest_bytes)
+        .map_err(|error| LaunchDenyReason::InvalidCapabilityManifest {
+            detail: format!("capability manifest artifact is not valid JSON: {error}"),
+        })?;
+    let manifest_object =
+        manifest_value
+            .as_object()
+            .ok_or_else(|| LaunchDenyReason::InvalidCapabilityManifest {
+                detail: "capability manifest artifact must be a JSON object".to_string(),
+            })?;
+
+    let mut declared = BTreeSet::new();
+    if let Some(capabilities_value) = manifest_object.get("capabilities") {
+        collect_capability_aliases_from_capability_objects(capabilities_value, &mut declared)?;
+    }
+    if let Some(granted_value) = manifest_object.get("granted_capabilities") {
+        collect_capability_aliases_from_array(
+            "granted_capabilities",
+            granted_value,
+            &mut declared,
+        )?;
+    }
+    if let Some(tool_allowlist_value) = manifest_object.get("tool_allowlist") {
+        collect_capability_aliases_from_array(
+            "tool_allowlist",
+            tool_allowlist_value,
+            &mut declared,
+        )?;
+    }
+
+    if declared.is_empty() {
+        return Err(LaunchDenyReason::InvalidCapabilityManifest {
+            detail: "capability manifest artifact does not declare any capabilities".to_string(),
+        });
+    }
+    Ok(declared)
+}
+
+fn collect_capability_aliases_from_array(
+    field: &str,
+    value: &serde_json::Value,
+    declared: &mut BTreeSet<String>,
+) -> std::result::Result<(), LaunchDenyReason> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| LaunchDenyReason::InvalidCapabilityManifest {
+            detail: format!("'{field}' in capability manifest must be an array"),
+        })?;
+    for (index, entry) in entries.iter().enumerate() {
+        let capability =
+            entry
+                .as_str()
+                .ok_or_else(|| LaunchDenyReason::InvalidCapabilityManifest {
+                    detail: format!("'{field}[{index}]' in capability manifest must be a string"),
+                })?;
+        add_capability_aliases(declared, capability);
+    }
+    Ok(())
+}
+
+fn collect_capability_aliases_from_capability_objects(
+    value: &serde_json::Value,
+    declared: &mut BTreeSet<String>,
+) -> std::result::Result<(), LaunchDenyReason> {
+    let capabilities =
+        value
+            .as_array()
+            .ok_or_else(|| LaunchDenyReason::InvalidCapabilityManifest {
+                detail: "'capabilities' in capability manifest must be an array".to_string(),
+            })?;
+
+    for (index, capability_entry) in capabilities.iter().enumerate() {
+        match capability_entry {
+            serde_json::Value::String(capability) => add_capability_aliases(declared, capability),
+            serde_json::Value::Object(object) => {
+                let mut found = false;
+                for field in ["capability_id", "id", "name", "tool_class"] {
+                    if let Some(field_value) = object.get(field) {
+                        let capability =
+                            field_value.as_str().ok_or_else(|| {
+                                LaunchDenyReason::InvalidCapabilityManifest {
+                                    detail: format!(
+                                        "'capabilities[{index}].{field}' in capability manifest must be a string"
+                                    ),
+                                }
+                            })?;
+                        add_capability_aliases(declared, capability);
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(LaunchDenyReason::InvalidCapabilityManifest {
+                        detail: format!(
+                            "'capabilities[{index}]' in capability manifest is missing a recognizable capability identifier"
+                        ),
+                    });
+                }
+            },
+            _ => {
+                return Err(LaunchDenyReason::InvalidCapabilityManifest {
+                    detail: format!(
+                        "'capabilities[{index}]' in capability manifest must be a string or object"
+                    ),
+                });
+            },
+        }
+    }
+
+    Ok(())
+}
+
+fn add_capability_aliases(declared: &mut BTreeSet<String>, capability: &str) {
+    for alias in capability_aliases(capability) {
+        declared.insert(alias);
+    }
+}
+
+fn capability_aliases(capability: &str) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    let normalized = capability.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return aliases;
+    }
+
+    aliases.insert(normalized.clone());
+    if let Some(stripped) = normalized.strip_prefix("kernel.") {
+        aliases.insert(stripped.to_string());
+    } else {
+        aliases.insert(format!("kernel.{normalized}"));
+    }
+    aliases.extend(tool_class_aliases(&normalized));
+    aliases
+}
+
+fn tool_class_aliases(capability: &str) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    let normalized = capability.replace('_', "");
+
+    match normalized.as_str() {
+        "read" => {
+            aliases.insert("fs.read".to_string());
+            aliases.insert("kernel.fs.read".to_string());
+        },
+        "write" => {
+            aliases.insert("fs.write".to_string());
+            aliases.insert("kernel.fs.write".to_string());
+        },
+        "execute" | "exec" => {
+            aliases.insert("shell.exec".to_string());
+            aliases.insert("kernel.shell.exec".to_string());
+        },
+        "listfiles" | "ls" => {
+            aliases.insert("fs.list".to_string());
+            aliases.insert("kernel.fs.list".to_string());
+        },
+        "search" | "grep" => {
+            aliases.insert("fs.search".to_string());
+            aliases.insert("kernel.fs.search".to_string());
+        },
+        "artifact" | "cas" => {
+            aliases.insert("artifact.fetch".to_string());
+            aliases.insert("kernel.artifact.fetch".to_string());
+        },
+        _ => {},
+    }
+    aliases
 }
 
 fn extract_policy_hash(
@@ -799,6 +1078,25 @@ fn deny_reason_message(reason: &LaunchDenyReason) -> String {
         },
         LaunchDenyReason::MissingPolicyHash => "missing policy_hash".to_string(),
         LaunchDenyReason::UnresolvablePolicy => "policy_hash is not resolvable in CAS".to_string(),
+        LaunchDenyReason::MissingPolicyWorkIdBinding => {
+            "policy artifact missing required work_id binding".to_string()
+        },
+        LaunchDenyReason::WorkIdBindingMismatch => {
+            "policy work_id binding does not match requested work_id".to_string()
+        },
+        LaunchDenyReason::CapabilityManifestHashBindingMismatch => {
+            "policy capability_manifest_hash does not match requested capability_manifest_hash"
+                .to_string()
+        },
+        LaunchDenyReason::InvalidCapabilityManifest { detail } => {
+            format!("invalid capability manifest: {detail}")
+        },
+        LaunchDenyReason::MissingRequiredCapabilities { missing } => {
+            format!(
+                "capability manifest missing role-required capabilities: {}",
+                missing.join(", ")
+            )
+        },
         LaunchDenyReason::InvalidHashFormat { field, detail } => {
             format!("invalid hash format for '{field}': {detail}")
         },
@@ -831,6 +1129,58 @@ mod tests {
         args: RoleLaunchArgs,
     }
 
+    fn store_capability_manifest(cas_path: &Path, capability_ids: &[String]) -> [u8; 32] {
+        let capabilities: Vec<serde_json::Value> = capability_ids
+            .iter()
+            .map(|capability_id| serde_json::json!({ "capability_id": capability_id }))
+            .collect();
+        let payload = serde_json::json!({
+            "schema": "apm2.capability_manifest.v1",
+            "schema_version": "1.0.0",
+            "capabilities": capabilities,
+        });
+        let bytes = canonical_json_bytes(&payload)
+            .expect("capability manifest payload canonicalization should succeed");
+        store_bytes_in_cas(cas_path, &bytes).expect("capability manifest should store")
+    }
+
+    fn store_policy_snapshot(
+        cas_path: &Path,
+        work_id: Option<&str>,
+        role: &str,
+        role_spec_hash: &str,
+        context_pack_hash: &str,
+        capability_manifest_hash: Option<&str>,
+    ) -> [u8; 32] {
+        let mut policy_payload = serde_json::Map::new();
+        policy_payload.insert(
+            "schema_id".to_string(),
+            serde_json::json!("apm2.policy_snapshot.v1"),
+        );
+        policy_payload.insert(
+            "role_spec_hash".to_string(),
+            serde_json::json!(role_spec_hash),
+        );
+        policy_payload.insert(
+            "context_pack_hash".to_string(),
+            serde_json::json!(context_pack_hash),
+        );
+        policy_payload.insert("role".to_string(), serde_json::json!(role));
+        if let Some(work_id) = work_id {
+            policy_payload.insert("work_id".to_string(), serde_json::json!(work_id));
+        }
+        if let Some(capability_manifest_hash) = capability_manifest_hash {
+            policy_payload.insert(
+                "capability_manifest_hash".to_string(),
+                serde_json::json!(capability_manifest_hash),
+            );
+        }
+
+        let policy_bytes = canonical_json_bytes(&serde_json::Value::Object(policy_payload))
+            .expect("policy payload canonicalization should succeed");
+        store_bytes_in_cas(cas_path, &policy_bytes).expect("policy should store")
+    }
+
     fn setup_test_env() -> TestEnv {
         let tempdir = tempfile::TempDir::new().expect("temp dir should create");
         let cas_path = tempdir.path().join("cas");
@@ -856,26 +1206,29 @@ mod tests {
 
         let context_pack_hash =
             store_bytes_in_cas(&cas_path, b"context-pack").expect("context pack should store");
-        let capability_manifest_hash = store_bytes_in_cas(&cas_path, b"capability-manifest")
-            .expect("capability manifest should store");
+        let required_capability_ids: Vec<String> =
+            role_spec.required_capabilities.keys().cloned().collect();
+        let capability_manifest_hash =
+            store_capability_manifest(&cas_path, &required_capability_ids);
 
-        let policy_payload = serde_json::json!({
-            "schema_id": "apm2.policy_snapshot.v1",
-            "role_spec_hash": hex::encode(role_spec_hash),
-            "context_pack_hash": hex::encode(context_pack_hash),
-            "role": "implementer"
-        });
-        let policy_bytes = canonical_json_bytes(&policy_payload)
-            .expect("policy payload canonicalization should succeed");
-        let policy_hash =
-            store_bytes_in_cas(&cas_path, &policy_bytes).expect("policy should store");
+        let role_spec_hash_hex = hex::encode(role_spec_hash);
+        let context_pack_hash_hex = hex::encode(context_pack_hash);
+        let capability_manifest_hash_hex = hex::encode(capability_manifest_hash);
+        let policy_hash = store_policy_snapshot(
+            &cas_path,
+            Some("W-TEST-001"),
+            "implementer",
+            &role_spec_hash_hex,
+            &context_pack_hash_hex,
+            Some(&capability_manifest_hash_hex),
+        );
 
         let args = RoleLaunchArgs {
             work_id: "W-TEST-001".to_string(),
             role: "implementer".to_string(),
-            role_spec_hash: hex::encode(role_spec_hash),
-            context_pack_hash: hex::encode(context_pack_hash),
-            capability_manifest_hash: hex::encode(capability_manifest_hash),
+            role_spec_hash: role_spec_hash_hex,
+            context_pack_hash: context_pack_hash_hex,
+            capability_manifest_hash: capability_manifest_hash_hex,
             policy_hash: hex::encode(policy_hash),
             lease_id: Some("L-TEST-001".to_string()),
         };
@@ -974,6 +1327,127 @@ mod tests {
                 assert_eq!(reason, LaunchDenyReason::UnresolvableRoleSpec);
             },
             other => panic!("expected denied error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_work_id_mismatch_between_cli_and_policy_denied() {
+        let mut env = setup_test_env();
+        env.args.work_id = "W-TEST-OTHER".to_string();
+
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("work_id mismatch should deny launch");
+        match error {
+            RoleLaunchError::Denied { reason } => {
+                assert_eq!(reason, LaunchDenyReason::WorkIdBindingMismatch);
+            },
+            other => panic!("expected denied error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_policy_missing_work_id_binding_denied() {
+        let mut env = setup_test_env();
+        let policy_hash = store_policy_snapshot(
+            &env.cas_path,
+            None,
+            &env.args.role,
+            &env.args.role_spec_hash,
+            &env.args.context_pack_hash,
+            Some(&env.args.capability_manifest_hash),
+        );
+        env.args.policy_hash = hex::encode(policy_hash);
+
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("policy missing work_id binding should deny launch");
+        match error {
+            RoleLaunchError::Denied { reason } => {
+                assert_eq!(reason, LaunchDenyReason::MissingPolicyWorkIdBinding);
+            },
+            other => panic!("expected denied error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_capability_manifest_hash_mismatch_with_policy_denied() {
+        let mut env = setup_test_env();
+        let mut capabilities = fac_workobject_implementor_v2_role_contract()
+            .required_capabilities
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        capabilities.push("extra.capability".to_string());
+        let alternate_manifest_hash = store_capability_manifest(&env.cas_path, &capabilities);
+        env.args.capability_manifest_hash = hex::encode(alternate_manifest_hash);
+
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("capability manifest hash mismatch should deny launch");
+        match error {
+            RoleLaunchError::Denied { reason } => {
+                assert_eq!(
+                    reason,
+                    LaunchDenyReason::CapabilityManifestHashBindingMismatch
+                );
+            },
+            other => panic!("expected denied error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_capability_manifest_missing_required_role_capabilities_denied() {
+        let mut env = setup_test_env();
+        let minimal_manifest_hash =
+            store_capability_manifest(&env.cas_path, &[String::from("fs.read")]);
+        env.args.capability_manifest_hash = hex::encode(minimal_manifest_hash);
+
+        let policy_hash = store_policy_snapshot(
+            &env.cas_path,
+            Some(&env.args.work_id),
+            &env.args.role,
+            &env.args.role_spec_hash,
+            &env.args.context_pack_hash,
+            Some(&env.args.capability_manifest_hash),
+        );
+        env.args.policy_hash = hex::encode(policy_hash);
+
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("missing required role capabilities should deny launch");
+        match error {
+            RoleLaunchError::Denied {
+                reason: LaunchDenyReason::MissingRequiredCapabilities { missing },
+            } => {
+                assert!(
+                    missing.contains(&"artifact.fetch".to_string()),
+                    "missing set should include artifact.fetch"
+                );
+                assert!(
+                    missing.contains(&"evidence.publish".to_string()),
+                    "missing set should include evidence.publish"
+                );
+            },
+            other => panic!("expected missing-required-capabilities denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stale_context_binding_denied() {
+        let mut env = setup_test_env();
+        let stale_context_hash = store_bytes_in_cas(&env.cas_path, b"context-pack-stale")
+            .expect("stale context should store");
+        env.args.context_pack_hash = hex::encode(stale_context_hash);
+
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("stale context binding should deny launch");
+        match error {
+            RoleLaunchError::Denied {
+                reason: LaunchDenyReason::StaleBindingContext { detail },
+            } => {
+                assert!(
+                    detail.contains("context_pack_hash"),
+                    "stale detail should mention context_pack_hash mismatch"
+                );
+            },
+            other => panic!("expected stale-binding-context denial, got {other:?}"),
         }
     }
 
