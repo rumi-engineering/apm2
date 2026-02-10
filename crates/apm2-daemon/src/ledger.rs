@@ -118,19 +118,17 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type = 'SubleaseIssued'",
             [],
         )?;
-        // SECURITY (v13 Finding 2 — Receipt Uniqueness Constraint):
+        // SECURITY (TCK-00407 — Receipt Semantic Identity Constraint):
         //
-        // Enforce at-most-once semantics for review receipt events at the
-        // database level. The `receipt_id` is stored as a field in the JSON
-        // payload. A partial unique index on `json_extract(payload, '$.receipt_id')`
-        // for review receipt event types prevents concurrent duplicate
-        // `IngestReviewReceipt` calls from creating multiple receipt events.
-        // This converts the check-then-act pattern into defense-in-depth:
-        // application-level `get_event_by_receipt_id` provides the fast-path,
-        // while the database constraint provides the authoritative uniqueness
-        // guarantee.
+        // Enforce at-most-once semantics for review receipt events using the
+        // canonical semantic tuple:
+        //   `(receipt_id, lease_id, work_id, changeset_digest)`.
         //
-        // MIGRATION: Quarantine historical duplicate `receipt_id` rows before
+        // `work_id` is sourced from the payload field and falls back to the
+        // row's `work_id` column for legacy rows that predate canonical tuple
+        // persistence.
+        //
+        // MIGRATION: Quarantine historical duplicate semantic tuples before
         // creating the unique index. Quarantine entries are keyed by stable
         // `event_id` (never persistent `rowid`) so startup replays are safe
         // even if SQLite rowids are recycled over time.
@@ -148,15 +146,30 @@ impl SqliteLedgerEventEmitter {
              FROM ledger_events le \
              INNER JOIN ( \
                  SELECT json_extract(CAST(payload AS TEXT), '$.receipt_id') AS receipt_id, \
+                        json_extract(CAST(payload AS TEXT), '$.lease_id') AS lease_id, \
+                        COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id) AS work_identity, \
+                        json_extract(CAST(payload AS TEXT), '$.changeset_digest') AS changeset_digest, \
                         MIN(rowid) AS keep_rowid \
                  FROM ledger_events \
                  WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
                  AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL \
-                 GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id') \
+                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') IS NOT NULL \
+                 AND COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id) IS NOT NULL \
+                 AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') IS NOT NULL \
+                 GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id'), \
+                          json_extract(CAST(payload AS TEXT), '$.lease_id'), \
+                          COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id), \
+                          json_extract(CAST(payload AS TEXT), '$.changeset_digest') \
                  HAVING COUNT(*) > 1 \
              ) dups ON json_extract(CAST(le.payload AS TEXT), '$.receipt_id') = dups.receipt_id \
+                     AND json_extract(CAST(le.payload AS TEXT), '$.lease_id') = dups.lease_id \
+                     AND COALESCE(json_extract(CAST(le.payload AS TEXT), '$.work_id'), le.work_id) = dups.work_identity \
+                     AND json_extract(CAST(le.payload AS TEXT), '$.changeset_digest') = dups.changeset_digest \
              WHERE le.event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
              AND json_extract(CAST(le.payload AS TEXT), '$.receipt_id') IS NOT NULL \
+             AND json_extract(CAST(le.payload AS TEXT), '$.lease_id') IS NOT NULL \
+             AND COALESCE(json_extract(CAST(le.payload AS TEXT), '$.work_id'), le.work_id) IS NOT NULL \
+             AND json_extract(CAST(le.payload AS TEXT), '$.changeset_digest') IS NOT NULL \
              AND le.rowid != dups.keep_rowid \
              ",
             [],
@@ -168,9 +181,15 @@ impl SqliteLedgerEventEmitter {
              )",
             [],
         )?;
+        conn.execute("DROP INDEX IF EXISTS idx_unique_receipt_id", [])?;
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
-             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_semantic_identity \
+             ON ledger_events( \
+                 json_extract(CAST(payload AS TEXT), '$.receipt_id'), \
+                 json_extract(CAST(payload AS TEXT), '$.lease_id'), \
+                 COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id), \
+                 json_extract(CAST(payload AS TEXT), '$.changeset_digest') \
+             ) \
              WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')",
             [],
         )?;
@@ -946,6 +965,74 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .flatten()
     }
 
+    fn get_event_by_receipt_identity(
+        &self,
+        receipt_id: &str,
+        lease_id: &str,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND json_extract(CAST(payload AS TEXT), '$.receipt_id') = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.lease_id') = ?2 \
+             AND COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id) = ?3 \
+             AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') = ?4 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![receipt_id, lease_id, work_id, changeset_digest_hex],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    fn get_event_by_changeset_identity(
+        &self,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE event_type = 'changeset_published' \
+             AND work_id = ?1 \
+             AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') = ?2 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![work_id, changeset_digest_hex],
+            |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
         let Ok(conn) = self.conn.lock() else {
             return 0;
@@ -1052,7 +1139,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
     fn emit_review_receipt(
         &self,
-        episode_id: &str,
+        lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -1097,8 +1185,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "event_type".to_string(),
             serde_json::json!("review_receipt_recorded"),
         );
-        payload_map.insert("episode_id".to_string(), serde_json::json!(episode_id));
-        payload_map.insert("lease_id".to_string(), serde_json::json!(episode_id));
+        payload_map.insert("episode_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("work_id".to_string(), serde_json::json!(work_id));
         payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
         payload_map.insert(
             "changeset_digest".to_string(),
@@ -1160,7 +1249,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
             event_type: "review_receipt_recorded".to_string(),
-            work_id: episode_id.to_string(),
+            work_id: work_id.to_string(),
             actor_id: reviewer_actor_id.to_string(),
             payload: payload_bytes.clone(),
             signature: signature.to_bytes().to_vec(),
@@ -1193,7 +1282,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         info!(
             event_id = %event_id,
-            episode_id = %episode_id,
+            lease_id = %lease_id,
+            work_id = %work_id,
             receipt_id = %receipt_id,
             time_envelope_ref = %time_envelope_ref,
             "Persisted ReviewReceiptRecorded event"
@@ -1206,6 +1296,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
     fn emit_review_blocked_receipt(
         &self,
         lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -1245,6 +1336,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             serde_json::json!("review_blocked_recorded"),
         );
         payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("work_id".to_string(), serde_json::json!(work_id));
         payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
         payload_map.insert(
             "changeset_digest".to_string(),
@@ -1313,7 +1405,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
             event_type: "review_blocked_recorded".to_string(),
-            work_id: receipt_id.to_string(),
+            work_id: work_id.to_string(),
             actor_id: reviewer_actor_id.to_string(),
             payload: payload_bytes.clone(),
             signature: signature.to_bytes().to_vec(),
@@ -1345,6 +1437,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         info!(
             event_id = %event_id,
+            lease_id = %lease_id,
+            work_id = %work_id,
             receipt_id = %receipt_id,
             reason_code = %reason_code,
             time_envelope_ref = %time_envelope_ref,
@@ -3227,7 +3321,8 @@ mod tests {
         let identity_proof = [0x99u8; 32];
         let event1 = emitter
             .emit_review_receipt(
-                "episode-001",
+                "lease-001",
+                "work-001",
                 "RR-IDEMP-001",
                 &changeset,
                 &artifact,
@@ -3277,6 +3372,7 @@ mod tests {
         let blocked_event = emitter
             .emit_review_blocked_receipt(
                 "lease-blocked-001",
+                "work-blocked-001",
                 "RR-BLOCKED-001",
                 &changeset_digest,
                 &artifact_bundle_hash,
@@ -3442,7 +3538,7 @@ mod tests {
         )
         .unwrap();
 
-        let duplicate_payload = br#"{"receipt_id":"RR-DUPE-001"}"#;
+        let duplicate_payload = br#"{"receipt_id":"RR-DUPE-001","lease_id":"L-DUPE-001","work_id":"W-DUPE-001","changeset_digest":"abc123"}"#;
         conn.execute(
             "INSERT INTO ledger_events
                 (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
@@ -3545,6 +3641,7 @@ mod tests {
         let event = emitter
             .emit_review_blocked_receipt(
                 "lease-blocked-iph",
+                "work-blocked-iph",
                 "RR-BLOCKED-IPH",
                 &changeset_digest,
                 &artifact_bundle_hash,
@@ -3572,6 +3669,11 @@ mod tests {
             artifact_hash.as_str().unwrap(),
             hex::encode(artifact_bundle_hash),
             "artifact_bundle_hash in blocked event payload must match the input"
+        );
+        assert_eq!(
+            payload.get("work_id").and_then(serde_json::Value::as_str),
+            Some("work-blocked-iph"),
+            "blocked payload must include canonical work_id binding"
         );
 
         let blocked_reason_code = payload
