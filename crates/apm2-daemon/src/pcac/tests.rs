@@ -885,6 +885,25 @@ fn compute_join_hash_changes_on_scope_witness() {
 }
 
 #[test]
+fn compute_join_hash_is_order_invariant_for_scope_witnesses() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+
+    let mut input_a = valid_input();
+    input_a.scope_witness_hashes = vec![test_hash(0x10), test_hash(0x30), test_hash(0x20)];
+
+    let mut input_b = valid_input();
+    input_b.scope_witness_hashes = vec![test_hash(0x30), test_hash(0x20), test_hash(0x10)];
+
+    let cert_a = kernel.join(&input_a).unwrap();
+    let cert_b = kernel.join(&input_b).unwrap();
+
+    assert_eq!(
+        cert_a.authority_join_hash, cert_b.authority_join_hash,
+        "Permuting scope_witness_hashes must not change the join hash"
+    );
+}
+
+#[test]
 fn compute_join_hash_changes_on_freshness_policy() {
     let kernel = Arc::new(InProcessKernel::new(100));
 
@@ -933,6 +952,25 @@ fn compute_join_hash_changes_on_stop_budget_digest() {
     assert_ne!(
         cert_a.authority_join_hash, cert_b.authority_join_hash,
         "Changing stop_budget_profile_digest must change the join hash"
+    );
+}
+
+#[test]
+fn compute_join_hash_is_order_invariant_for_pre_actuation_receipts() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+
+    let mut input_a = valid_input();
+    input_a.pre_actuation_receipt_hashes = vec![test_hash(0x41), test_hash(0x42), test_hash(0x43)];
+
+    let mut input_b = valid_input();
+    input_b.pre_actuation_receipt_hashes = vec![test_hash(0x43), test_hash(0x41), test_hash(0x42)];
+
+    let cert_a = kernel.join(&input_a).unwrap();
+    let cert_b = kernel.join(&input_b).unwrap();
+
+    assert_eq!(
+        cert_a.authority_join_hash, cert_b.authority_join_hash,
+        "Permuting pre_actuation_receipt_hashes must not change the join hash"
     );
 }
 

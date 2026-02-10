@@ -273,7 +273,7 @@ pub struct AuthorityJoinInputV1 {
     /// Evidence level of the identity proof.
     pub identity_evidence_level: IdentityEvidenceLevel,
 
-    /// Optional waiver hash for PointerOnly identity at Tier2+.
+    /// Optional waiver hash for `PointerOnly` identity at Tier2+.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer_only_waiver_hash: Option<Hash>,
 
@@ -861,22 +861,17 @@ pub struct AutonomyCeiling {
 // =============================================================================
 
 /// Enforcement mode for sovereignty checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SovereigntyEnforcementMode {
     /// Enforce all checks (epoch, revocation, ceiling, freeze).
+    #[default]
     Strict,
     /// Monitor only (log violations but allow).
     Monitor,
     /// Disabled (bypass checks).
     Disabled,
-}
-
-impl Default for SovereigntyEnforcementMode {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 impl std::fmt::Display for SovereigntyEnforcementMode {
@@ -902,7 +897,8 @@ pub struct PointerOnlyWaiver {
     /// Expiry tick for the waiver.
     pub expires_at_tick: u64,
 
-    /// Hash of the scope (e.g., work_id or principal_id) this waiver binds to.
+    /// Hash of the scope (e.g., `work_id` or `principal_id`) this waiver binds
+    /// to.
     pub scope_binding_hash: Hash,
 }
 

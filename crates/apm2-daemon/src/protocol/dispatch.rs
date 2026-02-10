@@ -310,8 +310,6 @@ pub struct TransitionAuthorityBindings {
     pub typed_budget_hash: [u8; 32],
     /// Policy resolution reference.
     pub policy_resolved_ref: String,
-            pcac_policy: None,
-            pointer_only_waiver: None,
 }
 
 /// Parameters for a stop-flag mutation audit event (TCK-00351).
@@ -1277,8 +1275,6 @@ pub fn derive_transition_authority_bindings(
     actor_id: &str,
     role: WorkRole,
     policy_resolved_ref: &str,
-            pcac_policy: None,
-            pointer_only_waiver: None,
     capability_manifest_hash: [u8; 32],
     context_pack_hash: [u8; 32],
     stop_conditions: crate::episode::envelope::StopConditions,
@@ -1300,8 +1296,6 @@ pub fn derive_transition_authority_bindings(
         typed_budgets,
         typed_budget_hash,
         policy_resolved_ref: policy_resolved_ref.to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
     };
 
     let permeability_payload = build_permeability_receipt_payload(work_id, &bindings);
@@ -3633,8 +3627,6 @@ use serde::{Deserialize, Serialize};
 pub struct PolicyResolution {
     /// Unique reference to the `PolicyResolvedForChangeSet` event.
     pub policy_resolved_ref: String,
-            pcac_policy: None,
-            pointer_only_waiver: None,
 
     /// BLAKE3 hash of the resolved policy.
     pub resolved_policy_hash: [u8; 32],
@@ -3685,7 +3677,7 @@ pub struct PolicyResolution {
     #[serde(default)]
     pub pcac_policy: Option<apm2_core::pcac::PcacPolicyKnobs>,
 
-    /// PointerOnly waiver resolved from the governance event.
+    /// `PointerOnly` waiver resolved from the governance event.
     #[serde(default)]
     pub pointer_only_waiver: Option<apm2_core::pcac::PointerOnlyWaiver>,
 }
@@ -3872,8 +3864,6 @@ impl PolicyResolver for StubPolicyResolver {
             resolved_risk_tier: 0, // Stub resolver: Tier0 default
             resolved_scope_baseline,
             expected_adapter_profile_hash: None, // TODO(TCK-00399): populate from governance
-            pcac_policy: None,
-            pointer_only_waiver: None,
         })
     }
 }
@@ -7570,8 +7560,6 @@ impl PrivilegedDispatcher {
             lease_id: claim.lease_id,
             capability_manifest_hash: policy_resolution.capability_manifest_hash.to_vec(),
             policy_resolved_ref: policy_resolution.policy_resolved_ref,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             context_pack_hash: policy_resolution.context_pack_hash.to_vec(),
         }))
     }
@@ -9055,8 +9043,6 @@ impl PrivilegedDispatcher {
             policy_resolved_ref: claim.policy_resolution.policy_resolved_ref.clone(),
             capability_manifest_hash: claim.policy_resolution.capability_manifest_hash.to_vec(),
             episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None, // Will be set when episode starts in async context
             pcac_policy: claim.policy_resolution.pcac_policy.clone(),
             pointer_only_waiver: claim.policy_resolution.pointer_only_waiver.clone(),
         };
@@ -14532,10 +14518,8 @@ mod tests {
                     policy_resolved_ref: String::new(),
                     capability_manifest_hash: vec![],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                 })
                 .expect("session registration should succeed");
 
@@ -14750,14 +14734,10 @@ mod tests {
                 lease_id: lease_id.to_string(),
                 ephemeral_handle: String::new(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             dispatcher
                 .session_registry
@@ -15062,7 +15042,8 @@ mod tests {
             role: WorkRole::Implementer,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: format!("resolved-for-{work_id}"),
-                            resolved_policy_hash: [0u8; 32],                capability_manifest_hash: [0u8; 32],
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
@@ -15088,10 +15069,6 @@ mod tests {
             pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
         };
         dispatcher
             .session_registry
@@ -16228,8 +16205,6 @@ mod tests {
             lease_id: "L-001".to_string(),
             capability_manifest_hash: vec![],
             policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
             context_pack_hash: vec![],
         });
         let encoded = claim_resp.encode();
@@ -16532,13 +16507,14 @@ mod tests {
             role: WorkRole::Implementer,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-                            resolved_policy_hash: [0u8; 32],                capability_manifest_hash: [0u8; 32],
+                pcac_policy: None,
+                pointer_only_waiver: None,
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
-                pcac_policy: None,
-                pointer_only_waiver: None,
             },
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
@@ -16606,13 +16582,14 @@ mod tests {
             role: WorkRole::GateExecutor,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-                            resolved_policy_hash: [0u8; 32],                capability_manifest_hash: [0u8; 32],
+                pcac_policy: None,
+                pointer_only_waiver: None,
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
-                pcac_policy: None,
-                pointer_only_waiver: None,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()],
@@ -16677,8 +16654,8 @@ mod tests {
             role: WorkRole::GateExecutor,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 resolved_policy_hash: [0xAA; 32],
                 capability_manifest_hash: policy_capability_manifest_hash(
                     "W-team-dev-test456",
@@ -16692,8 +16669,6 @@ mod tests {
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
-                pcac_policy: None,
-                pointer_only_waiver: None,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
@@ -16759,7 +16734,8 @@ mod tests {
             role: WorkRole::GateExecutor,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-                            resolved_policy_hash: [0u8; 32],                capability_manifest_hash: [0u8; 32],
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
@@ -16831,8 +16807,8 @@ mod tests {
             role: WorkRole::Implementer,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "PolicyResolvedForChangeSet:test".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 resolved_policy_hash: [0xAA; 32],
                 capability_manifest_hash: policy_capability_manifest_hash(
                     "W-team-alpha-impl123",
@@ -16846,8 +16822,6 @@ mod tests {
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
-                pcac_policy: None,
-                pointer_only_waiver: None,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
@@ -17593,8 +17567,8 @@ mod tests {
                 lease_id: "L-WS-001".to_string(),
                 ephemeral_handle: "handle-ws-001".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-WS-001".to_string()),
             };
@@ -18127,14 +18101,10 @@ mod tests {
                 ephemeral_handle: "H-KNOWN-001".to_string(),
                 lease_id: "L-KNOWN-001".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             registry.register_session(known_session).unwrap();
             assert_eq!(registry.len(), 1, "Pre-condition: 1 known session");
@@ -18296,14 +18266,10 @@ mod tests {
                 ephemeral_handle: "H-001".to_string(),
                 lease_id: "L-001".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
             assert!(registry.get_session("S-TEST-001").is_some());
@@ -18333,10 +18299,8 @@ mod tests {
                     policy_resolved_ref: String::new(),
                     capability_manifest_hash: vec![],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                 };
                 let evicted = registry.register_session(session).unwrap();
                 assert!(evicted.is_empty());
@@ -18350,14 +18314,10 @@ mod tests {
                 ephemeral_handle: "H-NEW".to_string(),
                 lease_id: "L-NEW".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             let evicted = registry.register_session(new_session).unwrap();
             assert_eq!(evicted.len(), 1, "Exactly one session should be evicted");
@@ -18389,14 +18349,10 @@ mod tests {
                 ephemeral_handle: "H-FAIL".to_string(),
                 lease_id: "L-FAIL".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             let evicted = registry.register_session(session).unwrap();
             assert!(evicted.is_empty());
@@ -18445,10 +18401,8 @@ mod tests {
                     policy_resolved_ref: String::new(),
                     capability_manifest_hash: vec![],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                 };
                 registry.register_session(session).unwrap();
                 store.register(&format!("S-{i}"), i as u64).unwrap();
@@ -18462,14 +18416,10 @@ mod tests {
                 ephemeral_handle: "H-NEW".to_string(),
                 lease_id: "L-NEW".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             let evicted = registry.register_session(new_session).unwrap();
             assert_eq!(evicted.len(), 1);
@@ -18520,10 +18470,8 @@ mod tests {
                     policy_resolved_ref: String::new(),
                     capability_manifest_hash: vec![],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                 };
                 registry.register_session(session).unwrap();
                 store
@@ -18547,14 +18495,10 @@ mod tests {
                 ephemeral_handle: "H-NEW".to_string(),
                 lease_id: "L-NEW".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             let evicted = registry.register_session(new_session).unwrap();
             assert_eq!(evicted.len(), 1);
@@ -18638,14 +18582,10 @@ mod tests {
                 ephemeral_handle: "H-MANIFEST".to_string(),
                 lease_id: "L-MANIFEST".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
             store.register("S-MANIFEST-001", 42).unwrap();
@@ -18703,14 +18643,10 @@ mod tests {
                 ephemeral_handle: "H-RESULT".to_string(),
                 lease_id: "L-RESULT".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
 
@@ -18844,14 +18780,10 @@ mod tests {
                 ephemeral_handle: "H-EPID-FAIL".to_string(),
                 lease_id: "L-EPID-FAIL".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
             store.register("S-EPID-FAIL", 1_000_000).unwrap();
@@ -18933,14 +18865,10 @@ mod tests {
                     ephemeral_handle: format!("H-EVICT-{i}"),
                     lease_id: format!("L-EVICT-{i}"),
                     policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![0u8; 32],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                 };
                 registry.register_session(session).unwrap();
                 store.register(&sid, 1_000_000).unwrap();
@@ -18972,14 +18900,10 @@ mod tests {
                 ephemeral_handle: "H-EVICT-NEW".to_string(),
                 lease_id: "L-EVICT-NEW".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             let evicted = registry.register_session(new_session).unwrap();
             assert_eq!(evicted.len(), 1, "Exactly one session should be evicted");
@@ -19048,14 +18972,10 @@ mod tests {
                     ephemeral_handle: format!("H-CHURN-{i}"),
                     lease_id: format!("L-CHURN-{i}"),
                     policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![0u8; 32],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                 };
                 let evicted = registry.register_session(session).unwrap();
 
@@ -19117,14 +19037,10 @@ mod tests {
                 ephemeral_handle: "H-ROLLBACK-M".to_string(),
                 lease_id: "L-ROLLBACK-M".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
             store.register("S-ROLLBACK-M", 42).unwrap();
@@ -19159,14 +19075,10 @@ mod tests {
                 ephemeral_handle: "H-NEW-M".to_string(),
                 lease_id: "L-NEW-M".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             registry.register_session(new_session).unwrap();
             store.register("S-NEW-M", 100).unwrap();
@@ -19316,14 +19228,10 @@ mod tests {
                 ephemeral_handle: "H-UNIFIED".to_string(),
                 lease_id: "L-UNIFIED".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
             store.register("S-UNIFIED-001", 42).unwrap();
@@ -19416,14 +19324,10 @@ mod tests {
                     ephemeral_handle: format!("H-{i}"),
                     lease_id: format!("L-{i}"),
                     policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![0u8; 32],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                 };
                 registry.register_session(session).unwrap();
                 store.register(&sid, i as u64).unwrap();
@@ -19439,14 +19343,10 @@ mod tests {
                 ephemeral_handle: "H-NEW".to_string(),
                 lease_id: "L-NEW".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             let evicted = registry.register_session(new_session).unwrap();
             assert_eq!(evicted.len(), 1);
@@ -19571,14 +19471,10 @@ mod tests {
                     ephemeral_handle: format!("H-{i}"),
                     lease_id: format!("L-{i}"),
                     policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![0u8; 32],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                 };
                 registry.register_session(session).unwrap();
                 telemetry.register(&sid, i as u64).unwrap();
@@ -19598,14 +19494,10 @@ mod tests {
                 ephemeral_handle: "H-NEW-STOP".to_string(),
                 lease_id: "L-NEW-STOP".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             };
             let evicted = registry.register_session(new_session).unwrap();
             assert_eq!(evicted.len(), 1);
@@ -20547,13 +20439,14 @@ mod tests {
                         role: WorkRole::Implementer,
                         policy_resolution: PolicyResolution {
                             policy_resolved_ref: "test-resolved".to_string(),
-                            resolved_policy_hash: [0u8; 32],                            capability_manifest_hash: [0u8; 32],
+                            resolved_policy_hash: [0u8; 32],
+                            capability_manifest_hash: [0u8; 32],
                             context_pack_hash: [0u8; 32],
                             resolved_risk_tier: 0,
                             resolved_scope_baseline: None,
                             expected_adapter_profile_hash: None,
-                        pcac_policy: None,
-                        pointer_only_waiver: None,
+                            pcac_policy: None,
+                            pointer_only_waiver: None,
                         },
                         executor_custody_domains: vec![],
                         author_custody_domains: vec![],
@@ -21514,8 +21407,8 @@ mod tests {
                 lease_id: "L-MALFORMED-001".to_string(),
                 ephemeral_handle: "handle-malformed-001".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 // Malformed: contains forbidden '/' characters for an EpisodeId
                 episode_id: Some("invalid/episode/id".to_string()),
@@ -21622,8 +21515,8 @@ mod tests {
                 ephemeral_handle: "h1".to_string(),
                 lease_id: "lease-001".to_string(),
                 policy_resolved_ref: "pol-001".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: Some(ep1.as_str().to_string()),
             };
@@ -21636,8 +21529,8 @@ mod tests {
                 ephemeral_handle: "h2".to_string(),
                 lease_id: "lease-002".to_string(),
                 policy_resolved_ref: "pol-002".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![0u8; 32],
                 episode_id: Some(ep2.as_str().to_string()),
             };
@@ -24192,7 +24085,8 @@ mod tests {
                     role: WorkRole::Reviewer,
                     policy_resolution: PolicyResolution {
                         policy_resolved_ref: "PolicyResolvedForChangeSet:W-DUP-LEASE-B".to_string(),
-                            resolved_policy_hash: [0u8; 32],                        capability_manifest_hash: [0u8; 32],
+                        resolved_policy_hash: [0u8; 32],
+                        capability_manifest_hash: [0u8; 32],
                         context_pack_hash: [0u8; 32],
                         resolved_risk_tier: 0,
                         resolved_scope_baseline: None,
@@ -24291,7 +24185,8 @@ mod tests {
                     role: WorkRole::Reviewer,
                     policy_resolution: PolicyResolution {
                         policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
-                            resolved_policy_hash: [0u8; 32],                        capability_manifest_hash: [0u8; 32],
+                        resolved_policy_hash: [0u8; 32],
+                        capability_manifest_hash: [0u8; 32],
                         context_pack_hash: [0u8; 32],
                         resolved_risk_tier: 0,
                         resolved_scope_baseline: None,
@@ -26294,7 +26189,8 @@ mod tests {
         fn none_scope_baseline_is_fail_closed() {
             let resolution = PolicyResolution {
                 policy_resolved_ref: "test".to_string(),
-                            resolved_policy_hash: [0u8; 32],                capability_manifest_hash: [0u8; 32],
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
@@ -26324,7 +26220,8 @@ mod tests {
             };
             let resolution = PolicyResolution {
                 policy_resolved_ref: "test".to_string(),
-                            resolved_policy_hash: [0u8; 32],                capability_manifest_hash: [0u8; 32],
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: Some(baseline),
@@ -26412,8 +26309,8 @@ mod tests {
                 role: WorkRole::Implementer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-none".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: [0xAA; 32],
                     capability_manifest_hash: policy_capability_manifest_hash(
                         "W-V3-SCOPE-NONE",
@@ -26427,8 +26324,6 @@ mod tests {
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -26489,8 +26384,8 @@ mod tests {
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-narrow".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: [0xAA; 32],
                     capability_manifest_hash: policy_capability_manifest_hash(
                         "W-V3-SCOPE-NARROW",
@@ -26504,8 +26399,6 @@ mod tests {
                     resolved_risk_tier: 1,
                     resolved_scope_baseline: Some(narrow_baseline),
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -26570,8 +26463,8 @@ mod tests {
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-risk".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: [0xAA; 32],
                     capability_manifest_hash: policy_capability_manifest_hash(
                         "W-V3-RISK-CEIL",
@@ -26585,8 +26478,6 @@ mod tests {
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: Some(matching_baseline),
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -26648,8 +26539,8 @@ mod tests {
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-v3-invalid".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: [0xAA; 32],
                     capability_manifest_hash: policy_capability_manifest_hash(
                         "W-V3-RISK-INV",
@@ -26664,8 +26555,6 @@ mod tests {
                     resolved_risk_tier: 255,
                     resolved_scope_baseline: Some(matching_baseline),
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -27034,16 +26923,14 @@ mod tests {
                 role: WorkRole::Implementer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-delegated".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: policy_hash,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -27104,16 +26991,14 @@ mod tests {
                 role: WorkRole::Implementer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-delegated-2".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: policy_hash,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -27177,16 +27062,14 @@ mod tests {
                 role: WorkRole::Implementer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-delegated-3".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: policy_hash_bytes,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -27289,16 +27172,14 @@ mod tests {
                 role: WorkRole::Implementer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-low-auth".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: policy_hash,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 3, // High risk tier
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -27360,16 +27241,14 @@ mod tests {
                 role: WorkRole::Implementer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-delegated-4".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: policy_hash_b, // Different from receipt!
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 0,
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -27615,16 +27494,14 @@ mod tests {
                 role: WorkRole::Implementer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "resolved-bad-tier".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     resolved_policy_hash: policy_hash,
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                     resolved_risk_tier: 255, // Invalid!
                     resolved_scope_baseline: None,
                     expected_adapter_profile_hash: None,
-                    pcac_policy: None,
-                    pointer_only_waiver: None,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],

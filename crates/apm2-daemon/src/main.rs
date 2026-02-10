@@ -2409,8 +2409,8 @@ mod crash_recovery_integration_tests {
             role: WorkRole::Implementer,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "test-policy".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],

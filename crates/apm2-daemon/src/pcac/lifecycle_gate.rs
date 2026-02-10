@@ -250,9 +250,13 @@ impl InProcessKernel {
         hasher.update(&input.intent_digest);
         // Capability bindings
         hasher.update(&input.capability_manifest_hash);
-        // Scope witnesses: count prefix + each hash
-        hasher.update(&(input.scope_witness_hashes.len() as u64).to_le_bytes());
-        for scope_hash in &input.scope_witness_hashes {
+        // Scope witnesses: count prefix + each hash (canonical set ordering).
+        // Security: sorting prevents order-dependent AJC IDs for semantically
+        // identical witness sets.
+        let mut sorted_scope_witness_hashes = input.scope_witness_hashes.clone();
+        sorted_scope_witness_hashes.sort_unstable();
+        hasher.update(&(sorted_scope_witness_hashes.len() as u64).to_le_bytes());
+        for scope_hash in &sorted_scope_witness_hashes {
             hasher.update(scope_hash);
         }
         // Delegation bindings (length-prefixed strings)
@@ -280,9 +284,13 @@ impl InProcessKernel {
         hasher.update(&input.freshness_witness_tick.to_le_bytes());
         // Stop/budget bindings
         hasher.update(&input.stop_budget_profile_digest);
-        // Pre-actuation receipts: count prefix + each hash
-        hasher.update(&(input.pre_actuation_receipt_hashes.len() as u64).to_le_bytes());
-        for receipt_hash in &input.pre_actuation_receipt_hashes {
+        // Pre-actuation receipts: count prefix + each hash (canonical set
+        // ordering). Security: sorting prevents replay amplification by receipt
+        // permutation.
+        let mut sorted_pre_actuation_receipt_hashes = input.pre_actuation_receipt_hashes.clone();
+        sorted_pre_actuation_receipt_hashes.sort_unstable();
+        hasher.update(&(sorted_pre_actuation_receipt_hashes.len() as u64).to_le_bytes());
+        for receipt_hash in &sorted_pre_actuation_receipt_hashes {
             hasher.update(receipt_hash);
         }
         // Risk classification
@@ -854,6 +862,7 @@ impl LifecycleGate {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_revalidate_sovereignty(
         &self,
         cert: &AuthorityJoinCertificateV1,
@@ -924,6 +933,7 @@ impl LifecycleGate {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_consume_sovereignty(
         &self,
         cert: &AuthorityJoinCertificateV1,
@@ -1013,6 +1023,7 @@ impl LifecycleGate {
 
     /// Executes `join -> revalidate-before-decision` with optional
     /// sovereignty checks for Tier2+.
+    #[allow(clippy::too_many_arguments)]
     pub fn join_and_revalidate_with_sovereignty(
         &self,
         input: &AuthorityJoinInputV1,
@@ -1060,6 +1071,7 @@ impl LifecycleGate {
 
     /// Executes revalidate-before-execution with optional sovereignty checks
     /// for Tier2+.
+    #[allow(clippy::too_many_arguments)]
     pub fn revalidate_before_execution_with_sovereignty(
         &self,
         cert: &AuthorityJoinCertificateV1,
@@ -1151,7 +1163,6 @@ impl LifecycleGate {
             current_revocation_head_hash,
             None,
             0,
-            None,
         )
     }
 
@@ -1172,6 +1183,7 @@ impl LifecycleGate {
             current_revocation_head_hash,
             sovereignty_state,
             current_tick,
+            None,
         )?;
 
         self.revalidate_before_execution_with_sovereignty(
@@ -1181,6 +1193,7 @@ impl LifecycleGate {
             current_revocation_head_hash,
             sovereignty_state,
             current_tick,
+            None,
         )?;
 
         let (consumed_witness, consume_record) = self.consume_before_effect_with_sovereignty(
@@ -1191,6 +1204,7 @@ impl LifecycleGate {
             current_revocation_head_hash,
             sovereignty_state,
             current_tick,
+            None,
         )?;
 
         Ok(LifecycleReceipts {

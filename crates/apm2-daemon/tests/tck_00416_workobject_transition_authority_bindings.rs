@@ -360,8 +360,6 @@ fn test_multiple_missing_bindings_all_reported() {
         },
         typed_budget_hash: [0u8; 32],
         policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
     };
 
     let cas = MemoryCas::new();

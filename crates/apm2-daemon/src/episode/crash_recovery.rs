@@ -566,8 +566,6 @@ mod tests {
             pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
         }
     }
 
@@ -602,16 +600,14 @@ mod tests {
             role: WorkRole::Implementer,
             policy_resolution: PolicyResolution {
                 policy_resolved_ref: "test-policy".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
                 resolved_risk_tier: 0,
                 resolved_scope_baseline: None,
                 expected_adapter_profile_hash: None,
-                pcac_policy: None,
-                pointer_only_waiver: None,
             },
             executor_custody_domains: Vec::new(),
             author_custody_domains: Vec::new(),

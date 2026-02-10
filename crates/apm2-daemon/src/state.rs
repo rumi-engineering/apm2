@@ -1031,6 +1031,12 @@ impl DispatcherState {
                         Arc::new(durable_kernel);
                     let sovereignty_checker =
                         crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
+                    // TODO(TCK-00427): When wiring a bootstrap
+                    // `SovereigntyState` into `SessionDispatcher`, the epoch is
+                    // currently a static snapshot. Add an IPC/projection-driven
+                    // refresh path (see `SovereigntyState::refresh_epoch`) so
+                    // Tier2+ operations do not age into global stale-epoch
+                    // denial.
                     let pcac_gate = Arc::new(
                         crate::pcac::LifecycleGate::with_tick_kernel_and_sovereignty(
                             pcac_kernel,
@@ -1396,6 +1402,11 @@ impl DispatcherState {
         let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> = Arc::new(durable_kernel);
         let sovereignty_checker =
             crate::pcac::SovereigntyChecker::new(sovereignty_trusted_signer_key);
+        // TODO(TCK-00427): When wiring a bootstrap `SovereigntyState` into
+        // `SessionDispatcher`, the epoch is currently a static snapshot. Add
+        // an IPC/projection-driven refresh path (see
+        // `SovereigntyState::refresh_epoch`) so Tier2+ operations do not age
+        // into global stale-epoch denial.
         let pcac_gate = Arc::new(
             crate::pcac::LifecycleGate::with_tick_kernel_and_sovereignty(
                 pcac_kernel,

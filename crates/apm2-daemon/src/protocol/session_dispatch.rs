@@ -67,7 +67,7 @@ use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::crypto::Hash;
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
-use apm2_core::pcac::{PcacPolicyKnobs, PointerOnlyWaiver};
+use apm2_core::pcac::PcacPolicyKnobs;
 use apm2_core::tool::{self, tool_request as tool_req};
 use apm2_holon::defect::{
     DefectContext as HolonDefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType,
@@ -673,6 +673,9 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Per RFC-0016, timestamps must be monotonic. Using `SystemTime` directly
     /// violates time monotonicity guarantees.
     clock: Option<Arc<HolonicClock>>,
+    /// Test-only override for stage-3 PCAC tick derivation.
+    #[cfg(test)]
+    stage3_pcac_tick_override: Option<Arc<dyn Fn() -> Result<u64, String> + Send + Sync>>,
     /// Event sequence counter (per-session, monotonic).
     event_seq: AtomicU64,
     /// Subscription registry for HEF Pulse Plane resource governance
@@ -766,6 +769,7 @@ struct PendingPcacAuthority {
     certificate: apm2_core::pcac::AuthorityJoinCertificateV1,
     intent_digest: [u8; 32],
     pcac_policy: PcacPolicyKnobs,
+    principal_id: String,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -789,6 +793,8 @@ impl SessionDispatcher<InMemoryManifestStore> {
             broker: None,
             session_brokers: None,
             clock: None,
+            #[cfg(test)]
+            stage3_pcac_tick_override: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
@@ -816,6 +822,8 @@ impl SessionDispatcher<InMemoryManifestStore> {
             broker: None,
             session_brokers: None,
             clock: None,
+            #[cfg(test)]
+            stage3_pcac_tick_override: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
@@ -848,6 +856,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             broker: None,
             session_brokers: None,
             clock: None,
+            #[cfg(test)]
+            stage3_pcac_tick_override: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
@@ -880,6 +890,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             broker: None,
             session_brokers: None,
             clock: None,
+            #[cfg(test)]
+            stage3_pcac_tick_override: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
@@ -928,6 +940,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             broker: None,
             session_brokers: None,
             clock: None,
+            #[cfg(test)]
+            stage3_pcac_tick_override: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
             episode_runtime: None,
@@ -984,6 +998,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<HolonicClock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_stage3_pcac_tick_override_for_test(
+        mut self,
+        tick_override: Arc<dyn Fn() -> Result<u64, String> + Send + Sync>,
+    ) -> Self {
+        self.stage3_pcac_tick_override = Some(tick_override);
         self
     }
 
@@ -1671,6 +1695,56 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         ))
     }
 
+    #[inline]
+    fn token_principal_id(token: &SessionToken) -> &str {
+        // Session tokens do not yet carry a dedicated principal field. Until
+        // the token schema is expanded, use lease_id as the principal binding.
+        &token.lease_id
+    }
+
+    fn build_sovereignty_principal_mismatch_deny(
+        stage: &'static str,
+        session_principal_id: &str,
+        sovereignty_principal_id: &str,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Box<apm2_core::pcac::AuthorityDenyV1> {
+        Box::new(apm2_core::pcac::AuthorityDenyV1 {
+            deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                reason: format!(
+                    "sovereignty principal mismatch at {stage}: session_principal_id={session_principal_id}, sovereignty_principal_id={sovereignty_principal_id}"
+                ),
+            },
+            ajc_id,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+            containment_action: Some(apm2_core::pcac::FreezeAction::HardFreeze),
+        })
+    }
+
+    fn derive_stage3_pcac_tick(&self) -> Result<u64, String> {
+        #[cfg(test)]
+        if let Some(ref tick_override) = self.stage3_pcac_tick_override {
+            return tick_override();
+        }
+
+        let clock = self
+            .clock
+            .as_ref()
+            .ok_or_else(|| "clock unavailable".to_string())?;
+        let hlc = clock
+            .now_hlc()
+            .map_err(|e| format!("clock read failed: {e}"))?;
+        let tick = hlc.wall_ns / 1_000_000_000;
+        if tick == 0 {
+            return Err("clock tick is zero".to_string());
+        }
+        Ok(tick)
+    }
+
     /// Handles `RequestTool` requests (IPC-SESS-001).
     ///
     /// # TCK-00260: Capability Manifest Validation
@@ -2174,6 +2248,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     "PCAC authority denied: revocation provider unavailable (fail-closed)",
                 ));
             }
+            let pcac_policy = session_state
+                .pcac_policy
+                .clone()
+                .unwrap_or(PcacPolicyKnobs {
+                    lifecycle_enforcement: true,
+                    min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                    freshness_max_age_ticks: 100,
+                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                });
 
             let capability_manifest_hash: Hash =
                 if let Ok(hash) = session_state.capability_manifest_hash.as_slice().try_into() {
@@ -2301,6 +2384,55 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 };
 
             let sovereignty_state_ref = self.sovereignty_state.as_deref();
+            if matches!(risk_tier, apm2_core::pcac::RiskTier::Tier2Plus) {
+                if let Some(sovereignty_state) = sovereignty_state_ref {
+                    let session_principal_id = Self::token_principal_id(&token);
+                    if session_principal_id != sovereignty_state.principal_id.as_str() {
+                        let deny = Self::build_sovereignty_principal_mismatch_deny(
+                            "revalidate-before-decision",
+                            session_principal_id,
+                            sovereignty_state.principal_id.as_str(),
+                            None,
+                            current_time_envelope_ref,
+                            current_ledger_anchor,
+                            freshness_witness_tick,
+                        );
+                        let containment_action = deny.containment_action;
+                        warn!(
+                            session_id = %token.session_id,
+                            deny_class = %deny.deny_class,
+                            containment_action = ?containment_action,
+                            "RequestTool denied by PCAC sovereignty principal binding"
+                        );
+                        if let Some(action) = containment_action {
+                            if let Some(ref authority) = self.stop_authority {
+                                match action {
+                                    apm2_core::pcac::FreezeAction::HardFreeze => {
+                                        authority.set_emergency_stop(true);
+                                    },
+                                    apm2_core::pcac::FreezeAction::SoftFreeze => {
+                                        authority.set_governance_stop(true);
+                                    },
+                                    apm2_core::pcac::FreezeAction::NoAction => {},
+                                    _ => authority.set_emergency_stop(true),
+                                }
+                            }
+                        }
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            containment_action.map_or_else(
+                                || format!("PCAC authority denied: {}", deny.deny_class),
+                                |action| {
+                                    format!(
+                                        "PCAC authority denied: {} (containment_action: {action})",
+                                        deny.deny_class
+                                    )
+                                },
+                            ),
+                        ));
+                    }
+                }
+            }
             let certificate = match pcac_gate.join_and_revalidate_with_sovereignty(
                 &pcac_input,
                 current_time_envelope_ref,
@@ -2308,6 +2440,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 current_revocation_head,
                 sovereignty_state_ref,
                 freshness_witness_tick,
+                Some(&pcac_policy),
             ) {
                 Ok(cert) => cert,
                 Err(deny) => {
@@ -2351,7 +2484,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 gate: Arc::clone(pcac_gate),
                 certificate,
                 intent_digest,
-                pcac_policy: pcac_policy.clone(),
+                pcac_policy,
+                principal_id: Self::token_principal_id(&token).to_string(),
             })
         } else if self.is_authoritative_mode() {
             // BLOCKER 4 FIX: Authoritative mode requires mandatory PCAC gate wiring.
@@ -2894,24 +3028,89 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             },
                         };
 
-                    // SECURITY BLOCKER 1 FIX (round 2): Advance the kernel tick
-                    // from fresh HLC wall time BEFORE revalidation. Without this,
-                    // the kernel retains the tick from the join phase (before the
-                    // broker call). If the broker takes significant time, an AJC
-                    // that expires during the broker phase would be incorrectly
-                    // accepted because revalidate_before_execution uses the stale
-                    // join-phase tick. This closes the TOCTOU window.
-                    let mut fresh_tick = 0_u64;
-                    if let Some(ref clock) = self.clock {
-                        if let Ok(hlc) = clock.now_hlc() {
-                            fresh_tick = hlc.wall_ns / 1_000_000_000;
-                            if fresh_tick > 0 {
-                                pending_pcac.gate.advance_tick(fresh_tick);
+                    // SECURITY/QUALITY (TCK-00427): Stage-3 must fail closed if
+                    // the authoritative clock read fails. Revalidate/consume
+                    // must not proceed with a stale join-phase tick.
+                    let fresh_tick = match self.derive_stage3_pcac_tick() {
+                        Ok(tick) => {
+                            pending_pcac.gate.advance_tick(tick);
+                            tick
+                        },
+                        Err(error) => {
+                            warn!(
+                                session_id = %session_id,
+                                request_id = %request_id,
+                                error = %error,
+                                "PCAC denied: stage-3 clock read failed (fail-closed)"
+                            );
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorToolNotAllowed,
+                                format!(
+                                    "PCAC authority denied before execution: stage-3 clock read failed: {error}"
+                                ),
+                            ));
+                        },
+                    };
+
+                    let sovereignty_state_ref = self.sovereignty_state.as_deref();
+                    if matches!(
+                        pending_pcac.certificate.risk_tier,
+                        apm2_core::pcac::RiskTier::Tier2Plus
+                    ) {
+                        if let Some(sovereignty_state) = sovereignty_state_ref {
+                            if pending_pcac.principal_id != sovereignty_state.principal_id.as_str()
+                            {
+                                let deny = Self::build_sovereignty_principal_mismatch_deny(
+                                    "revalidate-before-execution",
+                                    &pending_pcac.principal_id,
+                                    sovereignty_state.principal_id.as_str(),
+                                    Some(pending_pcac.certificate.ajc_id),
+                                    current_time_envelope_ref,
+                                    current_ledger_anchor,
+                                    fresh_tick,
+                                );
+                                let containment_action = deny.containment_action;
+                                warn!(
+                                    session_id = %session_id,
+                                    request_id = %request_id,
+                                    deny_class = %deny.deny_class,
+                                    containment_action = ?containment_action,
+                                    "RequestTool denied by PCAC sovereignty principal binding before execution"
+                                );
+                                if let Some(action) = containment_action {
+                                    if let Some(ref authority) = self.stop_authority {
+                                        match action {
+                                            apm2_core::pcac::FreezeAction::HardFreeze => {
+                                                authority.set_emergency_stop(true);
+                                            },
+                                            apm2_core::pcac::FreezeAction::SoftFreeze => {
+                                                authority.set_governance_stop(true);
+                                            },
+                                            apm2_core::pcac::FreezeAction::NoAction => {},
+                                            _ => authority.set_emergency_stop(true),
+                                        }
+                                    }
+                                }
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorToolNotAllowed,
+                                    containment_action.map_or_else(
+                                        || {
+                                            format!(
+                                                "PCAC authority denied before execution: {}",
+                                                deny.deny_class
+                                            )
+                                        },
+                                        |action| {
+                                            format!(
+                                                "PCAC authority denied before execution: {} (containment_action: {action})",
+                                                deny.deny_class
+                                            )
+                                        },
+                                    ),
+                                ));
                             }
                         }
                     }
-
-                    let sovereignty_state_ref = self.sovereignty_state.as_deref();
                     if let Err(deny) = pending_pcac
                         .gate
                         .revalidate_before_execution_with_sovereignty(
@@ -4021,8 +4220,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             work_id: String::new(),
             role: 0, // UNSPECIFIED
             episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             tool_calls: 0,
             events_emitted: 0,
             started_at_ns: 0,
@@ -6078,8 +6275,8 @@ mod tests {
                         lease_id: "lease-001".to_string(),
                         ephemeral_handle: "handle-pcac-order".to_string(),
                         policy_resolved_ref: "policy-head-ref".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                        pcac_policy: None,
+                        pointer_only_waiver: None,
                         capability_manifest_hash: blake3::hash(b"pcac-order-manifest")
                             .as_bytes()
                             .to_vec(),
@@ -6167,6 +6364,445 @@ mod tests {
                     "consume must not run on broker deny; it is executed only on allow/effect path"
                 );
             });
+        }
+
+        #[test]
+        fn test_stage3_clock_failure_denies_before_effect() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async {
+                let minter = test_minter();
+                let joins = Arc::new(AtomicUsize::new(0));
+                let revalidations = Arc::new(AtomicUsize::new(0));
+                let consumes = Arc::new(AtomicUsize::new(0));
+
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+                manifest_store.register(
+                    "session-001",
+                    super::tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]),
+                );
+
+                let broker = Arc::new(ToolBroker::new(
+                    ToolBrokerConfig::default().without_policy_check(),
+                ));
+                broker
+                    .initialize_with_manifest(
+                        super::tck_00260_manifest_validation::make_test_manifest(vec![
+                            ToolClass::Read,
+                        ]),
+                    )
+                    .await
+                    .expect("broker manifest initialization");
+
+                let registry = Arc::new(InMemorySessionRegistry::new());
+                registry
+                    .register_session(SessionState {
+                        session_id: "session-001".to_string(),
+                        work_id: "W-PCAC-STAGE3-CLOCK".to_string(),
+                        role: crate::protocol::messages::WorkRole::Implementer.into(),
+                        lease_id: "lease-001".to_string(),
+                        ephemeral_handle: "handle-pcac-stage3-clock".to_string(),
+                        policy_resolved_ref: "policy-head-ref".to_string(),
+                        pcac_policy: None,
+                        pointer_only_waiver: None,
+                        capability_manifest_hash: blake3::hash(b"pcac-stage3-clock-manifest")
+                            .as_bytes()
+                            .to_vec(),
+                        episode_id: Some("session-001".to_string()),
+                    })
+                    .expect("session registration");
+                let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let started_at_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|duration| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let value = duration.as_nanos() as u64;
+                        value
+                    })
+                    .unwrap_or(1);
+                telemetry_store
+                    .register("session-001", started_at_ns)
+                    .expect("telemetry registration");
+
+                let clock =
+                    Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+                let stop_authority = Arc::new(StopAuthority::new());
+                let preactuation_gate = Arc::new(PreActuationGate::production_gate(
+                    Arc::clone(&stop_authority),
+                    None,
+                ));
+                let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+
+                let kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(SequencingKernel::new(
+                    Arc::clone(&joins),
+                    Arc::clone(&revalidations),
+                    Arc::clone(&consumes),
+                ));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_clock(clock)
+                        .with_ledger(ledger)
+                        .with_session_registry(registry_dyn)
+                        .with_telemetry_store(telemetry_store)
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate)
+                        .with_stage3_pcac_tick_override_for_test(Arc::new(|| {
+                            Err("injected stage-3 clock failure".to_string())
+                        }));
+
+                let token = test_token(&minter);
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).expect("token serialization"),
+                    tool_id: "read".to_string(),
+                    arguments: serde_json::to_vec(&serde_json::json!({"path": "/tmp/input"}))
+                        .expect("arguments serialization"),
+                    dedupe_key: "pcac-stage3-clock-deny".to_string(),
+                    epoch_seal: None,
+                };
+                let frame = encode_request_tool_request(&request);
+                let response = dispatcher
+                    .dispatch(&frame, &make_session_ctx())
+                    .expect("dispatch should return application-level response");
+
+                match response {
+                    SessionResponse::Error(err) => {
+                        assert_eq!(
+                            err.code,
+                            SessionErrorCode::SessionErrorToolNotAllowed as i32
+                        );
+                        assert!(
+                            err.message.contains("stage-3 clock read failed"),
+                            "expected stage-3 clock failure denial, got: {}",
+                            err.message
+                        );
+                    },
+                    other => panic!("expected stage-3 clock denial response, got: {other:?}"),
+                }
+
+                assert!(
+                    joins.load(Ordering::SeqCst) > 0,
+                    "join must run before stage-3 denial"
+                );
+                assert!(
+                    revalidations.load(Ordering::SeqCst) > 0,
+                    "stage-2 revalidation must run before stage-3 denial"
+                );
+                assert_eq!(
+                    consumes.load(Ordering::SeqCst),
+                    0,
+                    "stage-3 clock failure must deny before consume/effect"
+                );
+            });
+        }
+
+        #[test]
+        fn test_stage2_denies_on_sovereignty_principal_mismatch() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async {
+                let minter = test_minter();
+                let joins = Arc::new(AtomicUsize::new(0));
+                let revalidations = Arc::new(AtomicUsize::new(0));
+                let consumes = Arc::new(AtomicUsize::new(0));
+
+                let tier3_read_manifest = {
+                    let capability = crate::episode::Capability {
+                        capability_id: "cap-read-tier3".to_string(),
+                        tool_class: ToolClass::Read,
+                        scope: crate::episode::CapabilityScope::default(),
+                        risk_tier_required: crate::episode::RiskTier::Tier3,
+                    };
+                    crate::episode::CapabilityManifestBuilder::new("tier3-read-manifest")
+                        .delegator("test-delegator")
+                        .capabilities(vec![capability])
+                        .tool_allowlist(vec![ToolClass::Read])
+                        .build()
+                        .expect("tier3 manifest build")
+                };
+
+                let manifest_store = Arc::new(InMemoryManifestStore::new());
+                manifest_store.register("session-001", tier3_read_manifest.clone());
+
+                let broker = Arc::new(ToolBroker::new(
+                    ToolBrokerConfig::default().without_policy_check(),
+                ));
+                broker
+                    .initialize_with_manifest(tier3_read_manifest)
+                    .await
+                    .expect("broker manifest initialization");
+
+                let registry = Arc::new(InMemorySessionRegistry::new());
+                registry
+                    .register_session(SessionState {
+                        session_id: "session-001".to_string(),
+                        work_id: "W-PCAC-STAGE2-PRINCIPAL".to_string(),
+                        role: crate::protocol::messages::WorkRole::Implementer.into(),
+                        lease_id: "principal-A".to_string(),
+                        ephemeral_handle: "handle-pcac-stage2-principal".to_string(),
+                        policy_resolved_ref: "policy-head-ref".to_string(),
+                        pcac_policy: None,
+                        pointer_only_waiver: None,
+                        capability_manifest_hash: blake3::hash(b"pcac-stage2-principal")
+                            .as_bytes()
+                            .to_vec(),
+                        episode_id: Some("session-001".to_string()),
+                    })
+                    .expect("session registration");
+                let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+                let telemetry_store = Arc::new(SessionTelemetryStore::new());
+                let started_at_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|duration| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let value = duration.as_nanos() as u64;
+                        value
+                    })
+                    .unwrap_or(1);
+                telemetry_store
+                    .register("session-001", started_at_ns)
+                    .expect("telemetry registration");
+
+                let clock =
+                    Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+                let stop_authority = Arc::new(StopAuthority::new());
+                let preactuation_gate = Arc::new(PreActuationGate::production_gate(
+                    Arc::clone(&stop_authority),
+                    None,
+                ));
+                let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+
+                let kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(SequencingKernel::new(
+                    Arc::clone(&joins),
+                    Arc::clone(&revalidations),
+                    Arc::clone(&consumes),
+                ));
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+                let sovereignty_state = Arc::new(crate::pcac::SovereigntyState {
+                    epoch: None,
+                    principal_id: "principal-B".to_string(),
+                    revocation_head_known: true,
+                    autonomy_ceiling: Some(apm2_core::pcac::AutonomyCeiling {
+                        max_risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                        policy_binding_hash: [0xAB; 32],
+                    }),
+                    active_freeze: apm2_core::pcac::FreezeAction::NoAction,
+                });
+
+                let dispatcher =
+                    SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                        .with_broker(broker)
+                        .with_clock(clock)
+                        .with_ledger(ledger)
+                        .with_session_registry(registry_dyn)
+                        .with_telemetry_store(telemetry_store)
+                        .with_preactuation_gate(preactuation_gate)
+                        .with_stop_authority(stop_authority)
+                        .with_pcac_lifecycle_gate(pcac_gate)
+                        .with_sovereignty_state(sovereignty_state);
+
+                let token = minter
+                    .mint(
+                        "session-001",
+                        "principal-A",
+                        std::time::SystemTime::now(),
+                        Duration::from_secs(3600),
+                    )
+                    .expect("token mint");
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).expect("token serialization"),
+                    tool_id: "read".to_string(),
+                    arguments: serde_json::to_vec(&serde_json::json!({"path": "/tmp/input"}))
+                        .expect("arguments serialization"),
+                    dedupe_key: "pcac-stage2-principal-mismatch".to_string(),
+                    epoch_seal: None,
+                };
+                let frame = encode_request_tool_request(&request);
+                let response = dispatcher
+                    .dispatch(&frame, &make_session_ctx())
+                    .expect("dispatch should return application-level response");
+
+                match response {
+                    SessionResponse::Error(err) => {
+                        assert_eq!(
+                            err.code,
+                            SessionErrorCode::SessionErrorToolNotAllowed as i32
+                        );
+                        assert!(
+                            err.message.contains("sovereignty principal mismatch"),
+                            "expected principal mismatch denial, got: {}",
+                            err.message
+                        );
+                    },
+                    other => panic!("expected principal mismatch denial response, got: {other:?}"),
+                }
+
+                assert_eq!(
+                    joins.load(Ordering::SeqCst),
+                    0,
+                    "stage-2 principal mismatch must deny before join"
+                );
+                assert_eq!(
+                    revalidations.load(Ordering::SeqCst),
+                    0,
+                    "stage-2 principal mismatch must deny before revalidate"
+                );
+                assert_eq!(
+                    consumes.load(Ordering::SeqCst),
+                    0,
+                    "stage-2 principal mismatch must deny before consume"
+                );
+            });
+        }
+
+        #[test]
+        fn test_stage3_denies_on_sovereignty_principal_mismatch() {
+            let minter = test_minter();
+            let joins = Arc::new(AtomicUsize::new(0));
+            let revalidations = Arc::new(AtomicUsize::new(0));
+            let consumes = Arc::new(AtomicUsize::new(0));
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: "session-001".to_string(),
+                    work_id: "W-PCAC-STAGE3-PRINCIPAL".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "principal-A".to_string(),
+                    ephemeral_handle: "handle-pcac-stage3-principal".to_string(),
+                    policy_resolved_ref: "policy-head-ref".to_string(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    capability_manifest_hash: blake3::hash(b"pcac-stage3-principal")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some("session-001".to_string()),
+                })
+                .expect("session registration");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+            let ledger: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+            let stop_authority = Arc::new(StopAuthority::new());
+
+            let kernel: Arc<dyn AuthorityJoinKernel> = Arc::new(SequencingKernel::new(
+                Arc::clone(&joins),
+                Arc::clone(&revalidations),
+                Arc::clone(&consumes),
+            ));
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(kernel));
+            let sovereignty_state = Arc::new(crate::pcac::SovereigntyState {
+                epoch: None,
+                principal_id: "principal-B".to_string(),
+                revocation_head_known: true,
+                autonomy_ceiling: Some(apm2_core::pcac::AutonomyCeiling {
+                    max_risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                    policy_binding_hash: [0xBC; 32],
+                }),
+                active_freeze: apm2_core::pcac::FreezeAction::NoAction,
+            });
+
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let dispatcher = SessionDispatcher::with_manifest_store(minter, manifest_store)
+                .with_clock(clock)
+                .with_ledger(ledger)
+                .with_session_registry(registry_dyn)
+                .with_stop_authority(stop_authority)
+                .with_pcac_lifecycle_gate(Arc::clone(&pcac_gate))
+                .with_sovereignty_state(sovereignty_state);
+
+            let session_revocation_head = *blake3::hash(b"policy-head-ref").as_bytes();
+            let certificate = AuthorityJoinCertificateV1 {
+                ajc_id: [0x11; 32],
+                authority_join_hash: [0x22; 32],
+                intent_digest: [0x33; 32],
+                risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                issued_time_envelope_ref: [0x44; 32],
+                as_of_ledger_anchor: [0x55; 32],
+                expires_at_tick: u64::MAX,
+                revocation_head_hash: session_revocation_head,
+                identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                admission_capacity_token: None,
+            };
+            let pending_pcac = PendingPcacAuthority {
+                gate: pcac_gate,
+                certificate: certificate.clone(),
+                intent_digest: certificate.intent_digest,
+                pcac_policy: apm2_core::pcac::PcacPolicyKnobs {
+                    lifecycle_enforcement: true,
+                    min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                    freshness_max_age_ticks: 100,
+                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                },
+                principal_id: "principal-A".to_string(),
+            };
+
+            let decision = Ok(ToolDecision::Allow {
+                request_id: "REQ-PCAC-STAGE3-PRINCIPAL".to_string(),
+                capability_id: "cap-read-tier3".to_string(),
+                rule_id: Some("rule-tier3".to_string()),
+                policy_hash: [0u8; 32],
+                budget_delta: crate::episode::decision::BudgetDelta::single_call(),
+                credential: None,
+            });
+            let episode_id = EpisodeId::new("session-001").expect("valid episode id");
+            let response = dispatcher
+                .handle_broker_decision(
+                    decision,
+                    "session-001",
+                    ToolClass::Read,
+                    b"{}",
+                    ReplayTimestamp::new(100, 0),
+                    &episode_id,
+                    None,
+                    None,
+                    false,
+                    Some(pending_pcac),
+                )
+                .expect("handle_broker_decision should return application-level response");
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("sovereignty principal mismatch"),
+                        "expected stage-3 principal mismatch denial, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected stage-3 principal mismatch denial, got: {other:?}"),
+            }
+
+            assert_eq!(
+                joins.load(Ordering::SeqCst),
+                0,
+                "stage-3 principal mismatch path should not invoke join"
+            );
+            assert_eq!(
+                revalidations.load(Ordering::SeqCst),
+                0,
+                "stage-3 principal mismatch must deny before revalidate"
+            );
+            assert_eq!(
+                consumes.load(Ordering::SeqCst),
+                0,
+                "stage-3 principal mismatch must deny before consume"
+            );
         }
 
         /// TCK-00336: Verify fail-closed behavior when no broker is configured.
@@ -6328,8 +6964,8 @@ mod tests {
                     // TCK-00426: PCAC gate requires non-empty manifest hash
                     // and policy_resolved_ref in authoritative mode.
                     policy_resolved_ref: "test-policy-ref".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: blake3::hash(b"test-manifest").as_bytes().to_vec(),
                     episode_id: Some(session_id.to_string()),
                 })
@@ -7275,6 +7911,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-SS-001".to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -7446,6 +8084,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-TEL-001".to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -7521,8 +8161,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -7716,8 +8356,8 @@ mod tests {
                     // TCK-00426: PCAC gate requires non-empty manifest hash and
                     // policy_resolved_ref in authoritative mode.
                     policy_resolved_ref: "test-policy-ref".to_string(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: blake3::hash(b"e2e-read-manifest")
                         .as_bytes()
                         .to_vec(),
@@ -7907,8 +8547,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -7990,6 +8630,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-385-001".to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8051,6 +8693,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-385-002".to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8121,8 +8765,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8189,8 +8833,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8238,8 +8882,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             let session2 = SessionState {
                 session_id: "s2".to_string(),
@@ -8250,8 +8894,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
 
             registry.register_session(session1).unwrap();
@@ -8312,8 +8956,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
 
@@ -8354,6 +8998,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-LIFECYCLE".to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8435,8 +9081,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
 
@@ -8504,6 +9150,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-REVOKE-001".to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry
                 .register_session(session)
@@ -8651,6 +9299,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-ACTIVE-001".to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
 
@@ -8775,6 +9425,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some("E-V1-001".to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             };
             registry.register_session(session).unwrap();
 

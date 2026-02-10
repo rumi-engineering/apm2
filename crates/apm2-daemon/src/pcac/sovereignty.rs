@@ -41,6 +41,10 @@ const DEFAULT_MAX_FUTURE_SKEW_TICKS: u64 = 300;
 /// Captures the current sovereignty inputs needed for Tier2+ validation.
 /// Callers populate this from their authority store before calling
 /// `SovereigntyChecker` methods.
+///
+/// Current limitation: this state is currently treated as a snapshot. Without
+/// runtime epoch refresh wiring, Tier2+ checks will eventually deny on stale
+/// epoch evidence as freshness thresholds elapse.
 #[derive(Debug, Clone)]
 pub struct SovereigntyState {
     /// Current sovereignty epoch, if known.
@@ -57,6 +61,17 @@ pub struct SovereigntyState {
 
     /// Active freeze action, if any.
     pub active_freeze: FreezeAction,
+}
+
+impl SovereigntyState {
+    /// Refreshes the sovereignty epoch snapshot.
+    ///
+    /// TODO(TCK-00427): Wire this through a runtime IPC/projection update path.
+    /// For now this stub exists so daemon construction sites can track the
+    /// missing liveness plumbing explicitly.
+    pub fn refresh_epoch(&mut self, next_epoch: SovereigntyEpoch) {
+        self.epoch = Some(next_epoch);
+    }
 }
 
 /// Validates sovereignty inputs for Tier2+ authority operations.

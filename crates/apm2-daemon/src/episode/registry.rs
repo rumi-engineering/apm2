@@ -1479,7 +1479,7 @@ struct PersistableSessionState {
     /// PCAC policy configuration (TCK-00428).
     #[serde(default)]
     pub pcac_policy: Option<apm2_core::pcac::PcacPolicyKnobs>,
-    /// Active waiver for PointerOnly identity (TCK-00428).
+    /// Active waiver for `PointerOnly` identity (TCK-00428).
     #[serde(default)]
     pub pointer_only_waiver: Option<apm2_core::pcac::PointerOnlyWaiver>,
     /// Hash of the capability manifest for this session.
@@ -1496,8 +1496,8 @@ impl From<&SessionState> for PersistableSessionState {
             role: session.role,
             ephemeral_handle: session.ephemeral_handle.clone(),
             policy_resolved_ref: session.policy_resolved_ref.clone(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+            pcac_policy: session.pcac_policy.clone(),
+            pointer_only_waiver: session.pointer_only_waiver.clone(),
             capability_manifest_hash: session.capability_manifest_hash.clone(),
             episode_id: session.episode_id.clone(),
         }
@@ -1514,8 +1514,6 @@ impl From<PersistableSessionState> for SessionState {
             // Sessions loaded from disk have no valid lease - they must re-authenticate
             lease_id: String::new(),
             policy_resolved_ref: persistable.policy_resolved_ref,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             capability_manifest_hash: persistable.capability_manifest_hash,
             episode_id: persistable.episode_id,
             pcac_policy: persistable.pcac_policy,
@@ -2377,8 +2375,6 @@ mod session_registry_tests {
             pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
         }
     }
 
@@ -3459,8 +3455,6 @@ mod tck_00267 {
             pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
         }
     }
 
@@ -3784,8 +3778,6 @@ mod tck_00385_security_fixes {
             pointer_only_waiver: None,
             capability_manifest_hash: vec![],
             episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
         }
     }
 
@@ -4271,12 +4263,10 @@ mod tck_00385_security_fixes {
                     role: 1,
                     ephemeral_handle: "h-exp".to_string(),
                     policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                 },
                 info: SessionTerminationInfo::new("expired-1", "timeout", "FAILURE"),
                 issued_at_epoch_secs: 1_000_000,
@@ -4430,12 +4420,10 @@ mod tck_00385_security_fixes {
                     role: 1,
                     ephemeral_handle: "h-ae".to_string(),
                     policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                 },
                 info: SessionTerminationInfo::new("abs-exp-1", "normal", "SUCCESS"),
                 issued_at_epoch_secs: past_epoch.saturating_sub(300),
@@ -4472,12 +4460,10 @@ mod tck_00385_security_fixes {
                     role: 1,
                     ephemeral_handle: "h-av".to_string(),
                     policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                 },
                 info: SessionTerminationInfo::new("abs-valid-1", "normal", "SUCCESS"),
                 issued_at_epoch_secs: future_epoch.saturating_sub(300),
@@ -4578,12 +4564,10 @@ mod tck_00385_security_fixes {
                 role: 1,
                 ephemeral_handle: "h-c1".to_string(),
                 policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                pcac_policy: None,
+                pointer_only_waiver: None,
                 capability_manifest_hash: vec![],
                 episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
             }],
             terminated: vec![PersistableTerminatedEntry {
                 session: PersistableSessionState {
@@ -4592,12 +4576,10 @@ mod tck_00385_security_fixes {
                     role: 1,
                     ephemeral_handle: "h-c1-term".to_string(),
                     policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
                     capability_manifest_hash: vec![],
                     episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                 },
                 info: SessionTerminationInfo::new("collide-1", "crash", "FAILURE"),
                 issued_at_epoch_secs: future_epoch.saturating_sub(300),
@@ -4649,12 +4631,10 @@ mod tck_00385_security_fixes {
                         role: 1,
                         ephemeral_handle: format!("h-{sid}"),
                         policy_resolved_ref: String::new(),
-            pcac_policy: None,
-            pointer_only_waiver: None,
+                        pcac_policy: None,
+                        pointer_only_waiver: None,
                         capability_manifest_hash: vec![],
                         episode_id: None,
-            pcac_policy: None,
-            pointer_only_waiver: None,
                     },
                     info: SessionTerminationInfo::new(&sid, "normal", "SUCCESS"),
                     issued_at_epoch_secs: future_base.saturating_sub(300),
