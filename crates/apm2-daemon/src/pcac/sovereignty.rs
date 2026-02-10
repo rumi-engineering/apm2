@@ -128,6 +128,12 @@ impl SovereigntyChecker {
         }
     }
 
+    /// Returns the trusted sovereignty signer public key.
+    #[must_use]
+    pub const fn trusted_signer_key(&self) -> [u8; 32] {
+        self.trusted_signer_key
+    }
+
     /// Returns `true` if the certificate's risk tier requires sovereignty
     /// checks.
     const fn requires_sovereignty_check(cert: &AuthorityJoinCertificateV1) -> bool {
