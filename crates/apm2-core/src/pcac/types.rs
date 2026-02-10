@@ -746,6 +746,7 @@ pub struct AuthorityConsumedV1 {
 /// Runtime validators MUST also bind `signer_public_key` to a trusted
 /// authority key source. A signer/key mismatch is fail-closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SovereigntyEpoch {
     /// Unique epoch identifier.
     #[serde(deserialize_with = "deserialize_bounded_string")]
@@ -848,6 +849,7 @@ impl std::fmt::Display for FreezeAction {
 /// Consume checks verify that the requested risk tier does not exceed the
 /// autonomy ceiling for the principal's scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutonomyCeiling {
     /// Maximum risk tier allowed under this ceiling.
     pub max_risk_tier: RiskTier,
@@ -890,6 +892,7 @@ impl std::fmt::Display for SovereigntyEnforcementMode {
 /// is allowed only with an explicit, unexpired waiver bound to the session
 /// or scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PointerOnlyWaiver {
     /// Unique waiver identifier (WVR-XXXX).
     pub waiver_id: String,

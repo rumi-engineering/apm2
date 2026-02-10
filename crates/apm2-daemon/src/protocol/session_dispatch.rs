@@ -7362,6 +7362,49 @@ mod tests {
             Arc::clone(registry) as Arc<dyn crate::session::SessionRegistry>
         }
 
+        fn tier3_sovereignty_fixture(
+            principal_id: &str,
+        ) -> (
+            crate::pcac::SovereigntyChecker,
+            Arc<crate::pcac::SovereigntyState>,
+        ) {
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]);
+            let trusted_signer_key = signing_key.verifying_key().to_bytes();
+            let checker = crate::pcac::SovereigntyChecker::with_thresholds(
+                trusted_signer_key,
+                u64::MAX,
+                u64::MAX,
+            );
+
+            let epoch_id = "epoch-tier3-fixture";
+            let freshness_tick = 1;
+            let state = crate::pcac::SovereigntyState {
+                epoch: Some(apm2_core::pcac::SovereigntyEpoch {
+                    epoch_id: epoch_id.to_string(),
+                    freshness_tick,
+                    principal_scope_hash: crate::pcac::SovereigntyChecker::principal_scope_hash(
+                        principal_id,
+                    ),
+                    signer_public_key: trusted_signer_key,
+                    signature: crate::pcac::SovereigntyChecker::sign_epoch(
+                        &signing_key,
+                        principal_id,
+                        epoch_id,
+                        freshness_tick,
+                    ),
+                }),
+                principal_id: principal_id.to_string(),
+                revocation_head_known: true,
+                autonomy_ceiling: Some(apm2_core::pcac::AutonomyCeiling {
+                    max_risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                    policy_binding_hash: [0xAB; 32],
+                }),
+                active_freeze: apm2_core::pcac::FreezeAction::NoAction,
+            };
+
+            (checker, Arc::new(state))
+        }
+
         #[derive(Debug)]
         struct CountingReadHandler {
             executions: Arc<AtomicUsize>,
@@ -7529,7 +7572,12 @@ mod tests {
                 // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                     Arc::new(crate::pcac::InProcessKernel::new(1));
-                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
+                let (sovereignty_checker, sovereignty_state) =
+                    tier3_sovereignty_fixture("lease-001");
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
+                    pcac_kernel,
+                    sovereignty_checker,
+                ));
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -7540,7 +7588,8 @@ mod tests {
                         .with_telemetry_store(Arc::clone(&telemetry_store))
                         .with_preactuation_gate(preactuation_gate)
                         .with_stop_authority(stop_authority)
-                        .with_pcac_lifecycle_gate(pcac_gate);
+                        .with_pcac_lifecycle_gate(pcac_gate)
+                        .with_sovereignty_state(sovereignty_state);
 
                 let spawn_time = std::time::SystemTime::now();
                 let token = minter
@@ -7756,7 +7805,12 @@ mod tests {
                 // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                     Arc::new(crate::pcac::InProcessKernel::new(1));
-                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
+                let (sovereignty_checker, sovereignty_state) =
+                    tier3_sovereignty_fixture("lease-001");
+                let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_sovereignty_checker(
+                    pcac_kernel,
+                    sovereignty_checker,
+                ));
                 let dispatcher =
                     SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
                         .with_broker(broker)
@@ -7767,7 +7821,8 @@ mod tests {
                         .with_telemetry_store(Arc::clone(&telemetry_store))
                         .with_preactuation_gate(preactuation_gate)
                         .with_stop_authority(stop_authority)
-                        .with_pcac_lifecycle_gate(pcac_gate);
+                        .with_pcac_lifecycle_gate(pcac_gate)
+                        .with_sovereignty_state(sovereignty_state);
 
                 let spawn_time = std::time::SystemTime::now();
                 let token = minter

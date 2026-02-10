@@ -6,7 +6,7 @@ use std::sync::Arc;
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel, DeterminismClass,
-    IdentityEvidenceLevel, RiskTier,
+    IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier, SovereigntyEnforcementMode,
 };
 
 use super::durable_consume::DurableConsumeIndex;
@@ -86,6 +86,15 @@ fn valid_input() -> AuthorityJoinInputV1 {
         time_envelope_ref: test_hash(0x07),
         as_of_ledger_anchor: test_hash(0x08),
         pointer_only_waiver_hash: None,
+    }
+}
+
+fn strict_sovereignty_policy() -> PcacPolicyKnobs {
+    PcacPolicyKnobs {
+        lifecycle_enforcement: true,
+        min_tier2_identity_evidence: IdentityEvidenceLevel::Verified,
+        freshness_max_age_ticks: 300,
+        tier2_sovereignty_mode: SovereigntyEnforcementMode::Strict,
     }
 }
 
@@ -737,6 +746,92 @@ fn lifecycle_gate_without_sovereignty_state_denies_tier2() {
         err.containment_action,
         Some(FreezeAction::HardFreeze),
         "missing sovereignty state must emit hard-freeze containment signal"
+    );
+}
+
+#[test]
+fn lifecycle_gate_missing_checker_denies_revalidate_in_strict_mode() {
+    use apm2_core::pcac::FreezeAction;
+
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let strict_policy = strict_sovereignty_policy();
+
+    let err = gate
+        .join_and_revalidate_with_sovereignty(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            Some(&strict_policy),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                if reason.contains("sovereignty checker not wired")
+        ),
+        "strict mode must deny Tier2+ revalidate when checker is missing, got: {:?}",
+        err.deny_class
+    );
+    assert_eq!(
+        err.containment_action,
+        Some(FreezeAction::HardFreeze),
+        "missing checker in strict mode must emit hard-freeze containment"
+    );
+}
+
+#[test]
+fn lifecycle_gate_missing_checker_denies_consume_in_strict_mode() {
+    use apm2_core::pcac::FreezeAction;
+
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let strict_policy = strict_sovereignty_policy();
+
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join_and_revalidate should succeed before consume check");
+
+    let err = gate
+        .consume_before_effect_with_sovereignty(
+            &cert,
+            input.intent_digest,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            Some(&strict_policy),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err.deny_class,
+            AuthorityDenyClass::SovereigntyUncertainty { ref reason }
+                if reason.contains("sovereignty checker not wired")
+        ),
+        "strict mode must deny Tier2+ consume when checker is missing, got: {:?}",
+        err.deny_class
+    );
+    assert_eq!(
+        err.containment_action,
+        Some(FreezeAction::HardFreeze),
+        "missing checker in strict mode must emit hard-freeze containment"
     );
 }
 

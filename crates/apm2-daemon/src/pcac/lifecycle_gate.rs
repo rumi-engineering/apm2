@@ -947,7 +947,31 @@ impl LifecycleGate {
                     Err(deny)
                 }
             },
-            (None, _) => Ok(()),
+            (None, _) => {
+                if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Strict {
+                    let deny = Box::new(AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                            reason: "sovereignty checker not wired; strict mode requires checker"
+                                .to_string(),
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: current_ledger_anchor,
+                        denied_at_tick: current_tick,
+                        containment_action: Some(FreezeAction::HardFreeze),
+                    });
+                    self.actuate_containment(stage, &deny);
+                    Err(deny)
+                } else {
+                    if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                        warn!(
+                            stage = stage,
+                            "Sovereignty checker not wired (monitor mode)"
+                        );
+                    }
+                    Ok(())
+                }
+            },
         }
     }
 
@@ -1017,7 +1041,31 @@ impl LifecycleGate {
                     Err(deny)
                 }
             },
-            (None, _) => Ok(()),
+            (None, _) => {
+                if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Strict {
+                    let deny = Box::new(AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                            reason: "sovereignty checker not wired; strict mode requires checker"
+                                .to_string(),
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: current_ledger_anchor,
+                        denied_at_tick: current_tick,
+                        containment_action: Some(FreezeAction::HardFreeze),
+                    });
+                    self.actuate_containment(stage, &deny);
+                    Err(deny)
+                } else {
+                    if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                        warn!(
+                            stage = stage,
+                            "Sovereignty checker not wired (monitor mode)"
+                        );
+                    }
+                    Ok(())
+                }
+            },
         }
     }
 

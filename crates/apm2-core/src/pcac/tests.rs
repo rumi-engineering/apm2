@@ -998,6 +998,49 @@ fn deny_unknown_fields_authority_consume_record() {
 }
 
 #[test]
+fn deny_unknown_fields_sovereignty_epoch() {
+    let json = serde_json::json!({
+        "epoch_id": "epoch-001",
+        "freshness_tick": 100,
+        "principal_scope_hash": vec![0x41u8; 32],
+        "signer_public_key": vec![0x42u8; 32],
+        "signature": vec![0xAAu8; 64],
+        "smuggled_field": true
+    })
+    .to_string();
+
+    let result = serde_json::from_str::<SovereigntyEpoch>(&json);
+    assert!(result.is_err(), "unknown field must be rejected");
+}
+
+#[test]
+fn deny_unknown_fields_autonomy_ceiling() {
+    let json = serde_json::json!({
+        "max_risk_tier": "tier2_plus",
+        "policy_binding_hash": vec![0xDDu8; 32],
+        "smuggled_field": true
+    })
+    .to_string();
+
+    let result = serde_json::from_str::<AutonomyCeiling>(&json);
+    assert!(result.is_err(), "unknown field must be rejected");
+}
+
+#[test]
+fn deny_unknown_fields_pointer_only_waiver() {
+    let json = serde_json::json!({
+        "waiver_id": "WVR-0001",
+        "expires_at_tick": 1234,
+        "scope_binding_hash": vec![0xABu8; 32],
+        "smuggled_field": true
+    })
+    .to_string();
+
+    let result = serde_json::from_str::<PointerOnlyWaiver>(&json);
+    assert!(result.is_err(), "unknown field must be rejected");
+}
+
+#[test]
 fn deny_unknown_fields_authority_deny_v1() {
     let deny = AuthorityDenyV1 {
         deny_class: AuthorityDenyClass::InvalidSessionId,
