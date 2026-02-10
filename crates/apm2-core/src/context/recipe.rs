@@ -6,12 +6,13 @@
 //! filesystem fallback.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::determinism::canonicalize_json;
@@ -38,6 +39,9 @@ pub const MAX_REQUIRED_READ_PATH_LENGTH: usize = 4_096;
 
 /// Maximum number of path components in a required read path.
 pub const MAX_REQUIRED_READ_PATH_COMPONENTS: usize = 256;
+
+/// Maximum aggregate number of path components processed per compilation.
+pub const MAX_AGGREGATE_COMPONENTS: usize = 100_000;
 
 /// Maximum number of hash-pinned required-read digests.
 pub const MAX_REQUIRED_READ_DIGESTS: usize = MAX_REQUIRED_READ_PATHS;
@@ -104,6 +108,8 @@ pub enum RecipeCompilerReasonCode {
     RequiredReadPathTraversal,
     /// Required path has too many components.
     RequiredReadPathTooManyComponents,
+    /// Aggregate path component processing budget exceeded.
+    AggregateComponentLimitExceeded,
     /// Required path resolves outside workspace boundaries.
     RequiredReadPathOutsideWorkspace,
     /// Required path resolves through a symlink component.
@@ -173,6 +179,7 @@ impl std::fmt::Display for RecipeCompilerReasonCode {
             Self::RequiredReadPathAbsolute => "required_read_path_absolute",
             Self::RequiredReadPathTraversal => "required_read_path_traversal",
             Self::RequiredReadPathTooManyComponents => "required_read_path_too_many_components",
+            Self::AggregateComponentLimitExceeded => "aggregate_component_limit_exceeded",
             Self::RequiredReadPathOutsideWorkspace => "required_read_path_outside_workspace",
             Self::RequiredReadPathSymlink => "required_read_path_symlink",
             Self::RequiredReadPathNotFound => "required_read_path_not_found",
@@ -283,6 +290,12 @@ pub struct ContextPackRecipeCompiler {
     default_compiled_at_tick: u64,
 }
 
+#[derive(Debug, Default)]
+struct PathValidationSession {
+    aggregate_components: usize,
+    verified_prefixes: HashSet<PathBuf>,
+}
+
 impl ContextPackRecipeCompiler {
     /// Creates a compiler rooted at `workspace_root`.
     ///
@@ -381,9 +394,11 @@ impl ContextPackRecipeCompiler {
         observed_read_paths: &BTreeSet<String>,
         compiled_at_tick: u64,
     ) -> Result<CompiledContextPackRecipe, RecipeCompilerError> {
+        let mut path_validation = PathValidationSession::default();
         let normalized_paths = self.validate_selector_closure(
             &selector.required_read_paths,
             &selector.required_read_digests,
+            &mut path_validation,
         )?;
         let required_read_digest_set_hash =
             compute_required_read_digest_set_hash(&selector.required_read_digests)?;
@@ -396,7 +411,11 @@ impl ContextPackRecipeCompiler {
             selector.context_manifest_hash,
             selector.budget_profile_hash,
         )?;
-        self.enforce_observed_dependencies_hash_pinned(observed_read_paths, &recipe)?;
+        self.enforce_observed_dependencies_hash_pinned(
+            observed_read_paths,
+            &recipe,
+            &mut path_validation,
+        )?;
         let recipe_hash = recipe.recipe_hash()?;
 
         let fingerprint = DriftFingerprint {
@@ -418,6 +437,7 @@ impl ContextPackRecipeCompiler {
         &self,
         required_read_paths: &BTreeSet<String>,
         required_read_digests: &BTreeMap<String, [u8; 32]>,
+        path_validation: &mut PathValidationSession,
     ) -> Result<Vec<String>, RecipeCompilerError> {
         if required_read_paths.is_empty() {
             return Err(RecipeCompilerError::SelectorClosure {
@@ -453,7 +473,7 @@ impl ContextPackRecipeCompiler {
         let mut dedupe = BTreeSet::new();
 
         for raw_path in required_read_paths {
-            let normalized_path = self.validate_required_read_path(raw_path)?;
+            let normalized_path = self.validate_required_read_path(raw_path, path_validation)?;
             if !dedupe.insert(normalized_path.clone()) {
                 return Err(RecipeCompilerError::SelectorClosure {
                     code: RecipeCompilerReasonCode::DuplicateNormalizedRequiredReadPath,
@@ -467,7 +487,7 @@ impl ContextPackRecipeCompiler {
 
         let mut normalized_digest_map: BTreeMap<String, [u8; 32]> = BTreeMap::new();
         for (raw_path, digest) in required_read_digests {
-            let normalized_path = self.validate_required_read_path(raw_path)?;
+            let normalized_path = self.validate_required_read_path(raw_path, path_validation)?;
             if normalized_digest_map
                 .insert(normalized_path.clone(), *digest)
                 .is_some()
@@ -510,9 +530,11 @@ impl ContextPackRecipeCompiler {
         &self,
         observed_read_paths: &BTreeSet<String>,
         recipe: &ContextPackRecipe,
+        path_validation: &mut PathValidationSession,
     ) -> Result<(), RecipeCompilerError> {
         for observed in observed_read_paths {
-            let normalized_observed = self.validate_required_read_path(observed)?;
+            let normalized_observed =
+                self.validate_required_read_path(observed, path_validation)?;
             if !recipe
                 .required_read_digests
                 .contains_key(&normalized_observed)
@@ -529,7 +551,11 @@ impl ContextPackRecipeCompiler {
         Ok(())
     }
 
-    fn validate_required_read_path(&self, raw_path: &str) -> Result<String, RecipeCompilerError> {
+    fn validate_required_read_path(
+        &self,
+        raw_path: &str,
+        path_validation: &mut PathValidationSession,
+    ) -> Result<String, RecipeCompilerError> {
         if raw_path.is_empty() {
             return Err(RecipeCompilerError::SelectorClosure {
                 code: RecipeCompilerReasonCode::RequiredReadPathEmpty,
@@ -575,7 +601,7 @@ impl ContextPackRecipeCompiler {
             });
         }
 
-        self.ensure_no_symlink_components(&candidate, raw_path)?;
+        self.ensure_no_symlink_components(&candidate, raw_path, path_validation)?;
 
         Ok(normalized_required_read_path_string(&normalized_relative))
     }
@@ -584,6 +610,7 @@ impl ContextPackRecipeCompiler {
         &self,
         absolute_candidate: &Path,
         raw_path: &str,
+        path_validation: &mut PathValidationSession,
     ) -> Result<(), RecipeCompilerError> {
         let relative = absolute_candidate
             .strip_prefix(&self.workspace_root)
@@ -596,7 +623,22 @@ impl ContextPackRecipeCompiler {
         let mut current = self.workspace_root.clone();
         for component in relative.components() {
             if let Component::Normal(part) = component {
+                path_validation.aggregate_components =
+                    path_validation.aggregate_components.saturating_add(1);
+                if path_validation.aggregate_components > MAX_AGGREGATE_COMPONENTS {
+                    return Err(RecipeCompilerError::SelectorClosure {
+                        code: RecipeCompilerReasonCode::AggregateComponentLimitExceeded,
+                        message: format!(
+                            "aggregate path component budget exceeded ({} > {})",
+                            path_validation.aggregate_components, MAX_AGGREGATE_COMPONENTS
+                        ),
+                        path: Some(raw_path.to_string()),
+                    });
+                }
                 current.push(part);
+                if path_validation.verified_prefixes.contains(&current) {
+                    continue;
+                }
                 let metadata =
                     fs::symlink_metadata(&current).map_err(|error| match error.kind() {
                         std::io::ErrorKind::NotFound => RecipeCompilerError::SelectorClosure {
@@ -620,6 +662,7 @@ impl ContextPackRecipeCompiler {
                         path: Some(raw_path.to_string()),
                     });
                 }
+                path_validation.verified_prefixes.insert(current.clone());
             }
         }
 
@@ -794,8 +837,22 @@ impl ContextPackRecipe {
                     .to_string(),
             });
         }
+        self.validate_artifact_size_limit()?;
 
         Ok(())
+    }
+
+    fn validate_artifact_size_limit(&self) -> Result<(), RecipeCompilerError> {
+        let canonical_size = self.canonical_bytes()?.len();
+        if canonical_size <= MAX_RECIPE_ARTIFACT_BYTES {
+            return Ok(());
+        }
+        Err(RecipeCompilerError::RecipeValidation {
+            code: RecipeCompilerReasonCode::ArtifactTooLarge,
+            message: format!(
+                "recipe artifact exceeds maximum size ({canonical_size} > {MAX_RECIPE_ARTIFACT_BYTES})"
+            ),
+        })
     }
 
     /// Returns canonical JSON bytes for deterministic hashing/CAS storage.
@@ -994,7 +1051,7 @@ pub fn reconstruct_from_receipts(
     recipe.validate()?;
 
     let computed_hash = recipe.recipe_hash()?;
-    if computed_hash != fingerprint.recipe_hash {
+    if computed_hash.ct_ne(&fingerprint.recipe_hash).into() {
         return Err(RecipeCompilerError::HashMismatch {
             code: RecipeCompilerReasonCode::RecipeHashMismatch,
             expected_hex: hex::encode(fingerprint.recipe_hash),
@@ -1003,19 +1060,17 @@ pub fn reconstruct_from_receipts(
         });
     }
 
-    let recipe_bindings = (
-        recipe.role_spec_hash,
-        recipe.required_read_digest_set_hash,
-        recipe.context_manifest_hash,
-        recipe.budget_profile_hash,
-    );
-    let fingerprint_bindings = (
-        fingerprint.role_hash,
-        fingerprint.required_read_digest_set_hash,
-        fingerprint.context_manifest_hash,
-        fingerprint.budget_profile_hash,
-    );
-    if recipe_bindings != fingerprint_bindings {
+    let bindings_mismatch = recipe.role_spec_hash.ct_ne(&fingerprint.role_hash)
+        | recipe
+            .required_read_digest_set_hash
+            .ct_ne(&fingerprint.required_read_digest_set_hash)
+        | recipe
+            .context_manifest_hash
+            .ct_ne(&fingerprint.context_manifest_hash)
+        | recipe
+            .budget_profile_hash
+            .ct_ne(&fingerprint.budget_profile_hash);
+    if bindings_mismatch.into() {
         return Err(RecipeCompilerError::RecipeValidation {
             code: RecipeCompilerReasonCode::FingerprintMismatch,
             message: "reconstructed recipe fields do not match drift fingerprint".to_string(),
@@ -1505,6 +1560,46 @@ mod tests {
     }
 
     #[test]
+    fn selector_closure_rejects_excessive_aggregate_component_count() {
+        let workspace = setup_workspace();
+        let compiler =
+            ContextPackRecipeCompiler::new(workspace.path()).expect("compiler should initialize");
+
+        let shared_components: Vec<String> =
+            (0..24).map(|index| format!("deep{index:02}")).collect();
+        let shared_prefix = shared_components.join("/");
+        let shared_dir = workspace.path().join(&shared_prefix);
+        fs::create_dir_all(&shared_dir).expect("deep directory structure should be created");
+
+        let mut required_read_paths = BTreeSet::new();
+        let mut required_read_digests = BTreeMap::new();
+        for index in 0..2001usize {
+            let file_name = format!("file_{index:04}.txt");
+            fs::write(shared_dir.join(&file_name), b"component budget")
+                .expect("required read fixture should be created");
+            let path = format!("{shared_prefix}/{file_name}");
+            required_read_paths.insert(path.clone());
+            required_read_digests.insert(path.clone(), *blake3::hash(path.as_bytes()).as_bytes());
+        }
+
+        let selector = ContextPackSelectorInput {
+            role_spec_hash: [0x41; 32],
+            required_read_paths,
+            required_read_digests,
+            context_manifest_hash: [0x42; 32],
+            budget_profile_hash: [0x43; 32],
+        };
+
+        let error = compiler
+            .compile(&selector)
+            .expect_err("aggregate component validation budget should be enforced");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::AggregateComponentLimitExceeded
+        );
+    }
+
+    #[test]
     fn selector_closure_rejects_missing_required_digest() {
         let workspace = setup_workspace();
         let compiler =
@@ -1701,6 +1796,36 @@ mod tests {
         assert_eq!(
             error.reason_code(),
             RecipeCompilerReasonCode::MissingCasRequiredReadDigest
+        );
+    }
+
+    #[test]
+    fn recipe_validate_rejects_oversized_canonical_artifact() {
+        let mut required_read_paths = Vec::new();
+        let mut required_read_digests = BTreeMap::new();
+        let repeated_component = "component".repeat(16);
+
+        for index in 0..6_000usize {
+            let path = format!("oversized/{index:05}/{repeated_component}.txt");
+            required_read_paths.push(path.clone());
+            required_read_digests.insert(path, [0x5A; 32]);
+        }
+
+        let required_read_digest_set_hash =
+            compute_required_read_digest_set_hash(&required_read_digests)
+                .expect("digest set hash should compute");
+        let error = ContextPackRecipe::new(
+            [0x10; 32],
+            required_read_paths,
+            required_read_digests,
+            required_read_digest_set_hash,
+            [0x20; 32],
+            [0x30; 32],
+        )
+        .expect_err("oversized canonical recipe artifact should fail validation");
+        assert_eq!(
+            error.reason_code(),
+            RecipeCompilerReasonCode::ArtifactTooLarge
         );
     }
 
