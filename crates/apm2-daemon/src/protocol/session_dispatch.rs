@@ -79,7 +79,7 @@ use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, error, info, warn};
 
-use super::dispatch::{ConnectionContext, LedgerEventEmitter};
+use super::dispatch::{ConnectionContext, LedgerEventEmitter, PrivilegedDispatcher};
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     BoundedDecode, DecisionType, DecodeConfig, EmitEventRequest, EmitEventResponse,
@@ -608,6 +608,11 @@ impl V1ManifestStore {
 /// Shared reference to a [`V1ManifestStore`].
 pub type SharedV1ManifestStore = Arc<V1ManifestStore>;
 
+fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
+    static DISPATCHER: std::sync::OnceLock<PrivilegedDispatcher> = std::sync::OnceLock::new();
+    DISPATCHER.get_or_init(PrivilegedDispatcher::new)
+}
+
 // ============================================================================
 // Dispatcher
 // ============================================================================
@@ -650,6 +655,8 @@ pub type SharedV1ManifestStore = Arc<V1ManifestStore>;
 pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Token minter for validation.
     token_minter: TokenMinter,
+    /// Daemon signer used to issue channel context tokens.
+    channel_context_signer: Arc<apm2_core::crypto::Signer>,
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
     /// Manifest store for capability validation (TCK-00260).
@@ -795,6 +802,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
     pub fn new(token_minter: TokenMinter) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config: DecodeConfig::default(),
             manifest_store: None,
             ledger: None,
@@ -824,6 +832,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
     pub fn with_decode_config(token_minter: TokenMinter, decode_config: DecodeConfig) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config,
             manifest_store: None,
             ledger: None,
@@ -858,6 +867,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     pub fn with_manifest_store(token_minter: TokenMinter, manifest_store: Arc<M>) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config: DecodeConfig::default(),
             manifest_store: Some(manifest_store),
             ledger: None,
@@ -892,6 +902,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config,
             manifest_store: Some(manifest_store),
             ledger: None,
@@ -942,6 +953,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config: DecodeConfig::default(),
             manifest_store: Some(manifest_store),
             ledger: Some(ledger),
@@ -971,6 +983,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     pub fn with_ledger(mut self, ledger: Arc<dyn LedgerEventEmitter>) -> Self {
         self.ledger = Some(ledger);
         self
+    }
+
+    /// Sets the signer used for channel context token issuance.
+    #[must_use]
+    pub fn with_channel_context_signer(mut self, signer: Arc<apm2_core::crypto::Signer>) -> Self {
+        self.channel_context_signer = signer;
+        self
+    }
+
+    /// Returns the public verifying key used to validate channel context
+    /// tokens issued by this dispatcher.
+    #[must_use]
+    pub fn channel_context_verifying_key(&self) -> apm2_core::crypto::VerifyingKey {
+        self.channel_context_signer.verifying_key()
     }
 
     /// Sets the content-addressed store for `PublishEvidence`.
@@ -1599,6 +1625,56 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[inline]
     const fn is_authoritative_mode(&self) -> bool {
         self.ledger.is_some() || self.cas.is_some()
+    }
+
+    #[inline]
+    const fn requires_channel_boundary_enforcement(tool_class: ToolClass) -> bool {
+        !matches!(
+            tool_class,
+            ToolClass::Read | ToolClass::ListFiles | ToolClass::Search
+        )
+    }
+
+    const fn tool_decision_broker_verified(
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+    ) -> bool {
+        matches!(
+            decision,
+            Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
+        )
+    }
+
+    const fn tool_decision_capability_verified(
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+    ) -> bool {
+        matches!(
+            decision,
+            Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
+        )
+    }
+
+    const fn tool_decision_policy_verified(
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+    ) -> bool {
+        matches!(
+            decision,
+            Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
+        )
+    }
+
+    fn format_channel_boundary_defects(
+        defects: &[apm2_core::channel::ChannelBoundaryDefect],
+    ) -> String {
+        let payload = defects
+            .iter()
+            .map(|defect| {
+                serde_json::json!({
+                    "violation_class": defect.violation_class,
+                    "detail": defect.detail,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_string())
     }
 
     fn derive_pcac_risk_tier_from_policy(
@@ -2523,17 +2599,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     "PCAC authority denied: revocation provider unavailable (fail-closed)",
                 ));
             }
-            let pcac_policy = session_state
-                .pcac_policy
-                .clone()
-                .unwrap_or(PcacPolicyKnobs {
-                    lifecycle_enforcement: true,
-                    min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
-                    freshness_max_age_ticks: 100,
-                    // Fail closed for Tier2+ until authoritative runtime
-                    // sovereignty state/policy is hydrated.
-                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
-                });
+            let mut pcac_policy = session_state.pcac_policy.clone().unwrap_or_default();
+            if pcac_policy.pointer_only_waiver.is_none() {
+                pcac_policy
+                    .pointer_only_waiver
+                    .clone_from(&session_state.pointer_only_waiver);
+            }
 
             let capability_manifest_hash: Hash =
                 if let Ok(hash) = session_state.capability_manifest_hash.as_slice().try_into() {
@@ -3186,6 +3257,60 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Self::enforce_mandatory_defect_termination(decision, &token.session_id, &defects);
         let decision_requires_termination = matches!(&decision, Ok(ToolDecision::Terminate { .. }));
 
+        let channel_context_token = if Self::requires_channel_boundary_enforcement(tool_class) {
+            let policy_ledger_verified = Self::tool_decision_policy_verified(&decision);
+            let broker_verified = Self::tool_decision_broker_verified(&decision);
+            let capability_verified = Self::tool_decision_capability_verified(&decision);
+            let context_firewall_verified = defects.is_empty();
+            let all_verification_flags_true = broker_verified
+                && capability_verified
+                && context_firewall_verified
+                && policy_ledger_verified;
+
+            if all_verification_flags_true {
+                match channel_boundary_dispatcher()
+                    .validate_channel_boundary_and_issue_context_token(
+                        self.channel_context_signer.as_ref(),
+                        &token.lease_id,
+                        &request_id,
+                        timestamp_ns / 1_000_000_000,
+                        &tool_class,
+                        policy_ledger_verified,
+                        broker_verified,
+                        capability_verified,
+                        context_firewall_verified,
+                    ) {
+                    Ok(token) => Some(token),
+                    Err(defects) => {
+                        let defects_json = Self::format_channel_boundary_defects(&defects);
+                        warn!(
+                            session_id = %token.session_id,
+                            tool_class = %tool_class,
+                            defects = %defects_json,
+                            "RequestTool denied by channel-boundary enforcement"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("channel boundary validation failed: {defects_json}"),
+                        ));
+                    },
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(channel_context_token) = channel_context_token.as_deref() {
+            debug!(
+                session_id = %token.session_id,
+                tool_class = %tool_class,
+                token_len = channel_context_token.len(),
+                "channel context token issued for actuation request"
+            );
+        }
+
         let mut response = self.handle_broker_decision(
             decision,
             &token.session_id,
@@ -3197,6 +3322,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             verified_content,
             toctou_verification_required,
             pending_pcac,
+            channel_context_token,
         );
 
         if !defects.is_empty() {
@@ -3304,6 +3430,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         mut verified_content: Option<VerifiedToolContent>,
         toctou_verification_required: bool,
         pending_pcac: Option<PendingPcacAuthority>,
+        channel_context_token: Option<String>,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -3867,6 +3994,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: policy_hash.to_vec(),
                     result_hash,
                     inline_result,
+                    channel_context_token,
                     stop_checked,
                     budget_checked,
                     budget_enforcement_deferred,
@@ -3902,6 +4030,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: policy_hash.to_vec(),
                     result_hash: None,
                     inline_result: None,
+                    channel_context_token,
                     stop_checked,
                     budget_checked,
                     budget_enforcement_deferred,
@@ -3956,6 +4085,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: Vec::new(),
                     result_hash,
                     inline_result,
+                    channel_context_token,
                     stop_checked,
                     budget_checked,
                     budget_enforcement_deferred,
@@ -5724,6 +5854,7 @@ mod tests {
             policy_hash: vec![],
             result_hash: None,
             inline_result: None,
+            channel_context_token: None,
             stop_checked: false,
             budget_checked: false,
             budget_enforcement_deferred: false,
@@ -5732,6 +5863,228 @@ mod tests {
         let encoded = tool_resp.encode();
         assert!(!encoded.is_empty());
         assert_eq!(encoded[0], SessionMessageType::RequestTool.tag());
+    }
+
+    #[test]
+    fn test_daemon_tool_request_validates_channel_boundary() {
+        use crate::episode::preactuation::{PreActuationGate, StopAuthority};
+        use crate::episode::{InMemorySessionRegistry, ToolBroker, ToolBrokerConfig, ToolClass};
+        use crate::htf::{ClockConfig, HolonicClock};
+        use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let minter = test_minter();
+            let token = test_token(&minter);
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest =
+                tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Execute]);
+            manifest_store.register("session-001", manifest.clone());
+
+            let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
+            broker
+                .initialize_with_manifest(manifest)
+                .await
+                .expect("broker manifest initialization should succeed");
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: "session-001".to_string(),
+                    work_id: "W-BOUNDARY-001".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-boundary-001".to_string(),
+                    policy_resolved_ref: "policy-resolved-ref-001".to_string(),
+                    capability_manifest_hash: blake3::hash(b"boundary-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some("session-001".to_string()),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                })
+                .expect("session registration should succeed");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let started_at_ns = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|duration| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let value = duration.as_nanos() as u64;
+                    value
+                })
+                .unwrap_or(1);
+            telemetry
+                .register("session-001", started_at_ns)
+                .expect("telemetry registration should succeed");
+
+            let authority = Arc::new(StopAuthority::new());
+            let gate = Arc::new(PreActuationGate::production_gate(
+                Arc::clone(&authority),
+                None,
+            ));
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("default clock should initialize"),
+            );
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), manifest_store)
+                .with_broker(broker)
+                .with_clock(clock)
+                .with_session_registry(registry_dyn)
+                .with_telemetry_store(telemetry)
+                .with_preactuation_gate(gate)
+                .with_stop_authority(authority);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "execute".to_string(),
+                arguments: serde_json::to_vec(&serde_json::json!({
+                    "command": "echo",
+                    "args": ["hello"]
+                }))
+                .expect("arguments serialization"),
+                dedupe_key: "boundary-typed-tool".to_string(),
+                epoch_seal: None,
+            };
+            let frame = encode_request_tool_request(&request);
+            let typed_response = dispatcher
+                .dispatch(&frame, &make_session_ctx())
+                .expect("typed request dispatch should complete");
+
+            match typed_response {
+                SessionResponse::Error(err) => {
+                    assert!(
+                        !err.message.contains("channel boundary validation failed"),
+                        "typed tool path must not fail channel boundary validation: {}",
+                        err.message
+                    );
+                },
+                SessionResponse::RequestTool(_) => {},
+                other => panic!("unexpected response for typed request: {other:?}"),
+            }
+
+            let unknown_request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).expect("token serialization"),
+                tool_id: "unknown-tool".to_string(),
+                arguments: b"{}".to_vec(),
+                dedupe_key: "boundary-unknown-tool".to_string(),
+                epoch_seal: None,
+            };
+            let unknown_frame = encode_request_tool_request(&unknown_request);
+            let unknown_response = dispatcher
+                .dispatch(&unknown_frame, &make_session_ctx())
+                .expect("unknown request dispatch should complete");
+
+            match unknown_response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("unknown tool class"),
+                        "unknown source should be denied in dispatch path: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected unknown tool denial, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_channel_context_token_roundtrip() {
+        use apm2_core::channel::{ChannelSource, decode_channel_context_token};
+
+        use crate::episode::ToolClass;
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let issued_at_secs = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("current time should be after unix epoch")
+            .as_secs();
+        let token = channel_boundary_dispatcher()
+            .validate_channel_boundary_and_issue_context_token(
+                &signer,
+                "lease-1",
+                "REQ-1",
+                issued_at_secs,
+                &ToolClass::Execute,
+                true,
+                true,
+                true,
+                true,
+            )
+            .expect("daemon should issue channel context token");
+
+        let decoded = decode_channel_context_token(
+            &token,
+            &signer.verifying_key(),
+            "lease-1",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_secs(),
+            "REQ-1",
+        )
+        .expect("token should decode");
+        assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
+        assert!(
+            decoded.channel_source_witness.is_some(),
+            "decoded token should include witness"
+        );
+    }
+
+    #[test]
+    fn test_channel_verification_flags_false_on_deny() {
+        use crate::episode::capability::DenyReason;
+
+        let decision = Ok(ToolDecision::Deny {
+            request_id: "REQ-DENY-001".to_string(),
+            reason: DenyReason::PolicyDenied {
+                rule_id: "rule-deny".to_string(),
+                reason: "policy denied".to_string(),
+            },
+            rule_id: Some("rule-deny".to_string()),
+            policy_hash: [0x11; 32],
+        });
+
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_broker_verified(&decision)
+        );
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_capability_verified(
+                &decision
+            )
+        );
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_policy_verified(&decision)
+        );
+    }
+
+    #[test]
+    fn test_channel_verification_flags_false_on_broker_error() {
+        let decision = Err(crate::episode::BrokerError::Internal {
+            message: "broker unavailable".to_string(),
+        });
+
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_broker_verified(&decision)
+        );
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_capability_verified(
+                &decision
+            )
+        );
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_policy_verified(&decision)
+        );
     }
 
     // ========================================================================
@@ -6580,6 +6933,7 @@ mod tests {
                     None,
                     false,
                     None,
+                    None,
                 )
                 .expect("dispatch should return application-level error response");
 
@@ -6621,6 +6975,7 @@ mod tests {
             fn join(
                 &self,
                 input: &AuthorityJoinInputV1,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
             ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
                 self.joins.fetch_add(1, Ordering::SeqCst);
                 let mut hasher = blake3::Hasher::new();
@@ -6638,6 +6993,7 @@ mod tests {
                     issued_time_envelope_ref: input.time_envelope_ref,
                     as_of_ledger_anchor: input.as_of_ledger_anchor,
                     expires_at_tick: u64::MAX,
+                    issued_at_tick: 1,
                     revocation_head_hash: input.directory_head_hash,
                     identity_evidence_level: input.identity_evidence_level,
                     admission_capacity_token: None,
@@ -6650,6 +7006,7 @@ mod tests {
                 current_time_envelope_ref: Hash,
                 current_ledger_anchor: Hash,
                 current_revocation_head_hash: Hash,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
             ) -> Result<(), Box<AuthorityDenyV1>> {
                 self.revalidations.fetch_add(1, Ordering::SeqCst);
                 if current_revocation_head_hash != cert.revocation_head_hash {
@@ -6673,6 +7030,7 @@ mod tests {
                 _requires_authoritative_acceptance: bool,
                 current_time_envelope_ref: Hash,
                 _current_revocation_head_hash: Hash,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
             ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
             {
                 self.consumes.fetch_add(1, Ordering::SeqCst);
@@ -7036,6 +7394,7 @@ mod tests {
                             freshness_max_age_ticks: 100,
                             tier2_sovereignty_mode:
                                 apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                            pointer_only_waiver: None,
                         }),
                         pointer_only_waiver: None,
                         capability_manifest_hash: blake3::hash(b"pcac-stage2-principal")
@@ -7217,6 +7576,7 @@ mod tests {
                 issued_time_envelope_ref: [0x44; 32],
                 as_of_ledger_anchor: [0x55; 32],
                 expires_at_tick: u64::MAX,
+                issued_at_tick: 1,
                 revocation_head_hash: session_revocation_head,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 admission_capacity_token: None,
@@ -7232,6 +7592,7 @@ mod tests {
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: 100,
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                    pointer_only_waiver: None,
                 },
                 principal_id: "principal-A".to_string(),
                 membership_verified: true,
@@ -7261,6 +7622,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -7357,6 +7719,7 @@ mod tests {
                 issued_time_envelope_ref: [0x33; 32],
                 as_of_ledger_anchor: current_ledger_anchor,
                 expires_at_tick: u64::MAX,
+                issued_at_tick: 1,
                 revocation_head_hash: current_revocation_head,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 admission_capacity_token: None,
@@ -7382,8 +7745,9 @@ mod tests {
                 pcac_policy: apm2_core::pcac::PcacPolicyKnobs {
                     lifecycle_enforcement: true,
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
-                    freshness_max_age_ticks: 100,
+                    freshness_max_age_ticks: u64::MAX,
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Disabled,
+                    pointer_only_waiver: None,
                 },
                 principal_id: "lease-001".to_string(),
                 membership_verified: true,
@@ -7414,6 +7778,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -7520,6 +7885,7 @@ mod tests {
                 issued_time_envelope_ref: current_time_envelope_ref,
                 as_of_ledger_anchor: current_ledger_anchor,
                 expires_at_tick: u64::MAX,
+                issued_at_tick: 1,
                 revocation_head_hash: current_revocation_head,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 admission_capacity_token: None,
@@ -7536,6 +7902,7 @@ mod tests {
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: u64::MAX,
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Disabled,
+                    pointer_only_waiver: None,
                 },
                 principal_id: "lease-001".to_string(),
                 membership_verified: true,
@@ -7566,6 +7933,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -7649,6 +8017,7 @@ mod tests {
                 issued_time_envelope_ref: [0x13; 32],
                 as_of_ledger_anchor: current_ledger_anchor,
                 expires_at_tick: u64::MAX,
+                issued_at_tick: 1,
                 revocation_head_hash: current_revocation_head,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 admission_capacity_token: None,
@@ -7666,6 +8035,7 @@ mod tests {
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: 100,
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                    pointer_only_waiver: None,
                 },
                 principal_id: "lease-001".to_string(),
                 membership_verified: true,
@@ -7695,6 +8065,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                 )
                 .expect("dispatch should return application-level response");
 
@@ -7780,6 +8151,7 @@ mod tests {
                 issued_time_envelope_ref: [0x33; 32],
                 as_of_ledger_anchor: current_ledger_anchor,
                 expires_at_tick: u64::MAX,
+                issued_at_tick: 1,
                 revocation_head_hash: current_revocation_head,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 admission_capacity_token: None,
@@ -7797,6 +8169,7 @@ mod tests {
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: 100,
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                    pointer_only_waiver: None,
                 },
                 principal_id: "lease-001".to_string(),
                 membership_verified: true,
@@ -7826,6 +8199,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                 )
                 .expect("dispatch should return application-level response");
 

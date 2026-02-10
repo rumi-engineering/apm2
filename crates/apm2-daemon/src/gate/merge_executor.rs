@@ -41,6 +41,9 @@ use std::sync::Arc;
 
 use apm2_core::crypto::Signer;
 use apm2_core::fac::{MergeReceipt, PolicyResolvedForChangeSet, ReasonCode, ReviewBlockedRecorded};
+use apm2_core::ledger::EventRecord;
+use apm2_core::work::{EventFamilyPromotionGate, WorkReducerState};
+use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -56,6 +59,16 @@ use super::orchestrator::{Clock, GateOutcome, SystemClock};
 /// Prevents unbounded memory growth. When reached, new merge requests
 /// are rejected with fail-closed semantics.
 pub const MAX_PENDING_MERGES: usize = 1_000;
+
+/// Maximum number of work events accepted per merge input.
+///
+/// Prevents unbounded CPU/memory usage in the promotion gate.
+pub const MAX_WORK_EVENTS: usize = 10_000;
+
+/// Maximum aggregate payload bytes across all work events.
+///
+/// Prevents expensive JSON/protobuf decode under adversarial payload sizing.
+pub const MAX_WORK_EVENTS_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 /// Maximum length of any string field in merge executor events.
 const MAX_STRING_LENGTH: usize = 4096;
@@ -147,6 +160,30 @@ pub enum MergeExecutorError {
         max: usize,
     },
 
+    /// Work event list exceeds bounded merge-input limit.
+    #[error("work_events count {actual} exceeds maximum {max} for work_id {work_id}")]
+    WorkEventLimitExceeded {
+        /// The work ID.
+        work_id: String,
+        /// Actual work event count.
+        actual: usize,
+        /// Maximum allowed work event count.
+        max: usize,
+    },
+
+    /// Aggregate event payload bytes exceed bounded merge-input limit.
+    #[error(
+        "work_events aggregate payload {actual_bytes} bytes exceeds maximum {max_bytes} for work_id {work_id}"
+    )]
+    WorkEventByteLimitExceeded {
+        /// The work ID.
+        work_id: String,
+        /// Actual aggregate payload bytes.
+        actual_bytes: usize,
+        /// Maximum allowed aggregate payload bytes.
+        max_bytes: usize,
+    },
+
     /// Missing PR number for merge.
     #[error("no PR number associated with work_id {work_id}")]
     MissingPrNumber {
@@ -159,6 +196,19 @@ pub enum MergeExecutorError {
     MissingPolicyResolution {
         /// The work ID.
         work_id: String,
+    },
+
+    /// Event-family promotion gate blocked the merge.
+    #[error("event-family promotion gate blocked for work_id {work_id}: {reason}")]
+    PromotionGateBlocked {
+        /// The work ID.
+        work_id: String,
+        /// Reason for blocking.
+        reason: String,
+        /// Structured defect records from promotion gate evaluation.
+        ///
+        /// Not included in Display (can be large).
+        defect_records: Vec<apm2_core::events::DefectRecorded>,
     },
 }
 
@@ -228,6 +278,21 @@ pub enum MergeExecutorEvent {
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
+    /// Promotion gate denied merge — defect records emitted for ledger
+    /// persistence.
+    PromotionGateDenied {
+        /// The work ID.
+        work_id: String,
+        /// Number of defect records.
+        defect_count: usize,
+        /// Serialized defect records for ledger persistence
+        /// (protobuf-encoded bytes).
+        defect_payloads: Vec<Vec<u8>>,
+        /// Summary reason for the denial.
+        reason: String,
+        /// Timestamp (ms since epoch).
+        timestamp_ms: u64,
+    },
 }
 
 // =============================================================================
@@ -254,6 +319,14 @@ pub struct MergeInput {
     pub policy_resolution: PolicyResolvedForChangeSet,
     /// The actor ID performing the merge.
     pub actor_id: String,
+    /// Ledger events for this `work_id`.
+    ///
+    /// Must be non-empty; empty `work_events` are rejected (fail-closed).
+    pub work_events: Vec<EventRecord>,
+    /// Expected reducer state for replay-equivalence validation.
+    ///
+    /// Required when `work_events` are provided.
+    pub expected_reducer_state: Option<WorkReducerState>,
 }
 
 // =============================================================================
@@ -386,6 +459,102 @@ impl MergeExecutor {
     ) -> Result<(MergeReceipt, Vec<MergeExecutorEvent>), MergeExecutorError> {
         // Step 0: Validate input
         Self::validate_input(input)?;
+
+        // REQ-HEF-0014: Event-family parity and replay-equivalence gate.
+        // Promotion is blocked unless parity and replay-equivalence checks pass.
+        // This MUST happen BEFORE the irreversible squash merge (fail-closed).
+        if input.work_events.is_empty() {
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: "work_events must not be empty (fail-closed: promotion gate requires event history)"
+                    .to_string(),
+                defect_records: Vec::new(),
+            });
+        }
+
+        let expected_state = input.expected_reducer_state.as_ref().ok_or_else(|| {
+            MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: "work_events provided but expected_reducer_state is None (fail-closed)"
+                    .to_string(),
+                defect_records: Vec::new(),
+            }
+        })?;
+
+        // REQ-HEF-0014: Bind work_events to input.work_id — reject foreign events.
+        for (idx, event) in input.work_events.iter().enumerate() {
+            if event.session_id != input.work_id {
+                return Err(MergeExecutorError::PromotionGateBlocked {
+                    work_id: input.work_id.clone(),
+                    reason: format!(
+                        "work_events[{idx}] has session_id '{}' which does not match work_id '{}' (binding violation)",
+                        event.session_id, input.work_id
+                    ),
+                    defect_records: Vec::new(),
+                });
+            }
+        }
+
+        // Verify expected_reducer_state is keyed only to this work_id.
+        if expected_state.get(&input.work_id).is_none() {
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "expected_reducer_state does not contain work_id '{}' (binding violation)",
+                    input.work_id
+                ),
+                defect_records: Vec::new(),
+            });
+        }
+        if expected_state.len() > 1 {
+            let mut foreign_work_ids: Vec<&str> = expected_state
+                .work_items
+                .keys()
+                .filter_map(|key| (key.as_str() != input.work_id).then_some(key.as_str()))
+                .collect();
+            foreign_work_ids.sort_unstable();
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "expected_reducer_state contains foreign work_ids [{}] for work_id '{}' (binding violation)",
+                    foreign_work_ids.join(", "),
+                    input.work_id
+                ),
+                defect_records: Vec::new(),
+            });
+        }
+
+        let gate_result = EventFamilyPromotionGate::evaluate(&input.work_events, expected_state)
+            .map_err(|e| MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!("promotion gate evaluation error: {e}"),
+                defect_records: Vec::new(),
+            })?;
+
+        if !gate_result.allowed {
+            let defect_descriptions: Vec<String> = gate_result
+                .defect_records
+                .iter()
+                .map(|d| format!("{}:{}", d.defect_type, d.defect_id))
+                .collect();
+            warn!(
+                work_id = %input.work_id,
+                parity_defect_count = gate_result.parity_defects.len(),
+                replay_passed = gate_result.replay_passed,
+                defects = ?defect_descriptions,
+                "Event-family promotion gate DENIED: merge blocked"
+            );
+            return Err(MergeExecutorError::PromotionGateBlocked {
+                work_id: input.work_id.clone(),
+                reason: format!(
+                    "parity_defects={}, replay_passed={}, defects=[{}]",
+                    gate_result.parity_defects.len(),
+                    gate_result.replay_passed,
+                    defect_descriptions.join(", "),
+                ),
+                defect_records: gate_result.defect_records,
+            });
+        }
 
         // Step 1: Verify all gates passed
         Self::verify_all_gates_passed(input)?;
@@ -560,6 +729,23 @@ impl MergeExecutor {
                 let (blocked, events) = self.handle_merge_conflict(input, reason);
                 Ok((None, Some(blocked), events))
             },
+            Err(MergeExecutorError::PromotionGateBlocked {
+                ref work_id,
+                ref reason,
+                ref defect_records,
+            }) => {
+                let now_ms = self.clock.now_ms();
+                let defect_payloads: Vec<Vec<u8>> =
+                    defect_records.iter().map(Message::encode_to_vec).collect();
+                let events = vec![MergeExecutorEvent::PromotionGateDenied {
+                    work_id: work_id.clone(),
+                    defect_count: defect_records.len(),
+                    defect_payloads,
+                    reason: reason.clone(),
+                    timestamp_ms: now_ms,
+                }];
+                Ok((None, None, events))
+            },
             Err(e) => Err(e),
         }
     }
@@ -577,6 +763,23 @@ impl MergeExecutor {
             return Err(MergeExecutorError::WorkIdTooLong {
                 actual: input.work_id.len(),
                 max: MAX_STRING_LENGTH,
+            });
+        }
+        if input.work_events.len() > MAX_WORK_EVENTS {
+            return Err(MergeExecutorError::WorkEventLimitExceeded {
+                work_id: input.work_id.clone(),
+                actual: input.work_events.len(),
+                max: MAX_WORK_EVENTS,
+            });
+        }
+        let total_bytes = input.work_events.iter().fold(0usize, |total, event| {
+            total.saturating_add(event.payload.len())
+        });
+        if total_bytes > MAX_WORK_EVENTS_BYTES {
+            return Err(MergeExecutorError::WorkEventByteLimitExceeded {
+                work_id: input.work_id.clone(),
+                actual_bytes: total_bytes,
+                max_bytes: MAX_WORK_EVENTS_BYTES,
             });
         }
         if input.gate_outcomes.is_empty() {
@@ -632,6 +835,8 @@ mod tests {
     use std::time::Instant;
 
     use apm2_core::fac::PolicyResolvedForChangeSetBuilder;
+    use apm2_core::reducer::{Reducer, ReducerContext};
+    use apm2_core::work::{WorkReducer, helpers};
 
     use super::*;
 
@@ -687,7 +892,38 @@ mod tests {
         }
     }
 
+    fn make_event(
+        event_type: &str,
+        session_id: &str,
+        actor_id: &str,
+        payload: Vec<u8>,
+        ts: u64,
+        seq: u64,
+    ) -> EventRecord {
+        EventRecord::with_timestamp(event_type, session_id, actor_id, payload, ts).with_seq_id(seq)
+    }
+
+    fn make_valid_work_events(work_id: &str) -> (Vec<EventRecord>, WorkReducerState) {
+        let opened_payload =
+            helpers::work_opened_payload(work_id, "TICKET", vec![1, 2, 3], vec![], vec![]);
+        let events = vec![
+            EventRecord::with_timestamp(
+                "work.opened",
+                work_id,
+                "actor:test",
+                opened_payload,
+                1_000,
+            )
+            .with_seq_id(1),
+        ];
+        let mut reducer = WorkReducer::new();
+        let ctx = ReducerContext::new(1);
+        reducer.apply(&events[0], &ctx).unwrap();
+        (events, reducer.state().clone())
+    }
+
     fn create_test_input(signer: &Signer) -> MergeInput {
+        let (work_events, expected_reducer_state) = make_valid_work_events("work-001");
         let policy_resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
             .resolved_risk_tier(1)
             .resolved_determinism_class(0)
@@ -722,6 +958,8 @@ mod tests {
             ],
             policy_resolution,
             actor_id: "merge-executor-test".to_string(),
+            work_events,
+            expected_reducer_state: Some(expected_reducer_state),
         }
     }
 
@@ -1004,6 +1242,316 @@ mod tests {
         assert!(matches!(
             result,
             Err(MergeExecutorError::WorkIdTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_promotion_gate_blocks_merge_on_parity_defects() {
+        let signer = Arc::new(Signer::generate());
+        let clock = Arc::new(MockClock {
+            now_ms: 1_704_067_200_000,
+        });
+        let executor = MergeExecutor::with_clock(Arc::clone(&signer), "merge-executor", clock);
+
+        let mut input = create_test_input(&signer);
+
+        // Create mismatched events that will cause parity defects:
+        // A daemon event with different actor than the dotted event
+        let work_id = "work-001";
+        let ts = 1_000u64;
+
+        let opened_payload =
+            helpers::work_opened_payload(work_id, "TICKET", vec![1, 2, 3], vec![], vec![]);
+        let events = vec![
+            make_event("work.opened", work_id, "actor:a", opened_payload, ts, 1),
+            // Daemon event with different actor (will cause parity defect)
+            make_event(
+                "work_claimed",
+                work_id,
+                "actor:WRONG",
+                serde_json::json!({
+                    "event_type": "work_claimed",
+                    "work_id": work_id,
+                    "actor_id": "actor:WRONG",
+                    "rationale_code": "wrong_rationale",
+                    "previous_transition_count": 0
+                })
+                .to_string()
+                .into_bytes(),
+                ts + 100,
+                2,
+            ),
+            // Dotted event with correct actor
+            make_event(
+                "work.transitioned",
+                work_id,
+                "actor:a",
+                helpers::work_transitioned_payload_with_sequence(
+                    work_id, "OPEN", "CLAIMED", "claim", 0,
+                ),
+                ts + 100,
+                3,
+            ),
+        ];
+
+        // Build expected state from just the dotted events
+        let mut reducer = WorkReducer::new();
+        let ctx = ReducerContext::new(1);
+        reducer.apply(&events[0], &ctx).unwrap();
+        reducer.apply(&events[2], &ReducerContext::new(3)).unwrap();
+        let expected_state = reducer.state().clone();
+
+        input.work_events = events;
+        input.expected_reducer_state = Some(expected_state);
+
+        let adapter = SuccessAdapter {
+            result_sha: "abc123def456".to_string(),
+        };
+        let result = executor.execute_merge(&input, &adapter);
+
+        assert!(result.is_err(), "merge must be blocked by promotion gate");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MergeExecutorError::PromotionGateBlocked { .. }),
+            "error must be PromotionGateBlocked, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_execute_or_block_emits_promotion_gate_denied_event() {
+        let signer = Arc::new(Signer::generate());
+        let clock = Arc::new(MockClock {
+            now_ms: 1_704_067_200_000,
+        });
+        let executor = MergeExecutor::with_clock(Arc::clone(&signer), "merge-executor", clock);
+
+        let mut input = create_test_input(&signer);
+        let work_id = "work-001";
+        let ts = 1_000u64;
+
+        input.work_events = vec![
+            make_event(
+                "work.opened",
+                work_id,
+                "actor:a",
+                helpers::work_opened_payload(work_id, "TICKET", vec![1, 2, 3], vec![], vec![]),
+                ts,
+                1,
+            ),
+            make_event(
+                "work_claimed",
+                work_id,
+                "actor:WRONG",
+                serde_json::json!({
+                    "event_type": "work_claimed",
+                    "work_id": work_id,
+                    "actor_id": "actor:WRONG",
+                    "rationale_code": "wrong_rationale",
+                    "previous_transition_count": 0
+                })
+                .to_string()
+                .into_bytes(),
+                ts + 100,
+                2,
+            ),
+            make_event(
+                "work.transitioned",
+                work_id,
+                "actor:a",
+                helpers::work_transitioned_payload_with_sequence(
+                    work_id, "OPEN", "CLAIMED", "claim", 0,
+                ),
+                ts + 100,
+                3,
+            ),
+        ];
+
+        let mut reducer = WorkReducer::new();
+        reducer
+            .apply(&input.work_events[0], &ReducerContext::new(1))
+            .unwrap();
+        reducer
+            .apply(&input.work_events[2], &ReducerContext::new(3))
+            .unwrap();
+        input.expected_reducer_state = Some(reducer.state().clone());
+
+        let adapter = SuccessAdapter {
+            result_sha: "abc123def456".to_string(),
+        };
+
+        let (receipt, blocked, events) = executor.execute_or_block(&input, &adapter).unwrap();
+        assert!(receipt.is_none());
+        assert!(blocked.is_none());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            MergeExecutorEvent::PromotionGateDenied {
+                work_id,
+                defect_count,
+                defect_payloads,
+                ..
+            } => {
+                assert_eq!(work_id, "work-001");
+                assert!(*defect_count > 0);
+                assert_eq!(*defect_count, defect_payloads.len());
+                assert!(defect_payloads.iter().all(|payload| !payload.is_empty()));
+                let decoded = apm2_core::events::DefectRecorded::decode(&defect_payloads[0][..])
+                    .expect("serialized defect payload must decode");
+                assert!(!decoded.defect_id.is_empty());
+            },
+            other => panic!("expected PromotionGateDenied with defects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_merge_rejects_empty_work_events_fail_closed() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        input.work_events.clear();
+        input.expected_reducer_state = None;
+
+        let adapter = SuccessAdapter {
+            result_sha: "abc123".to_string(),
+        };
+
+        let result = executor.execute_merge(&input, &adapter);
+        assert!(
+            matches!(result, Err(MergeExecutorError::PromotionGateBlocked { .. })),
+            "expected fail-closed promotion gate error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_work_event_limit_exceeded_rejected() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        input.work_events = (0..=MAX_WORK_EVENTS)
+            .map(|i| {
+                EventRecord::with_timestamp(
+                    "work.opened",
+                    "work-001",
+                    "actor:test",
+                    helpers::work_opened_payload(
+                        "work-001",
+                        "TICKET",
+                        vec![1, 2, 3],
+                        vec![],
+                        vec![],
+                    ),
+                    1_000 + (i as u64),
+                )
+                .with_seq_id((i + 1) as u64)
+            })
+            .collect();
+        input.expected_reducer_state = Some(make_valid_work_events("work-001").1);
+
+        let adapter = SuccessAdapter {
+            result_sha: "sha-ok".to_string(),
+        };
+
+        let result = executor.execute_merge(&input, &adapter);
+        assert!(matches!(
+            result,
+            Err(MergeExecutorError::WorkEventLimitExceeded {
+                actual: _,
+                max: MAX_WORK_EVENTS,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_promotion_gate_rejects_foreign_work_events() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        let (foreign_events, foreign_expected_state) = make_valid_work_events("WRONG-WORK");
+        input.work_events = foreign_events;
+        input.expected_reducer_state = Some(foreign_expected_state);
+
+        let adapter = SuccessAdapter {
+            result_sha: "abc123def456".to_string(),
+        };
+
+        let err = executor.execute_merge(&input, &adapter).unwrap_err();
+        match err {
+            MergeExecutorError::PromotionGateBlocked {
+                work_id,
+                reason,
+                defect_records,
+            } => {
+                assert_eq!(work_id, "work-001");
+                assert!(reason.contains("binding violation"));
+                assert!(reason.contains("WRONG-WORK"));
+                assert!(defect_records.is_empty());
+            },
+            other => panic!("expected PromotionGateBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_promotion_gate_rejects_foreign_expected_reducer_state_entries() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        let (_, foreign_expected_state) = make_valid_work_events("foreign-work");
+        let mut expected = input
+            .expected_reducer_state
+            .clone()
+            .expect("test input should contain expected state");
+        expected
+            .work_items
+            .extend(foreign_expected_state.work_items);
+        input.expected_reducer_state = Some(expected);
+
+        let adapter = SuccessAdapter {
+            result_sha: "abc123def456".to_string(),
+        };
+
+        let err = executor.execute_merge(&input, &adapter).unwrap_err();
+        match err {
+            MergeExecutorError::PromotionGateBlocked { reason, .. } => {
+                assert!(reason.contains("expected_reducer_state contains foreign work_ids"));
+                assert!(reason.contains("foreign-work"));
+            },
+            other => panic!("expected PromotionGateBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_work_event_byte_limit_exceeded_rejected() {
+        let signer = Arc::new(Signer::generate());
+        let executor = MergeExecutor::new(Arc::clone(&signer), "merge-executor");
+
+        let mut input = create_test_input(&signer);
+        input.work_events = vec![
+            EventRecord::with_timestamp(
+                "work.opened",
+                "work-001",
+                "actor:test",
+                vec![0_u8; MAX_WORK_EVENTS_BYTES + 1],
+                1_000,
+            )
+            .with_seq_id(1),
+        ];
+
+        let adapter = SuccessAdapter {
+            result_sha: "sha-ok".to_string(),
+        };
+
+        let result = executor.execute_merge(&input, &adapter);
+        assert!(matches!(
+            result,
+            Err(MergeExecutorError::WorkEventByteLimitExceeded {
+                actual_bytes: _,
+                max_bytes: MAX_WORK_EVENTS_BYTES,
+                ..
+            })
         ));
     }
 }

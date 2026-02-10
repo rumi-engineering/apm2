@@ -96,6 +96,9 @@ pub struct RequestResponse {
     pub rule_id: Option<String>,
     /// Policy hash at decision time (hex-encoded).
     pub policy_hash: String,
+    /// Signed daemon-issued channel context token for FAC role launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_context_token: Option<String>,
 }
 
 /// Error response for JSON output.
@@ -198,6 +201,7 @@ fn run_request(args: &RequestArgs, socket_path: &Path, json_output: bool) -> u8 
                 decision: decision_str.to_string(),
                 rule_id: response.rule_id,
                 policy_hash: hex::encode(&response.policy_hash),
+                channel_context_token: response.channel_context_token,
             };
 
             if json_output {
@@ -214,6 +218,13 @@ fn run_request(args: &RequestArgs, socket_path: &Path, json_output: bool) -> u8 
                     println!("  Rule ID:      {rule}");
                 }
                 println!("  Policy Hash:  {}", request_response.policy_hash);
+                if let Some(ref token) = request_response.channel_context_token {
+                    println!("  Channel Context Token:  {token}");
+                    println!(
+                        "  Use with: apm2 fac role-launch ... --channel-context-token <token> --request-id {}",
+                        request_response.request_id
+                    );
+                }
             }
 
             exit_codes::SUCCESS
@@ -295,6 +306,7 @@ mod tests {
             decision: "ALLOW".to_string(),
             rule_id: None,
             policy_hash: "abc123".to_string(),
+            channel_context_token: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -310,6 +322,7 @@ mod tests {
             decision: "DENY".to_string(),
             rule_id: Some("rule-block-foo".to_string()),
             policy_hash: "def456".to_string(),
+            channel_context_token: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();

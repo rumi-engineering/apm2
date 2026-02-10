@@ -129,6 +129,16 @@ pub enum AuthorityDenyClass {
         predicate_id: String,
     },
 
+    /// Certificate age exceeded policy freshness maximum.
+    FreshnessExceeded {
+        /// Tick when the certificate was issued.
+        issued_at_tick: u64,
+        /// Current tick at revalidation/consume.
+        current_tick: u64,
+        /// Maximum admissible age in ticks from policy.
+        max_age_ticks: u64,
+    },
+
     /// The AJC has expired (tick > `expires_at_tick`).
     CertificateExpired {
         /// The tick at which the AJC expired.
@@ -240,6 +250,9 @@ pub enum AuthorityDenyClass {
     /// Waiver has expired or is invalid.
     WaiverExpiredOrInvalid,
 
+    /// Pointer-only waiver scope does not match request scope.
+    WaiverScopeInvalid,
+
     /// Policy explicitly denies this authority request.
     PolicyDeny {
         /// Machine-readable reason code.
@@ -276,6 +289,7 @@ pub enum AuthorityDenyClass {
 }
 
 impl std::fmt::Display for AuthorityDenyClass {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingRequiredField { field_name } => {
@@ -305,6 +319,14 @@ impl std::fmt::Display for AuthorityDenyClass {
             Self::TemporalArbitrationPersistentDisagreement { predicate_id } => write!(
                 f,
                 "temporal arbitration persistent disagreement for predicate {predicate_id}"
+            ),
+            Self::FreshnessExceeded {
+                issued_at_tick,
+                current_tick,
+                max_age_ticks,
+            } => write!(
+                f,
+                "freshness exceeded (issued_at_tick={issued_at_tick}, current_tick={current_tick}, max_age_ticks={max_age_ticks})"
             ),
             Self::CertificateExpired {
                 expired_at,
@@ -359,6 +381,7 @@ impl std::fmt::Display for AuthorityDenyClass {
                 write!(f, "pointer-only identity denied at Tier2+")
             },
             Self::WaiverExpiredOrInvalid => write!(f, "waiver expired or invalid"),
+            Self::WaiverScopeInvalid => write!(f, "waiver scope invalid"),
             Self::PolicyDeny { reason } => write!(f, "policy deny: {reason}"),
             Self::DelegationWidening => write!(f, "delegation widening"),
             Self::InvalidDelegationChain => write!(f, "invalid delegation chain"),

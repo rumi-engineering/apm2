@@ -18,7 +18,7 @@ use super::deny::AuthorityDenyClass;
 use super::intent_class::{AcceptanceFactClass, BoundaryIntentClass};
 use super::types::{
     MAX_CANONICALIZER_ID_LENGTH, MAX_CHECKPOINT_LENGTH, MAX_MERKLE_PROOF_STEPS,
-    PcacValidationError, RiskTier,
+    PcacValidationError, RiskTier, WaiverBindingMeta,
 };
 use crate::crypto::Hash;
 
@@ -163,6 +163,10 @@ pub struct AuthorityJoinReceiptV1 {
     /// Authoritative bindings (for authoritative mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoritative_bindings: Option<AuthoritativeBindings>,
+
+    /// Optional waiver metadata when `PointerOnly` was admitted under policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiver_binding_meta: Option<WaiverBindingMeta>,
 }
 
 // =============================================================================
@@ -683,6 +687,9 @@ impl AuthorityJoinReceiptV1 {
         if let Some(ref bindings) = self.authoritative_bindings {
             bindings.validate()?;
             validate_time_envelope_ref_coherence(&self.time_envelope_ref, bindings)?;
+        }
+        if let Some(ref waiver_meta) = self.waiver_binding_meta {
+            waiver_meta.validate()?;
         }
         Ok(())
     }

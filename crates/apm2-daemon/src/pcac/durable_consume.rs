@@ -473,9 +473,10 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
     fn join(
         &self,
         input: &apm2_core::pcac::AuthorityJoinInputV1,
+        policy: &apm2_core::pcac::PcacPolicyKnobs,
     ) -> Result<apm2_core::pcac::AuthorityJoinCertificateV1, Box<apm2_core::pcac::AuthorityDenyV1>>
     {
-        self.inner.join(input)
+        self.inner.join(input, policy)
     }
 
     fn revalidate(
@@ -484,12 +485,14 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         current_time_envelope_ref: Hash,
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
+        policy: &apm2_core::pcac::PcacPolicyKnobs,
     ) -> Result<(), Box<apm2_core::pcac::AuthorityDenyV1>> {
         self.inner.revalidate(
             cert,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            policy,
         )
     }
 
@@ -501,6 +504,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
+        policy: &apm2_core::pcac::PcacPolicyKnobs,
     ) -> Result<
         (
             apm2_core::pcac::AuthorityConsumedV1,
@@ -519,6 +523,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
             requires_authoritative_acceptance,
             current_time_envelope_ref,
             current_revocation_head_hash,
+            policy,
         )?;
 
         // QUALITY MAJOR 2 FIX: Use the authoritative tick from the inner
@@ -589,9 +594,10 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
     fn join(
         &self,
         input: &apm2_core::pcac::AuthorityJoinInputV1,
+        policy: &apm2_core::pcac::PcacPolicyKnobs,
     ) -> Result<apm2_core::pcac::AuthorityJoinCertificateV1, Box<apm2_core::pcac::AuthorityDenyV1>>
     {
-        self.inner.join(input)
+        apm2_core::pcac::AuthorityJoinKernel::join(self.inner.as_ref(), input, policy)
     }
 
     fn revalidate(
@@ -600,12 +606,15 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
         current_time_envelope_ref: Hash,
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
+        policy: &apm2_core::pcac::PcacPolicyKnobs,
     ) -> Result<(), Box<apm2_core::pcac::AuthorityDenyV1>> {
-        self.inner.revalidate(
+        apm2_core::pcac::AuthorityJoinKernel::revalidate(
+            self.inner.as_ref(),
             cert,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            policy,
         )
     }
 
@@ -617,6 +626,7 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
         requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
+        policy: &apm2_core::pcac::PcacPolicyKnobs,
     ) -> Result<
         (
             apm2_core::pcac::AuthorityConsumedV1,
@@ -628,13 +638,15 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
         // 1) Run inner consume semantics first (all deny-producing checks),
         // 2) commit durable record barrier,
         // 3) return witnesses.
-        let (consumed_witness, consume_record) = self.inner.consume(
+        let (consumed_witness, consume_record) = apm2_core::pcac::AuthorityJoinKernel::consume(
+            self.inner.as_ref(),
             cert,
             intent_digest,
             boundary_intent_class,
             requires_authoritative_acceptance,
             current_time_envelope_ref,
             current_revocation_head_hash,
+            policy,
         )?;
 
         // QUALITY MAJOR 2 FIX: Use the authoritative tick from the inner
@@ -954,6 +966,10 @@ mod tests {
         }
     }
 
+    fn default_policy() -> apm2_core::pcac::PcacPolicyKnobs {
+        apm2_core::pcac::PcacPolicyKnobs::default()
+    }
+
     struct PostIntentFailureKernel {
         cert: AuthorityJoinCertificateV1,
     }
@@ -962,6 +978,7 @@ mod tests {
         fn join(
             &self,
             _input: &AuthorityJoinInputV1,
+            _policy: &apm2_core::pcac::PcacPolicyKnobs,
         ) -> Result<AuthorityJoinCertificateV1, Box<apm2_core::pcac::AuthorityDenyV1>> {
             Ok(self.cert.clone())
         }
@@ -972,6 +989,7 @@ mod tests {
             _current_time_envelope_ref: Hash,
             _current_ledger_anchor: Hash,
             _current_revocation_head_hash: Hash,
+            _policy: &apm2_core::pcac::PcacPolicyKnobs,
         ) -> Result<(), Box<apm2_core::pcac::AuthorityDenyV1>> {
             Ok(())
         }
@@ -984,6 +1002,7 @@ mod tests {
             _requires_authoritative_acceptance: bool,
             current_time_envelope_ref: Hash,
             _current_revocation_head_hash: Hash,
+            _policy: &apm2_core::pcac::PcacPolicyKnobs,
         ) -> Result<
             (
                 apm2_core::pcac::AuthorityConsumedV1,
@@ -1027,7 +1046,8 @@ mod tests {
         let kernel = DurableKernel::new(inner, Box::new(index));
 
         let input = valid_input();
-        let cert = kernel.join(&input).unwrap();
+        let policy = default_policy();
+        let cert = kernel.join(&input, &policy).unwrap();
         let (witness, record) = kernel
             .consume(
                 &cert,
@@ -1036,6 +1056,7 @@ mod tests {
                 input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
+                &policy,
             )
             .unwrap();
         assert_eq!(witness.ajc_id, cert.ajc_id);
@@ -1051,7 +1072,8 @@ mod tests {
         let kernel = DurableKernel::new(inner, Box::new(index));
 
         let input = valid_input();
-        let cert = kernel.join(&input).unwrap();
+        let policy = default_policy();
+        let cert = kernel.join(&input, &policy).unwrap();
 
         // First consume succeeds.
         kernel
@@ -1062,6 +1084,7 @@ mod tests {
                 input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
+                &policy,
             )
             .unwrap();
 
@@ -1074,6 +1097,7 @@ mod tests {
                 input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
+                &policy,
             )
             .unwrap_err();
         assert!(matches!(
@@ -1088,6 +1112,7 @@ mod tests {
         let path = dir.path().join("consume.log");
 
         let input = valid_input();
+        let policy = default_policy();
         let ajc_id;
 
         // First session: consume once.
@@ -1096,7 +1121,7 @@ mod tests {
             let inner = InProcessKernel::new(100);
             let kernel = DurableKernel::new(inner, Box::new(index));
 
-            let cert = kernel.join(&input).unwrap();
+            let cert = kernel.join(&input, &policy).unwrap();
             ajc_id = cert.ajc_id;
             kernel
                 .consume(
@@ -1106,6 +1131,7 @@ mod tests {
                     input.boundary_intent_class.is_authoritative(),
                     input.time_envelope_ref,
                     cert.revocation_head_hash,
+                    &policy,
                 )
                 .unwrap();
         }
@@ -1120,7 +1146,7 @@ mod tests {
             let kernel = DurableKernel::new(inner, Box::new(index));
 
             // Same tick + same input = same AJC ID.
-            let cert = kernel.join(&input).unwrap();
+            let cert = kernel.join(&input, &policy).unwrap();
             assert_eq!(cert.ajc_id, ajc_id);
 
             let err = kernel
@@ -1131,6 +1157,7 @@ mod tests {
                     input.boundary_intent_class.is_authoritative(),
                     input.time_envelope_ref,
                     cert.revocation_head_hash,
+                    &policy,
                 )
                 .unwrap_err();
             assert!(matches!(
@@ -1151,7 +1178,8 @@ mod tests {
         let kernel = DurableKernel::new(inner, Box::new(index));
 
         let input = valid_input();
-        let cert = kernel.join(&input).unwrap();
+        let policy = default_policy();
+        let cert = kernel.join(&input, &policy).unwrap();
         kernel
             .consume(
                 &cert,
@@ -1160,6 +1188,7 @@ mod tests {
                 input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
+                &policy,
             )
             .unwrap();
 
@@ -1180,7 +1209,9 @@ mod tests {
 
         let seed_kernel = InProcessKernel::new(100);
         let input = valid_input();
-        let cert = seed_kernel.join(&input).unwrap();
+        let policy = default_policy();
+        let cert =
+            apm2_core::pcac::AuthorityJoinKernel::join(&seed_kernel, &input, &policy).unwrap();
 
         let inner = PostIntentFailureKernel { cert: cert.clone() };
         let kernel = DurableKernel::new(inner, Box::new(index));
@@ -1193,6 +1224,7 @@ mod tests {
                 input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
+                &policy,
             )
             .unwrap_err();
         assert!(
@@ -1378,10 +1410,11 @@ mod tests {
         let capped_index = CappedInMemoryConsumeIndex::new(cap);
         let inner = InProcessKernel::new(100);
         let kernel = DurableKernel::new(inner, Box::new(capped_index));
+        let policy = default_policy();
 
         // First consume succeeds.
         let input1 = valid_input();
-        let cert1 = kernel.join(&input1).unwrap();
+        let cert1 = kernel.join(&input1, &policy).unwrap();
         kernel
             .consume(
                 &cert1,
@@ -1390,6 +1423,7 @@ mod tests {
                 input1.boundary_intent_class.is_authoritative(),
                 input1.time_envelope_ref,
                 cert1.revocation_head_hash,
+                &policy,
             )
             .unwrap();
 
@@ -1397,7 +1431,7 @@ mod tests {
         let mut input2 = valid_input();
         input2.session_id = "session-002".to_string();
         input2.lease_id = "lease-002".to_string();
-        let cert2 = kernel.join(&input2).unwrap();
+        let cert2 = kernel.join(&input2, &policy).unwrap();
         let err = kernel
             .consume(
                 &cert2,
@@ -1406,6 +1440,7 @@ mod tests {
                 input2.boundary_intent_class.is_authoritative(),
                 input2.time_envelope_ref,
                 cert2.revocation_head_hash,
+                &policy,
             )
             .unwrap_err();
 

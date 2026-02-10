@@ -44,14 +44,19 @@ mod kernel;
 mod receipts;
 pub mod temporal_arbitration;
 mod types;
+pub mod verifier_economics;
+pub mod verifier_metrics;
 
 #[cfg(test)]
 mod tests;
 
 pub use auth_verifier::{
     BindingExpectations, FactClass, MAX_MERKLE_INCLUSION_PROOF_DEPTH, MAX_REPLAY_LIFECYCLE_ENTRIES,
-    ReplayLifecycleEntry, classify_fact, validate_authoritative_bindings,
-    validate_replay_lifecycle_order, verify_receipt_authentication,
+    ReplayLifecycleEntry, TimedVerificationResult, classify_fact, timed_anti_entropy_verification,
+    timed_classify_fact, timed_validate_authoritative_bindings,
+    timed_validate_replay_lifecycle_order, timed_verify_receipt_authentication,
+    validate_authoritative_bindings, validate_replay_lifecycle_order,
+    verify_receipt_authentication,
 };
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
 pub use intent_class::{AcceptanceFactClass, BoundaryIntentClass};
@@ -74,5 +79,9 @@ pub use types::{
     MAX_FIELD_NAME_LENGTH, MAX_MERKLE_PROOF_STEPS, MAX_OPERATION_LENGTH,
     MAX_PRE_ACTUATION_RECEIPT_HASHES, MAX_REASON_LENGTH, MAX_SCOPE_WITNESS_HASHES,
     MAX_STRING_LENGTH, PcacPolicyKnobs, PcacValidationError, PointerOnlyWaiver, RiskTier,
-    SovereigntyEnforcementMode, SovereigntyEpoch,
+    SovereigntyEnforcementMode, SovereigntyEpoch, WaiverBindingMeta,
 };
+pub use verifier_economics::{
+    VerifierEconomicsChecker, VerifierEconomicsProfile, VerifierOperation,
+};
+pub use verifier_metrics::{record_anti_entropy_event_metrics, record_verifier_metrics};

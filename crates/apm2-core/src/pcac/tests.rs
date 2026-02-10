@@ -51,6 +51,7 @@ fn valid_certificate() -> AuthorityJoinCertificateV1 {
         issued_time_envelope_ref: test_hash(0x07),
         as_of_ledger_anchor: test_hash(0x08),
         expires_at_tick: 2000,
+        issued_at_tick: 1000,
         revocation_head_hash: test_hash(0xCC),
         identity_evidence_level: IdentityEvidenceLevel::Verified,
         admission_capacity_token: None,
@@ -598,6 +599,7 @@ fn join_receipt_serde_roundtrip() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: None,
     };
     let json = serde_json::to_string(&receipt).unwrap();
@@ -1164,6 +1166,7 @@ fn deny_unknown_fields_join_receipt() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: None,
     };
     let mut json: serde_json::Value = serde_json::to_value(&receipt).unwrap();
@@ -2154,6 +2157,7 @@ fn valid_join_receipt_passes_validation() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(valid_bindings()),
     };
     assert!(receipt.validate().is_ok());
@@ -2171,6 +2175,7 @@ fn test_observational_receipt_fails_authoritative_validation() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(valid_bindings()),
     };
     let err = receipt.validate_authoritative().unwrap_err();
@@ -2195,6 +2200,7 @@ fn test_omitted_class_field_fails_authoritative_validation() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(valid_bindings()),
     };
     let mut value = serde_json::to_value(&receipt).unwrap();
@@ -2232,6 +2238,7 @@ fn test_authoritative_class_passes_authoritative_validation() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(valid_bindings()),
     };
     assert!(receipt.validate_authoritative().is_ok());
@@ -2248,6 +2255,7 @@ fn join_receipt_zero_ajc_id_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
@@ -2265,6 +2273,7 @@ fn join_receipt_zero_authority_join_hash_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
@@ -2284,6 +2293,7 @@ fn join_receipt_zero_time_envelope_ref_rejected() {
         time_envelope_ref: zero_hash(),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
@@ -2303,6 +2313,7 @@ fn join_receipt_zero_ledger_anchor_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: zero_hash(),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
@@ -2322,6 +2333,7 @@ fn join_receipt_non_positive_joined_at_tick_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 0,
+        waiver_binding_meta: None,
         authoritative_bindings: None,
     };
     let err = receipt.validate().unwrap_err();
@@ -2343,6 +2355,7 @@ fn join_receipt_propagates_binding_validation_errors() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(bindings),
     };
     let err = receipt.validate().unwrap_err();
@@ -2362,6 +2375,7 @@ fn join_receipt_validate_authoritative_requires_bindings() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: None,
     };
     let err = receipt.validate_authoritative().unwrap_err();
@@ -2383,6 +2397,7 @@ fn join_receipt_mismatched_authoritative_time_envelope_ref_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(bindings),
     };
     let err = receipt.validate().unwrap_err();
@@ -2407,6 +2422,7 @@ fn join_receipt_authoritative_unknown_canonicalizer_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(valid_bindings()),
     };
     receipt.digest_meta.canonicalizer_id = "unknown-canonicalizer".to_string();
@@ -2430,6 +2446,7 @@ fn join_receipt_validate_authoritative_with_digest_passes() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(valid_bindings()),
     };
     assert!(
@@ -2450,6 +2467,7 @@ fn join_receipt_validate_authoritative_with_digest_rejects_mismatch() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(valid_bindings()),
     };
     let err = receipt
@@ -4151,6 +4169,7 @@ fn test_intent_class_preserved_in_receipts() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         joined_at_tick: 1000,
+        waiver_binding_meta: None,
         authoritative_bindings: Some(valid_bindings()),
     };
     assert!(join_receipt.validate().is_ok());

@@ -281,6 +281,20 @@ fn hash_and_sign(signer: &Signer, payload: &[u8], prev_hash: &[u8]) -> (Vec<u8>,
     (event_hash, signature)
 }
 
+fn make_valid_work_events(work_id: &str) -> (Vec<EventRecord>, apm2_core::work::WorkReducerState) {
+    let opened_payload = work_opened_payload(work_id, "TICKET", vec![1, 2, 3], vec![], vec![]);
+    let events = vec![
+        EventRecord::with_timestamp("work.opened", work_id, "actor:test", opened_payload, 1_000)
+            .with_seq_id(1),
+    ];
+
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+    reducer.apply(&events[0], &ctx).expect("apply work.opened");
+
+    (events, reducer.state().clone())
+}
+
 // =============================================================================
 // IT-00391-01: Full Lifecycle - All State Transitions
 // =============================================================================
@@ -540,6 +554,7 @@ async fn test_fac_autonomous_full_lifecycle() {
         .resolver_actor_id("resolver-001")
         .resolver_version("1.0.0")
         .build_and_sign(&harness.signer);
+    let (work_events, expected_reducer_state) = make_valid_work_events(work_id);
 
     let merge_input = MergeInput {
         work_id: work_id.to_string(),
@@ -549,6 +564,8 @@ async fn test_fac_autonomous_full_lifecycle() {
         gate_outcomes: outcomes,
         policy_resolution,
         actor_id: harness.actor_id(),
+        work_events,
+        expected_reducer_state: Some(expected_reducer_state),
     };
 
     let mock_adapter = MockSuccessGitHubAdapter::new("abc123def456");
@@ -918,6 +935,7 @@ async fn test_gate_failure_halts_lifecycle() {
         .resolver_actor_id("resolver-001")
         .resolver_version("1.0.0")
         .build_and_sign(&signer);
+    let (work_events, expected_reducer_state) = make_valid_work_events(work_id);
 
     let merge_input = MergeInput {
         work_id: work_id.to_string(),
@@ -927,6 +945,8 @@ async fn test_gate_failure_halts_lifecycle() {
         gate_outcomes: outcomes,
         policy_resolution,
         actor_id: "merge-actor".to_string(),
+        work_events,
+        expected_reducer_state: Some(expected_reducer_state),
     };
 
     let mock_adapter = MockSuccessGitHubAdapter::new("should-not-be-used");
@@ -975,6 +995,7 @@ async fn test_merge_conflict_produces_review_blocked() {
             timed_out: false,
         })
         .collect::<Vec<_>>();
+    let (work_events, expected_reducer_state) = make_valid_work_events("work-conflict-001");
 
     let merge_input = MergeInput {
         work_id: "work-conflict-001".to_string(),
@@ -984,6 +1005,8 @@ async fn test_merge_conflict_produces_review_blocked() {
         gate_outcomes,
         policy_resolution,
         actor_id: "merge-actor".to_string(),
+        work_events,
+        expected_reducer_state: Some(expected_reducer_state),
     };
 
     // Use the conflict adapter

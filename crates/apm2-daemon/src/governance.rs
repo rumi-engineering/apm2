@@ -222,6 +222,7 @@ impl PolicyResolver for GovernancePolicyResolver {
                 min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 freshness_max_age_ticks: 100,
                 tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                pointer_only_waiver: None,
             }),
             // TCK-00428: PointerOnly waiver logic (stub for now).
             // For Phase 1, we assume no global waiver unless configured.
