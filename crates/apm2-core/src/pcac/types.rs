@@ -273,6 +273,10 @@ pub struct AuthorityJoinInputV1 {
     /// Evidence level of the identity proof.
     pub identity_evidence_level: IdentityEvidenceLevel,
 
+    /// Optional waiver hash for PointerOnly identity at Tier2+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_only_waiver_hash: Option<Hash>,
+
     // -- Freshness bindings --
     /// Hash of the directory head at join time.
     pub directory_head_hash: Hash,
@@ -590,6 +594,15 @@ impl AuthorityJoinInputV1 {
             }
         }
 
+        // Optional hash field: pointer_only_waiver_hash must be non-zero when present.
+        if let Some(ref pwh) = self.pointer_only_waiver_hash {
+            if *pwh == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash {
+                    field: "pointer_only_waiver_hash",
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -841,6 +854,79 @@ pub struct AutonomyCeiling {
 
     /// Hash binding the ceiling to the policy that established it.
     pub policy_binding_hash: Hash,
+}
+
+// =============================================================================
+// Policy Types (RFC-0027 §5, TCK-00428)
+// =============================================================================
+
+/// Enforcement mode for sovereignty checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SovereigntyEnforcementMode {
+    /// Enforce all checks (epoch, revocation, ceiling, freeze).
+    Strict,
+    /// Monitor only (log violations but allow).
+    Monitor,
+    /// Disabled (bypass checks).
+    Disabled,
+}
+
+impl Default for SovereigntyEnforcementMode {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+impl std::fmt::Display for SovereigntyEnforcementMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Strict => write!(f, "strict"),
+            Self::Monitor => write!(f, "monitor"),
+            Self::Disabled => write!(f, "disabled"),
+        }
+    }
+}
+
+/// Waiver for `PointerOnly` identity evidence at Tier2+.
+///
+/// Per RFC-0027 §5: Tier2+ defaults to `Verified` identity. `PointerOnly`
+/// is allowed only with an explicit, unexpired waiver bound to the session
+/// or scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerOnlyWaiver {
+    /// Unique waiver identifier (WVR-XXXX).
+    pub waiver_id: String,
+
+    /// Expiry tick for the waiver.
+    pub expires_at_tick: u64,
+
+    /// Hash of the scope (e.g., work_id or principal_id) this waiver binds to.
+    pub scope_binding_hash: Hash,
+}
+
+/// Policy configuration for PCAC enforcement.
+///
+/// Defines the minimum policy knobs required by RFC-0027 for authority
+/// lifecycle, identity evidence, and sovereignty checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcacPolicyKnobs {
+    /// Whether to enforce the full join-revalidate-consume lifecycle.
+    ///
+    /// If `true`, `RequestTool` must pass the PCAC gate. If `false`, the
+    /// gate is bypassed (Phase 1 opt-out).
+    pub lifecycle_enforcement: bool,
+
+    /// Minimum identity evidence level required for Tier2+ operations.
+    pub min_tier2_identity_evidence: IdentityEvidenceLevel,
+
+    /// Maximum age (in ticks) for freshness witnesses.
+    pub freshness_max_age_ticks: u64,
+
+    /// Sovereignty enforcement mode for Tier2+ operations.
+    pub tier2_sovereignty_mode: SovereigntyEnforcementMode,
 }
 
 // =============================================================================

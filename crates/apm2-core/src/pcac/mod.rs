@@ -58,5 +58,6 @@ pub use types::{
     MAX_CANONICALIZER_ID_LENGTH, MAX_CHECKPOINT_LENGTH, MAX_DESCRIPTION_LENGTH,
     MAX_FIELD_NAME_LENGTH, MAX_MERKLE_PROOF_STEPS, MAX_OPERATION_LENGTH,
     MAX_PRE_ACTUATION_RECEIPT_HASHES, MAX_REASON_LENGTH, MAX_SCOPE_WITNESS_HASHES,
-    MAX_STRING_LENGTH, PcacValidationError, RiskTier, SovereigntyEpoch,
+    MAX_STRING_LENGTH, PcacPolicyKnobs, PcacValidationError, PointerOnlyWaiver, RiskTier,
+    SovereigntyEnforcementMode, SovereigntyEpoch,
 };
