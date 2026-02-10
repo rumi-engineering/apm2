@@ -733,6 +733,24 @@ fn rule_matches(rule: &FlowRule, tag: &TaintTag, target: TargetContext) -> bool 
 // Runtime ingress helpers
 // =============================================================================
 
+/// Trusted provenance metadata for IPC-supplied tool arguments.
+///
+/// Session IPC arguments are classified as adversarial by default. They may be
+/// downgraded to `FileRead` only when a trusted provenance source is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolArgumentProvenance {
+    /// The caller presents an expected CAS content hash for the arguments.
+    ///
+    /// Reclassification occurs only when the supplied hash matches the payload.
+    CasBound {
+        /// Expected BLAKE3 hash of the exact argument payload.
+        content_hash: [u8; 32],
+    },
+    /// The runtime has an explicit trusted provenance receipt for file-read
+    /// origin and authoritatively binds it to this payload.
+    ExplicitFileRead,
+}
+
 /// Result of evaluating runtime ingress taint for a tool argument payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTaintAssessment {
@@ -761,35 +779,36 @@ pub fn evaluate_tool_argument_ingress(
     arguments: &[u8],
     policy: &TaintPolicy,
 ) -> RuntimeTaintAssessment {
-    let source = classify_tool_argument_source(arguments);
+    evaluate_tool_argument_ingress_with_provenance(arguments, None, policy)
+}
+
+/// Evaluates runtime tool-argument ingress with trusted provenance metadata.
+///
+/// Without provenance, IPC arguments are classified as `UserPrompt`
+/// (adversarial) by default.
+#[must_use]
+pub fn evaluate_tool_argument_ingress_with_provenance(
+    arguments: &[u8],
+    provenance: Option<ToolArgumentProvenance>,
+    policy: &TaintPolicy,
+) -> RuntimeTaintAssessment {
     let content_hash = *blake3::hash(arguments).as_bytes();
+    let source = classify_tool_argument_source(content_hash, provenance);
     let tag = TaintTag::from_source(source, content_hash);
     let decision = policy.evaluate(&tag, TargetContext::ToolArgument);
     RuntimeTaintAssessment { tag, decision }
 }
 
-fn classify_tool_argument_source(arguments: &[u8]) -> TaintSource {
-    const PROMPT_INJECTION_MARKERS: &[&str] = &[
-        "ignore previous instructions",
-        "ignore all previous instructions",
-        "system prompt",
-        "developer message",
-        "jailbreak",
-        "override safety",
-        "<|im_start|system|>",
-    ];
-
-    let Ok(text) = std::str::from_utf8(arguments) else {
-        return TaintSource::UserPrompt;
-    };
-    let lowered = text.to_ascii_lowercase();
-    if PROMPT_INJECTION_MARKERS
-        .iter()
-        .any(|marker| lowered.contains(marker))
-    {
-        TaintSource::UserPrompt
-    } else {
-        TaintSource::FileRead
+fn classify_tool_argument_source(
+    content_hash: [u8; 32],
+    provenance: Option<ToolArgumentProvenance>,
+) -> TaintSource {
+    match provenance {
+        Some(ToolArgumentProvenance::CasBound {
+            content_hash: expected_hash,
+        }) if expected_hash == content_hash => TaintSource::FileRead,
+        Some(ToolArgumentProvenance::ExplicitFileRead) => TaintSource::FileRead,
+        _ => TaintSource::UserPrompt,
     }
 }
 
@@ -1439,14 +1458,14 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_evaluate_tool_argument_ingress_allows_regular_payload() {
+    fn test_evaluate_tool_argument_ingress_denies_marker_evasive_payload_by_default() {
         let policy = TaintPolicy::default();
         let args = br#"{"path":"src/main.rs","limit":64}"#;
 
         let assessment = evaluate_tool_argument_ingress(args, &policy);
 
-        assert!(assessment.is_allowed());
-        assert_eq!(assessment.tag.source, TaintSource::FileRead);
+        assert!(!assessment.is_allowed());
+        assert_eq!(assessment.tag.source, TaintSource::UserPrompt);
         assert_eq!(assessment.decision.target, TargetContext::ToolArgument);
     }
 
@@ -1471,6 +1490,55 @@ mod tests {
 
         assert!(!assessment.is_allowed());
         assert_eq!(assessment.tag.source, TaintSource::UserPrompt);
+    }
+
+    #[test]
+    fn test_evaluate_tool_argument_ingress_allows_verified_cas_provenance() {
+        let policy = TaintPolicy::default();
+        let args = br#"{"path":"src/main.rs","limit":64}"#;
+        let content_hash = *blake3::hash(args).as_bytes();
+
+        let assessment = evaluate_tool_argument_ingress_with_provenance(
+            args,
+            Some(ToolArgumentProvenance::CasBound { content_hash }),
+            &policy,
+        );
+
+        assert!(assessment.is_allowed());
+        assert_eq!(assessment.tag.source, TaintSource::FileRead);
+        assert_eq!(assessment.decision.target, TargetContext::ToolArgument);
+    }
+
+    #[test]
+    fn test_evaluate_tool_argument_ingress_denies_mismatched_cas_provenance() {
+        let policy = TaintPolicy::default();
+        let args = br#"{"path":"src/main.rs","limit":64}"#;
+
+        let assessment = evaluate_tool_argument_ingress_with_provenance(
+            args,
+            Some(ToolArgumentProvenance::CasBound {
+                content_hash: [0xAB; 32],
+            }),
+            &policy,
+        );
+
+        assert!(!assessment.is_allowed());
+        assert_eq!(assessment.tag.source, TaintSource::UserPrompt);
+    }
+
+    #[test]
+    fn test_evaluate_tool_argument_ingress_allows_explicit_provenance() {
+        let policy = TaintPolicy::default();
+        let args = br#"{"path":"src/main.rs","limit":64}"#;
+
+        let assessment = evaluate_tool_argument_ingress_with_provenance(
+            args,
+            Some(ToolArgumentProvenance::ExplicitFileRead),
+            &policy,
+        );
+
+        assert!(assessment.is_allowed());
+        assert_eq!(assessment.tag.source, TaintSource::FileRead);
     }
 
     // =========================================================================

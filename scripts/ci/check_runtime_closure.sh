@@ -40,6 +40,269 @@ if [[ "${security_qcp}" == "YES" || "${security_qcp}" == "TRUE" || "${security_q
     log_info "SECURITY/QCP mode enabled via env flag"
 fi
 
+resolve_review_head_sha() {
+    local requested_head resolved_head
+    requested_head="${APM2_REVIEW_HEAD_SHA:-${GITHUB_SHA:-HEAD}}"
+    if resolved_head="$(git rev-parse --verify "${requested_head}^{commit}" 2>/dev/null)"; then
+        echo "${resolved_head}"
+    else
+        git rev-parse --verify HEAD^{commit}
+    fi
+}
+
+detect_current_pr_number() {
+    local value
+    for value in "${APM2_PR_NUMBER:-}" "${PR_NUMBER:-}"; do
+        if [[ "${value}" =~ ^[0-9]+$ ]]; then
+            echo "${value}"
+            return 0
+        fi
+    done
+
+    if [[ "${GITHUB_REF:-}" =~ ^refs/pull/([0-9]+)/ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    if [[ -n "${GITHUB_EVENT_PATH:-}" && -f "${GITHUB_EVENT_PATH}" ]]; then
+        python3 - "${GITHUB_EVENT_PATH}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+
+pr = payload.get("pull_request") if isinstance(payload, dict) else None
+if isinstance(pr, dict):
+    number = pr.get("number")
+    if number is not None and re.fullmatch(r"\d+", str(number)):
+        print(number)
+PY
+        return 0
+    fi
+
+    return 1
+}
+
+collect_current_pr_categories() {
+    local value raw_buffer label_buffer
+    raw_buffer=""
+
+    for value in \
+        "${APM2_PR_CATEGORY:-}" \
+        "${PR_CATEGORY:-}" \
+        "${APM2_PR_CATEGORIES:-}" \
+        "${PR_CATEGORIES:-}" \
+        "${APM2_PR_LABELS:-}" \
+        "${PR_LABELS:-}"; do
+        if [[ -n "${value}" ]]; then
+            raw_buffer+="${value}"$'\n'
+        fi
+    done
+
+    if [[ "${security_qcp}" == "YES" || "${security_qcp}" == "TRUE" || "${security_qcp}" == "1" ]]; then
+        raw_buffer+=$'SECURITY\nQCP=YES\nSECURITY/QCP=YES\n'
+    fi
+
+    if [[ -n "${GITHUB_EVENT_PATH:-}" && -f "${GITHUB_EVENT_PATH}" ]]; then
+        label_buffer="$(python3 - "${GITHUB_EVENT_PATH}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+
+pull_request = payload.get("pull_request") if isinstance(payload, dict) else None
+if not isinstance(pull_request, dict):
+    sys.exit(0)
+
+labels = pull_request.get("labels")
+if not isinstance(labels, list):
+    sys.exit(0)
+
+for label in labels:
+    if isinstance(label, dict):
+        name = label.get("name")
+        if isinstance(name, str):
+            print(name)
+PY
+)"
+        if [[ -n "${label_buffer}" ]]; then
+            raw_buffer+="${label_buffer}"$'\n'
+        fi
+    fi
+
+    printf '%s' "${raw_buffer}" \
+        | tr ',;' '\n' \
+        | awk '
+            {
+                line = $0
+                gsub(/^[[:space:]]+/, "", line)
+                gsub(/[[:space:]]+$/, "", line)
+                if (length(line) > 0) {
+                    print toupper(line)
+                }
+            }
+        ' \
+        | sort -u
+}
+
+validate_waiver_binding() {
+    local waiver_file output
+    waiver_file="$1"
+
+    if output="$(
+        python3 - "${waiver_file}" "${ALLOWED_WAIVER_COMMITS_CSV}" "${CURRENT_PR_NUMBER}" "${CURRENT_PR_CATEGORIES_CSV}" <<'PY'
+import re
+import sys
+
+import yaml
+
+
+def fail(message: str) -> None:
+    print(message)
+    raise SystemExit(1)
+
+
+def normalize_category(value) -> str:
+    text = str(value)
+    normalized = " ".join(text.strip().upper().split())
+    return normalized
+
+
+waiver_path = sys.argv[1]
+allowed_commits = {
+    item.strip().lower()
+    for item in sys.argv[2].split(",")
+    if item.strip()
+}
+current_pr_number = sys.argv[3].strip()
+current_categories = {
+    normalize_category(item)
+    for item in sys.argv[4].split(",")
+    if item.strip()
+}
+
+with open(waiver_path, "r", encoding="utf-8") as handle:
+    payload = yaml.safe_load(handle) or {}
+
+if not isinstance(payload, dict):
+    fail("waiver document must be a YAML mapping")
+
+waiver = payload.get("waiver", payload)
+if not isinstance(waiver, dict):
+    fail("waiver payload is malformed")
+
+references = waiver.get("references", {})
+if not isinstance(references, dict):
+    fail("waiver references block is malformed")
+
+commit_sha = references.get("commit_sha")
+if not isinstance(commit_sha, str) or not commit_sha.strip():
+    fail("missing required references.commit_sha")
+commit_sha = commit_sha.strip().lower()
+if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+    fail("references.commit_sha must be a full 40-hex commit SHA")
+if commit_sha not in allowed_commits:
+    fail("references.commit_sha does not match reviewed HEAD or immediate parent")
+
+reference_pr_number = references.get("pr_number")
+if reference_pr_number is not None:
+    reference_pr_number = str(reference_pr_number).strip()
+    if not re.fullmatch(r"\d+", reference_pr_number):
+        fail("references.pr_number must be numeric")
+else:
+    reference_pr_number = ""
+
+pr_url = references.get("pr_url")
+pr_number_from_url = ""
+if isinstance(pr_url, str) and pr_url.strip():
+    match = re.search(r"/pull/(\d+)(?:[/?#]|$)", pr_url.strip())
+    if match:
+        pr_number_from_url = match.group(1)
+
+if reference_pr_number and pr_number_from_url and reference_pr_number != pr_number_from_url:
+    fail("references.pr_number does not match PR number encoded in references.pr_url")
+
+effective_pr_number = reference_pr_number or pr_number_from_url
+if effective_pr_number:
+    if not current_pr_number:
+        fail("waiver is PR-bound but current PR number is unavailable")
+    if effective_pr_number != current_pr_number:
+        fail(
+            f"waiver PR binding mismatch (expected PR #{effective_pr_number}, got #{current_pr_number})"
+        )
+
+category_values = []
+for source in (references, waiver):
+    for key in ("category", "pr_category", "categories", "pr_categories"):
+        if key not in source:
+            continue
+        raw = source[key]
+        if isinstance(raw, list):
+            category_values.extend(raw)
+        else:
+            category_values.append(raw)
+
+normalized_required_categories = []
+for value in category_values:
+    if isinstance(value, str):
+        split_values = [segment for segment in re.split(r"[,;]", value) if segment.strip()]
+        if split_values:
+            normalized_required_categories.extend(
+                normalize_category(segment) for segment in split_values
+            )
+            continue
+    normalized = normalize_category(value)
+    if normalized:
+        normalized_required_categories.append(normalized)
+
+if normalized_required_categories:
+    if not current_categories:
+        fail("waiver category binding present but current PR categories are unavailable")
+    missing = [
+        category
+        for category in normalized_required_categories
+        if category not in current_categories
+    ]
+    if missing:
+        fail(
+            "waiver category binding mismatch (missing current categories: "
+            + ", ".join(missing)
+            + ")"
+        )
+
+print("ok")
+PY
+    )"; then
+        return 0
+    fi
+
+    log_warn "rejecting waiver ${waiver_file}: ${output}"
+    return 1
+}
+
+REVIEW_HEAD_SHA="$(resolve_review_head_sha)"
+mapfile -t ALLOWED_WAIVER_COMMITS < <(
+    git rev-list --parents -n 1 "${REVIEW_HEAD_SHA}" \
+        | awk '{print $1; for (i = 2; i <= NF; ++i) print $i}' \
+        | sort -u
+)
+ALLOWED_WAIVER_COMMITS_CSV="$(IFS=,; echo "${ALLOWED_WAIVER_COMMITS[*]}")"
+
+CURRENT_PR_NUMBER="$(detect_current_pr_number || true)"
+mapfile -t CURRENT_PR_CATEGORIES < <(collect_current_pr_categories)
+CURRENT_PR_CATEGORIES_CSV="$(IFS=,; echo "${CURRENT_PR_CATEGORIES[*]}")"
+
 BASE_REF="${APM2_DIFF_BASE:-}"
 if [[ -z "${BASE_REF}" ]]; then
     if git rev-parse --verify origin/main >/dev/null 2>&1; then
@@ -107,6 +370,10 @@ find_active_waiver() {
         fi
 
         if [[ "${expiry}" < "${today}" ]]; then
+            continue
+        fi
+
+        if ! validate_waiver_binding "${waiver_file}"; then
             continue
         fi
 

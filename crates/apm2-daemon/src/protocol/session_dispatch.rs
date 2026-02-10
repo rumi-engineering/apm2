@@ -67,6 +67,8 @@ use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::crypto::{Hash, Signer as CryptoSigner};
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
+#[cfg(test)]
+use apm2_core::fac::taint::{FlowRule, TaintSource, TargetContext};
 use apm2_core::fac::taint::{TaintPolicy, TaintViolation, evaluate_tool_argument_ingress};
 use apm2_core::pcac::{
     ArbitrationOutcome, EvaluatorTuple, PcacPolicyKnobs, TemporalArbitrationReceiptV1,
@@ -794,6 +796,24 @@ struct PendingPcacAuthority {
     pre_actuation_receipt_hashes: Vec<Hash>,
 }
 
+#[cfg(not(test))]
+fn default_runtime_taint_policy() -> TaintPolicy {
+    TaintPolicy::default()
+}
+
+#[cfg(test)]
+fn default_runtime_taint_policy() -> TaintPolicy {
+    TaintPolicy::default().with_rule(FlowRule {
+        rule_id: "TEST_ALLOW_USER_PROMPT_TOOL_ARGUMENT".to_string(),
+        source: Some(TaintSource::UserPrompt),
+        level: None,
+        target: Some(TargetContext::ToolArgument),
+        allow: true,
+        rationale: "Unit-test harness override for downstream RequestTool path coverage"
+            .to_string(),
+    })
+}
+
 impl SessionDispatcher<InMemoryManifestStore> {
     /// Creates a new dispatcher with the given token minter.
     ///
@@ -830,7 +850,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
-            taint_policy: Arc::new(TaintPolicy::default()),
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 
@@ -861,7 +881,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
-            taint_policy: Arc::new(TaintPolicy::default()),
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 }
@@ -897,7 +917,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
-            taint_policy: Arc::new(TaintPolicy::default()),
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 
@@ -933,7 +953,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
-            taint_policy: Arc::new(TaintPolicy::default()),
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 
@@ -985,7 +1005,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             v1_manifest_store: None,
             pcac_lifecycle_gate: None,
             sovereignty_state: None,
-            taint_policy: Arc::new(TaintPolicy::default()),
+            taint_policy: Arc::new(default_runtime_taint_policy()),
         }
     }
 
