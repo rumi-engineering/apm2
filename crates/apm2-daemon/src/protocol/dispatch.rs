@@ -6436,10 +6436,11 @@ impl PrivilegedDispatcher {
     /// # Errors
     ///
     /// Returns boundary defects when validation fails or token issuance fails.
-    #[allow(clippy::fn_params_excessive_bools)]
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
     pub fn validate_channel_boundary_and_issue_context_token(
         &self,
         signer: &apm2_core::crypto::Signer,
+        lease_id: &str,
         tool_class: &ToolClass,
         policy_verified: bool,
         broker_verified: bool,
@@ -6458,7 +6459,7 @@ impl PrivilegedDispatcher {
             return Err(defects);
         }
 
-        issue_channel_context_token(&check, signer).map_err(|error| {
+        issue_channel_context_token(&check, lease_id, signer).map_err(|error| {
             vec![ChannelBoundaryDefect::new(
                 ChannelViolationClass::MissingChannelMetadata,
                 format!("failed to issue channel context token: {error}"),
@@ -15875,6 +15876,7 @@ mod tests {
             let token = dispatcher
                 .validate_channel_boundary_and_issue_context_token(
                     &signer,
+                    "lease-1",
                     &ToolClass::Execute,
                     true,
                     true,
@@ -15883,7 +15885,7 @@ mod tests {
                 )
                 .expect("validated boundary should issue token");
 
-            let decoded = decode_channel_context_token(&token, &signer.verifying_key())
+            let decoded = decode_channel_context_token(&token, &signer.verifying_key(), "lease-1")
                 .expect("token should decode");
             assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
             assert!(decoded.broker_verified);

@@ -385,12 +385,16 @@ fn resolve_channel_context(
     let Some(daemon_verifying_key) = daemon_verifying_key else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
+    let Some(expected_lease_id) = args.lease_id.as_deref() else {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    };
 
     if token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LENGTH {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     }
 
-    let Ok(check) = decode_channel_context_token(token, daemon_verifying_key) else {
+    let Ok(check) = decode_channel_context_token(token, daemon_verifying_key, expected_lease_id)
+    else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
 
@@ -1866,7 +1870,8 @@ mod tests {
             policy_ledger_verified: true,
         };
         env.args.channel_context_token = Some(
-            issue_channel_context_token(&check, &signer).expect("token issuance should succeed"),
+            issue_channel_context_token(&check, "L-TEST-001", &signer)
+                .expect("token issuance should succeed"),
         );
 
         let response = execute_role_launch_with_daemon_verifying_key(
@@ -1901,6 +1906,46 @@ mod tests {
                 assert!(
                     violations.contains(&ChannelViolationClass::UnknownChannelSource),
                     "fail-closed fallback should deny unknown channel source"
+                );
+            },
+            other => panic!("expected channel-boundary denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_channel_context_token_with_wrong_lease_id_fails_closed() {
+        let mut env = setup_test_env();
+        let signer = Signer::generate();
+        let daemon_verifying_key = signer.verifying_key();
+        let check = ChannelBoundaryCheck {
+            source: ChannelSource::TypedToolIntent,
+            channel_source_witness: Some(derive_channel_source_witness(
+                ChannelSource::TypedToolIntent,
+            )),
+            broker_verified: true,
+            capability_verified: true,
+            context_firewall_verified: true,
+            policy_ledger_verified: true,
+        };
+        env.args.channel_context_token = Some(
+            issue_channel_context_token(&check, "L-OTHER", &signer)
+                .expect("token issuance should succeed"),
+        );
+
+        let error = execute_role_launch_with_daemon_verifying_key(
+            &env.args,
+            &env.ledger_path,
+            &env.cas_path,
+            Some(&daemon_verifying_key),
+        )
+        .expect_err("token bound to a different lease id must fail closed");
+        match error {
+            RoleLaunchError::Denied {
+                reason: LaunchDenyReason::ChannelBoundaryViolation { violations, .. },
+            } => {
+                assert!(
+                    violations.contains(&ChannelViolationClass::UnknownChannelSource),
+                    "mismatched lease token must fail closed to unknown source"
                 );
             },
             other => panic!("expected channel-boundary denial, got {other:?}"),

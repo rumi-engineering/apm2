@@ -65,6 +65,7 @@ pub struct ChannelBoundaryCheck {
 #[allow(clippy::struct_excessive_bools)]
 struct ChannelContextTokenPayloadV1 {
     source: ChannelSource,
+    pub lease_id: String,
     channel_source_witness: [u8; 32],
     broker_verified: bool,
     capability_verified: bool,
@@ -125,6 +126,14 @@ pub enum ChannelContextTokenError {
     /// Token signature did not verify against the daemon public key.
     #[error("channel context token signature verification failed")]
     SignatureVerificationFailed,
+    /// Token lease binding did not match the expected lease ID.
+    #[error("channel context token lease mismatch: expected {expected}, got {actual}")]
+    LeaseMismatch {
+        /// Lease identifier expected by the current operation.
+        expected: String,
+        /// Lease identifier carried in the token payload.
+        actual: String,
+    },
 }
 
 /// Channel boundary violation defect.
@@ -211,6 +220,7 @@ pub fn verify_channel_source_witness(
 /// serialization fails.
 pub fn issue_channel_context_token(
     check: &ChannelBoundaryCheck,
+    lease_id: &str,
     signer: &Signer,
 ) -> Result<String, ChannelContextTokenError> {
     let Some(channel_source_witness) = check.channel_source_witness else {
@@ -219,6 +229,7 @@ pub fn issue_channel_context_token(
 
     let payload = ChannelContextTokenPayloadV1 {
         source: check.source,
+        lease_id: lease_id.to_string(),
         channel_source_witness,
         broker_verified: check.broker_verified,
         capability_verified: check.capability_verified,
@@ -252,6 +263,7 @@ pub fn issue_channel_context_token(
 pub fn decode_channel_context_token(
     token: &str,
     daemon_verifying_key: &VerifyingKey,
+    expected_lease_id: &str,
 ) -> Result<ChannelBoundaryCheck, ChannelContextTokenError> {
     if token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LEN {
         return Err(ChannelContextTokenError::TokenTooLong {
@@ -308,6 +320,12 @@ pub fn decode_channel_context_token(
         daemon_verifying_key,
     ) {
         return Err(ChannelContextTokenError::SignatureVerificationFailed);
+    }
+    if payload.payload.lease_id != expected_lease_id {
+        return Err(ChannelContextTokenError::LeaseMismatch {
+            expected: expected_lease_id.to_string(),
+            actual: payload.payload.lease_id,
+        });
     }
 
     Ok(ChannelBoundaryCheck {
@@ -605,8 +623,9 @@ mod tests {
     fn test_channel_context_token_roundtrip() {
         let check = baseline_check();
         let signer = Signer::generate();
-        let token = issue_channel_context_token(&check, &signer).expect("token should encode");
-        let decoded = decode_channel_context_token(&token, &signer.verifying_key())
+        let token =
+            issue_channel_context_token(&check, "lease-1", &signer).expect("token should encode");
+        let decoded = decode_channel_context_token(&token, &signer.verifying_key(), "lease-1")
             .expect("token should decode");
         assert_eq!(decoded, check);
     }
@@ -616,6 +635,7 @@ mod tests {
         let signer = Signer::generate();
         let payload = ChannelContextTokenPayloadV1 {
             source: ChannelSource::TypedToolIntent,
+            lease_id: "lease-1".to_string(),
             channel_source_witness: [0xCC; 32],
             broker_verified: true,
             capability_verified: true,
@@ -632,7 +652,7 @@ mod tests {
         let token = base64::engine::general_purpose::STANDARD
             .encode(serde_json::to_vec(&token_payload).expect("token payload should serialize"));
 
-        let result = decode_channel_context_token(&token, &signer.verifying_key());
+        let result = decode_channel_context_token(&token, &signer.verifying_key(), "lease-1");
         assert_eq!(
             result,
             Err(ChannelContextTokenError::WitnessVerificationFailed)
@@ -644,10 +664,11 @@ mod tests {
         let check = baseline_check();
         let daemon_signer = Signer::generate();
         let attacker_signer = Signer::generate();
-        let forged_token = issue_channel_context_token(&check, &attacker_signer)
+        let forged_token = issue_channel_context_token(&check, "lease-1", &attacker_signer)
             .expect("attacker token should encode");
 
-        let result = decode_channel_context_token(&forged_token, &daemon_signer.verifying_key());
+        let result =
+            decode_channel_context_token(&forged_token, &daemon_signer.verifying_key(), "lease-1");
         assert_eq!(
             result,
             Err(ChannelContextTokenError::SignatureVerificationFailed)
@@ -658,7 +679,8 @@ mod tests {
     fn test_tampered_token_rejected() {
         let check = baseline_check();
         let signer = Signer::generate();
-        let token = issue_channel_context_token(&check, &signer).expect("token should encode");
+        let token =
+            issue_channel_context_token(&check, "lease-1", &signer).expect("token should encode");
 
         let token_json = base64::engine::general_purpose::STANDARD
             .decode(token)
@@ -670,10 +692,40 @@ mod tests {
         let tampered_token = base64::engine::general_purpose::STANDARD
             .encode(serde_json::to_vec(&token_payload).expect("tampered token should serialize"));
 
-        let result = decode_channel_context_token(&tampered_token, &signer.verifying_key());
+        let result =
+            decode_channel_context_token(&tampered_token, &signer.verifying_key(), "lease-1");
         assert_eq!(
             result,
             Err(ChannelContextTokenError::SignatureVerificationFailed)
         );
+    }
+
+    #[test]
+    fn test_token_with_wrong_lease_id_rejected() {
+        let check = baseline_check();
+        let signer = Signer::generate();
+        let token =
+            issue_channel_context_token(&check, "lease-a", &signer).expect("token should encode");
+
+        let result = decode_channel_context_token(&token, &signer.verifying_key(), "lease-b");
+        assert_eq!(
+            result,
+            Err(ChannelContextTokenError::LeaseMismatch {
+                expected: "lease-b".to_string(),
+                actual: "lease-a".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_token_with_matching_lease_id_accepted() {
+        let check = baseline_check();
+        let signer = Signer::generate();
+        let token =
+            issue_channel_context_token(&check, "lease-a", &signer).expect("token should encode");
+
+        let decoded = decode_channel_context_token(&token, &signer.verifying_key(), "lease-a")
+            .expect("matching lease must pass");
+        assert_eq!(decoded, check);
     }
 }

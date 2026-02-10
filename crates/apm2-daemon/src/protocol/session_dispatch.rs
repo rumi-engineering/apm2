@@ -2987,6 +2987,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 match channel_boundary_dispatcher()
                     .validate_channel_boundary_and_issue_context_token(
                         self.channel_context_signer.as_ref(),
+                        &token.lease_id,
                         &tool_class,
                         policy_verified,
                         broker_verified,
@@ -5674,6 +5675,7 @@ mod tests {
         let token = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token(
                 &signer,
+                "lease-1",
                 &ToolClass::Execute,
                 true,
                 true,
@@ -5682,7 +5684,7 @@ mod tests {
             )
             .expect("daemon should issue channel context token");
 
-        let decoded = decode_channel_context_token(&token, &signer.verifying_key())
+        let decoded = decode_channel_context_token(&token, &signer.verifying_key(), "lease-1")
             .expect("token should decode");
         assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
         assert!(
