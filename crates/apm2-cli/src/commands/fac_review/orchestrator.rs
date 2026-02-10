@@ -24,9 +24,9 @@ use super::model_pool::{
     select_cross_family_fallback, select_fallback_model, select_review_model_random,
 };
 use super::state::{
-    build_review_run_id, build_run_key, find_active_review_entry, load_review_run_state_strict,
-    next_review_sequence_number, remove_review_state_entry, try_acquire_review_lease,
-    upsert_review_state_entry, write_pulse_file, write_review_run_state,
+    build_review_run_id, build_run_key, find_active_review_entry, get_process_start_time,
+    load_review_run_state_strict, next_review_sequence_number, remove_review_state_entry,
+    try_acquire_review_lease, upsert_review_state_entry, write_pulse_file, write_review_run_state,
 };
 use super::types::{
     ExecutionContext, LIVENESS_REPORT_INTERVAL, LOOP_SLEEP, MAX_RESTART_ATTEMPTS,
@@ -271,6 +271,7 @@ fn persist_review_run_state(
     state.backend_id = Some(model.backend.as_str().to_string());
     state.restart_count = restart_count;
     state.pid = pid;
+    state.proc_start_time = pid.and_then(get_process_start_time);
     let _ = write_review_run_state(state)?;
     Ok(())
 }
@@ -346,7 +347,10 @@ fn run_single_review(
         backend_id: Some(current_model.backend.as_str().to_string()),
         restart_count,
         sequence_number,
+        previous_run_id: None,
+        previous_head_sha: None,
         pid: None,
+        proc_start_time: None,
     };
 
     let emit_run_event =
