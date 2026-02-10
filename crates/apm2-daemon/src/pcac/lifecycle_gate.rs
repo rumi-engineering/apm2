@@ -2665,7 +2665,7 @@ impl LifecycleGate {
             Self::requires_temporal_arbitration(cert),
             "consume-before-effect",
         )?;
-        self.consume_before_effect(
+        let consume_result = self.consume_before_effect(
             cert,
             intent_digest,
             boundary_intent_class,
@@ -2673,7 +2673,36 @@ impl LifecycleGate {
             current_time_envelope_ref,
             current_revocation_head_hash,
             resolved_policy,
-        )
+        )?;
+
+        let lifecycle_evidence =
+            apm2_core::pcac::PcacLifecycleEvidenceState::from_successful_consume(
+                cert,
+                &consume_result.0,
+                &consume_result.1,
+            );
+        match apm2_core::pcac::maybe_export_runtime_bundle(&lifecycle_evidence) {
+            Ok(
+                apm2_core::pcac::PcacRuntimeExportOutcome::Disabled
+                | apm2_core::pcac::PcacRuntimeExportOutcome::Admissible,
+            ) => {},
+            Ok(apm2_core::pcac::PcacRuntimeExportOutcome::NonAdmissible { reason }) => {
+                warn!(
+                    reason = %reason,
+                    ajc_id = %hex::encode(cert.ajc_id),
+                    "pcac objective/gate evidence exported as non-admissible lifecycle snapshot; continuing to avoid authority burn"
+                );
+            },
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    ajc_id = %hex::encode(cert.ajc_id),
+                    "pcac objective/gate evidence export failed after consume; continuing to avoid authority burn"
+                );
+            },
+        }
+
+        Ok(consume_result)
     }
 
     /// Executes the full lifecycle:
