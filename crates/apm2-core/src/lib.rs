@@ -44,6 +44,7 @@ pub mod budget;
 pub mod cac;
 pub mod capsule;
 pub mod ccp;
+pub mod channel;
 pub mod config;
 pub mod consensus;
 pub mod context;

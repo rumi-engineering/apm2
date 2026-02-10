@@ -9,6 +9,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
+use apm2_core::channel::{
+    ChannelBoundaryCheck, ChannelSource, ChannelViolationClass, validate_channel_boundary,
+};
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::fac::{DenyCondition, RoleSpecV2};
 use apm2_core::ledger::{Ledger, LedgerError};
@@ -51,6 +54,16 @@ pub struct RoleLaunchArgs {
     /// Optional lease ID for authorization.
     #[arg(long)]
     pub lease_id: Option<String>,
+    /// Classified authority channel source for launch actuation.
+    ///
+    /// `typed_tool_intent` is the only admissible authoritative source.
+    /// All other sources deny fail-closed.
+    #[arg(
+        long,
+        value_parser = parse_channel_source_arg,
+        default_value = "unknown"
+    )]
+    pub channel_source: ChannelSource,
 }
 
 /// Fail-closed denial reasons for role launch admission.
@@ -92,6 +105,12 @@ pub enum LaunchDenyReason {
         /// Missing capability identifiers.
         missing: Vec<String>,
     },
+    /// Channel boundary violations detected before authoritative launch.
+    ChannelBoundaryViolation {
+        /// Channel violation classes observed in deterministic validation
+        /// order.
+        violations: Vec<ChannelViolationClass>,
+    },
     /// A hash input is malformed.
     InvalidHashFormat {
         /// Input field name.
@@ -131,6 +150,8 @@ pub struct LaunchReceiptV1 {
     pub policy_hash: [u8; 32],
     /// Bound lease identifier used for authorization context.
     pub lease_id: String,
+    /// Classified authority channel source used for this launch decision.
+    pub channel_source: ChannelSource,
     /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
     /// BLAKE3 digest over canonical receipt bytes (excluding this field).
@@ -148,6 +169,7 @@ struct LaunchReceiptDigestInput {
     capability_manifest_hash: [u8; 32],
     policy_hash: [u8; 32],
     lease_id: String,
+    channel_source: ChannelSource,
     timestamp_ns: u64,
 }
 
@@ -312,6 +334,8 @@ fn execute_role_launch(
     )
     .map_err(RoleLaunchError::denied)?;
 
+    enforce_channel_boundary(args.channel_source).map_err(RoleLaunchError::denied)?;
+
     let timestamp_ns = derive_receipt_timestamp_ns(&ledger)?;
     let receipt = build_launch_receipt(args, hashes, timestamp_ns)?;
     let receipt_hash = store_receipt_in_cas(cas_path, &receipt)?;
@@ -414,11 +438,49 @@ fn validate_optional_bounded(
     Ok(())
 }
 
+fn parse_channel_source_arg(value: &str) -> std::result::Result<ChannelSource, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "typed_tool_intent" => Ok(ChannelSource::TypedToolIntent),
+        "free_form_output" => Ok(ChannelSource::FreeFormOutput),
+        "direct_manifest" => Ok(ChannelSource::DirectManifest),
+        "unknown" => Ok(ChannelSource::Unknown),
+        _ => Err(
+            "channel_source must be one of: typed_tool_intent, free_form_output, direct_manifest, unknown"
+                .to_string(),
+        ),
+    }
+}
+
 fn parse_hash_input(field: &str, value: &str) -> std::result::Result<[u8; 32], LaunchDenyReason> {
     parse_hex_hash_literal(field, value).map_err(|detail| LaunchDenyReason::InvalidHashFormat {
         field: field.to_string(),
         detail,
     })
+}
+
+fn enforce_channel_boundary(
+    channel_source: ChannelSource,
+) -> std::result::Result<(), LaunchDenyReason> {
+    let check = ChannelBoundaryCheck {
+        source: channel_source,
+        authorized: matches!(channel_source, ChannelSource::TypedToolIntent),
+        broker_verified: matches!(channel_source, ChannelSource::TypedToolIntent),
+        capability_verified: true,
+        context_firewall_verified: true,
+    };
+    let defects = validate_channel_boundary(&check);
+    if defects.is_empty() {
+        return Ok(());
+    }
+
+    let mut violations = Vec::new();
+    for defect in defects {
+        if !violations.contains(&defect.violation_class) {
+            violations.push(defect.violation_class);
+        }
+    }
+
+    Err(LaunchDenyReason::ChannelBoundaryViolation { violations })
 }
 
 fn parse_hex_hash_literal(field: &str, value: &str) -> std::result::Result<[u8; 32], String> {
@@ -496,6 +558,7 @@ fn build_launch_receipt(
         capability_manifest_hash: hashes.capability_manifest,
         policy_hash: hashes.policy,
         lease_id: lease_id.clone(),
+        channel_source: args.channel_source,
         timestamp_ns,
     };
 
@@ -511,6 +574,7 @@ fn build_launch_receipt(
         capability_manifest_hash: hashes.capability_manifest,
         policy_hash: hashes.policy,
         lease_id,
+        channel_source: args.channel_source,
         timestamp_ns,
         receipt_digest,
     })
@@ -1110,6 +1174,18 @@ fn deny_reason_message(reason: &LaunchDenyReason) -> String {
                 missing.join(", ")
             )
         },
+        LaunchDenyReason::ChannelBoundaryViolation { violations } => {
+            if violations.is_empty() {
+                "channel boundary violation".to_string()
+            } else {
+                let labels = violations
+                    .iter()
+                    .map(|violation| channel_violation_label(*violation))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("channel boundary violation: {labels}")
+            }
+        },
         LaunchDenyReason::InvalidHashFormat { field, detail } => {
             format!("invalid hash format for '{field}': {detail}")
         },
@@ -1119,6 +1195,17 @@ fn deny_reason_message(reason: &LaunchDenyReason) -> String {
         LaunchDenyReason::InternalError { detail } => {
             format!("internal launch binding error: {detail}")
         },
+    }
+}
+
+const fn channel_violation_label(violation: ChannelViolationClass) -> &'static str {
+    match violation {
+        ChannelViolationClass::UntypedChannelSource => "untyped_channel_source",
+        ChannelViolationClass::BrokerBypassDetected => "broker_bypass_detected",
+        ChannelViolationClass::CapabilityNotVerified => "capability_not_verified",
+        ChannelViolationClass::ContextFirewallNotVerified => "context_firewall_not_verified",
+        ChannelViolationClass::MissingChannelMetadata => "missing_channel_metadata",
+        ChannelViolationClass::UnknownChannelSource => "unknown_channel_source",
     }
 }
 
@@ -1244,6 +1331,7 @@ mod tests {
             capability_manifest_hash: capability_manifest_hash_hex,
             policy_hash: hex::encode(policy_hash),
             lease_id: Some("L-TEST-001".to_string()),
+            channel_source: ChannelSource::TypedToolIntent,
         };
 
         TestEnv {
@@ -1287,6 +1375,8 @@ mod tests {
             "launch receipt must be stored in CAS at {}",
             receipt_path.display()
         );
+        let receipt = load_receipt(&env.cas_path, &response.receipt_hash);
+        assert_eq!(receipt.channel_source, ChannelSource::TypedToolIntent);
     }
 
     #[test]
@@ -1534,5 +1624,29 @@ mod tests {
             first.receipt_hash, second.receipt_hash,
             "same inputs must produce same receipt_hash"
         );
+    }
+
+    #[test]
+    fn test_launch_denied_on_channel_violation() {
+        let mut env = setup_test_env();
+        env.args.channel_source = ChannelSource::FreeFormOutput;
+
+        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
+            .expect_err("free-form channel source should deny launch");
+        match error {
+            RoleLaunchError::Denied {
+                reason: LaunchDenyReason::ChannelBoundaryViolation { violations },
+            } => {
+                assert!(
+                    violations.contains(&ChannelViolationClass::UntypedChannelSource),
+                    "violations should include untyped channel source"
+                );
+                assert!(
+                    violations.contains(&ChannelViolationClass::BrokerBypassDetected),
+                    "violations should include broker bypass detection"
+                );
+            },
+            other => panic!("expected channel-boundary denial, got {other:?}"),
+        }
     }
 }
