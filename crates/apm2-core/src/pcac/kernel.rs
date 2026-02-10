@@ -21,7 +21,8 @@
 use super::deny::AuthorityDenyV1;
 use super::intent_class::BoundaryIntentClass;
 use super::types::{
-    AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1, AuthorityJoinInputV1,
+    AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1,
+    AuthorityJoinInputV1, PcacPolicyKnobs,
 };
 use crate::crypto::Hash;
 
@@ -58,6 +59,7 @@ pub trait AuthorityJoinKernel: Send + Sync {
     fn join(
         &self,
         input: &AuthorityJoinInputV1,
+        policy: &PcacPolicyKnobs,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>>;
 
     /// Verify an AJC remains valid against current authority state.
@@ -68,6 +70,7 @@ pub trait AuthorityJoinKernel: Send + Sync {
     /// * `current_time_envelope_ref` — Current HTF time witness.
     /// * `current_ledger_anchor` — Current ledger anchor.
     /// * `current_revocation_head_hash` — Current revocation frontier.
+    /// * `policy` — Resolved PCAC policy knobs for this authority operation.
     ///
     /// # Errors
     ///
@@ -82,6 +85,7 @@ pub trait AuthorityJoinKernel: Send + Sync {
         current_time_envelope_ref: Hash,
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
+        policy: &PcacPolicyKnobs,
     ) -> Result<(), Box<AuthorityDenyV1>>;
 
     /// Consume an AJC for a specific intent, returning proof of consumption.
@@ -106,6 +110,7 @@ pub trait AuthorityJoinKernel: Send + Sync {
     /// * `current_revocation_head_hash` — Current revocation frontier; if this
     ///   has advanced beyond the AJC's `revocation_head_hash`, consume MUST be
     ///   denied with `RevocationFrontierAdvanced`.
+    /// * `policy` — Resolved PCAC policy knobs for this authority operation.
     ///
     /// # Errors
     ///
@@ -119,6 +124,7 @@ pub trait AuthorityJoinKernel: Send + Sync {
     ///   supplied for an authoritative consume path.
     /// - `AlreadyConsumed` if this AJC was already consumed.
     /// - `CertificateExpired` if the AJC has expired.
+    #[allow(clippy::too_many_arguments)]
     fn consume(
         &self,
         cert: &AuthorityJoinCertificateV1,
@@ -127,5 +133,6 @@ pub trait AuthorityJoinKernel: Send + Sync {
         requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
+        policy: &PcacPolicyKnobs,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>;
 }

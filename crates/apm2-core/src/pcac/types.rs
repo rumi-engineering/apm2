@@ -672,6 +672,7 @@ pub enum DeterminismClass {
 /// - `intent_digest`: The intent this certificate authorizes.
 /// - `risk_tier`: Risk classification at join time.
 /// - `issued_time_envelope_ref`: HTF authoritative issue witness.
+/// - `issued_at_tick`: Authoritative issue tick.
 /// - `as_of_ledger_anchor`: Ledger anchor used at join time.
 /// - `expires_at_tick`: Policy/freshness cutoff in authoritative tick space.
 /// - `revocation_head_hash`: Revocation frontier commitment.
@@ -700,6 +701,9 @@ pub struct AuthorityJoinCertificateV1 {
 
     /// HTF authoritative issue witness (content hash of time envelope).
     pub issued_time_envelope_ref: Hash,
+
+    /// Authoritative issue tick.
+    pub issued_at_tick: u64,
 
     /// Ledger anchor used at join time.
     pub as_of_ledger_anchor: Hash,
@@ -925,6 +929,22 @@ pub struct PointerOnlyWaiver {
     pub scope_binding_hash: Hash,
 }
 
+/// Waiver binding metadata persisted on lifecycle receipts for audit and
+/// replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaiverBindingMeta {
+    /// Canonical hash of the waiver used at join time.
+    pub waiver_hash: Hash,
+    /// Human-readable scope identifier for audit surfaces.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    pub waiver_scope: String,
+    /// Tick at which the waiver expires.
+    pub waiver_expires_at_tick: u64,
+    /// Risk tier captured when the waiver was consumed.
+    pub risk_tier_at_issuance: RiskTier,
+}
+
 /// Policy configuration for PCAC enforcement.
 ///
 /// Defines the minimum policy knobs required by RFC-0027 for authority
@@ -946,6 +966,10 @@ pub struct PcacPolicyKnobs {
 
     /// Sovereignty enforcement mode for Tier2+ operations.
     pub tier2_sovereignty_mode: SovereigntyEnforcementMode,
+
+    /// Optional waiver permitting `PointerOnly` evidence in constrained paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_only_waiver: Option<PointerOnlyWaiver>,
 }
 
 // =============================================================================
@@ -982,6 +1006,97 @@ pub struct AuthorityConsumeRecordV1 {
     pub effect_selector_digest: Hash,
 }
 
+impl PointerOnlyWaiver {
+    /// Returns a deterministic content hash used for join-time binding.
+    #[must_use]
+    pub fn content_hash(&self) -> Hash {
+        use blake3::Hasher;
+
+        let mut hasher = Hasher::new();
+        hasher.update(b"pcac-pointer-only-waiver-v1");
+        hasher.update(self.waiver_id.as_bytes());
+        hasher.update(&self.expires_at_tick.to_le_bytes());
+        hasher.update(&self.scope_binding_hash);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Validates boundary constraints on waiver fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcacValidationError`] when any field is empty, zero-valued,
+    /// or exceeds bounded size constraints.
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.waiver_id.is_empty() {
+            return Err(PcacValidationError::EmptyRequiredField { field: "waiver_id" });
+        }
+        if self.waiver_id.len() > MAX_STRING_LENGTH {
+            return Err(PcacValidationError::StringTooLong {
+                field: "waiver_id",
+                len: self.waiver_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.expires_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "expires_at_tick",
+            });
+        }
+        if self.scope_binding_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "scope_binding_hash",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl WaiverBindingMeta {
+    /// Validates boundary constraints on waiver binding metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcacValidationError`] when any field is empty, zero-valued,
+    /// or exceeds bounded size constraints.
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.waiver_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "waiver_hash",
+            });
+        }
+        if self.waiver_scope.is_empty() {
+            return Err(PcacValidationError::EmptyRequiredField {
+                field: "waiver_scope",
+            });
+        }
+        if self.waiver_scope.len() > MAX_STRING_LENGTH {
+            return Err(PcacValidationError::StringTooLong {
+                field: "waiver_scope",
+                len: self.waiver_scope.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.waiver_expires_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "waiver_expires_at_tick",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for PcacPolicyKnobs {
+    fn default() -> Self {
+        Self {
+            lifecycle_enforcement: true,
+            min_tier2_identity_evidence: IdentityEvidenceLevel::Verified,
+            freshness_max_age_ticks: 100,
+            tier2_sovereignty_mode: SovereigntyEnforcementMode::Strict,
+            pointer_only_waiver: None,
+        }
+    }
+}
+
 impl AuthorityJoinCertificateV1 {
     /// Validate boundary constraints for authority join certificates.
     ///
@@ -1006,6 +1121,11 @@ impl AuthorityJoinCertificateV1 {
         if self.issued_time_envelope_ref == ZERO_HASH {
             return Err(PcacValidationError::ZeroHash {
                 field: "issued_time_envelope_ref",
+            });
+        }
+        if self.issued_at_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "issued_at_tick",
             });
         }
         if self.as_of_ledger_anchor == ZERO_HASH {

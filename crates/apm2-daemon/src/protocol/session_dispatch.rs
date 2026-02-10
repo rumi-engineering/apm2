@@ -2252,17 +2252,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     "PCAC authority denied: revocation provider unavailable (fail-closed)",
                 ));
             }
-            let pcac_policy = session_state
-                .pcac_policy
-                .clone()
-                .unwrap_or(PcacPolicyKnobs {
-                    lifecycle_enforcement: true,
-                    min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
-                    freshness_max_age_ticks: 100,
-                    // Fail closed for Tier2+ until authoritative runtime
-                    // sovereignty state/policy is hydrated.
-                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
-                });
+            let mut pcac_policy = session_state.pcac_policy.clone().unwrap_or_default();
+            if pcac_policy.pointer_only_waiver.is_none() {
+                pcac_policy
+                    .pointer_only_waiver
+                    .clone_from(&session_state.pointer_only_waiver);
+            }
 
             let capability_manifest_hash: Hash =
                 if let Ok(hash) = session_state.capability_manifest_hash.as_slice().try_into() {
@@ -2489,7 +2484,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 current_revocation_head,
                 sovereignty_state_ref,
                 freshness_witness_tick,
-                Some(&pcac_policy),
+                &pcac_policy,
             ) {
                 Ok(cert) => cert,
                 Err(deny) => {
@@ -3193,7 +3188,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             current_revocation_head,
                             sovereignty_state_ref,
                             fresh_tick,
-                            Some(&pending_pcac.pcac_policy),
+                            &pending_pcac.pcac_policy,
                         )
                     {
                         let containment_action = deny.containment_action;
@@ -3292,7 +3287,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             current_revocation_head,
                             sovereignty_state_ref,
                             fresh_tick,
-                            Some(&pending_pcac.pcac_policy),
+                            &pending_pcac.pcac_policy,
                         ) {
                         Ok(receipts) => receipts,
                         Err(deny) => {
@@ -6292,6 +6287,7 @@ mod tests {
             fn join(
                 &self,
                 input: &AuthorityJoinInputV1,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
             ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
                 self.joins.fetch_add(1, Ordering::SeqCst);
                 let mut hasher = blake3::Hasher::new();
@@ -6309,6 +6305,7 @@ mod tests {
                     issued_time_envelope_ref: input.time_envelope_ref,
                     as_of_ledger_anchor: input.as_of_ledger_anchor,
                     expires_at_tick: u64::MAX,
+                    issued_at_tick: 1,
                     revocation_head_hash: input.directory_head_hash,
                     identity_evidence_level: input.identity_evidence_level,
                     admission_capacity_token: None,
@@ -6321,6 +6318,7 @@ mod tests {
                 current_time_envelope_ref: Hash,
                 current_ledger_anchor: Hash,
                 current_revocation_head_hash: Hash,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
             ) -> Result<(), Box<AuthorityDenyV1>> {
                 self.revalidations.fetch_add(1, Ordering::SeqCst);
                 if current_revocation_head_hash != cert.revocation_head_hash {
@@ -6344,6 +6342,7 @@ mod tests {
                 _requires_authoritative_acceptance: bool,
                 current_time_envelope_ref: Hash,
                 _current_revocation_head_hash: Hash,
+                _policy: &apm2_core::pcac::PcacPolicyKnobs,
             ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
             {
                 self.consumes.fetch_add(1, Ordering::SeqCst);
@@ -6707,6 +6706,7 @@ mod tests {
                             freshness_max_age_ticks: 100,
                             tier2_sovereignty_mode:
                                 apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                            pointer_only_waiver: None,
                         }),
                         pointer_only_waiver: None,
                         capability_manifest_hash: blake3::hash(b"pcac-stage2-principal")
@@ -6888,6 +6888,7 @@ mod tests {
                 issued_time_envelope_ref: [0x44; 32],
                 as_of_ledger_anchor: [0x55; 32],
                 expires_at_tick: u64::MAX,
+                issued_at_tick: 1,
                 revocation_head_hash: session_revocation_head,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 admission_capacity_token: None,
@@ -6903,6 +6904,7 @@ mod tests {
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: 100,
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                    pointer_only_waiver: None,
                 },
                 principal_id: "principal-A".to_string(),
                 pre_actuation_required: false,
@@ -7019,6 +7021,7 @@ mod tests {
                 issued_time_envelope_ref: [0x13; 32],
                 as_of_ledger_anchor: current_ledger_anchor,
                 expires_at_tick: u64::MAX,
+                issued_at_tick: 1,
                 revocation_head_hash: current_revocation_head,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 admission_capacity_token: None,
@@ -7036,6 +7039,7 @@ mod tests {
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: 100,
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                    pointer_only_waiver: None,
                 },
                 principal_id: "lease-001".to_string(),
                 pre_actuation_required: true,
@@ -7148,6 +7152,7 @@ mod tests {
                 issued_time_envelope_ref: [0x33; 32],
                 as_of_ledger_anchor: current_ledger_anchor,
                 expires_at_tick: u64::MAX,
+                issued_at_tick: 1,
                 revocation_head_hash: current_revocation_head,
                 identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                 admission_capacity_token: None,
@@ -7165,6 +7170,7 @@ mod tests {
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
                     freshness_max_age_ticks: 100,
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+                    pointer_only_waiver: None,
                 },
                 principal_id: "lease-001".to_string(),
                 pre_actuation_required: true,

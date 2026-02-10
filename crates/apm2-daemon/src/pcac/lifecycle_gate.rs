@@ -25,8 +25,9 @@ use std::sync::{Arc, Mutex};
 
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
-    AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass, FreezeAction, RiskTier,
+    AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyClass, AuthorityDenyV1,
+    AuthorityJoinCertificateV1, AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass,
+    FreezeAction, IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier, SovereigntyEnforcementMode,
 };
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
@@ -161,6 +162,57 @@ impl InProcessKernel {
         }
     }
 
+    /// Test convenience wrapper that applies the strict default PCAC policy.
+    ///
+    /// Production paths should call the `AuthorityJoinKernel` trait method
+    /// with an explicitly resolved policy.
+    pub fn join(
+        &self,
+        input: &AuthorityJoinInputV1,
+    ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+        <Self as AuthorityJoinKernel>::join(self, input, &PcacPolicyKnobs::default())
+    }
+
+    /// Test convenience wrapper that applies the strict default PCAC policy.
+    pub fn revalidate(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        <Self as AuthorityJoinKernel>::revalidate(
+            self,
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+            &PcacPolicyKnobs::default(),
+        )
+    }
+
+    /// Test convenience wrapper that applies the strict default PCAC policy.
+    pub fn consume(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        intent_digest: Hash,
+        boundary_intent_class: BoundaryIntentClass,
+        requires_authoritative_acceptance: bool,
+        current_time_envelope_ref: Hash,
+        current_revocation_head_hash: Hash,
+    ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
+        <Self as AuthorityJoinKernel>::consume(
+            self,
+            cert,
+            intent_digest,
+            boundary_intent_class,
+            requires_authoritative_acceptance,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+            &PcacPolicyKnobs::default(),
+        )
+    }
+
     /// Converts a clock error from [`current_tick`] into an authority denial
     /// with the provided context.
     ///
@@ -216,6 +268,162 @@ impl InProcessKernel {
                 containment_action: None,
             }));
         }
+        Ok(())
+    }
+
+    fn deny(
+        deny_class: AuthorityDenyClass,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Box<AuthorityDenyV1> {
+        Box::new(AuthorityDenyV1 {
+            deny_class,
+            ajc_id,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+            containment_action: None,
+        })
+    }
+
+    fn validate_policy(
+        policy: &PcacPolicyKnobs,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if policy.freshness_max_age_ticks == 0 {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description:
+                        "pcac policy state is ambiguous: freshness_max_age_ticks must be > 0"
+                            .to_string(),
+                },
+                ajc_id,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+            ));
+        }
+
+        match policy.min_tier2_identity_evidence {
+            IdentityEvidenceLevel::Verified | IdentityEvidenceLevel::PointerOnly => {},
+            _ => {
+                return Err(Self::deny(
+                    AuthorityDenyClass::UnknownState {
+                        description:
+                            "pcac policy state is ambiguous: unknown min_tier2_identity_evidence"
+                                .to_string(),
+                    },
+                    ajc_id,
+                    time_envelope_ref,
+                    ledger_anchor,
+                    denied_at_tick,
+                ));
+            },
+        }
+
+        match policy.tier2_sovereignty_mode {
+            SovereigntyEnforcementMode::Strict
+            | SovereigntyEnforcementMode::Monitor
+            | SovereigntyEnforcementMode::Disabled => {},
+            _ => {
+                return Err(Self::deny(
+                    AuthorityDenyClass::UnknownState {
+                        description:
+                            "pcac policy state is ambiguous: unknown tier2_sovereignty_mode"
+                                .to_string(),
+                    },
+                    ajc_id,
+                    time_envelope_ref,
+                    ledger_anchor,
+                    denied_at_tick,
+                ));
+            },
+        }
+
+        if let Some(ref waiver) = policy.pointer_only_waiver {
+            waiver.validate().map_err(|error| {
+                Self::deny(
+                    AuthorityDenyClass::UnknownState {
+                        description: format!(
+                            "pcac policy state is ambiguous: invalid waiver: {error}"
+                        ),
+                    },
+                    ajc_id,
+                    time_envelope_ref,
+                    ledger_anchor,
+                    denied_at_tick,
+                )
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_pointer_only_waiver(
+        input: &AuthorityJoinInputV1,
+        policy: &PcacPolicyKnobs,
+        tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        let Some(ref waiver) = policy.pointer_only_waiver else {
+            return Err(Self::deny(
+                AuthorityDenyClass::WaiverExpiredOrInvalid,
+                None,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                tick,
+            ));
+        };
+
+        if tick > waiver.expires_at_tick {
+            return Err(Self::deny(
+                AuthorityDenyClass::WaiverExpiredOrInvalid,
+                None,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                tick,
+            ));
+        }
+
+        let expected_waiver_hash = waiver.content_hash();
+        let Some(actual_waiver_hash) = input.pointer_only_waiver_hash else {
+            return Err(Self::deny(
+                AuthorityDenyClass::WaiverExpiredOrInvalid,
+                None,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                tick,
+            ));
+        };
+
+        if !bool::from(actual_waiver_hash.ct_eq(&expected_waiver_hash)) {
+            return Err(Self::deny(
+                AuthorityDenyClass::WaiverExpiredOrInvalid,
+                None,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                tick,
+            ));
+        }
+
+        let scope_match = input
+            .scope_witness_hashes
+            .iter()
+            .any(|scope_hash| bool::from(scope_hash.ct_eq(&waiver.scope_binding_hash)));
+        if !scope_match {
+            return Err(Self::deny(
+                AuthorityDenyClass::WaiverScopeInvalid,
+                None,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+                tick,
+            ));
+        }
+
         Ok(())
     }
 
@@ -393,6 +601,7 @@ impl AuthorityJoinKernel for InProcessKernel {
     fn join(
         &self,
         input: &AuthorityJoinInputV1,
+        policy: &PcacPolicyKnobs,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
         let tick = self.current_tick().map_err(|reason| {
             self.clock_error_to_deny(
@@ -402,6 +611,44 @@ impl AuthorityJoinKernel for InProcessKernel {
                 input.as_of_ledger_anchor,
             )
         })?;
+        Self::validate_policy(
+            policy,
+            None,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+
+        match input.risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 | RiskTier::Tier2Plus => {},
+            _ => {
+                return Err(Self::deny(
+                    AuthorityDenyClass::UnknownState {
+                        description: "join input contains unknown risk tier".to_string(),
+                    },
+                    None,
+                    input.time_envelope_ref,
+                    input.as_of_ledger_anchor,
+                    tick,
+                ));
+            },
+        }
+
+        match input.identity_evidence_level {
+            IdentityEvidenceLevel::Verified | IdentityEvidenceLevel::PointerOnly => {},
+            _ => {
+                return Err(Self::deny(
+                    AuthorityDenyClass::UnknownState {
+                        description: "join input contains unknown identity evidence level"
+                            .to_string(),
+                    },
+                    None,
+                    input.time_envelope_ref,
+                    input.as_of_ledger_anchor,
+                    tick,
+                ));
+            },
+        }
 
         // Validate required string fields.
         if input.session_id.is_empty() {
@@ -516,29 +763,36 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
-        // §5: Tier2+ denies PointerOnly identity evidence.
+        // Tier2+ pointer-only identity is waiver-bound, scope-bound, and
+        // expiry-bound. Missing/invalid state denies immediately.
         if matches!(input.risk_tier, RiskTier::Tier2Plus)
             && matches!(
                 input.identity_evidence_level,
-                apm2_core::pcac::IdentityEvidenceLevel::PointerOnly
+                IdentityEvidenceLevel::PointerOnly
             )
         {
-            return Err(Box::new(AuthorityDenyV1 {
-                deny_class: apm2_core::pcac::AuthorityDenyClass::PointerOnlyDeniedAtTier2Plus,
-                ajc_id: None,
-                time_envelope_ref: input.time_envelope_ref,
-                ledger_anchor: input.as_of_ledger_anchor,
-                denied_at_tick: tick,
-                containment_action: None,
-            }));
+            Self::validate_pointer_only_waiver(input, policy, tick)?;
         }
 
         // Compute join hash and mint AJC.
         let join_hash = Self::compute_join_hash(input);
         let ajc_id = Self::mint_ajc_id(&join_hash, tick);
 
-        // Default TTL: 300 ticks for Phase 1.
-        let expires_at_tick = tick + 300;
+        let expires_at_tick = tick
+            .checked_add(policy.freshness_max_age_ticks)
+            .ok_or_else(|| {
+                Self::deny(
+                    AuthorityDenyClass::UnknownState {
+                        description:
+                            "pcac policy produced overflow in certificate expiry calculation"
+                                .to_string(),
+                    },
+                    None,
+                    input.time_envelope_ref,
+                    input.as_of_ledger_anchor,
+                    tick,
+                )
+            })?;
 
         // Compute revocation head from directory_head_hash.
         let revocation_head_hash = input.directory_head_hash;
@@ -550,6 +804,7 @@ impl AuthorityJoinKernel for InProcessKernel {
             boundary_intent_class: input.boundary_intent_class,
             risk_tier: input.risk_tier,
             issued_time_envelope_ref: input.time_envelope_ref,
+            issued_at_tick: tick,
             as_of_ledger_anchor: input.as_of_ledger_anchor,
             expires_at_tick,
             revocation_head_hash,
@@ -564,6 +819,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         current_time_envelope_ref: Hash,
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
+        policy: &PcacPolicyKnobs,
     ) -> Result<(), Box<AuthorityDenyV1>> {
         let tick = self.current_tick().map_err(|reason| {
             self.clock_error_to_deny(
@@ -573,8 +829,54 @@ impl AuthorityJoinKernel for InProcessKernel {
                 current_ledger_anchor,
             )
         })?;
+        Self::validate_policy(
+            policy,
+            Some(cert.ajc_id),
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            tick,
+        )?;
 
-        // Law 4: Certificate expiry check.
+        match cert.risk_tier {
+            RiskTier::Tier0 | RiskTier::Tier1 | RiskTier::Tier2Plus => {},
+            _ => {
+                return Err(Self::deny(
+                    AuthorityDenyClass::UnknownState {
+                        description: "certificate contains unknown risk tier".to_string(),
+                    },
+                    Some(cert.ajc_id),
+                    current_time_envelope_ref,
+                    current_ledger_anchor,
+                    tick,
+                ));
+            },
+        }
+
+        if cert.issued_at_tick == 0 {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description: "certificate contains non-positive issued_at_tick".to_string(),
+                },
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                current_ledger_anchor,
+                tick,
+            ));
+        }
+        if tick < cert.issued_at_tick {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description:
+                        "certificate issued_at_tick is ahead of current tick (ambiguous time state)"
+                            .to_string(),
+                },
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                current_ledger_anchor,
+                tick,
+            ));
+        }
+        // Law 4: Certificate expiry is an absolute hard-stop.
         if tick > cert.expires_at_tick {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: apm2_core::pcac::AuthorityDenyClass::CertificateExpired {
@@ -587,6 +889,21 @@ impl AuthorityJoinKernel for InProcessKernel {
                 denied_at_tick: tick,
                 containment_action: None,
             }));
+        }
+
+        let age_ticks = tick - cert.issued_at_tick;
+        if age_ticks > policy.freshness_max_age_ticks {
+            return Err(Self::deny(
+                AuthorityDenyClass::FreshnessExceeded {
+                    issued_at_tick: cert.issued_at_tick,
+                    current_tick: tick,
+                    max_age_ticks: policy.freshness_max_age_ticks,
+                },
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                current_ledger_anchor,
+                tick,
+            ));
         }
 
         // Law 4: Revocation frontier advancement.
@@ -627,6 +944,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
+        policy: &PcacPolicyKnobs,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         let tick = self.current_tick().map_err(|reason| {
             self.clock_error_to_deny(
@@ -636,10 +954,39 @@ impl AuthorityJoinKernel for InProcessKernel {
                 cert.as_of_ledger_anchor,
             )
         })?;
+        Self::validate_policy(
+            policy,
+            Some(cert.ajc_id),
+            current_time_envelope_ref,
+            cert.as_of_ledger_anchor,
+            tick,
+        )?;
 
-        // MAJOR 3 FIX: Certificate expiry check in consume — the trait
-        // contract documents this as a required check, and time can advance
-        // between revalidate and consume.
+        if cert.issued_at_tick == 0 {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description: "certificate contains non-positive issued_at_tick".to_string(),
+                },
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                cert.as_of_ledger_anchor,
+                tick,
+            ));
+        }
+        if tick < cert.issued_at_tick {
+            return Err(Self::deny(
+                AuthorityDenyClass::UnknownState {
+                    description:
+                        "certificate issued_at_tick is ahead of current tick (ambiguous time state)"
+                            .to_string(),
+                },
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                cert.as_of_ledger_anchor,
+                tick,
+            ));
+        }
+        // MAJOR 3 FIX: Certificate expiry is the hard-stop in consume.
         if tick > cert.expires_at_tick {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: apm2_core::pcac::AuthorityDenyClass::CertificateExpired {
@@ -652,6 +999,21 @@ impl AuthorityJoinKernel for InProcessKernel {
                 denied_at_tick: tick,
                 containment_action: None,
             }));
+        }
+
+        let age_ticks = tick - cert.issued_at_tick;
+        if age_ticks > policy.freshness_max_age_ticks {
+            return Err(Self::deny(
+                AuthorityDenyClass::FreshnessExceeded {
+                    issued_at_tick: cert.issued_at_tick,
+                    current_tick: tick,
+                    max_age_ticks: policy.freshness_max_age_ticks,
+                },
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                cert.as_of_ledger_anchor,
+                tick,
+            ));
         }
 
         // Law 4: Revocation frontier advancement check in consume.
@@ -973,12 +1335,10 @@ impl LifecycleGate {
         current_ledger_anchor: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
-        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        pcac_policy: &PcacPolicyKnobs,
         stage: &'static str,
     ) -> Result<(), Box<AuthorityDenyV1>> {
-        let sovereignty_mode = pcac_policy
-            .map(|p| p.tier2_sovereignty_mode)
-            .unwrap_or_default();
+        let sovereignty_mode = pcac_policy.tier2_sovereignty_mode;
 
         if !Self::requires_sovereignty_check(cert)
             || sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled
@@ -1068,12 +1428,10 @@ impl LifecycleGate {
         current_ledger_anchor: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
-        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        pcac_policy: &PcacPolicyKnobs,
         stage: &'static str,
     ) -> Result<(), Box<AuthorityDenyV1>> {
-        let sovereignty_mode = pcac_policy
-            .map(|p| p.tier2_sovereignty_mode)
-            .unwrap_or_default();
+        let sovereignty_mode = pcac_policy.tier2_sovereignty_mode;
 
         if !Self::requires_sovereignty_check(cert)
             || sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled
@@ -1161,13 +1519,15 @@ impl LifecycleGate {
         current_time_envelope_ref: Hash,
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
+        policy: &PcacPolicyKnobs,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
-        let cert = self.kernel.join(input)?;
+        let cert = self.kernel.join(input, policy)?;
         self.kernel.revalidate(
             &cert,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            policy,
         )?;
         Ok(cert)
     }
@@ -1183,13 +1543,14 @@ impl LifecycleGate {
         current_revocation_head_hash: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
-        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        pcac_policy: &PcacPolicyKnobs,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
         let cert = self.join_and_revalidate(
             input,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            pcac_policy,
         )?;
         self.check_revalidate_sovereignty(
             &cert,
@@ -1211,12 +1572,14 @@ impl LifecycleGate {
         current_time_envelope_ref: Hash,
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
+        policy: &PcacPolicyKnobs,
     ) -> Result<(), Box<AuthorityDenyV1>> {
         self.kernel.revalidate(
             cert,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            policy,
         )
     }
 
@@ -1231,13 +1594,14 @@ impl LifecycleGate {
         current_revocation_head_hash: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
-        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        pcac_policy: &PcacPolicyKnobs,
     ) -> Result<(), Box<AuthorityDenyV1>> {
         self.revalidate_before_execution(
             cert,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            pcac_policy,
         )?;
         self.check_revalidate_sovereignty(
             cert,
@@ -1251,6 +1615,7 @@ impl LifecycleGate {
     }
 
     /// Consumes authority immediately before effect execution.
+    #[allow(clippy::too_many_arguments)]
     pub fn consume_before_effect(
         &self,
         cert: &AuthorityJoinCertificateV1,
@@ -1259,6 +1624,7 @@ impl LifecycleGate {
         requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
+        policy: &PcacPolicyKnobs,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         self.kernel.consume(
             cert,
@@ -1267,6 +1633,7 @@ impl LifecycleGate {
             requires_authoritative_acceptance,
             current_time_envelope_ref,
             current_revocation_head_hash,
+            policy,
         )
     }
 
@@ -1284,7 +1651,7 @@ impl LifecycleGate {
         current_revocation_head_hash: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
-        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        pcac_policy: &PcacPolicyKnobs,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         self.check_consume_sovereignty(
             cert,
@@ -1302,6 +1669,7 @@ impl LifecycleGate {
             requires_authoritative_acceptance,
             current_time_envelope_ref,
             current_revocation_head_hash,
+            pcac_policy,
         )
     }
 
@@ -1314,6 +1682,7 @@ impl LifecycleGate {
         current_time_envelope_ref: Hash,
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
+        pcac_policy: &PcacPolicyKnobs,
     ) -> Result<LifecycleReceipts, Box<AuthorityDenyV1>> {
         self.execute_with_sovereignty(
             input,
@@ -1322,10 +1691,12 @@ impl LifecycleGate {
             current_revocation_head_hash,
             None,
             0,
+            pcac_policy,
         )
     }
 
     /// Executes the full lifecycle with optional sovereignty checks.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_with_sovereignty(
         &self,
         input: &AuthorityJoinInputV1,
@@ -1334,6 +1705,7 @@ impl LifecycleGate {
         current_revocation_head_hash: Hash,
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
+        pcac_policy: &PcacPolicyKnobs,
     ) -> Result<LifecycleReceipts, Box<AuthorityDenyV1>> {
         let cert = self.join_and_revalidate_with_sovereignty(
             input,
@@ -1342,7 +1714,7 @@ impl LifecycleGate {
             current_revocation_head_hash,
             sovereignty_state,
             current_tick,
-            None,
+            pcac_policy,
         )?;
 
         self.revalidate_before_execution_with_sovereignty(
@@ -1352,7 +1724,7 @@ impl LifecycleGate {
             current_revocation_head_hash,
             sovereignty_state,
             current_tick,
-            None,
+            pcac_policy,
         )?;
 
         let (consumed_witness, consume_record) = self.consume_before_effect_with_sovereignty(
@@ -1365,7 +1737,7 @@ impl LifecycleGate {
             current_revocation_head_hash,
             sovereignty_state,
             current_tick,
-            None,
+            pcac_policy,
         )?;
 
         Ok(LifecycleReceipts {
