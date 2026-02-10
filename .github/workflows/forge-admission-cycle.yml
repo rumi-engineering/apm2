@@ -191,6 +191,15 @@ jobs:
           echo "fac-gate: polling pr=${pr_number} sha=${head_sha} deadline=${max_wait}s"
 
           while [[ $SECONDS -lt $deadline ]]; do
+            # Staleness check: if the PR HEAD has moved past our SHA, this run
+            # is superseded.  Exit cleanly so the concurrency slot is released
+            # for the run that matches the new HEAD.
+            current_head="$(gh api "repos/${repo}/pulls/${pr_number}" --jq '.head.sha' 2>/dev/null || true)"
+            if [[ -n "$current_head" && "$current_head" != "$head_sha" ]]; then
+              echo "fac-gate: STALE sha=${head_sha} superseded by ${current_head}, exiting"
+              exit 0
+            fi
+
             sec_v="$(check_verdict "security" "$security_logins")"
             qual_v="$(check_verdict "code-quality" "$quality_logins")"
 
