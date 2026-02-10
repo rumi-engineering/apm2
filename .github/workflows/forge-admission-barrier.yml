@@ -1,0 +1,28 @@
+name: Forge Admission Barrier
+
+# The required Barrier status check remains emitted by the inline barrier job
+# in forge-admission-cycle.yml. This workflow is retained to keep the FAC-only
+# workflow topology expected by policy and tickets.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to validate"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  barrier-placeholder:
+    name: Forge Admission Barrier (manual)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report barrier ownership
+        run: |
+          set -euo pipefail
+          echo "Barrier status enforcement is implemented in forge-admission-cycle.yml"
+          echo "Manual request received for PR #${{ inputs.pr_number }}"
