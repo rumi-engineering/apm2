@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0009"
+  title: "Projection compromise containment and trust-root pin evidence"
+  category: "INCIDENT_RESPONSE_EVIDENCE"
+  status: "PLANNED"
+  description: "Evidence that projection-surface compromise is detected, quarantined, and prevented from affecting authoritative lifecycle outcomes."
+  requirement_ids:
+    - "RFC-0028::REQ-0009"
+  expected_contents:
+    - "projection divergence detector traces (expected vs observed digests)"
+    - "trust-root snapshots proving authority decisions derive from CAS+ledger only"
+    - "projection channel quarantine and unblock decision traces"
+    - "post-containment projection replay/reconstruction receipts"

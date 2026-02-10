@@ -1,0 +1,56 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00462"
+    title: "RFC-0028 REQ-0001 lifecycle intent typing and acceptance-fact separation"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0028"
+    requirements:
+      - requirement_id: "REQ-0001"
+        requirement_ref: "documents/rfcs/RFC-0028/requirements/REQ-0001.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0001"
+        artifact_ref: "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0001.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_OBSERVABILITY"
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Add explicit boundary intent typing checks (`Observe`, `Assert`, `Delegate`, `Actuate`, `Govern`) at lifecycle admission boundaries."
+      - "Enforce acceptance-fact separation so Observe-class payloads cannot satisfy authoritative predicates."
+      - "Emit replay-verifiable typed lifecycle receipts linking intent class to join/revalidate/consume/effect traces."
+      - "Add deny-path coverage for intent-class confusion and downgraded acceptance-fact substitutions."
+    out_of_scope:
+      - "Redefinition of RFC-0027 lifecycle semantics."
+      - "Performance optimization of lifecycle receipt serialization."
+  plan:
+    steps:
+      - "Introduce typed intent classification contract for boundary ingress."
+      - "Bind lifecycle receipts to intent class and acceptance-fact lineage."
+      - "Add deterministic deny behavior for Observe-to-authority coercion attempts."
+      - "Add integration tests and evidence trace extraction for lifecycle completeness."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0001"
+    criteria:
+      - "Observe-class inputs cannot satisfy authoritative admission predicates."
+      - "Every authoritative external interaction has replay-verifiable boundary intent type metadata."
+      - "Missing or mismatched intent-type receipt fields fail closed with structured defects."
+  notes:
+    security: |
+      Intent class confusion is treated as privilege escalation and must deny.
+    verification: |
+      Include positive and negative test traces showing intent typing integrity.
+    general: |
+      This is the prerequisite baseline ticket for all subsequent RFC-0028 implementation tickets.

@@ -2,11 +2,13 @@ title: Orchestrator Monitor Reading Pack
 
 purpose: "Context pack for fix agents and reviewers dispatched by orchestrator-monitor."
 
-references[8]:
-  - path: "@documents/theory/glossary/glossary.json"
+references[9]:
+  - path: "@documents/theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/reviews/CI_EXPECTATIONS.md"
     purpose: "CI quality gates and mandatory pre-merge checks."
+  - path: "@documents/skills/implementor-default/SKILL.md"
+    purpose: "Default implementor execution skill used by fix-agent dispatch."
   - path: "@documents/security/THREAT_MODEL.cac.json"
     purpose: "Threat model context for security-sensitive changes."
   - path: "@documents/security/AGENTS.cac.json"

@@ -1,0 +1,23 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0005"
+  title: "Portable acceptance evidence and deterministic third-party reverification"
+  category: "SECURITY"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    Authoritative external claims MUST be backed by portable, receipt-addressed evidence
+    that independent counterparties can deterministically re-verify without ambient state.
+  rationale: |
+    Boundary trust cannot rely on one implementation's private state or interpretation.
+  acceptance_criteria:
+    - "Acceptance evidence can be independently re-verified across at least two verifier implementations."
+    - "Portable replay package includes all required receipt pointers and verification metadata."
+    - "Unverifiable imported authority claims are denied."
+  imported_dependencies:
+    - "RFC-0020::REQ-0004"
+    - "RFC-0020::REQ-0034"
+    - "RFC-0020::REQ-0035"
+  evidence_ids:
+    - "EVID-0005"
+

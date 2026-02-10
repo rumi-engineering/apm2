@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0008"
+  title: "Optimization authority-surface non-regression evidence"
+  category: "POLICY_CHECK_RESULTS"
+  status: "PLANNED"
+  description: "Evidence that efficiency optimizations preserve production agent authority-surface monotonicity and never reintroduce direct GitHub API/gh capability classes."
+  requirement_ids:
+    - "RFC-0029::REQ-0008"
+  expected_contents:
+    - "role capability-surface diff reports per optimization candidate"
+    - "gate decision traces for authority-surface monotonicity checks"
+    - "negative tests showing direct GitHub capability reintroduction is blocked"
+    - "staleness/ambiguity fail-closed deny traces for missing surface evidence"

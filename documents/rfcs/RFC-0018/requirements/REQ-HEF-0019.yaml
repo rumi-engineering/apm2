@@ -1,0 +1,26 @@
+rfc_requirement:
+  schema_version: "2026-02-09"
+  template_version: "2026-01-23"
+  id: "REQ-HEF-0019"
+  type: "FUNCTIONAL"
+  title: "FAC review CLI contract and deterministic run-state persistence"
+  statement: |
+    `apm2 fac review` MUST expose a stable command contract for review lifecycle control
+    (`run`, `dispatch`, `status`, `project`, `tail`) and persist deterministic run-state
+    metadata required for crash-safe resume.
+
+    The persisted state MUST be machine-readable, PR/work keyed, and sufficient to
+    reconstruct active reviewer lineage without ambient process inspection.
+
+    Primary delivery tickets: TCK-00441, TCK-00443.
+  acceptance_criteria:
+    - "CLI surfaces listed commands with deterministic argument/JSON output contracts."
+    - "Run-state persistence includes reviewer identity, backend, model, role, restart counters, and head SHA bindings."
+    - "Status/projection commands can reconstruct lifecycle state from persisted artifacts after process restart."
+    - "Missing or corrupt persisted state yields fail-closed review status with explicit defect emission."
+  evidence:
+    evidence_ids:
+      - "EVID-HEF-0017"
+      - "EVID-HEF-0019"
+    inherited_from_prd: false
+    notes: []

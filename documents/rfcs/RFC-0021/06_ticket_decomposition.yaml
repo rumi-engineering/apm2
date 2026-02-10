@@ -86,3 +86,12 @@ rfc_ticket_decomposition:
         - "verifier compute and receipt fanout ceilings"
       requirement_ids: ["REQ-0012"]
       evidence_ids: ["EVID-0010"]
+
+    - ticket_id: "TCK-VPHI-0011"
+      title: "Implement trade-secret-only controls and patent-filing denial"
+      scope:
+        - "trade-secret mode policy evaluator"
+        - "patent/provisional workflow detection and deny path"
+        - "external disclosure channel classification enforcement"
+      requirement_ids: ["REQ-0013"]
+      evidence_ids: ["EVID-0011"]

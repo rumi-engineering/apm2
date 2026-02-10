@@ -1,0 +1,41 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0009"
+  title: "Public projection compromise detection and containment"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Compromise of public projection surfaces (for example GitHub repository takeover,
+    unauthorized state mutation, or projection endpoint forgery) MUST be detected as
+    divergence against CAS+ledger-derived expected projection state.
+
+    Authoritative FAC decisions MUST remain pinned to CAS+ledger trust roots and MUST
+    continue when projection channels are quarantined. Projection channels MUST be
+    replay-recoverable from durable receipts after compromise adjudication.
+
+    Promotion-critical compromise handling MUST resolve temporal authority via
+    signed `TimeAuthorityEnvelopeV1` and declared HTF window references.
+    Unknown/stale/missing/invalid temporal authority MUST fail closed.
+    Canonical temporal predicates for this requirement are `TP-EIO29-001`
+    and `TP-EIO29-008`.
+  rationale: |
+    Public projection compromise is expected at scale and must not propagate into
+    authority paths or local source-of-truth decisions.
+  acceptance_criteria:
+    - "Projection divergence detection emits structured defects with digest-bound evidence."
+    - "Compromised projection channels are quarantined without halting authoritative FAC progression."
+    - "Authoritative admission and gate decisions remain derivable from CAS+ledger only."
+    - "Projection state can be reconstructed from trusted receipts after containment."
+    - "Compromise and quarantine decisions include signed time_authority_ref and window_ref fields."
+    - "Temporal-authority ambiguity in compromise flows fails closed."
+  imported_dependencies:
+    - "RFC-0027::REQ-0006"
+    - "RFC-0027::REQ-0009"
+    - "RFC-0019::REQ-0007"
+    - "RFC-0020::REQ-0034"
+    - "RFC-0020::REQ-0035"
+    - "RFC-0016::REQ-HTF-0003"
+    - "RFC-0016::REQ-HTF-0007"
+  evidence_ids:
+    - "EVID-0009"

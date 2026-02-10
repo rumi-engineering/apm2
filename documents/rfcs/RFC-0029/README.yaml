@@ -1,0 +1,55 @@
+rfc_readme:
+  schema_version: "2026-02-10"
+  template_version: "2026-01-23"
+  rfc_id: "RFC-0029"
+  title: "Holonic External I/O Efficiency Profile over PCAC"
+  summary: |
+    RFC-0029 defines the efficiency/economics profile for external holonic I/O on
+    top of RFC-0027 PCAC lifecycle semantics. It imports the RFC-0019 PCAC snapshot
+    baseline and enforces stage-aware economics with security interlock constraints.
+
+    RFC-0029 does not redefine PCAC semantics; it defines profile-level gates,
+    requirements, and evidence for efficiency conformance.
+    This revision formalizes temporal window algebra and evaluator semantics for
+    all `TP-EIO29-*` predicates, degraded-mode and halt-risk budgets, overload
+    admission-control and anti-starvation math, multi-sink Byzantine continuity
+    assumptions, split-brain revocation monotonicity, and stronger inter-RFC
+    semantic drift fail-closed behavior.
+    The profile preserves hard non-regression constraints for trade-secret posture
+    and projection-authority isolation while tightening evidence quality, physical
+    failure assumptions, and attacker-adaptation economics.
+  primary_document:
+    path: "HOLONIC_EXTERNAL_IO_EFFICIENCY.md"
+    role: "Master profile-definition draft"
+    resolution_hint: "Repository-resolved file path: documents/rfcs/RFC-0029/HOLONIC_EXTERNAL_IO_EFFICIENCY.md"
+  key_files:
+    - file: "00_meta.yaml"
+      purpose: "RFC metadata and dependency posture"
+    - file: "01_problem_and_imports.yaml"
+      purpose: "Normative import set, profile intent, goals, and non-goals"
+    - file: "02_design_decisions.yaml"
+      purpose: "Formal efficiency model, TP predicate contracts, queue economics, and drift policy"
+    - file: "03_trust_boundaries.yaml"
+      purpose: "Trust boundaries, threats, and fail-closed enforcement controls"
+    - file: "04_contracts_and_versioning.yaml"
+      purpose: "CAC schema registry, validation order, defect classes, and ownership boundaries"
+    - file: "05_rollout_and_ops.yaml"
+      purpose: "Unified gate sequence, bottleneck/parallelization model, and operational assumptions"
+    - file: "06_ticket_decomposition.yaml"
+      purpose: "Ticket decomposition status for implementation phase transition"
+    - file: "07_test_and_evidence.yaml"
+      purpose: "Testing layers, evidence quality contracts, and artifact traceability"
+    - file: "08_risks_and_open_questions.yaml"
+      purpose: "Profile risks, residuals, and unresolved questions"
+    - file: "09_governance_and_gates.yaml"
+      purpose: "Gate registry, CAC gate bindings, governance policy, and theory lineage"
+    - file: "HOLONIC_EXTERNAL_IO_EFFICIENCY.md"
+      purpose: "Efficiency profile constraints, gates, and drift policy over PCAC"
+    - file: "requirements/README.yaml"
+      purpose: "Requirements index for RFC-0029 profile namespace"
+    - file: "evidence_artifacts/README.yaml"
+      purpose: "Evidence index for RFC-0029 efficiency profile gates"
+  status: "DRAFT"
+  version: "v0.5"
+  lifecycle_stage: "IMPLEMENTATION_TRACKING"
+  next_action: "Execute RFC-0029 ticket plan (`TCK-00470..TCK-00479`) and maintain quantitative evidence quality/freshness contracts for promotion-critical gate conformance."

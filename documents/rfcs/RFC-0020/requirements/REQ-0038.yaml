@@ -1,0 +1,27 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0038"
+  title: "Markov-blanket authoritative channel enforcement and no-bypass actuation"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Launch-driven authoritative execution MUST enforce Markov-blanket channel boundaries:
+    only typed tool-intent channel events are admissible as authority inputs and all
+    authoritative effects MUST traverse broker + capability + context-firewall checks.
+
+    Primary delivery ticket: TCK-00450.
+  rationale: |
+    Treating free-form model output as authority input creates bypass and injection surfaces;
+    typed boundary channels are required for containment and replayability.
+  acceptance_criteria:
+    - "Authoritative actuation is blocked unless sourced from typed tool-intent channel events."
+    - "No bypass path exists around broker/capability/context-firewall enforcement in launch flows."
+    - "Boundary violations emit structured defects and deny authoritative progression."
+    - "Adversarial replay tests verify no revived side-effects through untyped channels."
+  evidence_ids:
+    - "EVID-0002"
+    - "EVID-0030"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §4"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §8"

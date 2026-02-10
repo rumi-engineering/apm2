@@ -1,0 +1,28 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0017"
+  title: "RoleSpec v2 contract for WorkObject implementor execution"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    FAC MUST define and enforce a WorkObject-oriented RoleSpec profile (`fac_workobject_implementor_v2`)
+    that is hash-addressed, canonicalized, and validated before authoritative execution.
+
+    The RoleSpec contract MUST encode explicit deny taxonomy for missing/stale/unknown/unverifiable
+    authority context and require declared tool budgets, allowlists, and output schema contracts.
+
+    Primary delivery ticket: TCK-00446.
+  rationale: |
+    WorkObject execution cannot remain instruction-text driven; role authority and behavior
+    must be machine-verifiable and replayable from hash-addressed policy artifacts.
+  acceptance_criteria:
+    - "RoleSpec profile exists as deterministic canonical artifact addressable by role_spec_hash."
+    - "Conformance checks reject missing budgets, missing output schema, and missing deny taxonomy fields."
+    - "RoleSpec deny taxonomy is exercised by negative-path tests for stale/missing/unknown authority states."
+    - "RoleSpec selection is policy-bound rather than ambient prompt selection."
+  evidence_ids:
+    - "EVID-0012"
+    - "EVID-0013"
+  source_refs:
+    - "documents/rfcs/RFC-0019/17_pcac_implementation_contract_snapshot.md"

@@ -7,7 +7,7 @@
   - `documents/skills/modes-of-reasoning/assets/selector.json`
   - `documents/skills/modes-of-reasoning/assets/40-mechanistic.json`
   - `documents/skills/modes-of-reasoning/assets/70-engineering-design.json`
-  - theory bundle touchpoints for self-check: `documents/theory/{principles.json,laws.json,unified_theory.json,defects.json}`, plus `documents/theory/AGENTS.md`
+  - theory touchpoint for self-check: `documents/theory/unified-theory-v2.json`, plus `documents/theory/AGENTS.md`
 
 ### Reasoning Mode Selection
 - DIAGNOSE selected mode: `40-mechanistic` (`dcp://apm2.agents/mor/mode/mechanistic@1`)
@@ -164,7 +164,7 @@ validation_report:
   checks_passed:
     - "DOMINANCE_ORDER respected: winner is test-harness scoped and does not widen runtime authority."
     - "No new crate dependency or circular dependency required; can live under existing daemon protocol test support modules."
-    - "Directly targets known defect classes from `documents/theory/defects.json`: INTERFACE_PROLIFERATION, ABSTRACTION_BREAK, and inefficiency classes (EXTRA_TOOL_CALLS / UNNECESSARY_REVIEW_CYCLES)."
+    - "Directly targets known defect classes from `documents/theory/unified-theory-v2.json`: INTERFACE_PROLIFERATION, ABSTRACTION_BREAK, and inefficiency classes (EXTRA_TOOL_CALLS / UNNECESSARY_REVIEW_CYCLES)."
     - "Generalization scope matches explanation: repeated session/dispatch setup and assertions are the dominant duplication mechanism."
     - "Boundary conditions are explicit (test-only, explicit error-code expectations, no hidden policy defaults)."
   checks_failed: []

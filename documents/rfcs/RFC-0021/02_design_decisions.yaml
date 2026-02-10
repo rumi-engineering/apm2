@@ -172,3 +172,24 @@ rfc_design_decisions:
       source_refs:
         - "HOLONIC_VENTURE_PROVING_INTERFACE.md §0.6"
         - "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
+
+    - id: "DEC-0009"
+      title: "Enforce trade-secret-only IP posture for venture-origin strategic mechanisms"
+      statement: "VPHI denies patent/provisional filing and unapproved external disclosure workflows; strategic mechanisms remain trade-secret protected."
+      context: |
+        Venture proving can produce high-leverage strategic mechanisms. Public IP filing
+        and uncontrolled disclosure pathways create irreversible leakage and security exposure.
+      alternatives:
+        - id: "ALT-0001"
+          name: "Hybrid IP posture (patent + trade secret)"
+          pros: ["Potential legal exclusivity via filings"]
+          cons: ["Disclosure surface expansion and adversarial reconnaissance risk"]
+        - id: "ALT-0002"
+          name: "Trade-secret-only posture with filing denial"
+          pros: ["Minimized disclosure surface and stronger confidentiality boundary"]
+          cons: ["Requires strict disclosure governance and enforcement automation"]
+      chosen_rationale: "ALT-0002 chosen to prioritize containment and privacy over disclosure-based protection."
+      impacted_requirement_ids: ["REQ-0013"]
+      source_refs:
+        - "HOLONIC_VENTURE_PROVING_INTERFACE.md §0.8"
+        - "HOLONIC_VENTURE_PROVING_INTERFACE.md §7.3"

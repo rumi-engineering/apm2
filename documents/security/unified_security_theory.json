@@ -21,7 +21,7 @@
       "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
       "documents/security/SECURITY_POLICY.cac.json",
       "documents/security/THREAT_MODEL.cac.json",
-      "documents/theory/unified_theory.json"
+      "documents/theory/unified-theory-v2.json"
     ],
     "dependencies": [
       "dcp://apm2.local/governance/holonic_unified_theory@v1",
