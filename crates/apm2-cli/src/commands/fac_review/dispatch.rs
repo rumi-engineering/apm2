@@ -651,8 +651,7 @@ where
                             spawn_review,
                         );
                     },
-                    Some(_) => {},
-                    None => {
+                    _ => {
                         let stale_key = DispatchIdempotencyKey::new(
                             &key.owner_repo,
                             key.pr_number,
@@ -698,6 +697,24 @@ where
                                 spawn_review,
                             );
                         }
+                        let detail = match state.pid {
+                            Some(pid) => format!(
+                                "stale run-state pid={pid} is not live and no live pending marker old_head={} run_id={}",
+                                state.head_sha, state.run_id
+                            ),
+                            None => format!(
+                                "stale run-state has no pid and no live pending marker old_head={} run_id={}",
+                                state.head_sha, state.run_id
+                            ),
+                        };
+                        return fail_closed_dispatch(
+                            home,
+                            pr_url,
+                            key,
+                            TERMINAL_STALE_HEAD_AMBIGUITY,
+                            &detail,
+                            Some(state.sequence_number.saturating_add(1).max(1)),
+                        );
                     },
                 }
             }
@@ -968,7 +985,7 @@ mod tests {
     use crate::commands::fac_review::types::{
         DISPATCH_LOCK_ACQUIRE_TIMEOUT, ReviewKind, ReviewRunState, ReviewRunStatus,
         TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP, TERMINAL_DISPATCH_LOCK_TIMEOUT,
-        TERMINAL_SHA_DRIFT_SUPERSEDED,
+        TERMINAL_SHA_DRIFT_SUPERSEDED, TERMINAL_STALE_HEAD_AMBIGUITY,
     };
 
     fn sample_run_state(pid: Option<u32>) -> ReviewRunState {
@@ -1111,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_different_sha_creates_new() {
+    fn test_dispatch_different_sha_after_terminal_state_creates_new() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
 
@@ -1119,6 +1136,7 @@ mod tests {
         stale.sequence_number = 2;
         stale.head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         stale.run_id = "pr441-security-s2-aaaaaaaa".to_string();
+        stale.status = ReviewRunStatus::Done;
         write_review_run_state_for_home(home, &stale).expect("seed stale state");
 
         let spawn = |_: &str,
@@ -1152,6 +1170,104 @@ mod tests {
         .expect("dispatch with new sha");
 
         assert_eq!(result.mode, "started");
+    }
+
+    #[test]
+    fn test_stale_head_no_live_handle_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let mut stale_state = sample_run_state(None);
+        stale_state.head_sha = "1111111111111111111111111111111111111111".to_string();
+        stale_state.run_id = "pr441-security-s3-11111111".to_string();
+        stale_state.sequence_number = 3;
+        write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
+
+        let key = dispatch_key("2222222222222222222222222222222222222222");
+        let spawn = |_: &str,
+                     _: u32,
+                     _: ReviewKind,
+                     _: &str,
+                     _: u64|
+         -> Result<DispatchReviewResult, String> {
+            panic!("spawn must not be called for unresolved stale-head ownership");
+        };
+
+        let err = dispatch_single_review_for_home_with_spawn(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            42,
+            &spawn,
+        )
+        .expect_err("dispatch with no stale live handle must fail closed");
+        assert!(
+            err.contains(TERMINAL_STALE_HEAD_AMBIGUITY),
+            "unexpected error: {err}"
+        );
+
+        match load_review_run_state_for_home(home, 441, "security").expect("load state") {
+            ReviewRunStateLoad::Present(state) => {
+                assert_eq!(state.status, ReviewRunStatus::Failed);
+                assert_eq!(
+                    state.terminal_reason.as_deref(),
+                    Some(TERMINAL_STALE_HEAD_AMBIGUITY)
+                );
+                assert_eq!(state.head_sha, "2222222222222222222222222222222222222222");
+                assert_eq!(state.sequence_number, 4);
+            },
+            other => panic!("expected present run-state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stale_head_dead_pid_no_marker_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let mut stale_state = sample_run_state(Some(dead_pid_for_test()));
+        stale_state.head_sha = "3333333333333333333333333333333333333333".to_string();
+        stale_state.run_id = "pr441-security-s7-33333333".to_string();
+        stale_state.sequence_number = 7;
+        write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
+
+        let key = dispatch_key("4444444444444444444444444444444444444444");
+        let spawn = |_: &str,
+                     _: u32,
+                     _: ReviewKind,
+                     _: &str,
+                     _: u64|
+         -> Result<DispatchReviewResult, String> {
+            panic!("spawn must not be called for stale dead-pid ambiguity");
+        };
+
+        let err = dispatch_single_review_for_home_with_spawn(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            43,
+            &spawn,
+        )
+        .expect_err("dispatch with stale dead pid and no marker must fail closed");
+        assert!(
+            err.contains(TERMINAL_STALE_HEAD_AMBIGUITY),
+            "unexpected error: {err}"
+        );
+
+        match load_review_run_state_for_home(home, 441, "security").expect("load state") {
+            ReviewRunStateLoad::Present(state) => {
+                assert_eq!(state.status, ReviewRunStatus::Failed);
+                assert_eq!(
+                    state.terminal_reason.as_deref(),
+                    Some(TERMINAL_STALE_HEAD_AMBIGUITY)
+                );
+                assert_eq!(state.head_sha, "4444444444444444444444444444444444444444");
+                assert_eq!(state.sequence_number, 8);
+            },
+            other => panic!("expected present run-state, got {other:?}"),
+        }
     }
 
     #[test]
