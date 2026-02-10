@@ -15,6 +15,7 @@
 
 pub mod durable_consume;
 mod lifecycle_gate;
+pub mod sovereignty;
 
 #[cfg(test)]
 mod tests;
@@ -24,3 +25,4 @@ pub use durable_consume::{
     FileBackedConsumeIndex,
 };
 pub use lifecycle_gate::{InProcessKernel, LifecycleGate, LifecycleReceipts};
+pub use sovereignty::{SovereigntyChecker, SovereigntyState};

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{
     MAX_DESCRIPTION_LENGTH, MAX_FIELD_NAME_LENGTH, MAX_OPERATION_LENGTH, MAX_REASON_LENGTH,
-    PcacValidationError, RiskTier,
+    MAX_STRING_LENGTH, PcacValidationError, RiskTier, deserialize_bounded_string,
 };
 use crate::crypto::Hash;
 
@@ -128,18 +128,53 @@ pub enum AuthorityDenyClass {
         description: String,
     },
 
-    // ---- Tier2+ sovereignty failures (RFC-0027 §6.6) ----
+    // ---- Tier2+ sovereignty failures (RFC-0027 §6.6, TCK-00427) ----
     /// Sovereignty epoch evidence is stale for Tier2+ operations.
-    StaleSovereigntyEpoch,
+    StaleSovereigntyEpoch {
+        /// The epoch that was checked.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
+        epoch_id: String,
+        /// Last known freshness tick for this epoch.
+        last_known_tick: u64,
+        /// Current tick at check time.
+        current_tick: u64,
+    },
 
     /// Principal revocation head state is unknown or ambiguous.
-    UnknownRevocationHead,
+    UnknownRevocationHead {
+        /// The principal whose revocation head is unknown.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
+        principal_id: String,
+    },
 
     /// Autonomy ceiling is incompatible with requested risk tier.
-    IncompatibleAutonomyCeiling,
+    IncompatibleAutonomyCeiling {
+        /// The required maximum risk tier (ceiling).
+        required: RiskTier,
+        /// The actual risk tier requested.
+        actual: RiskTier,
+    },
 
     /// Active sovereign freeze state for the target scope.
-    ActiveSovereignFreeze,
+    ActiveSovereignFreeze {
+        /// The freeze action that is active.
+        freeze_action: super::types::FreezeAction,
+    },
+
+    /// Sovereignty epoch signer key does not match trusted authority key.
+    UntrustedSovereigntySigner {
+        /// Trusted signer public key configured for this checker.
+        expected_signer_key: Hash,
+        /// Signer public key embedded in the sovereignty epoch.
+        actual_signer_key: Hash,
+    },
+
+    /// Sovereignty uncertainty triggered a freeze action.
+    SovereigntyUncertainty {
+        /// Reason for the sovereignty uncertainty.
+        #[serde(deserialize_with = "deserialize_bounded_string")]
+        reason: String,
+    },
 
     // ---- Policy failures ----
     /// Tier2+ denies `PointerOnly` identity evidence without waiver.
@@ -214,10 +249,30 @@ impl std::fmt::Display for AuthorityDenyClass {
             Self::BoundaryMonotonicityViolation { description } => {
                 write!(f, "boundary monotonicity violation: {description}")
             },
-            Self::StaleSovereigntyEpoch => write!(f, "stale sovereignty epoch"),
-            Self::UnknownRevocationHead => write!(f, "unknown revocation head"),
-            Self::IncompatibleAutonomyCeiling => write!(f, "incompatible autonomy ceiling"),
-            Self::ActiveSovereignFreeze => write!(f, "active sovereign freeze"),
+            Self::StaleSovereigntyEpoch {
+                epoch_id,
+                last_known_tick,
+                current_tick,
+            } => write!(
+                f,
+                "stale sovereignty epoch {epoch_id} (last: {last_known_tick}, current: {current_tick})"
+            ),
+            Self::UnknownRevocationHead { principal_id } => {
+                write!(f, "unknown revocation head for principal {principal_id}")
+            },
+            Self::IncompatibleAutonomyCeiling { required, actual } => write!(
+                f,
+                "incompatible autonomy ceiling (required: {required}, actual: {actual})"
+            ),
+            Self::ActiveSovereignFreeze { freeze_action } => {
+                write!(f, "active sovereign freeze: {freeze_action}")
+            },
+            Self::UntrustedSovereigntySigner { .. } => {
+                write!(f, "untrusted sovereignty epoch signer")
+            },
+            Self::SovereigntyUncertainty { reason } => {
+                write!(f, "sovereignty uncertainty: {reason}")
+            },
             Self::PointerOnlyDeniedAtTier2Plus => {
                 write!(f, "pointer-only identity denied at Tier2+")
             },
@@ -270,6 +325,13 @@ pub struct AuthorityDenyV1 {
 
     /// Tick at denial time.
     pub denied_at_tick: u64,
+
+    /// Optional containment action recommended by the denial path.
+    ///
+    /// Used by sovereignty checks to surface freeze recommendations to caller
+    /// layers that perform containment actuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment_action: Option<super::types::FreezeAction>,
 }
 
 impl std::fmt::Display for AuthorityDenyV1 {
@@ -277,6 +339,9 @@ impl std::fmt::Display for AuthorityDenyV1 {
         write!(f, "authority denied: {}", self.deny_class)?;
         if let Some(ref ajc_id) = self.ajc_id {
             write!(f, " (ajc_id: {})", hex::encode(ajc_id))?;
+        }
+        if let Some(containment_action) = self.containment_action {
+            write!(f, " (containment: {containment_action})")?;
         }
         Ok(())
     }
@@ -321,6 +386,33 @@ impl AuthorityDenyClass {
                     });
                 }
             },
+            Self::StaleSovereigntyEpoch { epoch_id, .. } => {
+                if epoch_id.len() > MAX_STRING_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "epoch_id",
+                        len: epoch_id.len(),
+                        max: MAX_STRING_LENGTH,
+                    });
+                }
+            },
+            Self::UnknownRevocationHead { principal_id } => {
+                if principal_id.len() > MAX_STRING_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "principal_id",
+                        len: principal_id.len(),
+                        max: MAX_STRING_LENGTH,
+                    });
+                }
+            },
+            Self::SovereigntyUncertainty { reason } => {
+                if reason.len() > MAX_STRING_LENGTH {
+                    return Err(PcacValidationError::StringTooLong {
+                        field: "reason",
+                        len: reason.len(),
+                        max: MAX_STRING_LENGTH,
+                    });
+                }
+            },
             Self::VerifierEconomicsBoundsExceeded { operation, .. } => {
                 if operation.len() > MAX_OPERATION_LENGTH {
                     return Err(PcacValidationError::StringTooLong {
@@ -330,7 +422,7 @@ impl AuthorityDenyClass {
                     });
                 }
             },
-            // All other variants have no unbounded string fields.
+            // All remaining variants have no string fields requiring checks.
             _ => {},
         }
         Ok(())

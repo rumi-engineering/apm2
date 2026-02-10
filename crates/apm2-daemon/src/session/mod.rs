@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use apm2_core::pcac::{PcacPolicyKnobs, PointerOnlyWaiver};
 pub use consume::{
     ConsumeSessionContext, ConsumeSessionError, ConsumeSessionHandler,
     EXIT_CLASSIFICATION_CONTEXT_MISS, MAX_REFINEMENT_ATTEMPTS, TERMINATION_RATIONALE_CONTEXT_MISS,
@@ -102,6 +103,12 @@ pub struct SessionState {
     pub capability_manifest_hash: Vec<u8>,
     /// Episode ID in the runtime (if created).
     pub episode_id: Option<String>,
+    /// PCAC policy configuration (TCK-00428).
+    #[serde(default)]
+    pub pcac_policy: Option<PcacPolicyKnobs>,
+    /// Active waiver for `PointerOnly` identity (TCK-00428).
+    #[serde(default)]
+    pub pointer_only_waiver: Option<PointerOnlyWaiver>,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -118,6 +125,8 @@ impl std::fmt::Debug for SessionState {
                 &hex::encode(&self.capability_manifest_hash),
             )
             .field("episode_id", &self.episode_id)
+            .field("pcac_policy", &self.pcac_policy)
+            .field("pointer_only_waiver", &self.pointer_only_waiver)
             .finish()
     }
 }

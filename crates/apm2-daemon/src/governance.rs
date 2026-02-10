@@ -197,6 +197,21 @@ impl PolicyResolver for GovernancePolicyResolver {
             resolved_risk_tier,
             resolved_scope_baseline,
             expected_adapter_profile_hash: None,
+            // TCK-00428: Populate PCAC policy knobs for Phase 1 transitional enforcement.
+            // - Lifecycle: enforced (opt-in via gate presence).
+            // - Identity: Tier2+ requires Verified evidence.
+            // - Freshness: 100 ticks max age.
+            // - Sovereignty: Strict fail-closed until authoritative runtime sovereignty state is
+            //   hydrated via IPC/projection updates.
+            pcac_policy: Some(apm2_core::pcac::PcacPolicyKnobs {
+                lifecycle_enforcement: true,
+                min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                freshness_max_age_ticks: 100,
+                tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
+            }),
+            // TCK-00428: PointerOnly waiver logic (stub for now).
+            // For Phase 1, we assume no global waiver unless configured.
+            pointer_only_waiver: None,
         })
     }
 }

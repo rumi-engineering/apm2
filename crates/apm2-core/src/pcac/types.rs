@@ -10,9 +10,92 @@
 //! cardinality limits via [`AuthorityJoinInputV1::validate`]. Violations
 //! produce deterministic denials (fail-closed).
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::crypto::Hash;
+
+mod signature_bytes_serde {
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+
+    /// Bounded deserializer for 64-byte Ed25519 signatures.
+    ///
+    /// Rejects oversized payloads during deserialization, avoiding
+    /// unbounded allocation through intermediary `Vec<u8>`.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SignatureBytesVisitor;
+
+        impl<'de> Visitor<'de> for SignatureBytesVisitor {
+            type Value = [u8; 64];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a byte sequence of exactly 64 bytes")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if let Some(size) = seq.size_hint() {
+                    if size > 64 {
+                        return Err(de::Error::custom(format!(
+                            "signature too long: more than 64 bytes ({size})"
+                        )));
+                    }
+                }
+
+                let mut arr = [0u8; 64];
+                for (i, slot) in arr.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                }
+
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::custom("signature too long: more than 64 bytes"));
+                }
+
+                Ok(arr)
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v.len() != 64 {
+                    return Err(E::custom(format!(
+                        "expected 64 bytes for signature, got {}",
+                        v.len()
+                    )));
+                }
+
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(v);
+                Ok(arr)
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_bytes(&v)
+            }
+        }
+
+        deserializer.deserialize_seq(SignatureBytesVisitor)
+    }
+}
 
 // =============================================================================
 // Resource Limits
@@ -48,6 +131,54 @@ pub const MAX_FIELD_NAME_LENGTH: usize = 128;
 
 /// Maximum length for operation strings in deny classes.
 pub const MAX_OPERATION_LENGTH: usize = 256;
+
+// =============================================================================
+// Deserialization helpers
+// =============================================================================
+
+/// Serde deserializer that enforces [`MAX_STRING_LENGTH`] during
+/// deserialization.
+///
+/// This rejects oversized strings at the protocol boundary so large payloads
+/// cannot bypass size constraints until `validate()` time.
+pub fn deserialize_bounded_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedStringVisitor;
+
+    impl Visitor<'_> for BoundedStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "a string with at most {MAX_STRING_LENGTH} bytes")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            if v.len() > MAX_STRING_LENGTH {
+                return Err(E::custom(format!(
+                    "string field length {} exceeds maximum {}",
+                    v.len(),
+                    MAX_STRING_LENGTH,
+                )));
+            }
+            Ok(v.to_owned())
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            if v.len() > MAX_STRING_LENGTH {
+                return Err(E::custom(format!(
+                    "string field length {} exceeds maximum {}",
+                    v.len(),
+                    MAX_STRING_LENGTH,
+                )));
+            }
+            Ok(v)
+        }
+    }
+
+    deserializer.deserialize_string(BoundedStringVisitor)
+}
 
 // =============================================================================
 // Identity Evidence Level
@@ -141,6 +272,10 @@ pub struct AuthorityJoinInputV1 {
 
     /// Evidence level of the identity proof.
     pub identity_evidence_level: IdentityEvidenceLevel,
+
+    /// Optional waiver hash for `PointerOnly` identity at Tier2+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_only_waiver_hash: Option<Hash>,
 
     // -- Freshness bindings --
     /// Hash of the directory head at join time.
@@ -459,6 +594,15 @@ impl AuthorityJoinInputV1 {
             }
         }
 
+        // Optional hash field: pointer_only_waiver_hash must be non-zero when present.
+        if let Some(ref pwh) = self.pointer_only_waiver_hash {
+            if *pwh == ZERO_HASH {
+                return Err(PcacValidationError::ZeroHash {
+                    field: "pointer_only_waiver_hash",
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -577,6 +721,212 @@ pub struct AuthorityConsumedV1 {
 
     /// Tick at which consumption occurred.
     pub consumed_at_tick: u64,
+}
+
+// =============================================================================
+// Sovereignty types (RFC-0027 §6.6, TCK-00427)
+// =============================================================================
+
+/// Sovereignty epoch evidence for Tier2+ authority paths.
+///
+/// Captures the epoch identifier, last known freshness tick, a signer public
+/// key, and a cryptographic signature binding the epoch to the authority scope.
+/// Tier2+ consume and revalidate check that the epoch is current (not stale)
+/// and that the signature cryptographically verifies against the signer key.
+///
+/// # Signature Verification
+///
+/// Signatures are Ed25519 signatures over a domain-separated message:
+/// `b"apm2-sovereignty-epoch-v1" || principal_scope_hash || epoch_id ||
+/// freshness_tick`. The `principal_scope_hash` is a BLAKE3 digest of the
+/// principal ID, cryptographically binding the epoch to a specific principal
+/// scope and preventing cross-principal replay attacks.
+/// The signature field stores raw 64-byte signature bytes.
+///
+/// Runtime validators MUST also bind `signer_public_key` to a trusted
+/// authority key source. A signer/key mismatch is fail-closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SovereigntyEpoch {
+    /// Unique epoch identifier.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    pub epoch_id: String,
+
+    /// The freshness tick at which this epoch was last observed.
+    pub freshness_tick: u64,
+
+    /// BLAKE3 digest of the principal ID this epoch is bound to.
+    ///
+    /// Signatures commit to this hash, preventing cross-principal replay.
+    /// Validators MUST verify that this matches the runtime principal scope.
+    pub principal_scope_hash: Hash,
+
+    /// Public key of the signer that produced this epoch's signature.
+    pub signer_public_key: Hash,
+
+    /// Cryptographic signature binding the epoch to the authority scope.
+    /// Must verify against `signer_public_key` via Ed25519 verification.
+    #[serde(with = "signature_bytes_serde")]
+    pub signature: [u8; 64],
+}
+
+impl SovereigntyEpoch {
+    /// Validate boundary constraints on sovereignty epoch fields.
+    ///
+    /// Checks that:
+    /// - `epoch_id` is non-empty and within [`MAX_STRING_LENGTH`].
+    /// - `principal_scope_hash` is non-zero.
+    /// - `signer_public_key` is non-zero.
+    /// - `freshness_tick` is strictly positive.
+    /// - `signature` is non-zero (unsigned epochs are invalid).
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcacValidationError` on the first violation found
+    /// (fail-closed).
+    pub fn validate(&self) -> Result<(), PcacValidationError> {
+        if self.epoch_id.is_empty() {
+            return Err(PcacValidationError::EmptyRequiredField { field: "epoch_id" });
+        }
+        if self.epoch_id.len() > MAX_STRING_LENGTH {
+            return Err(PcacValidationError::StringTooLong {
+                field: "epoch_id",
+                len: self.epoch_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
+        if self.principal_scope_hash == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "principal_scope_hash",
+            });
+        }
+        if self.signer_public_key == ZERO_HASH {
+            return Err(PcacValidationError::ZeroHash {
+                field: "signer_public_key",
+            });
+        }
+        if self.freshness_tick == 0 {
+            return Err(PcacValidationError::NonPositiveTick {
+                field: "freshness_tick",
+            });
+        }
+        if self.signature == [0u8; 64] {
+            return Err(PcacValidationError::ZeroHash { field: "signature" });
+        }
+        Ok(())
+    }
+}
+
+/// Freeze action emitted on sovereignty uncertainty conditions.
+///
+/// When sovereignty state is uncertain, policy may require a freeze to
+/// prevent authority consumption until the uncertainty is resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FreezeAction {
+    /// No freeze action required.
+    NoAction,
+    /// Soft freeze: deny new authority joins but allow in-flight consumes.
+    SoftFreeze,
+    /// Hard freeze: deny all authority operations immediately.
+    HardFreeze,
+}
+
+impl std::fmt::Display for FreezeAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAction => write!(f, "no_action"),
+            Self::SoftFreeze => write!(f, "soft_freeze"),
+            Self::HardFreeze => write!(f, "hard_freeze"),
+        }
+    }
+}
+
+/// Autonomy ceiling representing the maximum authority level for a scope.
+///
+/// Consume checks verify that the requested risk tier does not exceed the
+/// autonomy ceiling for the principal's scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutonomyCeiling {
+    /// Maximum risk tier allowed under this ceiling.
+    pub max_risk_tier: RiskTier,
+
+    /// Hash binding the ceiling to the policy that established it.
+    pub policy_binding_hash: Hash,
+}
+
+// =============================================================================
+// Policy Types (RFC-0027 §5, TCK-00428)
+// =============================================================================
+
+/// Enforcement mode for sovereignty checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SovereigntyEnforcementMode {
+    /// Enforce all checks (epoch, revocation, ceiling, freeze).
+    #[default]
+    Strict,
+    /// Monitor only (log violations but allow).
+    Monitor,
+    /// Disabled (bypass checks).
+    Disabled,
+}
+
+impl std::fmt::Display for SovereigntyEnforcementMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Strict => write!(f, "strict"),
+            Self::Monitor => write!(f, "monitor"),
+            Self::Disabled => write!(f, "disabled"),
+        }
+    }
+}
+
+/// Waiver for `PointerOnly` identity evidence at Tier2+.
+///
+/// Per RFC-0027 §5: Tier2+ defaults to `Verified` identity. `PointerOnly`
+/// is allowed only with an explicit, unexpired waiver bound to the session
+/// or scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PointerOnlyWaiver {
+    /// Unique waiver identifier (WVR-XXXX).
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    pub waiver_id: String,
+
+    /// Expiry tick for the waiver.
+    pub expires_at_tick: u64,
+
+    /// Hash of the scope (e.g., `work_id` or `principal_id`) this waiver binds
+    /// to.
+    pub scope_binding_hash: Hash,
+}
+
+/// Policy configuration for PCAC enforcement.
+///
+/// Defines the minimum policy knobs required by RFC-0027 for authority
+/// lifecycle, identity evidence, and sovereignty checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcacPolicyKnobs {
+    /// Whether to enforce the full join-revalidate-consume lifecycle.
+    ///
+    /// If `true`, `RequestTool` must pass the PCAC gate. If `false`, the
+    /// gate is bypassed (Phase 1 opt-out).
+    pub lifecycle_enforcement: bool,
+
+    /// Minimum identity evidence level required for Tier2+ operations.
+    pub min_tier2_identity_evidence: IdentityEvidenceLevel,
+
+    /// Maximum age (in ticks) for freshness witnesses.
+    pub freshness_max_age_ticks: u64,
+
+    /// Sovereignty enforcement mode for Tier2+ operations.
+    pub tier2_sovereignty_mode: SovereigntyEnforcementMode,
 }
 
 // =============================================================================

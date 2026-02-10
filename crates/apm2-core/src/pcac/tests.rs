@@ -27,6 +27,7 @@ fn valid_join_input() -> AuthorityJoinInputV1 {
         permeability_receipt_hash: None,
         identity_proof_hash: test_hash(0x03),
         identity_evidence_level: IdentityEvidenceLevel::Verified,
+        pointer_only_waiver_hash: None,
         directory_head_hash: test_hash(0x04),
         freshness_policy_hash: test_hash(0x05),
         freshness_witness_tick: 1000,
@@ -69,6 +70,16 @@ fn valid_consume_record() -> AuthorityConsumeRecordV1 {
         consumed_time_envelope_ref: test_hash(0xDD),
         consumed_at_tick: 1500,
         effect_selector_digest: test_hash(0xEE),
+    }
+}
+
+fn valid_sovereignty_epoch() -> SovereigntyEpoch {
+    SovereigntyEpoch {
+        epoch_id: "epoch-001".to_string(),
+        freshness_tick: 100,
+        principal_scope_hash: test_hash(0x41),
+        signer_public_key: test_hash(0x42),
+        signature: [0xAA; 64],
     }
 }
 
@@ -405,9 +416,21 @@ fn deny_class_serde_roundtrip() {
             expected: test_hash(0x01),
             actual: test_hash(0x02),
         },
-        AuthorityDenyClass::StaleSovereigntyEpoch,
-        AuthorityDenyClass::UnknownRevocationHead,
-        AuthorityDenyClass::ActiveSovereignFreeze,
+        AuthorityDenyClass::StaleSovereigntyEpoch {
+            epoch_id: "epoch-001".to_string(),
+            last_known_tick: 100,
+            current_tick: 300,
+        },
+        AuthorityDenyClass::UnknownRevocationHead {
+            principal_id: "principal-001".to_string(),
+        },
+        AuthorityDenyClass::ActiveSovereignFreeze {
+            freeze_action: types::FreezeAction::HardFreeze,
+        },
+        AuthorityDenyClass::UntrustedSovereigntySigner {
+            expected_signer_key: test_hash(0xA1),
+            actual_signer_key: test_hash(0xA2),
+        },
         AuthorityDenyClass::DelegationWidening,
         AuthorityDenyClass::PointerOnlyDeniedAtTier2Plus,
         AuthorityDenyClass::PolicyDeny {
@@ -437,6 +460,7 @@ fn authority_deny_v1_display_without_ajc() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     assert_eq!(deny.to_string(), "authority denied: invalid session ID");
 }
@@ -451,6 +475,7 @@ fn authority_deny_v1_display_with_ajc() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let display = deny.to_string();
     assert!(display.contains("authority denied: authority already consumed"));
@@ -465,6 +490,7 @@ fn authority_deny_v1_is_error() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     // Verify it implements std::error::Error
     let err: &dyn std::error::Error = &deny;
@@ -502,6 +528,14 @@ fn consume_record_serde_roundtrip() {
     let json = serde_json::to_string(&record).unwrap();
     let back: AuthorityConsumeRecordV1 = serde_json::from_str(&json).unwrap();
     assert_eq!(back, record);
+}
+
+#[test]
+fn sovereignty_epoch_serde_roundtrip() {
+    let epoch = valid_sovereignty_epoch();
+    let json = serde_json::to_string(&epoch).unwrap();
+    let back: SovereigntyEpoch = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, epoch);
 }
 
 // =============================================================================
@@ -843,10 +877,28 @@ fn deny_taxonomy_covers_all_lifecycle_failures() {
     ];
 
     let _sovereignty_failures = [
-        AuthorityDenyClass::StaleSovereigntyEpoch,
-        AuthorityDenyClass::UnknownRevocationHead,
-        AuthorityDenyClass::IncompatibleAutonomyCeiling,
-        AuthorityDenyClass::ActiveSovereignFreeze,
+        AuthorityDenyClass::StaleSovereigntyEpoch {
+            epoch_id: "epoch-001".to_string(),
+            last_known_tick: 100,
+            current_tick: 300,
+        },
+        AuthorityDenyClass::UnknownRevocationHead {
+            principal_id: "principal-001".to_string(),
+        },
+        AuthorityDenyClass::IncompatibleAutonomyCeiling {
+            required: types::RiskTier::Tier2Plus,
+            actual: types::RiskTier::Tier2Plus,
+        },
+        AuthorityDenyClass::ActiveSovereignFreeze {
+            freeze_action: types::FreezeAction::HardFreeze,
+        },
+        AuthorityDenyClass::UntrustedSovereigntySigner {
+            expected_signer_key: zero_hash(),
+            actual_signer_key: zero_hash(),
+        },
+        AuthorityDenyClass::SovereigntyUncertainty {
+            reason: "test".to_string(),
+        },
     ];
 
     let _policy_failures = [
@@ -946,6 +998,49 @@ fn deny_unknown_fields_authority_consume_record() {
 }
 
 #[test]
+fn deny_unknown_fields_sovereignty_epoch() {
+    let json = serde_json::json!({
+        "epoch_id": "epoch-001",
+        "freshness_tick": 100,
+        "principal_scope_hash": vec![0x41u8; 32],
+        "signer_public_key": vec![0x42u8; 32],
+        "signature": vec![0xAAu8; 64],
+        "smuggled_field": true
+    })
+    .to_string();
+
+    let result = serde_json::from_str::<SovereigntyEpoch>(&json);
+    assert!(result.is_err(), "unknown field must be rejected");
+}
+
+#[test]
+fn deny_unknown_fields_autonomy_ceiling() {
+    let json = serde_json::json!({
+        "max_risk_tier": "tier2_plus",
+        "policy_binding_hash": vec![0xDDu8; 32],
+        "smuggled_field": true
+    })
+    .to_string();
+
+    let result = serde_json::from_str::<AutonomyCeiling>(&json);
+    assert!(result.is_err(), "unknown field must be rejected");
+}
+
+#[test]
+fn deny_unknown_fields_pointer_only_waiver() {
+    let json = serde_json::json!({
+        "waiver_id": "WVR-0001",
+        "expires_at_tick": 1234,
+        "scope_binding_hash": vec![0xABu8; 32],
+        "smuggled_field": true
+    })
+    .to_string();
+
+    let result = serde_json::from_str::<PointerOnlyWaiver>(&json);
+    assert!(result.is_err(), "unknown field must be rejected");
+}
+
+#[test]
 fn deny_unknown_fields_authority_deny_v1() {
     let deny = AuthorityDenyV1 {
         deny_class: AuthorityDenyClass::InvalidSessionId,
@@ -953,6 +1048,7 @@ fn deny_unknown_fields_authority_deny_v1() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let mut json: serde_json::Value = serde_json::to_value(&deny).unwrap();
     json.as_object_mut()
@@ -1168,8 +1264,134 @@ fn authority_deny_v1_validates_embedded_class() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     assert!(deny.validate().is_err());
+}
+
+#[test]
+fn oversize_stale_sovereignty_epoch_epoch_id_rejected_by_validator() {
+    let class = AuthorityDenyClass::StaleSovereigntyEpoch {
+        epoch_id: "x".repeat(types::MAX_STRING_LENGTH + 1),
+        last_known_tick: 100,
+        current_tick: 300,
+    };
+    let err = class.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "epoch_id")
+    );
+}
+
+#[test]
+fn oversize_unknown_revocation_head_principal_id_rejected_by_validator() {
+    let class = AuthorityDenyClass::UnknownRevocationHead {
+        principal_id: "x".repeat(types::MAX_STRING_LENGTH + 1),
+    };
+    let err = class.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "principal_id")
+    );
+}
+
+#[test]
+fn oversize_sovereignty_uncertainty_reason_rejected_by_validator() {
+    let class = AuthorityDenyClass::SovereigntyUncertainty {
+        reason: "x".repeat(types::MAX_STRING_LENGTH + 1),
+    };
+    let err = class.validate().unwrap_err();
+    assert!(
+        matches!(err, types::PcacValidationError::StringTooLong { field, .. } if field == "reason")
+    );
+}
+
+// =============================================================================
+// Bounded deserialization tests (Security BLOCKER)
+// =============================================================================
+
+#[test]
+fn sovereignty_epoch_deserialize_rejects_oversize_epoch_id() {
+    let mut value = serde_json::to_value(valid_sovereignty_epoch()).unwrap();
+    value["epoch_id"] = serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+    let result: Result<SovereigntyEpoch, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized epoch_id must be rejected");
+}
+
+#[test]
+fn sovereignty_epoch_deserialize_rejects_oversize_signature() {
+    let mut value = serde_json::to_value(valid_sovereignty_epoch()).unwrap();
+    let oversized = [0xAA_u8; 65];
+    value["signature"] = serde_json::Value::Array(
+        oversized
+            .iter()
+            .map(|&b| serde_json::Value::Number(b.into()))
+            .collect(),
+    );
+
+    let result: Result<SovereigntyEpoch, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized signature must be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("64") || err.contains("signature too long"),
+        "expected size-bound error, got: {err}"
+    );
+}
+
+#[test]
+fn pointer_only_waiver_deserialize_rejects_oversize_waiver_id() {
+    let mut value = serde_json::to_value(PointerOnlyWaiver {
+        waiver_id: "WVR-0001".to_string(),
+        expires_at_tick: 1234,
+        scope_binding_hash: test_hash(0xAB),
+    })
+    .unwrap();
+    value["waiver_id"] = serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+
+    let result: Result<PointerOnlyWaiver, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized waiver_id must be rejected");
+}
+
+#[test]
+fn deny_class_deserialize_rejects_oversize_stale_sovereignty_epoch_epoch_id() {
+    let mut value = serde_json::to_value(AuthorityDenyClass::StaleSovereigntyEpoch {
+        epoch_id: "epoch-001".to_string(),
+        last_known_tick: 100,
+        current_tick: 300,
+    })
+    .unwrap();
+    value["stale_sovereignty_epoch"]["epoch_id"] =
+        serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+
+    let result: Result<AuthorityDenyClass, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized epoch_id must be rejected");
+}
+
+#[test]
+fn deny_class_deserialize_rejects_oversize_unknown_revocation_head_principal_id() {
+    let mut value = serde_json::to_value(AuthorityDenyClass::UnknownRevocationHead {
+        principal_id: "principal-001".to_string(),
+    })
+    .unwrap();
+    value["unknown_revocation_head"]["principal_id"] =
+        serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+
+    let result: Result<AuthorityDenyClass, _> = serde_json::from_value(value);
+    assert!(result.is_err(), "oversized principal_id must be rejected");
+}
+
+#[test]
+fn deny_class_deserialize_rejects_oversize_sovereignty_uncertainty_reason() {
+    let mut value = serde_json::to_value(AuthorityDenyClass::SovereigntyUncertainty {
+        reason: "uncertain".to_string(),
+    })
+    .unwrap();
+    value["sovereignty_uncertainty"]["reason"] =
+        serde_json::Value::String("x".repeat(types::MAX_STRING_LENGTH + 1));
+
+    let result: Result<AuthorityDenyClass, _> = serde_json::from_value(value);
+    assert!(
+        result.is_err(),
+        "oversized uncertainty reason must be rejected"
+    );
 }
 
 // =============================================================================
@@ -1462,6 +1684,7 @@ fn risk_tier_and_determinism_class_reexported_from_pcac_module() {
         permeability_receipt_hash: None,
         identity_proof_hash: test_hash(0x03),
         identity_evidence_level: crate::pcac::IdentityEvidenceLevel::Verified,
+        pointer_only_waiver_hash: None,
         directory_head_hash: test_hash(0x04),
         freshness_policy_hash: test_hash(0x05),
         freshness_witness_tick: 1000,
@@ -2781,6 +3004,7 @@ fn deny_v1_zero_time_envelope_ref_rejected() {
         time_envelope_ref: zero_hash(),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let err = deny.validate().unwrap_err();
     assert!(
@@ -2796,6 +3020,7 @@ fn deny_v1_zero_ledger_anchor_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: zero_hash(),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let err = deny.validate().unwrap_err();
     assert!(
@@ -2811,6 +3036,7 @@ fn deny_v1_zero_ajc_id_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     let err = deny.validate().unwrap_err();
     assert!(matches!(err, types::PcacValidationError::ZeroHash { field } if field == "ajc_id"));
@@ -2824,6 +3050,7 @@ fn deny_v1_non_positive_denied_at_tick_rejected() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 0,
+        containment_action: None,
     };
     let err = deny.validate().unwrap_err();
     assert!(
@@ -2839,6 +3066,7 @@ fn deny_v1_valid_ajc_id_passes() {
         time_envelope_ref: test_hash(0x07),
         ledger_anchor: test_hash(0x08),
         denied_at_tick: 500,
+        containment_action: None,
     };
     assert!(deny.validate().is_ok());
 }
