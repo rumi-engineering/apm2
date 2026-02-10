@@ -39,6 +39,7 @@
 
 mod auth_verifier;
 mod deny;
+pub mod intent_class;
 mod kernel;
 mod receipts;
 mod types;
@@ -52,6 +53,7 @@ pub use auth_verifier::{
     validate_replay_lifecycle_order, verify_receipt_authentication,
 };
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
+pub use intent_class::{AcceptanceFactClass, BoundaryIntentClass};
 pub use kernel::AuthorityJoinKernel;
 pub use receipts::{
     AuthoritativeBindings, AuthorityConsumeReceiptV1, AuthorityDenyReceiptV1,

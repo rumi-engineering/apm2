@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use super::deny::AuthorityDenyClass;
+use super::intent_class::{AcceptanceFactClass, BoundaryIntentClass};
 use super::types::{
     MAX_CANONICALIZER_ID_LENGTH, MAX_CHECKPOINT_LENGTH, MAX_MERKLE_PROOF_STEPS,
     PcacValidationError, RiskTier,
@@ -25,6 +26,14 @@ use crate::crypto::Hash;
 const ZERO_HASH: Hash = [0u8; 32];
 /// Canonicalizer IDs that are currently admissible for digest verification.
 const ALLOWED_CANONICALIZER_IDS: &[&str] = &["blake3-canonical-v1", "apm2.canonicalizer.jcs"];
+
+const fn default_boundary_intent_class() -> BoundaryIntentClass {
+    BoundaryIntentClass::Observe
+}
+
+const fn default_acceptance_fact_class() -> AcceptanceFactClass {
+    AcceptanceFactClass::Observational
+}
 
 // =============================================================================
 // Common receipt metadata
@@ -138,6 +147,10 @@ pub struct AuthorityJoinReceiptV1 {
     /// Risk tier at join time.
     pub risk_tier: RiskTier,
 
+    /// Boundary intent class recorded at join time.
+    #[serde(default = "default_boundary_intent_class")]
+    pub boundary_intent_class: BoundaryIntentClass,
+
     /// Time envelope reference at join time.
     pub time_envelope_ref: Hash,
 
@@ -210,6 +223,14 @@ pub struct AuthorityConsumeReceiptV1 {
     /// The intent digest that was consumed.
     pub intent_digest: Hash,
 
+    /// Boundary intent class recorded at consume time. Must match join.
+    #[serde(default = "default_boundary_intent_class")]
+    pub boundary_intent_class: BoundaryIntentClass,
+
+    /// Acceptance-fact class derived from `boundary_intent_class`.
+    #[serde(default = "default_acceptance_fact_class")]
+    pub acceptance_fact_class: AcceptanceFactClass,
+
     /// Time envelope reference at consume time.
     pub time_envelope_ref: Hash,
 
@@ -260,6 +281,10 @@ pub struct AuthorityDenyReceiptV1 {
 
     /// Tick at denial time.
     pub denied_at_tick: u64,
+
+    /// Boundary intent class (when available) for denial audit trails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_intent_class: Option<BoundaryIntentClass>,
 
     /// The lifecycle stage at which denial occurred.
     pub denied_at_stage: LifecycleStage,
@@ -673,6 +698,12 @@ impl AuthorityJoinReceiptV1 {
     /// authoritative bindings are absent, or propagates any structural/binding
     /// validation error.
     pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
+        if !self.boundary_intent_class.is_authoritative() {
+            return Err(PcacValidationError::FieldCoherenceMismatch {
+                outer_field: "boundary_intent_class",
+                inner_field: "authoritative_boundary_intent_class",
+            });
+        }
         self.validate()?;
         self.digest_meta.validate_authoritative()?;
         let bindings = self.authoritative_bindings.as_ref().ok_or(
@@ -750,6 +781,12 @@ impl AuthorityConsumeReceiptV1 {
                 field: "effect_selector_digest",
             });
         }
+        if self.acceptance_fact_class != self.boundary_intent_class.acceptance_fact_class() {
+            return Err(PcacValidationError::FieldCoherenceMismatch {
+                outer_field: "acceptance_fact_class",
+                inner_field: "boundary_intent_class.acceptance_fact_class",
+            });
+        }
         // Optional hash field: pre_actuation_receipt_hash must be non-zero
         // when present (authority-critical binding).
         if let Some(ref parh) = self.pre_actuation_receipt_hash {
@@ -777,6 +814,18 @@ impl AuthorityConsumeReceiptV1 {
     /// authoritative bindings are absent, or propagates any structural/binding
     /// validation error.
     pub fn validate_authoritative(&self) -> Result<(), PcacValidationError> {
+        if !self.boundary_intent_class.is_authoritative() {
+            return Err(PcacValidationError::FieldCoherenceMismatch {
+                outer_field: "boundary_intent_class",
+                inner_field: "authoritative_boundary_intent_class",
+            });
+        }
+        if self.acceptance_fact_class != AcceptanceFactClass::Authoritative {
+            return Err(PcacValidationError::FieldCoherenceMismatch {
+                outer_field: "acceptance_fact_class",
+                inner_field: "AcceptanceFactClass::Authoritative",
+            });
+        }
         self.validate()?;
         self.digest_meta.validate_authoritative()?;
         let bindings = self.authoritative_bindings.as_ref().ok_or(

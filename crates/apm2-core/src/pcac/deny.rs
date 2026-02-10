@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::intent_class::BoundaryIntentClass;
 use super::types::{
     MAX_DESCRIPTION_LENGTH, MAX_FIELD_NAME_LENGTH, MAX_OPERATION_LENGTH, MAX_REASON_LENGTH,
     MAX_STRING_LENGTH, PcacValidationError, RiskTier, deserialize_bounded_string,
@@ -126,6 +127,21 @@ pub enum AuthorityDenyClass {
     BoundaryMonotonicityViolation {
         /// Description of the violation.
         description: String,
+    },
+
+    /// Observe-class payload cannot satisfy authoritative predicates
+    /// (RFC-0028 REQ-0001).
+    ObservationalPayloadInAuthoritativePath {
+        /// The intent class that was provided.
+        intent_class: BoundaryIntentClass,
+    },
+
+    /// Intent class changed between lifecycle stages (replay-attack vector).
+    IntentClassDriftBetweenStages {
+        /// Intent class at join.
+        join_intent_class: BoundaryIntentClass,
+        /// Intent class at consume (mismatched).
+        consume_intent_class: BoundaryIntentClass,
     },
 
     // ---- Tier2+ sovereignty failures (RFC-0027 §6.6, TCK-00427) ----
@@ -249,6 +265,17 @@ impl std::fmt::Display for AuthorityDenyClass {
             Self::BoundaryMonotonicityViolation { description } => {
                 write!(f, "boundary monotonicity violation: {description}")
             },
+            Self::ObservationalPayloadInAuthoritativePath { intent_class } => write!(
+                f,
+                "observational payload cannot satisfy authoritative path: {intent_class}"
+            ),
+            Self::IntentClassDriftBetweenStages {
+                join_intent_class,
+                consume_intent_class,
+            } => write!(
+                f,
+                "intent class drift between stages (join: {join_intent_class}, consume: {consume_intent_class})"
+            ),
             Self::StaleSovereigntyEpoch {
                 epoch_id,
                 last_known_tick,

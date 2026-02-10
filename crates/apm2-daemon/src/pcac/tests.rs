@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
-    AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel, DeterminismClass,
-    IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier, SovereigntyEnforcementMode,
+    AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass,
+    DeterminismClass, IdentityEvidenceLevel, PcacPolicyKnobs, RiskTier, SovereigntyEnforcementMode,
 };
 
 use super::durable_consume::DurableConsumeIndex;
@@ -70,6 +70,7 @@ fn valid_input() -> AuthorityJoinInputV1 {
         session_id: "session-001".to_string(),
         holon_id: None,
         intent_digest: test_hash(0x01),
+        boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
         capability_manifest_hash: test_hash(0x02),
         scope_witness_hashes: vec![],
         lease_id: "lease-001".to_string(),
@@ -269,6 +270,8 @@ fn consume_succeeds_with_matching_intent() {
         .consume(
             &cert,
             input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             input.directory_head_hash,
         )
@@ -288,6 +291,8 @@ fn consume_denies_intent_mismatch() {
         .consume(
             &cert,
             test_hash(0xFF),
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             input.directory_head_hash,
         )
@@ -309,6 +314,8 @@ fn consume_denies_double_consume() {
         .consume(
             &cert,
             input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             input.directory_head_hash,
         )
@@ -319,6 +326,8 @@ fn consume_denies_double_consume() {
         .consume(
             &cert,
             input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             input.directory_head_hash,
         )
@@ -326,6 +335,93 @@ fn consume_denies_double_consume() {
     assert!(matches!(
         err.deny_class,
         AuthorityDenyClass::AlreadyConsumed { .. }
+    ));
+}
+
+fn assert_authoritative_class_satisfies_consume(intent_class: BoundaryIntentClass) {
+    let kernel = InProcessKernel::new(100);
+    let mut input = valid_input();
+    input.boundary_intent_class = intent_class;
+    let cert = kernel.join(&input).expect("join should succeed");
+    let result = kernel.consume(
+        &cert,
+        input.intent_digest,
+        intent_class,
+        true,
+        input.time_envelope_ref,
+        input.directory_head_hash,
+    );
+    assert!(result.is_ok(), "expected authoritative class to consume");
+}
+
+#[test]
+fn test_observe_class_cannot_satisfy_authoritative() {
+    let kernel = InProcessKernel::new(100);
+    let mut input = valid_input();
+    input.boundary_intent_class = BoundaryIntentClass::Observe;
+    let cert = kernel.join(&input).expect("join should succeed");
+
+    let err = kernel
+        .consume(
+            &cert,
+            input.intent_digest,
+            BoundaryIntentClass::Observe,
+            true,
+            input.time_envelope_ref,
+            input.directory_head_hash,
+        )
+        .expect_err("observe class must be denied for authoritative consume");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::ObservationalPayloadInAuthoritativePath {
+            intent_class: BoundaryIntentClass::Observe
+        }
+    ));
+}
+
+#[test]
+fn test_assert_class_satisfies_authoritative() {
+    assert_authoritative_class_satisfies_consume(BoundaryIntentClass::Assert);
+}
+
+#[test]
+fn test_delegate_class_satisfies_authoritative() {
+    assert_authoritative_class_satisfies_consume(BoundaryIntentClass::Delegate);
+}
+
+#[test]
+fn test_actuate_class_satisfies_authoritative() {
+    assert_authoritative_class_satisfies_consume(BoundaryIntentClass::Actuate);
+}
+
+#[test]
+fn test_govern_class_satisfies_authoritative() {
+    assert_authoritative_class_satisfies_consume(BoundaryIntentClass::Govern);
+}
+
+#[test]
+fn test_intent_class_drift_denied() {
+    let kernel = InProcessKernel::new(100);
+    let mut input = valid_input();
+    input.boundary_intent_class = BoundaryIntentClass::Assert;
+    let cert = kernel.join(&input).expect("join should succeed");
+
+    let err = kernel
+        .consume(
+            &cert,
+            input.intent_digest,
+            BoundaryIntentClass::Observe,
+            true,
+            input.time_envelope_ref,
+            input.directory_head_hash,
+        )
+        .expect_err("intent class drift must deny");
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::IntentClassDriftBetweenStages {
+            join_intent_class: BoundaryIntentClass::Assert,
+            consume_intent_class: BoundaryIntentClass::Observe
+        }
     ));
 }
 
@@ -810,6 +906,8 @@ fn lifecycle_gate_missing_checker_denies_consume_in_strict_mode() {
         .consume_before_effect_with_sovereignty(
             &cert,
             input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             input.as_of_ledger_anchor,
             input.directory_head_hash,
@@ -1183,6 +1281,8 @@ fn consume_denies_expired_certificate() {
         .consume(
             &cert,
             input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             input.directory_head_hash,
         )
@@ -2274,6 +2374,8 @@ fn durable_kernel_consume_does_not_double_consume_inner() {
         .consume(
             &cert,
             input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             cert.revocation_head_hash,
         )
@@ -2288,6 +2390,8 @@ fn durable_kernel_consume_does_not_double_consume_inner() {
         .consume(
             &cert,
             input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             input.time_envelope_ref,
             cert.revocation_head_hash,
         )

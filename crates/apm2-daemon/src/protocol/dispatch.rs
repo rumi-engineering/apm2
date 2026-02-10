@@ -7431,6 +7431,8 @@ impl PrivilegedDispatcher {
             .consume_before_effect(
                 &certificate,
                 effect_intent_digest,
+                join_input.boundary_intent_class,
+                true,
                 current_time_envelope_ref,
                 current_revocation_head,
             )
@@ -12574,6 +12576,7 @@ impl PrivilegedDispatcher {
                 session_id: request.receipt_id.clone(),
                 holon_id: None,
                 intent_digest: effect_intent_digest,
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
                 capability_manifest_hash,
                 scope_witness_hashes: vec![scope_witness_hash],
                 lease_id: request.lease_id.clone(),
@@ -14140,6 +14143,7 @@ impl PrivilegedDispatcher {
                 session_id: request.sublease_id.clone(),
                 holon_id: None,
                 intent_digest: effect_intent_digest,
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Delegate,
                 capability_manifest_hash,
                 scope_witness_hashes: vec![scope_witness_hash],
                 lease_id: request.parent_lease_id.clone(),
@@ -28158,6 +28162,8 @@ mod tests {
                     &self,
                     cert: &AuthorityJoinCertificateV1,
                     intent_digest: [u8; 32],
+                    boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+                    requires_authoritative_acceptance: bool,
                     current_time_envelope_ref: [u8; 32],
                     current_revocation_head_hash: [u8; 32],
                 ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
@@ -28165,6 +28171,8 @@ mod tests {
                     self.inner.consume(
                         cert,
                         intent_digest,
+                        boundary_intent_class,
+                        requires_authoritative_acceptance,
                         current_time_envelope_ref,
                         current_revocation_head_hash,
                     )

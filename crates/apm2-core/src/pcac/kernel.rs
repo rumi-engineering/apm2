@@ -19,6 +19,7 @@
 //! <= EffectReceipt`
 
 use super::deny::AuthorityDenyV1;
+use super::intent_class::BoundaryIntentClass;
 use super::types::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityJoinCertificateV1, AuthorityJoinInputV1,
 };
@@ -97,6 +98,10 @@ pub trait AuthorityJoinKernel: Send + Sync {
     ///
     /// * `cert` — The AJC to consume.
     /// * `intent_digest` — Must match the AJC's intent digest exactly.
+    /// * `boundary_intent_class` — Consume-stage intent class presented by the
+    ///   caller. MUST match the class bound in `cert`.
+    /// * `requires_authoritative_acceptance` — Whether this consume path is
+    ///   enforcing authoritative acceptance predicates.
     /// * `current_time_envelope_ref` — Current HTF time witness.
     /// * `current_revocation_head_hash` — Current revocation frontier; if this
     ///   has advanced beyond the AJC's `revocation_head_hash`, consume MUST be
@@ -108,12 +113,18 @@ pub trait AuthorityJoinKernel: Send + Sync {
     /// - `RevocationFrontierAdvanced` if the revocation frontier moved since
     ///   the AJC was issued.
     /// - `IntentDigestMismatch` if digests don't match.
+    /// - `IntentClassDriftBetweenStages` if join/consume class bindings
+    ///   diverge.
+    /// - `ObservationalPayloadInAuthoritativePath` when an `observe` intent is
+    ///   supplied for an authoritative consume path.
     /// - `AlreadyConsumed` if this AJC was already consumed.
     /// - `CertificateExpired` if the AJC has expired.
     fn consume(
         &self,
         cert: &AuthorityJoinCertificateV1,
         intent_digest: Hash,
+        boundary_intent_class: BoundaryIntentClass,
+        requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>;
