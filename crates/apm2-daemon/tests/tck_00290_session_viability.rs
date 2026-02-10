@@ -22,6 +22,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use apm2_core::fac::taint::{FlowRule, TaintPolicy, TaintSource, TargetContext};
 use apm2_daemon::cas::{DurableCas, DurableCasConfig};
 use apm2_daemon::episode::executor::ContentAddressedStore;
 use apm2_daemon::episode::{
@@ -97,6 +98,17 @@ fn make_test_manifest(tools: Vec<ToolClass>) -> apm2_daemon::episode::Capability
         .expect("manifest build failed")
 }
 
+fn test_tool_argument_taint_policy() -> TaintPolicy {
+    TaintPolicy::default().with_rule(FlowRule {
+        rule_id: "TEST_ALLOW_USER_PROMPT_TOOL_ARGUMENT".to_string(),
+        source: Some(TaintSource::UserPrompt),
+        level: None,
+        target: Some(TargetContext::ToolArgument),
+        allow: true,
+        rationale: "TCK-00290 tests focus on dispatcher wiring, not taint policy".to_string(),
+    })
+}
+
 // =============================================================================
 // IT-00290-01: RequestTool execution tests
 // Verification: cargo test -p apm2-daemon session_request_tool_exec
@@ -115,7 +127,8 @@ fn session_request_tool_exec_allow_with_manifest() {
     let manifest = make_test_manifest(vec![ToolClass::Read, ToolClass::Write]);
     store.register("session-001", manifest);
 
-    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+        .with_taint_policy(test_tool_argument_taint_policy());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -158,7 +171,8 @@ fn session_request_tool_exec_deny_not_in_allowlist() {
     let manifest = make_test_manifest(vec![ToolClass::Read]);
     store.register("session-001", manifest);
 
-    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+        .with_taint_policy(test_tool_argument_taint_policy());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -196,7 +210,8 @@ fn session_request_tool_exec_deny_no_manifest_for_session() {
     let store = Arc::new(InMemoryManifestStore::new());
 
     // Don't register a manifest for session-001 (empty store)
-    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+        .with_taint_policy(test_tool_argument_taint_policy());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -232,7 +247,8 @@ fn session_request_tool_exec_deny_no_manifest_for_session() {
 #[test]
 fn session_request_tool_exec_deny_no_store_configured() {
     let minter = test_minter();
-    let dispatcher = SessionDispatcher::new(minter.clone());
+    let dispatcher =
+        SessionDispatcher::new(minter.clone()).with_taint_policy(test_tool_argument_taint_policy());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -510,8 +526,9 @@ fn session_event_evidence_persist_full_config_integration() {
     store.register("session-001", manifest);
 
     // Create fully-configured dispatcher with clock
-    let dispatcher =
-        SessionDispatcher::with_all_stores(minter.clone(), store, ledger, cas).with_clock(clock);
+    let dispatcher = SessionDispatcher::with_all_stores(minter.clone(), store, ledger, cas)
+        .with_clock(clock)
+        .with_taint_policy(test_tool_argument_taint_policy());
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 

@@ -874,6 +874,7 @@ async fn async_main(args: Args) -> Result<()> {
         use rand::rngs::OsRng;
         ed25519_dalek::SigningKey::generate(&mut OsRng)
     };
+    let lifecycle_signing_key_bytes = ledger_signing_key.to_bytes();
 
     // TCK-00387: Crash recovery on startup
     // Before accepting new connections, recover any sessions from persistent state,
@@ -946,7 +947,9 @@ async fn async_main(args: Args) -> Result<()> {
                 metrics_registry.clone(),
                 Arc::clone(conn),
                 cas_path,
-                Some(ledger_signing_key),
+                Some(ed25519_dalek::SigningKey::from_bytes(
+                    &lifecycle_signing_key_bytes,
+                )),
                 daemon_config.config.daemon.adapter_rotation.clone(),
             )
             .map_err(|e| {
@@ -963,7 +966,9 @@ async fn async_main(args: Args) -> Result<()> {
                 state.session_registry().clone(),
                 metrics_registry.clone(),
                 sqlite_conn.clone(),
-                Some(ledger_signing_key),
+                Some(ed25519_dalek::SigningKey::from_bytes(
+                    &lifecycle_signing_key_bytes,
+                )),
                 &daemon_config.config.daemon.adapter_rotation,
             )
             .map_err(|e| anyhow::anyhow!("adapter rotation initialization failed: {e}"))?
@@ -973,11 +978,14 @@ async fn async_main(args: Args) -> Result<()> {
 
     // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
     //
-    // The orchestrator is instantiated with a fresh signing key and wired into
-    // the DispatcherState. When a session terminates, the dispatcher calls
-    // `notify_session_terminated` which delegates to the orchestrator. A
+    // The orchestrator is instantiated with the daemon lifecycle signing key
+    // and wired into the DispatcherState. When a session terminates, the dispatcher
+    // calls `notify_session_terminated` which delegates to the orchestrator. A
     // background task polls for gate timeouts periodically.
-    let gate_signer = Arc::new(Signer::generate());
+    let gate_signer = Arc::new(
+        Signer::from_bytes(&lifecycle_signing_key_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to derive gate signer from lifecycle key: {e}"))?,
+    );
     // TCK-00418: Share the dispatcher's evidence CAS with the gate
     // orchestrator so that time_envelope_ref hashes stored during
     // `issue_gate_lease` are resolvable by `validate_lease_time_authority`
@@ -1012,14 +1020,13 @@ async fn async_main(args: Args) -> Result<()> {
     // verdicts exist only in memory and are lost on restart.
     {
         let orch = Arc::clone(&gate_orchestrator);
+        let timeout_signing_key_bytes = lifecycle_signing_key_bytes;
         // Create a dedicated ledger emitter for the timeout poller if a
         // ledger database is configured. Uses the same sqlite_conn (shared
-        // via Arc<Mutex>) and a fresh signing key.
+        // via Arc<Mutex>) and the daemon lifecycle signing key.
         let timeout_ledger_emitter: Option<SqliteLedgerEventEmitter> =
             sqlite_conn.as_ref().map(|conn| {
-                let timeout_signer = Signer::generate();
-                let key_bytes = timeout_signer.secret_key_bytes();
-                let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                let signing_key = ed25519_dalek::SigningKey::from_bytes(&timeout_signing_key_bytes);
                 SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
             });
         tokio::spawn(async move {
@@ -1049,11 +1056,21 @@ async fn async_main(args: Args) -> Result<()> {
                                 _ => "gate.event",
                             };
                             let payload = serde_json::to_vec(event).unwrap_or_default();
-                            #[allow(clippy::cast_possible_truncation)]
-                            let timestamp_ns = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos() as u64)
-                                .unwrap_or(0);
+                            let timestamp_ns = match event {
+                                apm2_daemon::gate::GateOrchestratorEvent::GateTimedOut {
+                                    timestamp_ms,
+                                    ..
+                                }
+                                | apm2_daemon::gate::GateOrchestratorEvent::GateTimeoutReceiptGenerated {
+                                    timestamp_ms,
+                                    ..
+                                }
+                                | apm2_daemon::gate::GateOrchestratorEvent::AllGatesCompleted {
+                                    timestamp_ms,
+                                    ..
+                                } => timestamp_ms.saturating_mul(1_000_000),
+                                _ => 0,
+                            };
                             if let Err(e) = emitter.emit_session_event(
                                 "gate-timeout-poller",
                                 event_type,
@@ -1334,7 +1351,10 @@ async fn async_main(args: Args) -> Result<()> {
             let poll_interval = watchdog_config.poll_interval;
 
             // Use the daemon's signer (unified signing key per lifecycle).
-            let watchdog_signer = Signer::generate();
+            let watchdog_signer =
+                Signer::from_bytes(&lifecycle_signing_key_bytes).map_err(|e| {
+                    anyhow::anyhow!("failed to derive watchdog signer from lifecycle key: {e}")
+                })?;
             let watchdog = DivergenceWatchdog::new(watchdog_signer, watchdog_config);
 
             info!(
@@ -1344,12 +1364,12 @@ async fn async_main(args: Args) -> Result<()> {
                 "Divergence watchdog enabled"
             );
 
+            let watchdog_signing_key_bytes = lifecycle_signing_key_bytes;
             // Create a dedicated ledger emitter for the watchdog.
             let watchdog_ledger_emitter: Option<SqliteLedgerEventEmitter> =
                 sqlite_conn.as_ref().map(|conn| {
-                    let watchdog_sign_key = Signer::generate();
-                    let key_bytes = watchdog_sign_key.secret_key_bytes();
-                    let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                    let signing_key =
+                        ed25519_dalek::SigningKey::from_bytes(&watchdog_signing_key_bytes);
                     SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
                 });
 
@@ -1427,7 +1447,8 @@ async fn async_main(args: Args) -> Result<()> {
                                  ledger MergeReceipt HEAD"
                             );
 
-                            // Emit DefectRecorded event to the ledger.
+                            // Emit DefectRecorded + InterventionFreeze transition
+                            // events to the ledger.
                             if let Some(ref emitter) = watchdog_ledger_emitter {
                                 use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
 
@@ -1445,6 +1466,35 @@ async fn async_main(args: Args) -> Result<()> {
                                         defect_id = %result.defect_event.defect_id,
                                         "Persisted divergence DefectRecorded event"
                                     );
+                                }
+
+                                match serde_json::to_vec(&result.freeze) {
+                                    Ok(freeze_payload) => {
+                                        if let Err(e) = emitter.emit_session_event(
+                                            "divergence-watchdog",
+                                            "intervention.freeze",
+                                            &freeze_payload,
+                                            &result.freeze.gate_actor_id,
+                                            result.freeze.frozen_at,
+                                        ) {
+                                            error!(
+                                                error = %e,
+                                                freeze_id = %result.freeze.freeze_id,
+                                                "Failed to persist InterventionFreeze transition event"
+                                            );
+                                        } else {
+                                            info!(
+                                                freeze_id = %result.freeze.freeze_id,
+                                                "Persisted divergence InterventionFreeze transition event"
+                                            );
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!(
+                                            error = %e,
+                                            "Failed to serialize InterventionFreeze transition payload"
+                                        );
+                                    },
                                 }
                             }
 
