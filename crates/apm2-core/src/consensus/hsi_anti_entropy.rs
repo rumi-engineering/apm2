@@ -1372,6 +1372,7 @@ impl ByzantineRelayDetector {
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Fields read via clone in accept_deliver binding checks.
 struct OutstandingRequest {
     request_id: String,
     session_id: String,
@@ -1505,6 +1506,80 @@ impl PullOnlyEnforcer {
         deliver: &AntiEntropyDeliver,
         verifier: &dyn EventAttestationVerifier,
     ) -> Result<(), HsiAntiEntropyError> {
+        self.validate_deliver_preconditions(deliver)?;
+
+        // SECURITY: Read-only replay check BEFORE request correlation.
+        // State mutation (record) is deferred until after all authorization
+        // gates pass. This prevents unsolicited deliveries from poisoning
+        // replay high-water marks for legitimate future deliveries.
+        self.replay_protector.check(deliver)?;
+
+        let request = match self.outstanding_requests.get(&deliver.request_id) {
+            Some(req) => req.clone(),
+            None => {
+                return Err(defect_error(
+                    AntiEntropyDefectKind::UnsolicitedDelivery,
+                    &deliver.issuer_id,
+                    None,
+                    Some(&deliver.cell_id),
+                    Some(&deliver.session_id),
+                    Some(&deliver.request_id),
+                    "deliver without matching prior request",
+                ));
+            },
+        };
+
+        // Verify request/deliver binding (identity, nonce, range, digest).
+        self.verify_request_binding(&request, deliver)?;
+
+        // SECURITY: Check budget availability BEFORE expensive per-event
+        // cryptographic verification. This prevents CPU amplification where
+        // an attacker sends deliveries that trigger verification loops but
+        // would exceed budget anyway. The request is consumed on budget
+        // failure to prevent infinite retry.
+        let bytes = deliver.estimated_wire_bytes();
+        if let Err(budget_err) = self.budget_enforcer.record_delivery(
+            &deliver.session_id,
+            &request.issuer_id,
+            deliver.events.len(),
+            bytes,
+        ) {
+            self.outstanding_requests.remove(&deliver.request_id);
+            return Err(budget_err);
+        }
+
+        for event in &deliver.events {
+            if !verifier.verify_event(event) {
+                // Consume the request to prevent retry abuse with invalid
+                // attestations that would repeatedly trigger verification.
+                self.outstanding_requests.remove(&deliver.request_id);
+                return Err(defect_error(
+                    AntiEntropyDefectKind::InvalidAttestation,
+                    &deliver.issuer_id,
+                    None,
+                    Some(&deliver.cell_id),
+                    Some(&deliver.session_id),
+                    Some(&deliver.request_id),
+                    &format!("event attestation rejected at seq {}", event.seq_id),
+                ));
+            }
+        }
+
+        // SECURITY: Only record replay state AFTER all authorization gates
+        // have passed. This ensures unsolicited or tampered deliveries
+        // cannot poison replay high-water marks.
+        self.replay_protector.record(deliver)?;
+
+        self.outstanding_requests.remove(&deliver.request_id);
+        Ok(())
+    }
+
+    /// Validates deliver preconditions: initiator role and structural
+    /// integrity.
+    fn validate_deliver_preconditions(
+        &self,
+        deliver: &AntiEntropyDeliver,
+    ) -> Result<(), HsiAntiEntropyError> {
         if !self.local_is_initiator {
             return Err(defect_error(
                 AntiEntropyDefectKind::UnsolicitedDelivery,
@@ -1529,23 +1604,34 @@ impl PullOnlyEnforcer {
             ));
         }
 
-        // SECURITY: Read-only replay check BEFORE request correlation.
-        // State mutation (record) is deferred until after all authorization
-        // gates pass. This prevents unsolicited deliveries from poisoning
-        // replay high-water marks for legitimate future deliveries.
-        self.replay_protector.check(deliver)?;
+        Ok(())
+    }
 
-        let Some(request) = self.outstanding_requests.get(&deliver.request_id) else {
+    /// Verifies request/deliver binding: identity, nonce, ranges, and digest.
+    /// Consumes (one-shot) the outstanding request on any mismatch to prevent
+    /// retry abuse.
+    fn verify_request_binding(
+        &mut self,
+        request: &OutstandingRequest,
+        deliver: &AntiEntropyDeliver,
+    ) -> Result<(), HsiAntiEntropyError> {
+        // SECURITY: Verify issuer identity binding. The deliver issuer_id
+        // MUST match the request issuer_id. Without this check, an attacker
+        // could spoof a different issuer_id, causing budget to be charged to
+        // the original requester while replay state is applied to the spoofed
+        // identity.
+        if request.issuer_id != deliver.issuer_id {
+            self.outstanding_requests.remove(&deliver.request_id);
             return Err(defect_error(
-                AntiEntropyDefectKind::UnsolicitedDelivery,
+                AntiEntropyDefectKind::TamperedDelivery,
                 &deliver.issuer_id,
                 None,
                 Some(&deliver.cell_id),
                 Some(&deliver.session_id),
                 Some(&deliver.request_id),
-                "deliver without matching prior request",
+                "deliver issuer_id does not match request issuer_id",
             ));
-        };
+        }
 
         if request.nonce != deliver.nonce
             || request.seq_start != deliver.seq_start
@@ -1553,6 +1639,7 @@ impl PullOnlyEnforcer {
             || request.session_id != deliver.session_id
             || request.cell_id != deliver.cell_id
         {
+            self.outstanding_requests.remove(&deliver.request_id);
             return Err(defect_error(
                 AntiEntropyDefectKind::TamperedDelivery,
                 &deliver.issuer_id,
@@ -1565,6 +1652,7 @@ impl PullOnlyEnforcer {
         }
 
         if request.expected_range_digest != deliver.range_digest {
+            self.outstanding_requests.remove(&deliver.request_id);
             return Err(defect_error(
                 AntiEntropyDefectKind::TamperedDelivery,
                 &deliver.issuer_id,
@@ -1576,34 +1664,6 @@ impl PullOnlyEnforcer {
             ));
         }
 
-        for event in &deliver.events {
-            if !verifier.verify_event(event) {
-                return Err(defect_error(
-                    AntiEntropyDefectKind::InvalidAttestation,
-                    &deliver.issuer_id,
-                    None,
-                    Some(&deliver.cell_id),
-                    Some(&deliver.session_id),
-                    Some(&deliver.request_id),
-                    &format!("event attestation rejected at seq {}", event.seq_id),
-                ));
-            }
-        }
-
-        let bytes = deliver.estimated_wire_bytes();
-        self.budget_enforcer.record_delivery(
-            &deliver.session_id,
-            &request.issuer_id,
-            deliver.events.len(),
-            bytes,
-        )?;
-
-        // SECURITY: Only record replay state AFTER all authorization gates
-        // have passed. This ensures unsolicited or tampered deliveries
-        // cannot poison replay high-water marks.
-        self.replay_protector.record(deliver)?;
-
-        self.outstanding_requests.remove(&deliver.request_id);
         Ok(())
     }
 
@@ -1730,7 +1790,7 @@ mod tests {
             offer_id: "offer-1".to_string(),
             cell_id: "cell-a".to_string(),
             issuer_id: "issuer-a".to_string(),
-            issuer_hlc: Hlc::new(1000 + issuer_sequence, 0),
+            issuer_hlc: Hlc::new(10_000 + issuer_sequence, 0),
             issuer_sequence,
             ledger_head_seq: 10,
             ledger_head_hash: [1u8; HASH_SIZE],
@@ -1746,7 +1806,7 @@ mod tests {
             offer_id: "offer-1".to_string(),
             cell_id: "cell-a".to_string(),
             issuer_id: "issuer-a".to_string(),
-            issuer_hlc: Hlc::new(2000 + issuer_sequence, 0),
+            issuer_hlc: Hlc::new(10_000 + issuer_sequence, 0),
             issuer_sequence,
             range_start: 1,
             range_end: 3,
@@ -1799,7 +1859,7 @@ mod tests {
             session_id: session_id.to_string(),
             cell_id: "cell-a".to_string(),
             issuer_id: "issuer-a".to_string(),
-            issuer_hlc: Hlc::new(3000 + issuer_sequence, 0),
+            issuer_hlc: Hlc::new(10_000 + issuer_sequence, 0),
             issuer_sequence,
             nonce,
             seq_start,
@@ -1817,12 +1877,38 @@ mod tests {
         events: Vec<DeliveredEvent>,
         issuer_sequence: u64,
     ) -> AntiEntropyDeliver {
+        mk_deliver_with_issuer(
+            request_id,
+            session_id,
+            "issuer-a",
+            seq_start,
+            seq_end,
+            nonce,
+            events,
+            issuer_sequence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mk_deliver_with_issuer(
+        request_id: &str,
+        session_id: &str,
+        issuer_id: &str,
+        seq_start: u64,
+        seq_end: u64,
+        nonce: u64,
+        events: Vec<DeliveredEvent>,
+        issuer_sequence: u64,
+    ) -> AntiEntropyDeliver {
+        // Use the same HLC base (10_000) as other wire messages so that
+        // replay monotonicity is satisfied when issuer_id matches across
+        // request and deliver messages.
         AntiEntropyDeliver {
             request_id: request_id.to_string(),
             session_id: session_id.to_string(),
             cell_id: "cell-a".to_string(),
-            issuer_id: "issuer-b".to_string(),
-            issuer_hlc: Hlc::new(4000 + issuer_sequence, 0),
+            issuer_id: issuer_id.to_string(),
+            issuer_hlc: Hlc::new(10_000 + issuer_sequence, 0),
             issuer_sequence,
             nonce,
             seq_start,
@@ -2033,10 +2119,15 @@ mod tests {
 
         let mut denied = 0usize;
         let mut prev = [0u8; HASH_SIZE];
+        // Use strictly monotone issuer sequences: request at 2*index+1,
+        // deliver at 2*index+2, so the interleaved sequence is always
+        // increasing for the same issuer.
         for index in 0..8usize {
             let seq = u64::try_from(index + 1).unwrap();
             let events = build_events(seq, 1, prev);
             prev = events[0].event_hash;
+            let req_issuer_seq = u64::try_from(2 * index + 1).unwrap();
+            let del_issuer_seq = u64::try_from(2 * index + 2).unwrap();
             let request = mk_request(
                 &format!("req-{index}"),
                 "sess-ddos",
@@ -2044,7 +2135,7 @@ mod tests {
                 seq,
                 seq,
                 range_digest_for(&events),
-                20 + seq,
+                req_issuer_seq,
             );
             enforcer
                 .register_request(&request, Some("relay-ddos"))
@@ -2056,7 +2147,7 @@ mod tests {
                 seq,
                 seq,
                 events,
-                40 + seq,
+                del_issuer_seq,
             );
             if enforcer
                 .accept_deliver(&deliver, &AcceptAllVerifier)
@@ -2161,6 +2252,115 @@ mod tests {
             "high_water must be bounded: {} > {}",
             rp.high_water_len(),
             MAX_REPLAY_ISSUERS,
+        );
+    }
+
+    // ─── Regression: issuer identity binding in accept_deliver ────────────
+    #[test]
+    fn tck_00381_deliver_issuer_mismatch_rejected_and_request_consumed() {
+        // SECURITY REGRESSION: Verifies the blocker fix — a DELIVER whose
+        // issuer_id differs from the original REQUEST issuer_id must be
+        // rejected with TamperedDelivery. The mismatched request must be
+        // consumed (one-shot) to prevent retry abuse.
+        let mut enforcer = PullOnlyEnforcer::new(true, default_budget()).unwrap();
+        let events = build_events(1, 1, [0u8; HASH_SIZE]);
+        let digest = range_digest_for(&events);
+
+        // Register request as "issuer-a".
+        let request = mk_request("req-id-bind", "sess-id", 1, 1, 50, digest, 1);
+        enforcer
+            .register_request(&request, Some("relay-1"))
+            .unwrap();
+
+        // Deliver claims to be "issuer-evil" (different from "issuer-a").
+        let spoofed = mk_deliver_with_issuer(
+            "req-id-bind",
+            "sess-id",
+            "issuer-evil",
+            1,
+            1,
+            50,
+            events.clone(),
+            2,
+        );
+        let err = enforcer
+            .accept_deliver(&spoofed, &AcceptAllVerifier)
+            .unwrap_err();
+        assert_eq!(
+            err.defect().unwrap().kind,
+            AntiEntropyDefectKind::TamperedDelivery,
+            "issuer_id mismatch must produce TamperedDelivery"
+        );
+        assert!(
+            err.defect()
+                .unwrap()
+                .detail
+                .contains("issuer_id does not match"),
+            "detail must mention issuer_id mismatch"
+        );
+
+        // The outstanding request must have been consumed (one-shot).
+        assert_eq!(
+            enforcer.outstanding_request_count(),
+            0,
+            "mismatched issuer must consume the request"
+        );
+
+        // A subsequent legitimate deliver for the same request_id must
+        // fail with UnsolicitedDelivery (request already consumed).
+        let legit = mk_deliver("req-id-bind", "sess-id", 1, 1, 50, events, 3);
+        let err2 = enforcer
+            .accept_deliver(&legit, &AcceptAllVerifier)
+            .unwrap_err();
+        assert_eq!(
+            err2.defect().unwrap().kind,
+            AntiEntropyDefectKind::UnsolicitedDelivery,
+            "consumed request must reject subsequent deliver"
+        );
+    }
+
+    // ─── Regression: one-shot request prevents CPU amplification ──────────
+    #[test]
+    fn tck_00381_failed_verification_consumes_request_one_shot() {
+        // SECURITY REGRESSION: Verifies the major fix — when event
+        // attestation verification fails, the outstanding request is
+        // consumed (one-shot policy). This prevents an attacker from
+        // repeatedly sending deliveries with invalid signatures to
+        // trigger expensive verification loops against the same request.
+        let mut enforcer = PullOnlyEnforcer::new(true, default_budget()).unwrap();
+        let events = build_events(1, 1, [0u8; HASH_SIZE]);
+        let digest = range_digest_for(&events);
+
+        let request = mk_request("req-oneshot", "sess-os", 1, 1, 77, digest, 1);
+        enforcer
+            .register_request(&request, Some("relay-1"))
+            .unwrap();
+        assert_eq!(enforcer.outstanding_request_count(), 1);
+
+        // First deliver with invalid attestation — must fail and consume.
+        let deliver = mk_deliver("req-oneshot", "sess-os", 1, 1, 77, events.clone(), 2);
+        let err = enforcer
+            .accept_deliver(&deliver, &RejectAllVerifier)
+            .unwrap_err();
+        assert_eq!(
+            err.defect().unwrap().kind,
+            AntiEntropyDefectKind::InvalidAttestation,
+        );
+        assert_eq!(
+            enforcer.outstanding_request_count(),
+            0,
+            "failed verification must consume the request (one-shot)"
+        );
+
+        // Second attempt on the same request_id must fail as unsolicited.
+        let retry = mk_deliver("req-oneshot", "sess-os", 1, 1, 77, events, 3);
+        let err2 = enforcer
+            .accept_deliver(&retry, &AcceptAllVerifier)
+            .unwrap_err();
+        assert_eq!(
+            err2.defect().unwrap().kind,
+            AntiEntropyDefectKind::UnsolicitedDelivery,
+            "retry after one-shot consumption must be unsolicited"
         );
     }
 }
