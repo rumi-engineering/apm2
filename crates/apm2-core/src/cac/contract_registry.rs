@@ -274,12 +274,11 @@ pub enum CacDefectClass {
 impl CacDefectClass {
     const fn compatibility_state(self) -> CacCompatibilityState {
         match self {
-            Self::SchemaRegistryDriftAmbiguous | Self::CanonicalizerVectorMismatch => {
-                CacCompatibilityState::Suspect
-            },
             Self::SchemaUnresolved
             | Self::SchemaVersionIncompatible
+            | Self::SchemaRegistryDriftAmbiguous
             | Self::CanonicalizerUnresolved
+            | Self::CanonicalizerVectorMismatch
             | Self::DigestIncomplete
             | Self::DigestMismatch
             | Self::SignatureFreshnessFailed
@@ -533,9 +532,10 @@ pub enum EscalationAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tier2EscalationPolicy {
-    /// Freeze promotion-critical paths when blocked defects are present.
+    /// Freeze promotion-critical paths when any non-compatible defects are
+    /// present.
     pub freeze_on_blocked: bool,
-    /// Halt when blocked defects remain unresolved past deadline.
+    /// Halt when unresolved defects remain unresolved past deadline.
     pub halt_on_unresolved_deadline: bool,
     /// Maximum allowed unresolved duration before halt escalation.
     pub adjudication_deadline_secs: u64,
@@ -575,11 +575,13 @@ impl Tier2EscalationPolicy {
     /// Evaluates escalation action from current defects and unresolved age.
     #[must_use]
     pub fn evaluate(&self, defects: &[CacDefect], unresolved_for_secs: u64) -> EscalationAction {
-        let has_blocked = defects
+        let compatibility_state = defects
             .iter()
-            .any(|defect| defect.compatibility_state == CacCompatibilityState::Blocked);
+            .map(|defect| defect.compatibility_state)
+            .max()
+            .unwrap_or(CacCompatibilityState::Compatible);
 
-        if !has_blocked || !self.freeze_on_blocked {
+        if compatibility_state == CacCompatibilityState::Compatible || !self.freeze_on_blocked {
             return EscalationAction::Continue;
         }
 
@@ -995,28 +997,28 @@ fn default_contract_registry_entries() -> Vec<ContractObjectRegistryEntry> {
             WINDOW_OR_TTL_NOT_REQUIRED_REF,
         ),
         default_registry_entry(
-            "ContextPackSpecV1",
+            "RoleContextPackSpecV1",
             "context_pack.spec",
             "cac.context_pack_spec.v1",
             SIGNATURE_SET_REQUIRED_REF,
             WINDOW_OR_TTL_NOT_REQUIRED_REF,
         ),
         default_registry_entry(
-            "ContextPackManifestV1",
+            "RoleContextPackManifestV1",
             "context_pack.manifest",
             "cac.context_pack_manifest.v1",
             SIGNATURE_SET_REQUIRED_REF,
             WINDOW_OR_TTL_NOT_REQUIRED_REF,
         ),
         default_registry_entry(
-            "ReasoningSelectorV1",
+            "RoleReasoningSelectorV1",
             "reasoning.selector",
             "cac.reasoning_selector.v1",
             SIGNATURE_SET_REQUIRED_REF,
             WINDOW_OR_TTL_NOT_REQUIRED_REF,
         ),
         default_registry_entry(
-            "BudgetProfileV1",
+            "RoleBudgetProfileV1",
             "budget.profile",
             "cac.budget_profile.v1",
             SIGNATURE_SET_REQUIRED_REF,
@@ -1313,6 +1315,15 @@ mod tests {
         )
     }
 
+    fn sample_suspect_defect() -> CacDefect {
+        CacDefect {
+            class: CacDefectClass::SchemaRegistryDriftAmbiguous,
+            step: CacValidationStep::SchemaResolution,
+            compatibility_state: CacCompatibilityState::Suspect,
+            detail: "test suspect defect".to_string(),
+        }
+    }
+
     #[test]
     fn test_default_registry_complete() {
         let registry = ContractObjectRegistry::default_registry();
@@ -1376,6 +1387,28 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_registry_drift_compatibility_is_blocked() {
+        let defect = CacDefect::new(
+            CacDefectClass::SchemaRegistryDriftAmbiguous,
+            CacValidationStep::SchemaResolution,
+            "schema_stable_id drift detected",
+        );
+
+        assert_eq!(defect.compatibility_state, CacCompatibilityState::Blocked);
+    }
+
+    #[test]
+    fn test_canonicalizer_vector_mismatch_compatibility_is_blocked() {
+        let defect = CacDefect::new(
+            CacDefectClass::CanonicalizerVectorMismatch,
+            CacValidationStep::CanonicalizerCompatibility,
+            "canonicalizer tuple mismatch detected",
+        );
+
+        assert_eq!(defect.compatibility_state, CacCompatibilityState::Blocked);
+    }
+
+    #[test]
     fn test_validation_order_deterministic() {
         let registry = ContractObjectRegistry::default_registry();
         let entry = registry
@@ -1412,6 +1445,46 @@ mod tests {
 
         let action = policy.evaluate(&defects, policy.adjudication_deadline_secs + 1);
         assert_eq!(action, EscalationAction::Halt);
+    }
+
+    #[test]
+    fn test_tier2_freeze_on_suspect_before_deadline() {
+        let policy = Tier2EscalationPolicy::default_strict();
+        let defects = vec![sample_suspect_defect()];
+
+        let action = policy.evaluate(&defects, policy.adjudication_deadline_secs - 1);
+        assert_eq!(action, EscalationAction::FreezePromotionPaths);
+    }
+
+    #[test]
+    fn test_tier2_halt_on_suspect_after_deadline() {
+        let policy = Tier2EscalationPolicy::default_strict();
+        let defects = vec![sample_suspect_defect()];
+
+        let action = policy.evaluate(&defects, policy.adjudication_deadline_secs);
+        assert_eq!(action, EscalationAction::Halt);
+    }
+
+    #[test]
+    fn test_role_context_object_ids_match_rfc_0019_chapter_17() {
+        let registry = ContractObjectRegistry::default_registry();
+        let expected_rows = [
+            ("cac.context_pack_spec.v1", "RoleContextPackSpecV1"),
+            ("cac.context_pack_manifest.v1", "RoleContextPackManifestV1"),
+            ("cac.reasoning_selector.v1", "RoleReasoningSelectorV1"),
+            ("cac.budget_profile.v1", "RoleBudgetProfileV1"),
+        ];
+
+        for (schema_id, expected_object_id) in expected_rows {
+            let entry = registry.lookup_by_schema_id(schema_id).unwrap_or_else(|| {
+                panic!("schema_id '{schema_id}' should exist in default registry")
+            });
+            assert_eq!(entry.object_id, expected_object_id);
+            assert_eq!(
+                entry.schema_stable_id,
+                format!("dcp://apm2.local/schemas/{schema_id}@v1")
+            );
+        }
     }
 
     #[test]
