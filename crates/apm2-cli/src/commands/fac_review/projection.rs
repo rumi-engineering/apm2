@@ -168,6 +168,21 @@ fn event_timestamp_epoch(raw: &str) -> Option<u64> {
         .and_then(|value| value.timestamp().try_into().ok())
 }
 
+fn run_state_started_epoch(state: &super::types::ReviewRunState) -> Option<u64> {
+    DateTime::parse_from_rfc3339(&state.started_at)
+        .ok()
+        .and_then(|value| value.timestamp().try_into().ok())
+}
+
+fn run_state_is_stale_for_dispatch(
+    state: &super::types::ReviewRunState,
+    since_epoch: Option<u64>,
+) -> bool {
+    since_epoch.is_some_and(|min_epoch| {
+        run_state_started_epoch(state).is_none_or(|started_epoch| started_epoch < min_epoch)
+    })
+}
+
 pub fn event_is_terminal_crash(event: &serde_json::Value) -> bool {
     let restart_count = event
         .get("restart_count")
@@ -305,9 +320,15 @@ pub fn projection_state_for_type(
     "none".to_string()
 }
 
-fn render_state_code_from_run_state(load: &super::state::ReviewRunStateLoad) -> String {
+fn render_state_code_from_run_state(
+    load: &super::state::ReviewRunStateLoad,
+    since_epoch: Option<u64>,
+) -> String {
     match load {
         super::state::ReviewRunStateLoad::Present(state) => {
+            if run_state_is_stale_for_dispatch(state, since_epoch) {
+                return "stale:dispatch-window".to_string();
+            }
             let head_short = &state.head_sha[..state.head_sha.len().min(7)];
             let model = state.model_id.as_deref().unwrap_or("n/a");
             let backend = state.backend_id.as_deref().unwrap_or("n/a");
@@ -444,13 +465,15 @@ pub fn run_project_inner(
             }
         }
     }
-    let security = render_state_code_from_run_state(&security_load);
-    let quality = render_state_code_from_run_state(&quality_load);
+    let security = render_state_code_from_run_state(&security_load, since_epoch);
+    let quality = render_state_code_from_run_state(&quality_load, since_epoch);
 
     let latest_run_state_head = [&security_load, &quality_load]
         .into_iter()
         .filter_map(|load| match load {
-            super::state::ReviewRunStateLoad::Present(state) => {
+            super::state::ReviewRunStateLoad::Present(state)
+                if !run_state_is_stale_for_dispatch(state, since_epoch) =>
+            {
                 Some((state.sequence_number, state.head_sha.clone()))
             },
             _ => None,
@@ -580,4 +603,62 @@ pub fn run_project_inner(
         last_seq,
         errors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::DateTime;
+
+    use super::render_state_code_from_run_state;
+    use crate::commands::fac_review::state::ReviewRunStateLoad;
+    use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
+
+    fn sample_run_state(status: ReviewRunStatus, started_at: &str) -> ReviewRunState {
+        ReviewRunState {
+            run_id: "pr441-security-s2-01234567".to_string(),
+            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            pr_number: 441,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: started_at.to_string(),
+            status,
+            terminal_reason: Some("pass".to_string()),
+            model_id: Some("gpt-5.3-codex".to_string()),
+            backend_id: Some("codex".to_string()),
+            restart_count: 0,
+            sequence_number: 2,
+            pid: None,
+        }
+    }
+
+    #[test]
+    fn stale_done_state_is_not_authoritative_after_since_epoch() {
+        let load = ReviewRunStateLoad::Present(sample_run_state(
+            ReviewRunStatus::Done,
+            "2026-02-10T00:00:00Z",
+        ));
+        let since_epoch = DateTime::parse_from_rfc3339("2026-02-10T02:00:00Z")
+            .expect("since_epoch parse")
+            .timestamp()
+            .try_into()
+            .expect("since_epoch must be non-negative");
+        let rendered = render_state_code_from_run_state(&load, Some(since_epoch));
+        assert_eq!(rendered, "stale:dispatch-window");
+    }
+
+    #[test]
+    fn fresh_done_state_remains_done_after_since_epoch() {
+        let load = ReviewRunStateLoad::Present(sample_run_state(
+            ReviewRunStatus::Done,
+            "2026-02-10T05:00:00Z",
+        ));
+        let since_epoch = DateTime::parse_from_rfc3339("2026-02-10T02:00:00Z")
+            .expect("since_epoch parse")
+            .timestamp()
+            .try_into()
+            .expect("since_epoch must be non-negative");
+        let rendered = render_state_code_from_run_state(&load, Some(since_epoch));
+        assert!(rendered.starts_with("done:"));
+    }
 }

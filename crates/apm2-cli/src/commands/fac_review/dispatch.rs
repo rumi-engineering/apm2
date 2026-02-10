@@ -7,10 +7,13 @@ use std::process::Command;
 use chrono::Utc;
 use fs2::FileExt;
 
-use super::state::{find_active_review_entry, is_process_alive, load_review_run_state};
+use super::state::{
+    build_review_run_id, find_active_review_entry, load_review_run_state,
+    next_review_sequence_number, write_review_run_state,
+};
 use super::types::{
-    DISPATCH_PENDING_TTL, DispatchReviewResult, PendingDispatchEntry, ReviewKind, apm2_home_dir,
-    ensure_parent_dir, sanitize_for_path,
+    DISPATCH_PENDING_TTL, DispatchReviewResult, PendingDispatchEntry, ReviewKind, ReviewRunState,
+    ReviewRunStatus, apm2_home_dir, ensure_parent_dir, now_iso8601, sanitize_for_path,
 };
 
 // ── Dispatch lock paths ─────────────────────────────────────────────────────
@@ -132,6 +135,14 @@ fn is_systemd_unit_active(unit: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn is_process_alive(pid: u32) -> bool {
+    super::state::is_process_alive(pid)
+}
+
+fn run_state_has_live_process(state: &ReviewRunState) -> bool {
+    state.pid.is_some_and(is_process_alive)
+}
+
 // ── Dispatch locking ────────────────────────────────────────────────────────
 
 fn with_dispatch_lock<T>(
@@ -209,6 +220,34 @@ fn attach_run_state_contract(
     }
 }
 
+fn seed_pending_run_state_for_dispatch(
+    pr_url: &str,
+    pr_number: u32,
+    review_kind: ReviewKind,
+    head_sha: &str,
+) -> Result<ReviewRunState, String> {
+    let review_type = review_kind.as_str();
+    let sequence_number = next_review_sequence_number(pr_number, review_type)?;
+    let state = ReviewRunState {
+        run_id: build_review_run_id(pr_number, review_type, sequence_number, head_sha),
+        pr_url: pr_url.to_string(),
+        pr_number,
+        head_sha: head_sha.to_string(),
+        review_type: review_type.to_string(),
+        reviewer_role: "fac_reviewer".to_string(),
+        started_at: now_iso8601(),
+        status: ReviewRunStatus::Pending,
+        terminal_reason: None,
+        model_id: None,
+        backend_id: None,
+        restart_count: 0,
+        sequence_number,
+        pid: None,
+    };
+    write_review_run_state(&state)?;
+    Ok(state)
+}
+
 // ── Single review dispatch ──────────────────────────────────────────────────
 
 pub fn dispatch_single_review(
@@ -224,7 +263,10 @@ pub fn dispatch_single_review(
         if let super::state::ReviewRunStateLoad::Present(state) =
             load_review_run_state(pr_number, review_type)?
         {
-            if state.head_sha.eq_ignore_ascii_case(head_sha) && !state.status.is_terminal() {
+            if state.head_sha.eq_ignore_ascii_case(head_sha)
+                && !state.status.is_terminal()
+                && run_state_has_live_process(&state)
+            {
                 return attach_run_state_contract(
                     pr_number,
                     review_type,
@@ -281,8 +323,18 @@ pub fn dispatch_single_review(
             );
         }
 
+        let mut seeded_state =
+            seed_pending_run_state_for_dispatch(pr_url, pr_number, review_kind, head_sha)?;
         let result =
-            spawn_detached_review(pr_url, pr_number, review_kind, head_sha, dispatch_epoch)?;
+            match spawn_detached_review(pr_url, pr_number, review_kind, head_sha, dispatch_epoch) {
+                Ok(result) => result,
+                Err(err) => {
+                    seeded_state.status = ReviewRunStatus::Failed;
+                    seeded_state.terminal_reason = Some("dispatch_spawn_failed".to_string());
+                    write_review_run_state(&seeded_state)?;
+                    return Err(err);
+                },
+            };
         write_pending_dispatch(owner_repo, pr_number, review_type, head_sha, &result)?;
         attach_run_state_contract(pr_number, review_type, result)
     })
@@ -401,4 +453,51 @@ fn spawn_detached_review(
         unit: None,
         log_file: Some(log_path.display().to_string()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_state_has_live_process;
+    use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
+
+    fn sample_run_state(pid: Option<u32>) -> ReviewRunState {
+        ReviewRunState {
+            run_id: "pr441-security-s1-01234567".to_string(),
+            pr_url: "https://github.com/example/repo/pull/441".to_string(),
+            pr_number: 441,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            review_type: "security".to_string(),
+            reviewer_role: "fac_reviewer".to_string(),
+            started_at: "2026-02-10T00:00:00Z".to_string(),
+            status: ReviewRunStatus::Alive,
+            terminal_reason: None,
+            model_id: Some("gpt-5.3-codex".to_string()),
+            backend_id: Some("codex".to_string()),
+            restart_count: 0,
+            sequence_number: 1,
+            pid,
+        }
+    }
+
+    fn dead_pid_for_test() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .args(["-lc", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
+    #[test]
+    fn run_state_liveness_requires_pid() {
+        assert!(!run_state_has_live_process(&sample_run_state(None)));
+    }
+
+    #[test]
+    fn run_state_liveness_rejects_dead_pid() {
+        assert!(!run_state_has_live_process(&sample_run_state(Some(
+            dead_pid_for_test()
+        ))));
+    }
 }

@@ -547,6 +547,12 @@ fn run_single_review(
                 model: current_model.model.clone(),
                 backend: current_model.backend,
                 temp_files: Vec::new(),
+                run_id: run_state.run_id.clone(),
+                sequence_number: run_state.sequence_number,
+                terminal_reason: None,
+                model_id: Some(current_model.model.clone()),
+                backend_id: Some(current_model.backend.as_str().to_string()),
+                status: ReviewRunStatus::Alive,
             },
         )?;
         persist_review_run_state(

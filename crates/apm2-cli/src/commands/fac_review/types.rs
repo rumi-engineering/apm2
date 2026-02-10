@@ -62,9 +62,10 @@ pub enum ReviewRunType {
     Quality,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewRunStatus {
+    #[default]
     Pending,
     Alive,
     Done,
@@ -156,6 +157,19 @@ pub struct ReviewStateEntry {
     pub backend: ReviewBackend,
     #[serde(default)]
     pub temp_files: Vec<PathBuf>,
+    // TCK-00441: Deterministic run state fields
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub sequence_number: u32,
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub backend_id: Option<String>,
+    #[serde(default)]
+    pub status: ReviewRunStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

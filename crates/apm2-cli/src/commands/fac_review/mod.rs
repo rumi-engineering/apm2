@@ -97,7 +97,12 @@ fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
     }
 }
 
-fn emit_run_ndjson_since(offset: u64, pr_number: u32, run_ids: &[String]) -> Result<(), String> {
+fn emit_run_ndjson_since(
+    offset: u64,
+    pr_number: u32,
+    run_ids: &[String],
+    to_stderr: bool,
+) -> Result<(), String> {
     let path = review_events_path()?;
     if !path.exists() {
         return Ok(());
@@ -126,12 +131,20 @@ fn emit_run_ndjson_since(offset: u64, pr_number: u32, run_ids: &[String]) -> Res
             .and_then(serde_json::Value::as_str)
             .is_some_and(|event| event == "sequence_done");
         if run_ids.is_empty() || is_sequence_done {
-            println!("{line}");
+            if to_stderr {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
             continue;
         }
         let run_id = parsed.get("run_id").and_then(serde_json::Value::as_str);
         if run_id.is_some_and(|id| run_ids.iter().any(|candidate| candidate == id)) {
-            println!("{line}");
+            if to_stderr {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
         }
     }
     Ok(())
@@ -163,7 +176,7 @@ pub fn run_review(
                 if let Some(entry) = &summary.quality {
                     run_ids.push(entry.run_id.clone());
                 }
-                let _ = emit_run_ndjson_since(event_offset, summary.pr_number, &run_ids);
+                let _ = emit_run_ndjson_since(event_offset, summary.pr_number, &run_ids, true);
                 let payload = serde_json::json!({
                     "schema": "apm2.fac.review.run.v1",
                     "summary": summary,
@@ -1021,8 +1034,8 @@ mod tests {
     };
     use super::state::{read_last_lines, read_pulse_file_from_path, write_pulse_file_to_path};
     use super::types::{
-        EVENT_ROTATE_BYTES, FacEventContext, ReviewBackend, ReviewKind, ReviewStateEntry,
-        ReviewStateFile, default_model, default_review_type, now_iso8601_millis,
+        EVENT_ROTATE_BYTES, FacEventContext, ReviewBackend, ReviewKind, ReviewRunStatus,
+        ReviewStateEntry, ReviewStateFile, default_model, default_review_type, now_iso8601_millis,
     };
 
     fn dead_pid_for_test() -> u32 {
@@ -1454,6 +1467,12 @@ mod tests {
                 model: default_model(),
                 backend: ReviewBackend::Codex,
                 temp_files: Vec::new(),
+                run_id: "stale-security-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some(default_model()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         let events = Vec::<serde_json::Value>::new();
@@ -1488,6 +1507,12 @@ mod tests {
                 model: default_model(),
                 backend: ReviewBackend::Codex,
                 temp_files: Vec::new(),
+                run_id: "stale-quality-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some(default_model()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         let events = vec![serde_json::json!({
@@ -1639,6 +1664,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "security-1-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         assert_eq!(
@@ -1670,6 +1701,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "security-old-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         state.reviewers.insert(
@@ -1688,6 +1725,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "security-new-run".to_string(),
+                sequence_number: 2,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         assert_eq!(
@@ -1717,6 +1760,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "quality-1-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         assert_eq!(latest_state_head_sha(&state, 42), None);
@@ -1783,6 +1832,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "sec-state-fallback-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         let events: Vec<serde_json::Value> = vec![];
@@ -1821,6 +1876,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "sec-current-head-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         let events: Vec<serde_json::Value> = vec![];
