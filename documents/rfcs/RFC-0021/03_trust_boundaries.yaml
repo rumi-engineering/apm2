@@ -31,6 +31,15 @@ rfc_trust_boundaries:
         - "AAT-BIZ enforcement where required"
         - "quorum and signature verification"
 
+    - id: "TB-0004"
+      name: "VPHI to External Disclosure and IP Filing Channels"
+      trust_level: "DENY_BY_DEFAULT"
+      statement: "External disclosure and filing endpoints are non-admissible unless explicitly policy-authorized as confidential; patent/provisional filing channels are prohibited."
+      required_controls:
+        - "trade-secret mode policy verification"
+        - "patent/provisional workflow deny controls"
+        - "external disclosure channel classification enforcement"
+
   threat_model:
     - id: "THR-0001"
       name: "Signal forgery"
@@ -80,6 +89,14 @@ rfc_trust_boundaries:
         - "fanout amplification budgets"
         - "anti-entropy boundedness proofs"
 
+    - id: "THR-0007"
+      name: "Strategic disclosure via patent or external publication workflow"
+      mechanism: "Venture-origin strategic mechanism leaks through filing/publication channels"
+      mitigation:
+        - "trade-secret-only policy gate"
+        - "deny-by-default disclosure channel classifier"
+        - "security defect emission on attempted filing/disclosure policy violation"
+
   invariants:
     - id: "INV-TB-001"
       statement: "No direct VPH-to-merge path exists."
@@ -91,3 +108,5 @@ rfc_trust_boundaries:
       statement: "Gate truth is HTF-authoritative; wall-clock fields never authorize promotion."
     - id: "INV-TB-005"
       statement: "Scale-control unknown states are fail-closed for Tier2+ promotion paths."
+    - id: "INV-TB-006"
+      statement: "Patent/provisional filing and unapproved external disclosure channels are denied for venture-origin strategic mechanisms."

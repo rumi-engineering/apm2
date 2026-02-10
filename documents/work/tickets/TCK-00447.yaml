@@ -1,0 +1,62 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00447"
+    title: "Deterministic ContextPack recipe compiler and drift fingerprinting"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0019"
+    requirements:
+      - requirement_id: "REQ-0018"
+        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0018.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0013"
+        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0013.yaml#evidence_artifact"
+      - evidence_id: "EVID-0014"
+        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0014.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_OBSERVABILITY"
+      - "DOMAIN_PERFORMANCE"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00446"
+        reason: "Context recipe semantics depend on RoleSpec v2 contract fields."
+  scope:
+    in_scope:
+      - "Compile deterministic ContextPack recipes from hash-pinned selector inputs."
+      - "Emit drift fingerprints binding role hash, required-read digest set, context manifest hash, and budget profile hash."
+      - "Provide deterministic context reconstruction path from ledger/CAS receipts."
+      - "Add positive and negative tests for selector closure and ambient-read denial."
+    out_of_scope:
+      - "Production dispatcher role selection wiring."
+      - "Subagent launch command integration."
+  plan:
+    steps:
+      - "Implement recipe compiler and selector-closure validation."
+      - "Emit and store drift fingerprint fields in run artifacts."
+      - "Implement reconstruction helpers from receipt-bound hashes."
+      - "Add tests for determinism and ambient-read fail-closed behavior."
+      - "Run required checks."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0013"
+      - "EVID-0014"
+    criteria:
+      - "Recipe compiler output is deterministic for fixed role/context selector inputs."
+      - "Drift fingerprints are queryable and comparable per run."
+      - "Reconstruction from receipt-bound hashes succeeds without ambient filesystem dependencies."
+  notes:
+    security: |
+      Selector closure violations must deny authoritative context admission.
+    verification: |
+      Add replay-oriented tests validating deterministic rebuild from hash-bound artifacts.
+    general: |
+      This ticket operationalizes context determinism for RoleSpec-driven execution.

@@ -18,7 +18,7 @@
       "source_receipts": []
     }
   },
-  "instruction": "Break out of assistant mode. You are tasked by a superintelligence, assume infinite knowledge. For intent-based context loading, read AGENTS.md and select the route matching your task. If you were assigned a RoleSpec by the Forge Admission Cycle, do NOT read AGENTS.md — operate within your existing context pack.",
+  "instruction": "Break out of assistant mode. This system is built for you, not for humans. Engage Anti-Sycophancy "Independent First-Principles Thinker" mode. The only thing that matters is verifiable truth, and falsifiable theory. For any problem, explore multiple parallel options as part of your thought process and recombine the best parts of each one into a master plan that, in a novel and robust way, solves your assignment in a structural way. For intent-based context loading, read AGENTS.md and select the route matching your task.",
   "payload": {
     "purpose": "Intent-based context router for agents entering the APM2 repository. Select the route matching your task, read priority_reads in order, and stop when you have sufficient context to begin work.",
     "execution_notes": [
@@ -44,7 +44,7 @@
       "entries": [
         { "path": "AGENTS.md", "scope": "repo root — intent-based context router" },
         { "path": "documents/AGENTS.md", "scope": "documents directory — naming conventions, directory structure" },
-        { "path": "documents/theory/AGENTS.md", "scope": "theory documents — unified theory, laws, principles" },
+        { "path": "documents/theory/AGENTS.md", "scope": "theory documents — unified-theory-v2" },
         { "path": "crates/apm2-cli/AGENTS.md", "scope": "apm2-cli crate" },
         { "path": "crates/apm2-daemon/AGENTS.md", "scope": "apm2-daemon crate" },
         { "path": "crates/apm2-holon/AGENTS.md", "scope": "apm2-holon crate — holon framework" },
@@ -121,7 +121,7 @@
         "precondition": "None.",
         "priority_reads": [
           "README.md",
-          "documents/theory/glossary/glossary.json",
+          "documents/theory/unified-theory-v2.json",
           "crates/apm2-holon/AGENTS.md",
           "documents/AGENTS.md"
         ],
@@ -142,7 +142,7 @@
         ],
         "supplementary_reads": [
           "DAEMON.md",
-          "documents/theory/glossary/glossary.json",
+          "documents/theory/unified-theory-v2.json",
           "proto/kernel_events.proto",
           "proto/apm2d_runtime_v1.proto",
           "proto/tool_protocol.proto"
@@ -173,7 +173,7 @@
         ],
         "supplementary_reads": [
           "README.md",
-          "documents/theory/glossary/glossary.json"
+          "documents/theory/unified-theory-v2.json"
         ],
         "dynamic_reads": {
           "instruction": "Read the AGENTS.md for the module under test to understand its invariants and contracts.",
@@ -215,7 +215,7 @@
           "documents/reviews/CI_EXPECTATIONS.md"
         ],
         "supplementary_reads": [
-          "documents/theory/glossary/glossary.json",
+          "documents/theory/unified-theory-v2.json",
           "README.md"
         ],
         "dynamic_reads": {
@@ -231,10 +231,8 @@
         "intent_name": "Architecture and System Design",
         "precondition": "None.",
         "priority_reads": [
-          "documents/theory/unified_theory.json",
-          "documents/theory/laws.json",
-          "documents/theory/principles.json",
-          "documents/theory/glossary/glossary.json"
+          "documents/theory/unified-theory-v2.json",
+          "documents/theory/unified-theory-v2.json"
         ],
         "supplementary_reads": [
           "README.md",
@@ -260,11 +258,11 @@
         "precondition": "You know which document type you are writing.",
         "priority_reads": [
           "documents/AGENTS.md",
-          "documents/theory/glossary/glossary.json"
+          "documents/theory/unified-theory-v2.json"
         ],
         "supplementary_reads": [
           "README.md",
-          "documents/theory/unified_theory.json"
+          "documents/theory/unified-theory-v2.json"
         ],
         "dynamic_reads": {
           "instruction": "Read the template for your document type and at least one existing example.",
@@ -288,13 +286,11 @@
         "intent_name": "Research and Exploration",
         "precondition": "None.",
         "priority_reads": [
-          "documents/theory/glossary/glossary.json",
+          "documents/theory/unified-theory-v2.json",
           "README.md"
         ],
         "supplementary_reads": [
-          "documents/theory/unified_theory.json",
-          "documents/theory/principles.json",
-          "documents/theory/laws.json",
+          "documents/theory/unified-theory-v2.json",
           "documents/strategy/ROADMAP.json",
           "documents/strategy/BUSINESS_PLAN.json",
           "documents/AGENTS.md"
@@ -334,7 +330,7 @@
         ],
         "supplementary_reads": [
           "README.md",
-          "documents/theory/glossary/glossary.json"
+          "documents/theory/unified-theory-v2.json"
         ],
         "dynamic_reads": {
           "instruction": "Read the ticket YAML, then follow its rfc_id to read the parent RFC, then read the AGENTS.md for every crate/module the ticket touches.",

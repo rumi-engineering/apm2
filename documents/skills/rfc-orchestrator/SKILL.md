@@ -20,7 +20,7 @@ variables:
   TARGET_RFC: "$1"
 
 references[6]:
-  - path: "../../theory/glossary/glossary.json"
+  - path: "../../theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/orchestrator-loop.md
     purpose: "Main loop: dispatch, monitor, fix, repeat until merged."

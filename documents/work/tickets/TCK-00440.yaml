@@ -1,0 +1,95 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00440"
+    title: "RFC-0019 ch18 CAC traceability overlay and Tier2+ fail-closed matrix"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0019"
+    requirements:
+      - requirement_id: "REQ-0021"
+        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0021.yaml#requirement"
+      - requirement_id: "REQ-0010"
+        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0010.yaml#requirement"
+      - requirement_id: "REQ-0011"
+        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0011.yaml#requirement"
+      - requirement_id: "REQ-0014"
+        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0014.yaml#requirement"
+      - requirement_id: "REQ-0006"
+        requirement_ref: "documents/rfcs/RFC-0028/requirements/REQ-0006.yaml#requirement"
+      - requirement_id: "REQ-0009"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0009.yaml#requirement"
+      - requirement_id: "REQ-0010"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0010.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0010"
+        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0010.yaml#evidence_artifact"
+      - evidence_id: "EVID-0011"
+        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0011.yaml#evidence_artifact"
+      - evidence_id: "EVID-0014"
+        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0014.yaml#evidence_artifact"
+      - evidence_id: "EVID-0009"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+      - evidence_id: "EVID-0010"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0010.yaml#evidence_artifact"
+      - evidence_id: "EVID-0006"
+        artifact_ref: "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_OBSERVABILITY"
+      - "DOMAIN_PERFORMANCE"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00439"
+        reason: "Chapter 18 CAC overlay depends on chapter 17 schema-qualified snapshot registry baseline."
+  scope:
+    in_scope:
+      - "Add matrix rules requiring promotion-critical claims to carry CAC schema, digest-set, canonicalizer, and Tier2+ fail-closed trigger fields."
+      - "Add a dedicated CAC contract overlay matrix for promotion-critical traceability rows."
+      - "Explicitly model RoleSpec context injection claims so efficiency/code-quality gains are tied to deterministic selector-closed CAC context delivery."
+      - "Bind CAC overlay rows to concrete TRC-FAC claims (`TRC-FAC-01`, `TRC-FAC-02`, `TRC-FAC-07`, `TRC-FAC-12`, `TRC-FAC-14`, `TRC-FAC-15`, `TRC-FAC-16`)."
+      - "Define explicit unresolved-ambiguity escalation semantics (`deny + freeze -> halt escalation`) for Tier2+ timelines."
+      - "Ensure CAC overlay is coherent with RFC-0028 gate CAC contracts and RFC-0029 predicate/gate CAC contracts."
+    out_of_scope:
+      - "Introducing new non-CAC gate families."
+      - "Changing baseline FAC gate ordering beyond CAC data-contract requirements."
+      - "Kernel/runtime implementation changes."
+  plan:
+    steps:
+      - "Augment matrix rules with CAC overlay requirements for promotion-critical claims."
+      - "Introduce chapter 18 CAC overlay table with schema/digest/canonicalizer/fail-closed columns."
+      - "Add TRC-FAC-10 CAC overlay row for RoleSpec/context-pack/selector determinism and minimality."
+      - "Populate row-level mappings for all promotion-critical temporal/recovery/isolation claims."
+      - "Cross-check against RFC-0028 and RFC-0029 CAC sections for consistency."
+      - "Validate dependency and evidence links for machine readability."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0010"
+      - "EVID-0011"
+      - "EVID-0014"
+      - "EVID-0009"
+      - "EVID-0006"
+    criteria:
+      - "REQ-0021 promotion-critical CAC overlay requirements are represented in chapter 18."
+      - "RFC-0019 chapter 18 has an explicit CAC promotion-critical overlay matrix."
+      - "Each listed TRC row includes schema contracts, digest-set bindings, canonicalizer bindings, and Tier2+ fail-closed trigger text."
+      - "TRC-FAC-10 binds RoleSpec context injection determinism/minimality to explicit CAC schema and digest contracts."
+      - "Tier2+ unresolved CAC ambiguity is explicitly non-promotable and escalation-bounded."
+      - "Cross-RFC CAC overlay content is consistent with chapter 17 snapshot registry and RFC-0028/0029 CAC contracts."
+  notes:
+    security: |
+      Traceability rows are non-admissible when CAC schema/digest/canonicalizer surfaces are missing,
+      ambiguous, stale, or unverifiable.
+    verification: |
+      Validate matrix row coverage for all promotion-critical claims and verify no row can pass without
+      explicit CAC fail-closed behavior.
+    general: |
+      Governance backfill ticket created because RFC-0019 (pre-RFC-0020) traceability surfaces were
+      patched to add CAC contract precision.

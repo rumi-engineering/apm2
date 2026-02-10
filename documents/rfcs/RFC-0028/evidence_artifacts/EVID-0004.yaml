@@ -1,0 +1,13 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0004"
+  title: "No-bypass and pre-actuation prerequisite conformance"
+  category: "INTEGRATION_TEST_RESULTS"
+  status: "PLANNED"
+  description: "Evidence that all authority-bearing actuation traverses required enforcement dependencies and prerequisite bindings."
+  requirement_ids:
+    - "RFC-0028::REQ-0003"
+    - "RFC-0028::REQ-0004"
+  expected_contents:
+    - "no-bypass path coverage report"
+    - "pre-actuation prerequisite selector bindings"

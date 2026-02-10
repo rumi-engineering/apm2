@@ -24,6 +24,8 @@ rfc_evidence_artifacts_readme:
       file: "EVID-0009.yaml"
     - id: "EVID-0010"
       file: "EVID-0010.yaml"
+    - id: "EVID-0011"
+      file: "EVID-0011.yaml"
   conventions:
     - "Root key MUST be evidence_artifact."
     - "evidence_artifact.id MUST match filename."

@@ -4,10 +4,10 @@
 
 Read all of these before generating output:
 
-- documents/theory/glossary/glossary.json
-- documents/theory/laws.json
-- documents/theory/principles.json
-- documents/theory/unified_theory.json
+- documents/theory/unified-theory-v2.json
+- documents/theory/unified-theory-v2.json
+- documents/theory/unified-theory-v2.json
+- documents/theory/unified-theory-v2.json
 - documents/strategy/MASTER_STRATEGY.json
 - documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md
 - documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md

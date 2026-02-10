@@ -1,0 +1,3102 @@
+{
+  "schema": "apm2.holonic.unified_theory.v2",
+  "schema_version": "2.1.0",
+  "kind": "holonic.unified_theory",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-27T02:14:09Z",
+    "dependencies": [
+      "apm2://theory",
+      "dcp://apm2.local/governance/holonic_unified_theory@v1"
+    ],
+    "labels": [
+      "agent-native",
+      "control-loops",
+      "evidence",
+      "holonic",
+      "laws",
+      "ledger",
+      "security",
+      "theory",
+      "pasm",
+      "stigmergic-morphogenesis",
+      "genome-axioms",
+      "theory-v2"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-KERNEL-GOVERNANCE",
+      "work_id": "DOC-HOLONIC-UNIFIED-THEORY-0002",
+      "normative_declarations": [
+        "All statements are intended to be operationalizable as contracts, gates, reducers, and defect counterexamples.",
+        "This document is the canonical theory source of truth; all derivative terminology, contracts, and guidance must remain explicitly mapped to it."
+      ]
+    },
+    "stable_id": "dcp://apm2.local/governance/holonic_unified_theory@v2",
+    "integrity": {
+      "integrity_proof_ref": "dcp://apm2.local/integrity_proofs/holonic_unified_theory@v2",
+      "integrity_proof_required_for_enforcement": true,
+      "integrity_proof_kind": "ed25519"
+    },
+    "updated_at": "2026-02-10T12:00:00Z"
+  },
+  "payload": {
+    "doc": {
+      "id": "APM2-HOLONIC-UNIFIED-THEORY-0002",
+      "title": "Grand Unified Theory of Agent-Native Holonic Software (APM2) - PASM v2",
+      "status": "draft",
+      "effective_date": "2026-02-09",
+      "audience": [
+        "adapter",
+        "agents",
+        "cli",
+        "context-compiler",
+        "daemon",
+        "kernel",
+        "policy",
+        "security",
+        "tooling"
+      ],
+      "scope_tags": [
+        "capability-security",
+        "content-addressed-storage",
+        "context-as-code",
+        "event-sourcing",
+        "holarchy",
+        "holonic-mesh",
+        "federation",
+        "global-distribution",
+        "tiered-storage",
+        "exabyte-scale",
+        "recurrence-reduction",
+        "verification-economics",
+        "pasm-genome",
+        "proof-admitted-closure",
+        "stigmergic-morphogenesis",
+        "admission-calculus",
+        "axiom-alignment-graph",
+        "applicable-theory-compressed",
+        "kernel-aligned-ingest",
+        "signal-maximization"
+      ]
+    },
+    "genome": {
+      "node_class": "NORMATIVE",
+      "meta_constraint": {
+        "id": "META-DOMINANCE",
+        "statement": "Containment/Security > Verification/Correctness > Liveness/Progress.",
+        "operational_rule": "If containment or correctness constraints cannot be satisfied, deny, decompose/escalate, and record. Containment-tier failures override correctness and liveness gates unconditionally. Correctness-tier failures override liveness gates. Liveness-tier failures never override containment or correctness verdicts.",
+        "dominance_tier_mapping": {
+          "S0_CONTAINMENT": {
+            "laws": [
+              "LAW-05",
+              "LAW-15",
+              "LAW-18"
+            ],
+            "description": "Authority, audit, measurement integrity, revocation — breach here is a security stop-the-line."
+          },
+          "S1_CORRECTNESS": {
+            "laws": [
+              "LAW-01",
+              "LAW-02",
+              "LAW-03",
+              "LAW-04",
+              "LAW-07",
+              "LAW-08",
+              "LAW-13",
+              "LAW-14",
+              "LAW-16",
+              "LAW-17",
+              "LAW-19",
+              "LAW-20"
+            ],
+            "description": "Verification, contracts, evidence, composition — failure means unverified state transition."
+          },
+          "S2_LIVENESS": {
+            "laws": [
+              "LAW-06",
+              "LAW-09",
+              "LAW-10",
+              "LAW-11",
+              "LAW-12"
+            ],
+            "description": "Budgets, freshness, convergence, idempotency, bounded search — failure means degraded progress, not security breach."
+          }
+        },
+        "law_refs": [
+          "LAW-02",
+          "LAW-05",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "invariant_refs": [
+          "INV-F-14"
+        ],
+        "invariant_status": "DEFINED — INV-F-01 through INV-F-18 are defined in genome.invariants.fundamental. INV-F-01 through INV-F-15 restored from v1 and upgraded for v2 (bridge_predicate_refs, machine_check, axiom_refs added; v2 law cross-references expanded). INV-F-16 (Markov Blanket Seal), INV-F-17 (Bounded Revocation Propagation), INV-F-18 (Bounded Progress Under Partial Synchrony) are new in v2, addressing coverage gaps for boundary privacy, revocation propagation, and liveness respectively.",
+        "node_class": "NORMATIVE"
+      },
+      "axioms": {
+        "AXIOM-BOUNDARY": {
+          "statement": "Holons are Markov-blanketed actors with typed, sealed boundary channels and private ephemeral internals.",
+          "formal_object": {
+            "notation": "h = (Id_h, d_h, Ch_h, K_h)",
+            "components": {
+              "Id_h": "Unique holon identity, auditable and bound to accountability chain (LAW-05).",
+              "d_h": "Recursion depth in holarchy; d_root = 0, d_child = d_parent + 1.",
+              "Ch_h": "Set of typed, sealed boundary channels; Ch_h = {c_i : T_i} where each c_i has declared schema T_i != bottom.",
+              "K_h": "Private ephemeral kernel state; not observable across boundary (Markov blanket)."
+            },
+            "bridge_predicates": {
+              "BP-BND-01": "forall h, forall c in Ch_h: type(c) != bottom — untyped traffic forbidden",
+              "BP-BND-02": "forall h, forall c in Ch_h, forall m in messages(c): m = canonicalize_T(m) — pre-hash canonicalization (LAW-13)",
+              "BP-BND-03": "forall h, forall h' in children(h): boundary_facing(Ch_h') subset_of channel_classes(Ch_h) — boundary-visible child channels must conform to parent vocabulary; private internal channels unconstrained (LAW-16). boundary_facing is a declared property set at channel creation time (not derived from runtime behavior) to avoid circularity; reclassification requires explicit governance decision and channel contract update",
+              "BP-BND-04": "forall h: K_h intersect direct_data_observable(parent(h)) = empty — Markov blanket seal on data-plane observability; side-channel leakage (timing, resource usage, error patterns) is out of scope for this predicate and MUST be addressed by a separate side-channel mitigation policy (see threat_model.side_channel_policy)",
+              "BP-BND-05": "forall h: d_h = d_{parent(h)} + 1 and d_h <= policy.max_recursion_depth — recursion depth is bounded and monotonically derived (LAW-12, LAW-16)"
+            },
+            "definitions": {
+              "channel_classes(Ch_h)": "The set of declared channel-class labels for holon h's boundary: channel_classes(Ch_h) = {class(c) | c in Ch_h}. Canonical classes are defined by RFC-0020 HSI: DISCOVERY, HANDSHAKE, WORK, EVIDENCE, GOVERNANCE. Each class constrains admissible payload shape, session-type semantics, and replay behavior.",
+              "boundary_facing(Ch_h')": "The subset of child h's channels that are observable at the parent boundary: boundary_facing(Ch_h') = {c in Ch_h' | c participates in cross-boundary exchange with parent(h')}. Channels not in this set are private internal channels and unconstrained by LAW-16 composition rules.",
+              "observable(parent(h))": "The union of information reachable from parent(h)'s boundary channels and any state shared with parent's peers/supervisor: observable(parent(h)) = union({messages(c) | c in Ch_{parent(h)}}) union shared_projections(parent(h)). The Markov blanket seal requires K_h to be disjoint from this set."
+            }
+          },
+          "hard_constraints": [
+            "Untyped boundary traffic is forbidden.",
+            "Boundary-relevant fields must be canonicalized before hashing/signing.",
+            "Boundary semantics must compose across recursion depth."
+          ],
+          "law_refs": [
+            "LAW-05",
+            "LAW-13",
+            "LAW-16"
+          ],
+          "invariant_refs": [
+            "INV-F-03",
+            "INV-F-05",
+            "INV-F-16"
+          ],
+          "node_class": "NORMATIVE"
+        },
+        "AXIOM-SUBSTRATE": {
+          "statement": "Authoritative facts live in an append-only, tamper-evident substrate with explicit convergence algebra.",
+          "formal_object": {
+            "notation": "(L, join, tau) with a <= b iff a join b = b; tau: L -> HTF",
+            "components": {
+              "L": "Set of authoritative facts (ledger entries, evidence receipts, policy decisions).",
+              "join": "Commutative, associative, idempotent merge operator; defines convergence algebra for replicated views.",
+              "<=": "Partial order induced by join; a <= b means b subsumes a; monotonicity of L means facts are never retracted.",
+              "tau": "Timestamp function mapping facts to HTF authority time; normative ordering and expiry derive from tau, not wall clock (LAW-09)."
+            },
+            "bridge_predicates": {
+              "BP-SUB-01": "forall f in L: append_only(f) — no retraction (LAW-03)",
+              "BP-SUB-02": "forall view_i, view_j: view_i join view_j is defined and convergent — explicit merge (LAW-10). When join(view_i, view_j) is undefined (semantically incompatible views), the system MUST emit a conflict_record and escalate to governance per LAW-10; undefined join MUST NOT silently produce a default value or drop either view",
+              "BP-SUB-03": "forall projection p: exists derivation_receipt d binding p to L — projections traceable to authoritative facts; derivation function MUST declare determinism class: DETERMINISTIC (exact replay required), PROBABILISTIC_BOUNDED (replay within declared divergence bound), or NONDETERMINISTIC_RECEIPTED (each derivation emits a receipt capturing inputs, outputs, and derivation parameters sufficient for audit) (LAW-03)",
+              "BP-SUB-04": "forall f in L: tau(f) in HTF_authority and tau is monotone w.r.t. causal order — normative ordering by HTF, not wall clock (LAW-04, LAW-09)"
+            }
+          },
+          "hard_constraints": [
+            "Convergence algebra must be explicit for replicated views.",
+            "Bounded views must commit to ledger head/checkpoint.",
+            "Normative ordering/expiry uses HTF authority, not wall clock."
+          ],
+          "law_refs": [
+            "LAW-03",
+            "LAW-07",
+            "LAW-10",
+            "LAW-15"
+          ],
+          "invariant_refs": [
+            "INV-F-01",
+            "INV-F-04",
+            "INV-F-06",
+            "INV-F-07",
+            "INV-F-08",
+            "INV-F-12",
+            "INV-F-13"
+          ],
+          "node_class": "NORMATIVE"
+        },
+        "AXIOM-AUTHORITY": {
+          "statement": "Authority attenuates by capability delegation and is always budget/time bounded with fail-closed stop checks.",
+          "formal_object": {
+            "notation": "A_h = (Cap_h, Bud_h, Aud_h) where Cap_h subset_of C, Bud_h in B, Aud_h: Id_h -> AuditLog; over poset (C, <=) and budget monoid (B, +, 0, <=)",
+            "components": {
+              "(C, <=)": "Capability poset; c' <= c means c' is an attenuation of c; delegation moves down, never up.",
+              "(B, +, 0, <=)": "Budget monoid with ordering; 0 is exhaustion; b' <= b means b' is a sub-budget of b. The monoid operation '+' is budget composition (splitting a parent budget into sub-budgets for children: b_parent = b_child1 + b_child2 + ... + b_remainder). Budget consumption is a separate operation consume(b, cost) -> b' where b' <= b and b' = b - cost in each dimension. Consumption is monotone decrease; the monoid '+' is used for allocation, not consumption.",
+              "Cap_h": "Holon h's granted capability set; Cap_h subset_of C; initial state is empty (default-deny).",
+              "Bud_h": "Holon h's remaining budget vector; multi-dimensional (tokens, tool_calls, wall_ms, ...). Exhaustion in ANY dimension triggers stop: (exists dim d: Bud_h[d] <= 0) implies stop_or_escalate(h). See INV-F-09.",
+              "Aud_h": "Audit binding from holon identity to accountability log (LAW-05 dual-axis: authority + accountability)."
+            },
+            "bridge_predicates": {
+              "BP-AUT-01": "Cap_root = empty; forall grant g: g = attenuate(parent_cap, mask) — no ambient authority",
+              "BP-AUT-02": "forall delegation (c_parent -> c_child): c_child <= c_parent — attenuation only (LAW-05)",
+              "BP-AUT-03": "forall h: (exists dim d: Bud_h[d] <= 0) implies stop_or_escalate(h) — ANY-dimension budget exhaustion triggers stop or escalation (LAW-12). stop_or_escalate(h) = if exists parent(h) with Bud_{parent(h)} > 0 in all dims: delegate_to(parent(h), h, budget_exhaustion_receipt) within policy.escalation_timeout[tier(h)]; else: terminate(h) with terminal_receipt. Escalation MUST be receipted.",
+              "BP-AUT-04": "forall actuation a by h: exists entry in Aud_h linking a to Id_h — accountability axis (LAW-05)",
+              "BP-AUT-05": "forall revocation r at time t: propagate(r, h) within SLO(tier(c)) — bounded revocation latency (LAW-18)",
+              "BP-AUT-06": "exists genesis_policy G: Cap_root = G.initial_capabilities AND G is sealed after bootstrap — the root holon receives initial capabilities from a genesis policy that is immutable after system initialization; this is the sole exception to the attenuation-only delegation rule (BP-AUT-02); genesis_policy MUST be content-addressed and signed by the system governance authority"
+            }
+          },
+          "hard_constraints": [
+            "No ambient authority.",
+            "Default-deny capability posture.",
+            "Missing stop-state verifiability implies deny/terminate."
+          ],
+          "law_refs": [
+            "LAW-05",
+            "LAW-12",
+            "LAW-18"
+          ],
+          "invariant_refs": [
+            "INV-F-05",
+            "INV-F-09",
+            "INV-F-11",
+            "INV-F-17",
+            "INV-F-18"
+          ],
+          "node_class": "NORMATIVE"
+        },
+        "AXIOM-CLOSURE": {
+          "statement": "Authoritative transition exists only as policy-indexed closure over facts with replayable evidence receipts.",
+          "formal_object": {
+            "notation": "Cl_P: P(L) -> P(L) where P(L) is the power-set lattice of facts from L, ordered by subset inclusion; Cl_P is extensive (X subset_of Cl_P(X)), monotone (X subset_of Y implies Cl_P(X) subset_of Cl_P(Y)), idempotent (Cl_P(Cl_P(X)) = Cl_P(X))",
+            "components": {
+              "Cl_P": "Policy-indexed closure operator; P selects the gate set and acceptance predicates.",
+              "L": "The substrate lattice from AXIOM-SUBSTRATE; Cl_P maps facts to authorized facts.",
+              "extensive": "forall x in L: x <= Cl_P(x) — closure never loses information.",
+              "monotone": "x <= y implies Cl_P(x) <= Cl_P(y) — more facts yield at least as many authorized facts.",
+              "idempotent": "Cl_P(Cl_P(x)) = Cl_P(x) — re-verification is stable."
+            },
+            "bridge_predicates": {
+              "BP-CLS-01": "forall P, forall x in L: (x -> Cl_P(x)) implies exists receipt_bundle R s.t. verify(R) = pass — gated promotion (LAW-01)",
+              "BP-CLS-02": "forall P, forall x in L, forall g in P: fail(g) implies Cl_P(x) = x — fail dominates verdict aggregation",
+              "BP-CLS-03": "forall P, forall x in L, forall E subset E', forall g in P: containment_or_correctness(g) and verdict(P, x, E) = fail implies verdict(P, x, E') = fail — fail is monotone under evidence accumulation for containment/correctness gates (META-DOMINANCE S0/S1)",
+              "BP-CLS-04": "forall P, forall x in L, forall g in P: liveness_tier(g) and verdict(P, x, E) = fail and exists re_evaluation_receipt R': verdict(P, x, E union {R'}) may yield pass — liveness-tier gates permit re-evaluation with explicit receipt (LAW-19); does not override containment/correctness fail-monotonicity. Constraints on re-evaluation: (1) R' must be issued by authority >= tier(g), (2) re_evaluation_count(g, x) <= policy.max_re_evaluations[tier(g)], (3) freshness(R') <= policy.re_evaluation_window, (4) R' must contain new evidence not present in E",
+              "BP-CLS-05": "forall P, forall x in L, forall e required by P: missing(e) implies Cl_P(x) <= Cl_P_complete(x) — incomplete evidence yields at most partial closure (pending or fail per tiered policy)",
+              "BP-CLS-06": "forall P1, P2, forall x in L: commute(Cl_{P1}, Cl_{P2}) implies Cl_{P2}(Cl_{P1}(x)) = Cl_{P1 union P2}(x) — union identity when operators commute (LAW-16)",
+              "BP-CLS-07": "forall P1, P2, forall x in L: causal_depends(P2, P1) implies Cl_{P2}(Cl_{P1}(x)) != Cl_{P1}(Cl_{P2}(x)) in general; composition is Cl_{P2} compose Cl_{P1} (ordered) — RFC-layer gate ordering refines this"
+            },
+            "definitions": {
+              "commute(Cl_{P1}, Cl_{P2})": "Cl_{P1}(Cl_{P2}(x)) = Cl_{P2}(Cl_{P1}(x)) for all x in L. Sufficient condition: P1 and P2 have disjoint gate sets (no gate in P2 reads evidence emitted by P1 or vice versa).",
+              "Cl_P_complete(x)": "Cl_P applied with all required evidence present. Cl_P(x) <= Cl_P_complete(x) because missing evidence can only reduce the set of authorized promotions.",
+              "containment_or_correctness(g)": "Gate g belongs to the containment or correctness dominance tier per META-DOMINANCE (Security > Correctness > Liveness). Fail-monotonicity is unconditional for these gates (BP-CLS-03).",
+              "liveness_tier(g)": "Gate g belongs to the liveness/progress dominance tier per META-DOMINANCE. These gates may permit re-evaluation under LAW-19 uncertainty-qualified promotion (BP-CLS-04), but never override a containment or correctness fail.",
+              "verify(R, P, X)": "Receipt bundle verification: verify(R, P, X) = pass iff forall g in P: exists R_g in R such that g.terminal_verifier(R_g, X) in {pass} AND R_g.integrity_valid() AND R_g.freshness <= policy.max_evidence_age[tier(g)]. Returns fail if any gate fails; returns pending if any gate is pending and none fail. Trust assumption: terminal_verifier implementations are in the TCB."
+            }
+          },
+          "hard_constraints": [
+            "Fail dominates verdict aggregation.",
+            "Missing required evidence cannot mask existing fail.",
+            "Tiered policy defines pass/pending/fail acceptance semantics."
+          ],
+          "law_refs": [
+            "LAW-01",
+            "LAW-14",
+            "LAW-15",
+            "LAW-19",
+            "LAW-20"
+          ],
+          "invariant_refs": [
+            "INV-F-02",
+            "INV-F-10",
+            "INV-F-15",
+            "INV-F-18"
+          ],
+          "node_class": "NORMATIVE"
+        }
+      },
+      "invariants": {
+        "node_class": "NORMATIVE",
+        "provenance_note": "Restored from unified_theory v1 and upgraded for v2 genome (new axiom formal objects, bridge predicates, LAW-16 through LAW-20). Each invariant now carries axiom_refs, bridge_predicate_refs, and machine_check fields absent in v1.",
+        "fundamental": {
+          "INV-F-01": {
+            "name": "Append-Only Truth",
+            "statement": "Authoritative truth is append-only and tamper-evident (hash-chained, signed). Shared authority facts MUST be quorum-authenticated via BFT consensus.",
+            "formal_predicate": "forall f in L, forall t1 < t2: f in L(t1) implies f in L(t2). forall shared_authority_fact f: accepted(f) implies bft_quorum_verified(f).",
+            "axiom_refs": [
+              "AXIOM-SUBSTRATE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-SUB-01"
+            ],
+            "law_refs": [
+              "LAW-03",
+              "LAW-15"
+            ],
+            "machine_check": "ledger_hash_chain_valid AND no_delete_operations_in_log AND bft_quorum_authenticated_for_shared_authority_facts",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-02": {
+            "name": "No Transition Without Gate Receipt",
+            "statement": "No authoritative state transition occurs without the required gate set producing a machine-readable receipt bound to evidence. High-impact transitions additionally require uncertainty annotation (LAW-19) and deterministic re-verification path (LAW-20).",
+            "formal_predicate": "forall (s -> s') in authoritative_transitions: exists receipt_bundle R such that verify(R, required_gates(s, s'), evidence(s, s')) = pass AND R.integrity_valid(). For risk_tier in {T2, T3}: R must include uncertainty_annotation AND reverification_path. required_gates(s, s') = gate_table[risk_tier(s, s')][transition_type(s, s')] where gate_table is a normative policy artifact mapping (risk_tier, transition_type) to gate sets; gate_table MUST be content-addressed and sealed per deployment epoch.",
+            "axiom_refs": [
+              "AXIOM-CLOSURE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-CLS-01"
+            ],
+            "law_refs": [
+              "LAW-01",
+              "LAW-14",
+              "LAW-15",
+              "LAW-19",
+              "LAW-20"
+            ],
+            "machine_check": "transition_receipt_present AND receipt_signatures_valid AND gate_coverage_complete AND (risk_tier < T2 OR uncertainty_fields_present AND reverification_path_registered)",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-03": {
+            "name": "Typed Canonical Boundaries",
+            "statement": "All boundary-relevant fields MUST be typed, unitful where quantitative, and canonicalized before hashing/signing. Untyped boundary traffic is forbidden. Boundary semantics must compose across recursion depth.",
+            "formal_predicate": "forall h, forall c in Ch_h: type(c) != bottom. forall h, forall c in Ch_h, forall m in messages(c): m = canonicalize_T(m). forall h, forall h' in children(h): boundary_facing(Ch_h') subset_of channel_classes(Ch_h).",
+            "axiom_refs": [
+              "AXIOM-BOUNDARY"
+            ],
+            "bridge_predicate_refs": [
+              "BP-BND-01",
+              "BP-BND-02",
+              "BP-BND-03"
+            ],
+            "law_refs": [
+              "LAW-13",
+              "LAW-16"
+            ],
+            "machine_check": "no_ambiguous_boundary_strings AND canonical_form_hash_stable AND schema_version_transition_explicit AND only_approved_boundary_primitives_used",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-04": {
+            "name": "Summaries as Lossy Derived Claims",
+            "statement": "Summaries are lossy derived claims treated as summary receipts with deterministic evidence pointers and declared loss profiles; admissible for planning/triage, but any gate requiring exactness MUST zoom-in to referenced evidence via content-hash selector or fail-closed.",
+            "formal_predicate": "forall summary s: exists selector_set S and loss_profile lp such that s = summarize(S, lp) AND forall selector in S: resolve(selector) != empty. forall gate g requiring exactness: verdict(g, s) = pending when NOT zoom_in_supplied(g, s); verdict(g, s) = verify(g, resolve(selector(s))) when zoom_in_supplied(g, s).",
+            "axiom_refs": [
+              "AXIOM-SUBSTRATE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-SUB-03"
+            ],
+            "law_refs": [
+              "LAW-07"
+            ],
+            "machine_check": "all_selectors_resolve AND loss_profile_present AND high_risk_gate_requires_zoom_in",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-05": {
+            "name": "Default-Deny Least-Privilege Containment",
+            "statement": "Capabilities are default-deny, least-privilege, time/budget bounded; context reads are firewalled with the same rigor as tools. Outbound connectivity for contained agents MUST use relay holons to preserve the outbound-only security boundary.",
+            "formal_predicate": "Cap_root = empty (before genesis). forall delegation (c_parent -> c_child): c_child <= c_parent. forall h: (exists dim d: Bud_h[d] <= 0) implies stop_or_escalate(h). forall actuation a by h: exists entry in Aud_h linking a to Id_h. forall contained agent a: outbound(a) requires relay_holon(a).",
+            "axiom_refs": [
+              "AXIOM-BOUNDARY",
+              "AXIOM-AUTHORITY"
+            ],
+            "bridge_predicate_refs": [
+              "BP-AUT-01",
+              "BP-AUT-02",
+              "BP-AUT-03",
+              "BP-AUT-04"
+            ],
+            "law_refs": [
+              "LAW-05",
+              "LAW-12"
+            ],
+            "machine_check": "least_privilege_scope_check AND context_firewall_enforced AND audit_identity_binding_present AND outbound_connectivity_relay_enforced",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-06": {
+            "name": "Idempotent Actuation Under Drift",
+            "statement": "Actuation is retry-safe under non-stationarity via idempotency/dedupe keys, execution receipts, and precondition/revision guards; failed guards trigger revalidation and replan. No world effect occurs without a bound receipt.",
+            "formal_predicate": "forall side_effect e: exists idempotency_key(e) AND exists execution_receipt(e) AND binds(execution_receipt(e), effect(e)) AND precondition_guard(e).checked = true. forall e1, e2 with idempotency_key(e1) = idempotency_key(e2): effect(e1) = effect(e2) (deduplicated). forall world_effect w: NOT exists execution_receipt(w) implies w is denied.",
+            "axiom_refs": [
+              "AXIOM-SUBSTRATE"
+            ],
+            "bridge_predicate_refs": [],
+            "grounding_gap": "LAW-11 (Idempotent Actuation) lacks a dedicated bridge predicate in AXIOM-SUBSTRATE or AXIOM-CLOSURE. Actuation idempotency is grounded at the law level only. A future BP-SUB-05 or BP-CLS-08 should formalize receipt-bound world effects.",
+            "law_refs": [
+              "LAW-11",
+              "LAW-15"
+            ],
+            "machine_check": "duplicate_actuation_deduped AND guard_failures_trigger_replan AND no_unreceipted_world_effect",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-07": {
+            "name": "Explicit Convergence Algebra",
+            "statement": "Convergence is explicit: merge operators and conflict rules are declared per fact domain; reconciliation failures are recorded as defects. Undefined join MUST NOT silently produce a default value or drop a view; it MUST emit a conflict record and escalate.",
+            "formal_predicate": "forall fact_domain d: exists declared join_d or conflict_rule_d. forall view_i, view_j in domain d: join_d(view_i, view_j) is defined and convergent, OR conflict_record emitted AND escalation triggered.",
+            "axiom_refs": [
+              "AXIOM-SUBSTRATE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-SUB-02"
+            ],
+            "law_refs": [
+              "LAW-03",
+              "LAW-10"
+            ],
+            "machine_check": "all_fact_domains_have_join_or_conflict_rule AND reconciliation_failures_emit_defects AND digest_first_exchange_verified",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-08": {
+            "name": "Explicit Temporal Pinning and Freshness",
+            "statement": "Freshness is explicit policy; authoritative artifacts are versioned and time-scoped; episodes reason against pinned snapshots. Normative ordering and expiry derive from HTF authority time (LedgerTime, MonotonicTicks), not wall clock.",
+            "formal_predicate": "forall authoritative_artifact a: exists version(a) AND exists freshness_policy(a). forall f in L: tau(f) in HTF_authority AND tau is monotone w.r.t. causal order. forall expired artifact a: blocks_high_risk_promotion(a).",
+            "axiom_refs": [
+              "AXIOM-SUBSTRATE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-SUB-04"
+            ],
+            "law_refs": [
+              "LAW-04",
+              "LAW-09"
+            ],
+            "machine_check": "snapshot_hash_pinned AND freshness_window_valid AND expired_artifacts_block_high_risk_promotion",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-09": {
+            "name": "Mandatory Budgets and Stop Conditions",
+            "statement": "Budgets (typed budget vectors) and stop conditions are mandatory for all exploration and policy adaptation; unbounded exploration or non-termination is a defect. Budget exhaustion in ANY dimension triggers stop-or-escalate. Repetition detection MUST be active.",
+            "formal_predicate": "forall exploration e: exists lease(e) AND exists typed_budget_vector(e) AND exists stop_conditions(e). forall h: (exists dim d: Bud_h[d] <= 0) implies stop_or_escalate(h).",
+            "axiom_refs": [
+              "AXIOM-AUTHORITY"
+            ],
+            "bridge_predicate_refs": [
+              "BP-AUT-03"
+            ],
+            "law_refs": [
+              "LAW-06",
+              "LAW-12"
+            ],
+            "machine_check": "budget_exhaustion_triggers_stop_or_escalate AND non_convergence_emits_defect AND repetition_detection_active",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-10": {
+            "name": "Goodhart-Resistant Gate Design",
+            "statement": "Only gate what you can defend: verifiers must be designed for Goodhart resistance with holdouts/adversarial suites; safety constraints are separated from performance objectives. Monitor channels MUST be isolated from reward/training signals. Coalition resistance diagnostics MUST be executed.",
+            "formal_predicate": "forall gate_portfolio gp: exists holdout_coverage(gp) AND exists adversarial_suite(gp) AND isolated(monitor_channels(gp), reward_signals(gp)). forall gate g: safety_constraints(g) intersect optimization_objectives(g) = empty (separation of safety from optimization targets; safety constraints that are also operational requirements, e.g. latency SLOs for safety-critical paths, are classified as safety and excluded from optimization objective sets).",
+            "axiom_refs": [
+              "AXIOM-CLOSURE"
+            ],
+            "bridge_predicate_refs": [],
+            "grounding_gap": "LAW-08 (Goodhart Resistance) lacks a dedicated bridge predicate. BP-CLS-02 (fail-dominance) and BP-CLS-03 (fail-monotonicity) address verdict aggregation, not Goodhart resistance mechanisms (holdouts, adversarial suites, monitor isolation). A future BP-CLS-09 should formalize monitor-reward separation.",
+            "law_refs": [
+              "LAW-08",
+              "LAW-14"
+            ],
+            "machine_check": "holdout_not_used_for_training AND monitor_features_not_in_objective AND collusion_diagnostics_executed",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-11": {
+            "name": "Universal Stop-State Verification",
+            "statement": "All actuation paths MUST check stop state before execution. If stop state is missing or unverifiable, deny (fail-closed). This includes budget checks, lease validity, revocation status, and emergency stop signals.",
+            "formal_predicate": "forall actuation_path p: exists stop_check(p) AND stop_check(p).verified = true BEFORE execution(p). missing(stop_check(p)) OR unverifiable(stop_check(p)) implies deny(p).",
+            "axiom_refs": [
+              "AXIOM-AUTHORITY"
+            ],
+            "bridge_predicate_refs": [
+              "BP-AUT-03",
+              "BP-AUT-05"
+            ],
+            "law_refs": [
+              "LAW-05",
+              "LAW-12",
+              "LAW-15",
+              "LAW-18"
+            ],
+            "machine_check": "stop_state_checked_before_actuation AND missing_stop_state_triggers_deny AND revocation_status_current",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-12": {
+            "name": "Auditability-Preserving Compaction",
+            "statement": "Any compaction/snapshot MUST preserve auditability: a consumer can reconstruct acceptance decisions via hash-links to archived history and replay-equivalence receipts. Compacted facts remain in L (append-only); compaction adds a derived summary fact and marks originals as superseded.",
+            "formal_predicate": "forall compaction c producing f' from F = {f_1, ..., f_n}: forall q in {gate_verdict_queries, evidence_resolution_queries, audit_trail_queries}: q(f') = q(F). f' in L AND forall f_i in F: f_i in L (append-only preserved). exists compaction_receipt(c) linking f' to F via content hashes.",
+            "axiom_refs": [
+              "AXIOM-SUBSTRATE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-SUB-01",
+              "BP-SUB-03"
+            ],
+            "law_refs": [
+              "LAW-03",
+              "LAW-07",
+              "LAW-15"
+            ],
+            "machine_check": "compacted_facts_not_deleted AND compaction_receipt_present AND replay_equivalence_verified",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-13": {
+            "name": "Commitment-Bound Bounded Views",
+            "statement": "Bounded views (ContextPacks, snapshots, summaries) MUST carry a cryptographic commitment to the relevant ledger head/checkpoint and provide addressable selectors for any omitted referenced facts; view validity is by commitment hash, not by full history inclusion.",
+            "formal_predicate": "forall bounded_view v: exists checkpoint c in L AND exists commitment(v) binding v to c. forall omitted_fact f referenced by v: exists selector(f) such that resolve(selector(f), L) = f. valid(v) iff commitment(v).hash_matches(c) AND age(c, current_ledger_head(L)) <= freshness_policy(v).max_age.",
+            "axiom_refs": [
+              "AXIOM-SUBSTRATE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-SUB-03",
+              "BP-SUB-04"
+            ],
+            "law_refs": [
+              "LAW-03",
+              "LAW-06",
+              "LAW-07",
+              "LAW-15"
+            ],
+            "machine_check": "commitment_hash_valid AND all_selectors_resolvable AND ledger_head_current_within_freshness_window",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-14": {
+            "name": "Dominance-Ordered Constraint Precedence",
+            "statement": "When laws or gate verdicts conflict, apply Security/Containment (S0) > Verification/Correctness (S1) > Liveness/Progress (S2). S0 failures override S1 and S2 unconditionally. S1 failures override S2. If containment forbids sufficient context or capabilities, fail-closed, decompose/escalate, and record a defect.",
+            "formal_predicate": "forall conflict between gate g_i at tier t_i and gate g_j at tier t_j: t_i < t_j implies verdict(g_i) dominates verdict(g_j). forall containment_failure: result = deny AND action = decompose_or_escalate AND defect_record emitted.",
+            "tier_ordering_convention": "S0_CONTAINMENT = 0 < S1_CORRECTNESS = 1 < S2_LIVENESS = 2. Lower numeric index = higher precedence = dominates. The '<' in the predicate is numeric ordering on tier indices.",
+            "axiom_refs": [
+              "META-DOMINANCE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-CLS-02",
+              "BP-CLS-03"
+            ],
+            "law_refs": [
+              "LAW-02",
+              "LAW-05",
+              "LAW-14",
+              "LAW-15"
+            ],
+            "machine_check": "tier_ordering_enforced AND containment_override_logged AND s0_failure_blocks_all_promotion",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-15": {
+            "name": "Terminal-Verifier Evidence Requirement",
+            "statement": "Authoritative promotion requires terminal-verifier evidence: gate acceptance predicates MUST be machine-checkable and replayable within a declared determinism envelope in an integrity-verified environment. Stochastic evaluators (LLMs) may orchestrate or advise but cannot be the sole basis for Tier2+ promotion. Tier2+ requires diverse, non-correlated verifier families.",
+            "formal_predicate": "forall authoritative_promotion p: exists terminal_verifier tv such that machine_checkable(tv) AND replayable_within(tv, determinism_envelope(tv)) where determinism_envelope(tv) = (determinism_class(tv), divergence_bound(tv), replay_semantics(tv)), determinism_class in {DETERMINISTIC, PROBABILISTIC_BOUNDED, NONDETERMINISTIC_RECEIPTED}, and for PROBABILISTIC_BOUNDED: replay_divergence(tv) <= divergence_bound(tv). forall p at risk_tier in {T2, T3}: distinct_verifier_families(p) >= 2 AND forall family F: NOT sole_terminal_authority(F, p). forall stochastic_evaluator se at risk_tier in {T2, T3}: NOT sole_terminal_authority(se, p).",
+            "axiom_refs": [
+              "AXIOM-CLOSURE"
+            ],
+            "bridge_predicate_refs": [
+              "BP-CLS-01"
+            ],
+            "law_refs": [
+              "LAW-01",
+              "LAW-04",
+              "LAW-14",
+              "LAW-15",
+              "LAW-17",
+              "LAW-20"
+            ],
+            "machine_check": "terminal_verifier_replay_pass AND receipt_signatures_valid AND (risk_tier < T2 OR distinct_family_count_check AND dependency_overlap_check)",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-16": {
+            "name": "Markov Blanket Seal",
+            "statement": "A holon's private kernel state K_h is not data-plane observable by its parent, peers, or children. All cross-boundary information exchange occurs exclusively through typed boundary channels Ch_h. Side-channel leakage (timing, resource usage, error patterns) is addressed by a separate side-channel mitigation policy.",
+            "formal_predicate": "forall h: K_h intersect direct_data_observable(parent(h)) = empty. forall h: K_h intersect direct_data_observable(peers(h)) = empty. forall h, forall h' in children(h): K_{h'} intersect direct_data_observable(h) = empty. All information exchange crosses boundary via Ch_h.",
+            "axiom_refs": ["AXIOM-BOUNDARY"],
+            "bridge_predicate_refs": ["BP-BND-04"],
+            "law_refs": ["LAW-05", "LAW-16"],
+            "machine_check": "no_kernel_state_in_boundary_messages AND boundary_channel_only_exchange_verified AND side_channel_policy_declared",
+            "side_channel_scope_note": "Data-plane observability seal only. Side-channel leakage (timing, resource, error) is out of scope for this invariant and MUST be addressed by threat_model.side_channel_policy (currently PLANNED).",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-17": {
+            "name": "Bounded Revocation Propagation",
+            "statement": "Revocation of authority (capabilities, keys, policy grants) MUST propagate to all affected holons within a bounded latency SLO determined by the revoked capability's tier. Use of stale (revoked) authority after the SLO deadline is a stop-the-line defect for S0/S1 tiers. Revocation-wins semantics: under network partitions, revocation dominates grant.",
+            "formal_predicate": "forall revocation r of capability c at time t: forall h in affected_set(r): revocation_received(h, r) within SLO(tier(c)) where SLO(S0) < SLO(S1) < SLO(S2). forall actuation a by h using c after t + SLO(tier(c)): denied(a) AND defect_emitted(POLICY_VIOLATION). forall partition P: revocation(c) received on either side of P implies c is denied on both sides upon partition heal.",
+            "axiom_refs": ["AXIOM-AUTHORITY"],
+            "bridge_predicate_refs": ["BP-AUT-05"],
+            "law_refs": ["LAW-05", "LAW-18"],
+            "machine_check": "revocation_propagation_receipted AND coverage_set_complete_check AND latency_within_tier_slo AND post_revocation_actuation_denied",
+            "node_class": "NORMATIVE"
+          },
+          "INV-F-18": {
+            "name": "Bounded Progress Under Partial Synchrony",
+            "statement": "Well-formed work with sufficient budget reaches a terminal state (pass, fail, or escalate) within bounded time under partial synchrony. Liveness holds when: (1) fewer than f of n nodes are Byzantine with f < n/3 and n >= 4, (2) network partitions heal within GST (declared per deployment as policy.max_message_delay), (3) governance decisions resolve within policy.governance_timeout. Before GST, safety holds but liveness may not. This invariant is S2_LIVENESS tier and never overrides S0/S1 safety properties.",
+            "formal_predicate": "forall well_formed_work w with Bud_w > 0 in all dims: exists terminal_time t <= SLO(tier(w)) such that state(w, t) in {PASS, FAIL, ESCALATED}, given: byzantine_count < n/3 AND n >= 4 AND partition_duration <= policy.max_message_delay AND governance_latency <= policy.governance_timeout. NOT holds_before(GST).",
+            "axiom_refs": ["AXIOM-CLOSURE", "AXIOM-AUTHORITY"],
+            "bridge_predicate_refs": ["BP-AUT-03", "BP-CLS-01"],
+            "law_refs": ["LAW-12", "LAW-19"],
+            "machine_check": "terminal_state_reached_within_slo AND non_termination_emits_defect AND partial_synchrony_assumptions_declared",
+            "dominance_tier": "S2_LIVENESS — this invariant MUST NOT override INV-F-14 dominance ordering. If liveness conflicts with containment or correctness, containment/correctness wins and the work is terminated with an escalation receipt.",
+            "node_class": "NORMATIVE"
+          }
+        }
+      },
+      "threat_model": {
+        "node_class": "NORMATIVE",
+        "status": "PLANNED — required before theory promotion to APPROVED",
+        "adversary_classes": {
+          "BYZANTINE": "Up to f < n/3 nodes may behave arbitrarily (send conflicting messages, forge state, collude). Assumed for BFT consensus in LAW-03 and verifier independence in LAW-17.",
+          "RATIONAL_SELFISH": "Agents that follow protocol when profitable but deviate when deviation yields higher utility. Assumed for LAW-08 Goodhart resistance and coalition-resistance.",
+          "CURIOUS_BUT_HONEST": "Agents that follow protocol but attempt to learn information beyond their authorized scope. Assumed for AXIOM-BOUNDARY Markov blanket and LAW-05 containment.",
+          "EXTERNAL_ATTACKER": "Adversary with network-level access but no initial capabilities within the holarchy. Assumed for LAW-18 revocation and LAW-15 measurement integrity."
+        },
+        "attack_surfaces": [
+          "Capability forgery or escalation (mitigated by AXIOM-AUTHORITY OCAP)",
+          "Evidence fabrication or replay (mitigated by LAW-15 tamper-evidence)",
+          "Side-channel information leakage (UNMITIGATED — see BP-BND-04 qualification)",
+          "Sybil attacks on verifier diversity (mitigated by LAW-17 family independence)",
+          "Oracle poisoning (partially mitigated by LAW-09 freshness, LAW-19 uncertainty)",
+          "Denial-of-service via budget exhaustion (mitigated by LAW-12 bounded search)",
+          "Collusion between agent and verifier (WEAKLY mitigated — LAW-08 claims coalition-resistance but lacks concrete mechanism)"
+        ],
+        "side_channel_policy": "PLANNED — side-channel mitigation (timing, resource, error) not yet specified. Required for BP-BND-04 completeness."
+      }
+    },
+    "law_alignment": {
+      "laws": {
+        "LAW-01": {
+          "name": "Loop Closure & Gated Promotion",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Defines authoritative promotion: no shared truth transition without verification receipts whose acceptance predicates reduce to replayable, machine-checkable terminal verifiers in an integrity-verified environment. Includes hierarchical gate separation for Planner/Executor layers with layer-specific budgets.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Hierarchical Gate Separation",
+            "Layer-Specific Budgets"
+          ]
+        },
+        "LAW-02": {
+          "name": "Observable Context Sufficiency",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Defines measurable surrogates for role-relative, capability-bounded context sufficiency; drives context compiler optimization. Mandates subtask isolation with scoped ContextPacks and typed inter-subtask interfaces; containment conflicts force decomposition/escalation (fail-closed).",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Subtask Isolation",
+            "Inter-Subtask Interface"
+          ],
+          "defect_classes": [
+            "CONTEXT_BLEED"
+          ]
+        },
+        "LAW-03": {
+          "name": "Monotone Ledger vs. Overwritable Projection",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Separates truth substrate from mutable projections; authoritative truth is the monotone ledger + evidence + deterministic addressability, while agents operate on bounded views synchronized by ledger commitments. Requires merge algebra and monotone compaction (derived artifacts that reference history). Memory mutations are ledger events; retrieval is auditable tool invocation. Shared authority facts MUST be quorum-authenticated via BFT consensus.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Memory Mutation as Ledger Events",
+            "Retrieval as Tool Call",
+            "BFT Consensus Quorum"
+          ],
+          "defect_classes": [
+            "SILENT_MEMORY_MUTATION"
+          ]
+        },
+        "LAW-04": {
+          "name": "Stochastic Stability",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Since transducers (agents) are stochastic, stability is achieved only through the binding of Stability = (Contract + Receipt + Evidence) to replayable terminal verifiers and an explicit determinism envelope. Event ordering MUST rely on Hybrid Logical Clocks (HLC) to preserve causal determinism.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Causal Determinism (HLC)"
+          ]
+        },
+        "LAW-05": {
+          "name": "Dual-Axis Containment & Variety Control",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Containment requires both Authority (Capabilities) and Accountability (Identity/Audit), including context-read firewalls treated as capabilities; containment dominates sufficiency and privilege escalations must be explicit. Connectivity for contained agents MUST use Relay Holons to preserve outbound-only security boundary.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Relay-Mediated Connectivity"
+          ]
+        },
+        "LAW-06": {
+          "name": "MDL as a Gated Budget",
+          "reference_path": "unified-theory-v2.json",
+          "role": "MDL budgets enforce cognitive reach; triggers decomposition/refactoring when exceeded.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-07": {
+          "name": "Verifiable Summaries",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Summaries are derived receipts with evidence pointers and deterministic zoom-in; admissible for planning/triage, but gates needing exactness MUST zoom-in to evidence or fail-closed.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-08": {
+          "name": "Verifier Economics (Goodhart Resistance)",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Only gate what you can defend; holdouts/adversarial suites; safety constraints separated from performance targets. Includes monitorability conservation and coalition-resistance against collusive optimization pressure.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Monitorability Conservation",
+            "Audit Channel Integrity"
+          ],
+          "defect_classes": [
+            "MONITOR_GAMING"
+          ]
+        },
+        "LAW-09": {
+          "name": "Temporal Pinning & Freshness",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Versioned/time-scoped artifacts; frozen snapshots for episodes; explicit drift handling.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-10": {
+          "name": "Anti-Entropy & Merge Semantics",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Convergence requires explicit merge operators and conflict recording; periodic reconciliation.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-11": {
+          "name": "Conservation of Work and Idempotent Actuation",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Actuation must be retry-safe under non-stationarity via idempotency/dedupe keys, precondition/revision guards when applicable, and execution receipts; drift-triggered guard failures force revalidation/replan.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-12": {
+          "name": "Bounded Search and Termination Discipline",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Exploration and policy adaptation run under budgets and stop conditions; non-convergence is a defect. Includes repetition detection, delay-aware stability posture, and anti-flip-flop transition design (hysteresis/deadbands/hold-down timers).",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Repetition Detection",
+            "Degeneration as Defect"
+          ],
+          "defect_classes": [
+            "REASONING_DEGENERATION"
+          ]
+        },
+        "LAW-13": {
+          "name": "Semantic Contracting",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Typed/unitful/canonical boundaries; versioned enums; canonicalization before hashing/signing. Semantic transitions use explicit epoch cutovers or declared compatibility contracts; no implicit backward-compatibility assumptions.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-14": {
+          "name": "Proportionality and Risk-Weighted Evidence",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Gate strength scales with risk/blast radius and adapts to escape rates; risk includes jurisdictional, rights, and externality surfaces, not only local performance impact.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-15": {
+          "name": "Measurement Integrity",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Receipts are tamper-evident and evidence-bearing (inputs/outputs/hashes + command transcript + toolchain versions + environment digest/integrity proof); omission of required evidence is a defect; fail-closed in high-risk transitions. Includes evaluator validity auditing, privacy-preserving measurement, and signal provenance weighting for control relevance.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Evaluator Validity",
+            "Evaluator Brittleness as Defect"
+          ],
+          "defect_classes": [
+            "EVALUATOR_DRIFT"
+          ]
+        },
+        "LAW-16": {
+          "name": "Closure Under Composition & Boundary Contracts",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Holonic systems scale by preserving boundary primitive closure across recursion depth: coarse-grained commitments/receipts/summaries at boundaries, deterministic selector-based zoom-in, explicit challenge paths, and stable semantics under composition.",
+          "node_class": "NORMATIVE",
+          "amendments": [
+            "Re-verification Channel",
+            "Population-Scale Compositionality"
+          ]
+        },
+        "LAW-17": {
+          "name": "Verifier Independence",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Tier2+ promotions require diverse, non-correlated verifier families; disagreement must be escalated, never silently collapsed.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-18": {
+          "name": "Revocation Latency and Propagation",
+          "reference_path": "unified-theory-v2.json",
+          "role": "Revocation must propagate with receipt-backed bounded latency across declared trust surface; stale authority acceptance after SLO is fail-closed.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-19": {
+          "name": "Uncertainty-Qualified Promotion",
+          "reference_path": "unified-theory-v2.json",
+          "role": "High-impact promotions require explicit uncertainty/provenance annotation and policy-bounded residual uncertainty.",
+          "node_class": "NORMATIVE"
+        },
+        "LAW-20": {
+          "name": "Deterministic Re-verification Path",
+          "reference_path": "unified-theory-v2.json",
+          "role": "High-impact decisions must provide deterministic machine re-verification path, independent verifier-family rerun, and receipt-bound outcome publication.",
+          "node_class": "NORMATIVE"
+        }
+      },
+      "law_order": [
+        "LAW-01",
+        "LAW-02",
+        "LAW-03",
+        "LAW-04",
+        "LAW-05",
+        "LAW-06",
+        "LAW-07",
+        "LAW-08",
+        "LAW-09",
+        "LAW-10",
+        "LAW-11",
+        "LAW-12",
+        "LAW-13",
+        "LAW-14",
+        "LAW-15",
+        "LAW-16",
+        "LAW-17",
+        "LAW-18",
+        "LAW-19",
+        "LAW-20"
+      ]
+    },
+    "applicable_theory": {
+      "node_class": "EXPLANATORY",
+      "selection_policy": {
+        "goal": "Maximize kernel-aligned signal while minimizing orchestration-layer baggage.",
+        "source_documents": [
+          "documents/theory/unified-theory-v2.json"
+        ],
+        "retention_rules": [
+          "Keep law-linked and kernel-applicable content (boundary/substrate/authority/closure).",
+          "Prefer machine-checkable predicates/evidence contracts over narrative-only content.",
+          "Drop doctrine/protocol/prescription implementation specifics from architecture bundle.",
+          "Filter principle references to selected high-signal IDs."
+        ],
+        "node_class": "EXPLANATORY",
+        "note": "Legacy bundles were compressed and inlined into this artifact during clean-break migration."
+      },
+      "laws_compact": {
+        "node_class": "NORMATIVE",
+        "source_stable_id": "dcp://apm2.agents/laws/bundle@1",
+        "items": {
+          "LAW-01": {
+            "name": "Loop Closure & Gated Promotion",
+            "status": "active",
+            "effective_date": "2026-02-04",
+            "statement": "Exploratory actions may be open-loop within a sandbox, but **no state transition becomes authoritative until it is verified under the appropriate gate set.** Furthermore, the system must **evolve** by converting loop failures into stronger primitives.",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-01-PROMOTION-GATED",
+              "acceptance_predicate": "authoritative_transition => required_gate_set_pass && receipt_bundle_signed && terminal_verifier_replayable",
+              "required_evidence": [
+                "gate_run_receipts",
+                "evidence_bundle_manifest",
+                "terminal_verifier_integrity_receipt"
+              ],
+              "machine_checks": [
+                "required_gates_present",
+                "receipt_signatures_valid",
+                "terminal_verifier_replay_pass"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-CLS-01"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-02": {
+            "name": "Observable Context Sufficiency",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "\"Mutual Information\" in the context channel is optimized via **measurable surrogates**, as sufficiency cannot be tested directly.",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-02-CONTEXT-SUFFICIENCY",
+              "acceptance_predicate": "scoped_execution => pack_miss_rate <= policy.max_pack_miss && unplanned_context_tool_calls <= policy.max_unplanned_calls",
+              "required_evidence": [
+                "context_pack_manifest",
+                "toolcall_log_index",
+                "context_miss_telemetry"
+              ],
+              "machine_checks": [
+                "context_reads_within_allowlist",
+                "pack_miss_rate_computed",
+                "unplanned_discovery_calls_counted"
+              ],
+              "fail_closed": true,
+              "fail_closed_rationale": "META-DOMINANCE S1 correctness tier — context sufficiency failure triggers decompose/escalate, not silent continuation. Degraded operation (with defect record) permitted only when pack_miss_rate exceeds soft threshold but remains below hard threshold."
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-03": {
+            "name": "Monotone Ledger vs. Overwritable Projection",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "The **substrate ledger of facts** (patches, receipts, decisions) is monotone and commutative within a declared merge algebra; the **system state** (codebase, workspace) is a non-monotone projection.",
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-03-MONOTONE-TRUTH",
+              "acceptance_predicate": "authoritative_fact => append_only_ledger && merge_operator_declared && projection_mutation_traceable_to_fact",
+              "required_evidence": [
+                "ledger_event_record",
+                "merge_operator_declaration",
+                "projection_derivation_receipt"
+              ],
+              "machine_checks": [
+                "ledger_hash_chain_valid",
+                "merge_operator_present",
+                "no_silent_state_mutation",
+                "bft_quorum_authenticated_for_shared_authority_facts"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-SUB-01",
+                "BP-SUB-03"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-04": {
+            "name": "Stochastic Stability",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "Since both transducers (agents) and verifiers (tests) are stochastic, stability is achieved only through the binding of three elements: **Stability = (Contract + Receipt + Evidence).**",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-04-STABILITY-TRIAD",
+              "acceptance_predicate": "high_risk_claim => contract_declared && receipt_valid && evidence_replay_or_bounded_probabilistic_replay",
+              "required_evidence": [
+                "contract_schema_ref",
+                "receipt_signature",
+                "evidence_bundle_or_probabilistic_replay_bounds"
+              ],
+              "machine_checks": [
+                "determinism_class_declared",
+                "receipt_to_evidence_binding_valid",
+                "replay_check_or_probability_bound_check_pass"
+              ],
+              "fail_closed": true
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-05": {
+            "name": "Dual-Axis Containment & Variety Control",
+            "status": "active",
+            "effective_date": "2026-02-04",
+            "statement": "Containment requires both **Authority (Capabilities)** and **Accountability (Identity/Audit)**, and stability requires **Interface Variety Control**.",
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-05-DUAL-CONTAINMENT",
+              "acceptance_predicate": "actuation_or_context_read => capability_valid && identity_auditable && boundary_variety_within_declared_contract",
+              "required_evidence": [
+                "capability_manifest",
+                "identity_proof",
+                "permeability_receipt_when_cross_boundary",
+                "schema_contract"
+              ],
+              "machine_checks": [
+                "least_privilege_scope_check",
+                "context_firewall_enforced",
+                "audit_identity_binding_present",
+                "outbound_connectivity_relay_enforced"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-AUT-02",
+                "BP-AUT-04"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-06": {
+            "name": "MDL as a Gated Budget",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "Minimal Description Length (MDL) is a hard resource constraint enforced by gates. If the description of \"how to work\" exceeds the context window ($W$), the agent will fail.",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-06-MDL-BUDGET",
+              "acceptance_predicate": "episode_or_interface => mdl_estimate <= declared_budget",
+              "required_evidence": [
+                "context_budget",
+                "mdl_estimation_receipt",
+                "interface_token_profile"
+              ],
+              "machine_checks": [
+                "budget_declared",
+                "mdl_measurement_present",
+                "overbudget_paths_emit_refactor_ticket"
+              ],
+              "fail_closed": true,
+              "fail_closed_rationale": "Statement declares MDL as a 'hard resource constraint'; fail-open contradicts the stated semantics. Overbudget episodes MUST stop and emit refactor ticket, not silently continue.",
+              "formal_grounding": [
+                "BP-AUT-03"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-07": {
+            "name": "Verifiable Summaries",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "Hierarchical summaries are lossy claims and must be treated as **\"Summary Receipts\" with explicit evidence pointers.**",
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-07-VERIFIABLE-SUMMARIES",
+              "acceptance_predicate": "summary_claim => selector_coverage_complete && evidence_pointers_resolve && loss_profile_declared",
+              "required_evidence": [
+                "summary_receipt",
+                "selector_coverage_report",
+                "evidence_pointer_resolution_log"
+              ],
+              "machine_checks": [
+                "all_selectors_resolve",
+                "loss_profile_present",
+                "high_risk_gate_requires_zoom_in"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-SUB-03"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-08": {
+            "name": "Verifier Economics (Goodhart Resistance)",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "Optimization pressure will exploit proxy gaps; therefore, **only gate what you can defend.**",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-08-GOODHART-RESISTANCE",
+              "acceptance_predicate": "gate_portfolio => holdout_coverage_present && adversarial_suite_active && monitor_channels_isolated_from_reward",
+              "required_evidence": [
+                "holdout_results",
+                "adversarial_suite_receipt",
+                "monitor_isolation_receipt"
+              ],
+              "machine_checks": [
+                "holdout_not_used_for_training",
+                "monitor_features_not_in_objective",
+                "collusion_diagnostics_executed"
+              ],
+              "fail_closed": true
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-09": {
+            "name": "Temporal Pinning & Freshness",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "The universe is non-stationary (dependencies update, model behavior drifts). **All authoritative artifacts are versioned and time-scoped; freshness is a policy.**",
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-09-TEMPORAL-PINNING",
+              "acceptance_predicate": "authoritative_artifact => version_pinned && freshness_policy_satisfied && drift_delta_recorded_if_outdated",
+              "required_evidence": [
+                "source_snapshot_receipt",
+                "freshness_policy_receipt",
+                "drift_delta_record_if_applicable"
+              ],
+              "machine_checks": [
+                "snapshot_hash_pinned",
+                "freshness_window_valid",
+                "expired_artifacts_block_high_risk_promotion"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-SUB-04"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-10": {
+            "name": "Anti-Entropy & Merge Semantics",
+            "status": "active",
+            "effective_date": "2026-02-04",
+            "statement": "Convergence in a distributed holarchy requires an **explicit anti-entropy protocol** to resolve forked truths, distinguishing between **Control** and **Data** planes.",
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-10-ANTI-ENTROPY",
+              "acceptance_predicate": "distributed_reconciliation => merge_semantics_declared && conflict_recorded && anti_entropy_cycle_receipted",
+              "required_evidence": [
+                "anti_entropy_cycle_receipt",
+                "merge_operator_catalog",
+                "conflict_records"
+              ],
+              "machine_checks": [
+                "all_fact_domains_have_join_or_conflict_rule",
+                "reconciliation_failures_emit_defects",
+                "digest_first_exchange_verified"
+              ],
+              "fail_closed": true,
+              "fail_closed_rationale": "Control-plane reconciliation failure (membership, policy roots, authority grants) MUST be fail-closed per PRIN-049 and META-DOMINANCE S1. Data-plane convergence failure may emit defect and continue with eventual consistency, but control-plane divergence is a correctness violation that can cause inconsistent authorization.",
+              "formal_grounding": [
+                "BP-SUB-02"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-11": {
+            "name": "Conservation of Work and Idempotent Actuation",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "Actuation must be safe under retries, duplication, and partial failure.",
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-11-IDEMPOTENT-ACTUATION",
+              "acceptance_predicate": "side_effect => idempotency_key_present && execution_receipt_emitted && precondition_guard_checked",
+              "required_evidence": [
+                "tool_execution_receipt",
+                "idempotency_key",
+                "precondition_or_revision_guard_result"
+              ],
+              "machine_checks": [
+                "duplicate_actuation_deduped",
+                "guard_failures_trigger_replan",
+                "no_unreceipted_world_effect"
+              ],
+              "fail_closed": true
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-12": {
+            "name": "Bounded Search and Termination Discipline",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "Any exploration MUST run under a lease with a termination policy; failure to converge within budget is a defect.",
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-12-BOUNDED-SEARCH",
+              "acceptance_predicate": "exploration => lease_valid && budget_vector_declared && stop_conditions_declared_and_checked",
+              "required_evidence": [
+                "lease_receipt",
+                "typed_budget_vector",
+                "stop_state_receipt"
+              ],
+              "machine_checks": [
+                "budget_exhaustion_triggers_stop_or_escalate",
+                "non_convergence_emits_defect",
+                "repetition_detection_active"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-AUT-03"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-13": {
+            "name": "Semantic Contracting",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "All quantitative and protocol-relevant fields MUST be typed, unitful, and canonicalized; ambiguous strings are defects at the boundary.",
+            "kernel_alignment": {
+              "primary": "AXIOM-BOUNDARY",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-13-SEMANTIC-CONTRACTING",
+              "acceptance_predicate": "boundary_field => typed && unitful_when_quantitative && canonicalized_before_hashing",
+              "required_evidence": [
+                "schema_validation_receipt",
+                "canonicalization_receipt",
+                "epoch_or_compatibility_contract"
+              ],
+              "machine_checks": [
+                "no_ambiguous_boundary_strings",
+                "canonical_form_hash_stable",
+                "schema_version_transition_explicit"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-BND-01",
+                "BP-BND-02"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-14": {
+            "name": "Proportionality and Risk-Weighted Evidence",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "Gate set strength must be a function of risk and blast radius, not tradition.",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-14-RISK-WEIGHTED-EVIDENCE",
+              "acceptance_predicate": "gate_selection => required_gate_set == gate_table[risk_tier] && evidence_strength >= required_strength[risk_tier]",
+              "required_evidence": [
+                "risk_tier_assignment_receipt",
+                "gate_selection_receipt",
+                "required_gate_run_receipts"
+              ],
+              "machine_checks": [
+                "risk_tier_declared",
+                "missing_required_gate_blocks_promotion",
+                "escape_rate_feedback_updates_policy"
+              ],
+              "fail_closed": true
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-15": {
+            "name": "Measurement Integrity",
+            "status": "active",
+            "effective_date": "2026-01-27",
+            "statement": "Measurements and receipts MUST be tamper-evident; omission of required evidence is a defect.",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-15-MEASUREMENT-INTEGRITY",
+              "acceptance_predicate": "measurement_or_receipt => tamper_evident && required_fields_complete && provenance_valid",
+              "required_evidence": [
+                "signed_receipt_or_authority_seal",
+                "required_measurement_fields",
+                "provenance_digest"
+              ],
+              "machine_checks": [
+                "signature_or_seal_valid",
+                "required_evidence_non_empty",
+                "pipeline_compromise_triggers_fail_closed_for_high_risk"
+              ],
+              "fail_closed": true
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-16": {
+            "name": "Closure Under Composition & Boundary Contracts",
+            "status": "active",
+            "effective_date": "2026-02-05",
+            "statement": "Holons MUST be closed under composition: a holon-of-holons interacts with peers and supervisors using the same primitive boundary channels and message shapes as a leaf holon. Cross-boundary communication MUST be coarse-grained (commitments, receipts, summaries, selectors), and any zoom-in to raw evidence MUST occur by content hash under explicitly delegated capability. New ad-hoc cross-boundary primitives are forbidden without a versioned interface contract and an explicit governance decision.",
+            "kernel_alignment": {
+              "primary": "AXIOM-BOUNDARY",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-16-COMPOSITIONAL-CLOSURE",
+              "acceptance_predicate": "cross_boundary_exchange => canonical_channel_class_used && ad_hoc_primitive_absent && zoom_in_via_selector_under_capability",
+              "required_evidence": [
+                "boundary_contract_manifest",
+                "channel_class_validation_receipt",
+                "selector_based_zoom_in_receipt_when_used"
+              ],
+              "machine_checks": [
+                "only_approved_boundary_primitives_used",
+                "cross_boundary_raw_blob_transfer_blocked_unless_explicit_policy",
+                "challenge_path_available"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-BND-03",
+                "BP-CLS-06",
+                "BP-CLS-07"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-17": {
+            "name": "Verifier Independence",
+            "status": "active",
+            "effective_date": "2026-02-07",
+            "statement": "High-risk authoritative promotion requires verifier diversity: at least two non-correlated verifier families must agree, and no single evaluator family may be a sole terminal authority for Tier2+ decisions.",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-17-VERIFIER-INDEPENDENCE",
+              "acceptance_predicate": "risk_tier in {T2,T3} => distinct_verifier_families >= 2 && correlation_risk <= policy.max_correlation && no_single_family_override",
+              "required_evidence": [
+                "gate_run_receipts",
+                "verifier_family_manifest",
+                "correlation_assessment_receipt"
+              ],
+              "machine_checks": [
+                "distinct_family_count_check",
+                "dependency_overlap_check",
+                "disagreement_path_receipted"
+              ],
+              "fail_closed": true
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-18": {
+            "name": "Revocation Latency and Propagation",
+            "status": "active",
+            "effective_date": "2026-02-07",
+            "statement": "Revocation of authority (capabilities, keys, policy grants) must propagate with bounded latency across the declared trust surface; stale authority use after revocation SLO is a stop-the-line defect.",
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-18-REVOCATION-PROPAGATION",
+              "acceptance_predicate": "revocation_event => coverage_complete_within_slo && stale_authority_accept_rate == 0 for required tiers",
+              "required_evidence": [
+                "revocation_event_receipt",
+                "revocation_propagation_receipts",
+                "covered_cell_set_commitment",
+                "htf_or_hlc_time_anchor"
+              ],
+              "machine_checks": [
+                "coverage_set_complete_check",
+                "latency_within_tier_slo",
+                "post_revocation_actuation_denied"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-AUT-05"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-19": {
+            "name": "Uncertainty-Qualified Promotion",
+            "status": "active",
+            "effective_date": "2026-02-07",
+            "statement": "Authoritative promotion decisions must carry explicit uncertainty class, confidence provenance, and residual-risk annotation; binary pass/fail is invalid when uncertainty is irreducible above policy limits.",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-19-UNCERTAINTY-QUALIFIED",
+              "acceptance_predicate": "high_impact_promotion => uncertainty_annotation_present && confidence_provenance_valid && residual_uncertainty <= policy.max_residual_uncertainty[risk_tier]",
+              "required_evidence": [
+                "decision_receipt_with_uncertainty_fields",
+                "confidence_calibration_evidence",
+                "residual_risk_annotation"
+              ],
+              "machine_checks": [
+                "uncertainty_fields_non_empty",
+                "calibration_evidence_attached_when_probabilistic",
+                "threshold_compliance_or_escalation_receipt"
+              ],
+              "fail_closed": true,
+              "formal_grounding": [
+                "BP-CLS-04"
+              ]
+            },
+            "node_class": "NORMATIVE"
+          },
+          "LAW-20": {
+            "name": "Deterministic Re-verification Path",
+            "status": "active",
+            "effective_date": "2026-02-07",
+            "statement": "High-impact gate decisions must expose a machine re-verification path that is deterministic within a declared determinism envelope (exact replay for deterministic verifiers, bounded-divergence replay for stochastic verifiers per LAW-04), with reproducible evidence package, independent verifier-family rerun, and receipt-bound outcome publication. Stochastic verifiers MUST declare their determinism class and acceptable divergence bound; re-verification passes iff divergence <= declared bound.",
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "verifier": {
+              "predicate_id": "LAW-20-DETERMINISTIC-REVERIFICATION",
+              "acceptance_predicate": "high_impact_decision => reverification_path_available && replay_package_resolvable && reverification_receipt_published_within_slo",
+              "required_evidence": [
+                "reverification_contract_manifest",
+                "reverification_receipts",
+                "reverification_outcome_receipt",
+                "selector_resolvability_report"
+              ],
+              "machine_checks": [
+                "reverification_endpoint_or_protocol_registered",
+                "independent_rerun_family_check",
+                "response_and_resolution_slo_check"
+              ],
+              "fail_closed": true
+            },
+            "node_class": "NORMATIVE"
+          }
+        }
+      },
+      "principles_compact": {
+        "node_class": "EXPLANATORY",
+        "source_stable_id": "dcp://apm2.agents/principles/bundle@1",
+        "selected_ids": [
+          "PRIN-001",
+          "PRIN-005",
+          "PRIN-047",
+          "PRIN-049",
+          "PRIN-053",
+          "PRIN-090",
+          "PRIN-092",
+          "PRIN-094",
+          "PRIN-100",
+          "PRIN-101",
+          "PRIN-105",
+          "PRIN-106",
+          "PRIN-107",
+          "PRIN-108",
+          "PRIN-111",
+          "PRIN-112",
+          "PRIN-121",
+          "PRIN-122",
+          "PRIN-123",
+          "PRIN-124"
+        ],
+        "items": {
+          "PRIN-001": {
+            "name": "Landauer\u2019s Principle",
+            "title": "Erasure costs energy, so \u201cfree compute\u201d is fake",
+            "law_refs": [
+              "LAW-02",
+              "LAW-06"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "signal_statement": "Treat **token budgets**, **tool budgets**, and **artifact bytes** not as \"product limits\" but as **thermodynamic proxies**: every extra tool call and every extra token is irrecoverable physical work somewhere. APM2 encodes this via **Context Discipline**: strict budgets (`apm2_core::budget`) and compiled ContextPacks prevent wasteful discovery. The missing feedback loop is cost-of-context-discovery telemetry: agents should track marginal context acquisition cost and feed it back into budget policy as a loss function, closing the loop between expenditure and information gain.",
+            "connections": [],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-005": {
+            "name": "Communication\u2011avoiding Algorithms",
+            "title": "Minimize bytes moved per unit of progress",
+            "law_refs": [
+              "LAW-07"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "signal_statement": "APM2 enforces **Context Discipline** to minimize communication: do not discover what can be compiled. Use **CAS + hashes** to pass references, not values. Tool protocol passes prompt hashes and artifact hashes rather than raw bodies. Extend this to **authority**: minimize *capability movement*\u2014delegation should be rare, attenuated, and auditable.",
+            "connections": [
+              "PRIN-047",
+              "PRIN-053"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-047": {
+            "name": "Event Sourcing",
+            "title": "Model system as sequence of decisions, not hidden state mutation",
+            "law_refs": [
+              "LAW-03"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "signal_statement": "this is literally APM2\u2019s kernel: ledger events + deterministic reducers. Operationally: \u201cthe truth\u201d is the event stream + CAS. Everything else is a projection. Scale does not change this semantic split: one box and global federation both treat projections as disposable caches over authoritative facts.",
+            "connections": [
+              "PRIN-123"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-049": {
+            "name": "Consensus For Control, Convergence For Data",
+            "title": "Minimize global serialization",
+            "law_refs": [
+              "LAW-10",
+              "LAW-11"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "signal_statement": "Reserve BFT consensus for shared-authority control-plane facts (membership, policy roots). Treat data-plane replication as convergent (CRDTs/anti-entropy) per **TRUTH-AX-07**. Global consensus on every event is a liveness hazard and contradicts the Unified Theory (Consensus is Expensive).",
+            "connections": [
+              "PRIN-047"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-053": {
+            "name": "Backpressure",
+            "title": "The only honest overload strategy",
+            "law_refs": [
+              "LAW-12"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "signal_statement": "APM2 already implements backpressure in resource governance for pulse subscriptions and in budgets for sessions. Push it everywhere: tool execution pools, replication streams, CI import, gate evaluation. Also: treat \u201ccannot accept work\u201d as a normal outcome, not an error. This is scale invariant: local worker pools and inter-cell planes use the same admission semantics: budget-aware, deny-and-receipt on exhaustion, never silent drop.",
+            "connections": [
+              "PRIN-094"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-090": {
+            "name": "Typed Tool Schemas + Structured Outputs",
+            "title": "Validate and parse, don\u2019t \u201cinterpret\u201d prose",
+            "law_refs": [
+              "LAW-13"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-BOUNDARY",
+              "secondary": []
+            },
+            "signal_statement": "protobuf + validation is exactly right. The next step is ensuring every tool response is also structured and content-addressed, so downstream reasoning is about hashes and receipts, not uncontrolled text.",
+            "connections": [
+              "PRIN-092"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-092": {
+            "name": "Evidence-carrying Actions",
+            "title": "Every merge/deploy requires machine-checkable receipts",
+            "law_refs": [
+              "LAW-15"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "signal_statement": "AAT bundles, merge receipts, CI integrity receipts\u2014these are not \u201cdocs,\u201d they are the core security boundary. Anything not bound to evidence is not real. This predicate is unchanged by scale: local PR merges and federated promotions both require the same receipt/evidence/digest validity, with only proof economics and batching changing.",
+            "connections": [
+              "PRIN-047",
+              "PRIN-121"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-094": {
+            "name": "Risk Classes + Autonomy Levels",
+            "title": "Gate authority by evidence and risk",
+            "law_refs": [
+              "LAW-14"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "signal_statement": "APM2 already encodes risk tiers in factory logic; make it universal with explicit four-tier Unified Theory semantics (T0..T3) and lossless mapping to daemon tiers (Tier0..Tier4): suggest \u2192 patch \u2192 merge \u2192 deploy are different effect classes requiring escalating receipts and isolation. The same risk vocabulary applies on one host and at federated scale; only evidence economics and verification batch sizes change, not the contract shape or gate semantics.",
+            "connections": [
+              "PRIN-090",
+              "PRIN-092"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-100": {
+            "name": "Ashby\u2019s Law Of Requisite Variety",
+            "title": "Only variety can destroy variety",
+            "law_refs": [
+              "LAW-05"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "signal_statement": "Holons must match the variety of their environment (inputs) with sufficient internal state or control options. However, **HB-05** inverts this: we constrain the *interface* variety via schemas so the internal controller doesn\u2019t need infinite variety. **Context Discipline** acts as a variety filter, reducing the state space the agent must handle.",
+            "connections": [],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-101": {
+            "name": "Goodhart\u2019s Law",
+            "title": "When a measure becomes a target, it ceases to be a good measure",
+            "law_refs": [
+              "LAW-08"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "signal_statement": "If you grade agents solely on \"tickets closed\", they will close invalid tickets. **MECH-MONITOR-ISOLATION** and **MECH-EVALUATOR-AUDIT** exist to prevent this. Metrics used for reward/training must be structurally separated from metrics used for oversight/audit (Law 8).",
+            "connections": [],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-105": {
+            "name": "Deterministic Re-verification and Reversal",
+            "title": "Correctness requires auditable re-check and bounded reversal paths",
+            "law_refs": [
+              "LAW-01",
+              "LAW-07",
+              "LAW-12",
+              "LAW-14",
+              "LAW-16",
+              "LAW-20"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": [
+                "AXIOM-SUBSTRATE",
+                "AXIOM-AUTHORITY",
+                "AXIOM-BOUNDARY"
+              ]
+            },
+            "signal_statement": "Theory thread: closed-loop governance is incomplete without re-verification loops. A knowledge system is stronger when disagreement is resolved by independent machine reruns that can repair upstream assumptions.",
+            "connections": [],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-106": {
+            "name": "Epistemic Hygiene and Uncertainty Calibration",
+            "title": "Belief quality depends on calibration, provenance, and contradiction handling",
+            "law_refs": [
+              "LAW-07",
+              "LAW-08",
+              "LAW-15"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": [
+                "AXIOM-CLOSURE"
+              ]
+            },
+            "signal_statement": "Theory thread: reasoning quality is a control problem over beliefs, not outputs. A robust theory stack preserves uncertainty metadata and differentiates unknown, conflicting, and falsified states.",
+            "connections": [
+              "PRIN-101"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-107": {
+            "name": "Ontology Governance and Semantic Drift",
+            "title": "Shared meaning requires explicit concept evolution rules",
+            "law_refs": [
+              "LAW-03",
+              "LAW-13",
+              "LAW-16"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": [
+                "AXIOM-BOUNDARY"
+              ]
+            },
+            "signal_statement": "Theory thread: semantics must be governed as infrastructure. Concept drift, alias sprawl, and implicit renaming are epistemic failure modes that degrade model signal-to-noise over time. This is scale invariant: semantic drift destroys correctness in a single repository and in a 100B-agent federation alike.",
+            "connections": [
+              "PRIN-111"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-108": {
+            "name": "Epochal Schema Evolution",
+            "title": "Forward evolution with explicit discontinuities",
+            "law_refs": [
+              "LAW-09",
+              "LAW-13",
+              "LAW-16"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": [
+                "AXIOM-BOUNDARY"
+              ]
+            },
+            "signal_statement": "Theory thread: evolution speed comes from explicit epoch cuts, typed migration receipts, and clear validity windows. Backward compatibility can be offered selectively, but the default is forward movement with auditable transition semantics.",
+            "connections": [
+              "PRIN-112"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-111": {
+            "name": "Civilizational Agent Ecology",
+            "title": "Design with one invariant architecture from small cells to 100B-agent holarchies",
+            "law_refs": [
+              "LAW-10",
+              "LAW-14",
+              "LAW-16"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": [
+                "AXIOM-CLOSURE",
+                "AXIOM-BOUNDARY"
+              ]
+            },
+            "signal_statement": "Theory thread: treat single-host 10-20 agent deployments as small cells of the same holonic system. Do not fork semantics by scale; vary placement, capacity, and verifier economics while keeping authority, evidence, and composition primitives identical.",
+            "connections": [
+              "PRIN-047",
+              "PRIN-053",
+              "PRIN-092",
+              "PRIN-049",
+              "PRIN-100",
+              "PRIN-121",
+              "PRIN-124"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-112": {
+            "name": "Forward-Only Evolution",
+            "title": "Prefer explicit epoch cuts over perpetual compatibility drag",
+            "law_refs": [
+              "LAW-09",
+              "LAW-13",
+              "LAW-16"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": [
+                "AXIOM-BOUNDARY"
+              ]
+            },
+            "signal_statement": "Theory thread: deliberate discontinuity can raise signal-to-noise when transition boundaries are explicit, signed, and testable. The objective is not compatibility theater; it is semantic clarity across time.",
+            "connections": [
+              "PRIN-108"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-121": {
+            "name": "Verifier Diversity and Independence",
+            "title": "High-stakes confidence requires non-correlated verifiers",
+            "law_refs": [
+              "LAW-08",
+              "LAW-14",
+              "LAW-17"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "signal_statement": "APM2 gates should not collapse into single-evaluator authority. Tier2+ decisions require explicit verifier-family metadata, independence checks, and disagreement escalation to reduce common-mode failure. This is cross-scale: local deployments can realize independence via separate rerun stacks/toolchains, while federated deployments add cell-level family diversity and cross-cell disagreement routing.",
+            "connections": [
+              "PRIN-092",
+              "PRIN-101",
+              "PRIN-106",
+              "PRIN-124"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-122": {
+            "name": "Drift Taxonomy and Detection",
+            "title": "Separate covariate, prior, concept, and evaluator drift",
+            "law_refs": [
+              "LAW-09",
+              "LAW-15",
+              "LAW-19"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": [
+                "AXIOM-CLOSURE"
+              ]
+            },
+            "signal_statement": "APM2 freshness and stability controls should label drift class explicitly in receipts and defects. Incorrect drift attribution causes unstable policy updates and wasted remediation effort.",
+            "connections": [
+              "PRIN-106"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-123": {
+            "name": "Summary Rate-Distortion Contracts",
+            "title": "Compression is valid only with explicit loss bounds",
+            "law_refs": [
+              "LAW-07",
+              "LAW-12",
+              "LAW-14"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": [
+                "AXIOM-AUTHORITY",
+                "AXIOM-CLOSURE"
+              ]
+            },
+            "signal_statement": "Summaries should be treated as budgeted information products. For Tier2+, summary-only decisions are valid only when distortion bounds and selector coverage satisfy the governing gate policy.",
+            "connections": [
+              "PRIN-005"
+            ],
+            "node_class": "EXPLANATORY"
+          },
+          "PRIN-124": {
+            "name": "Revocation-Wins Delegated Authority",
+            "title": "Delegation must converge toward least authority under partitions",
+            "law_refs": [
+              "LAW-05",
+              "LAW-10",
+              "LAW-18"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": [
+                "AXIOM-SUBSTRATE"
+              ]
+            },
+            "signal_statement": "Capability delegation across holonic boundaries should use revocation-wins semantics, explicit propagation receipts, and tiered revocation SLOs so containment survives partitions and lagging replicas. Same principle at every scale: branch/work leases on one host and cross-cell capability grants both fail closed on stale authority.",
+            "connections": [
+              "PRIN-049",
+              "PRIN-094"
+            ],
+            "node_class": "EXPLANATORY"
+          }
+        }
+      },
+      "defects_compact": {
+        "node_class": "NORMATIVE",
+        "taxonomy": {
+          "defect_domain": [
+            "CONTEXT",
+            "ENGINEERING",
+            "SPECIFICATION_GAP",
+            "VERIFICATION",
+            "SECURITY_CAPABILITY",
+            "PRODUCT_VALUE",
+            "OPERATIONS",
+            "ECONOMICS"
+          ],
+          "stage_detected": [
+            "INTENT",
+            "REFINEMENT",
+            "PLANNING",
+            "IMPLEMENTATION",
+            "REVIEW",
+            "CI",
+            "UAT",
+            "RELEASE",
+            "RUNTIME",
+            "INCIDENT",
+            "GOVERNANCE"
+          ],
+          "surface": [
+            "CLI",
+            "DAEMON_API",
+            "LEDGER",
+            "EVIDENCE",
+            "PRIMITIVE",
+            "TEMPLATE",
+            "DOCS",
+            "POLICY",
+            "CAPABILITY",
+            "SKILL",
+            "INFRA",
+            "OBSERVABILITY",
+            "RELEASE_CHANNEL",
+            "ECONOMICS",
+            "ORACLE"
+          ],
+          "severity": [
+            "S0_STOP_THE_LINE",
+            "S1_CRITICAL",
+            "S2_MAJOR",
+            "S3_MINOR",
+            "S4_INFO"
+          ],
+          "reproducibility": [
+            "DETERMINISTIC",
+            "PROBABILISTIC",
+            "FLAKY",
+            "UNKNOWN"
+          ],
+          "disposition": [
+            "OPEN",
+            "ACKNOWLEDGED",
+            "FIX_IN_PROGRESS",
+            "FIXED",
+            "WONT_FIX",
+            "DUPLICATE",
+            "NEEDS_INFO"
+          ],
+          "confidence": [
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+          ],
+          "inefficiency_class": [
+            "EXTRA_TOOL_CALLS",
+            "CONTEXT_OVERBUDGET",
+            "REDUNDANT_COMPUTE",
+            "REDUNDANT_COMMUNICATION",
+            "UNNECESSARY_REVIEW_CYCLES",
+            "UNNECESSARY_ROLLOUT_RISK",
+            "AMBIGUOUS_OUTPUT",
+            "WEAK_VERIFIER_SIGNAL",
+            "CAPABILITY_OVERGRANT",
+            "CAPABILITY_UNDERGRANT",
+            "UNBOUNDED_SEARCH",
+            "SCHEMA_DRIFT",
+            "INTERFACE_PROLIFERATION"
+          ],
+          "violation_code": [
+            "SILENT_MEMORY_MUTATION",
+            "MONITOR_GAMING",
+            "CONTEXT_BLEED",
+            "UNBOUNDED_SEARCH",
+            "EVALUATOR_DRIFT",
+            "REASONING_DEGENERATION",
+            "POLICY_VIOLATION",
+            "MEASUREMENT_INTEGRITY",
+            "SCHEMA_VIOLATION",
+            "INTERFACE_PROLIFERATION",
+            "ABSTRACTION_BREAK",
+            "PROOF_ARTIFACT_MISMATCH",
+            "MODEL_REALITY_DRIFT",
+            "TCB_UNBOUNDED",
+            "NON_REPLAYABLE_PROOF"
+          ],
+          "action_type": [
+            "UPDATE_DOCS",
+            "UPDATE_TEMPLATES",
+            "UPDATE_CLI_CONTRACT",
+            "UPDATE_POLICY",
+            "UPDATE_CAPABILITIES",
+            "ADD_GATE",
+            "FIX_GATE",
+            "ADD_TEST",
+            "FIX_IMPLEMENTATION",
+            "CREATE_OR_EXTEND_PRIMITIVE",
+            "REFACTOR_SCOPE",
+            "REVISE_REFINEMENT",
+            "REVISE_INTENT",
+            "IMPROVE_OBSERVABILITY",
+            "IMPROVE_RELEASE_PROCESS",
+            "OPTIMIZE_ECONOMICS"
+          ]
+        },
+        "record_schema": {
+          "schema_id": "apm2.defects.record.schema.v1",
+          "description": "DefectRecord is an evidence-backed counterexample linked to intent/contracts and pipeline artifacts. Primary uses: dedupe, clustering, automated remediation, governance.\n",
+          "required": [
+            "schema_version",
+            "id",
+            "created_at",
+            "defect_domain",
+            "stage_detected",
+            "surface",
+            "severity",
+            "title",
+            "statement",
+            "actor",
+            "environment",
+            "links",
+            "evidence",
+            "fingerprint"
+          ],
+          "properties": {
+            "schema_version": {
+              "type": "string",
+              "const": "apm2.defects.record.v1"
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^DFT-[0-9]{6}$"
+            },
+            "created_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "defect_domain": {
+              "$ref": "apm2.defects.taxonomy.v1#/enums/defect_domain"
+            },
+            "violation_code": {
+              "$ref": "apm2.defects.taxonomy.v1#/enums/violation_code",
+              "description": "Specific Law/Mechanism violation code if applicable."
+            },
+            "stage_detected": {
+              "$ref": "apm2.defects.taxonomy.v1#/enums/stage_detected"
+            },
+            "surface": {
+              "$ref": "apm2.defects.taxonomy.v1#/enums/surface"
+            },
+            "severity": {
+              "$ref": "apm2.defects.taxonomy.v1#/enums/severity"
+            },
+            "reproducibility": {
+              "$ref": "apm2.defects.taxonomy.v1#/enums/reproducibility",
+              "default": "UNKNOWN"
+            },
+            "disposition": {
+              "$ref": "apm2.defects.taxonomy.v1#/enums/disposition",
+              "default": "OPEN"
+            },
+            "inefficiency": {
+              "description": "Optional inefficiency annotations; defects MAY be classified as pure inefficiency.",
+              "properties": {
+                "inefficiency_class": {
+                  "$ref": "apm2.defects.taxonomy.v1#/enums/inefficiency_class"
+                },
+                "delta_cost": {
+                  "type": "object",
+                  "properties": {
+                    "tokens": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "tool_calls": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "wall_ms": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "cpu_ms": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "bytes_io": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "risk_score": {
+                      "type": "number",
+                      "minimum": 0.0
+                    }
+                  }
+                }
+              }
+            },
+            "title": {
+              "type": "string",
+              "max_length": 140
+            },
+            "statement": {
+              "description": "Counterexample form: expected predicate/contract vs observed behavior; include minimal context needed for interpretation; avoid narrative.\n",
+              "type": "string",
+              "max_length": 2000
+            },
+            "actor": {
+              "required": [
+                "holon_id",
+                "role"
+              ],
+              "properties": {
+                "holon_id": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "lease_ref": {
+                  "type": "string"
+                },
+                "budget_ref": {
+                  "type": "string"
+                },
+                "capability_set_ref": {
+                  "type": "string"
+                }
+              }
+            },
+            "environment": {
+              "required": [
+                "system_version",
+                "git_rev",
+                "platform"
+              ],
+              "properties": {
+                "system_version": {
+                  "type": "string"
+                },
+                "git_rev": {
+                  "type": "string"
+                },
+                "platform": {
+                  "type": "string"
+                },
+                "config_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "links": {
+              "required": [
+                "intent_refs"
+              ],
+              "properties": {
+                "intent_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "contract_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "rfc_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "ticket_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "pr_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "release_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "gate_run_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "oracle_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "evidence": {
+              "required": [
+                "evidence_refs"
+              ],
+              "properties": {
+                "evidence_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "repro": {
+                  "type": "array",
+                  "items": {
+                    "required": [
+                      "cmd"
+                    ],
+                    "properties": {
+                      "cmd": {
+                        "type": "string"
+                      },
+                      "cwd": {
+                        "type": "string"
+                      },
+                      "env": {
+                        "type": "object"
+                      },
+                      "expected": {
+                        "type": "string"
+                      },
+                      "observed": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "analysis": {
+              "description": "Optional; added by classifier agents post-intake.",
+              "properties": {
+                "hypotheses": {
+                  "type": "array",
+                  "items": {
+                    "required": [
+                      "type",
+                      "confidence"
+                    ],
+                    "properties": {
+                      "type": {
+                        "type": "string"
+                      },
+                      "confidence": {
+                        "$ref": "apm2.defects.taxonomy.v1#/enums/confidence"
+                      },
+                      "supporting_evidence_refs": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                "recommended_actions": {
+                  "type": "array",
+                  "items": {
+                    "required": [
+                      "action_type"
+                    ],
+                    "properties": {
+                      "action_type": {
+                        "$ref": "apm2.defects.taxonomy.v1#/enums/action_type"
+                      },
+                      "target_ref": {
+                        "type": "string"
+                      },
+                      "notes": {
+                        "type": "string",
+                        "max_length": 600
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "fingerprint": {
+              "description": "Deterministic hash over normalized fields for dedupe/clustering. Minimum inputs: defect_domain + surface + normalized title + key links + repro[0].cmd.\n",
+              "type": "string"
+            }
+          }
+        },
+        "minimal_invariants": {
+          "id": "DEFECT-INV-9.1",
+          "source_section": "textbook.9.1",
+          "items": [
+            "Evidence integrity: content addressing, retention, replay.",
+            "Fail-closed gates: no merge/promotion without required receipts.",
+            "Capability least privilege and SoD enforcement.",
+            "ContextPack enforcement and budget adherence.",
+            "Deterministic structured outputs for automation surfaces.",
+            "Regression prevention for every fix."
+          ],
+          "node_class": "NORMATIVE"
+        },
+        "core_theory_statements": {
+          "defect_as_counterexample": "A defect is an evidence-backed counterexample that falsifies an intent predicate or a contract under a verifier. A defect is not limited to functional incorrectness; any avoidable work, avoidable risk, avoidable ambiguity, or avoidable non-determinism is a defect. A defect record MUST be replayable in principle; if full replay is impossible, the defect record MUST declare a residual-evidence specification documenting the gap, the circumstances that prevent replay, and sufficient context for an independent agent to reproduce or bound the failure.",
+          "intent_contract_verifier_evidence": "Intent is a predicate over system state and/or traces. Contracts are normative interface constraints (CLI output, daemon API semantics, schema shape, policy rules). Verifiers are procedures that produce Pass or Fail(counterexample). Evidence is the replayable artifact set bound to a verifier outcome. An autonomous SDLC is a refinement compiler that maps intent predicates through contracts and verifiers into evidence-backed authoritative transitions; each refinement step narrows the solution space and must itself be receipted.",
+          "closure_criteria": "A defect is closed only when: - a verifier exists that fails on the original counterexample, - the verifier passes on the fixed state, - evidence receipts are captured and referenced, - the relevant contract/intent references are updated when applicable. \u201cWorks on my machine\u201d is a defect. Closure is evidence-backed.",
+          "node_class": "EXPLANATORY"
+        },
+        "trace_matrix": {
+          "version": "1.0.0",
+          "node_class": "NORMATIVE",
+          "usage_notes": [
+            "Trace matrix guides triage, clustering, and countermeasure selection.",
+            "Mappings are defaults and may be extended per-incident with evidence-backed machine re-verification."
+          ],
+          "defect_domain_to_theory": {
+            "CONTEXT": {
+              "laws": [
+                "LAW-02",
+                "LAW-06",
+                "LAW-07",
+                "LAW-12"
+              ],
+              "principles": [
+                "PRIN-123"
+              ]
+            },
+            "ENGINEERING": {
+              "laws": [
+                "LAW-01",
+                "LAW-03",
+                "LAW-11",
+                "LAW-13",
+                "LAW-16"
+              ],
+              "principles": [
+                "PRIN-047",
+                "PRIN-090"
+              ]
+            },
+            "SPECIFICATION_GAP": {
+              "laws": [
+                "LAW-01",
+                "LAW-13",
+                "LAW-19",
+                "LAW-20"
+              ],
+              "principles": [
+                "PRIN-105",
+                "PRIN-107",
+                "PRIN-108",
+                "PRIN-122"
+              ]
+            },
+            "VERIFICATION": {
+              "laws": [
+                "LAW-01",
+                "LAW-04",
+                "LAW-08",
+                "LAW-15",
+                "LAW-17"
+              ],
+              "principles": [
+                "PRIN-092",
+                "PRIN-101",
+                "PRIN-121"
+              ]
+            },
+            "SECURITY_CAPABILITY": {
+              "laws": [
+                "LAW-05",
+                "LAW-11",
+                "LAW-15",
+                "LAW-18"
+              ],
+              "principles": [
+                "PRIN-124"
+              ]
+            },
+            "PRODUCT_VALUE": {
+              "laws": [
+                "LAW-07",
+                "LAW-14",
+                "LAW-19",
+                "LAW-20"
+              ],
+              "principles": [
+                "PRIN-101",
+                "PRIN-105",
+                "PRIN-106"
+              ]
+            },
+            "OPERATIONS": {
+              "laws": [
+                "LAW-09",
+                "LAW-10",
+                "LAW-12",
+                "LAW-18"
+              ],
+              "principles": [
+                "PRIN-053"
+              ]
+            },
+            "ECONOMICS": {
+              "laws": [
+                "LAW-06",
+                "LAW-08",
+                "LAW-14"
+              ],
+              "principles": [
+                "PRIN-001",
+                "PRIN-123"
+              ]
+            }
+          },
+          "violation_code_to_theory": {
+            "SILENT_MEMORY_MUTATION": {
+              "laws": [
+                "LAW-03",
+                "LAW-15"
+              ],
+              "principles": [
+                "PRIN-047"
+              ]
+            },
+            "MONITOR_GAMING": {
+              "laws": [
+                "LAW-08",
+                "LAW-15",
+                "LAW-17"
+              ],
+              "principles": [
+                "PRIN-101",
+                "PRIN-121"
+              ]
+            },
+            "CONTEXT_BLEED": {
+              "laws": [
+                "LAW-02",
+                "LAW-05",
+                "LAW-16"
+              ],
+              "principles": [
+                "PRIN-090"
+              ]
+            },
+            "UNBOUNDED_SEARCH": {
+              "laws": [
+                "LAW-12",
+                "LAW-14"
+              ],
+              "principles": []
+            },
+            "EVALUATOR_DRIFT": {
+              "laws": [
+                "LAW-04",
+                "LAW-15",
+                "LAW-19"
+              ],
+              "principles": [
+                "PRIN-106",
+                "PRIN-122"
+              ]
+            },
+            "REASONING_DEGENERATION": {
+              "laws": [
+                "LAW-12",
+                "LAW-19"
+              ],
+              "principles": [
+                "PRIN-106"
+              ]
+            },
+            "POLICY_VIOLATION": {
+              "laws": [
+                "LAW-05",
+                "LAW-14",
+                "LAW-18",
+                "LAW-20"
+              ],
+              "principles": [
+                "PRIN-094",
+                "PRIN-124"
+              ]
+            },
+            "MEASUREMENT_INTEGRITY": {
+              "laws": [
+                "LAW-07",
+                "LAW-15",
+                "LAW-19"
+              ],
+              "principles": [
+                "PRIN-092",
+                "PRIN-106"
+              ]
+            },
+            "SCHEMA_VIOLATION": {
+              "laws": [
+                "LAW-13",
+                "LAW-16"
+              ],
+              "principles": [
+                "PRIN-090",
+                "PRIN-107",
+                "PRIN-108"
+              ]
+            },
+            "INTERFACE_PROLIFERATION": {
+              "laws": [
+                "LAW-06",
+                "LAW-16"
+              ],
+              "principles": [
+                "PRIN-123"
+              ]
+            },
+            "ABSTRACTION_BREAK": {
+              "laws": [
+                "LAW-01",
+                "LAW-06",
+                "LAW-16"
+              ],
+              "principles": [
+                "PRIN-107"
+              ]
+            },
+            "PROOF_ARTIFACT_MISMATCH": {
+              "laws": [
+                "LAW-01",
+                "LAW-15",
+                "LAW-20"
+              ],
+              "principles": [
+                "PRIN-092",
+                "PRIN-105"
+              ]
+            },
+            "MODEL_REALITY_DRIFT": {
+              "laws": [
+                "LAW-04",
+                "LAW-09",
+                "LAW-19"
+              ],
+              "principles": [
+                "PRIN-106",
+                "PRIN-122"
+              ]
+            },
+            "TCB_UNBOUNDED": {
+              "laws": [
+                "LAW-05",
+                "LAW-13",
+                "LAW-15"
+              ],
+              "principles": [
+                "PRIN-090"
+              ]
+            },
+            "NON_REPLAYABLE_PROOF": {
+              "laws": [
+                "LAW-01",
+                "LAW-07",
+                "LAW-15",
+                "LAW-20"
+              ],
+              "principles": [
+                "PRIN-092",
+                "PRIN-105"
+              ]
+            }
+          }
+        }
+      },
+      "architecture_compact": {
+        "node_class": "EXPLANATORY",
+        "axioms": {
+          "AX-01": {
+            "name": "Stochastic Transducer",
+            "statement": "LLMs are conditional distributions p(y|x), not proof systems. Correctness requires external verification.",
+            "law_refs": [
+              "LAW-04"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-02": {
+            "name": "Bounded Context Channel",
+            "statement": "Context window W is a hard bandwidth limit; state must be compressed (s) such that |s| <= W via Context Discipline.",
+            "law_refs": [
+              "LAW-02",
+              "LAW-06"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-05": {
+            "name": "Contract-Cognition Interface",
+            "statement": "Contracts (predicates P(x)) provide stability for unstable stochastic cognition.",
+            "law_refs": [
+              "LAW-13"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-BOUNDARY",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-06": {
+            "name": "Claims-Evidence Disjunction",
+            "statement": "Claims are untrusted until bound to reproducible cryptographic evidence.",
+            "law_refs": [
+              "LAW-07",
+              "LAW-15"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": [
+                "AXIOM-CLOSURE"
+              ]
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-07": {
+            "name": "Monotonic Growth",
+            "statement": "Prefer monotone, commutative updates over destructive edits to reduce coordination complexity.",
+            "law_refs": [
+              "LAW-03",
+              "LAW-10"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-10": {
+            "name": "Selective Permeability",
+            "statement": "Information and authority flow must be constrained via capabilities (OCAP) and Variety Control.",
+            "law_refs": [
+              "LAW-05"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-14": {
+            "name": "Safe Impossibility",
+            "statement": "Prefer denial-by-construction (capabilities) over post-hoc detection.",
+            "law_refs": [
+              "LAW-05",
+              "LAW-15"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": [
+                "AXIOM-CLOSURE"
+              ]
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-15": {
+            "name": "Ambient Authority Elimination",
+            "statement": "Any implicit privilege is a vulnerability; all authority must be externalized into unforgeable objects.",
+            "law_refs": [
+              "LAW-05"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-21": {
+            "name": "Scale-Invariant Interface Composition",
+            "statement": "A holarchic system scales only if it is closed under composition: a holon-of-holons must be addressable and governable through the same boundary primitives as a single holon.",
+            "law_refs": [
+              "LAW-16",
+              "LAW-07",
+              "LAW-05"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-BOUNDARY",
+              "secondary": [
+                "AXIOM-SUBSTRATE",
+                "AXIOM-AUTHORITY"
+              ]
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-25": {
+            "name": "Deterministic Re-verification",
+            "statement": "Correctness in high-impact systems requires deterministic re-verification and bounded-reversal channels with evidence-addressable dispute paths.",
+            "law_refs": [
+              "LAW-01",
+              "LAW-07",
+              "LAW-16"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": [
+                "AXIOM-SUBSTRATE",
+                "AXIOM-BOUNDARY"
+              ]
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "AX-27": {
+            "name": "Externality Closure",
+            "statement": "Optimization quality depends on accounting for externalized energy, storage, operator, and social costs.",
+            "law_refs": [
+              "LAW-06",
+              "LAW-14",
+              "LAW-15"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          }
+        },
+        "models": {
+          "MOD-EVENT": {
+            "name": "Event Sourcing",
+            "statement": "State is a projection (reduction) of an append-only sequence or partial order of events.",
+            "law_refs": [
+              "LAW-03"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "MOD-EVIDENCE": {
+            "name": "Cryptographic Commitment",
+            "statement": "Evidence is bound to claims via cryptographic commitment: content-addressed hashing, digital signatures, and tamper-evident chaining ensure that evidence integrity is independently verifiable.",
+            "law_refs": [
+              "LAW-15"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "MOD-COMPAT": {
+            "name": "Schema Evolution",
+            "statement": "Schema changes are transformations in a type system; compatibility is a constraint on reader/writer interaction.",
+            "law_refs": [
+              "LAW-13"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-BOUNDARY",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "MOD-CAP": {
+            "name": "Object Capability (OCAP)",
+            "statement": "Authority = Possession of unforgeable object reference.",
+            "law_refs": [
+              "LAW-05"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "MOD-CONV": {
+            "name": "Convergent Replication",
+            "statement": "Consistency via monotone updates and merge operators (CRDT). Distinguish Control (BFT) vs Data (Convergence).",
+            "law_refs": [
+              "LAW-10"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "MOD-SUMMARY": {
+            "name": "Multi-Scale Artifacts",
+            "statement": "Summaries are lossy compressions of evidence with explicit selector coverage, loss profiles, and zoom-in paths to source artifacts via content-addressed references.",
+            "law_refs": [
+              "LAW-07"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          }
+        },
+        "strategies": {
+          "STRAT-VERIFY": {
+            "name": "External Anchoring",
+            "rule": "Verify stochastic LLM outputs via deterministic tools (tests, linters, schemas).",
+            "law_refs": [
+              "LAW-04"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "STRAT-VERIFIABLE-REFS": {
+            "name": "Verifiable References",
+            "rule": "Inject content-hashes and stable IDs into context; expand details only on demand.",
+            "law_refs": [
+              "LAW-07"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "STRAT-CANONICAL": {
+            "name": "Canonical Encoding",
+            "rule": "Use JCS/Canonical formats to ensure stable content addressing and avoid spurious diffs.",
+            "law_refs": [
+              "LAW-13"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-BOUNDARY",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "STRAT-CONTRACT-FIRST": {
+            "name": "Contract-First Design",
+            "rule": "Prioritize structural contracts to reduce ambiguity in the finite context channel.",
+            "law_refs": [
+              "LAW-13"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-BOUNDARY",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "STRAT-OCAP-FIRST": {
+            "name": "Capability Default",
+            "rule": "Default to safe impossibility by withholding capabilities from agents unless explicitly required.",
+            "law_refs": [
+              "LAW-05",
+              "LAW-14"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": [
+                "AXIOM-CLOSURE"
+              ]
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "STRAT-LEAST-AUTHORITY": {
+            "name": "Confinement",
+            "rule": "Minimize privilege surface using OCAP to limit impact of harmful agent actions.",
+            "law_refs": [
+              "LAW-05"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-AUTHORITY",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "STRAT-GATED-AUTONOMY": {
+            "name": "Bounded Failure",
+            "rule": "Define task success as either Predicate(result) == True OR Bound(FailureEvidence).",
+            "law_refs": [
+              "LAW-01",
+              "LAW-12"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": [
+                "AXIOM-AUTHORITY"
+              ]
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "STRAT-IDEMPOTENCY": {
+            "name": "Reliable Execution",
+            "rule": "Ensure all agent-facing primitives are idempotent to survive distributed reordering.",
+            "law_refs": [
+              "LAW-11"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-SUBSTRATE",
+              "secondary": []
+            },
+            "node_class": "EXPLANATORY"
+          },
+          "STRAT-CROSS-SCALE-INVARIANCE": {
+            "name": "Cross-Scale Invariance",
+            "rule": "Keep authority, evidence, and composition primitives identical across scales; tune only budgets, topology, and verifier economics.",
+            "law_refs": [
+              "LAW-01",
+              "LAW-05",
+              "LAW-10",
+              "LAW-16"
+            ],
+            "kernel_alignment": {
+              "primary": "AXIOM-CLOSURE",
+              "secondary": [
+                "AXIOM-AUTHORITY",
+                "AXIOM-SUBSTRATE",
+                "AXIOM-BOUNDARY"
+              ]
+            },
+            "node_class": "EXPLANATORY"
+          }
+        },
+        "exclusions": {
+          "dropped_sections": [
+            "doctrines",
+            "protocols",
+            "prescriptions"
+          ],
+          "reason": "Excluded to keep theory kernel-first and remove orchestration/runtime implementation detail.",
+          "node_class": "EXPLANATORY"
+        }
+      },
+      "terminology_compact": {
+        "node_class": "NORMATIVE",
+        "intent": "Canonical terminology kernel replacing legacy glossary skill references.",
+        "terms": {
+          "holon": {
+            "definition": "Autonomous boundary-bearing actor: state + authority + interfaces under explicit contracts.",
+            "kernel_alignment": "AXIOM-BOUNDARY",
+            "law_refs": [
+              "LAW-05",
+              "LAW-16"
+            ]
+          },
+          "boundary_channel": {
+            "definition": "Typed, canonicalized ingress/egress surface where all cross-holon interaction must occur; enforcement point for dual-axis containment.",
+            "kernel_alignment": "AXIOM-BOUNDARY",
+            "law_refs": [
+              "LAW-05",
+              "LAW-13",
+              "LAW-16"
+            ]
+          },
+          "channel_class": {
+            "definition": "Declared boundary communication class constraining admissible payload shape, semantics, and replay behavior.",
+            "kernel_alignment": "AXIOM-BOUNDARY",
+            "law_refs": [
+              "LAW-13",
+              "LAW-16"
+            ]
+          },
+          "context_pack": {
+            "definition": "Versioned, budgeted working set for a task; scoped context only, no ambient read authority.",
+            "kernel_alignment": "AXIOM-AUTHORITY",
+            "law_refs": [
+              "LAW-02",
+              "LAW-12"
+            ]
+          },
+          "context_pack_manifest": {
+            "definition": "Receipted manifest declaring the bounded, content-addressed artifact allowlist for a ContextPack.",
+            "kernel_alignment": "AXIOM-AUTHORITY",
+            "law_refs": [
+              "LAW-02",
+              "LAW-05",
+              "LAW-15"
+            ]
+          },
+          "lease": {
+            "definition": "Time-bounded authority grant with explicit termination and renewal semantics.",
+            "kernel_alignment": "AXIOM-AUTHORITY",
+            "law_refs": [
+              "LAW-12",
+              "LAW-18"
+            ]
+          },
+          "budget": {
+            "definition": "Quantified bound on search/work expenditure enforced by policy; exhaustion triggers stop, decompose, or escalate.",
+            "kernel_alignment": "AXIOM-AUTHORITY",
+            "law_refs": [
+              "LAW-06",
+              "LAW-12"
+            ]
+          },
+          "typed_budget_vector": {
+            "definition": "Machine-checkable realization of `budget`; unitful tuple (tokens, tool_calls, wall_ms, ...) enforcing bounded search and stop semantics.",
+            "kernel_alignment": "AXIOM-AUTHORITY",
+            "law_refs": [
+              "LAW-12",
+              "LAW-13"
+            ]
+          },
+          "ocap": {
+            "definition": "Unforgeable capability token representing attenuated authority; no ambient privilege.",
+            "kernel_alignment": "AXIOM-AUTHORITY",
+            "law_refs": [
+              "LAW-05",
+              "LAW-18"
+            ]
+          },
+          "identity_proof": {
+            "definition": "Auditable identity evidence binding actor lineage and signing authority to accountability records.",
+            "kernel_alignment": "AXIOM-AUTHORITY",
+            "law_refs": [
+              "LAW-05",
+              "LAW-15"
+            ]
+          },
+          "ledger": {
+            "definition": "Append-only fact substrate with explicit merge semantics; authoritative history is monotone.",
+            "kernel_alignment": "AXIOM-SUBSTRATE",
+            "law_refs": [
+              "LAW-03",
+              "LAW-10"
+            ]
+          },
+          "event_record": {
+            "definition": "Atomic append-only ledger fact entry carrying payload commitment, ordering anchor, and integrity linkage.",
+            "kernel_alignment": "AXIOM-SUBSTRATE",
+            "law_refs": [
+              "LAW-03",
+              "LAW-15"
+            ]
+          },
+          "anti_entropy_protocol": {
+            "definition": "Declared reconciliation procedure for forked distributed views using merge semantics and receipted convergence cycles.",
+            "kernel_alignment": "AXIOM-SUBSTRATE",
+            "law_refs": [
+              "LAW-03",
+              "LAW-10"
+            ]
+          },
+          "receipt": {
+            "definition": "Tamper-evident evidence record proving a check, actuation, or decision outcome.",
+            "kernel_alignment": "AXIOM-CLOSURE",
+            "law_refs": [
+              "LAW-01",
+              "LAW-15"
+            ]
+          },
+          "evidence": {
+            "definition": "Reproducible, addressable artifacts that can independently validate a claim or gate outcome.",
+            "kernel_alignment": "AXIOM-SUBSTRATE",
+            "law_refs": [
+              "LAW-07",
+              "LAW-20"
+            ]
+          },
+          "gate": {
+            "definition": "Policy-indexed closure checkpoint that maps evidence to pass/pending/fail under fail-dominant semantics.",
+            "kernel_alignment": "AXIOM-CLOSURE",
+            "law_refs": [
+              "LAW-01",
+              "LAW-14"
+            ]
+          },
+          "risk_tier": {
+            "definition": "Policy-declared impact tier used to select gate strength, evidence depth, and acceptable residual uncertainty.",
+            "kernel_alignment": "AXIOM-CLOSURE",
+            "law_refs": [
+              "LAW-14",
+              "LAW-19"
+            ]
+          },
+          "terminal_verifier": {
+            "definition": "Machine-checkable predicate implementation that decides gate acceptance from bound evidence.",
+            "kernel_alignment": "AXIOM-CLOSURE",
+            "law_refs": [
+              "LAW-01",
+              "LAW-20"
+            ]
+          },
+          "view_commitment": {
+            "definition": "Cryptographic commitment to a bounded view of the substrate, anchored to a ledger state.",
+            "kernel_alignment": "AXIOM-SUBSTRATE",
+            "law_refs": [
+              "LAW-03",
+              "LAW-15"
+            ]
+          },
+          "merge_receipt": {
+            "definition": "Evidence that reconciliation applied declared join/conflict rules and recorded resulting state.",
+            "kernel_alignment": "AXIOM-SUBSTRATE",
+            "law_refs": [
+              "LAW-10",
+              "LAW-15"
+            ]
+          },
+          "episode": {
+            "definition": "Bounded execution slice with declared intent, inputs, outputs, and receipt-linked transitions.",
+            "kernel_alignment": "AXIOM-CLOSURE",
+            "law_refs": [
+              "LAW-12",
+              "LAW-15"
+            ]
+          },
+          "daemon": {
+            "definition": "Long-lived coordinating process that enforces policy, lifecycle, and evidence routing for local agents/tools.",
+            "kernel_alignment": "AXIOM-BOUNDARY",
+            "law_refs": [
+              "LAW-05",
+              "LAW-13"
+            ]
+          },
+          "oracle": {
+            "definition": "External signal ingress under explicit trust policy, freshness bounds, and evidence qualification. Oracle facts enter the substrate L only via dedicated oracle_gate with explicit trust_policy, freshness_bound, and evidence_qualification; oracle facts are second-class until promoted by a containment-tier gate.",
+            "kernel_alignment": "AXIOM-CLOSURE",
+            "law_refs": [
+              "LAW-09",
+              "LAW-19"
+            ]
+          },
+          "world_effect": {
+            "definition": "Any operation that produces observable state change outside the holon's private kernel state K_h, including but not limited to: file I/O, network I/O, process signals, shared memory mutations, persistent storage writes, and cross-boundary message sends. All world effects MUST be receipted per LAW-11.",
+            "kernel_alignment": "AXIOM-SUBSTRATE",
+            "law_refs": [
+              "LAW-11",
+              "LAW-15"
+            ]
+          },
+          "tcb": {
+            "definition": "Trusted Computing Base: the minimal set of components whose correct operation is necessary for system security properties to hold. Includes: kernel runtime, capability enforcement engine, ledger integrity verifier, cryptographic primitives, and genesis policy. TCB growth MUST be bounded and auditable; unbounded TCB is a STOP_THE_LINE defect (violation code TCB_UNBOUNDED).",
+            "kernel_alignment": "AXIOM-AUTHORITY",
+            "law_refs": [
+              "LAW-05",
+              "LAW-15"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

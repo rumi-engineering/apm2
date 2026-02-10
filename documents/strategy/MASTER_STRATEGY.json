@@ -852,43 +852,43 @@
       "law_registry": [
         {
           "law_id": "LAW-01",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-02",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-04",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-05",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-06",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-07",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-08",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-09",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-12",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-15",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         }
       ],
       "lease_policy_registry": [

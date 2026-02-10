@@ -12,10 +12,10 @@
       "documents/strategy/ROADMAP.json",
       "documents/strategy/BUSINESS_PLAN.json",
       "documents/theory/AGENTS.md",
-      "documents/theory/unified_theory.json",
-      "documents/theory/laws.json",
-      "documents/theory/principles.json",
-      "documents/theory/agent_native_architecture.json"
+      "documents/theory/unified-theory-v2.json",
+      "documents/theory/unified-theory-v2.json",
+      "documents/theory/unified-theory-v2.json",
+      "documents/theory/unified-theory-v2.json"
     ]
   },
   "payload": {
@@ -5860,43 +5860,43 @@
       "law_registry": [
         {
           "law_id": "LAW-01",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-02",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-04",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-05",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-06",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-07",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-08",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-09",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-12",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         },
         {
           "law_id": "LAW-15",
-          "source_doc": "documents/theory/laws.json"
+          "source_doc": "documents/theory/unified-theory-v2.json"
         }
       ],
       "lease_policy_registry": [
@@ -6653,22 +6653,22 @@
         "parser_status": "parsed"
       },
       {
-        "doc_path": "documents/theory/unified_theory.json",
+        "doc_path": "documents/theory/unified-theory-v2.json",
         "digest_sha256": "ff3fde0ba6df0b73df7e37e798ff0ee3f05b316e7145b5bac0f746fc1bb96e5c",
         "parser_status": "parsed"
       },
       {
-        "doc_path": "documents/theory/laws.json",
+        "doc_path": "documents/theory/unified-theory-v2.json",
         "digest_sha256": "3d510064e9784259843a1592ef52bdd706a1364dc9ad1391c7339912d4f78229",
         "parser_status": "parsed"
       },
       {
-        "doc_path": "documents/theory/principles.json",
+        "doc_path": "documents/theory/unified-theory-v2.json",
         "digest_sha256": "b803a79de6205aef45b961e05dfac506e455b49f01f1c51b6092311d0715d062",
         "parser_status": "parsed"
       },
       {
-        "doc_path": "documents/theory/agent_native_architecture.json",
+        "doc_path": "documents/theory/unified-theory-v2.json",
         "digest_sha256": "6e1bf62fbf4789b90eb3582718f8670632a7bf8e84cf550e0e813a337b1dbeb2",
         "parser_status": "parsed"
       }

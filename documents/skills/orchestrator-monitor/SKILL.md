@@ -34,8 +34,8 @@ notes:
   - "Use `apm2 fac logs --pr <N>` to discover and display local pipeline/evidence/review log files. Add `--json` for machine-readable output."
   - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata and full comment-body retrieval)."
 
-references[10]:
-  - path: "@documents/theory/glossary/glossary.json"
+references[11]:
+  - path: "@documents/theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/reviews/CI_EXPECTATIONS.md"
     purpose: "CI and validation contract for implementation completion."
@@ -47,6 +47,8 @@ references[10]:
     purpose: "Exact command catalog with timeout and side-effect semantics."
   - path: "references/reading.md"
     purpose: "Curated context pack for dispatched fix/review agents."
+  - path: "@documents/skills/implementor-default/SKILL.md"
+    purpose: "Default implementor skill; use this for all fix-agent dispatches."
   - path: "references/common-review-findings.md"
     purpose: "Frequent BLOCKER/MAJOR patterns; inject into fix-agent context before coding."
   - path: "references/daemon-implementation-patterns.md"
@@ -56,9 +58,11 @@ references[10]:
   - path: "@documents/reviews/CODE_QUALITY_PROMPT.md"
     purpose: "Code-quality review prompt contract used by FAC review dispatch."
 
-implementor_warm_handoff_required_reads[16]:
-  - path: "@documents/theory/glossary/glossary.json"
+implementor_warm_handoff_required_reads[17]:
+  - path: "@documents/theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
+  - path: "@documents/skills/implementor-default/SKILL.md"
+    purpose: "Default implementor execution contract and 5-Whys-derived gates."
   - path: "@documents/skills/modes-of-reasoning/assets/07-type-theoretic.json"
     purpose: "Mode #07: Type-Theoretic Reasoning"
   - path: "@documents/skills/modes-of-reasoning/assets/49-robust-worst-case.json"
@@ -90,13 +94,20 @@ implementor_warm_handoff_required_reads[16]:
   - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
     purpose: "RS-41: Safe Patterns"
 
-implementor_warm_handoff_required_payload[3]:
+implementor_warm_handoff_required_payload[4]:
+  - field: implementor_skill_invocation
+    requirement: "Dispatch prompt MUST begin with `/implementor-default <TICKET_ID or PR_CONTEXT>`; `/ticket` is deprecated."
   - field: required_reads
     requirement: "Include implementor_warm_handoff_required_reads and explicitly instruct REQUIRED READING before editing."
   - field: latest_review_findings
     requirement: "Include complete findings from the latest review cycle, covering BLOCKER, MAJOR, MINOR, and NIT severities."
   - field: worktree
     requirement: "Include the exact worktree path the implementor agent should use for all changes."
+
+implementor_dispatch_defaults:
+  required_skill: "/implementor-default"
+  deprecated_skill: "/ticket"
+  instruction: "All implementor subagent dispatches use implementor-default unless a ticket explicitly overrides it."
 
 review_prompt_required_payload[1]:
   - field: pr_url
@@ -141,7 +152,7 @@ decision_tree:
       action: invoke_reference
       reference: references/orchestration-loop.md
 
-invariants[14]:
+invariants[15]:
   - "Use conservative gating: if PR state, SHA binding, review verdict, or CI truth is ambiguous, classify as BLOCKED and do not merge."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
@@ -153,6 +164,7 @@ invariants[14]:
   - "Fix subagents assume their branch is stale until proven current against origin/main."
   - "Fix subagents resolve merge conflicts to zero before making code changes."
   - "All implementor-agent dispatches include a warm handoff with implementor_warm_handoff_required_payload."
+  - "Default implementor dispatch starts with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
   - "Prefer fresh fix agents after failed review rounds or stalled progress."
   - "Record every dispatch decision with reason and observed evidence (head SHA, CI, review status)."
   - "Throughput optimization should be paired with quality countermetrics (reopen rate, rollback count, repeat BLOCKER rate)."

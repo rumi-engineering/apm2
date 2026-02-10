@@ -1,0 +1,60 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00449"
+    title: "FAC CLI role launch contract with hash-binding admission checks"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0020"
+    requirements:
+      - requirement_id: "REQ-0037"
+        requirement_ref: "documents/rfcs/RFC-0020/requirements/REQ-0037.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0029"
+        artifact_ref: "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0029.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_SECURITY"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00448"
+        reason: "RoleSpec production binding is prerequisite for launch command admission checks."
+      - ticket_id: "TCK-00402"
+        reason: "Adapter bridge substrate is required for authoritative launch path actuation."
+  scope:
+    in_scope:
+      - "Add FAC CLI role-launch command contract requiring explicit hash-bound inputs."
+      - "Implement launch-time fail-closed checks for role/context/policy/work bindings."
+      - "Emit launch receipts with role/context/policy hash commitments."
+      - "Add tests for missing/stale/unverifiable launch binding denial."
+    out_of_scope:
+      - "Markov-blanket channel enforcement and no-bypass actuation checks."
+      - "Liveness pulse and restart policy surfaces."
+  plan:
+    steps:
+      - "Define launch command flags and validation contract."
+      - "Implement admission-check pipeline prior to actuation."
+      - "Emit and validate launch receipt shape and required hash bindings."
+      - "Add negative-path tests for ambiguous launch context."
+      - "Run required checks."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0029"
+    criteria:
+      - "Launch command requires explicit hash-bound authority/context/policy fields."
+      - "Missing/stale/ambiguous binding state denies launch deterministically."
+      - "Launch receipts provide replay-verifiable hash lineage."
+  notes:
+    security: |
+      Launch admission checks are authority-critical and must fail closed.
+    verification: |
+      Include adversarial tests for malformed and stale launch bindings.
+    general: |
+      This ticket establishes the launch admission contract consumed by channel and liveness work.

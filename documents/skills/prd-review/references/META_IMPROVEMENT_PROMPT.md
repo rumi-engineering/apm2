@@ -8,8 +8,8 @@ You are an Expert Methodologist and Systems Architect. Your objective is not to 
 Before beginning the analysis, ingest the following context to understand the system's "Physics" and "Constitution":
 
 1.  **The Constitution:**
-    *   `documents/theory/unified_theory.json` (Grand Unified Theory - dcp://apm2.local/governance/holonic_unified_theory@v1)
-    *   `documents/theory/agent_native_architecture.json` (Theory, Doctrine & Practice)
+    *   `documents/theory/unified-theory-v2.json` (Grand Unified Theory - dcp://apm2.local/governance/holonic_unified_theory@v1)
+    *   `documents/theory/unified-theory-v2.json` (Theory, Doctrine & Practice)
 
 2.  **The Target System (The Skill):**
     *   `documents/skills/prd-review/SKILL.md` (The Protocol)

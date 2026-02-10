@@ -77,7 +77,7 @@
         "name": "BOOTSTRAP",
         "action": "Read all dependency artifacts and select reasoning modes. Steps: (1) Read the alien engineering protocol to internalize AEP clauses, dominance order, and lexicon. (2) Read the reasoning mode selector and choose modes for DIAGNOSE and GENERALIZE phases. (3) Load each selected mode's full asset file and internalize its proc steps. (4) Record selections and rationale.",
         "required_reading": [
-          {"ref": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1", "file": "documents/prompts/instruction.alien_engineering_protocol.v1.json", "note": "Internalize AEP clauses, dominance order, and required_reading chain. Follow its required_reading to load theory bundles (principles.json, laws.json, unified_theory.json, defects.json) as needed for Phase 6 self-check."},
+          {"ref": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1", "file": "documents/prompts/instruction.alien_engineering_protocol.v1.json", "note": "Internalize AEP clauses, dominance order, and required_reading chain. Follow its required_reading to load the unified theory source: documents/theory/unified-theory-v2.json."},
           {"ref": "dcp://apm2.agents/mor/selector@1", "file": "documents/skills/modes-of-reasoning/assets/selector.json", "note": "Use heuristics and patterns to select modes for DIAGNOSE and GENERALIZE phases."},
           {"note": "After mode selection, load the chosen mode asset files from documents/skills/modes-of-reasoning/assets/{id}-{name}.json"}
         ],
@@ -129,7 +129,7 @@
       {
         "phase": 6,
         "name": "SELF-CHECK",
-        "action": "Validate the winner against: (1) Does it violate DOMINANCE_ORDER? (2) Does it introduce a new crate dependency or circular dep? (3) Would it have prevented any known defect in documents/theory/defects.json? (4) Does the generalization scope match the explanation tree? (5) Are boundary conditions explicit? If any check fails, demote and promote runner-up.",
+        "action": "Validate the winner against: (1) Does it violate DOMINANCE_ORDER? (2) Does it introduce a new crate dependency or circular dep? (3) Would it have prevented any known defect in documents/theory/unified-theory-v2.json? (4) Does the generalization scope match the explanation tree? (5) Are boundary conditions explicit? If any check fails, demote and promote runner-up.",
         "output": "validation_report: { checks_passed[], checks_failed[], final_recommendation }",
         "budget": {"tc": 50, "ms": 120000}
       }

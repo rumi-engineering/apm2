@@ -17,7 +17,7 @@ protocol:
     - SkillInstructionSet
 
 references[2]:
-  - path: "../../theory/glossary/glossary.json"
+  - path: "../../theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: documents/standards/instructions/AGENT_INSTRUCTION_AUTHORING_STANDARD.md
     purpose: "Human-readable standard and templates for writing SKILL.md and references/."

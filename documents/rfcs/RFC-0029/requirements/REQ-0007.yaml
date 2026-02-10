@@ -1,0 +1,34 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0007"
+  title: "Disclosure-control interlock non-regression for optimization paths"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Efficiency optimizations MUST preserve disclosure-control policy constraints.
+    Current default policy mode is `TRADE_SECRET_ONLY`.
+
+    Optimization decisions MUST bind to `phase_disclosure_profile(phase_id)` for
+    the evaluated window; optimizations that assume a disclosure mode not active
+    for the current phase are non-admissible.
+
+    No optimization path may weaken fail-closed behavior when disclosure-control
+    evidence is unknown, stale, missing, or ambiguous, regardless of policy mode.
+    Any policy mode transition is non-admissible without signed policy epoch
+    transition evidence and explicit interlock validation.
+  rationale: |
+    Economics improvements are invalid if they reduce confidentiality posture or
+    create irreversible strategic disclosure channels.
+  acceptance_criteria:
+    - "Optimization gate denies any proposal that regresses disclosure-control predicates."
+    - "Optimization gate denies phase/policy mode mismatches for disclosure posture."
+    - "In `TRADE_SECRET_ONLY` mode, patent/provisional workflow attempts remain blocked."
+    - "Disclosure-channel classification remains deny-by-default for unapproved classes."
+    - "Gate evidence binds optimization decisions to disclosure-control policy snapshot hashes."
+  imported_dependencies:
+    - "RFC-0028::REQ-0007"
+    - "RFC-0021::REQ-0013"
+    - "RFC-0020::REQ-0035"
+  evidence_ids:
+    - "EVID-0007"

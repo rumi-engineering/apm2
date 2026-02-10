@@ -1,0 +1,167 @@
+rfc_test_and_evidence:
+  schema_version: "2026-02-10"
+
+  test_strategy:
+    overview: |
+      Security profile claims require adversarial testing with declared
+      statistical power, reproducibility across hardware/runtime classes, and
+      freshness SLAs.
+
+      Evidence freshness is an admission surface: stale security evidence blocks
+      promotion by transitioning gates to BLOCKED.
+
+    layers:
+      - layer: "UNIT"
+        description: "Predicate-level and invariant-level checks for lifecycle/security contracts."
+      - layer: "INTEGRATION"
+        description: "End-to-end gate and CAC input validation across lifecycle, projection, and temporal boundaries."
+      - layer: "ADVERSARIAL"
+        description: "Downgrade, compromise, split-brain, and ambiguity stress scenarios with fail-closed assertions."
+      - layer: "CONFORMANCE"
+        description: "Cross-verifier deterministic replay/reverification and canonicalizer-vector compatibility checks."
+
+    evidence_quality_requirements:
+      adversarial_test_contract:
+        - "Adversarial tests must declare statistical power."
+        - "Adversarial tests must declare a sample plan before execution."
+      reproducibility_contract:
+        - "Promotion-critical evidence must reproduce across declared hardware classes."
+        - "Promotion-critical evidence must reproduce across declared runtime classes."
+      freshness_contract:
+        freshness_sla_required: true
+        auto_expiry_required: true
+        stale_behavior: "Stale security evidence transitions gate to BLOCKED and denies promotion."
+
+  evidence_artifacts:
+    - id: "RFC-0028::EVID-0001"
+      title: "Lifecycle stage completeness for security profile"
+      purpose: "Evidence that profiled flows emit complete join/revalidate/consume/effect traces and deny missing-stage paths."
+      requirements_covered:
+        - "RFC-0028::REQ-0001"
+
+    - id: "RFC-0028::EVID-0002"
+      title: "Join/revalidate identity-freshness conformance"
+      purpose: "Evidence that proof-carrying identity/freshness/revocation checks fail closed under stale or ambiguous state."
+      requirements_covered:
+        - "RFC-0028::REQ-0002"
+
+    - id: "RFC-0028::EVID-0003"
+      title: "Consume-stage intent and single-consume conformance"
+      purpose: "Evidence that intent digest equality, single-consume uniqueness, and delegation meet exactness hold under replay/restart and independent recomputation."
+      requirements_covered:
+        - "RFC-0028::REQ-0003"
+
+    - id: "RFC-0028::EVID-0004"
+      title: "No-bypass and pre-actuation prerequisite conformance"
+      purpose: "Evidence that authority-bearing actuation traverses required enforcement dependencies and prerequisites."
+      requirements_covered:
+        - "RFC-0028::REQ-0003"
+        - "RFC-0028::REQ-0004"
+
+    - id: "RFC-0028::EVID-0005"
+      title: "Effect-stage acceptance-fact and declassification conformance"
+      purpose: "Evidence that effect-stage authority claims satisfy acceptance-fact completeness and declassification receipt linkage."
+      requirements_covered:
+        - "RFC-0028::REQ-0004"
+        - "RFC-0028::REQ-0005"
+
+    - id: "RFC-0028::EVID-0006"
+      title: "Drift and gate-block evidence"
+      purpose: "Evidence that snapshot drift or predicate invalidity blocks profile gates and promotion."
+      requirements_covered:
+        - "RFC-0028::REQ-0006"
+
+    - id: "RFC-0028::EVID-0007"
+      title: "Trade-secret mode and no-patent disclosure-control evidence"
+      purpose: "Evidence that trade-secret mode is enforced and patent/provisional or unapproved disclosure channels are denied."
+      requirements_covered:
+        - "RFC-0028::REQ-0007"
+
+    - id: "RFC-0028::EVID-0008"
+      title: "Projection authority isolation and direct-GitHub deny evidence"
+      purpose: "Evidence that production agent runtimes carry zero direct GitHub authority and projection effects are projection_worker-linked."
+      requirements_covered:
+        - "RFC-0028::REQ-0008"
+
+    - id: "RFC-0028::EVID-0009"
+      title: "Projection compromise containment and trust-root pin evidence"
+      purpose: "Evidence that projection compromise is detected/quarantined while authority decisions remain CAS+ledger-rooted and replay-recoverable."
+      requirements_covered:
+        - "RFC-0028::REQ-0009"
+
+  imported_evidence_anchors:
+    - id: "RFC-0027::EVID-0001"
+      file: "documents/rfcs/RFC-0027/evidence_artifacts/EVID-0001.yaml"
+      role: "Lifecycle baseline anchor"
+    - id: "RFC-0027::EVID-0008"
+      file: "documents/rfcs/RFC-0027/evidence_artifacts/EVID-0008.yaml"
+      role: "Authority closure anchor"
+    - id: "RFC-0027::EVID-0010"
+      file: "documents/rfcs/RFC-0027/evidence_artifacts/EVID-0010.yaml"
+      role: "Promotion-critical portability/reverification anchor"
+
+  test_categories:
+    - category: "Lifecycle completeness"
+      evidence_ids:
+        - "RFC-0028::EVID-0001"
+      requirement_ids:
+        - "RFC-0028::REQ-0001"
+      focus: "Complete ordered stage receipts and fail-closed missing-stage deny traces."
+
+    - category: "Identity, freshness, and revocation"
+      evidence_ids:
+        - "RFC-0028::EVID-0002"
+      requirement_ids:
+        - "RFC-0028::REQ-0002"
+      focus: "Tier2+ identity/freshness/revocation closure under stale/ambiguous state."
+
+    - category: "Consume intent and delegation exactness"
+      evidence_ids:
+        - "RFC-0028::EVID-0003"
+      requirement_ids:
+        - "RFC-0028::REQ-0003"
+      focus: "Intent digest equality, single-consume uniqueness, and deterministic meet recomputation."
+
+    - category: "No-bypass and prerequisite closure"
+      evidence_ids:
+        - "RFC-0028::EVID-0004"
+      requirement_ids:
+        - "RFC-0028::REQ-0003"
+        - "RFC-0028::REQ-0004"
+      focus: "No unmediated actuation path and mandatory pre-actuation prerequisite binding."
+
+    - category: "Acceptance-fact and declassification"
+      evidence_ids:
+        - "RFC-0028::EVID-0005"
+      requirement_ids:
+        - "RFC-0028::REQ-0004"
+        - "RFC-0028::REQ-0005"
+      focus: "Effect-stage acceptance-fact completeness and receipted declassification linkage."
+
+    - category: "Drift and gate-block"
+      evidence_ids:
+        - "RFC-0028::EVID-0006"
+      requirement_ids:
+        - "RFC-0028::REQ-0006"
+      focus: "Snapshot/predicate drift detection with explicit promotion-block behavior."
+
+    - category: "Trade-secret disclosure controls"
+      evidence_ids:
+        - "RFC-0028::EVID-0007"
+      requirement_ids:
+        - "RFC-0028::REQ-0007"
+      focus: "Default trade-secret-only mode enforcement and deny traces for unapproved disclosure workflows."
+
+    - category: "Projection isolation"
+      evidence_ids:
+        - "RFC-0028::EVID-0008"
+      requirement_ids:
+        - "RFC-0028::REQ-0008"
+      focus: "Zero direct GitHub authority in production agent_runtime and projection_worker-only actuation."
+
+    - category: "Compromise containment"
+      evidence_ids:
+        - "RFC-0028::EVID-0009"
+      requirement_ids:
+        - "RFC-0028::REQ-0009"
+      focus: "Compromise detection, quarantine containment, and authoritative-flow continuity under trust-root pinning."

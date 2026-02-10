@@ -12,3 +12,9 @@ rfc_readme:
   note: |
     RFC-0016 defines HTF and prohibits wall-time authority in normative protocol
     decisions. HTF is a substrate RFC and impacts multiple subsystems.
+    Canonical cross-RFC vocabulary is:
+    - htf_boundary
+    - authority_clock
+    - time_envelope
+    - tick_floor_met
+    - display_clock (display-only; never gate authority)

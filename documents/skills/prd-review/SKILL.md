@@ -23,7 +23,7 @@ variables:
   PRD_ID: "$2"
 
 references[17]:
-  - path: "../../theory/glossary/glossary.json"
+  - path: "../../theory/unified-theory-v2.json"
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: references/prd-review-workflow.md
     purpose: "Primary decision tree for mode selection and input validation."

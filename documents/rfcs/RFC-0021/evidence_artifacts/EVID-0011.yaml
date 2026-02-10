@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0011"
+  title: "Trade-secret policy enforcement and no-patent controls"
+  category: "GATE_ENFORCEMENT_TEST"
+  status: "PLANNED"
+  description: "Evidence that VPHI enforces trade-secret-only posture and blocks patent/provisional filing and unapproved external disclosures."
+  requirement_ids: ["REQ-0013"]
+  ticket_ids: ["TCK-VPHI-0011"]
+  expected_contents:
+    - "deny traces for patent/provisional filing attempts"
+    - "external disclosure channel policy decision logs"
+    - "trade-secret policy snapshot hash linkage in gate receipts"
+    - "adversarial replay proving fail-closed behavior on unknown IP posture states"

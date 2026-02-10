@@ -1,0 +1,23 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0001"
+  title: "Canonical boundary economics profile"
+  category: "NON_FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    External interaction paths MUST evaluate budget admissibility via a canonical
+    economics profile parameterized by risk tier and interaction class.
+  rationale: |
+    Without one profile surface, budget decisions are inconsistent and non-reproducible.
+  acceptance_criteria:
+    - "Admission decisions expose profile inputs/outputs deterministically."
+    - "Policy explains budget allowance/denial per interaction class."
+    - "Unprofiled authoritative paths deny by default."
+  imported_dependencies:
+    - "RFC-0020::REQ-0001"
+    - "RFC-0019::REQ-0014"
+    - "RFC-0020::REQ-0035"
+  evidence_ids:
+    - "EVID-0001"
+

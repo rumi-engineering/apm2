@@ -1,0 +1,15 @@
+rfc_requirements_readme:
+  schema_version: "2026-01-23"
+  rfc_id: "RFC-0028"
+  namespace_rule: "References inside RFC-0028 MUST use fully qualified form RFC-0028::REQ-XXXX."
+  temporal_authority_policy: "Security decisions touching timing MUST require signed HTF authority and fail closed on ambiguity."
+  requirements:
+    - "REQ-0001"
+    - "REQ-0002"
+    - "REQ-0003"
+    - "REQ-0004"
+    - "REQ-0005"
+    - "REQ-0006"
+    - "REQ-0007"
+    - "REQ-0008"
+    - "REQ-0009"

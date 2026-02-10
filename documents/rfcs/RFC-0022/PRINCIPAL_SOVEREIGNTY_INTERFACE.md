@@ -1393,10 +1393,10 @@ Downstream dependency notes:
 ## 15. References
 1. `documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md`
 2. `documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md`
-3. `documents/theory/laws.json`
-4. `documents/theory/principles.json`
-5. `documents/theory/unified_theory.json`
-6. `documents/theory/glossary/glossary.json`
+3. `documents/theory/unified-theory-v2.json`
+4. `documents/theory/unified-theory-v2.json`
+5. `documents/theory/unified-theory-v2.json`
+6. `documents/theory/unified-theory-v2.json`
 7. `documents/strategy/MASTER_STRATEGY.json`
 8. `documents/strategy/BUSINESS_PLAN.json`
 9. `documents/security/SECURITY_POLICY.cac.json`

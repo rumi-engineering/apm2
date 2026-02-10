@@ -49,8 +49,10 @@ decision_tree:
             If restart also fails, use `gh workflow run forge-admission-cycle.yml` as last-resort fallback.
         - id: FIX_AGENT_ACTION
           action: |
-            For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent.
-            Inject references/common-review-findings.md and references/daemon-implementation-patterns.md in its context.
+            For CI_FAILED, REVIEW_FAILED, or PR_CONFLICTING PRs with implementor slots, dispatch one fresh fix agent
+            with `/implementor-default <TICKET_ID or PR_CONTEXT>`.
+            Inject @documents/skills/implementor-default/SKILL.md, references/common-review-findings.md,
+            and references/daemon-implementation-patterns.md in its context.
             Fix agents should use `apm2 fac push` to push their changes — this auto-creates/updates the PR and triggers reviews.
         - id: REVIEW_PROGRESS_ACTION
           action: "For PRs with active reviews, run fac_review_status and fac_review_project; the Forge Admission Cycle workflow remains the GitHub projection path."
@@ -102,10 +104,13 @@ decision_tree:
 
     - id: FIX_AGENT_PROMPT_CONTRACT
       purpose: "Ensure implementor agent briefs are consistent and conservatively gated."
-      steps[5]:
+      steps[7]:
+        - id: REQUIRE_DEFAULT_IMPLEMENTOR_SKILL
+          action: "Prompt must start with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
         - id: INCLUDE_REQUIRED_CONTEXT
           action: |
             Include PR number, branch, HEAD SHA, explicit findings list, and required references:
+            @documents/skills/implementor-default/SKILL.md,
             references/common-review-findings.md, references/daemon-implementation-patterns.md,
             documents/reviews/CI_EXPECTATIONS.md.
         - id: REQUIRE_BRANCH_SYNC_BEFORE_EDIT

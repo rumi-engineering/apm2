@@ -1,0 +1,24 @@
+rfc_requirement:
+  schema_version: "2026-02-09"
+  template_version: "2026-01-23"
+  id: "REQ-HEF-0023"
+  type: "SECURITY"
+  title: "Credential-surface hardening and PAT-free projection operation"
+  statement: |
+    FAC review and projection surfaces MUST avoid persistent PAT dependence and MUST prevent
+    reviewer credential exposure through process arguments, logs, or unbounded environment propagation.
+
+    Runtime command execution MUST keep sensitive credential material out of argv and enforce
+    deny-by-default behavior when credential posture is ambiguous.
+
+    Primary delivery ticket: TCK-00445.
+  acceptance_criteria:
+    - "Projection path operates without PAT secrets in normal FAC operation."
+    - "Sensitive credential values are not present in process argv or projected logs."
+    - "Credential source ambiguity blocks authoritative projection and emits structured defects."
+    - "Security checks verify hardened command invocation patterns in FAC workflow execution."
+  evidence:
+    evidence_ids:
+      - "EVID-HEF-0017"
+    inherited_from_prd: false
+    notes: []

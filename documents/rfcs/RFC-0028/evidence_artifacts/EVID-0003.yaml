@@ -1,0 +1,15 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0003"
+  title: "Consume-stage intent and single-consume conformance"
+  category: "TEST_RESULTS"
+  status: "PLANNED"
+  description: "Evidence that consume-time intent equality, single-consume uniqueness, and delegation meet exactness hold under replay/restart and independent verifier recomputation."
+  requirement_ids:
+    - "RFC-0028::REQ-0003"
+  expected_contents:
+    - "intent mismatch deny traces"
+    - "duplicate consume deny traces"
+    - "durable consume record checks"
+    - "DelegationMeetComputationReceiptV1 records for admitted delegations"
+    - "independent verifier meet recomputation concordance reports"

@@ -11,7 +11,7 @@ A practical taxonomy of 81 reasoning modes stored as CAC assets. For background 
 
 ## Asset References
 
-- **Glossary**: `documents/theory/glossary/glossary.json` - REQUIRED READING: APM2 terminology and ontology
+- **Glossary**: `documents/theory/unified-theory-v2.json` - REQUIRED READING: APM2 terminology and ontology
 - **Mode assets**: `assets/{NN}-{name}.json` (e.g., `assets/58-mechanism-design.json`)
 - **Selector asset**: `assets/selector.json` - contains axes, patterns, and heuristics for mode selection
 - **Stable IDs**: `dcp://apm2.agents/mor/mode/{name}@1`

@@ -1,0 +1,198 @@
+rfc_trust_boundaries:
+  schema_version: "2026-02-10"
+
+  trust_model:
+    summary: |
+      RFC-0028 assumes external I/O is adversarial.
+
+      Security admission must treat boundary inputs, projection channels,
+      federation synchronization surfaces, and operator workflows as potential
+      compromise vectors. Unknown, stale, conflicting, or unverifiable
+      authority-critical state is fail-closed deny.
+    profile_binding_scope:
+      current_profile: "GitHub projection sink family"
+      extension_rule: "Additional sink families are non-promotable until explicit policy-extension and evidence-admission contracts are approved."
+
+  trust_boundaries:
+    - id: "TB-SIO28-0001"
+      name: "PCAC lifecycle boundary"
+      description: "Authority-bearing external flow crosses join/revalidate/consume/effect stages and is admissible only if lifecycle and security predicates remain satisfied end-to-end."
+      assets:
+        - "join_state"
+        - "revalidate_state"
+        - "consume_state"
+        - "effect_state"
+        - "authority kernel decisions"
+      failure_modes:
+        - "missing stage receipt"
+        - "intent digest mismatch"
+        - "duplicate consume"
+        - "no-bypass effect path violation"
+
+    - id: "TB-SIO28-0002"
+      name: "Delegation authority boundary"
+      description: "Delegated authority crosses parent/overlay composition and is admissible only as deterministic exact meet with satisfiability and depth bounds."
+      assets:
+        - "delegation vectors A/O/D"
+        - "delegation_meet_exact_v1"
+        - "delegation_satisfiability receipt"
+        - "delegation_lineage_hash"
+      failure_modes:
+        - "delegation widening"
+        - "verifier disagreement"
+        - "vacuous delegation"
+        - "depth overflow"
+
+    - id: "TB-SIO28-0003"
+      name: "Projection sink isolation boundary"
+      description: "Production agent_runtime and projection_worker are separate principal classes; projection actuation is isolated and receipt-linked."
+      profile_binding:
+        sink_family: "GitHub projection surfaces"
+        stage_default_on_unknown: "GH-DIRECT-STAGE-2"
+      assets:
+        - "projection_worker"
+        - "sink identity snapshot"
+        - "projection isolation policy"
+        - "compromise containment receipts"
+      failure_modes:
+        - "direct github_api/gh_cli/admin capability in agent_runtime"
+        - "projection digest divergence"
+        - "DNS binding mismatch"
+        - "endpoint digest mismatch"
+
+    - id: "TB-SIO28-0004"
+      name: "Federation and split-brain boundary"
+      description: "Truth-plane synchronization across partitions must preserve revocation dominance and deny unresolved merged frontier states."
+      assets:
+        - "revocation_frontier"
+        - "time authority envelope"
+        - "split-brain arbitration policy"
+      failure_modes:
+        - "conflicting revocation claims"
+        - "partitioned revocation channel"
+        - "frozen promotion under unresolved frontier"
+      partition_tolerance_truth_table:
+        - topology: "Local quorum intact, remote lag"
+          revocation_certainty: "high local, uncertain remote"
+          delegation_certainty: "local only"
+          security_outcome: "local allow with remote import restrictions"
+        - topology: "Split-brain truth planes"
+          revocation_certainty: "conflicting"
+          delegation_certainty: "conflicting"
+          security_outcome: "freeze + deny promotion"
+        - topology: "Revocation channel partitioned"
+          revocation_certainty: "low"
+          delegation_certainty: "uncertain"
+          security_outcome: "deny consume for affected scopes"
+        - topology: "Projection-only partition"
+          revocation_certainty: "unaffected"
+          delegation_certainty: "unaffected"
+          security_outcome: "truth-plane continues, projection effects quarantined as needed"
+
+    - id: "TB-SIO28-0005"
+      name: "Temporal authority boundary"
+      description: "Promotion-critical temporal predicates require canonical evaluator tuple and shared contract arbitration for TP-EIO29-001/008."
+      assets:
+        - "time_authority_envelope_valid"
+        - "promotion_temporal_ambiguity == false"
+        - "temporal disagreement receipt"
+        - "temporal arbitration receipt"
+      failure_modes:
+        - "temporal ambiguity"
+        - "predicate disagreement"
+        - "expired arbitration deadline"
+
+    - id: "TB-SIO28-0006"
+      name: "Operator and organizational boundary"
+      description: "Human policy/configuration workflows can introduce authority errors and therefore require strict typed controls and dual approval for risky updates."
+      assets:
+        - "operator safety guard profile"
+        - "semantic diff preview"
+        - "dual-approval controls"
+      failure_modes:
+        - "wrong boundary ID"
+        - "stale policy deployment"
+        - "incorrect sink identity mapping"
+        - "display-clock used as authority input"
+        - "malformed degradation policy changes"
+      mandatory_ux_constraints:
+        - "Authority fields accept only typed HTF references and signed object digests."
+        - "Display-clock values are visually and semantically isolated from authority input controls."
+        - "Risky policy updates require semantic diff preview and explicit dual approval."
+
+  threats:
+    - id: "TH-SIO28-0001"
+      name: "Lifecycle stage attack surface"
+      mechanism: "Exploit T_flow stage boundaries (T_join union T_revalidate union T_consume union T_effect) via missing or inconsistent stage evidence."
+      impact: "Authoritative side-effects admitted without full lifecycle closure."
+      mitigation: "For all t in T_flow, mitigated(t) == true is mandatory; missing lifecycle evidence is deny."
+
+    - id: "TH-SIO28-0002"
+      name: "Temporal ambiguity exploitation"
+      mechanism: "Inject stale/unknown/unverifiable temporal authority or induce evaluator disagreement on shared predicates TP-EIO29-001/008."
+      impact: "Promotion-critical authority decisions become unsafe."
+      mitigation: "Fail-closed arbitration outcomes, S3 freeze on transient disagreement, deny on persistent disagreement or missed deadlines."
+
+    - id: "TH-SIO28-0003"
+      name: "Delegation widening and vacuous authority"
+      mechanism: "Craft overlay/delegation vectors that widen authority or pass algebraically while yielding empty admissible workset."
+      impact: "Privilege escalation or unsafe promotion with non-executable delegation state."
+      mitigation: "Exact-meet determinism, satisfiability proof, depth bounds, and falsification deny obligations."
+
+    - id: "TH-SIO28-0004"
+      name: "Projection compromise and divergence"
+      mechanism: "Observed projection digest differs from expected ledger-derived digest or projection surface is externally tampered."
+      impact: "False projection state may be mistaken for authority truth."
+      mitigation: "projection_compromise_contained predicate, projection channel quarantine, and CAS+ledger authority pinning."
+
+    - id: "TH-SIO28-0005"
+      name: "DNS hijack or sink identity mismatch"
+      mechanism: "Endpoint digest mismatch or DNS binding mismatch during sink rotation or external endpoint resolution."
+      impact: "Projection effects routed to untrusted sink."
+      mitigation: "SinkIdentitySnapshotV1 transitions with overlap/epoch continuity checks; immediate quarantine and deny on mismatch."
+
+    - id: "TH-SIO28-0006"
+      name: "Split-brain revocation conflict"
+      mechanism: "Conflicting revocation frontiers under partition/rejoin conditions."
+      impact: "Stale authority may remain accepted in some partitions."
+      mitigation: "Revocation-wins merge rule rf_merge(scope) = max(rf_a(scope), rf_b(scope)); unresolved merged frontier denies admission."
+
+    - id: "TH-SIO28-0007"
+      name: "Direct projection capability reintroduction"
+      mechanism: "Production agent runtime regains github_api/gh_cli/admin capability classes."
+      impact: "High-impact blast radius and bypass of projection isolation controls."
+      mitigation: "Stage policy GH-DIRECT-STAGE-0/1/2 with fail-closed default to Stage 2 hard deny on unknown state."
+
+    - id: "TH-SIO28-0008"
+      name: "Operator-induced policy error"
+      mechanism: "Wrong boundary IDs, stale deployments, malformed degradation policy edits, or ambiguous manual updates."
+      impact: "Unsafe policy may be promoted."
+      mitigation: "Typed HTF authority fields only, semantic diff preview, explicit dual approval, and operator-safety gate blocking."
+
+  controls_and_enforcement:
+    threat_algebra:
+      flow_formula: "T_flow = T_join union T_revalidate union T_consume union T_effect"
+      admission_rule: "forall t in T_flow, mitigated(t) == true"
+
+    defect_taxonomy:
+      - "CAC_SCHEMA_UNRESOLVED"
+      - "CAC_SCHEMA_VERSION_INCOMPATIBLE"
+      - "CAC_CANONICALIZER_UNRESOLVED"
+      - "CAC_CANONICALIZER_VECTOR_MISMATCH"
+      - "CAC_DIGEST_SET_INCOMPLETE"
+      - "CAC_DIGEST_MISMATCH"
+      - "CAC_SIGNATURE_INVALID"
+      - "CAC_INPUT_STALE"
+      - "CAC_VALIDATION_ORDER_VIOLATION"
+
+    fail_closed_policy:
+      - "All gates are fail-closed for promotion-critical paths."
+      - "Unknown, stale, missing, or ambiguous security state is deny."
+      - "Tier2+ CAC defects force deny plus S3 freeze pending adjudication; missed adjudication deadline escalates to S4 halt."
+
+    stage_policy:
+      projection_direct_authority:
+        - "GH-DIRECT-STAGE-0: dev compatibility only"
+        - "GH-DIRECT-STAGE-1: production deny-by-default"
+        - "GH-DIRECT-STAGE-2: production hard deny"
+      default_on_unknown: "Fail closed to GH-DIRECT-STAGE-2."

@@ -43,11 +43,11 @@ rfc_problem_and_imports:
     - id: "NC-004"
       statement: "OCAP only: capabilities are not discoverable; tool authority enters an episode only via explicit delegation (capability manifest by hash)"
       law_refs: ["LAW-05"]
-      evidence_ref: "documents/theory/unified_theory.json#ocap"
+      evidence_ref: "documents/theory/unified-theory-v2.json#ocap"
     - id: "NC-005"
       statement: "Stop-order gating is mandatory: before any actuation (tool execution, evidence publish, event emission, external projection), the kernel MUST verify stop-state; if stop-state is missing or unverifiable: deny (fail-closed)"
       law_refs: ["LAW-05", "LAW-12", "LAW-15"]
-      evidence_ref: "documents/theory/unified_theory.json#stop-order"
+      evidence_ref: "documents/theory/unified-theory-v2.json#stop-order"
     - id: "NC-006"
       statement: "View commitments are mandatory: every episode + receipt binds to a ledger anchor and a pinned world (repo/deps/policy/toolchain/model digests); no ambient HEAD/filesystem truth"
       law_refs: ["LAW-03", "LAW-09"]
@@ -58,14 +58,14 @@ rfc_problem_and_imports:
       evidence_ref: "proto/kernel_events.proto"
     - id: "NC-008"
       statement: "Small messages, big evidence: inter-holon communication is receipts + selectors; large payloads live in CAS and are referenced by hash"
-      evidence_ref: "documents/theory/unified_theory.json#evidence-economics"
+      evidence_ref: "documents/theory/unified-theory-v2.json#evidence-economics"
     - id: "NC-009"
       statement: "Constraint precedence: when constraints conflict, apply Security/Containment > Verification/Correctness > Liveness/Progress; if containment blocks sufficient context/capabilities, terminate/decompose/escalate and record a defect/decision"
-      evidence_ref: "documents/theory/unified_theory.json#dominance-order"
+      evidence_ref: "documents/theory/unified-theory-v2.json#dominance-order"
     - id: "NC-010"
       statement: "Typed quantities only: budgets/timeouts/limits MUST be typed quantities (unitful) at the boundary; never interpret naked integers as seconds/tokens/bytes across holons"
       law_refs: ["LAW-13"]
-      evidence_ref: "documents/theory/unified_theory.json#typed-quantities"
+      evidence_ref: "documents/theory/unified-theory-v2.json#typed-quantities"
   module_contract_ref: "00_meta.yaml#rfc_meta.module_contract"
   design_north_stars:
     - id: "NS-001"

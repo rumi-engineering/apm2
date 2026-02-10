@@ -1,0 +1,17 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0010"
+  title: "Tiered erasure+BFT reconstruction admissibility evidence"
+  category: "CHAOS_TEST_RESULTS"
+  status: "PLANNED"
+  description: "Evidence that mandatory tiers are reconstructable via declared erasure profiles and admitted only with quorum-validated digest integrity plus HTF-bound recovery receipts."
+  requirement_ids:
+    - "RFC-0029::REQ-0010"
+  expected_contents:
+    - "erasure reconstruction receipts for mandatory source/evidence tiers"
+    - "BFT quorum certificates over recovered digests"
+    - "SourceTrustSnapshot digest match proofs"
+    - "RecoveryAdmissibilityReceiptV1 artifacts with time_authority_ref and window_ref"
+    - "TP-EIO29-001 and TP-EIO29-004 predicate verdict receipts from canonical evaluator"
+    - "cross-window revocation frontier monotonicity checks during recovery drills"
+    - "negative tests for digest mismatch and insufficient quorum"

@@ -4,10 +4,10 @@
 
 Read all of these before generating output:
 
-- documents/theory/glossary/glossary.json
-- documents/theory/laws.json
-- documents/theory/principles.json
-- documents/theory/unified_theory.json
+- documents/theory/unified-theory-v2.json
+- documents/theory/unified-theory-v2.json
+- documents/theory/unified-theory-v2.json
+- documents/theory/unified-theory-v2.json
 - documents/strategy/MASTER_STRATEGY.json
 - documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md
 - documents/rfcs/RFC-0022/PRINCIPAL_SOVEREIGNTY_INTERFACE.md
@@ -22,7 +22,7 @@ This is the capstone and the most dangerous RFC in the series. A system that can
 ## Priority innovation vectors
 
 - **Containment before modification**: every self-modification proposal must come with a containment proof bounding what it can affect — think capability-based sandboxing applied to the modification process itself.
-- **Alignment as invariant preservation**: formalize alignment as a set of invariants (derived from theory/laws.json and theory/principles.json) that must be preserved across any modification, verified mechanically.
+- **Alignment as invariant preservation**: formalize alignment as a set of invariants (derived from theory/unified-theory-v2.json and theory/unified-theory-v2.json) that must be preserved across any modification, verified mechanically.
 - **Modification as episode**: treat each self-modification as a contained episode with its own capability manifest, budget, stop conditions, and evidence trail — reuse the HSI substrate.
 - **Anti-drift via bisimulation**: continuously verify that the post-modification system is bisimilar to the pre-modification system on all safety-critical behaviors.
 - **Recursive modification governance**: self-modification of the self-modification protocol itself must require strictly higher authority than normal modifications — preventing the system from loosening its own constraints.

@@ -1,0 +1,29 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0021"
+  title: "Promotion-critical CAC traceability overlay matrix"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    RFC-0019 chapter 18 MUST define a promotion-critical CAC traceability overlay matrix
+    binding TRC-FAC claims to schema contracts, digest-set completeness, canonicalizer tuples,
+    and Tier2+ fail-closed trigger semantics.
+
+    Overlay rows MUST remain coherent with RFC-0028 security and RFC-0029 efficiency CAC contracts.
+
+    Primary delivery ticket: TCK-00440.
+  rationale: |
+    Promotion-critical claims need explicit machine-checkable CAC bindings to avoid prose-only
+    traceability that can drift across RFC boundaries.
+  acceptance_criteria:
+    - "Chapter 18 includes explicit overlay rows for promotion-critical TRC claims with CAC contract fields."
+    - "Each overlay row binds schema contracts, digest sets, canonicalizer tuple, and fail-closed trigger semantics."
+    - "Tier2+ unresolved ambiguity is explicitly non-promotable with bounded escalation behavior."
+    - "Cross-RFC coherence checks cover RFC-0028/0029 CAC gate and predicate surfaces."
+  evidence_ids:
+    - "EVID-0010"
+    - "EVID-0011"
+    - "EVID-0014"
+  source_refs:
+    - "documents/rfcs/RFC-0019/18_fac_vnext_cross_rfc_traceability_matrix.md"

@@ -1,0 +1,101 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-02-09"
+
+  risks:
+    - id: "RSK-EIO29-0001"
+      title: "Emergency-time carve-out misuse in stop/revoke lane"
+      statement: |
+        The local_monotonic_emergency_time_valid carve-out can be misapplied to
+        authorize non-reduction operations when full envelope validity is
+        unavailable.
+      mitigation: |
+        Restrict carve-out to stop/revoke lane authority-reduction actions only;
+        deny all authority-expansion paths and require explicit gate evidence for
+        carve-out usage.
+      status: "OPEN"
+
+    - id: "RSK-EIO29-0002"
+      title: "Correlated temporal disagreement and evidence freshness liveness pressure"
+      statement: |
+        Sustained temporal disagreement with concurrent evidence freshness decay
+        can increase freeze cascades and delay recovery to D0.
+      mitigation: |
+        Enforce adjudication deadlines, prioritized bounded evidence regeneration,
+        and throughput-dominance recovery targets while maintaining no-authority-
+        expansion constraints in degraded modes.
+      status: "OPEN"
+
+    - id: "RSK-EIO29-0003"
+      title: "Disclosure policy versus redundancy placement tension"
+      statement: |
+        Required redundancy fragment placement may conflict with active
+        disclosure-control mode constraints, causing recoverability plan
+        infeasibility.
+      mitigation: |
+        Require redundancy_purpose_declassification_valid scoped receipts;
+        otherwise constrain redundancy plans to trust-boundary-local placement or
+        deny promotion-critical admissibility.
+      status: "OPEN"
+
+    - id: "RSK-EIO29-0004"
+      title: "Joint-state comparator drift across profiles"
+      statement: |
+        Divergent interpretation of mode_dominance_select across security and
+        efficiency profiles can produce inconsistent (S_i, D_j) arbitration
+        outcomes.
+      mitigation: |
+        Keep typed comparator contract centralized, emit arbitration receipts,
+        and fail closed on unresolved comparator state.
+      status: "OPEN"
+
+    - id: "RSK-EIO29-0005"
+      title: "Unbounded gate-cascade and evidence generation envelope"
+      statement: |
+        T_cascade_total feasibility relative to evidence TTL may be optimistic
+        until measured under representative stress and degradation conditions.
+      mitigation: |
+        Require measured p50/p95/p99 targets for T_gate_total and
+        T_evidence_generation plus proof that T_cascade_total remains below
+        promotion-critical evidence TTL bounds.
+      status: "OPEN"
+
+    - id: "RSK-EIO29-0006"
+      title: "Probabilistic queue and attacker-cost guarantees"
+      statement: |
+        Queue latency/recovery envelopes and attacker-cost asymmetry bounds are
+        probabilistic and can be misread as absolute safety guarantees.
+      mitigation: |
+        Bind confidence intervals and sample-size contracts into evidence quality
+        profiles and deny optimization when confidence minima are unresolved.
+      status: "OPEN"
+
+    - id: "RSK-EIO29-0007"
+      title: "Supported-envelope overreach"
+      statement: |
+        Promotion claims beyond tested federation size/geography/adversary
+        profiles are non-authoritative and may exceed validated bounds.
+      mitigation: |
+        Block promotion beyond declared stress-tested envelope until new evidence
+        receipts are admitted for expanded profiles.
+      status: "OPEN"
+
+  open_questions:
+    - id: "Q-EIO29-0001"
+      question: "What formal criteria govern safe expansion of overlap-safe predicates beyond TP-EIO29-001 and TP-EIO29-002?"
+      status: "OPEN"
+      resolution: "UNRESOLVED"
+
+    - id: "Q-EIO29-0002"
+      question: "What conservative uncertainty-qualification policy should be mandatory for ACR estimator confidence during low-signal windows?"
+      status: "OPEN"
+      resolution: "UNRESOLVED"
+
+    - id: "Q-EIO29-0003"
+      question: "What measured bounds for T_cascade_total versus evidence TTL hold under representative adversarial load and degraded-mode churn?"
+      status: "OPEN"
+      resolution: "UNRESOLVED"
+
+    - id: "Q-EIO29-0004"
+      question: "What liveness envelope is explicitly admissible under prolonged partition and adversarial disturbance without violating fail-closed guarantees?"
+      status: "OPEN"
+      resolution: "UNRESOLVED"

@@ -126,15 +126,15 @@
             "note": "Familiarize yourself with AEP clauses and dominance order."
           },
           {
-            "file": "documents/theory/principles.json",
+            "file": "documents/theory/unified-theory-v2.json",
             "note": "Extract invariants that should constrain standard-library-level design."
           },
           {
-            "file": "documents/theory/laws.json",
+            "file": "documents/theory/unified-theory-v2.json",
             "note": "Ground constraints in explicit causal laws."
           },
           {
-            "file": "documents/theory/unified_theory.json",
+            "file": "documents/theory/unified-theory-v2.json",
             "note": "Anchor proposals in APM2 invariant surfaces."
           },
           {
@@ -314,10 +314,10 @@
     "required_reading": [
       "Please read all theory and security artifacts before synthesis — the security corpus provides essential context for grounded proposals.",
       [
-        "documents/theory/principles.json",
-        "documents/theory/laws.json",
-        "documents/theory/unified_theory.json",
-        "documents/theory/glossary/glossary.json",
+        "documents/theory/unified-theory-v2.json",
+        "documents/theory/unified-theory-v2.json",
+        "documents/theory/unified-theory-v2.json",
+        "documents/theory/unified-theory-v2.json",
         "documents/security/AGENTS.cac.json",
         "documents/security/INCIDENT_RESPONSE.cac.json",
         "documents/security/NETWORK_DEFENSE.cac.json",

@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0007"
+  title: "Trade-secret mode and no-patent disclosure-control evidence"
+  category: "POLICY_CHECK_RESULTS"
+  status: "PLANNED"
+  description: "Evidence that external-I/O security gates enforce trade-secret-only mode and deny patent/provisional filing or unapproved disclosure channels."
+  requirement_ids:
+    - "RFC-0028::REQ-0007"
+  expected_contents:
+    - "trade-secret mode gate decision traces"
+    - "patent/provisional workflow deny traces with structured defects"
+    - "disclosure-channel classification deny/allow traces"
+    - "ip policy snapshot freshness and signature validation outputs"

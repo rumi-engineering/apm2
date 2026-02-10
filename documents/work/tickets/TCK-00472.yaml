@@ -1,0 +1,58 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00472"
+    title: "RFC-0029 REQ-0003 verification amortization and proof-cache discipline"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0029"
+    requirements:
+      - requirement_id: "REQ-0003"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0003.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0003"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0003.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_PERFORMANCE"
+      - "DOMAIN_RELIABILITY"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00471"
+        reason: "Amortization policy depends on deterministic digest-first selector and replay semantics."
+  scope:
+    in_scope:
+      - "Implement bounded proof-cache reuse and batching for correlated verification workloads."
+      - "Implement cache invalidation preserving freshness and revocation correctness."
+      - "Measure and report sub-linear verifier workload growth for declared workload classes."
+      - "Emit deny behavior for stale-cache and unresolved cache-binding states."
+    out_of_scope:
+      - "Queue lane admission and anti-starvation policy."
+      - "Projection continuity scenario orchestration."
+  plan:
+    steps:
+      - "Define proof-cache reuse/invalidation contract and deny classes."
+      - "Implement workload instrumentation for amortized verification growth."
+      - "Add stale-cache and revocation-race negative test fixtures."
+      - "Add benchmark and conformance evidence extraction for verifier economics."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0003"
+    criteria:
+      - "Proof-cache reuse is bounded and policy-gated."
+      - "Invalidation paths preserve revocation and freshness correctness."
+      - "Evidence demonstrates targeted sub-linear verifier workload growth."
+  notes:
+    security: |
+      Cache artifacts must not bypass revocation or freshness constraints.
+    verification: |
+      Include negatives proving stale-cache conditions deny deterministically.
+    general: |
+      This ticket closes REQ-0003 verification amortization obligations.

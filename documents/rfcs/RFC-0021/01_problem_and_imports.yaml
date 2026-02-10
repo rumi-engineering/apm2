@@ -41,7 +41,7 @@ rfc_problem_and_imports:
     - id: "VPHI-NC-004"
       statement: "Unknown, stale, or ambiguous signal states fail closed and route upward in scrutiny."
       law_refs: ["LAW-09", "LAW-12"]
-      evidence_ref: "documents/theory/laws.json"
+      evidence_ref: "documents/theory/unified-theory-v2.json"
     - id: "VPHI-NC-005"
       statement: "AAT-BIZ is mandatory for strategy-critical changes sourced from venture signals."
       law_refs: ["LAW-14", "LAW-15"]
@@ -54,6 +54,10 @@ rfc_problem_and_imports:
       statement: "Scale admissibility requires bounded anti-entropy and verifier-economics ceilings under exabyte-to-zettabyte evidence envelopes."
       law_refs: ["LAW-01", "LAW-04", "LAW-15"]
       evidence_ref: "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
+    - id: "VPHI-NC-008"
+      statement: "VPHI IP posture is trade-secret-only; patent/provisional filing and unapproved external disclosure channels are denied fail closed."
+      law_refs: ["LAW-05", "LAW-09", "LAW-15"]
+      evidence_ref: "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
 
   design_north_stars:
     - id: "VPHI-NS-001"
@@ -64,6 +68,8 @@ rfc_problem_and_imports:
       statement: "Attention routing is deterministic, auditable, and anti-downgrade by default."
     - id: "VPHI-NS-004"
       statement: "Every accepted venture-driven change increases future verifier power."
+    - id: "VPHI-NS-005"
+      statement: "Strategic mechanism disclosure is minimized through trade-secret-only controls and deny-by-default external disclosure posture."
 
   definitions:
     - term: "Venture Proving Holon (VPH)"

@@ -191,7 +191,7 @@ templates:
       <ARG1>: "$1"
 
     references[3]:
-      - path: "@documents/theory/glossary/glossary.json"
+      - path: "@documents/theory/unified-theory-v2.json"
         purpose: "REQUIRED READING: APM2 terminology and ontology."
       - path: references/<workflow>.md
         purpose: "Primary decision tree."

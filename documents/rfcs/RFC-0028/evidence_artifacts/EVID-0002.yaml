@@ -1,0 +1,13 @@
+evidence_artifact:
+  schema_version: "2026-02-09"
+  id: "EVID-0002"
+  title: "Join/revalidate identity-freshness conformance"
+  category: "POLICY_CHECK_RESULTS"
+  status: "PLANNED"
+  description: "Evidence that join/revalidate enforce proof-carrying identity and Tier2+ freshness/revocation fail-closed semantics."
+  requirement_ids:
+    - "RFC-0028::REQ-0002"
+  expected_contents:
+    - "stale freshness deny traces"
+    - "revocation-frontier deny traces"
+    - "identity proof conformance traces"

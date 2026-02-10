@@ -1,0 +1,40 @@
+requirement:
+  schema_version: "2026-02-09"
+  id: "REQ-0009"
+  title: "Projection multi-sink outage continuity and deferred replay boundedness"
+  category: "RELIABILITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    FAC authoritative progression MUST remain admissible for outage scenarios
+    bounded by `ProjectionContinuityWindowV1.outage_window_ref` when public
+    projection sinks (for example GitHub) are unavailable, rate-limited,
+    banned, adversarially divergent, or churned.
+
+    Projection intents MUST be durably buffered from ledger truth events and
+    replayed idempotently after sink recovery within
+    `ProjectionContinuityWindowV1.replay_window_ref`.
+
+    Gate admissibility MUST require valid signed `TimeAuthorityEnvelopeV1` and
+    fail closed on stale/unsigned/missing/invalid temporal authority.
+    Canonical temporal predicates for this requirement are `TP-EIO29-001`,
+    `TP-EIO29-003`, `TP-EIO29-004`, and `TP-EIO29-005`.
+  rationale: |
+    Public projection systems are availability-variable by nature. External sink
+    failure cannot be allowed to halt truth-plane continuity.
+  acceptance_criteria:
+    - "Authoritative FAC decisions remain derivable from CAS+ledger truth plane only, independent of projection sink state."
+    - "Continuity drills across multi-sink failure/churn scenarios show uninterrupted authoritative FAC progression for the full declared outage window."
+    - "Deferred projection replay converges idempotently within declared replay windows after sink recovery."
+    - "Backlog growth remains within declared retention and replay windows."
+    - "Time-authority denial tests cover missing/stale/invalid-signature/boundary-mismatch envelopes."
+    - "Unknown continuity/replay/temporal-authority state fails closed for promotion gates."
+  imported_dependencies:
+    - "RFC-0019::REQ-0010"
+    - "RFC-0019::REQ-0013"
+    - "RFC-0028::REQ-0009"
+    - "RFC-0020::REQ-0035"
+    - "RFC-0016::REQ-HTF-0003"
+    - "RFC-0016::REQ-HTF-0007"
+  evidence_ids:
+    - "EVID-0009"

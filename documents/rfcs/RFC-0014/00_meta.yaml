@@ -65,19 +65,19 @@ rfc_meta:
     laws:
       - id: LAW-03
         name: "Monotone Ledger vs. Overwritable Projection"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-10
         name: "Anti-Entropy & Merge Semantics"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-11
         name: "Conservation of Work and Idempotent Actuation"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-13
         name: "Semantic Contracting"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
       - id: LAW-15
         name: "Measurement Integrity"
-        ref: "documents/theory/laws.json"
+        ref: "documents/theory/unified-theory-v2.json"
   implementation:
     language: Rust
     edition: "2024"

@@ -59,7 +59,7 @@ rfc_meta:
       ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
       lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"
     doctrine:
-      unified_theory: "documents/theory/unified_theory.json"
+      unified_theory: "documents/theory/unified-theory-v2.json"
   implementation:
     language: Rust
     edition: "2024"

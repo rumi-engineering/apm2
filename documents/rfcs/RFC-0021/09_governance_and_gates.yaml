@@ -19,6 +19,13 @@ rfc_governance_and_gates:
         - "AAT_BIZ_ENFORCEMENT_TESTS"
       machine_predicate: "jq -e '.dominance_order_enforced == true and .htf_time_authority_enforced == true and .wall_clock_used_for_gate_truth == false and .unknown_state_fail_closed == true and .tier2plus_bypass_count == 0' evidence/rfc/RFC-0021/governance/GATE-RFC-SECURITY/summary.json"
       evidence_path: "evidence/rfc/RFC-0021/governance/GATE-RFC-SECURITY/"
+    - gate_id: "GATE-RFC-TRADE-SECRET"
+      authority_role: "AUTH_SECURITY"
+      required_evidence_categories:
+        - "IP_DISCLOSURE_CONTROL_TESTS"
+        - "GATE_ENFORCEMENT_TESTS"
+      machine_predicate: "jq -e '.trade_secret_mode == true and .patent_or_provisional_filing_attempt_count == 0 and .unapproved_external_disclosure_count == 0 and .ip_policy_snapshot_ttl_pass == true and .unknown_state_fail_closed == true' evidence/rfc/RFC-0021/governance/GATE-RFC-TRADE-SECRET/summary.json"
+      evidence_path: "evidence/rfc/RFC-0021/governance/GATE-RFC-TRADE-SECRET/"
     - gate_id: "GATE-RFC-PRODUCT"
       authority_role: "AUTH_PRODUCT"
       required_evidence_categories:
@@ -42,6 +49,7 @@ rfc_governance_and_gates:
       - "liveness_progress"
     ordered_gate_ids:
       - "GATE-RFC-SECURITY"
+      - "GATE-RFC-TRADE-SECRET"
       - "GATE-RFC-ARCHITECTURE"
       - "GATE-RFC-PRODUCT"
       - "GATE-RFC-SCALE"
@@ -52,10 +60,11 @@ rfc_governance_and_gates:
       - "signature_invalid"
       - "htf_boundary_invalid_or_stale"
       - "predicate_unknown_or_indeterminate"
+      - "ip_policy_unknown_or_violation"
 
   enforcement_ratchet:
     - phase: "DRAFT->GROUNDED"
-      requirement: "Signal->Work shadow loop proven with receipts and HTF-bound gate truth evidence"
+      requirement: "Signal->Work shadow loop proven with receipts, HTF-bound gate truth evidence, and trade-secret control evidence"
     - phase: "GROUNDED->APPROVED"
       requirement: "AAT-BIZ enforcement proven for Tier2+ required paths plus scale-envelope controls in-policy"
 

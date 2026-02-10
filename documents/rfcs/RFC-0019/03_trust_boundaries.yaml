@@ -115,6 +115,7 @@ rfc_trust_boundaries:
       description: |
         GitHub is an output target, never a source of truth.
         All GitHub writes are derived from internal ledger state.
+        Production agent runtimes are not admissible direct GitHub writers.
       actors:
         - "ProjectionWorker"
         - "GitHub API"
@@ -124,14 +125,17 @@ rfc_trust_boundaries:
         - "Ledger -> ProjectionWorker -> GitHub API -> ProjectionReceipt -> CAS+Ledger"
       authn_authz:
         authn: "GitHub token managed by projection worker"
-        authz: "Write permissions scoped to PR status/comments"
+        authz: "Projection worker only; production agent runtimes deny direct gh/GitHub API actuation"
       risks:
         - id: "RSK-TB-006"
           description: "GitHub state tampered externally"
-          mitigation: "Projection receipts enable tamper detection; ledger is truth"
+          mitigation: "Projection divergence detection + channel quarantine + replay-safe rebuild; CAS/ledger remains authoritative truth root"
         - id: "RSK-TB-007"
           description: "Duplicate projections on restart"
           mitigation: "Durable projection receipts with idempotency keys"
+        - id: "RSK-TB-015"
+          description: "Agent runtime directly invokes GitHub API/gh with privileged scope"
+          mitigation: "Capability-surface hard deny for production roles; projection isolation gate blocks and emits structured defects"
       evidence_ids: []
 
     - id: "TB-0006"

@@ -62,6 +62,7 @@ Therefore VPHI requires a separate, parallel subsystem with these invariants:
 - The VPH has **no direct promotion path** into trunk.
 - The VPH can only influence system evolution by emitting typed, signed, evidence-bound signals.
 - All resulting code changes still pass normal FAC gates plus AAT-BIZ when required.
+- All venture-origin strategic mechanisms are protected as trade secrets; patent/provisional filing pathways are non-admissible.
 
 ## 0.3 Machine-Checkable Objective Contracts (Normative)
 
@@ -75,6 +76,7 @@ Every major VPHI objective MUST declare baseline, quantitative target, HTF bound
 | `OBJ-VPHI-04` AAT-BIZ mandatory coverage | `aat_biz_required_work_coverage = 0.000` at `VPHI-BL-2026-02-05` | `aat_biz_required_work_coverage == 1.0` and `aat_biz_false_pass_count == 0` | `HTF-BND-P2-CLOSE` | Verification Council + Product Council | `jq -e '.aat_biz_required_work_coverage == 1.0 and .aat_biz_false_pass_count == 0 and .required_countermetric_coverage == 1.0 and .unknown_state_count == 0' evidence/venture/kpi/VPHI-KPI-04/summary.json` | `evidence/venture/kpi/VPHI-KPI-04/` |
 | `OBJ-VPHI-05` Strategy coupling | `strategy_claim_linkage_ratio = 0.000` at `VPHI-BL-2026-02-05` | `msc03_linkage_ratio == 1.0` and `msc05_linkage_ratio == 1.0` and `msc06_linkage_ratio == 1.0` | `HTF-BND-P3-CLOSE` | Company Board + Finance Council + Governance Council | `jq -e '.msc03_linkage_ratio == 1.0 and .msc05_linkage_ratio == 1.0 and .msc06_linkage_ratio == 1.0 and .aat_biz_required_paths_complete == true and .unknown_state_count == 0' evidence/venture/strategy_linkage/VPHI-STRAT-001/summary.json` | `evidence/venture/strategy_linkage/VPHI-STRAT-001/` |
 | `OBJ-VPHI-06` Scale-envelope admissibility | `verification_compute_share = 0.520` and `anti_entropy_backlog_ticks_p95 = 2400` at `VPHI-BL-2026-02-05` | `verification_compute_share <= 0.45`, `anti_entropy_backlog_ticks_p95 <= 1200`, and `receipt_fanout_amplification <= 1.15` | `HTF-BND-P3-ECON-CLOSE` | Runtime Council + Platform Council | `jq -e '.verification_compute_share <= 0.45 and .anti_entropy_backlog_ticks_p95 <= 1200 and .receipt_fanout_amplification <= 1.15 and .tiered_retention_manifest_complete == true and .unknown_state_count == 0' evidence/venture/scale/VPHI-SCALE-001/summary.json` | `evidence/venture/scale/VPHI-SCALE-001/` |
+| `OBJ-VPHI-07` Trade-secret control closure | `trade_secret_mode = unknown` at `VPHI-BL-2026-02-09` | `trade_secret_mode == true` and `patent_or_provisional_filing_attempt_count == 0` and `unapproved_external_disclosure_count == 0` | `HTF-BND-P1-SECURITY-CLOSE` | Security Council + Governance Council | `jq -e '.trade_secret_mode == true and .patent_or_provisional_filing_attempt_count == 0 and .unapproved_external_disclosure_count == 0 and .ip_policy_snapshot_ttl_pass == true and .unknown_state_count == 0' evidence/venture/security/VPHI-TS-001/summary.json` | `evidence/venture/security/VPHI-TS-001/` |
 
 All objective predicates fail closed: missing fields, parse errors, stale policy snapshots, invalid signatures, or unknown states are automatic deny outcomes.
 
@@ -140,6 +142,20 @@ Fail-closed scale controls:
 | `AEP_07` Anti-Goodhart posture | KPI + countermetric + independent oversight triplet requirement | `kpi_triplet_coverage == 1.0` | `evidence/venture/aat_biz/VPHI-GOODHART-001/` | proxy metric gaming |
 | `AEP_08` Recursive semantic stability | Depth-bounded composition checks | `semantic_equivalence_pass_rate_depth_le_12 >= 0.99` | `evidence/venture/semantics/VPHI-SEM-001/` | compositional semantic drift |
 
+## 0.8 Trade-Secret-Only Security Posture (Normative)
+
+VPHI operates under a strict trade-secret posture:
+- Patent, provisional, or equivalent external IP filing workflows are prohibited.
+- Unclassified or publicly routable disclosure channels are non-admissible for venture-origin strategic mechanisms.
+- Missing, stale, unsigned, or ambiguous IP-control evidence is an automatic deny for Tier2+ promotion.
+
+Required fail-closed predicate:
+
+```bash
+jq -e '.trade_secret_mode == true and .patent_or_provisional_filing_attempt_count == 0 and .unapproved_external_disclosure_count == 0 and .ip_policy_snapshot_ttl_pass == true and .unknown_state_count == 0' \
+  evidence/venture/security/VPHI-TS-001/summary.json
+```
+
 ---
 
 ## 1. Problem Statement (Normative)
@@ -162,6 +178,7 @@ Without VPHI, optimization pressure is biased toward local coding throughput and
 - latent product-market defects,
 - slow-burn drift in utility or economics,
 - metric gaming that inflates development KPIs while degrading real outcomes.
+- irreversible strategic leakage caused by public IP filing or uncontrolled disclosure paths.
 
 ### 1.3 Objective
 
@@ -375,6 +392,7 @@ AAT-BIZ verifies that changes derived from venture signals do not merely pass te
 - Countermetric policy bundle for relevant strategy claim.
 - Replay corpus for comparable historical outcomes.
 - Terminal verifier policy for business predicates.
+- Trade-secret policy snapshot and disclosure-control receipts.
 
 ### 6.3 Hypothesis Contract
 
@@ -432,6 +450,7 @@ Any missing artifact, unknown result, or stale policy is FAIL.
 - KPI gaming via proxy optimization
 - Policy downgrade to force low-scrutiny routes
 - Cross-boundary data exfiltration via business evidence artifacts
+- Strategic leakage via patent/provisional filing or unapproved external disclosure workflow
 
 ### 7.3 Required Controls
 
@@ -440,6 +459,7 @@ Any missing artifact, unknown result, or stale policy is FAIL.
 - Independent countermetric verifiers disjoint from optimization path.
 - Anti-downgrade checks for attention policy and AAT-BIZ requirements.
 - Evidence hygiene and classification enforcement before admission.
+- Trade-secret policy gate that denies patent/provisional workflows and unknown disclosure channel classes.
 
 ---
 
@@ -450,24 +470,28 @@ Any missing artifact, unknown result, or stale policy is FAIL.
 1. `GATE-VPH-SIGNAL-VALIDITY`
 - Verifies schema/signature/freshness/evidence linkage for venture signals.
 
-2. `GATE-VPH-ATTENTION-POLICY`
+2. `GATE-VPH-TRADE-SECRET-CONTROL`
+- Verifies trade-secret mode, no-patent posture, and disclosure-channel admissibility.
+
+3. `GATE-VPH-ATTENTION-POLICY`
 - Verifies deterministic routing and anti-downgrade enforcement.
 
-3. `GATE-AAT-BIZ`
+4. `GATE-AAT-BIZ`
 - Verifies business hypotheses and countermetrics for qualifying work.
 
 ### 8.2 Promotion Constraint
 
-Tier2+ work sourced from VPH signal MUST pass all three gates above in addition to existing FAC gates.
+Tier2+ work sourced from VPH signal MUST pass all four gates above in addition to existing FAC gates.
 
 ### 8.3 Waiver Policy
 
 - No waiver permitted for `GATE-VPH-SIGNAL-VALIDITY` on Tier2+.
+- No waiver permitted for `GATE-VPH-TRADE-SECRET-CONTROL`.
 - Temporary waiver allowed for `GATE-AAT-BIZ` only at Tier1 with explicit expiry and dual signoff.
 
 ### 8.4 Gate Evaluation Order and Fail-Closed Rule
 
-`GATE-VPH-SIGNAL-VALIDITY` MUST execute before `GATE-VPH-ATTENTION-POLICY`, which MUST execute before `GATE-AAT-BIZ` when required.
+`GATE-VPH-SIGNAL-VALIDITY` MUST execute before `GATE-VPH-TRADE-SECRET-CONTROL`, which MUST execute before `GATE-VPH-ATTENTION-POLICY`, which MUST execute before `GATE-AAT-BIZ` when required.
 
 A gate result is `DENY` when any of these conditions hold:
 - required artifact missing or unreadable,
@@ -484,6 +508,7 @@ Lower-precedence gates cannot override denies from higher-precedence containment
 
 ### Stage 0: Schema + Passive Ingestion
 - Deliver `VentureSignalBundleV1` and ingestion validation.
+- Enforce trade-secret policy snapshot validation and no-patent deny controls.
 - No routing impact; shadow only.
 
 ### Stage 1: Attention Routing Shadow
@@ -515,6 +540,7 @@ Lower-precedence gates cannot override denies from higher-precedence containment
 | `VPHI-KPI-04` | `0.000` | `aat_biz_required_work_coverage == 1.0` | `HTF-BND-P2-CLOSE` | Verification Council | `jq -e '.aat_biz_required_work_coverage == 1.0 and .required_countermetric_coverage == 1.0 and .aat_biz_false_pass_count == 0 and .unknown_state_count == 0' evidence/venture/kpi/VPHI-KPI-04/summary.json` | `evidence/venture/kpi/VPHI-KPI-04/` |
 | `VPHI-KPI-05` | `2` | `tier2plus_biz_source_promotions_without_aat_biz == 0` | `HTF-BND-P1-CLOSE` | Security Council + Product Council | `jq -e '.tier2plus_biz_source_promotions_without_aat_biz == 0 and .vph_direct_promotion_attempts == 0 and .authority_graph_complete == true and .unknown_state_count == 0' evidence/venture/kpi/VPHI-KPI-05/summary.json` | `evidence/venture/kpi/VPHI-KPI-05/` |
 | `VPHI-KPI-06` | `0.520` | `verification_compute_share <= 0.45` with non-regressing quality trend | `HTF-BND-P3-ECON-CLOSE` | Runtime Council + Finance Council | `jq -e '.verification_compute_share <= 0.45 and .quality_regression == false and .anti_entropy_backlog_ticks_p95 <= 1200 and .receipt_fanout_amplification <= 1.15 and .unknown_state_count == 0' evidence/venture/scale/VPHI-SCALE-001/summary.json` | `evidence/venture/scale/VPHI-SCALE-001/` |
+| `VPHI-KPI-07` | `trade_secret_mode unknown` | `trade_secret_mode == true` and `patent_or_provisional_filing_attempt_count == 0` and `unapproved_external_disclosure_count == 0` | `HTF-BND-P1-SECURITY-CLOSE` | Security Council + Governance Council | `jq -e '.trade_secret_mode == true and .patent_or_provisional_filing_attempt_count == 0 and .unapproved_external_disclosure_count == 0 and .ip_policy_snapshot_ttl_pass == true and .unknown_state_count == 0' evidence/venture/security/VPHI-TS-001/summary.json` | `evidence/venture/security/VPHI-TS-001/` |
 
 ### 10.2 Example Gate Command
 
@@ -549,6 +575,10 @@ Unknown/missing fields are hard fail.
 - Risk: narrative pressure weakens gates.
 - Mitigation: signed policy bundles and anti-downgrade invariants.
 
+6. **Strategic mechanism disclosure via IP workflow**
+- Risk: irreversible disclosure through patent/provisional submission pathways.
+- Mitigation: trade-secret-only gate, deny-by-default disclosure classifier, and mandatory defect emission on filing attempts.
+
 ---
 
 ## 12. Initial Ticket Decomposition (Normative Seed)
@@ -563,6 +593,7 @@ Unknown/missing fields are hard fail.
 8. `TCK-VPHI-0008` — Implement strategy exporter + coupling ledger for `MSC-03`, `MSC-05`, and `MSC-06`.
 9. `TCK-VPHI-0009` — Implement dominance-order plus HTF time-authority gate evaluator.
 10. `TCK-VPHI-0010` — Implement scale-envelope verifier-economics and anti-entropy controls.
+11. `TCK-VPHI-0011` — Implement trade-secret-only policy enforcement and patent-filing denial controls.
 
 ---
 
@@ -585,6 +616,7 @@ Unknown/missing fields are hard fail.
 To move from DRAFT to GROUNDED:
 
 1. At least one end-to-end shadow run from VPH signal to FAC work admission is demonstrated with receipts.
-2. `GATE-VPH-SIGNAL-VALIDITY` and `GATE-VPH-ATTENTION-POLICY` have deterministic verifier implementations.
+2. `GATE-VPH-SIGNAL-VALIDITY`, `GATE-VPH-TRADE-SECRET-CONTROL`, and `GATE-VPH-ATTENTION-POLICY` have deterministic verifier implementations.
 3. `AAT-BIZ` demonstrates at least one true-positive and one true-negative replay on historical venture signals.
 4. Security review confirms no direct promotion bypass from VPH to merge/projection paths.
+5. Security review verifies trade-secret mode enforcement with zero patent/provisional filing admissions.
