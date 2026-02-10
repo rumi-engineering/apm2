@@ -3,7 +3,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use super::ci_status::{CiStatus, ThrottledUpdater};
@@ -56,22 +56,34 @@ pub fn run_single_evidence_gate(
     log_path: &Path,
 ) -> bool {
     let started = Instant::now();
-    let output = Command::new(cmd)
+    let log_file = match File::create(log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            let duration = started.elapsed().as_secs();
+            eprintln!("failed to create log file {}: {e}", log_path.display());
+            emit_evidence_line(sha, gate_name, "FAIL", duration, log_path, None);
+            return false;
+        },
+    };
+    let stderr_file = match log_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            let duration = started.elapsed().as_secs();
+            let _ = fs::write(log_path, format!("failed to clone log handle: {e}\n"));
+            emit_evidence_line(sha, gate_name, "FAIL", duration, log_path, None);
+            return false;
+        },
+    };
+    let result = Command::new(cmd)
         .args(args)
         .current_dir(workspace_root)
-        .output();
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_file))
+        .status();
     let duration = started.elapsed().as_secs();
-    match output {
-        Ok(out) => {
-            let _ = fs::write(
-                log_path,
-                format!(
-                    "=== stdout ===\n{}\n=== stderr ===\n{}\n",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-            );
-            let passed = out.status.success();
+    match result {
+        Ok(exit_status) => {
+            let passed = exit_status.success();
             let status = if passed { "PASS" } else { "FAIL" };
             emit_evidence_line(sha, gate_name, status, duration, log_path, None);
             passed
@@ -711,7 +723,9 @@ pub fn run_evidence_gates_with_status(
     updater.force_update(&status);
 
     // Persist gate cache so future pipeline runs can reuse results.
-    let _ = gate_cache.save();
+    if let Err(e) = gate_cache.save() {
+        eprintln!("WARNING: gate cache save failed: {e}");
+    }
 
     if let Some(file) = projection_log {
         for line in &evidence_lines {

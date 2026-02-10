@@ -397,7 +397,6 @@ fn ecosystem_config_divergence_watchdog_section() {
         github_repo = "apm2"
         trunk_branch = "main"
         github_api_url = "https://api.github.com"
-        github_token_env = "$GITHUB_TOKEN"
         poll_interval_secs = 60
     "#;
 
@@ -410,14 +409,6 @@ fn ecosystem_config_divergence_watchdog_section() {
     assert_eq!(config.daemon.divergence_watchdog.github_repo, "apm2");
     assert_eq!(config.daemon.divergence_watchdog.trunk_branch, "main");
     assert_eq!(config.daemon.divergence_watchdog.poll_interval_secs, 60);
-    assert_eq!(
-        config
-            .daemon
-            .divergence_watchdog
-            .github_token_env
-            .as_deref(),
-        Some("$GITHUB_TOKEN")
-    );
 }
 
 /// UT-00393-11: Ecosystem config with `divergence_watchdog` disabled

@@ -31,7 +31,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use super::github_sync::{GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter};
+use super::factory::ProjectionTarget;
+use super::github_sync::ProjectionAdapter;
 use super::projection_receipt::ProjectedStatus;
 use crate::protocol::dispatch::SignedLedgerEvent;
 
@@ -1056,10 +1057,8 @@ pub struct ProjectionWorkerConfig {
     pub poll_interval: Duration,
     /// Maximum events to process per batch.
     pub batch_size: usize,
-    /// Whether to enable GitHub projection.
-    pub github_enabled: bool,
-    /// GitHub API configuration (if enabled).
-    pub github_config: Option<GitHubAdapterConfig>,
+    /// Optional external projection target.
+    pub projection_target: Option<ProjectionTarget>,
 }
 
 impl Default for ProjectionWorkerConfig {
@@ -1067,8 +1066,7 @@ impl Default for ProjectionWorkerConfig {
         Self {
             poll_interval: Duration::from_secs(1),
             batch_size: 100,
-            github_enabled: false,
-            github_config: None,
+            projection_target: None,
         }
     }
 }
@@ -1094,16 +1092,16 @@ impl ProjectionWorkerConfig {
         self
     }
 
-    /// Enables GitHub projection with the given configuration.
+    /// Sets the projection target surface.
     #[must_use]
-    pub fn with_github(mut self, config: GitHubAdapterConfig) -> Self {
-        self.github_enabled = true;
-        self.github_config = Some(config);
+    pub fn with_projection_target(mut self, target: ProjectionTarget) -> Self {
+        self.projection_target = Some(target);
         self
     }
 }
 
-/// The projection worker that tails the ledger and projects to GitHub.
+/// The projection worker that tails the ledger and projects to configured
+/// surfaces.
 pub struct ProjectionWorker {
     config: ProjectionWorkerConfig,
     work_index: WorkIndex,
@@ -1113,7 +1111,7 @@ pub struct ProjectionWorker {
     work_pr_tailer: LedgerTailer,
     /// Tailer for `review_receipt_recorded` events.
     review_tailer: LedgerTailer,
-    adapter: Option<GitHubProjectionAdapter>,
+    adapter: Option<Box<dyn ProjectionAdapter>>,
     /// Shutdown flag.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1150,12 +1148,13 @@ impl ProjectionWorker {
 
         // NOTE: Adapter is NOT created here to avoid fail-open issues.
         // The adapter MUST be injected via set_adapter() with a properly
-        // configured GitHubProjectionAdapter that uses:
+        // configured projection adapter that uses:
         // 1. A persistent signer from the daemon's key material
-        // 2. The real HTTP client (not mock) for production
+        // 2. Surface-scoped credentials from approved authority path
+        // 3. The real HTTP client (not mock) for production
         //
-        // If github_enabled is true but no adapter is set, projection will
-        // log warnings but not fail-open to GitHub.
+        // If projection_target is set but no adapter is injected, projection
+        // logs warnings but does not fail-open.
         let adapter = None;
 
         Ok(Self {
@@ -1181,22 +1180,22 @@ impl ProjectionWorker {
         &self.work_index
     }
 
-    /// Sets the GitHub projection adapter.
+    /// Sets the projection adapter.
     ///
     /// # Security
     ///
     /// The adapter MUST be created with:
     /// 1. A persistent signer from the daemon's key material (NOT random)
-    /// 2. A properly configured `GitHubAdapterConfig` with API token
+    /// 2. A surface-scoped configuration with API token
     /// 3. A real HTTP client for production (use `new()`, not `new_mock()`)
     ///
     /// Failing to provide a proper adapter will result in projections being
     /// skipped (fail-safe, not fail-open).
-    pub fn set_adapter(&mut self, adapter: GitHubProjectionAdapter) {
+    pub fn set_adapter(&mut self, adapter: Box<dyn ProjectionAdapter>) {
         self.adapter = Some(adapter);
     }
 
-    /// Returns whether a GitHub adapter is configured.
+    /// Returns whether a projection adapter is configured.
     #[must_use]
     pub const fn has_adapter(&self) -> bool {
         self.adapter.is_some()
@@ -1214,7 +1213,11 @@ impl ProjectionWorker {
         info!(
             poll_interval_ms = self.config.poll_interval.as_millis() as u64,
             batch_size = self.config.batch_size,
-            github_enabled = self.config.github_enabled,
+            projection_target = self
+                .config
+                .projection_target
+                .as_ref()
+                .map_or_else(|| "none".to_string(), ProjectionTarget::target_id),
             "Projection worker starting"
         );
 
@@ -1758,13 +1761,13 @@ impl ProjectionWorker {
             "Processing review receipt for projection"
         );
 
-        // Project to GitHub if adapter is configured
+        // Project to configured surface if adapter is configured.
         if let Some(ref adapter) = self.adapter {
             // Major fix: Thread blocking in async context
             // Register commit SHA for status projection using async method with
             // spawn_blocking
             adapter
-                .register_commit_sha_async(changeset_digest, pr_metadata.head_sha.clone())
+                .register_commit_sha(changeset_digest, &pr_metadata.head_sha)
                 .await
                 .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
 
@@ -1809,7 +1812,8 @@ impl ProjectionWorker {
                 receipt_id = %projection_receipt.receipt_id,
                 work_id = %work_id,
                 status = %projection_receipt.projected_status,
-                "Projected status to GitHub"
+                provider = %adapter.provider_name(),
+                "Projected status to external surface"
             );
 
             // Post PR comment (idempotent - check before posting)
@@ -1844,14 +1848,8 @@ impl ProjectionWorker {
                     "Skipping comment post (already posted - idempotency)"
                 );
             } else {
-                let comment_body = GitHubProjectionAdapter::<
-                    super::divergence_watchdog::SystemTimeSource,
-                >::format_review_comment(
-                    receipt_id, status, summary
-                );
-
                 adapter
-                    .post_comment(pr_metadata.pr_number, &comment_body)
+                    .post_review_comment(pr_metadata.pr_number, receipt_id, status, summary)
                     .await
                     .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
 
@@ -1899,13 +1897,14 @@ impl ProjectionWorker {
                     receipt_id = %receipt_id,
                     work_id = %work_id,
                     pr_number = pr_metadata.pr_number,
-                    "Posted review comment to GitHub PR"
+                    provider = %adapter.provider_name(),
+                    "Posted review comment to projection surface"
                 );
             }
         } else {
             debug!(
                 work_id = %work_id,
-                "GitHub projection disabled, skipping"
+                "Projection adapter unavailable, skipping"
             );
         }
 
@@ -2073,7 +2072,7 @@ mod tests {
 
         assert_eq!(config.poll_interval, Duration::from_secs(5));
         assert_eq!(config.batch_size, 50);
-        assert!(!config.github_enabled);
+        assert!(config.projection_target.is_none());
     }
 
     #[test]
@@ -2089,11 +2088,16 @@ mod tests {
     }
 
     #[test]
-    fn test_projection_worker_with_github_config() {
+    fn test_projection_worker_with_github_adapter() {
         let conn = create_test_db();
-        let github_config =
-            GitHubAdapterConfig::new("https://api.github.com", "owner", "repo").unwrap();
-        let config = ProjectionWorkerConfig::new().with_github(github_config.clone());
+        let github_config = super::super::github_sync::GitHubAdapterConfig::new(
+            "https://api.github.com",
+            "owner",
+            "repo",
+        )
+        .unwrap();
+        let target = ProjectionTarget::github("https://api.github.com", "owner", "repo");
+        let config = ProjectionWorkerConfig::new().with_projection_target(target);
 
         let worker = ProjectionWorker::new(Arc::clone(&conn), config);
         assert!(worker.is_ok());
@@ -2104,8 +2108,10 @@ mod tests {
 
         // Inject mock adapter for testing
         let signer = apm2_core::crypto::Signer::generate();
-        let adapter = GitHubProjectionAdapter::new_mock(signer, github_config).unwrap();
-        worker.set_adapter(adapter);
+        let adapter =
+            super::super::github_sync::GitHubProjectionAdapter::new_mock(signer, github_config)
+                .unwrap();
+        worker.set_adapter(Box::new(adapter));
         assert!(worker.has_adapter());
     }
 

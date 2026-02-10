@@ -26,7 +26,7 @@ flowchart TD
 
 ```yaml
 command_template: |
-  gh pr comment $PR_URL --body "$(cat <<'EOF'
+  apm2 fac pr comment $PR_URL --body "$(cat <<'EOF'
   ## Code Quality Review
 
   **QCP:** {qcp_status} — {qcp_justification}

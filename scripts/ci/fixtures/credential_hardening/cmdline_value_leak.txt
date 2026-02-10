@@ -1,1 +1,0 @@
-bash scripts/ci/fac_projection_gate.sh ghs_leak_fixture_token_123456789012345678901234567890

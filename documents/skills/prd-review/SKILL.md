@@ -55,7 +55,7 @@ references[17]:
     purpose: "CLI command reference."
   - path: ../agent-native-software/SKILL.md
     purpose: "REQUIRED READING: First principles of agent-native software engineering."
-  - path: ../../security/AGENTS.cac.json
+  - path: ../../security/AGESECURITY_POLICYNTS.cac.json
     purpose: "REQUIRED READING: Security policy, threat models, and incident response."
 
 decision_tree:

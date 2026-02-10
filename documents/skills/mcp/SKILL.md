@@ -1,3 +1,8 @@
+---
+name: mcp
+description: Never use MCP.
+---
+
 # MCP Low-Level Primitive (Rust) — SKILL.md
 
 ## Purpose

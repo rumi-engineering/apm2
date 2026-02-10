@@ -16,8 +16,8 @@
 //!     |
 //!     +-- MockTokenProvider (for testing)
 //!     |
-//!     +-- GitHubTokenProvider (TODO: real implementation)
-//!         Requires GitHub App credentials infrastructure.
+//!     +-- GitHubAppTokenProvider
+//!         Mints installation tokens using GitHub App JWT exchange.
 //!         See: https://docs.github.com/en/apps/creating-github-apps
 //! ```
 //!
@@ -25,15 +25,18 @@
 //!
 //! - Raw tokens are NEVER stored in the ledger
 //! - Tokens are hashed with SHA-256 before storage
-//! - Token storage in OS keyring is recommended (not implemented here)
+//! - App private keys load from keyring or runtime env
 //! - Short TTLs are enforced based on risk tier
 //! - Per-episode rate limits prevent token churn attacks (LAW-06)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use secrecy::SecretString;
+use chrono::{DateTime, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 
 use super::MAX_SCOPES_PER_LEASE;
 use super::error::GitHubError;
@@ -204,6 +207,289 @@ pub trait TokenProvider: Send + Sync {
 
     /// Returns the provider name for logging.
     fn name(&self) -> &'static str;
+}
+
+const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
+const DEFAULT_GITHUB_APP_KEYRING_SERVICE: &str = "apm2.github.app";
+
+/// Production token provider using GitHub App JWT exchange.
+pub struct GitHubAppTokenProvider {
+    app_id: String,
+    private_key: SecretString,
+    api_base_url: String,
+    http_client: reqwest::blocking::Client,
+}
+
+impl GitHubAppTokenProvider {
+    /// Creates a provider with the default GitHub API base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the app id or private key is empty, or the
+    /// HTTP client cannot be initialized.
+    pub fn new(app_id: impl Into<String>, private_key: SecretString) -> Result<Self, GitHubError> {
+        Self::new_with_api_base_url(app_id, private_key, DEFAULT_GITHUB_API_BASE_URL)
+    }
+
+    /// Creates a provider with an explicit API base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when required values are missing or the HTTP client
+    /// cannot be initialized.
+    pub fn new_with_api_base_url(
+        app_id: impl Into<String>,
+        private_key: SecretString,
+        api_base_url: impl Into<String>,
+    ) -> Result<Self, GitHubError> {
+        let app_id = app_id.into();
+        if app_id.trim().is_empty() {
+            return Err(GitHubError::InvalidInput {
+                field: "app_id".to_string(),
+                reason: "must not be empty".to_string(),
+            });
+        }
+
+        if private_key.expose_secret().trim().is_empty() {
+            return Err(GitHubError::InvalidInput {
+                field: "private_key".to_string(),
+                reason: "must not be empty".to_string(),
+            });
+        }
+
+        let api_base_url = api_base_url.into();
+        if api_base_url.trim().is_empty() {
+            return Err(GitHubError::InvalidInput {
+                field: "api_base_url".to_string(),
+                reason: "must not be empty".to_string(),
+            });
+        }
+
+        let http_client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|error| GitHubError::HttpError {
+                status: None,
+                message: error.to_string(),
+            })?;
+
+        Ok(Self {
+            app_id,
+            private_key,
+            api_base_url,
+            http_client,
+        })
+    }
+
+    /// Loads a private key from keyring storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if keyring access fails or the key is missing.
+    pub fn load_private_key_from_keyring(
+        service: &str,
+        account: &str,
+    ) -> Result<SecretString, GitHubError> {
+        let entry =
+            keyring::Entry::new(service, account).map_err(|error| GitHubError::Keyring {
+                message: error.to_string(),
+            })?;
+        let private_key = entry.get_password().map_err(|error| GitHubError::Keyring {
+            message: error.to_string(),
+        })?;
+        if private_key.trim().is_empty() {
+            return Err(GitHubError::Keyring {
+                message: "private key entry is empty".to_string(),
+            });
+        }
+        Ok(SecretString::from(private_key))
+    }
+
+    /// Resolves a private key from environment first, then keyring.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither source is available.
+    pub fn load_private_key_from_env_or_keyring(
+        app_id: &str,
+        env_var: &str,
+        keyring_service: Option<&str>,
+        keyring_account: Option<&str>,
+    ) -> Result<SecretString, GitHubError> {
+        if let Ok(private_key) = std::env::var(env_var) {
+            if !private_key.trim().is_empty() {
+                return Ok(SecretString::from(private_key));
+            }
+        }
+
+        let service = keyring_service.unwrap_or(DEFAULT_GITHUB_APP_KEYRING_SERVICE);
+        let default_account = format!("app-{app_id}");
+        let account = keyring_account.unwrap_or(default_account.as_str());
+        Self::load_private_key_from_keyring(service, account)
+    }
+
+    fn permissions_for_scopes(scopes: &[GitHubScope]) -> BTreeMap<String, String> {
+        let mut permissions = BTreeMap::new();
+        for scope in scopes {
+            match scope {
+                GitHubScope::ContentsRead => {
+                    Self::set_permission(&mut permissions, "contents", "read");
+                },
+                GitHubScope::MetadataRead => {
+                    Self::set_permission(&mut permissions, "metadata", "read");
+                },
+                GitHubScope::PullRequestsWrite => {
+                    Self::set_permission(&mut permissions, "pull_requests", "write");
+                },
+                GitHubScope::ChecksWrite => {
+                    Self::set_permission(&mut permissions, "checks", "write");
+                },
+                GitHubScope::StatusesWrite => {
+                    Self::set_permission(&mut permissions, "statuses", "write");
+                },
+                GitHubScope::ContentsWrite => {
+                    Self::set_permission(&mut permissions, "contents", "write");
+                },
+                GitHubScope::AdminRead => {
+                    Self::set_permission(&mut permissions, "administration", "read");
+                },
+                GitHubScope::ReleasesWrite => {
+                    // GitHub release operations are covered by `contents:write`.
+                    Self::set_permission(&mut permissions, "contents", "write");
+                },
+            }
+        }
+        permissions
+    }
+
+    fn set_permission(permissions: &mut BTreeMap<String, String>, name: &str, level: &str) {
+        let current = permissions.get(name).map_or("none", String::as_str);
+        let next = if current == "write" || level == "write" {
+            "write"
+        } else {
+            "read"
+        };
+        permissions.insert(name.to_string(), next.to_string());
+    }
+
+    fn generate_jwt(&self, now: u64) -> Result<String, GitHubError> {
+        #[derive(Debug, Serialize)]
+        struct Claims {
+            iat: u64,
+            exp: u64,
+            iss: String,
+        }
+
+        let claims = Claims {
+            iat: now.saturating_sub(60),
+            exp: now + 600,
+            iss: self.app_id.clone(),
+        };
+        let key = EncodingKey::from_rsa_pem(self.private_key.expose_secret().as_bytes()).map_err(
+            |error| GitHubError::Jwt {
+                message: error.to_string(),
+            },
+        )?;
+
+        jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).map_err(|error| {
+            GitHubError::Jwt {
+                message: error.to_string(),
+            }
+        })
+    }
+}
+
+impl TokenProvider for GitHubAppTokenProvider {
+    fn mint_token(&self, request: &TokenRequest) -> Result<TokenResponse, GitHubError> {
+        #[derive(Debug, Serialize)]
+        struct InstallationTokenRequest {
+            permissions: BTreeMap<String, String>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct InstallationTokenResponse {
+            token: String,
+            expires_at: String,
+        }
+
+        request.validate()?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| GitHubError::TokenProviderError {
+                message: error.to_string(),
+            })?
+            .as_secs();
+        let jwt = self.generate_jwt(now)?;
+        let permissions = Self::permissions_for_scopes(&request.scopes);
+        let payload = InstallationTokenRequest { permissions };
+        let endpoint = format!(
+            "{}/app/installations/{}/access_tokens",
+            self.api_base_url.trim_end_matches('/'),
+            request.installation_id
+        );
+
+        let response = self
+            .http_client
+            .post(endpoint)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "apm2-core/github-app-token-provider")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(jwt)
+            .json(&payload)
+            .send()
+            .map_err(|error| GitHubError::HttpError {
+                status: None,
+                message: error.to_string(),
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let message = response
+                .text()
+                .unwrap_or_else(|_| "unable to read token response body".to_string());
+            return Err(GitHubError::HttpError {
+                status: Some(status.as_u16()),
+                message,
+            });
+        }
+
+        let payload: InstallationTokenResponse =
+            response
+                .json()
+                .map_err(|error| GitHubError::TokenProviderError {
+                    message: error.to_string(),
+                })?;
+
+        let expires_at = DateTime::parse_from_rfc3339(&payload.expires_at)
+            .map_err(|error| GitHubError::TimeParse {
+                value: payload.expires_at.clone(),
+                message: error.to_string(),
+            })?
+            .with_timezone(&Utc)
+            .timestamp();
+        let expires_at = u64::try_from(expires_at).map_err(|_| GitHubError::TimeParse {
+            value: payload.expires_at.clone(),
+            message: "timestamp is before unix epoch".to_string(),
+        })?;
+
+        let effective_expiry = expires_at.min(now + request.effective_ttl().as_secs());
+        let token_hash = TokenResponse::hash_token(&payload.token);
+
+        Ok(TokenResponse {
+            token: SecretString::from(payload.token),
+            token_hash,
+            expires_at: effective_expiry,
+            scopes: request.scopes.clone(),
+            app_id: self.app_id.clone(),
+            installation_id: request.installation_id.clone(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "github-app"
+    }
 }
 
 /// Mock token provider for testing.
@@ -738,5 +1024,46 @@ mod unit_tests {
         // Should not fail on scope count
         let result = request.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_github_app_token_provider_rejects_empty_values() {
+        let provider = GitHubAppTokenProvider::new("", SecretString::from("key"));
+        assert!(matches!(
+            provider,
+            Err(GitHubError::InvalidInput { field, .. }) if field == "app_id"
+        ));
+
+        let provider = GitHubAppTokenProvider::new("2715660", SecretString::from(" "));
+        assert!(matches!(
+            provider,
+            Err(GitHubError::InvalidInput { field, .. }) if field == "private_key"
+        ));
+    }
+
+    #[test]
+    fn test_github_app_permissions_scope_write_wins() {
+        let permissions = GitHubAppTokenProvider::permissions_for_scopes(&[
+            GitHubScope::ContentsRead,
+            GitHubScope::ContentsWrite,
+            GitHubScope::MetadataRead,
+        ]);
+        assert_eq!(
+            permissions.get("contents").map(String::as_str),
+            Some("write")
+        );
+        assert_eq!(
+            permissions.get("metadata").map(String::as_str),
+            Some("read")
+        );
+    }
+
+    #[test]
+    fn test_github_app_generate_jwt_invalid_pem() {
+        let provider =
+            GitHubAppTokenProvider::new("2715660", SecretString::from("not-a-valid-pem"))
+                .expect("provider should construct with non-empty values");
+        let result = provider.generate_jwt(1_700_000_000);
+        assert!(matches!(result, Err(GitHubError::Jwt { .. })));
     }
 }

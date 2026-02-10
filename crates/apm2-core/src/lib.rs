@@ -56,6 +56,7 @@ pub mod economics;
 pub mod events;
 pub mod evidence;
 pub mod fac;
+pub mod forge;
 pub mod github;
 pub mod health;
 pub mod htf;

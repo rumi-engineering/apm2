@@ -27,7 +27,7 @@ references[12]:
     purpose: "REQUIRED READING: APM2 terminology and ontology."
   - path: "@documents/reviews/CI_EXPECTATIONS.md"
     purpose: "Repository merge gate and verification expectations."
-  - path: "@documents/security/AGENTS.cac.json"
+  - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security posture and fail-closed defaults for ambiguous trust state."
   - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
     purpose: "RS-15: explicit error channels and no silent fallback."

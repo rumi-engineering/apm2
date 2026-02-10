@@ -87,6 +87,8 @@ axum.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 tower.workspace = true
+reqwest.workspace = true
+jsonwebtoken.workspace = true
 
 # CLI (optional, for clap introspection)
 clap = { workspace = true, optional = true }

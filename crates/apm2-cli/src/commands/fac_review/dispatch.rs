@@ -67,12 +67,17 @@ fn read_fresh_pending_dispatch_for_home(
         return Ok(None);
     };
 
-    let age = Utc::now()
+    let dominated = Utc::now()
         .signed_duration_since(entry.started_at)
         .to_std()
-        .unwrap_or_default();
-    if age > DISPATCH_PENDING_TTL {
-        let _ = fs::remove_file(&path);
+        .map_or(true, |age| age > DISPATCH_PENDING_TTL);
+    if dominated {
+        if let Err(e) = fs::remove_file(&path) {
+            eprintln!(
+                "WARNING: failed to remove dispatch marker {}: {e}",
+                path.display()
+            );
+        }
         return Ok(None);
     }
 
@@ -80,7 +85,12 @@ fn read_fresh_pending_dispatch_for_home(
         return Ok(Some(entry));
     }
 
-    let _ = fs::remove_file(&path);
+    if let Err(e) = fs::remove_file(&path) {
+        eprintln!(
+            "WARNING: failed to remove dispatch marker {}: {e}",
+            path.display()
+        );
+    }
     Ok(None)
 }
 

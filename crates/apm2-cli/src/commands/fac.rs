@@ -197,6 +197,13 @@ pub enum FacSubcommand {
     /// parallel `security + quality` orchestration, model fallback, and
     /// NDJSON telemetry under `~/.apm2`.
     Review(ReviewArgs),
+
+    /// GitHub PR surface with hard deny for direct runtime authority.
+    ///
+    /// Per RFC-0028/RFC-0029 hard-cut policy, direct GitHub actuation from
+    /// agent-runtime is denied. Subcommands return structured deny defects,
+    /// except credential bootstrap (`auth-setup`).
+    Pr(super::fac_pr::PrArgs),
 }
 
 /// Arguments for `apm2 fac gates`.
@@ -839,6 +846,7 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path, session_socket: &Path) 
                 fac_review::run_tail(tail_args.lines, tail_args.follow)
             },
         },
+        FacSubcommand::Pr(args) => super::fac_pr::run_pr(args, json_output),
     }
 }
 

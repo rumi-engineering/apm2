@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::commands::fac_pr::{GitHubPrClient, PrListArgs};
 use crate::exit_codes::codes as exit_codes;
 
 // ── Ticket YAML parsing ─────────────────────────────────────────────────────
@@ -93,91 +94,6 @@ fn build_pr_body(meta: &TicketMeta) -> String {
     body
 }
 
-// ── PR helpers ───────────────────────────────────────────────────────────────
-
-/// Look up an existing PR number for the given branch, or return 0 if none.
-fn find_existing_pr(repo: &str, branch: &str) -> u32 {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--head",
-            branch,
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
-        ])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let num_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            num_str.parse::<u32>().unwrap_or(0)
-        },
-        _ => 0,
-    }
-}
-
-/// Create a new PR and return the PR number on success.
-fn create_pr(repo: &str, title: &str, body: &str) -> Result<u32, String> {
-    let output = Command::new("gh")
-        .args([
-            "pr", "create", "--repo", repo, "--title", title, "--body", body, "--base", "main",
-        ])
-        .output()
-        .map_err(|e| format!("failed to execute gh pr create: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr create failed: {stderr}"));
-    }
-
-    // gh pr create prints the PR URL on stdout; extract the number.
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let pr_number = url
-        .rsplit('/')
-        .next()
-        .and_then(|s| s.parse::<u32>().ok())
-        .ok_or_else(|| format!("could not parse PR number from gh output: {url}"))?;
-
-    Ok(pr_number)
-}
-
-/// Update an existing PR's title and body.
-fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), String> {
-    let pr_ref = pr_number.to_string();
-    let output = Command::new("gh")
-        .args([
-            "pr", "edit", &pr_ref, "--repo", repo, "--title", title, "--body", body,
-        ])
-        .output()
-        .map_err(|e| format!("failed to execute gh pr edit: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr edit failed: {stderr}"));
-    }
-    Ok(())
-}
-
-/// Enable auto-merge (squash) on a PR.
-fn enable_auto_merge(repo: &str, pr_number: u32) -> Result<(), String> {
-    let pr_ref = pr_number.to_string();
-    let output = Command::new("gh")
-        .args(["pr", "merge", &pr_ref, "--repo", repo, "--auto", "--squash"])
-        .output()
-        .map_err(|e| format!("failed to execute gh pr merge --auto: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Auto-merge may already be enabled — treat as non-fatal warning.
-        eprintln!("WARNING: gh pr merge --auto: {stderr}");
-    }
-    Ok(())
-}
-
 // ── run_push entry point ─────────────────────────────────────────────────────
 
 pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&Path>) -> u8 {
@@ -235,15 +151,45 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
         },
     };
 
+    let client = match GitHubPrClient::new(repo) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("ERROR: failed to initialize forge provider: {error}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
     // Step 2: create or update PR.
-    let pr_number = find_existing_pr(repo, &branch);
-    let pr_number = if pr_number == 0 {
+    let existing_pr = match client.list(&PrListArgs {
+        head: Some(branch.clone()),
+        ..PrListArgs::default()
+    }) {
+        Ok(entries) => entries.first().map(|e| e.number),
+        Err(e) => {
+            eprintln!("ERROR: failed to list PRs: {e}");
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+
+    let pr_number = if let Some(pr_num) = existing_pr {
+        // PR exists — update body if ticket metadata available.
+        if let Some(ref meta) = ticket_meta {
+            let title = build_pr_title(meta);
+            let body = build_pr_body(meta);
+            if let Err(e) = client.update_pr(pr_num, &title, &body) {
+                eprintln!("WARNING: {e}");
+            } else {
+                eprintln!("fac push: updated PR #{pr_num}");
+            }
+        }
+        pr_num
+    } else {
         // No existing PR — create one.
         let (title, body) = ticket_meta.as_ref().map_or_else(
             || (branch.clone(), String::new()),
             |meta| (build_pr_title(meta), build_pr_body(meta)),
         );
-        match create_pr(repo, &title, &body) {
+        match client.create_pr(&title, &body, &branch, "main") {
             Ok(num) => {
                 eprintln!("fac push: created PR #{num}");
                 num
@@ -253,22 +199,10 @@ pub fn run_push(repo: &str, remote: &str, branch: Option<&str>, ticket: Option<&
                 return exit_codes::GENERIC_ERROR;
             },
         }
-    } else {
-        // PR exists — update body if ticket metadata available.
-        if let Some(ref meta) = ticket_meta {
-            let title = build_pr_title(meta);
-            let body = build_pr_body(meta);
-            if let Err(e) = update_pr(repo, pr_number, &title, &body) {
-                eprintln!("WARNING: {e}");
-            } else {
-                eprintln!("fac push: updated PR #{pr_number}");
-            }
-        }
-        pr_number
     };
 
-    // Step 3: enable auto-merge.
-    if let Err(e) = enable_auto_merge(repo, pr_number) {
+    // Step 3: enable auto-merge (now properly propagates errors).
+    if let Err(e) = client.auto_merge(pr_number) {
         eprintln!("WARNING: auto-merge enable failed: {e}");
     } else {
         eprintln!("fac push: auto-merge enabled on PR #{pr_number}");

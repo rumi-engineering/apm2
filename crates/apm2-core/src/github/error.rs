@@ -95,6 +95,38 @@ pub enum GitHubError {
         message: String,
     },
 
+    /// Keyring interaction failed.
+    #[error("keyring error: {message}")]
+    Keyring {
+        /// Error message from keyring backend.
+        message: String,
+    },
+
+    /// JWT signing/encoding failed.
+    #[error("JWT error: {message}")]
+    Jwt {
+        /// Error message from JWT library.
+        message: String,
+    },
+
+    /// HTTP request/response error from GitHub API calls.
+    #[error("HTTP error (status={status:?}): {message}")]
+    HttpError {
+        /// Optional HTTP status code.
+        status: Option<u16>,
+        /// Error payload or transport message.
+        message: String,
+    },
+
+    /// Failed to parse a time value.
+    #[error("time parse error for '{value}': {message}")]
+    TimeParse {
+        /// Original unparsed value.
+        value: String,
+        /// Parsing error detail.
+        message: String,
+    },
+
     /// Too many scopes requested.
     #[error("too many scopes requested: {count} (max: {max})")]
     TooManyScopes {

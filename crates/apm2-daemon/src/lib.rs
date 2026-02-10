@@ -39,8 +39,6 @@
 //! - [`projection`]: FAC projection adapters for external system sync
 //! - [`protocol`]: UDS protocol and message framing
 //! - [`session`]: Session handling with context firewall integration
-//! - [`hmp`]: Holonic Message Protocol (HMP) — digest-first channels and
-//!   admission receipt semantics for RFC-0020 (TCK-00380)
 //! - [`hsi_contract`]: HSI Contract Manifest V1 for RFC-0020 (TCK-00347)
 //! - [`identity`]: Canonical identity identifiers (`PublicKeyIdV1`,
 //!   `KeySetIdV1`, `CellIdV1`, `HolonIdV1`) for RFC-0020
@@ -51,7 +49,6 @@ pub mod episode;
 pub mod evidence;
 pub mod gate;
 pub mod governance;
-pub mod hmp;
 pub mod hsi_contract;
 pub mod htf;
 pub mod identity;

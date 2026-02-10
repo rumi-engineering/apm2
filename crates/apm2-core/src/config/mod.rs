@@ -300,7 +300,7 @@ pub struct AdapterRotationProfileConfig {
 ///
 /// Controls the projection worker that posts review results to GitHub.
 /// Disabled by default; enable by setting `enabled = true` and providing
-/// GitHub API credentials.
+/// GitHub repository coordinates.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectionConfig {
@@ -319,16 +319,6 @@ pub struct ProjectionConfig {
     /// Repository name (e.g., "apm2").
     #[serde(default)]
     pub github_repo: String,
-
-    /// GitHub API token (stored as environment variable reference).
-    ///
-    /// For security, this should reference an environment variable,
-    /// e.g., `$GITHUB_TOKEN` or use a credential profile.
-    ///
-    /// **Required when `enabled = true`**: Missing token is a fatal error
-    /// to prevent fail-open security issues (TCK-00322 security review).
-    #[serde(default)]
-    pub github_token_env: Option<String>,
 
     /// Poll interval in seconds for ledger tailer.
     #[serde(default = "default_projection_poll_interval")]
@@ -411,14 +401,6 @@ pub struct DivergenceWatchdogSection {
     #[serde(default = "default_github_api_url")]
     pub github_api_url: String,
 
-    /// Environment variable name containing the GitHub API token.
-    ///
-    /// For security, the token itself is NOT stored in the config file.
-    /// Instead, provide the name of an environment variable that holds
-    /// the token (e.g., `$GITHUB_TOKEN`).
-    #[serde(default)]
-    pub github_token_env: Option<String>,
-
     /// Poll interval in seconds for divergence checks.
     /// Default: 30 seconds. Minimum: 1 second. Maximum: 3600 seconds.
     #[serde(default = "default_divergence_poll_interval")]
@@ -464,7 +446,6 @@ impl Default for DivergenceWatchdogSection {
             github_repo: String::new(),
             trunk_branch: default_trunk_branch(),
             github_api_url: default_github_api_url(),
-            github_token_env: None,
             poll_interval_secs: default_divergence_poll_interval(),
         }
     }

@@ -8,22 +8,22 @@ notes:
   - "Commands labeled side_effect=true modify external state."
   - "Use `apm2 fac push` as the canonical push workflow — it pushes, creates/updates the PR, enables auto-merge, and reviews auto-start via CI."
   - "Prefer FAC-native `apm2 fac review ...` commands for reviewer lifecycle state and `apm2 fac restart` for recovery operations."
-  - "Use direct `gh` commands only for surfaces that FAC does not yet expose (for example full review comment bodies)."
+  - "All GitHub interactions are available via `apm2 fac pr` subcommands — no direct `gh` usage required."
   - "Do NOT manually dispatch reviews after pushing — the Forge Admission Cycle CI workflow auto-dispatches them."
 
-commands[18]:
+commands[17]:
   - name: resolve_repo_root
     command: "timeout 10s git rev-parse --show-toplevel"
     purpose: "Discover repository root."
     side_effect: false
 
   - name: auth_check
-    command: "timeout 30s gh auth status"
+    command: "timeout 30s apm2 fac pr auth-check"
     purpose: "Verify GitHub auth before dispatch."
     side_effect: false
 
   - name: list_open_prs
-    command: "timeout 30s gh pr list --repo guardian-intelligence/apm2 --state open --json number --jq '.[].number'"
+    command: "timeout 30s apm2 fac pr list --state open --json number"
     purpose: "Discover open PR scope when user did not supply PR numbers."
     side_effect: false
 
@@ -33,8 +33,8 @@ commands[18]:
     side_effect: false
 
   - name: pr_state_json
-    command: "timeout 30s gh pr view <PR_NUMBER> --repo guardian-intelligence/apm2 --json state,mergeable,headRefOid,isDraft,statusCheckRollup"
-    purpose: "Fetch PR metadata (mergeable/state/head SHA) that is not yet emitted by FAC review projection."
+    command: "timeout 30s apm2 fac pr view <PR_NUMBER> --json state,mergeable,headRefOid,isDraft,statusCheckRollup"
+    purpose: "Fetch PR metadata (mergeable/state/head SHA)."
     side_effect: false
 
   - name: fac_review_project
@@ -43,8 +43,8 @@ commands[18]:
     side_effect: false
 
   - name: commit_statuses
-    command: "timeout 30s gh api repos/guardian-intelligence/apm2/commits/<HEAD_SHA>/status"
-    purpose: "Fallback cross-check of projected status contexts on GitHub for exact HEAD SHA binding."
+    command: "timeout 30s apm2 fac pr read-comments <PR_NUMBER>"
+    purpose: "Cross-check projected status contexts on GitHub for exact HEAD SHA binding."
     side_effect: false
 
   - name: restart_fac_via_apm2
@@ -54,12 +54,7 @@ commands[18]:
 
   - name: fac_push
     command: "timeout 120s apm2 fac push --ticket <TICKET_YAML>"
-    purpose: "Canonical push workflow: pushes branch, creates/updates PR from ticket YAML, enables auto-merge. Reviews auto-start via CI. Use this instead of raw git push + manual review dispatch."
-    side_effect: true
-
-  - name: retrigger_review_stream
-    command: "timeout 30s gh workflow run forge-admission-cycle.yml --repo guardian-intelligence/apm2 -f pr_number=<PR_NUMBER>"
-    purpose: "Fallback-only recovery path when `apm2 fac restart` is unavailable."
+    purpose: "Canonical push workflow: pushes branch, creates/updates PR from ticket YAML, enables auto-merge. Reviews auto-start via CI."
     side_effect: true
 
   - name: fac_review_tail
@@ -68,12 +63,12 @@ commands[18]:
     side_effect: false
 
   - name: fetch_full_review_comment_bodies
-    command: "timeout 30s gh pr view <PR_NUMBER> --repo guardian-intelligence/apm2 --json reviews,reviewThreads"
-    purpose: "Fetch full review comment bodies via GitHub until FAC projection exposes full comment text."
+    command: "timeout 30s apm2 fac pr read-comments <PR_NUMBER>"
+    purpose: "Fetch full review comment bodies for a PR."
     side_effect: false
 
   - name: enable_auto_merge
-    command: "timeout 30s gh pr merge <PR_NUMBER> --repo guardian-intelligence/apm2 --auto --squash --delete-branch"
+    command: "timeout 30s apm2 fac pr auto-merge <PR_NUMBER>"
     purpose: "Enable auto-merge after all merge gates pass."
     side_effect: true
 

@@ -26,9 +26,9 @@ flowchart TD
 ## State: Collect PR Identity
 
 ```yaml
-operation: gh_pr_view
+operation: fac_pr_view
 command: |
-  gh pr view $PR_URL --json title,number,author,baseRefName,headRefName,commits,files,additions,deletions
+  apm2 fac pr view $PR_URL --json title,number,author,baseRefName,headRefName,commits,files,additions,deletions
 
 required_fields:
   - pr_url: string

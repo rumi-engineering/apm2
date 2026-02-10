@@ -11,7 +11,7 @@ references[9]:
     purpose: "Default implementor execution skill used by fix-agent dispatch."
   - path: "@documents/security/THREAT_MODEL.cac.json"
     purpose: "Threat model context for security-sensitive changes."
-  - path: "@documents/security/AGENTS.cac.json"
+  - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security posture, policy profile, and containment expectations."
   - path: "references/common-review-findings.md"
     purpose: "Frequent BLOCKER/MAJOR findings to preempt before opening review."

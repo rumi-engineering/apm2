@@ -116,6 +116,8 @@ tower = { version = "0.4", features = ["util"] }
 hyper = { version = "1.5", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "tls12", "webpki-tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+jsonwebtoken = "9.3"
 
 # Sandboxing (Linux only)
 seccompiler = "0.5"

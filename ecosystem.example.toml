@@ -23,8 +23,13 @@ github_owner = "guardian-intelligence"
 github_repo = "apm2"
 trunk_branch = "main"
 github_api_url = "https://api.github.com"
-github_token_env = "$GITHUB_TOKEN"
 poll_interval_secs = 30
+
+# GitHub App auth material is loaded from runtime environment/keyring:
+# - APM2_GITHUB_APP_ID
+# - APM2_GITHUB_INSTALLATION_ID
+# - APM2_GITHUB_APP_PRIVATE_KEY (optional if keyring configured)
+# - APM2_GITHUB_KEYRING_SERVICE / APM2_GITHUB_KEYRING_ACCOUNT (optional)
 
 # Adapter profile rotation (TCK-00400).
 # Default rollout is operability-first: 100% claude-code-v1.

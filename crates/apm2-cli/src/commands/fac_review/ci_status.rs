@@ -24,11 +24,11 @@
 //! `apm2 fac logs --pr <N>`.
 
 use std::collections::BTreeMap;
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
 use super::types::now_iso8601;
+use crate::commands::fac_pr::GitHubPrClient;
 
 // ── Marker ───────────────────────────────────────────────────────────────────
 
@@ -135,37 +135,19 @@ pub fn find_status_comment(
     pr_number: u32,
     sha: &str,
 ) -> Result<Option<(u64, CiStatus)>, String> {
-    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100");
-    let output = Command::new("gh")
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|e| format!("failed to fetch PR comments: {e}"))?;
+    let client = GitHubPrClient::new(owner_repo)?;
+    let comments = client.read_comments(pr_number, 1)?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh api failed: {stderr}"));
-    }
-
-    let comments: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("failed to parse comment response: {e}"))?;
-
+    let marker_tag = format!("<!-- {STATUS_MARKER} -->");
     for comment in comments {
-        let body = comment
-            .get("body")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        if !body.contains(&format!("<!-- {STATUS_MARKER} -->")) {
+        if !comment.body.contains(&marker_tag) {
             continue;
         }
         // Extract YAML block between ```yaml and ```.
-        if let Some(yaml_str) = extract_yaml_block(body) {
+        if let Some(yaml_str) = extract_yaml_block(&comment.body) {
             if let Ok(status) = serde_yaml::from_str::<CiStatus>(yaml_str) {
                 if status.sha == sha {
-                    let comment_id = comment
-                        .get("id")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    return Ok(Some((comment_id, status)));
+                    return Ok(Some((comment.id, status)));
                 }
             }
         }
@@ -181,25 +163,8 @@ pub fn create_status_comment(
     status: &CiStatus,
 ) -> Result<(), String> {
     let body = status.to_comment_body();
-    let endpoint = format!("/repos/{owner_repo}/issues/{pr_number}/comments");
-
-    let output = Command::new("gh")
-        .args([
-            "api",
-            "-X",
-            "POST",
-            &endpoint,
-            "-f",
-            &format!("body={body}"),
-        ])
-        .output()
-        .map_err(|e| format!("failed to POST status comment: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("status comment POST failed: {stderr}"));
-    }
-    Ok(())
+    let client = GitHubPrClient::new(owner_repo)?;
+    client.comment(pr_number, &body).map(|_| ())
 }
 
 /// Extract the YAML content from a fenced code block in a comment body.

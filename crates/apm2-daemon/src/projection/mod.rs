@@ -40,6 +40,9 @@
 //! - [`LedgerTailer`]: Ledger event tailer for driving projection decisions
 //! - [`ProjectionAdapter`]: Async trait for write-only projection adapters
 //! - [`GitHubProjectionAdapter`]: GitHub commit status projection
+//! - [`ProjectionAdapterFactory`]: Secure adapter builder for projection
+//!   surfaces
+//! - [`ProjectionTarget`]: Provider-agnostic target descriptor
 //! - [`ProjectionReceipt`]: Signed proof of projection
 //! - [`ProjectedStatus`]: Status values that can be projected
 //! - [`IdempotencyKey`]: Key for idempotent projection operations
@@ -113,6 +116,7 @@
 //! ```
 
 pub mod divergence_watchdog;
+pub mod factory;
 pub mod github_sync;
 pub mod projection_receipt;
 pub mod worker;
@@ -123,6 +127,10 @@ pub use divergence_watchdog::{
     FreezeCheckError, FreezeRegistry, FreezeScope, InterventionFreeze, InterventionFreezeBuilder,
     InterventionUnfreeze, InterventionUnfreezeBuilder, ResolutionType, SystemTimeSource,
     TimeSource,
+};
+pub use factory::{
+    DefaultProjectionAdapterFactory, ProjectionAdapterBuildSpec, ProjectionAdapterFactory,
+    ProjectionSurface, ProjectionTarget,
 };
 pub use github_sync::{
     GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter, ProjectionError, TamperEvent,

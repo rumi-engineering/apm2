@@ -52,6 +52,9 @@ use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
 use apm2_core::config::EcosystemConfig;
 use apm2_core::crypto::Signer;
+use apm2_core::github::{
+    GitHubApp, GitHubAppTokenProvider, GitHubScope, RiskTier, TokenProvider, TokenRequest,
+};
 use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
@@ -66,6 +69,7 @@ use axum::Router;
 use axum::routing::get;
 use clap::Parser;
 use rusqlite::Connection;
+use secrecy::ExposeSecret;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -1082,10 +1086,11 @@ async fn async_main(args: Args) -> Result<()> {
     // The projection worker:
     // - Tails the ledger for ReviewReceiptRecorded events
     // - Maintains work index (changeset -> work_id -> PR)
-    // - Projects review results to GitHub (status + comment)
+    // - Projects review results to the configured surface (GitHub today)
     let projection_worker_handle = if let Some(ref conn) = sqlite_conn {
         use apm2_daemon::projection::{
-            GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionWorker, ProjectionWorkerConfig,
+            DefaultProjectionAdapterFactory, ProjectionAdapterBuildSpec, ProjectionAdapterFactory,
+            ProjectionTarget, ProjectionWorker, ProjectionWorkerConfig,
         };
 
         let projection_conn = Arc::clone(conn);
@@ -1096,146 +1101,106 @@ async fn async_main(args: Args) -> Result<()> {
             .with_poll_interval(Duration::from_secs(projection_config.poll_interval_secs))
             .with_batch_size(projection_config.batch_size);
 
-        // BLOCKER FIX: Incomplete Feature Wiring (Dead Code)
-        // Previously, ProjectionWorker was initialized but set_adapter was never
-        // called, causing self.adapter to always be None and all projections to
-        // be skipped. Now we properly instantiate GitHubProjectionAdapter and
-        // inject it.
-        let mut github_adapter: Option<GitHubProjectionAdapter> = None;
+        let mut projection_adapter = None;
+        let mut projection_target_id = "none".to_string();
 
-        // Enable GitHub projection if configured
-        if projection_config.enabled
-            && !projection_config.github_owner.is_empty()
-            && !projection_config.github_repo.is_empty()
-        {
-            // Build GitHub adapter config
-            match GitHubAdapterConfig::new(
+        if projection_config.enabled {
+            if projection_config.github_owner.is_empty() || projection_config.github_repo.is_empty()
+            {
+                // TCK-00322 MAJOR FIX: Missing owner/repo is fatal when enabled
+                return Err(anyhow::anyhow!(
+                    "projection.enabled=true but github_owner or github_repo is not configured"
+                ));
+            }
+
+            let projection_target = ProjectionTarget::github(
                 &projection_config.github_api_url,
                 &projection_config.github_owner,
                 &projection_config.github_repo,
-            ) {
-                Ok(mut github_config) => {
-                    // TCK-00322 MAJOR FIX: Fail-Open Mock Mode on Configuration Error
-                    // When `enabled = true`, missing token env var is now a FATAL error.
-                    // Previously, this would silently fall back to mock mode, which could
-                    // cause production systems to think they're projecting to GitHub when
-                    // they're not. Now we fail-closed: missing mandatory config = startup
-                    // failure.
-                    let Some(ref token_env) = projection_config.github_token_env else {
-                        // TCK-00322 MAJOR FIX: Missing token_env is fatal when enabled
-                        error!(
-                            "projection.enabled=true but github_token_env is not configured. \
-                             A GitHub token is required for production projection."
-                        );
-                        return Err(anyhow::anyhow!(
-                            "projection.enabled=true but github_token_env is not configured"
-                        ));
-                    };
+            );
+            projection_target_id = projection_target.target_id();
+            config = config.with_projection_target(projection_target.clone());
 
-                    // Strip leading $ if present
-                    let env_var = token_env.strip_prefix('$').unwrap_or(token_env);
-                    let Ok(token) = std::env::var(env_var) else {
-                        // TCK-00322 MAJOR FIX: Missing token is fatal when enabled
-                        error!(
-                            env_var = %env_var,
-                            "GitHub token env var not set. \
-                             projection.enabled=true requires a valid token. \
-                             Either set the env var or disable projection."
-                        );
-                        return Err(anyhow::anyhow!(
-                            "projection.enabled=true but github_token_env ({env_var}) is not set"
-                        ));
-                    };
+            // RFC-0028 REQ-0008 hard cutover: projection auth must use GitHub App
+            // installation tokens, not ambient personal tokens.
+            let (projection_token_provider, projection_installation_id) =
+                build_github_app_token_provider(&projection_config.github_api_url)?;
+            let projection_token = mint_github_app_token(
+                &projection_token_provider,
+                &projection_installation_id,
+                GitHubApp::Developer,
+                RiskTier::Med,
+                "projection-worker-startup",
+                vec![
+                    GitHubScope::ContentsRead,
+                    GitHubScope::MetadataRead,
+                    GitHubScope::PullRequestsWrite,
+                    GitHubScope::StatusesWrite,
+                ],
+            )?;
 
-                    github_config = match github_config.clone().with_api_token(&token) {
-                        Ok(cfg_with_token) => cfg_with_token,
-                        Err(e) => {
-                            // Invalid token format is fatal when projection is enabled
-                            error!(
-                                env_var = %env_var,
-                                error = %e,
-                                "Invalid GitHub token. Projection enabled but cannot proceed."
-                            );
-                            return Err(anyhow::anyhow!(
-                                "projection.enabled=true but GitHub token is invalid: {e}"
-                            ));
-                        },
-                    };
+            // TCK-00322 BLOCKER FIX: Non-Persistent Signer for Projection Receipts.
+            // Load or generate a persistent signer key from file. The key file path is
+            // configurable via projection.signer_key_file, defaulting to
+            // {state_file_dir}/projection_signer.key.
+            let signer_key_path = projection_config
+                .signer_key_file
+                .clone()
+                .unwrap_or_else(|| {
+                    daemon_config.state_file_path.parent().map_or_else(
+                        || PathBuf::from("/var/lib/apm2/projection_signer.key"),
+                        |p| p.join("projection_signer.key"),
+                    )
+                });
 
-                    config = config.with_github(github_config.clone());
+            let signer = load_or_create_persistent_signer(&signer_key_path)
+                .context("failed to load projection signer key")?;
+            info!(
+                key_path = %signer_key_path.display(),
+                public_key = %hex::encode(signer.public_key_bytes()),
+                "Loaded persistent projection signer"
+            );
 
-                    // TCK-00322 BLOCKER FIX: Non-Persistent Signer for Projection Receipts
-                    // Load or generate a persistent signer key from file. The key file path
-                    // is configurable via projection.signer_key_file, defaulting to
-                    // {state_file_dir}/projection_signer.key.
-                    let signer_key_path =
-                        projection_config
-                            .signer_key_file
-                            .clone()
-                            .unwrap_or_else(|| {
-                                daemon_config.state_file_path.parent().map_or_else(
-                                    || PathBuf::from("/var/lib/apm2/projection_signer.key"),
-                                    |p| p.join("projection_signer.key"),
-                                )
-                            });
-
-                    let signer = load_or_create_persistent_signer(&signer_key_path)
-                        .context("failed to load projection signer key")?;
-                    info!(
-                        key_path = %signer_key_path.display(),
-                        public_key = %hex::encode(signer.public_key_bytes()),
-                        "Loaded persistent projection signer"
-                    );
-
-                    // Determine cache path for idempotency
-                    // TCK-00322 MAJOR FIX: Don't use /tmp for cache - use ledger-adjacent path
-                    let cache_path = daemon_config.ledger_db_path.as_ref().map_or_else(
-                        || {
-                            daemon_config.state_file_path.parent().map_or_else(
-                                || PathBuf::from("/var/lib/apm2/projection_cache.db"),
-                                |p| p.join("projection_cache.db"),
-                            )
-                        },
-                        |p| p.with_extension("projection_cache.db"),
-                    );
-
-                    // Create adapter - always real mode when enabled=true (mock mode removed)
-                    // At this point we have validated the token, so we can proceed.
-                    match GitHubProjectionAdapter::new(signer, github_config, &cache_path) {
-                        Ok(adapter) => {
-                            info!(
-                                owner = %projection_config.github_owner,
-                                repo = %projection_config.github_repo,
-                                cache_path = %cache_path.display(),
-                                "GitHub projection adapter created"
-                            );
-                            github_adapter = Some(adapter);
-                        },
-                        Err(e) => {
-                            // Adapter creation failure is fatal when enabled
-                            return Err(anyhow::anyhow!("Failed to create GitHub adapter: {e}"));
-                        },
-                    }
+            // Determine cache path for idempotency.
+            // TCK-00322 MAJOR FIX: Don't use /tmp for cache - use ledger-adjacent path.
+            let cache_path = daemon_config.ledger_db_path.as_ref().map_or_else(
+                || {
+                    daemon_config.state_file_path.parent().map_or_else(
+                        || PathBuf::from("/var/lib/apm2/projection_cache.db"),
+                        |p| p.join("projection_cache.db"),
+                    )
                 },
-                Err(e) => {
-                    // Invalid config is fatal when enabled
-                    return Err(anyhow::anyhow!("Invalid GitHub adapter config: {e}"));
-                },
-            }
-        } else if projection_config.enabled {
-            // TCK-00322 MAJOR FIX: Missing owner/repo is fatal when enabled
-            return Err(anyhow::anyhow!(
-                "projection.enabled=true but github_owner or github_repo is not configured"
-            ));
+                |p| p.with_extension("projection_cache.db"),
+            );
+
+            // Fail-closed factory creation: only explicitly supported surfaces
+            // can be built.
+            let build_spec = ProjectionAdapterBuildSpec {
+                target: projection_target,
+                token: projection_token,
+                cache_path: cache_path.clone(),
+            };
+            let factory = DefaultProjectionAdapterFactory;
+            let adapter = factory
+                .build(signer, build_spec)
+                .map_err(|e| anyhow::anyhow!("failed to create projection adapter: {e}"))?;
+            info!(
+                target = %projection_target_id,
+                cache_path = %cache_path.display(),
+                "Projection adapter created"
+            );
+            projection_adapter = Some(adapter);
         }
 
         match ProjectionWorker::new(projection_conn, config) {
             Ok(mut worker) => {
-                // BLOCKER FIX: Actually inject the adapter into the worker!
-                // This was the critical missing step that caused all projections to be skipped.
-                if let Some(adapter) = github_adapter {
+                // Inject adapter into the worker when projection is enabled.
+                if let Some(adapter) = projection_adapter {
                     worker.set_adapter(adapter);
-                    info!("GitHub adapter injected into projection worker");
+                    info!(
+                        target = %projection_target_id,
+                        "Projection adapter injected into worker"
+                    );
                 } else {
                     // When projection is disabled, this is expected
                     info!("Projection worker started without adapter (projection disabled)");
@@ -1245,7 +1210,8 @@ async fn async_main(args: Args) -> Result<()> {
                 let worker_state = state.clone();
 
                 info!(
-                    github_enabled = projection_config.enabled,
+                    projection_enabled = projection_config.enabled,
+                    projection_target = %projection_target_id,
                     has_adapter = worker.has_adapter(),
                     "Starting projection worker"
                 );
@@ -1293,7 +1259,7 @@ async fn async_main(args: Args) -> Result<()> {
     // Requirements:
     //   - Ledger database must be configured (sqlite_conn is Some)
     //   - Divergence watchdog must be enabled in ecosystem config
-    //   - GitHub token must be available via environment variable
+    //   - GitHub App credentials must be available for installation tokens
     {
         let dw_config = &daemon_config.config.daemon.divergence_watchdog;
         if dw_config.enabled {
@@ -1310,19 +1276,9 @@ async fn async_main(args: Args) -> Result<()> {
                      is not configured"
                 ));
             }
-
-            // Resolve GitHub token from environment variable
-            let token_env_raw = dw_config
-                .github_token_env
-                .as_deref()
-                .unwrap_or("GITHUB_TOKEN");
-            let token_env = token_env_raw.strip_prefix('$').unwrap_or(token_env_raw);
-            let github_token = std::env::var(token_env).map_err(|_| {
-                anyhow::anyhow!(
-                    "divergence_watchdog.enabled=true but GitHub token env var \
-                     ({token_env}) is not set"
-                )
-            })?;
+            let (watchdog_token_provider, watchdog_installation_id) =
+                build_github_app_token_provider(&dw_config.github_api_url)?;
+            let watchdog_token_provider = Arc::new(watchdog_token_provider);
 
             // Build watchdog configuration
             let repo_id = format!("{}/{}", dw_config.github_owner, dw_config.github_repo);
@@ -1359,6 +1315,8 @@ async fn async_main(args: Args) -> Result<()> {
             let github_repo = dw_config.github_repo.clone();
             let trunk_branch = dw_config.trunk_branch.clone();
             let watchdog_state = state.clone();
+            let watchdog_installation_id_cloned = watchdog_installation_id;
+            let watchdog_token_provider_cloned = Arc::clone(&watchdog_token_provider);
 
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(poll_interval);
@@ -1396,12 +1354,29 @@ async fn async_main(args: Args) -> Result<()> {
 
                     // Step 2: Fetch the external trunk HEAD from GitHub API.
                     // GET /repos/{owner}/{repo}/git/ref/heads/{branch}
+                    let watchdog_token = match mint_github_app_token(
+                        watchdog_token_provider_cloned.as_ref(),
+                        &watchdog_installation_id_cloned,
+                        GitHubApp::Reader,
+                        RiskTier::Low,
+                        "divergence-watchdog-poll",
+                        vec![GitHubScope::ContentsRead, GitHubScope::MetadataRead],
+                    ) {
+                        Ok(token) => token,
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Failed to mint GitHub App token for divergence watchdog"
+                            );
+                            continue;
+                        },
+                    };
                     let external_head = match fetch_external_trunk_head(
                         &github_api_url,
                         &github_owner,
                         &github_repo,
                         &trunk_branch,
-                        &github_token,
+                        watchdog_token.expose_secret(),
                     )
                     .await
                     {
@@ -1636,6 +1611,55 @@ fn query_latest_merge_receipt_head(emitter: &SqliteLedgerEventEmitter) -> Option
     // the result_selector (commit SHA). Returns None if no merge receipts
     // exist (startup case).
     emitter.query_latest_merge_receipt_sha()
+}
+
+fn required_env_nonempty(name: &str) -> Result<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required environment variable {name}"))
+}
+
+fn build_github_app_token_provider(api_base_url: &str) -> Result<(GitHubAppTokenProvider, String)> {
+    let app_id = required_env_nonempty("APM2_GITHUB_APP_ID")?;
+    let installation_id = required_env_nonempty("APM2_GITHUB_INSTALLATION_ID")?;
+    let keyring_service = std::env::var("APM2_GITHUB_KEYRING_SERVICE")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let keyring_account = std::env::var("APM2_GITHUB_KEYRING_ACCOUNT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let private_key = GitHubAppTokenProvider::load_private_key_from_env_or_keyring(
+        &app_id,
+        "APM2_GITHUB_APP_PRIVATE_KEY",
+        keyring_service.as_deref(),
+        keyring_account.as_deref(),
+    )
+    .map_err(|error| anyhow::anyhow!("failed to load GitHub App private key: {error}"))?;
+    let provider = GitHubAppTokenProvider::new_with_api_base_url(app_id, private_key, api_base_url)
+        .map_err(|error| anyhow::anyhow!("failed to build GitHub App token provider: {error}"))?;
+    Ok((provider, installation_id))
+}
+
+fn mint_github_app_token(
+    provider: &GitHubAppTokenProvider,
+    installation_id: &str,
+    app: GitHubApp,
+    risk_tier: RiskTier,
+    episode_id: &str,
+    scopes: Vec<GitHubScope>,
+) -> Result<secrecy::SecretString> {
+    let request = TokenRequest::new(
+        app,
+        installation_id.to_string(),
+        risk_tier,
+        episode_id.to_string(),
+    )
+    .with_scopes(scopes);
+    provider
+        .mint_token(&request)
+        .map(|response| response.token)
+        .map_err(|error| anyhow::anyhow!("failed to mint GitHub installation token: {error}"))
 }
 
 /// Fetch the external trunk HEAD from GitHub API.

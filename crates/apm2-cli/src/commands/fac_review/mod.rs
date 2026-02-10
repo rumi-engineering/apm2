@@ -36,7 +36,6 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use apm2_daemon::telemetry::reviewer::{ProjectionSummary, ProjectionSummaryEmitter};
 use barrier::{
     emit_barrier_decision_event, enforce_barrier, ensure_gh_cli_ready, resolve_fac_event_context,
 };
@@ -348,14 +347,16 @@ pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output:
     match resolve_fac_event_context(repo, event_path, event_name) {
         Ok(ctx) => {
             if let Err(err) = enforce_barrier(&ctx) {
-                let _ = emit_barrier_decision_event(
+                if let Err(e) = emit_barrier_decision_event(
                     "barrier",
                     repo,
                     event_name,
                     Some(&ctx),
                     false,
                     Some(&err),
-                );
+                ) {
+                    eprintln!("WARNING: barrier event emission failed: {e}");
+                }
                 if json_output {
                     let payload = serde_json::json!({
                         "error": "fac_barrier_failed",
@@ -370,8 +371,11 @@ pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output:
                 }
                 return exit_codes::GENERIC_ERROR;
             }
-            let _ =
-                emit_barrier_decision_event("barrier", repo, event_name, Some(&ctx), true, None);
+            if let Err(e) =
+                emit_barrier_decision_event("barrier", repo, event_name, Some(&ctx), true, None)
+            {
+                eprintln!("WARNING: barrier event emission failed: {e}");
+            }
 
             let summary = BarrierSummary {
                 repo: ctx.repo,
@@ -415,8 +419,11 @@ pub fn run_barrier(repo: &str, event_path: &Path, event_name: &str, json_output:
             exit_codes::SUCCESS
         },
         Err(err) => {
-            let _ =
-                emit_barrier_decision_event("barrier", repo, event_name, None, false, Some(&err));
+            if let Err(e) =
+                emit_barrier_decision_event("barrier", repo, event_name, None, false, Some(&err))
+            {
+                eprintln!("WARNING: barrier event emission failed: {e}");
+            }
             if json_output {
                 let payload = serde_json::json!({
                     "error": "fac_barrier_failed",
@@ -679,25 +686,33 @@ fn run_kickoff_inner(
     let ctx = match resolve_fac_event_context(repo, event_path, event_name) {
         Ok(ctx) => ctx,
         Err(err) => {
-            let _ =
-                emit_barrier_decision_event("kickoff", repo, event_name, None, false, Some(&err));
+            if let Err(e) =
+                emit_barrier_decision_event("kickoff", repo, event_name, None, false, Some(&err))
+            {
+                eprintln!("WARNING: barrier event emission failed: {e}");
+            }
             return Err(err);
         },
     };
     if let Err(err) = enforce_barrier(&ctx) {
-        let _ =
-            emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), false, Some(&err));
+        if let Err(e) =
+            emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), false, Some(&err))
+        {
+            eprintln!("WARNING: barrier event emission failed: {e}");
+        }
         return Err(err);
     }
-    let _ = emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), true, None);
-    ensure_gh_cli_ready()?;
+    if let Err(e) = emit_barrier_decision_event("kickoff", repo, event_name, Some(&ctx), true, None)
+    {
+        eprintln!("WARNING: barrier event emission failed: {e}");
+    }
+    ensure_gh_cli_ready(repo)?;
 
     let started = Instant::now();
     let dispatch = run_dispatch_inner(&ctx.pr_url, ReviewRunType::All, Some(&ctx.head_sha))?;
     let mut after_seq = 0_u64;
     let deadline = Instant::now() + Duration::from_secs(max_wait_seconds);
     let mut terminal_state = "failure:timeout".to_string();
-    let mut summary_emitter = ProjectionSummaryEmitter::default();
 
     loop {
         let projection = run_project_inner(
@@ -706,16 +721,7 @@ fn run_kickoff_inner(
             Some(dispatch.dispatch_epoch),
             after_seq,
         )?;
-        let summary = ProjectionSummary::from_projection(
-            projection.sha.clone(),
-            projection.current_head_sha.clone(),
-            projection.security.clone(),
-            projection.quality.clone(),
-            projection.recent_events.clone(),
-        );
-        if let Some(line) = summary_emitter.emit_if_due(Instant::now(), &summary) {
-            println!("{line}");
-        }
+        println!("{}", projection.line);
         for error in &projection.errors {
             if public_projection_only {
                 eprintln!(

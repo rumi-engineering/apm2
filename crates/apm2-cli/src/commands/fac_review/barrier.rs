@@ -3,13 +3,13 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::process::Command;
 
 use super::events::emit_review_event;
 use super::types::{
     FacEventContext, MAX_EVENT_PAYLOAD_BYTES, now_iso8601_millis, split_owner_repo,
     validate_expected_head_sha,
 };
+use crate::commands::fac_pr::GitHubPrClient;
 
 // ── Event context resolution ────────────────────────────────────────────────
 
@@ -342,110 +342,32 @@ fn resolve_actor_login(payload: &serde_json::Value) -> String {
 // ── GitHub API helpers ──────────────────────────────────────────────────────
 
 pub fn fetch_default_branch(repo: &str) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args(["api", &format!("/repos/{repo}")])
-        .output()
-        .map_err(|err| format!("failed to execute gh api for default branch: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh api failed resolving default branch: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("invalid JSON from default branch API response: {err}"))?;
-    value
-        .get("default_branch")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| "default_branch missing from repository API response".to_string())
+    let client = GitHubPrClient::new(repo)?;
+    client.fetch_default_branch()
 }
 
 pub fn fetch_pr_data(repo: &str, pr_number: u32) -> Result<serde_json::Value, String> {
-    let output = Command::new("gh")
-        .args(["api", &format!("/repos/{repo}/pulls/{pr_number}")])
-        .output()
-        .map_err(|err| format!("failed to execute gh api for PR metadata: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh api failed resolving PR #{pr_number}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("invalid JSON from PR metadata API response: {err}"))
+    let client = GitHubPrClient::new(repo)?;
+    client.fetch_pr_data(pr_number)
 }
 
 pub fn resolve_actor_permission(repo: &str, actor: &str) -> Result<String, String> {
-    if actor.is_empty() || actor == "unknown" {
-        return Ok("none".to_string());
-    }
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &format!("/repos/{repo}/collaborators/{actor}/permission"),
-        ])
-        .output()
-        .map_err(|err| format!("failed to execute gh api for actor permission: {err}"))?;
-    if !output.status.success() {
-        return Ok("none".to_string());
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| format!("invalid JSON from actor permission API response: {err}"))?;
-    Ok(value
-        .get("permission")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("none")
-        .to_string())
+    let client = GitHubPrClient::new(repo)?;
+    client.resolve_actor_permission(actor)
 }
 
 pub fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<String, String> {
-    let endpoint = format!("/repos/{owner_repo}/pulls/{pr_number}");
-    let output = Command::new("gh")
-        .args(["api", &endpoint, "--jq", ".head.sha"])
-        .output()
-        .map_err(|err| format!("failed to execute gh api for PR head SHA: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh api failed resolving PR head SHA: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if sha.is_empty() {
-        return Err("gh api returned empty head sha".to_string());
-    }
-    Ok(sha)
+    let client = GitHubPrClient::new(owner_repo)?;
+    client.head_sha(pr_number)
 }
 
-pub fn ensure_gh_cli_ready() -> Result<(), String> {
-    let output = Command::new("gh")
-        .args(["auth", "status"])
-        .output()
-        .map_err(|err| format!("failed to execute `gh auth status`: {err}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if detail.is_empty() {
-            Err("`gh auth status` failed; authenticate the VPS runner with GitHub CLI".to_string())
-        } else {
-            Err(format!(
-                "`gh auth status` failed; authenticate the VPS runner with GitHub CLI ({detail})"
-            ))
-        }
-    }
+pub fn ensure_gh_cli_ready(repo: &str) -> Result<(), String> {
+    GitHubPrClient::new(repo)?.auth_check().map(|_| ())
 }
 
-pub fn resolve_authenticated_gh_login() -> Option<String> {
-    let output = Command::new("gh")
-        .args(["api", "user", "--jq", ".login"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+pub fn resolve_authenticated_gh_login(repo: &str) -> Option<String> {
+    let info = GitHubPrClient::new(repo).ok()?.auth_check().ok()?;
+    let login = info.login;
     if login.is_empty() { None } else { Some(login) }
 }
 
@@ -456,62 +378,31 @@ pub fn confirm_review_posted(
     head_sha: &str,
     expected_author_login: Option<&str>,
 ) -> Result<Option<super::types::PostedReview>, String> {
+    let client = GitHubPrClient::new(owner_repo)?;
+    let max_pages = u32::try_from(super::types::COMMENT_CONFIRM_MAX_PAGES).unwrap_or(20);
+    let comments = client.read_comments(pr_number, max_pages)?;
+
     let marker_lower = marker.to_ascii_lowercase();
     let head_sha_lower = head_sha.to_ascii_lowercase();
     let expected_author_lower = expected_author_login.map(str::to_ascii_lowercase);
 
-    for page in 1..=super::types::COMMENT_CONFIRM_MAX_PAGES {
-        let endpoint =
-            format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
-        let output = Command::new("gh")
-            .args(["api", &endpoint])
-            .output()
-            .map_err(|err| format!("failed to execute gh api for comments: {err}"))?;
-        if !output.status.success() {
-            return Ok(None);
+    for comment in comments.iter().rev() {
+        let body_lower = comment.body.to_ascii_lowercase();
+        if !(body_lower.contains(&marker_lower) && body_lower.contains(&head_sha_lower)) {
+            continue;
         }
 
-        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| format!("failed to parse comments response: {err}"))?;
-        let comments = payload
-            .as_array()
-            .ok_or_else(|| "comments response was not an array".to_string())?;
-        if comments.is_empty() {
-            break;
-        }
-
-        for comment in comments.iter().rev() {
-            let body = comment
-                .get("body")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let body_lower = body.to_ascii_lowercase();
-            if !(body_lower.contains(&marker_lower) && body_lower.contains(&head_sha_lower)) {
+        if let Some(expected_author) = expected_author_lower.as_deref() {
+            if comment.author.login.to_ascii_lowercase() != expected_author {
                 continue;
             }
+        }
 
-            if let Some(expected_author) = expected_author_lower.as_deref() {
-                let author = comment
-                    .get("user")
-                    .and_then(|value| value.get("login"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if author != expected_author {
-                    continue;
-                }
-            }
-
-            let id = comment
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if id != 0 {
-                return Ok(Some(super::types::PostedReview {
-                    id,
-                    verdict: super::detection::extract_verdict_from_comment_body(body),
-                }));
-            }
+        if comment.id != 0 {
+            return Ok(Some(super::types::PostedReview {
+                id: comment.id,
+                verdict: super::detection::extract_verdict_from_comment_body(&comment.body),
+            }));
         }
     }
     Ok(None)

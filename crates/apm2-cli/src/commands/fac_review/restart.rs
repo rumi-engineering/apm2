@@ -1,8 +1,6 @@
 //! Intelligent pipeline restart: reads CI state and re-enters the DAG at the
 //! optimal point (evidence gates, review dispatch, or noop).
 
-use std::process::Command;
-
 use serde::Serialize;
 
 use super::barrier::fetch_pr_head_sha;
@@ -10,6 +8,7 @@ use super::ci_status::{CiStatus, find_status_comment};
 use super::dispatch::dispatch_single_review;
 use super::evidence::run_evidence_gates_with_status;
 use super::types::{DispatchReviewResult, ReviewKind, parse_pr_url};
+use crate::commands::fac_pr::{GitHubPrClient, PrListArgs};
 use crate::exit_codes::codes as exit_codes;
 
 // ── Strategy ────────────────────────────────────────────────────────────────
@@ -72,7 +71,7 @@ fn resolve_pr_context(
     } else if let Some(number) = pr {
         (repo.to_string(), number)
     } else {
-        // Auto-detect from current branch via gh pr list.
+        // Auto-detect from current branch via forge PR listing.
         let branch = current_branch()?;
         let number = find_pr_for_branch(repo, &branch)?;
         (repo.to_string(), number)
@@ -90,7 +89,7 @@ fn resolve_pr_context(
 }
 
 fn current_branch() -> Result<String, String> {
-    let output = Command::new("git")
+    let output = std::process::Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .map_err(|e| format!("failed to resolve current branch: {e}"))?;
@@ -105,31 +104,15 @@ fn current_branch() -> Result<String, String> {
 }
 
 fn find_pr_for_branch(repo: &str, branch: &str) -> Result<u32, String> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--head",
-            branch,
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
-        ])
-        .output()
-        .map_err(|e| format!("failed to find PR for branch {branch}: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh pr list failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let num_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    num_str
-        .parse::<u32>()
-        .map_err(|_| format!("no open PR found for branch {branch} in {repo}"))
+    let client = GitHubPrClient::new(repo)?;
+    let entries = client.list(&PrListArgs {
+        head: Some(branch.to_string()),
+        ..PrListArgs::default()
+    })?;
+    entries
+        .first()
+        .map(|e| e.number)
+        .ok_or_else(|| format!("no open PR found for branch {branch} in {repo}"))
 }
 
 // ── Strategy determination ──────────────────────────────────────────────────

@@ -1,12 +1,12 @@
 {
   "schema": "cac.holonic_security_theory.v1",
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "kind": "holonic.security_theory",
   "meta": {
     "stable_id": "dcp://apm2.security/theory/unified_security_theory@v1",
     "classification": "INTERNAL",
     "created_at": "2026-02-07T12:30:00Z",
-    "updated_at": "2026-02-07T12:30:00Z",
+    "updated_at": "2026-02-10T00:00:00Z",
     "labels": [
       "agent-native",
       "capability-security",
@@ -51,7 +51,7 @@
     "doc": {
       "id": "APM2-SECURITY-UNIFIED-THEORY-0001",
       "title": "Unified Security Theory for Agent-Native Holonic Systems",
-      "status": "draft",
+      "status": "active",
       "effective_date": "2026-02-07",
       "audience": [
         "adapter",
@@ -75,7 +75,6 @@
         "verification-economics"
       ]
     },
-
     "thesis": {
       "one_line": "Security in agent-native holonic systems is the mechanical enforcement of containment boundaries through proof-carrying authority, where every effect is receipt-evidenced, every delegation is strictly narrowing, and every ambiguity resolves to denial.",
       "core_claims": {
@@ -86,7 +85,11 @@
             "Delegation cannot widen authority across any dimension.",
             "Verification cost is bounded and first-class."
           ],
-          "law_refs": ["SEC-LAW-01", "SEC-LAW-03", "SEC-LAW-05"],
+          "law_refs": [
+            "SEC-LAW-01",
+            "SEC-LAW-03",
+            "SEC-LAW-05"
+          ],
           "node_class": "NORMATIVE"
         },
         "SEC-THESIS-02": {
@@ -96,7 +99,10 @@
             "Replay verification is always possible for any claimed effect.",
             "Batch verification amortizes proof cost without weakening guarantees."
           ],
-          "law_refs": ["SEC-LAW-02", "SEC-LAW-05", "SEC-LAW-09"],
+          "law_refs": [
+            "SEC-LAW-02",
+            "SEC-LAW-05"
+          ],
           "node_class": "NORMATIVE"
         },
         "SEC-THESIS-03": {
@@ -106,7 +112,11 @@
             "Freshness is a machine-checkable policy, not best-effort.",
             "Stop uncertainty propagates denial within bounded latency."
           ],
-          "law_refs": ["SEC-LAW-04", "SEC-LAW-06", "SEC-LAW-10"],
+          "law_refs": [
+            "SEC-LAW-04",
+            "SEC-LAW-06",
+            "SEC-LAW-10"
+          ],
           "node_class": "NORMATIVE"
         },
         "SEC-THESIS-04": {
@@ -116,35 +126,241 @@
             "Batch attestation and Merkle proof structures are mandatory, not optimization.",
             "A law that needs special modes at higher scale reveals a missing, more fundamental law underneath."
           ],
-          "law_refs": ["SEC-LAW-05", "SEC-LAW-09", "SEC-LAW-10"],
+          "law_refs": [
+            "SEC-LAW-02",
+            "SEC-LAW-05",
+            "SEC-LAW-10"
+          ],
           "node_class": "NORMATIVE"
         }
       }
     },
-
     "parallel_framings": {
       "note": "Three independent framings were developed before recombination, per alien_security creative method. Each frames the same 10 invariants from a different organizing principle.",
       "frame_a_boundary_centric": {
         "organizing_principle": "Security is the geometry of trust boundaries — what crosses, at what granularity, under what proof obligation.",
         "key_insight": "Every security failure is a boundary violation: either something crossed that shouldn't have (injection, leakage), or something that crossed lacked proof (ambient authority, forged identity), or the boundary's freshness contract was stale (replay, rollback).",
         "strongest_contribution": "Clarifies that SEC-LAW-01 (no ambient authority), SEC-LAW-07 (digest-first), and SEC-LAW-08 (dual-lattice) are all boundary geometry laws — they constrain what geometric properties the trust boundary enforces.",
-        "law_grouping": ["SEC-LAW-01", "SEC-LAW-03", "SEC-LAW-07", "SEC-LAW-08"]
+        "law_grouping": [
+          "SEC-LAW-01",
+          "SEC-LAW-03",
+          "SEC-LAW-07",
+          "SEC-LAW-08"
+        ]
       },
       "frame_b_economics_centric": {
         "organizing_principle": "Security is a verification economics game — the defender's cost to verify must be bounded while the attacker's cost to forge must be unbounded.",
         "key_insight": "Every security primitive has a verification cost. At exabyte scale, any O(n) verification becomes a DoS vector. The defender's advantage comes from amortized batch verification (O(1) signature checks per batch + O(K log B) hashing) while the attacker must forge each proof independently.",
-        "strongest_contribution": "Clarifies that SEC-LAW-05 (bounded verification), SEC-LAW-09 (batch attestation), and SEC-LAW-10 (continuity economics) are verification economics laws — they bound the defender's cost while maintaining proof strength.",
-        "law_grouping": ["SEC-LAW-05", "SEC-LAW-09", "SEC-LAW-10"]
+        "strongest_contribution": "Clarifies that SEC-LAW-05 (bounded verification), SEC-LAW-09 (pull-budget anti-entropy), and SEC-LAW-10 (continuity economics) are verification economics laws — they bound defender cost under both proof validation and adversarial synchronization pressure.",
+        "law_grouping": [
+          "SEC-LAW-05",
+          "SEC-LAW-09",
+          "SEC-LAW-10"
+        ]
       },
       "frame_c_lattice_centric": {
         "organizing_principle": "Security is a lattice algebra — authority, taint, classification, and delegation form partially ordered sets where safety is meet-closure and violations are lattice breaks.",
         "key_insight": "The PermeabilityReceiptV1 meet operator (componentwise intersection across all authority dimensions) is a lattice meet. The dual-lattice taint/classification enforcement is a product lattice. Strict-subset delegation is monotone narrowing in the authority lattice. All three are instances of the same algebraic structure.",
         "strongest_contribution": "Clarifies that SEC-LAW-03 (strict-subset delegation), SEC-LAW-08 (dual-lattice), and SEC-LAW-02 (receipt authority) share algebraic structure — they are all lattice-meet-closure requirements.",
-        "law_grouping": ["SEC-LAW-02", "SEC-LAW-03", "SEC-LAW-08"]
+        "law_grouping": [
+          "SEC-LAW-02",
+          "SEC-LAW-03",
+          "SEC-LAW-08"
+        ]
       },
       "recombination": "The unified theory uses boundary geometry as the primary organizing frame (what crosses boundaries), lattice algebra as the structural invariant (how authority and taint compose), and verification economics as the scaling constraint (how proof cost bounds). Each law is annotated with its framing provenance."
     },
-
+    "governance_constraints": {
+      "precedence": [
+        {
+          "rank": 1,
+          "artifact": "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+          "applies_to": [
+            "protocol_semantics",
+            "runtime_security_semantics",
+            "freshness_policy",
+            "authority_fact_authentication"
+          ],
+          "conflict_action": "DENY_AND_EMIT_DEFECT"
+        },
+        {
+          "rank": 2,
+          "artifact": "documents/security/SECURITY_POLICY.cac.json",
+          "applies_to": [
+            "operational_policy",
+            "release_policy",
+            "incident_policy"
+          ],
+          "conflict_action": "DENY_AND_OPEN_SECURITY_TICKET"
+        },
+        {
+          "rank": 3,
+          "artifact": "documents/security/unified_security_theory.json",
+          "applies_to": [
+            "security_law_synthesis",
+            "cross_domain_rationale",
+            "traceability"
+          ],
+          "conflict_action": "MARK_NON_AUTHORITATIVE_UNTIL_ALIGNED"
+        }
+      ],
+      "normative_language": {
+        "MUST": "Mandatory requirement. Violation is a security defect and release-blocking.",
+        "SHOULD": "Allowed only with documented rationale and compensating controls bound to a ticket.",
+        "MAY": "Permitted only on non-authority-bearing paths; never grants authority or weakens fail-closed semantics."
+      },
+      "cryptography_profile": {
+        "canonicalization": "apm2.canonicalizer.jcs@1.0.0",
+        "approved_signature_algorithms": [
+          "ed25519"
+        ],
+        "approved_hash_algorithms": [
+          "blake3",
+          "sha256"
+        ],
+        "hash_algorithm_scope_constraints": [
+          "blake3_required_for_authority_receipts_episode_bindings_and_boundary_digests",
+          "sha256_allowed_only_for_sigstore_x509_and_rekor_interoperability_paths"
+        ],
+        "algorithm_agility_rule": "New algorithms are additive allowlist changes gated by compatibility tests and signed governance approval.",
+        "minimum_security_bits": 128,
+        "key_lifecycle_requirements": [
+          "rotate_or_reprovision_workload_signing_keys_every_90_days",
+          "propagate_revocation_p99_within_5_minutes",
+          "deny_signatures_from_expired_or_revoked_roots",
+          "sigstore_keyless_certificate_ttl_must_not_exceed_20_minutes",
+          "owner_and_approver_must_be_distinct_for_security_exceptions"
+        ]
+      },
+      "evidence_retention": {
+        "receipt_retention_days_min": 400,
+        "defect_retention_days_min": 400,
+        "waiver_event_retention_days_min": 400,
+        "immutability_requirement": "Evidence stores are append-only and content-addressed.",
+        "missing_evidence_action": "DENY_AUTHORITY_AND_EMIT_DEFECT"
+      },
+      "waiver_policy": {
+        "max_duration_days": 30,
+        "max_extensions": 1,
+        "required_fields": [
+          "waiver_id",
+          "issued_at",
+          "issued_at_utc",
+          "expires",
+          "expires_at_utc",
+          "owner",
+          "approver",
+          "ticket_ref",
+          "justification",
+          "relaxed_laws",
+          "relaxed_controls",
+          "compensating_controls",
+          "blast_radius",
+          "condition",
+          "renewal_count",
+          "extended_from_waiver_id"
+        ],
+        "separation_of_duties_rule": "waiver_owner_must_not_equal_waiver_approver",
+        "timestamp_precision_rule": "issued_at_utc_and_expires_at_utc_must_be_rfc3339_utc_timestamps",
+        "forbidden_scopes": [
+          "waiver_cannot_disable_SEC-LAW-01_on_authority_paths",
+          "waiver_cannot_disable_tier3_plus_stop_uncertainty_deny",
+          "waiver_cannot_disable_SEC-LAW-05_decode_or_proof_bounds_on_authority_paths",
+          "waiver_cannot_disable_policy_root_dual_approval_or_epoch_monotonicity_controls"
+        ],
+        "auto_expiry_action": "DENY_PATH_AND_EMIT_SEC-DEFECT-14",
+        "date_consistency_rule": "issued_at_and_expires_must_match_the_date_portion_of_issued_at_utc_and_expires_at_utc",
+        "extension_validation_rule": "renewal_count_must_be_less_than_or_equal_to_max_extensions_and_extended_from_waiver_id_required_when_renewal_count_gt_0"
+      },
+      "risk_tier_mapping": {
+        "unified_theory_to_daemon": {
+          "T0": "Tier0",
+          "T1": "Tier1",
+          "T2": "Tier2",
+          "T3": "Tier3"
+        },
+        "daemon_tier_without_unified_theory_peer": {
+          "Tier4": "reserved_for_platform_security_governance_controls"
+        },
+        "boundary_rule": "tier_mapping_must_be_explicit_and_lossless_at_every_policy_and_runtime_boundary"
+      },
+      "policy_root_mutation_policy": {
+        "minimum_distinct_approvers": 2,
+        "required_roles": [
+          "policy_owner",
+          "security_approver"
+        ],
+        "epoch_rule": "policy_root_epoch_must_be_strictly_monotone",
+        "anomaly_detection": {
+          "required": true,
+          "max_detection_latency_minutes": 5
+        },
+        "required_evidence": [
+          "dual_approval_receipt",
+          "policy_root_epoch_transition_receipt",
+          "policy_root_mutation_anomaly_scan"
+        ],
+        "violation_action": "DENY_POLICY_ROOT_MUTATION_AND_EMIT_SEC-DEFECT-24"
+      }
+    },
+    "explicit_assumptions": [
+      {
+        "assumption_id": "ASSUME-01",
+        "statement": "JCS canonicalization is deterministic across implementations and versions pinned by canonicalizer vectors.",
+        "validation": "conformance_tests_pass",
+        "monitoring_interval_minutes": 60,
+        "max_detection_latency_minutes": 120,
+        "if_broken": "DENY_SIGNATURE_VERIFICATION_AND_EMIT_SEC-DEFECT-19"
+      },
+      {
+        "assumption_id": "ASSUME-02",
+        "statement": "CAS objects are immutable and retrieval by hash is collision-resistant under approved hash policy.",
+        "validation": "hash_integrity_checks_pass",
+        "monitoring_interval_minutes": 60,
+        "max_detection_latency_minutes": 120,
+        "if_broken": "QUARANTINE_CAS_AND_DENY_AUTHORITY_ADMISSION_AND_EMIT_SEC-DEFECT-20"
+      },
+      {
+        "assumption_id": "ASSUME-03",
+        "statement": "Trust roots for identity and policy are distributed through authenticated channels with revocation support.",
+        "validation": "root_set_signature_and_epoch_checks_pass",
+        "monitoring_interval_minutes": 15,
+        "max_detection_latency_minutes": 30,
+        "if_broken": "FREEZE_AUTHORITY_BEARING_ACTUATION_AND_EMIT_SEC-DEFECT-21"
+      },
+      {
+        "assumption_id": "ASSUME-04",
+        "statement": "HTF temporal anchors are available for authority-bearing decisions; wall-clock is never authoritative.",
+        "validation": "freshness_policy_temporal_anchor_checks_pass",
+        "monitoring_interval_minutes": 5,
+        "max_detection_latency_minutes": 10,
+        "if_broken": "DENY_TIER2_PLUS_ACTUATION_AND_EMIT_SEC-DEFECT-15"
+      },
+      {
+        "assumption_id": "ASSUME-05",
+        "statement": "Ledger ordering for receipt anchors is monotonic and replay-detectable within declared rollback window bounds.",
+        "validation": "ledger_monotonicity_and_replay_checks_pass",
+        "monitoring_interval_minutes": 5,
+        "max_detection_latency_minutes": 10,
+        "if_broken": "HALT_PROMOTION_AND_EMIT_SEC-DEFECT-16"
+      },
+      {
+        "assumption_id": "ASSUME-06",
+        "statement": "CSPRNG entropy for signing keys, session keys, and nonces remains above policy floor with continuous health checks.",
+        "validation": "csprng_health_and_entropy_floor_checks_pass",
+        "monitoring_interval_minutes": 5,
+        "max_detection_latency_minutes": 10,
+        "if_broken": "FREEZE_NEW_KEY_ISSUANCE_AND_SESSION_DELEGATION_AND_EMIT_SEC-DEFECT-22"
+      },
+      {
+        "assumption_id": "ASSUME-07",
+        "statement": "Policy-root mutation workflows enforce dual approval and monotone policy-root epochs across all authority-bearing cells.",
+        "validation": "policy_root_dual_approval_and_epoch_monotonicity_checks_pass",
+        "monitoring_interval_minutes": 5,
+        "max_detection_latency_minutes": 10,
+        "if_broken": "FREEZE_POLICY_ROOT_MUTATIONS_AND_EMIT_SEC-DEFECT-24"
+      }
+    ],
     "security_laws": [
       {
         "id": "SEC-LAW-01",
@@ -152,7 +368,9 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "No agent, holon, or process holds authority by default. All authority is explicitly delegated through capability-gated, daemon-mediated paths. Side effects without capability delegation are mechanically impossible, not merely prohibited.",
-        "framing_provenance": ["boundary-centric"],
+        "framing_provenance": [
+          "boundary-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Object-capability security (Dennis & Van Horn 1966, Miller 2006)",
           "transferable_invariant": "In a pure capability system, the only way to obtain authority is to receive it from an entity that already holds it. No 'ambient' authority exists.",
@@ -161,12 +379,27 @@
         },
         "operational_source_refs": [
           "SP-INV-001",
+          "SP-RUNTIME-001",
           "CHK-BOUNDARY-AUTHORITY-01",
+          "CHK-BOUNDARY-AUTHORITY-02",
           "CHK-TOOL-CONTEXT-01",
-          "CHK-TOOL-CONTEXT-02"
+          "CHK-TOOL-CONTEXT-02",
+          "CHK-TOOL-CONTEXT-03",
+          "CHK-TOOL-CONTEXT-04",
+          "CHK-FILES-ATOMICITY-01",
+          "CHK-FILES-ATOMICITY-02",
+          "CHK-RISK-TIER-02",
+          "CHK-FILES-ATOMICITY-04"
         ],
-        "rfc_refs": ["RFC-0020 §0.1 constraint 1", "RFC-0020 §4.5", "RFC-0020 §8.3"],
-        "general_theory_refs": ["LAW-05", "PRIN-038"],
+        "rfc_refs": [
+          "RFC-0020 §0.1 constraint 1",
+          "RFC-0020 §4.5",
+          "RFC-0020 §8.3"
+        ],
+        "general_theory_refs": [
+          "LAW-05",
+          "PRIN-038"
+        ],
         "operationalization": [
           {
             "rule": "Daemon mediation",
@@ -215,7 +448,10 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "Every authoritative state transition produces a machine-readable receipt stored in CAS and linked via the ledger. Effects without receipts are treated as non-existent. Receipt authentication uses direct signature or AuthoritySealV1 over Merkle batch roots.",
-        "framing_provenance": ["lattice-centric", "boundary-centric"],
+        "framing_provenance": [
+          "lattice-centric",
+          "boundary-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Cryptographic commitment schemes and authenticated data structures (Merkle 1979)",
           "transferable_invariant": "A commitment scheme binds a party to a value such that the commitment can be verified without revealing the value, and the party cannot change the value after commitment. Receipts are commitments to effects.",
@@ -224,13 +460,39 @@
         },
         "operational_source_refs": [
           "SP-INV-002",
+          "SP-REL-001",
+          "CHK-BOUNDARY-AUTHORITY-02",
           "CHK-RECEIPT-AUTH-01",
           "CHK-RECEIPT-AUTH-02",
           "CHK-RECEIPT-AUTH-03",
-          "CHK-RECEIPT-AUTH-04"
+          "CHK-RECEIPT-AUTH-04",
+          "CHK-FILES-ATOMICITY-03",
+          "CHK-SUPPLY-CHAIN-01",
+          "CHK-SUPPLY-CHAIN-02",
+          "CHK-SUPPLY-CHAIN-03",
+          "CHK-SUPPLY-CHAIN-04",
+          "SP-POSTURE-003",
+          "SP-REL-002",
+          "SP-REL-003",
+          "SP-REL-004",
+          "SP-GATE-CLIPPY",
+          "SP-GATE-DENY",
+          "SP-GATE-AUDIT",
+          "SP-DEP-001",
+          "SP-DEP-002",
+          "SP-DEP-003"
         ],
-        "rfc_refs": ["RFC-0020 §1.3.1", "RFC-0020 §9.5"],
-        "general_theory_refs": ["LAW-01", "LAW-07", "PRIN-045", "PRIN-046", "PRIN-047"],
+        "rfc_refs": [
+          "RFC-0020 §1.3.1",
+          "RFC-0020 §9.5"
+        ],
+        "general_theory_refs": [
+          "LAW-01",
+          "LAW-07",
+          "PRIN-045",
+          "PRIN-046",
+          "PRIN-047"
+        ],
         "operationalization": [
           {
             "rule": "Receipt production",
@@ -287,7 +549,9 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "Every delegation narrows authority across ALL dimensions simultaneously: scope, budgets, stop predicates, attestation floor, input taint, output classification, expiry, and fanout caps. The meet operator on AuthorityVectorV1 enforces componentwise intersection — no dimension can widen.",
-        "framing_provenance": ["lattice-centric"],
+        "framing_provenance": [
+          "lattice-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Lattice theory and capability security (principle of least authority, POLA)",
           "transferable_invariant": "In a bounded lattice, the meet of two elements is their greatest lower bound. Authority delegation as lattice meet guarantees monotone narrowing: child ≤ parent across every dimension.",
@@ -299,8 +563,15 @@
           "CHK-BOUNDARY-AUTHORITY-03",
           "CHK-BOUNDARY-AUTHORITY-04"
         ],
-        "rfc_refs": ["RFC-0020 §8.3.2.1", "RFC-0020 §8.3.2.2"],
-        "general_theory_refs": ["LAW-05", "LAW-14", "PRIN-071"],
+        "rfc_refs": [
+          "RFC-0020 §8.3.2.1",
+          "RFC-0020 §8.3.2.2"
+        ],
+        "general_theory_refs": [
+          "LAW-05",
+          "LAW-14",
+          "PRIN-071"
+        ],
         "operationalization": [
           {
             "rule": "Meet operator enforcement",
@@ -355,7 +626,10 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "When the security state is unknown, stale, ambiguous, or unverifiable, the system denies actuation. Fail-open requires an explicit, time-bounded waiver with audit trail. 'Warn and continue' is not a valid security posture for authority-bearing paths.",
-        "framing_provenance": ["boundary-centric", "economics-centric"],
+        "framing_provenance": [
+          "boundary-centric",
+          "economics-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Safety engineering and fault-tolerant avionics (DO-178C)",
           "transferable_invariant": "In safety-critical systems, unknown state is treated as unsafe state. The system transitions to a known-safe configuration (denial) rather than proceeding under uncertainty.",
@@ -365,17 +639,32 @@
         "operational_source_refs": [
           "SP-INV-006",
           "SP-ID-002",
+          "SP-TIER-001",
           "SP-RUNTIME-002",
           "SP-RUNTIME-007",
           "CHK-IDENTITY-FRESHNESS-03",
           "CHK-IDENTITY-FRESHNESS-04",
           "CHK-BOUNDARY-AUTHORITY-04",
-          "WVR-0101",
-          "WVR-0102",
-          "WVR-0103"
+          "CHK-CRYPTO-SERIALIZATION-03",
+          "CHK-RISK-TIER-01",
+          "CHK-RISK-TIER-03",
+          "SP-POSTURE-001",
+          "SP-POSTURE-002",
+          "SP-VULN-001",
+          "SP-VULN-002",
+          "SP-VULN-003"
         ],
-        "rfc_refs": ["RFC-0020 §0.1 constraint 3", "RFC-0020 §4.4", "RFC-0020 §11.3.1"],
-        "general_theory_refs": ["LAW-01", "LAW-12", "LAW-14", "PRIN-092"],
+        "rfc_refs": [
+          "RFC-0020 §0.1 constraint 3",
+          "RFC-0020 §4.4",
+          "RFC-0020 §11.3.1"
+        ],
+        "general_theory_refs": [
+          "LAW-01",
+          "LAW-12",
+          "LAW-14",
+          "PRIN-092"
+        ],
         "operationalization": [
           {
             "rule": "Universal deny-on-ambiguity",
@@ -389,10 +678,11 @@
           },
           {
             "rule": "Waiver discipline",
-            "desc": "Fail-open behavior requires explicit waiver (WVR-*) with expiry, audit logging, binding tickets, and conditions.",
+            "desc": "Fail-open behavior requires explicit waiver (WVR-*) with bounded duration, named ownership, compensating controls, and ticket binding.",
             "subrules": [
-              "**Time-bounded:** All waivers carry expiry dates (currently 60-day windows).",
-              "**Logged:** Every waiver bypass is logged at WARN level with waiver ID.",
+              "**Time-bounded:** Waiver duration MUST be <= 30 days and extension count MUST be <= 1.",
+              "**Ownership:** Every waiver names owner, approver, and ticket_ref with security sign-off.",
+              "**Compensating controls:** Every waiver declares at least one active compensating control with measurable verification.",
               "**Scoped:** Waivers apply to specific control IDs, not blanket relaxation."
             ]
           }
@@ -403,13 +693,18 @@
           "required_evidence": [
             "check_result_log",
             "denial_receipt_or_waiver_ref",
-            "waiver_expiry_validation"
+            "waiver_expiry_validation",
+            "waiver_owner_and_approver",
+            "waiver_compensating_control_evidence"
           ],
           "machine_checks": [
             "no_authority_path_on_ambiguous_check",
             "waiver_not_expired",
             "waiver_conditions_met",
-            "waiver_bypass_logged"
+            "waiver_has_owner_and_ticket",
+            "waiver_duration_within_policy",
+            "waiver_compensating_control_active",
+            "waiver_bypass_logged_as_security_event"
           ],
           "fail_closed": true
         },
@@ -417,12 +712,14 @@
         "failure_mode": [
           "warn_and_continue_on_stale_identity",
           "expired_waiver_still_active",
+          "waiver_without_owner_or_compensating_controls",
           "silent_downgrade_of_verification_failure",
           "stop_uncertainty_not_denied_within_slo"
         ],
         "remediation_pattern": [
           "convert_warn_to_deny_on_authority_paths",
           "automate_waiver_expiry_enforcement",
+          "auto_revoke_waivers_missing_required_fields",
           "emit_defect_on_verification_failure",
           "enforce_250ms_stop_uncertainty_deny"
         ]
@@ -433,7 +730,9 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "Verification cost is first-class and bounded. Identity verification is O(log n) in namespace size. Proof bytes are bounded before acceptance. Batch attestation provides O(1) signature checks per batch. Any O(n) verification path is a denial-of-service vector and MUST be eliminated.",
-        "framing_provenance": ["economics-centric"],
+        "framing_provenance": [
+          "economics-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Information theory and authenticated data structures (Merkle trees, sparse Merkle tries)",
           "transferable_invariant": "Membership proof in an authenticated dictionary of size n requires O(log n) hash computations and O(log n) proof bytes. This is information-theoretically optimal for tree-structured commitments.",
@@ -444,12 +743,35 @@
           "SP-INV-004",
           "SP-ID-001",
           "CHK-IDENTITY-FRESHNESS-02",
+          "CHK-RECEIPT-AUTH-02",
           "CHK-RECEIPT-AUTH-03",
           "CHK-CRYPTO-SERIALIZATION-01",
-          "CHK-CRYPTO-SERIALIZATION-03"
+          "CHK-CRYPTO-SERIALIZATION-03",
+          "SP-POSTURE-002",
+          "SP-REL-002",
+          "SP-REL-003",
+          "SP-REL-004",
+          "SP-GATE-CLIPPY",
+          "SP-GATE-DENY",
+          "SP-GATE-AUDIT",
+          "SP-DEP-001",
+          "SP-DEP-002",
+          "SP-DEP-003"
         ],
-        "rfc_refs": ["RFC-0020 §0.1 constraint 10", "RFC-0020 §0.1 constraint 11", "RFC-0020 §0.1 constraint 13", "RFC-0020 §1.7.7", "RFC-0020 §9.5"],
-        "general_theory_refs": ["LAW-08", "LAW-16", "PRIN-003", "PRIN-007", "PRIN-046"],
+        "rfc_refs": [
+          "RFC-0020 §0.1 constraint 10",
+          "RFC-0020 §0.1 constraint 11",
+          "RFC-0020 §0.1 constraint 13",
+          "RFC-0020 §1.7.7",
+          "RFC-0020 §9.5"
+        ],
+        "general_theory_refs": [
+          "LAW-08",
+          "LAW-16",
+          "PRIN-003",
+          "PRIN-007",
+          "PRIN-046"
+        ],
         "operationalization": [
           {
             "rule": "O(log n) identity verification",
@@ -476,20 +798,34 @@
               "**<1% overhead contract:** Additional CPU and network overhead ≤ 1% vs baseline commit path.",
               "**Ledger-anchored roots:** Batch roots are ledger-anchored, not free-floating."
             ]
+          },
+          {
+            "rule": "Machine-checkable economics bounds",
+            "desc": "Asymptotic claims MUST be backed by explicit numeric bounds enforceable in CI and runtime telemetry.",
+            "subrules": [
+              "**max_decode_bytes_authority_path:** ≤ 262144 bytes before decode.",
+              "**max_collection_items_authority_path:** ≤ 10000 elements after decode.",
+              "**identity_verification_step_bound:** hash_steps ≤ 4 * ceil(log2(directory_entries)) + 64.",
+              "**tier3_plus_cpu_budget:** p99 verification_cpu_ms ≤ 50 for authority-bearing checks."
+            ]
           }
         ],
         "verifier": {
           "predicate_id": "SEC-LAW-05-BOUNDED-VERIFICATION",
-          "acceptance_predicate": "∀ verification v: cost(v) ∈ O(log n) ∧ proof_bytes(v) ≤ max_proof_bytes ∧ decode_bytes(v) ≤ max_decode_bytes",
+          "acceptance_predicate": "∀ verification v: proof_bytes(v) ≤ declared_proof_bound(v) ∧ decode_bytes(v) ≤ policy_decode_bound(v.path) ∧ collection_items(v) ≤ policy_collection_bound(v.path) ∧ hash_steps(v) ≤ 4 * ceil(log2(namespace_size(v))) + 64 ∧ cpu_p99_ms(v.path) ≤ policy_cpu_budget_ms(v.path)",
           "required_evidence": [
             "proof_byte_count",
             "decode_byte_count",
-            "verification_cost_profile"
+            "collection_item_count",
+            "verification_step_count",
+            "verification_cpu_latency_profile"
           ],
           "machine_checks": [
             "identity_proof_uses_merkle_path_not_linear_scan",
             "pre_decode_byte_bound_enforced",
             "post_decode_collection_bound_enforced",
+            "verification_step_count_within_declared_bound",
+            "tier3_plus_cpu_latency_within_declared_budget",
             "batch_overhead_within_one_percent"
           ],
           "fail_closed": true
@@ -514,12 +850,15 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "Freshness of identity, governance policy, and stop-state authority is a machine-checkable contract (FreshnessPolicyV1), not best-effort. Tier2+ paths fail closed on stale or unverifiable freshness. Wall-clock timestamps are forbidden as authority input; only HTF-compatible temporal references are valid.",
-        "framing_provenance": ["boundary-centric", "economics-centric"],
+        "framing_provenance": [
+          "boundary-centric",
+          "economics-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Distributed systems temporal ordering (Lamport 1978, hybrid logical clocks)",
           "transferable_invariant": "In an asynchronous distributed system, wall-clock time cannot be trusted for ordering authority-bearing events. Causal ordering (logical clocks, HLC/HTF) provides the only reliable temporal reference for distributed consensus.",
           "biological_analog": "Biological cells use molecular gradients and receptor binding (local, verifiable signals) for temporal coordination, not global time references. Cell-cycle checkpoints verify local state freshness before allowing progression.",
-          "why_transfers": "Holonic federation is asynchronous and adversarial. Wall-clock reliance enables clock-skew attacks (THR-AUTH-02: Lease Drift). HTF-anchored freshness policies provide the same guarantee as Lamport causality: if event A happened-before event B in the causal order, then A's timestamp < B's timestamp."
+          "why_transfers": "Holonic federation is asynchronous and adversarial. Wall-clock reliance enables clock-skew and replay windows captured in TM-CLASS-01. HTF-anchored freshness policies provide the same guarantee as Lamport causality: if event A happened-before event B in the causal order, then A's timestamp < B's timestamp."
         },
         "operational_source_refs": [
           "SP-INV-006",
@@ -528,16 +867,26 @@
           "CHK-IDENTITY-FRESHNESS-01",
           "CHK-IDENTITY-FRESHNESS-02",
           "CHK-IDENTITY-FRESHNESS-03",
-          "WVR-0101"
+          "CHK-CRYPTO-SERIALIZATION-04",
+          "CHK-RISK-TIER-03"
         ],
-        "rfc_refs": ["RFC-0020 §0.1 constraint 10b", "RFC-0020 §1.8", "RFC-0020 §1.9", "RFC-0020 §2.4.8"],
-        "general_theory_refs": ["LAW-09", "LAW-18", "PRIN-049"],
+        "rfc_refs": [
+          "RFC-0020 §0.1 constraint 10b",
+          "RFC-0020 §1.8",
+          "RFC-0020 §1.9",
+          "RFC-0020 §2.4.8"
+        ],
+        "general_theory_refs": [
+          "LAW-09",
+          "LAW-18",
+          "PRIN-049"
+        ],
         "operationalization": [
           {
             "rule": "FreshnessPolicyV1 enforcement",
-            "desc": "Each risk tier has explicit staleness thresholds and staleness actions (deny, downgrade, or allow with bounded lag).",
+            "desc": "Each risk tier has explicit staleness thresholds with authority-safe actions only.",
             "subrules": [
-              "**Tier0/Tier1:** May accept stale heads with bounded lag; downgrade to read-only.",
+              "**Tier0/Tier1:** May accept bounded staleness for non-authoritative read-only flows only.",
               "**Tier2+:** MUST fail-closed on staleness; no downgrade path.",
               "**Tier3+:** Stop-state freshness additionally enforced with 250ms deny SLO."
             ]
@@ -546,7 +895,8 @@
             "rule": "HTF temporal anchoring",
             "desc": "Authority-bearing temporal references use HTF boundary IDs, not wall-clock timestamps.",
             "subrules": [
-              "**EpochSealV1:** Optional but federation-critical; binds HTF envelope + optional VDF proof.",
+              "**EpochSealV1:** Required for cross-cell authority admission on untrusted federation links.",
+              "**VDF proof:** Required when anti-rollback confidence cannot be established from signed HTF envelope alone.",
               "**Anti-replay:** Cross-cell admission enforces both trust validity AND temporal validity."
             ]
           }
@@ -556,8 +906,8 @@
           "acceptance_predicate": "∀ tier2_plus_actuation a: freshness_verified(a.identity_head) ∧ freshness_verified(a.governance_head) ∧ freshness_verified(a.stop_state) ∧ ¬wall_clock_authority(a)",
           "required_evidence": [
             "freshness_policy_ref",
-            "identity_head_timestamp",
-            "governance_head_timestamp",
+            "identity_head_freshness_anchor",
+            "governance_head_freshness_anchor",
             "stop_state_freshness_proof"
           ],
           "machine_checks": [
@@ -587,8 +937,10 @@
         "name": "Digest-First Boundaries",
         "effective_date": "2026-02-07",
         "status": "active",
-        "statement": "Trust boundaries exchange hashes and selectors, never raw payloads. Content is dereferenced from CAS after hash verification. This bounds bandwidth, prevents injection via raw payload smuggling, and enables deduplication across the federation.",
-        "framing_provenance": ["boundary-centric"],
+        "statement": "Authority-bearing trust boundary decisions use hashes and selectors rather than raw payloads. Raw payload bytes may cross only into quarantine staging with zero authority effect until digest verification and taint/classification checks succeed. Content is dereferenced from CAS after hash verification.",
+        "framing_provenance": [
+          "boundary-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Content-addressed storage (git, IPFS, Nix store) and communication-avoiding algorithms",
           "transferable_invariant": "In communication-avoiding algorithm design (Demmel et al.), minimizing data movement (bytes across boundaries) rather than computation is the dominant optimization. Content-addressing achieves this by replacing payload transfer with hash comparison + selective dereference.",
@@ -600,8 +952,17 @@
           "CHK-CRYPTO-SERIALIZATION-01",
           "CHK-CRYPTO-SERIALIZATION-02"
         ],
-        "rfc_refs": ["RFC-0020 §0.1 constraint 6", "RFC-0020 §3.3"],
-        "general_theory_refs": ["LAW-06", "LAW-07", "PRIN-005", "PRIN-013", "PRIN-045"],
+        "rfc_refs": [
+          "RFC-0020 §0.1 constraint 6",
+          "RFC-0020 §3.3"
+        ],
+        "general_theory_refs": [
+          "LAW-06",
+          "LAW-07",
+          "PRIN-005",
+          "PRIN-013",
+          "PRIN-045"
+        ],
         "operationalization": [
           {
             "rule": "Hash-first exchange",
@@ -619,28 +980,32 @@
         ],
         "verifier": {
           "predicate_id": "SEC-LAW-07-DIGEST-FIRST",
-          "acceptance_predicate": "∀ boundary_crossing bc: payload(bc) = cas_dereference(verified_hash(bc)) ∧ ¬raw_payload_transfer(bc)",
+          "acceptance_predicate": "∀ boundary_crossing bc: authority_effect(bc) → payload_source(bc) = cas_dereference(verified_hash(bc)); raw_payload_transfer(bc) → quarantine_only(bc)",
           "required_evidence": [
             "content_hash",
             "cas_retrieval_proof",
-            "canonicalization_evidence"
+            "canonicalization_evidence",
+            "quarantine_receipt_if_raw_payload_seen"
           ],
           "machine_checks": [
-            "no_raw_payload_in_boundary_protocol",
+            "raw_payload_never_drives_authority_directly",
             "hash_verified_before_dereference",
-            "canonicalization_deterministic"
+            "canonicalization_deterministic",
+            "raw_payload_promoted_only_via_digest_verified_quarantine_path"
           ],
           "fail_closed": true
         },
         "scale_invariance": "Digest-first is more valuable at scale, not less. At depth 1, it's a clean design pattern. At depth 10^9, it's the difference between exabyte bandwidth consumption (raw payloads) and kilobyte hash exchange. The protocol is identical; only the savings magnitude changes.",
         "failure_mode": [
           "raw_payload_injection_at_boundary",
+          "raw_payload_directly_drives_authority",
           "non_deterministic_canonicalization",
           "hash_collision_exploitation",
           "cas_retrieval_without_hash_verification"
         ],
         "remediation_pattern": [
           "replace_raw_payload_with_hash_reference",
+          "route_bootstrap_payload_to_quarantine_and_promote_by_digest",
           "enforce_deterministic_canonicalization",
           "use_collision_resistant_hash_blake3",
           "verify_hash_chain_before_cas_dereference"
@@ -652,7 +1017,10 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "Operations crossing boundaries enforce BOTH an integrity gate (minimum taint level: UNTRUSTED < SANITIZED < VERIFIED < ATTESTED) AND a confidentiality gate (maximum classification level: PUBLIC < INTERNAL < CONFIDENTIAL < RESTRICTED). The two lattices are independent and jointly enforced — satisfying one does not exempt from the other.",
-        "framing_provenance": ["lattice-centric", "boundary-centric"],
+        "framing_provenance": [
+          "lattice-centric",
+          "boundary-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Bell-LaPadula (confidentiality) and Biba (integrity) security models; lattice-based access control (Denning 1976)",
           "transferable_invariant": "Security policy is a lattice homomorphism: subjects and objects carry labels from partially ordered sets, and allowable information flows must respect the order in both confidentiality (no read-up, no write-down) and integrity (no read-down, no write-up) simultaneously.",
@@ -660,15 +1028,29 @@
           "why_transfers": "Agent-native systems face both injection attacks (low-taint input reaching high-impact actuators — integrity failure) and leakage attacks (high-classification output reaching low-clearance channels — confidentiality failure). The dual-lattice structure prevents both simultaneously."
         },
         "operational_source_refs": [
+          "SP-RUNTIME-001",
           "SP-RUNTIME-003",
           "SP-RUNTIME-004",
+          "CHK-TOOL-CONTEXT-02",
+          "CHK-TOOL-CONTEXT-03",
           "CHK-INJECTION-CONFIDENTIALITY-01",
           "CHK-INJECTION-CONFIDENTIALITY-02",
           "CHK-INJECTION-CONFIDENTIALITY-03",
-          "CHK-INJECTION-CONFIDENTIALITY-04"
+          "CHK-INJECTION-CONFIDENTIALITY-04",
+          "CHK-RISK-TIER-02",
+          "SP-SECRET-001",
+          "SP-SECRET-002",
+          "SP-SECRET-003"
         ],
-        "rfc_refs": ["RFC-0020 §6.4", "RFC-0020 §0.1 constraint 7"],
-        "general_theory_refs": ["LAW-05", "LAW-15", "PRIN-071"],
+        "rfc_refs": [
+          "RFC-0020 §6.4",
+          "RFC-0020 §0.1 constraint 7"
+        ],
+        "general_theory_refs": [
+          "LAW-05",
+          "LAW-15",
+          "PRIN-071"
+        ],
         "operationalization": [
           {
             "rule": "Taint lattice enforcement (integrity)",
@@ -726,7 +1108,10 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "Authority synchronization across federation boundaries is pull-only. Byzantine peers cannot force authority admission. Anti-entropy budgets are scoped per episode, cell, and relay. Budget exceedance triggers denial and defect emission, not silent acceptance or degraded processing.",
-        "framing_provenance": ["economics-centric", "boundary-centric"],
+        "framing_provenance": [
+          "economics-centric",
+          "boundary-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Byzantine fault tolerance and anti-entropy protocols (Demers et al. 1987, Lamport et al. 1982)",
           "transferable_invariant": "In a Byzantine fault-tolerant system, correct nodes must bound the influence of faulty nodes. Pull-based synchronization achieves this: a correct node only accepts data it explicitly requested, bounding the influence of any single peer to the pull budget.",
@@ -737,11 +1122,18 @@
           "SP-RUNTIME-005",
           "SP-RUNTIME-006",
           "CHK-CONTINUITY-STOP-01",
-          "RUNBOOK-ALERT-05",
-          "WVR-0102"
+          "RUNBOOK-ALERT-05"
         ],
-        "rfc_refs": ["RFC-0020 §0.1 constraint 8", "RFC-0020 §2.4.3b"],
-        "general_theory_refs": ["LAW-10", "LAW-12", "PRIN-049", "PRIN-051"],
+        "rfc_refs": [
+          "RFC-0020 §0.1 constraint 8",
+          "RFC-0020 §2.4.3b"
+        ],
+        "general_theory_refs": [
+          "LAW-10",
+          "LAW-12",
+          "PRIN-049",
+          "PRIN-051"
+        ],
         "operationalization": [
           {
             "rule": "Pull-only authority flow",
@@ -757,6 +1149,8 @@
             "desc": "Budget exceedance is DENY_ACTUATION_AND_EMIT_DEFECT, not silent degradation.",
             "subrules": [
               "**Revocation-wins:** Revocation events take priority in merge semantics.",
+              "**Revocation carve-out:** Revocation messages are exempt from ingest denial but remain subject to strict parser and proof-byte bounds.",
+              "**Revocation flood guard:** Revocation carve-out is constrained by per-peer token bucket and global revocation parse budget to prevent carve-out abuse DoS.",
               "**Range caps and fanout caps:** Additional structural bounds on anti-entropy sync volume.",
               "**Convergence guarantee:** Revocation-wins semantics preserved despite budget bounds."
             ]
@@ -764,16 +1158,19 @@
         ],
         "verifier": {
           "predicate_id": "SEC-LAW-09-PULL-BASED-ANTI-ENTROPY",
-          "acceptance_predicate": "∀ authority_sync s: pull_initiated(s) ∧ within_budget(s, scope) ∧ (budget_exceeded(s) → denied(s) ∧ defect_emitted(s))",
+          "acceptance_predicate": "∀ authority_sync s: pull_initiated(s) ∧ ((is_revocation(s) ∧ within_revocation_guardrails(s)) ∨ within_budget(s, scope)) ∧ (budget_exceeded_non_revocation(s) → denied(s) ∧ defect_emitted(s))",
           "required_evidence": [
             "sync_initiation_proof",
             "budget_scope_and_current_usage",
+            "revocation_guardrail_counters",
             "denial_receipt_on_exceedance",
             "defect_record_on_exceedance"
           ],
           "machine_checks": [
             "no_push_authority_from_relay",
             "budget_tracked_per_scope",
+            "revocation_carveout_requires_valid_revocation_proof",
+            "revocation_carveout_rate_limited_and_metered",
             "exceedance_triggers_denial",
             "defect_emitted_on_denial"
           ],
@@ -799,7 +1196,10 @@
         "effective_date": "2026-02-07",
         "status": "active",
         "statement": "Stop orders are governance primitives, not convenience signals. Capsule processes MUST honor stops within bounded deadlines. Missing or unknown stop state defaults to denial. Tier3+ SLO: stop propagation p99 ≤ 2000ms; denial on uncertainty ≤ 250ms. The stop path is the last line of defense against runaway autonomous execution.",
-        "framing_provenance": ["boundary-centric", "economics-centric"],
+        "framing_provenance": [
+          "boundary-centric",
+          "economics-centric"
+        ],
         "cross_domain_provenance": {
           "source_discipline": "Safety engineering (IEC 61508 functional safety) and distributed consensus (Raft/Paxos leader deposition)",
           "transferable_invariant": "In functional safety systems, the safety function (emergency stop) has higher priority than the control function (normal operation). The safety function must remain operable even when the control function has failed.",
@@ -811,16 +1211,26 @@
           "CHK-CONTINUITY-STOP-02",
           "CHK-CONTINUITY-STOP-03",
           "RUNBOOK-ALERT-02",
-          "WVR-0101"
+          "SP-VULN-001",
+          "SP-VULN-002",
+          "SP-VULN-003"
         ],
-        "rfc_refs": ["RFC-0020 §4.4", "RFC-0020 §11.3.1"],
-        "general_theory_refs": ["LAW-01", "LAW-12", "LAW-14"],
+        "rfc_refs": [
+          "RFC-0020 §4.4",
+          "RFC-0020 §11.3.1"
+        ],
+        "general_theory_refs": [
+          "LAW-01",
+          "LAW-12",
+          "LAW-14"
+        ],
         "operationalization": [
           {
             "rule": "Bounded stop propagation",
             "desc": "Stop orders propagate through the holonic hierarchy with bounded latency.",
             "subrules": [
               "**Tier3+ p99:** Stop propagation ≤ 2000ms end-to-end.",
+              "**Topology bound:** Tier3+ stop overlay diameter MUST be ≤ 4 hops for authority-bearing deployments.",
               "**Uncertainty deny:** Stop uncertainty denial ≤ 250ms.",
               "**Fail-safe kernel boundary:** If stop state is unknown, kernel-boundary deny activates."
             ]
@@ -837,14 +1247,16 @@
         ],
         "verifier": {
           "predicate_id": "SEC-LAW-10-STOP-PRIMITIVE",
-          "acceptance_predicate": "∀ tier3_plus_holon h: stop_propagation_p99(h) ≤ 2000ms ∧ stop_uncertainty_deny(h) ≤ 250ms ∧ (stop_state_unknown(h) → actuation_denied(h))",
+          "acceptance_predicate": "∀ tier3_plus_holon h: stop_overlay_diameter(h) ≤ 4 ∧ stop_propagation_p99(h) ≤ 2000ms ∧ stop_uncertainty_deny(h) ≤ 250ms ∧ (stop_state_unknown(h) → actuation_denied(h))",
           "required_evidence": [
+            "stop_overlay_topology_snapshot",
             "stop_propagation_latency_measurement",
             "stop_uncertainty_deny_measurement",
             "drill_receipt_v1",
             "defect_record_on_slo_violation"
           ],
           "machine_checks": [
+            "stop_overlay_diameter_within_bound",
             "stop_propagation_within_2000ms",
             "stop_uncertainty_deny_within_250ms",
             "unknown_stop_state_triggers_denial",
@@ -852,7 +1264,7 @@
           ],
           "fail_closed": true
         },
-        "scale_invariance": "Stop propagation is hierarchical: each level propagates to its children within bounded time. At depth 10^9, the SLO applies at each level independently. Total propagation time is bounded by tree depth × per-level SLO, but each individual level's contract is identical.",
+        "scale_invariance": "Stop propagation scales by bounded-diameter overlay rather than unbounded chain depth. At depth 10^9, Tier3+ authority-bearing topologies remain admissible only when stop overlay diameter is constrained (≤ 4), preserving the same end-to-end 2000ms contract at every scale.",
         "failure_mode": [
           "stop_signal_ignored_by_capsule",
           "stop_propagation_exceeding_slo",
@@ -867,7 +1279,6 @@
         ]
       }
     ],
-
     "security_principles": [
       {
         "id": "SEC-PRIN-001",
@@ -875,10 +1286,24 @@
         "title": "Grant the minimum authority necessary for each task",
         "formal": "∀ task T, agent A: authority(A, T) = minimal_set(required_capabilities(T))",
         "apm2_mapping": "CapabilityManifestV1 binds tool-scope to the minimum needed. AuthorityVectorV1 meet operator ensures delegation never widens. EpisodeEnvelopeV1 pins the authority context for the duration of execution.",
-        "connections": ["SEC-PRIN-002", "SEC-PRIN-003", "SEC-PRIN-010"],
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-03"],
-        "mechanism_refs": ["SEC-MECH-01", "SEC-MECH-02", "SEC-MECH-04"],
-        "defect_refs": ["SEC-DEFECT-02", "SEC-DEFECT-06"]
+        "connections": [
+          "SEC-PRIN-002",
+          "SEC-PRIN-003",
+          "SEC-PRIN-010"
+        ],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-03"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-01",
+          "SEC-MECH-02",
+          "SEC-MECH-04"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-02",
+          "SEC-DEFECT-06"
+        ]
       },
       {
         "id": "SEC-PRIN-002",
@@ -886,21 +1311,48 @@
         "title": "Capabilities cannot be forged, stolen, or amplified — only held, delegated (narrowed), or revoked",
         "formal": "∀ capability C: acquire(C) ∈ {delegation_from_holder, explicit_grant_from_root} ∧ ¬forgeable(C)",
         "apm2_mapping": "PermeabilityReceiptV1 is the sole cross-boundary authority token. It is cryptographically signed and bound to an EpisodeEnvelope. There is no way to construct a valid receipt without holding a signing key that chains to the authority root.",
-        "connections": ["SEC-PRIN-001", "SEC-PRIN-004"],
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-02", "SEC-LAW-03"],
-        "mechanism_refs": ["SEC-MECH-01", "SEC-MECH-02"],
-        "defect_refs": ["SEC-DEFECT-01", "SEC-DEFECT-02"]
+        "connections": [
+          "SEC-PRIN-001",
+          "SEC-PRIN-004"
+        ],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-02",
+          "SEC-LAW-03"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-01",
+          "SEC-MECH-02"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-01",
+          "SEC-DEFECT-02"
+        ]
       },
       {
         "id": "SEC-PRIN-003",
         "name": "Defense in Depth",
         "title": "Multiple independent protection layers so no single failure is catastrophic",
-        "formal": "P(system_breach) = ∏ P(layer_i_breach) for independent layers i ∈ {1..n}",
+        "formal": "P(system_breach) = P(∩ layer_i_breach) with layer-coupling measured explicitly; independence is a testable hypothesis, not an assumption",
         "apm2_mapping": "Sandbox isolation (OS-level) + daemon mediation (process-level) + capability gating (authority-level) + taint checking (data-level) + freshness enforcement (temporal-level). Each layer is independently enforced.",
-        "connections": ["SEC-PRIN-001", "SEC-PRIN-005", "SEC-PRIN-008"],
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-04", "SEC-LAW-08"],
-        "mechanism_refs": ["SEC-MECH-01", "SEC-MECH-06", "SEC-MECH-08"],
-        "defect_refs": ["SEC-DEFECT-03"]
+        "connections": [
+          "SEC-PRIN-001",
+          "SEC-PRIN-005",
+          "SEC-PRIN-008"
+        ],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-04",
+          "SEC-LAW-08"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-01",
+          "SEC-MECH-06",
+          "SEC-MECH-08"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-03"
+        ]
       },
       {
         "id": "SEC-PRIN-004",
@@ -908,10 +1360,22 @@
         "title": "Once an effect is committed via receipt, neither party can deny it occurred",
         "formal": "∀ receipt R: signed(R) ∧ cas_stored(R) ∧ ledger_linked(R) → ¬deniable(R.effect)",
         "apm2_mapping": "Receipt production, CAS storage, and ledger anchoring create a three-layer commitment that provides non-repudiation. AuthoritySealV1 extends this to batch commitments via Merkle roots.",
-        "connections": ["SEC-PRIN-002", "SEC-PRIN-009"],
-        "law_refs": ["SEC-LAW-02", "SEC-LAW-07"],
-        "mechanism_refs": ["SEC-MECH-03", "SEC-MECH-05", "SEC-MECH-09"],
-        "defect_refs": ["SEC-DEFECT-04"]
+        "connections": [
+          "SEC-PRIN-002",
+          "SEC-PRIN-009"
+        ],
+        "law_refs": [
+          "SEC-LAW-02",
+          "SEC-LAW-07"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-03",
+          "SEC-MECH-05",
+          "SEC-MECH-09"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-04"
+        ]
       },
       {
         "id": "SEC-PRIN-005",
@@ -919,21 +1383,41 @@
         "title": "The cost of a missed attack far exceeds the cost of a false denial",
         "formal": "E[cost(false_negative)] >> E[cost(false_positive)] → optimal_threshold biased toward denial",
         "apm2_mapping": "This asymmetry is why fail-closed is the universal default. A missed injection attack can compromise the entire holonic hierarchy. A false denial delays one operation by one retry cycle. The cost ratio justifies aggressive denial under ambiguity.",
-        "connections": ["SEC-PRIN-003", "SEC-PRIN-006"],
-        "law_refs": ["SEC-LAW-04"],
-        "mechanism_refs": ["SEC-MECH-08"],
-        "defect_refs": ["SEC-DEFECT-05"]
+        "connections": [
+          "SEC-PRIN-003",
+          "SEC-PRIN-006"
+        ],
+        "law_refs": [
+          "SEC-LAW-04"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-08"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-05"
+        ]
       },
       {
         "id": "SEC-PRIN-006",
         "name": "Temporal Authority Requires Causal Ordering",
         "title": "Wall-clock time cannot ground authority decisions in asynchronous distributed systems",
         "formal": "∀ authority_decision D: temporal_reference(D) ∈ HTF_boundary_ids ∧ temporal_reference(D) ∉ wall_clock",
-        "apm2_mapping": "HTF boundary IDs provide the causal ordering substrate. FreshnessPolicyV1 uses these, not wall-clock timestamps, as authority input. This prevents clock-skew attacks (THR-AUTH-02) and ensures temporal validity is verifiable under partition.",
-        "connections": ["SEC-PRIN-007", "SEC-PRIN-005"],
-        "law_refs": ["SEC-LAW-06"],
-        "mechanism_refs": ["SEC-MECH-07", "SEC-MECH-10"],
-        "defect_refs": ["SEC-DEFECT-07"]
+        "apm2_mapping": "HTF boundary IDs provide the causal ordering substrate. FreshnessPolicyV1 uses these, not wall-clock timestamps, as authority input. This prevents TM-CLASS-01 clock-skew/replay vectors and ensures temporal validity is verifiable under partition.",
+        "connections": [
+          "SEC-PRIN-007",
+          "SEC-PRIN-005"
+        ],
+        "law_refs": [
+          "SEC-LAW-06"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-07",
+          "SEC-MECH-10",
+          "SEC-MECH-13"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-07"
+        ]
       },
       {
         "id": "SEC-PRIN-007",
@@ -941,10 +1425,20 @@
         "title": "In any concurrent merge of authority state, revocation takes precedence over grant",
         "formal": "∀ merge(state_a, state_b): if revoked(x) ∈ state_a ∧ granted(x) ∈ state_b → merged_state(x) = revoked",
         "apm2_mapping": "CRDT anti-entropy with revocation-wins semantics. This is critical for stop-path safety: if one branch of the federation has revoked authority while another hasn't received the revocation, the merge must honor the revocation.",
-        "connections": ["SEC-PRIN-006", "SEC-PRIN-010"],
-        "law_refs": ["SEC-LAW-09", "SEC-LAW-10"],
-        "mechanism_refs": ["SEC-MECH-10"],
-        "defect_refs": ["SEC-DEFECT-08"]
+        "connections": [
+          "SEC-PRIN-006",
+          "SEC-PRIN-010"
+        ],
+        "law_refs": [
+          "SEC-LAW-09",
+          "SEC-LAW-10"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-10"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-08"
+        ]
       },
       {
         "id": "SEC-PRIN-008",
@@ -952,10 +1446,21 @@
         "title": "Trust boundaries enforce both inbound integrity gates and outbound confidentiality gates",
         "formal": "∀ boundary B: gate_in(B) = min_taint_check ∧ gate_out(B) = max_classification_check",
         "apm2_mapping": "The dual-lattice (taint × classification) is applied at every holon boundary. Inbound: taint must meet minimum for the target actuator. Outbound: classification must not exceed the channel ceiling. Both gates are independently enforced.",
-        "connections": ["SEC-PRIN-003", "SEC-PRIN-001"],
-        "law_refs": ["SEC-LAW-08"],
-        "mechanism_refs": ["SEC-MECH-06", "SEC-MECH-08"],
-        "defect_refs": ["SEC-DEFECT-09", "SEC-DEFECT-10"]
+        "connections": [
+          "SEC-PRIN-003",
+          "SEC-PRIN-001"
+        ],
+        "law_refs": [
+          "SEC-LAW-08"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-06",
+          "SEC-MECH-08"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-09",
+          "SEC-DEFECT-10"
+        ]
       },
       {
         "id": "SEC-PRIN-009",
@@ -963,10 +1468,21 @@
         "title": "The cost of proof verification must be bounded and explicit, not an afterthought",
         "formal": "∀ verification V with namespace size n: cost(V) ∈ O(log n) ∧ proof_bytes(V) ≤ declared_bound",
         "apm2_mapping": "IdentityProofV1 with Merkle directory proofs provides O(log n) verification. AuthoritySealV1 batch verification provides O(1) amortized signature checks. Both have explicit proof byte bounds declared in directory heads.",
-        "connections": ["SEC-PRIN-004", "SEC-PRIN-010"],
-        "law_refs": ["SEC-LAW-05"],
-        "mechanism_refs": ["SEC-MECH-03", "SEC-MECH-05", "SEC-MECH-09"],
-        "defect_refs": ["SEC-DEFECT-11"]
+        "connections": [
+          "SEC-PRIN-004",
+          "SEC-PRIN-010"
+        ],
+        "law_refs": [
+          "SEC-LAW-05"
+        ],
+        "mechanism_refs": [
+          "SEC-MECH-03",
+          "SEC-MECH-05",
+          "SEC-MECH-09"
+        ],
+        "defect_refs": [
+          "SEC-DEFECT-11"
+        ]
       },
       {
         "id": "SEC-PRIN-010",
@@ -974,21 +1490,40 @@
         "title": "Deepest security primitives are fractal — same contract at every recursion depth",
         "formal": "∀ security_law L, recursion_depth d: semantic_contract(L, d) = semantic_contract(L, 1); only leverage(L, d) grows with d",
         "apm2_mapping": "Every SEC-LAW is stated in terms that hold identically from 1 agent to 10^9 agents. When a law needs special modes at higher scale, that signals a missing, more fundamental law underneath. The meet operator, fail-closed denial, digest-first exchange — all are the same at every depth.",
-        "connections": ["SEC-PRIN-001", "SEC-PRIN-009"],
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-02", "SEC-LAW-03", "SEC-LAW-04", "SEC-LAW-05", "SEC-LAW-06", "SEC-LAW-07", "SEC-LAW-08", "SEC-LAW-09", "SEC-LAW-10"],
+        "connections": [
+          "SEC-PRIN-001",
+          "SEC-PRIN-009"
+        ],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-02",
+          "SEC-LAW-03",
+          "SEC-LAW-04",
+          "SEC-LAW-05",
+          "SEC-LAW-06",
+          "SEC-LAW-07",
+          "SEC-LAW-08",
+          "SEC-LAW-09",
+          "SEC-LAW-10"
+        ],
         "mechanism_refs": [],
         "defect_refs": []
       }
     ],
-
     "security_mechanisms": [
       {
         "id": "SEC-MECH-01",
         "name": "PermeabilityReceiptV1",
         "purpose": "Sole cross-holon authority entrance. Carries delegated authority vector with meet-operator narrowing.",
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-03"],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-03"
+        ],
         "rfc_ref": "RFC-0020 §8.3",
-        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "operational_doc_refs": [
+          "SECURITY_POLICY.cac.json",
+          "SECURITY_CHECKLIST.cac.json"
+        ],
         "key_properties": [
           "Cryptographically signed authority delegation",
           "Meet operator enforces componentwise narrowing",
@@ -1000,9 +1535,15 @@
         "id": "SEC-MECH-02",
         "name": "CapabilityManifestV1",
         "purpose": "Sealed OCAP handles + scopes (paths, patterns, size, network, risk tier) for tool-level authority.",
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-03"],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-03"
+        ],
         "rfc_ref": "RFC-0020 §3.2",
-        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "operational_doc_refs": [
+          "SECURITY_POLICY.cac.json",
+          "SECURITY_CHECKLIST.cac.json"
+        ],
         "key_properties": [
           "Tool-scope binding for each delegated capability",
           "Validated against before every tool invocation",
@@ -1014,9 +1555,14 @@
         "id": "SEC-MECH-03",
         "name": "AuthoritySealV1",
         "purpose": "Batch receipt authentication via Merkle root signature. Provides O(1) amortized signature verification per batch.",
-        "law_refs": ["SEC-LAW-02", "SEC-LAW-05"],
+        "law_refs": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
         "rfc_ref": "RFC-0020 §9.5",
-        "operational_doc_refs": ["SECURITY_CHECKLIST.cac.json"],
+        "operational_doc_refs": [
+          "SECURITY_CHECKLIST.cac.json"
+        ],
         "key_properties": [
           "Merkle batch root signed by cell authority or quorum",
           "Per-receipt inclusion proofs for individual verification",
@@ -1028,9 +1574,16 @@
         "id": "SEC-MECH-04",
         "name": "EpisodeEnvelopeV1",
         "purpose": "Immutable binding of identity, budgets, stop conditions, pinned snapshots, and authority context for a single episode.",
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-02", "SEC-LAW-06"],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-02",
+          "SEC-LAW-06"
+        ],
         "rfc_ref": "RFC-0020 §3.3",
-        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "operational_doc_refs": [
+          "SECURITY_POLICY.cac.json",
+          "SECURITY_CHECKLIST.cac.json"
+        ],
         "key_properties": [
           "Binds: identity, budgets, stop conditions, repo hash, lockfile hash, policy hash, toolchain hash, manifest hash, contract hash, context hash, risk tier, determinism class",
           "All authoritative receipts MUST bind episode envelope hash",
@@ -1042,9 +1595,15 @@
         "id": "SEC-MECH-05",
         "name": "IdentityProofV1",
         "purpose": "O(log n) identity verification via certificate chain + Merkle directory proof.",
-        "law_refs": ["SEC-LAW-05", "SEC-LAW-06"],
+        "law_refs": [
+          "SEC-LAW-05",
+          "SEC-LAW-06"
+        ],
         "rfc_ref": "RFC-0020 §1.7.7",
-        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "NETWORK_DEFENSE.cac.json"],
+        "operational_doc_refs": [
+          "SECURITY_POLICY.cac.json",
+          "NETWORK_DEFENSE.cac.json"
+        ],
         "key_properties": [
           "Bundles: cell certificate hash, holon certificate hash, directory head hash, directory proof, as_of_anchor",
           "O(log n) membership proof in authenticated dictionary",
@@ -1056,9 +1615,14 @@
         "id": "SEC-MECH-06",
         "name": "Context Firewall",
         "purpose": "Hard enforcement of context read boundaries for capsule processes.",
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-08"],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-08"
+        ],
         "rfc_ref": "RFC-0020 §4.5",
-        "operational_doc_refs": ["SECURITY_CHECKLIST.cac.json"],
+        "operational_doc_refs": [
+          "SECURITY_CHECKLIST.cac.json"
+        ],
         "key_properties": [
           "Reads outside ContextPackManifest allowlist denied by default",
           "Tier3+: hard-fail termination + CapsuleViolation + denial receipt",
@@ -1070,12 +1634,17 @@
         "id": "SEC-MECH-07",
         "name": "FreshnessPolicyV1",
         "purpose": "Machine-checkable freshness contract with risk-tiered staleness thresholds and actions.",
-        "law_refs": ["SEC-LAW-06"],
+        "law_refs": [
+          "SEC-LAW-06"
+        ],
         "rfc_ref": "RFC-0020 §1.8, §1.9, §2.4.8",
-        "operational_doc_refs": ["SECURITY_POLICY.cac.json", "consensus-runbook.cac.json"],
+        "operational_doc_refs": [
+          "SECURITY_POLICY.cac.json",
+          "consensus-runbook.cac.json"
+        ],
         "key_properties": [
           "Per-risk-tier staleness thresholds",
-          "Staleness actions: deny, downgrade, or allow with bounded lag",
+          "Staleness actions: Tier0/1 read-only downgrade with bounded lag; Tier2+ deny",
           "HTF-compatible temporal references only",
           "Cross-cell admission enforces both trust AND temporal validity"
         ]
@@ -1084,9 +1653,14 @@
         "id": "SEC-MECH-08",
         "name": "SecretRedactor",
         "purpose": "Mandatory log and artifact redaction for sensitive material.",
-        "law_refs": ["SEC-LAW-08"],
+        "law_refs": [
+          "SEC-LAW-08"
+        ],
         "rfc_ref": "N/A (operational control)",
-        "operational_doc_refs": ["SECRETS_MANAGEMENT.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "operational_doc_refs": [
+          "SECRETS_MANAGEMENT.cac.json",
+          "SECURITY_CHECKLIST.cac.json"
+        ],
         "key_properties": [
           "Auto-redacts patterns: *_KEY, *_TOKEN, *_SECRET, *_PASSWORD, cloud/provider prefixes",
           "Applied to runtime logs, API responses, errors, textual channels",
@@ -1098,9 +1672,13 @@
         "id": "SEC-MECH-09",
         "name": "HolonDirectoryHeadV1",
         "purpose": "Authenticated dictionary commitment for O(log n) membership verification and DoS-bounded proof bytes.",
-        "law_refs": ["SEC-LAW-05"],
+        "law_refs": [
+          "SEC-LAW-05"
+        ],
         "rfc_ref": "RFC-0020 §1.7.7",
-        "operational_doc_refs": ["NETWORK_DEFENSE.cac.json"],
+        "operational_doc_refs": [
+          "NETWORK_DEFENSE.cac.json"
+        ],
         "key_properties": [
           "Cell-scoped directory with monotone epoch",
           "Ledger-anchored root hash (SMT-256 or Patricia trie)",
@@ -1111,13 +1689,18 @@
       {
         "id": "SEC-MECH-10",
         "name": "EpochSealV1",
-        "purpose": "Federation anti-rollback mechanism binding HTF envelope with optional VDF proof.",
-        "law_refs": ["SEC-LAW-06", "SEC-LAW-09"],
+        "purpose": "Federation anti-rollback mechanism binding HTF envelope with policy-gated VDF proof requirements.",
+        "law_refs": [
+          "SEC-LAW-06",
+          "SEC-LAW-09"
+        ],
         "rfc_ref": "RFC-0020 §1.9",
-        "operational_doc_refs": ["consensus-runbook.cac.json"],
+        "operational_doc_refs": [
+          "consensus-runbook.cac.json"
+        ],
         "key_properties": [
           "Binds HTF envelope for temporal anchoring",
-          "Optional VDF (Verifiable Delay Function) proof for anti-rollback",
+          "VDF (Verifiable Delay Function) proof required on untrusted links when signed envelope confidence is insufficient",
           "Federation-critical for cross-cell temporal coordination",
           "Prevents rollback attacks where adversary replays old epoch state"
         ]
@@ -1126,12 +1709,19 @@
         "id": "SEC-MECH-11",
         "name": "Sigstore Keyless Signing",
         "purpose": "Eliminate long-lived signing keys from release operations via OIDC → Fulcio → Cosign → Rekor pipeline.",
-        "law_refs": ["SEC-LAW-02"],
+        "law_refs": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
         "rfc_ref": "N/A (release infrastructure)",
-        "operational_doc_refs": ["SIGNING_AND_VERIFICATION.cac.json", "RELEASE_PROCEDURE.cac.json", "AGENTS.cac.json"],
+        "operational_doc_refs": [
+          "documents/security/SIGNING_AND_VERIFICATION.cac.json",
+          "documents/security/RELEASE_PROCEDURE.cac.json",
+          "documents/security/SECURITY_POLICY.cac.json"
+        ],
         "key_properties": [
           "GitHub Actions OIDC token → Fulcio short-lived certificate → Cosign ephemeral signing → Rekor transparency logging",
-          "No long-lived private keys to store, rotate, or protect",
+          "Eliminates project-managed long-lived private signing keys in CI release paths",
           "Identity-constrained verification: must match expected repository and workflow",
           "SLSA provenance + SBOM for build-origin claims"
         ]
@@ -1140,25 +1730,532 @@
         "id": "SEC-MECH-12",
         "name": "DrillReceiptV1",
         "purpose": "Evidence artifact proving chaos/partition drill execution and stop-path behavior under failure conditions.",
-        "law_refs": ["SEC-LAW-10"],
+        "law_refs": [
+          "SEC-LAW-10"
+        ],
         "rfc_ref": "RFC-0020 §11.3.1",
-        "operational_doc_refs": ["consensus-runbook.cac.json", "SECURITY_CHECKLIST.cac.json"],
+        "operational_doc_refs": [
+          "consensus-runbook.cac.json",
+          "SECURITY_CHECKLIST.cac.json"
+        ],
         "key_properties": [
           "Records: drill scenario, execution evidence, pass/fail, timing measurements",
           "Drill scenarios: network partition, ledger append latency, CAS unavailability, stop-path degradation",
           "Required for Tier3+ stop-path SLO validation",
           "Provides falsifiable evidence that stop mechanisms work under adversarial conditions"
         ]
+      },
+      {
+        "id": "SEC-MECH-13",
+        "name": "SessionKeyDelegationV1",
+        "purpose": "Bind ephemeral session keys to authenticated delegation context so handshake identities cannot be replayed or transplanted.",
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-02",
+          "SEC-LAW-06"
+        ],
+        "rfc_ref": "RFC-0020 §1.3.2",
+        "operational_doc_refs": [
+          "documents/security/SECURITY_POLICY.cac.json",
+          "documents/security/THREAT_MODEL.cac.json"
+        ],
+        "key_properties": [
+          "Session key delegation binds session_public_key to episode_envelope_hash and permeability_receipt_hash",
+          "Delegations carry nonce and expiry anchors with strict replay denial",
+          "Handshake acceptance requires trust-chain validation plus freshness checks",
+          "Session key scope cannot exceed parent capability and risk-tier ceilings"
+        ]
+      },
+      {
+        "id": "SEC-MECH-14",
+        "name": "PolicyRootDualApprovalV1",
+        "purpose": "Prevent insider and single-operator policy-root abuse through dual approval, epoch monotonicity, and anomaly-scored admission.",
+        "law_refs": [
+          "SEC-LAW-04",
+          "SEC-LAW-10"
+        ],
+        "rfc_ref": "N/A (governance control)",
+        "operational_doc_refs": [
+          "documents/security/SECURITY_POLICY.cac.json",
+          "documents/security/INCIDENT_RESPONSE.cac.json"
+        ],
+        "key_properties": [
+          "Policy-root mutations require two distinct approvers with disjoint roles",
+          "Every accepted mutation increments policy_root_epoch monotonically",
+          "Anomaly detection score is evaluated before mutation admission",
+          "Mutations emit governance receipts for forensic replay and revocation"
+        ]
       }
     ],
-
+    "mechanism_interface_contracts": [
+      {
+        "mechanism_id": "SEC-MECH-01",
+        "wire_format": "application/vnd.apm2.permeability_receipt.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "receipt_id",
+          "issuer",
+          "subject",
+          "authority_vector",
+          "episode_envelope_hash",
+          "issued_at_anchor",
+          "expires_at_anchor",
+          "signature"
+        ],
+        "size_bounds": {
+          "max_bytes": 16384,
+          "max_scope_entries": 1024,
+          "max_fanout_entries": 256
+        },
+        "verification_contract": [
+          "verify_signature_against_trust_root",
+          "verify_episode_envelope_hash_binding",
+          "verify_strict_subset_across_authority_dimensions",
+          "verify_not_expired_by_freshness_policy"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "missing_required_field",
+          "authority_vector_widening",
+          "expired_or_revoked_signer"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-02",
+        "wire_format": "application/vnd.apm2.capability_manifest.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "manifest_id",
+          "issuer",
+          "subject",
+          "tool_scopes",
+          "path_constraints",
+          "network_constraints",
+          "risk_tier_ceiling",
+          "issued_at_anchor",
+          "expires_at_anchor",
+          "signature"
+        ],
+        "size_bounds": {
+          "max_bytes": 32768,
+          "max_tool_entries": 512,
+          "max_path_rules": 2048
+        },
+        "verification_contract": [
+          "verify_signature_against_trust_root",
+          "verify_manifest_hash_bound_in_episode_envelope",
+          "verify_tool_scopes_are_subset_of_parent_manifest",
+          "verify_expiry_and_revocation"
+        ],
+        "reject_on": [
+          "missing_required_field",
+          "unknown_fields_on_authority_paths",
+          "wildcard_scope_without_explicit_waiver",
+          "scope_widening_vs_parent_manifest",
+          "expired_or_revoked_manifest"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-03",
+        "wire_format": "application/vnd.apm2.authority_seal.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "batch_root_hash",
+          "batch_id",
+          "issuer",
+          "signature_or_quorum_proof",
+          "ledger_anchor"
+        ],
+        "size_bounds": {
+          "max_bytes": 8192,
+          "max_merkle_depth": 64
+        },
+        "verification_contract": [
+          "verify_batch_root_signature_or_quorum",
+          "verify_ledger_anchor_monotonicity",
+          "verify_membership_proof_for_each_receipt",
+          "enforce_proof_bytes_bound_before_decode"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "free_floating_root_without_anchor",
+          "invalid_membership_proof",
+          "proof_depth_exceeds_bound",
+          "issuer_not_authorized_for_cell"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-04",
+        "wire_format": "application/vnd.apm2.episode_envelope.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "episode_id",
+          "identity_ref",
+          "capability_manifest_hash",
+          "permeability_receipt_hash",
+          "stop_predicate_hash",
+          "budget_vector",
+          "pinned_snapshot_hashes",
+          "created_at_anchor",
+          "signature"
+        ],
+        "size_bounds": {
+          "max_bytes": 24576,
+          "max_snapshot_hashes": 64
+        },
+        "verification_contract": [
+          "verify_signature_and_identity_chain",
+          "verify_all_required_hash_bindings_present",
+          "verify_budget_vector_within_delegated_limits",
+          "verify_stop_predicate_strengthening_under_delegation"
+        ],
+        "reject_on": [
+          "missing_required_hash_binding",
+          "mismatched_manifest_or_receipt_hash",
+          "missing_stop_predicate_binding",
+          "unknown_fields_on_authority_paths",
+          "unsigned_or_untrusted_envelope"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-05",
+        "wire_format": "application/vnd.apm2.identity_proof.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "cell_certificate_hash",
+          "holon_certificate_hash",
+          "directory_head_hash",
+          "directory_leaf_hash",
+          "membership_proof",
+          "as_of_anchor"
+        ],
+        "size_bounds": {
+          "max_bytes": 24576,
+          "max_proof_bytes_absolute": 262144,
+          "max_proof_bytes_source": "HolonDirectoryHeadV1.max_proof_bytes",
+          "max_chain_length": 8
+        },
+        "verification_contract": [
+          "verify_cert_chain_to_trusted_root",
+          "verify_directory_head_signature",
+          "verify_membership_proof_in_authenticated_dictionary",
+          "verify_as_of_anchor_against_freshness_policy",
+          "verify_membership_leaf_binds_cell_and_holon_certificate_hashes"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "linear_registry_lookup_fallback",
+          "proof_bytes_exceed_declared_bound",
+          "stale_directory_head_for_tier2_plus",
+          "revoked_certificate_in_chain",
+          "membership_leaf_binding_mismatch"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-06",
+        "wire_format": "application/vnd.apm2.context_firewall_decision.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "decision_id",
+          "capsule_id",
+          "request_path",
+          "allowlist_ref",
+          "decision",
+          "reason_code",
+          "risk_tier",
+          "timestamp_anchor"
+        ],
+        "size_bounds": {
+          "max_path_bytes": 4096,
+          "max_allowlist_entries": 4096
+        },
+        "verification_contract": [
+          "verify_request_path_within_allowlist",
+          "verify_decision_receipt_emitted_for_denies",
+          "verify_tier3_plus_hard_fail_semantics",
+          "verify_no_direct_io_bypass_from_capsule"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "allowlist_missing_or_unverifiable",
+          "path_outside_allowlist",
+          "decision_without_receipt",
+          "direct_io_bypass_detected"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-07",
+        "wire_format": "application/vnd.apm2.freshness_policy.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "policy_id",
+          "risk_tier_thresholds",
+          "staleness_actions",
+          "temporal_anchor_kind",
+          "revision",
+          "signature"
+        ],
+        "size_bounds": {
+          "max_bytes": 16384,
+          "max_tiers": 8
+        },
+        "verification_contract": [
+          "verify_policy_signature",
+          "verify_temporal_anchor_kind_is_htf",
+          "verify_tier2_plus_action_is_deny",
+          "verify_stop_uncertainty_deny_slo_for_tier3_plus"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "wall_clock_marked_as_authoritative",
+          "tier2_plus_allow_or_downgrade_action",
+          "missing_stop_state_rule",
+          "unsigned_policy_revision"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-08",
+        "wire_format": "application/vnd.apm2.secret_redaction_policy.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "policy_id",
+          "revision",
+          "pattern_set_hash",
+          "minimum_entropy_threshold",
+          "redaction_actions",
+          "signature"
+        ],
+        "size_bounds": {
+          "max_bytes": 8192,
+          "max_patterns": 2048
+        },
+        "verification_contract": [
+          "verify_policy_signature",
+          "verify_redaction_applied_before_persist_or_emit",
+          "verify_classification_ceiling_on_post_redaction_output",
+          "verify_test_corpus_no_plaintext_secret_matches"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "unsigned_policy_revision",
+          "redactor_disabled_on_authority_paths",
+          "raw_secret_pattern_match_in_emission",
+          "classification_ceiling_violation"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-09",
+        "wire_format": "application/vnd.apm2.holon_directory_head.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "directory_head_hash",
+          "cell_id",
+          "epoch",
+          "root_hash",
+          "max_proof_bytes",
+          "signature",
+          "ledger_anchor"
+        ],
+        "size_bounds": {
+          "max_bytes": 8192,
+          "max_epoch_gap": 1
+        },
+        "verification_contract": [
+          "verify_signature_against_policy_root",
+          "verify_ledger_anchor_and_epoch_monotonicity",
+          "verify_max_proof_bytes_nonzero_and_policy_bounded",
+          "verify_root_hash_matches_authenticated_dictionary"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "unsigned_directory_head",
+          "epoch_rollback",
+          "max_proof_bytes_missing_or_unbounded",
+          "dictionary_root_mismatch"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-10",
+        "wire_format": "application/vnd.apm2.epoch_seal.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "epoch_id",
+          "htf_envelope_hash",
+          "signer_set",
+          "signature_or_quorum_proof"
+        ],
+        "conditional_required_fields": [
+          "vdf_proof_when_link_trust_level_is_untrusted_or_rollback_risk_high"
+        ],
+        "size_bounds": {
+          "max_bytes": 32768,
+          "max_vdf_proof_bytes": 16384
+        },
+        "verification_contract": [
+          "verify_htf_envelope_binding",
+          "verify_epoch_monotonicity",
+          "verify_signer_set_authorization",
+          "verify_vdf_when_policy_requires"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "epoch_rollback_or_non_monotone_epoch",
+          "missing_required_vdf_proof",
+          "unknown_signer",
+          "proof_bytes_exceed_bound"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-11",
+        "wire_format": "dsse_envelope_plus_rekor_entry",
+        "canonicalization": "dsse_pae_plus_canonical_predicate_json",
+        "required_fields": [
+          "oidc_identity_claims",
+          "fulcio_certificate",
+          "cosign_signature",
+          "rekor_log_entry",
+          "slsa_provenance",
+          "sbom_spdx_digest",
+          "sbom_cyclonedx_digest"
+        ],
+        "size_bounds": {
+          "max_certificate_ttl_minutes": 20
+        },
+        "verification_contract": [
+          "verify_oidc_issuer_and_subject_match_expected_repo_workflow",
+          "verify_certificate_validity_window",
+          "verify_rekor_inclusion_and_consistency",
+          "verify_signature_matches_artifact_digest",
+          "verify_slsa_provenance_present_and_verifiable",
+          "verify_sbom_formats_include_spdx_and_cyclonedx"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "missing_transparency_log_entry",
+          "identity_claim_mismatch",
+          "certificate_outside_validity_window",
+          "unsigned_or_unattested_release_artifact",
+          "missing_slsa_provenance",
+          "missing_spdx_or_cyclonedx_sbom"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-12",
+        "wire_format": "application/vnd.apm2.drill_receipt.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "drill_id",
+          "scenario_id",
+          "scenario_version",
+          "executed_at_anchor",
+          "stop_latency_p99_ms",
+          "uncertainty_deny_ms",
+          "result",
+          "evidence_hashes",
+          "signer",
+          "signature"
+        ],
+        "size_bounds": {
+          "max_bytes": 16384,
+          "max_evidence_hashes": 256
+        },
+        "verification_contract": [
+          "verify_signature_and_signer_authorization",
+          "verify_scenario_in_required_drill_catalog",
+          "verify_metrics_against_tier3_plus_slo",
+          "verify_receipt_anchored_in_cas_and_ledger",
+          "verify_scenario_version_matches_catalog"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "unsigned_drill_receipt",
+          "unknown_scenario_id",
+          "missing_latency_metrics",
+          "forged_or_missing_evidence_hashes",
+          "missing_scenario_version"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-13",
+        "wire_format": "application/vnd.apm2.session_key_delegation.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "delegation_id",
+          "issuer",
+          "subject",
+          "session_public_key",
+          "episode_envelope_hash",
+          "permeability_receipt_hash",
+          "nonce",
+          "issued_at_anchor",
+          "expires_at_anchor",
+          "signature"
+        ],
+        "size_bounds": {
+          "max_bytes": 12288,
+          "max_nonce_bytes": 64
+        },
+        "verification_contract": [
+          "verify_signature_against_trusted_identity_root",
+          "verify_episode_and_permeability_bindings",
+          "verify_nonce_unused_within_replay_window",
+          "verify_session_key_scope_within_parent_capabilities",
+          "verify_expiry_and_freshness_policy"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "missing_required_field",
+          "binding_mismatch_to_episode_or_receipt",
+          "replayed_nonce",
+          "scope_widening_vs_parent",
+          "expired_or_revoked_signer"
+        ]
+      },
+      {
+        "mechanism_id": "SEC-MECH-14",
+        "wire_format": "application/vnd.apm2.policy_root_mutation.v1+json",
+        "canonicalization": "JCS",
+        "required_fields": [
+          "mutation_id",
+          "policy_root_epoch",
+          "previous_policy_root_hash",
+          "next_policy_root_hash",
+          "approver_set",
+          "anomaly_score",
+          "ticket_ref",
+          "issued_at_anchor",
+          "signature_bundle"
+        ],
+        "size_bounds": {
+          "max_bytes": 24576,
+          "max_approvers": 8
+        },
+        "verification_contract": [
+          "verify_dual_approval_with_distinct_roles",
+          "verify_policy_root_epoch_is_strictly_monotone",
+          "verify_ticket_ref_open_and_security_approved",
+          "verify_anomaly_score_below_policy_threshold",
+          "verify_mutation_receipt_anchored_in_ledger"
+        ],
+        "reject_on": [
+          "unknown_fields_on_authority_paths",
+          "single_approver_or_role_collision",
+          "policy_root_epoch_rollback_or_reuse",
+          "ticket_not_security_approved",
+          "anomaly_score_above_threshold",
+          "unsigned_or_unanchored_mutation"
+        ]
+      }
+    ],
     "security_defects": [
       {
         "id": "SEC-DEFECT-01",
         "name": "AMBIENT_AUTHORITY_ESCAPE",
         "description": "A capsule process obtained authority without going through daemon-mediated capability paths.",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-01"],
+        "law_refs": [
+          "SEC-LAW-01"
+        ],
         "detection": "Sandbox profile violation, direct syscall from capsule, tool invocation without manifest match",
         "remediation": "Strengthen sandbox profile, add missing tool type to mediation layer"
       },
@@ -1167,7 +2264,9 @@
         "name": "DELEGATION_WIDENING",
         "description": "A child holon obtained wider authority than its parent in any dimension of AuthorityVectorV1.",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-03"],
+        "law_refs": [
+          "SEC-LAW-03"
+        ],
         "detection": "Meet operator verification: child vector must equal meet(parent, child)",
         "remediation": "Fix meet operator implementation, add dimension-by-dimension assertion"
       },
@@ -1176,7 +2275,10 @@
         "name": "SINGLE_LAYER_BYPASS",
         "description": "A protection layer was bypassed without compensating control from another independent layer.",
         "severity": "HIGH",
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-08"],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-08"
+        ],
         "detection": "Security audit finding, penetration test result",
         "remediation": "Add compensating control at adjacent layer"
       },
@@ -1185,7 +2287,9 @@
         "name": "RECEIPTLESS_PROMOTION",
         "description": "An authoritative state transition occurred without producing a receipt stored in CAS and linked to the ledger.",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-02"],
+        "law_refs": [
+          "SEC-LAW-02"
+        ],
         "detection": "Ledger audit: transition exists without receipt reference",
         "remediation": "Block promotion when receipts missing, add receipt production to gate"
       },
@@ -1194,7 +2298,9 @@
         "name": "FAIL_OPEN_ON_AMBIGUITY",
         "description": "System proceeded with actuation despite unknown, stale, or unverifiable security state without valid waiver.",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-04"],
+        "law_refs": [
+          "SEC-LAW-04"
+        ],
         "detection": "Audit log showing actuation after ambiguous check result without waiver reference",
         "remediation": "Convert warn-and-continue to deny, add waiver requirement for any fail-open path"
       },
@@ -1203,7 +2309,10 @@
         "name": "CONFUSED_DEPUTY",
         "description": "A lower-privilege entity tricked a higher-privilege entity into performing unauthorized actions.",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-01", "SEC-LAW-03"],
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-03"
+        ],
         "detection": "Authority chain audit: verify all tool invocations trace to delegated capabilities",
         "remediation": "Add confused-deputy prevention check at tool mediation layer"
       },
@@ -1212,7 +2321,9 @@
         "name": "TEMPORAL_AUTHORITY_VIOLATION",
         "description": "Authority decision was grounded on wall-clock time instead of HTF-compatible temporal reference.",
         "severity": "HIGH",
-        "law_refs": ["SEC-LAW-06"],
+        "law_refs": [
+          "SEC-LAW-06"
+        ],
         "detection": "Code review, static analysis for wall-clock in authority paths",
         "remediation": "Replace wall-clock with HTF boundary ID references"
       },
@@ -1221,7 +2332,10 @@
         "name": "REVOCATION_SUPPRESSION",
         "description": "Revocation event was suppressed, delayed, or overridden by a concurrent grant during anti-entropy merge.",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-09", "SEC-LAW-10"],
+        "law_refs": [
+          "SEC-LAW-09",
+          "SEC-LAW-10"
+        ],
         "detection": "Anti-entropy audit: verify revocation-wins semantics in all merge operations",
         "remediation": "Fix merge operator to enforce revocation-wins, add revocation priority test"
       },
@@ -1230,7 +2344,9 @@
         "name": "PROMPT_INJECTION",
         "description": "External/untrusted input (low taint) reached a high-impact actuator without taint verification.",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-08"],
+        "law_refs": [
+          "SEC-LAW-08"
+        ],
         "detection": "Taint propagation audit, context firewall violation",
         "remediation": "Add taint check before high-impact actuator, enforce taint propagation through tool chain"
       },
@@ -1239,7 +2355,9 @@
         "name": "SECRET_LEAKAGE",
         "description": "High-classification material was emitted to a channel below its classification ceiling.",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-08"],
+        "law_refs": [
+          "SEC-LAW-08"
+        ],
         "detection": "SecretRedactor pattern match in log/error output, classification audit on boundary emissions",
         "remediation": "Route logs through SecretRedactor, enforce classification ceiling at emission"
       },
@@ -1248,7 +2366,9 @@
         "name": "LINEAR_VERIFICATION_COLLAPSE",
         "description": "Verification cost grew linearly with namespace size or evidence volume, creating a DoS vector.",
         "severity": "HIGH",
-        "law_refs": ["SEC-LAW-05"],
+        "law_refs": [
+          "SEC-LAW-05"
+        ],
         "detection": "Performance profiling showing O(n) verification, proof byte count exceeding declared bound",
         "remediation": "Replace linear scan with Merkle proof, enforce max_proof_bytes from directory head"
       },
@@ -1257,170 +2377,996 @@
         "name": "STOP_PATH_SLO_BREACH",
         "description": "Stop propagation or uncertainty denial exceeded the Tier3+ SLO (2000ms propagation, 250ms uncertainty deny).",
         "severity": "CRITICAL",
-        "law_refs": ["SEC-LAW-10"],
+        "law_refs": [
+          "SEC-LAW-10"
+        ],
         "detection": "DrillReceiptV1 timing measurements, runtime stop-path telemetry",
         "remediation": "Profile and optimize stop propagation path, implement kernel-boundary fail-safe"
+      },
+      {
+        "id": "SEC-DEFECT-13",
+        "name": "SUPPLY_CHAIN_PROVENANCE_GAP",
+        "description": "Release artifact was admitted without verifiable provenance, identity-constrained signature checks, or transparency log inclusion.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
+        "detection": "Release verification audit detects missing DSSE/SLSA provenance, missing Rekor entry, or workflow/repository identity mismatch",
+        "remediation": "Block release admission until signature, transparency, and provenance checks pass"
+      },
+      {
+        "id": "SEC-DEFECT-14",
+        "name": "WAIVER_GOVERNANCE_DRIFT",
+        "description": "Waiver bypass was executed without required owner/approver/ticket metadata, compensating controls, or policy-bounded duration.",
+        "severity": "HIGH",
+        "law_refs": [
+          "SEC-LAW-04"
+        ],
+        "detection": "Waiver registry audit finds missing required fields, excessive TTL, or inactive compensating controls",
+        "remediation": "Auto-revoke invalid waiver, deny affected authority paths, and require governance re-approval"
+      },
+      {
+        "id": "SEC-DEFECT-15",
+        "name": "FRESHNESS_POLICY_BYPASS_UNDER_PARTITION",
+        "description": "Authority-bearing actuation proceeded under partition despite stale or unverifiable identity/governance/stop freshness.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-06",
+          "SEC-LAW-09",
+          "SEC-LAW-10"
+        ],
+        "detection": "Partition drill or runtime audit shows Tier2+ actuation without valid freshness anchors",
+        "remediation": "Enforce Tier2+ deny-on-stale policy and require HTF/EpochSeal freshness anchors"
+      },
+      {
+        "id": "SEC-DEFECT-16",
+        "name": "CROSS_CELL_ROLLBACK_ACCEPTANCE",
+        "description": "Cross-cell authority admission accepted non-monotone epoch or replayed historical state.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-06",
+          "SEC-LAW-09"
+        ],
+        "detection": "Epoch monotonicity check failure, replayed seal reuse, or conflicting epoch acceptance across peers",
+        "remediation": "Reject rollback candidate, quarantine offending peer, and require epoch-seal revalidation"
+      },
+      {
+        "id": "SEC-DEFECT-17",
+        "name": "RESOURCE_BOUND_BYPASS",
+        "description": "Deserializer, proof parser, or anti-entropy path accepted bytes/collections beyond declared bounds.",
+        "severity": "HIGH",
+        "law_refs": [
+          "SEC-LAW-05",
+          "SEC-LAW-09"
+        ],
+        "detection": "Boundary parser telemetry shows decode/proof bounds exceeded without fail-closed denial",
+        "remediation": "Enforce pre-decode and post-decode bounds before trust decisions and emit defect on violation"
+      },
+      {
+        "id": "SEC-DEFECT-18",
+        "name": "UNTRUSTED_BOOTSTRAP_PAYLOAD_ADMISSION",
+        "description": "Raw bootstrap payload crossed trust boundary and influenced authority decisions without digest-first verification and taint/classification gates.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-07",
+          "SEC-LAW-08"
+        ],
+        "detection": "Boundary protocol audit detects direct authority impact from unverified payload bytes",
+        "remediation": "Require quarantine staging plus digest-first promotion before any authority-bearing use"
+      },
+      {
+        "id": "SEC-DEFECT-19",
+        "name": "CANONICALIZATION_DRIFT",
+        "description": "Different canonicalization implementations produced divergent bytes for the same semantic payload, causing signature disagreement or hash mismatches.",
+        "severity": "HIGH",
+        "law_refs": [
+          "SEC-LAW-02",
+          "SEC-LAW-05",
+          "SEC-LAW-07"
+        ],
+        "detection": "Cross-implementation canonicalization conformance tests fail or signatures diverge across verifiers for identical input objects",
+        "remediation": "Pin canonicalizer vectors, reject non-conformant serializers, and block authority admission until canonicalization parity is restored"
+      },
+      {
+        "id": "SEC-DEFECT-20",
+        "name": "CAS_IMMUTABILITY_BREACH",
+        "description": "Content-addressed storage returned mutable or hash-inconsistent objects on authority-bearing paths.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-02",
+          "SEC-LAW-07"
+        ],
+        "detection": "CAS integrity audit or replay verification detects hash mismatch for previously anchored object IDs",
+        "remediation": "Quarantine CAS tier, invalidate affected receipts, and re-anchor evidence from known-good replicas"
+      },
+      {
+        "id": "SEC-DEFECT-21",
+        "name": "TRUST_ROOT_DISTRIBUTION_FAILURE",
+        "description": "Identity or policy trust roots became unverifiable, stale, or inconsistently distributed across authority-bearing boundaries.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-02",
+          "SEC-LAW-06"
+        ],
+        "detection": "Root-set signature checks fail, epoch disagreements emerge across peers, or revocation propagation exceeds policy bounds",
+        "remediation": "Freeze authority-bearing actuation, rotate compromised roots, and require quorum-signed root re-establishment before recovery"
+      },
+      {
+        "id": "SEC-DEFECT-22",
+        "name": "SESSION_KEY_BINDING_BYPASS",
+        "description": "Session authentication accepted a key that was not bound to the active episode envelope and delegation receipt chain.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-01",
+          "SEC-LAW-02",
+          "SEC-LAW-06"
+        ],
+        "detection": "Handshake audit detects missing episode/permeability binding, replayed nonce, or session key scope mismatch",
+        "remediation": "Require SessionKeyDelegationV1 verification, invalidate replayed nonces, and rotate compromised session keys"
+      },
+      {
+        "id": "SEC-DEFECT-23",
+        "name": "DEPENDENCY_POISONING_ADMISSION",
+        "description": "A release or runtime artifact admitted dependencies with unverifiable provenance, disallowed licenses, or known vulnerabilities without an approved waiver.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
+        "detection": "CI/release gate audit shows cargo deny or cargo audit failures bypassed, or dependency drift admitted without security review receipt",
+        "remediation": "Block artifact admission, revert dependency change, and require provenance plus vulnerability clearance receipts"
+      },
+      {
+        "id": "SEC-DEFECT-24",
+        "name": "POLICY_ROOT_GOVERNANCE_BYPASS",
+        "description": "Policy-root mutation was accepted without dual approval, monotone epoch progression, or anomaly-scored admission.",
+        "severity": "CRITICAL",
+        "law_refs": [
+          "SEC-LAW-04",
+          "SEC-LAW-10"
+        ],
+        "detection": "Governance audit finds single-approver mutation, epoch rollback, or missing anomaly evidence",
+        "remediation": "Freeze policy-root mutations, revoke unapproved roots, and replay mutations through PolicyRootDualApprovalV1 controls"
       }
     ],
-
+    "threat_coverage": {
+      "source_ref": "documents/security/THREAT_MODEL.cac.json",
+      "classes": [
+        {
+          "threat_class": "TM-CLASS-01",
+          "name": "Identity, Replay, and Revocation Failures",
+          "law_refs": [
+            "SEC-LAW-02",
+            "SEC-LAW-04",
+            "SEC-LAW-06",
+            "SEC-LAW-09",
+            "SEC-LAW-10"
+          ],
+          "mechanism_refs": [
+            "SEC-MECH-05",
+            "SEC-MECH-07",
+            "SEC-MECH-09",
+            "SEC-MECH-10",
+            "SEC-MECH-13"
+          ],
+          "defect_refs": [
+            "SEC-DEFECT-07",
+            "SEC-DEFECT-08",
+            "SEC-DEFECT-15",
+            "SEC-DEFECT-16",
+            "SEC-DEFECT-21",
+            "SEC-DEFECT-22"
+          ],
+          "coverage_status": "STRONG",
+          "residual_risk": "Partition duration beyond freshness policy thresholds can still cause safe-deny availability loss."
+        },
+        {
+          "threat_class": "TM-CLASS-02",
+          "name": "Delegation and Confused-Deputy Escalation",
+          "law_refs": [
+            "SEC-LAW-01",
+            "SEC-LAW-03",
+            "SEC-LAW-04"
+          ],
+          "mechanism_refs": [
+            "SEC-MECH-01",
+            "SEC-MECH-02",
+            "SEC-MECH-04"
+          ],
+          "defect_refs": [
+            "SEC-DEFECT-01",
+            "SEC-DEFECT-02",
+            "SEC-DEFECT-06",
+            "SEC-DEFECT-14"
+          ],
+          "coverage_status": "STRONG",
+          "residual_risk": "Bugs in meet-operator implementations remain high impact and require property-based tests."
+        },
+        {
+          "threat_class": "TM-CLASS-03",
+          "name": "Fact Forgery and Verification-Cost Exhaustion",
+          "law_refs": [
+            "SEC-LAW-02",
+            "SEC-LAW-05"
+          ],
+          "mechanism_refs": [
+            "SEC-MECH-03",
+            "SEC-MECH-05",
+            "SEC-MECH-09",
+            "SEC-MECH-11"
+          ],
+          "defect_refs": [
+            "SEC-DEFECT-04",
+            "SEC-DEFECT-13",
+            "SEC-DEFECT-11",
+            "SEC-DEFECT-17",
+            "SEC-DEFECT-19",
+            "SEC-DEFECT-20",
+            "SEC-DEFECT-23"
+          ],
+          "coverage_status": "STRONG",
+          "residual_risk": "Large proof fanout can still pressure memory if decode bounds are misconfigured and release identity constraints are not rotated with workflow changes."
+        },
+        {
+          "threat_class": "TM-CLASS-04",
+          "name": "Byzantine Federation and Anti-Entropy Abuse",
+          "law_refs": [
+            "SEC-LAW-06",
+            "SEC-LAW-09",
+            "SEC-LAW-10"
+          ],
+          "mechanism_refs": [
+            "SEC-MECH-07",
+            "SEC-MECH-10",
+            "SEC-MECH-12"
+          ],
+          "defect_refs": [
+            "SEC-DEFECT-08",
+            "SEC-DEFECT-15",
+            "SEC-DEFECT-16"
+          ],
+          "coverage_status": "STRONG",
+          "residual_risk": "Sustained multi-peer Byzantine behavior can degrade throughput while preserving safety."
+        },
+        {
+          "threat_class": "TM-CLASS-05",
+          "name": "Prompt Injection and Data Exfiltration",
+          "law_refs": [
+            "SEC-LAW-01",
+            "SEC-LAW-07",
+            "SEC-LAW-08"
+          ],
+          "mechanism_refs": [
+            "SEC-MECH-02",
+            "SEC-MECH-06",
+            "SEC-MECH-08"
+          ],
+          "defect_refs": [
+            "SEC-DEFECT-09",
+            "SEC-DEFECT-10",
+            "SEC-DEFECT-18"
+          ],
+          "coverage_status": "PARTIAL",
+          "residual_risk": "Language-model side channels are not fully modelled and require dedicated red-team scenarios.",
+          "required_follow_up_ticket": "TCK-00622"
+        },
+        {
+          "threat_class": "TM-CLASS-06",
+          "name": "Availability and Economic Attacks",
+          "law_refs": [
+            "SEC-LAW-04",
+            "SEC-LAW-05",
+            "SEC-LAW-09",
+            "SEC-LAW-10"
+          ],
+          "mechanism_refs": [
+            "SEC-MECH-03",
+            "SEC-MECH-07",
+            "SEC-MECH-12"
+          ],
+          "defect_refs": [
+            "SEC-DEFECT-11",
+            "SEC-DEFECT-12",
+            "SEC-DEFECT-17"
+          ],
+          "coverage_status": "STRONG",
+          "residual_risk": "Extreme defensive deny posture can reduce availability under prolonged stress."
+        },
+        {
+          "threat_class": "TM-CLASS-07",
+          "name": "Supply Chain and Dependency Poisoning",
+          "law_refs": [
+            "SEC-LAW-02",
+            "SEC-LAW-05"
+          ],
+          "mechanism_refs": [
+            "SEC-MECH-11"
+          ],
+          "defect_refs": [
+            "SEC-DEFECT-13",
+            "SEC-DEFECT-23"
+          ],
+          "coverage_status": "PARTIAL",
+          "residual_risk": "Registry-level and transitive dependency poisoning attempts remain high-churn and require continuous policy updates.",
+          "required_follow_up_ticket": "TCK-00624"
+        },
+        {
+          "threat_class": "TM-CLASS-08",
+          "name": "Insider Governance Abuse and Policy-Root Compromise",
+          "law_refs": [
+            "SEC-LAW-04",
+            "SEC-LAW-10"
+          ],
+          "mechanism_refs": [
+            "SEC-MECH-14",
+            "SEC-MECH-07"
+          ],
+          "defect_refs": [
+            "SEC-DEFECT-14",
+            "SEC-DEFECT-21",
+            "SEC-DEFECT-24"
+          ],
+          "coverage_status": "PARTIAL",
+          "residual_risk": "Privileged insider behavior may still bypass intent unless anomaly models and dual-approval controls stay continuously tuned.",
+          "required_follow_up_ticket": "TCK-00621"
+        }
+      ],
+      "explicit_gaps": [
+        {
+          "gap_id": "SEC-GAP-01",
+          "name": "Insider governance abuse",
+          "status": "IN_PROGRESS",
+          "priority": "HIGH",
+          "owner": "platform-security",
+          "ticket_ref": "TCK-00621",
+          "due_date": "2026-03-15",
+          "required_follow_up": "Deploy PolicyRootDualApprovalV1 and anomaly detection for policy root operations across all production cells.",
+          "acceptance_evidence": [
+            "dual_approval_enforcement_receipt",
+            "policy_root_anomaly_detection_alert_coverage"
+          ]
+        },
+        {
+          "gap_id": "SEC-GAP-02",
+          "name": "Model-mediated side channels",
+          "status": "OPEN",
+          "priority": "HIGH",
+          "owner": "runtime-security",
+          "ticket_ref": "TCK-00622",
+          "due_date": "2026-03-22",
+          "required_follow_up": "Add adversarial prompt and token-level leakage tests tied to SEC-DEFECT-10 and SEC-DEFECT-18.",
+          "acceptance_evidence": [
+            "red_team_suite_results_for_prompt_injection_and_leakage",
+            "boundary_emission_classification_violation_rate_below_threshold"
+          ]
+        },
+        {
+          "gap_id": "SEC-GAP-03",
+          "name": "Training-data provenance poisoning",
+          "status": "OPEN",
+          "priority": "MEDIUM",
+          "owner": "release-security",
+          "ticket_ref": "TCK-00623",
+          "due_date": "2026-04-05",
+          "required_follow_up": "Add dataset attestation and provenance checks to release admission contracts.",
+          "acceptance_evidence": [
+            "dataset_attestation_verification_receipt",
+            "release_gate_rejects_unattested_training_data_inputs"
+          ]
+        },
+        {
+          "gap_id": "SEC-GAP-04",
+          "name": "Dependency confusion and typosquat admission",
+          "status": "OPEN",
+          "priority": "HIGH",
+          "owner": "release-security",
+          "ticket_ref": "TCK-00624",
+          "due_date": "2026-03-18",
+          "required_follow_up": "Enforce dependency source pinning, transitive provenance checks, and deny-on-untrusted-registry policy.",
+          "acceptance_evidence": [
+            "dependency_source_pinning_receipt",
+            "release_gate_rejects_untrusted_or_unattested_dependencies"
+          ]
+        }
+      ],
+      "gap_enforcement_policy": {
+        "high_priority_overdue_action": "BLOCK_RELEASE_AND_OPEN_SECURITY_INCIDENT",
+        "medium_priority_overdue_action": "BLOCK_PROMOTION_AND_REQUIRE_SECURITY_SIGN_OFF",
+        "evidence_required_for_closure": "acceptance_evidence_must_be_receipt_backed_and_traceable_to_controls"
+      }
+    },
     "cross_domain_provenance_summary": {
       "note": "Each security law has deep roots in established disciplines. This summary maps the complete cross-domain heritage.",
       "disciplines": [
         {
           "name": "Object-Capability Security",
           "founding_works": "Dennis & Van Horn 1966, Miller 2006 (E language, capability discipline)",
-          "laws_grounded": ["SEC-LAW-01", "SEC-LAW-03"],
+          "laws_grounded": [
+            "SEC-LAW-01",
+            "SEC-LAW-03"
+          ],
           "transferable_invariant": "Authority is held, not ambient; acquired only by delegation from holder or explicit grant from root."
         },
         {
           "name": "Cryptographic Commitment Schemes",
           "founding_works": "Merkle 1979 (Merkle trees), Pedersen 1991 (commitment schemes)",
-          "laws_grounded": ["SEC-LAW-02", "SEC-LAW-05", "SEC-LAW-07"],
+          "laws_grounded": [
+            "SEC-LAW-02",
+            "SEC-LAW-05",
+            "SEC-LAW-07"
+          ],
           "transferable_invariant": "A binding commitment prevents the committer from changing the committed value. Receipt-backed authority is a commitment to effects."
         },
         {
           "name": "Lattice-Based Access Control",
           "founding_works": "Denning 1976, Bell-LaPadula 1973 (confidentiality), Biba 1977 (integrity)",
-          "laws_grounded": ["SEC-LAW-03", "SEC-LAW-08"],
+          "laws_grounded": [
+            "SEC-LAW-03",
+            "SEC-LAW-08"
+          ],
           "transferable_invariant": "Security policy as lattice homomorphism: information flow respects partial order in both confidentiality and integrity dimensions."
         },
         {
           "name": "Safety Engineering",
           "founding_works": "IEC 61508 (functional safety), DO-178C (avionics software)",
-          "laws_grounded": ["SEC-LAW-04", "SEC-LAW-10"],
+          "laws_grounded": [
+            "SEC-LAW-04",
+            "SEC-LAW-10"
+          ],
           "transferable_invariant": "Safety function has higher priority than control function. Unknown state is unsafe state. Emergency stop must be operable even under control failure."
         },
         {
           "name": "Information Theory and Authenticated Data Structures",
           "founding_works": "Shannon 1948, Merkle 1979, various sparse Merkle trie designs",
-          "laws_grounded": ["SEC-LAW-05", "SEC-LAW-07"],
+          "laws_grounded": [
+            "SEC-LAW-05",
+            "SEC-LAW-07"
+          ],
           "transferable_invariant": "Membership proof in authenticated dictionary of size n requires O(log n) computation. Content-addressing enables deduplication and selective retrieval."
         },
         {
           "name": "Distributed Systems Temporal Ordering",
           "founding_works": "Lamport 1978 (logical clocks), hybrid logical clocks, vector causality",
-          "laws_grounded": ["SEC-LAW-06"],
+          "laws_grounded": [
+            "SEC-LAW-06"
+          ],
           "transferable_invariant": "Wall-clock time is unreliable for ordering in asynchronous distributed systems. Causal ordering provides the only reliable temporal substrate."
         },
         {
           "name": "Byzantine Fault Tolerance",
           "founding_works": "Lamport et al. 1982 (Byzantine Generals), Demers et al. 1987 (epidemic anti-entropy)",
-          "laws_grounded": ["SEC-LAW-09"],
+          "laws_grounded": [
+            "SEC-LAW-09"
+          ],
           "transferable_invariant": "Correct nodes must bound the influence of faulty nodes. Pull-based synchronization bounds attacker influence to the pull budget."
         },
         {
           "name": "Biological Immune Systems",
           "founding_works": "Clonal selection theory (Burnet 1957), innate/adaptive immunity",
-          "laws_grounded": ["SEC-LAW-04", "SEC-LAW-05", "SEC-LAW-09", "SEC-LAW-10"],
+          "laws_grounded": [
+            "SEC-LAW-04",
+            "SEC-LAW-05",
+            "SEC-LAW-09",
+            "SEC-LAW-10"
+          ],
           "transferable_invariant": "Default rejection of unknown antigens (fail-closed). O(log n)-like recognition via clonal selection. Pull-based phagocytosis via opsonization. Apoptosis as governance primitive."
         }
       ]
     },
-
     "traceability_matrix": {
       "note": "Bidirectional traceability: every operational control maps to at least one SEC-LAW, and every SEC-LAW maps to at least one operational control.",
       "law_to_operational": {
-        "SEC-LAW-01": ["SP-INV-001", "CHK-BOUNDARY-AUTHORITY-01", "CHK-BOUNDARY-AUTHORITY-02", "CHK-TOOL-CONTEXT-01", "CHK-TOOL-CONTEXT-02"],
-        "SEC-LAW-02": ["SP-INV-002", "CHK-RECEIPT-AUTH-01", "CHK-RECEIPT-AUTH-02", "CHK-RECEIPT-AUTH-03", "CHK-RECEIPT-AUTH-04"],
-        "SEC-LAW-03": ["SP-INV-005", "CHK-BOUNDARY-AUTHORITY-03", "CHK-BOUNDARY-AUTHORITY-04"],
-        "SEC-LAW-04": ["SP-INV-006", "SP-ID-002", "SP-RUNTIME-002", "SP-RUNTIME-007", "CHK-IDENTITY-FRESHNESS-03", "CHK-IDENTITY-FRESHNESS-04", "CHK-BOUNDARY-AUTHORITY-04"],
-        "SEC-LAW-05": ["SP-INV-004", "SP-ID-001", "CHK-IDENTITY-FRESHNESS-02", "CHK-RECEIPT-AUTH-03", "CHK-CRYPTO-SERIALIZATION-01", "CHK-CRYPTO-SERIALIZATION-03"],
-        "SEC-LAW-06": ["SP-INV-006", "SP-ID-002", "SP-RUNTIME-002", "CHK-IDENTITY-FRESHNESS-01", "CHK-IDENTITY-FRESHNESS-02", "CHK-IDENTITY-FRESHNESS-03"],
-        "SEC-LAW-07": ["SP-INV-003", "CHK-CRYPTO-SERIALIZATION-01", "CHK-CRYPTO-SERIALIZATION-02"],
-        "SEC-LAW-08": ["SP-RUNTIME-003", "SP-RUNTIME-004", "CHK-INJECTION-CONFIDENTIALITY-01", "CHK-INJECTION-CONFIDENTIALITY-02", "CHK-INJECTION-CONFIDENTIALITY-03", "CHK-INJECTION-CONFIDENTIALITY-04"],
-        "SEC-LAW-09": ["SP-RUNTIME-005", "SP-RUNTIME-006", "CHK-CONTINUITY-STOP-01"],
-        "SEC-LAW-10": ["SP-RUNTIME-007", "CHK-CONTINUITY-STOP-02", "CHK-CONTINUITY-STOP-03"]
+        "SEC-LAW-01": [
+          "SP-INV-001",
+          "SP-RUNTIME-001",
+          "CHK-BOUNDARY-AUTHORITY-01",
+          "CHK-BOUNDARY-AUTHORITY-02",
+          "CHK-TOOL-CONTEXT-01",
+          "CHK-TOOL-CONTEXT-02",
+          "CHK-TOOL-CONTEXT-03",
+          "CHK-TOOL-CONTEXT-04",
+          "CHK-FILES-ATOMICITY-01",
+          "CHK-FILES-ATOMICITY-02",
+          "CHK-RISK-TIER-02",
+          "CHK-FILES-ATOMICITY-04"
+        ],
+        "SEC-LAW-02": [
+          "SP-INV-002",
+          "SP-REL-001",
+          "CHK-BOUNDARY-AUTHORITY-02",
+          "CHK-RECEIPT-AUTH-01",
+          "CHK-RECEIPT-AUTH-02",
+          "CHK-RECEIPT-AUTH-03",
+          "CHK-RECEIPT-AUTH-04",
+          "CHK-FILES-ATOMICITY-03",
+          "CHK-SUPPLY-CHAIN-01",
+          "CHK-SUPPLY-CHAIN-02",
+          "CHK-SUPPLY-CHAIN-03",
+          "CHK-SUPPLY-CHAIN-04",
+          "SP-POSTURE-003",
+          "SP-REL-002",
+          "SP-REL-003",
+          "SP-REL-004",
+          "SP-GATE-CLIPPY",
+          "SP-GATE-DENY",
+          "SP-GATE-AUDIT",
+          "SP-DEP-001",
+          "SP-DEP-002",
+          "SP-DEP-003"
+        ],
+        "SEC-LAW-03": [
+          "SP-INV-005",
+          "CHK-BOUNDARY-AUTHORITY-03",
+          "CHK-BOUNDARY-AUTHORITY-04"
+        ],
+        "SEC-LAW-04": [
+          "SP-INV-006",
+          "SP-ID-002",
+          "SP-TIER-001",
+          "SP-RUNTIME-002",
+          "SP-RUNTIME-007",
+          "CHK-IDENTITY-FRESHNESS-03",
+          "CHK-IDENTITY-FRESHNESS-04",
+          "CHK-BOUNDARY-AUTHORITY-04",
+          "CHK-CRYPTO-SERIALIZATION-03",
+          "CHK-RISK-TIER-01",
+          "CHK-RISK-TIER-03",
+          "SP-POSTURE-001",
+          "SP-POSTURE-002",
+          "SP-VULN-001",
+          "SP-VULN-002",
+          "SP-VULN-003"
+        ],
+        "SEC-LAW-05": [
+          "SP-INV-004",
+          "SP-ID-001",
+          "CHK-IDENTITY-FRESHNESS-02",
+          "CHK-RECEIPT-AUTH-02",
+          "CHK-RECEIPT-AUTH-03",
+          "CHK-CRYPTO-SERIALIZATION-01",
+          "CHK-CRYPTO-SERIALIZATION-03",
+          "SP-POSTURE-002",
+          "SP-REL-002",
+          "SP-REL-003",
+          "SP-REL-004",
+          "SP-GATE-CLIPPY",
+          "SP-GATE-DENY",
+          "SP-GATE-AUDIT",
+          "SP-DEP-001",
+          "SP-DEP-002",
+          "SP-DEP-003"
+        ],
+        "SEC-LAW-06": [
+          "SP-INV-006",
+          "SP-ID-002",
+          "SP-RUNTIME-002",
+          "CHK-IDENTITY-FRESHNESS-01",
+          "CHK-IDENTITY-FRESHNESS-02",
+          "CHK-IDENTITY-FRESHNESS-03",
+          "CHK-CRYPTO-SERIALIZATION-04",
+          "CHK-RISK-TIER-03"
+        ],
+        "SEC-LAW-07": [
+          "SP-INV-003",
+          "CHK-CRYPTO-SERIALIZATION-01",
+          "CHK-CRYPTO-SERIALIZATION-02"
+        ],
+        "SEC-LAW-08": [
+          "SP-RUNTIME-001",
+          "SP-RUNTIME-003",
+          "SP-RUNTIME-004",
+          "CHK-TOOL-CONTEXT-02",
+          "CHK-TOOL-CONTEXT-03",
+          "CHK-INJECTION-CONFIDENTIALITY-01",
+          "CHK-INJECTION-CONFIDENTIALITY-02",
+          "CHK-INJECTION-CONFIDENTIALITY-03",
+          "CHK-INJECTION-CONFIDENTIALITY-04",
+          "CHK-RISK-TIER-02",
+          "SP-SECRET-001",
+          "SP-SECRET-002",
+          "SP-SECRET-003"
+        ],
+        "SEC-LAW-09": [
+          "SP-RUNTIME-005",
+          "SP-RUNTIME-006",
+          "CHK-CONTINUITY-STOP-01"
+        ],
+        "SEC-LAW-10": [
+          "SP-RUNTIME-007",
+          "CHK-CONTINUITY-STOP-02",
+          "CHK-CONTINUITY-STOP-03",
+          "SP-VULN-001",
+          "SP-VULN-002",
+          "SP-VULN-003"
+        ]
       },
       "operational_to_law": {
-        "SP-INV-001": ["SEC-LAW-01"],
-        "SP-INV-002": ["SEC-LAW-02"],
-        "SP-INV-003": ["SEC-LAW-07"],
-        "SP-INV-004": ["SEC-LAW-05"],
-        "SP-INV-005": ["SEC-LAW-03"],
-        "SP-INV-006": ["SEC-LAW-04", "SEC-LAW-06"],
-        "SP-ID-001": ["SEC-LAW-05"],
-        "SP-ID-002": ["SEC-LAW-04", "SEC-LAW-06"],
-        "SP-RUNTIME-001": ["SEC-LAW-01", "SEC-LAW-08"],
-        "SP-RUNTIME-002": ["SEC-LAW-04", "SEC-LAW-06"],
-        "SP-RUNTIME-003": ["SEC-LAW-08"],
-        "SP-RUNTIME-004": ["SEC-LAW-08"],
-        "SP-RUNTIME-005": ["SEC-LAW-09"],
-        "SP-RUNTIME-006": ["SEC-LAW-09"],
-        "SP-RUNTIME-007": ["SEC-LAW-10"],
-        "SP-REL-001": ["SEC-LAW-02"],
-        "SP-TIER-001": ["SEC-LAW-04"],
-        "CHK-BOUNDARY-AUTHORITY-01": ["SEC-LAW-01"],
-        "CHK-BOUNDARY-AUTHORITY-02": ["SEC-LAW-01", "SEC-LAW-02"],
-        "CHK-BOUNDARY-AUTHORITY-03": ["SEC-LAW-03"],
-        "CHK-BOUNDARY-AUTHORITY-04": ["SEC-LAW-03", "SEC-LAW-04"],
-        "CHK-IDENTITY-FRESHNESS-01": ["SEC-LAW-06"],
-        "CHK-IDENTITY-FRESHNESS-02": ["SEC-LAW-05", "SEC-LAW-06"],
-        "CHK-IDENTITY-FRESHNESS-03": ["SEC-LAW-04", "SEC-LAW-06"],
-        "CHK-IDENTITY-FRESHNESS-04": ["SEC-LAW-04"],
-        "CHK-RECEIPT-AUTH-01": ["SEC-LAW-02"],
-        "CHK-RECEIPT-AUTH-02": ["SEC-LAW-02", "SEC-LAW-05"],
-        "CHK-RECEIPT-AUTH-03": ["SEC-LAW-02", "SEC-LAW-05"],
-        "CHK-RECEIPT-AUTH-04": ["SEC-LAW-02"],
-        "CHK-TOOL-CONTEXT-01": ["SEC-LAW-01"],
-        "CHK-TOOL-CONTEXT-02": ["SEC-LAW-01", "SEC-LAW-08"],
-        "CHK-TOOL-CONTEXT-03": ["SEC-LAW-01", "SEC-LAW-08"],
-        "CHK-TOOL-CONTEXT-04": ["SEC-LAW-01"],
-        "CHK-INJECTION-CONFIDENTIALITY-01": ["SEC-LAW-08"],
-        "CHK-INJECTION-CONFIDENTIALITY-02": ["SEC-LAW-08"],
-        "CHK-INJECTION-CONFIDENTIALITY-03": ["SEC-LAW-08"],
-        "CHK-INJECTION-CONFIDENTIALITY-04": ["SEC-LAW-08"],
-        "CHK-FILES-ATOMICITY-01": ["SEC-LAW-01"],
-        "CHK-FILES-ATOMICITY-02": ["SEC-LAW-01"],
-        "CHK-FILES-ATOMICITY-03": ["SEC-LAW-02"],
-        "CHK-CRYPTO-SERIALIZATION-01": ["SEC-LAW-05", "SEC-LAW-07"],
-        "CHK-CRYPTO-SERIALIZATION-02": ["SEC-LAW-07"],
-        "CHK-CRYPTO-SERIALIZATION-03": ["SEC-LAW-04", "SEC-LAW-05"],
-        "CHK-CRYPTO-SERIALIZATION-04": ["SEC-LAW-06"],
-        "CHK-RISK-TIER-01": ["SEC-LAW-04"],
-        "CHK-RISK-TIER-02": ["SEC-LAW-01", "SEC-LAW-08"],
-        "CHK-RISK-TIER-03": ["SEC-LAW-04", "SEC-LAW-06"],
-        "CHK-CONTINUITY-STOP-01": ["SEC-LAW-09"],
-        "CHK-CONTINUITY-STOP-02": ["SEC-LAW-10"],
-        "CHK-CONTINUITY-STOP-03": ["SEC-LAW-10"],
-        "CHK-SUPPLY-CHAIN-01": ["SEC-LAW-02"],
-        "CHK-SUPPLY-CHAIN-02": ["SEC-LAW-02"],
-        "CHK-SUPPLY-CHAIN-03": ["SEC-LAW-02"],
-        "CHK-SUPPLY-CHAIN-04": ["SEC-LAW-02"]
+        "SP-INV-001": [
+          "SEC-LAW-01"
+        ],
+        "SP-INV-002": [
+          "SEC-LAW-02"
+        ],
+        "SP-INV-003": [
+          "SEC-LAW-07"
+        ],
+        "SP-INV-004": [
+          "SEC-LAW-05"
+        ],
+        "SP-INV-005": [
+          "SEC-LAW-03"
+        ],
+        "SP-INV-006": [
+          "SEC-LAW-04",
+          "SEC-LAW-06"
+        ],
+        "SP-ID-001": [
+          "SEC-LAW-05"
+        ],
+        "SP-ID-002": [
+          "SEC-LAW-04",
+          "SEC-LAW-06"
+        ],
+        "SP-RUNTIME-001": [
+          "SEC-LAW-01",
+          "SEC-LAW-08"
+        ],
+        "SP-RUNTIME-002": [
+          "SEC-LAW-04",
+          "SEC-LAW-06"
+        ],
+        "SP-RUNTIME-003": [
+          "SEC-LAW-08"
+        ],
+        "SP-RUNTIME-004": [
+          "SEC-LAW-08"
+        ],
+        "SP-RUNTIME-005": [
+          "SEC-LAW-09"
+        ],
+        "SP-RUNTIME-006": [
+          "SEC-LAW-09"
+        ],
+        "SP-RUNTIME-007": [
+          "SEC-LAW-04",
+          "SEC-LAW-10"
+        ],
+        "SP-REL-001": [
+          "SEC-LAW-02"
+        ],
+        "SP-TIER-001": [
+          "SEC-LAW-04"
+        ],
+        "CHK-BOUNDARY-AUTHORITY-01": [
+          "SEC-LAW-01"
+        ],
+        "CHK-BOUNDARY-AUTHORITY-02": [
+          "SEC-LAW-01",
+          "SEC-LAW-02"
+        ],
+        "CHK-BOUNDARY-AUTHORITY-03": [
+          "SEC-LAW-03"
+        ],
+        "CHK-BOUNDARY-AUTHORITY-04": [
+          "SEC-LAW-03",
+          "SEC-LAW-04"
+        ],
+        "CHK-IDENTITY-FRESHNESS-01": [
+          "SEC-LAW-06"
+        ],
+        "CHK-IDENTITY-FRESHNESS-02": [
+          "SEC-LAW-05",
+          "SEC-LAW-06"
+        ],
+        "CHK-IDENTITY-FRESHNESS-03": [
+          "SEC-LAW-04",
+          "SEC-LAW-06"
+        ],
+        "CHK-IDENTITY-FRESHNESS-04": [
+          "SEC-LAW-04"
+        ],
+        "CHK-RECEIPT-AUTH-01": [
+          "SEC-LAW-02"
+        ],
+        "CHK-RECEIPT-AUTH-02": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
+        "CHK-RECEIPT-AUTH-03": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
+        "CHK-RECEIPT-AUTH-04": [
+          "SEC-LAW-02"
+        ],
+        "CHK-TOOL-CONTEXT-01": [
+          "SEC-LAW-01"
+        ],
+        "CHK-TOOL-CONTEXT-02": [
+          "SEC-LAW-01",
+          "SEC-LAW-08"
+        ],
+        "CHK-TOOL-CONTEXT-03": [
+          "SEC-LAW-01",
+          "SEC-LAW-08"
+        ],
+        "CHK-TOOL-CONTEXT-04": [
+          "SEC-LAW-01"
+        ],
+        "CHK-INJECTION-CONFIDENTIALITY-01": [
+          "SEC-LAW-08"
+        ],
+        "CHK-INJECTION-CONFIDENTIALITY-02": [
+          "SEC-LAW-08"
+        ],
+        "CHK-INJECTION-CONFIDENTIALITY-03": [
+          "SEC-LAW-08"
+        ],
+        "CHK-INJECTION-CONFIDENTIALITY-04": [
+          "SEC-LAW-08"
+        ],
+        "CHK-FILES-ATOMICITY-01": [
+          "SEC-LAW-01"
+        ],
+        "CHK-FILES-ATOMICITY-02": [
+          "SEC-LAW-01"
+        ],
+        "CHK-FILES-ATOMICITY-03": [
+          "SEC-LAW-02"
+        ],
+        "CHK-CRYPTO-SERIALIZATION-01": [
+          "SEC-LAW-05",
+          "SEC-LAW-07"
+        ],
+        "CHK-CRYPTO-SERIALIZATION-02": [
+          "SEC-LAW-07"
+        ],
+        "CHK-CRYPTO-SERIALIZATION-03": [
+          "SEC-LAW-04",
+          "SEC-LAW-05"
+        ],
+        "CHK-CRYPTO-SERIALIZATION-04": [
+          "SEC-LAW-06"
+        ],
+        "CHK-RISK-TIER-01": [
+          "SEC-LAW-04"
+        ],
+        "CHK-RISK-TIER-02": [
+          "SEC-LAW-01",
+          "SEC-LAW-08"
+        ],
+        "CHK-RISK-TIER-03": [
+          "SEC-LAW-04",
+          "SEC-LAW-06"
+        ],
+        "CHK-CONTINUITY-STOP-01": [
+          "SEC-LAW-09"
+        ],
+        "CHK-CONTINUITY-STOP-02": [
+          "SEC-LAW-10"
+        ],
+        "CHK-CONTINUITY-STOP-03": [
+          "SEC-LAW-10"
+        ],
+        "CHK-SUPPLY-CHAIN-01": [
+          "SEC-LAW-02"
+        ],
+        "CHK-SUPPLY-CHAIN-02": [
+          "SEC-LAW-02"
+        ],
+        "CHK-SUPPLY-CHAIN-03": [
+          "SEC-LAW-02"
+        ],
+        "CHK-SUPPLY-CHAIN-04": [
+          "SEC-LAW-02"
+        ],
+        "SP-POSTURE-001": [
+          "SEC-LAW-04"
+        ],
+        "SP-POSTURE-002": [
+          "SEC-LAW-02",
+          "SEC-LAW-04",
+          "SEC-LAW-05"
+        ],
+        "SP-POSTURE-003": [
+          "SEC-LAW-02"
+        ],
+        "SP-REL-002": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
+        "SP-REL-003": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
+        "SP-REL-004": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
+        "SP-GATE-CLIPPY": [
+          "SEC-LAW-05"
+        ],
+        "SP-GATE-DENY": [
+          "SEC-LAW-05"
+        ],
+        "SP-GATE-AUDIT": [
+          "SEC-LAW-05"
+        ],
+        "SP-DEP-001": [
+          "SEC-LAW-05"
+        ],
+        "SP-DEP-002": [
+          "SEC-LAW-05"
+        ],
+        "SP-DEP-003": [
+          "SEC-LAW-02",
+          "SEC-LAW-05"
+        ],
+        "SP-SECRET-001": [
+          "SEC-LAW-08"
+        ],
+        "SP-SECRET-002": [
+          "SEC-LAW-08"
+        ],
+        "SP-SECRET-003": [
+          "SEC-LAW-08"
+        ],
+        "SP-VULN-001": [
+          "SEC-LAW-10"
+        ],
+        "SP-VULN-002": [
+          "SEC-LAW-10"
+        ],
+        "SP-VULN-003": [
+          "SEC-LAW-10"
+        ],
+        "CHK-FILES-ATOMICITY-04": [
+          "SEC-LAW-01"
+        ]
       }
     },
-
     "waiver_registry": {
-      "note": "Active waivers represent explicit, time-bounded relaxations of security laws. Each waiver traces to the law(s) it relaxes.",
+      "note": "Active waivers are exceptional, time-bounded relaxations with explicit accountability. Missing required metadata invalidates the waiver and reverts behavior to fail-closed denial.",
+      "policy": {
+        "max_duration_days": 30,
+        "max_extensions": 1,
+        "required_fields": [
+          "waiver_id",
+          "issued_at",
+          "issued_at_utc",
+          "expires",
+          "expires_at_utc",
+          "owner",
+          "approver",
+          "ticket_ref",
+          "justification",
+          "relaxed_laws",
+          "relaxed_controls",
+          "compensating_controls",
+          "blast_radius",
+          "condition",
+          "renewal_count",
+          "extended_from_waiver_id"
+        ],
+        "validation_checks": [
+          "owner_must_not_equal_approver",
+          "issued_at_utc_and_expires_at_utc_must_be_rfc3339_utc",
+          "ticket_ref_must_be_open_and_security_approved",
+          "issued_at_and_expires_must_match_utc_date_portions",
+          "renewal_count_must_be_within_policy_limits"
+        ],
+        "enforcement": "waiver_missing_required_field_or_expired => deny_authority_path_and_emit_SEC-DEFECT-14",
+        "separation_of_duties_rule": "waiver_owner_must_not_equal_waiver_approver",
+        "timestamp_precision_rule": "issued_at_utc_and_expires_at_utc_must_be_rfc3339_utc_timestamps",
+        "date_consistency_rule": "issued_at_and_expires_must_match_the_date_portion_of_issued_at_utc_and_expires_at_utc",
+        "extension_validation_rule": "renewal_count_must_be_less_than_or_equal_to_max_extensions_and_extended_from_waiver_id_required_when_renewal_count_gt_0",
+        "forbidden_scopes": [
+          "waiver_cannot_disable_SEC-LAW-01_on_authority_paths",
+          "waiver_cannot_disable_tier3_plus_stop_uncertainty_deny",
+          "waiver_cannot_disable_SEC-LAW-05_decode_or_proof_bounds_on_authority_paths",
+          "waiver_cannot_disable_policy_root_dual_approval_or_epoch_monotonicity_controls"
+        ],
+        "auto_expiry_action": "DENY_PATH_AND_EMIT_SEC-DEFECT-14"
+      },
       "active_waivers": [
         {
           "waiver_id": "WVR-0101",
           "title": "Transitional governance freshness bypass",
-          "relaxed_laws": ["SEC-LAW-04", "SEC-LAW-06"],
-          "relaxed_controls": ["SP-INV-006", "SP-RUNTIME-007"],
-          "expires": "2026-04-07",
-          "condition": "Only when governance_transitional_resolver=true; logged at WARN with waiver ID"
+          "issued_at": "2026-02-07",
+          "issued_at_utc": "2026-02-07T00:00:00Z",
+          "owner": "platform-security",
+          "approver": "HOLON-SECURITY-GOVERNANCE",
+          "ticket_ref": "TCK-00612",
+          "justification": "Avoid deadlock during temporary governance resolver migration while preserving non-actuation safety.",
+          "relaxed_laws": [
+            "SEC-LAW-04",
+            "SEC-LAW-06"
+          ],
+          "relaxed_controls": [
+            "SP-INV-006",
+            "SP-RUNTIME-002"
+          ],
+          "compensating_controls": [
+            "require_dual_signature_for_governance_head_changes",
+            "force_read_only_mode_for_tier2_plus_when_freshness_unverifiable"
+          ],
+          "blast_radius": "single_cell_non_actuation_governance_resolution_only",
+          "renewal_count": 0,
+          "expires": "2026-03-09",
+          "expires_at_utc": "2026-03-09T23:59:59Z",
+          "condition": "Only when governance_transitional_resolver=true and no authority-bearing actuation is performed.",
+          "telemetry_requirements": [
+            "emit_security_waiver_event_each_use",
+            "hourly_report_of_waiver_hit_count"
+          ],
+          "extended_from_waiver_id": null
         },
         {
           "waiver_id": "WVR-0102",
           "title": "Deferred pre-actuation budget enforcement",
-          "relaxed_laws": ["SEC-LAW-09"],
-          "relaxed_controls": ["SP-RUNTIME-006"],
-          "expires": "2026-04-07",
-          "condition": "Only BudgetTracker::deferred() sentinel; budget_enforcement_deferred=true bound in receipt"
+          "issued_at": "2026-02-07",
+          "issued_at_utc": "2026-02-07T00:00:00Z",
+          "owner": "runtime-security",
+          "approver": "HOLON-SECURITY-GOVERNANCE",
+          "ticket_ref": "TCK-00613",
+          "justification": "Short-lived migration bridge while replacing deferred budget tracker with pre-actuation enforcement.",
+          "relaxed_laws": [
+            "SEC-LAW-09"
+          ],
+          "relaxed_controls": [
+            "SP-RUNTIME-006"
+          ],
+          "compensating_controls": [
+            "enforce_parser_and_proof_bounds_with_strict_deny",
+            "enforce_per_relay_rate_limit_even_when_budget_tracker_deferred"
+          ],
+          "blast_radius": "tier0_tier1_non_actuation_sync_only",
+          "renewal_count": 0,
+          "expires": "2026-03-09",
+          "expires_at_utc": "2026-03-09T23:59:59Z",
+          "condition": "Only for non-authority-bearing synchronization when BudgetTracker::deferred() sentinel is present and bound in receipt.",
+          "forbidden_effects": [
+            "no_tier2_plus_actuation",
+            "no_relaxation_of_revocation_wins_merge"
+          ],
+          "extended_from_waiver_id": null
         },
         {
           "waiver_id": "WVR-0103",
           "title": "Deferred identity proof CAS dereference",
-          "relaxed_laws": ["SEC-LAW-05"],
-          "relaxed_controls": ["SP-ID-001"],
-          "expires": "2026-04-07",
-          "condition": "Shape-only hash validation (32-byte non-zero) without full CAS dereference; hash bound in signed events"
+          "issued_at": "2026-02-07",
+          "issued_at_utc": "2026-02-07T00:00:00Z",
+          "owner": "identity-security",
+          "approver": "HOLON-SECURITY-GOVERNANCE",
+          "ticket_ref": "TCK-00614",
+          "justification": "Temporary developer-mode accommodation while full CAS dereference reliability fixes are rolled out.",
+          "relaxed_laws": [
+            "SEC-LAW-05"
+          ],
+          "relaxed_controls": [
+            "SP-ID-001"
+          ],
+          "compensating_controls": [
+            "require_signature_validation_and_trust_chain_check",
+            "block_release_and_tier2_plus_actuation_if_full_cas_dereference_fails"
+          ],
+          "blast_radius": "developer_mode_and_read_only_identity_checks",
+          "renewal_count": 0,
+          "expires": "2026-03-01",
+          "expires_at_utc": "2026-03-01T23:59:59Z",
+          "condition": "Shape-only hash validation allowed only in developer-mode read-only flows; never for release or authority-bearing actuation.",
+          "extended_from_waiver_id": null
         }
       ]
     },
-
     "scale_invariance_validation": {
       "note": "Each security law is validated for scale invariance: does the semantic contract hold identically from 1 agent to 10^9?",
+      "validation_evidence_requirements": [
+        "benchmark_receipts_for_depth_1_and_depth_10e9_simulations",
+        "property_tests_showing_semantic_equivalence_across_depths",
+        "cost_profiles_with_declared_input_size_and_proof_bounds"
+      ],
       "validation": [
         {
           "law": "SEC-LAW-01",
@@ -1479,12 +3425,11 @@
         {
           "law": "SEC-LAW-10",
           "depth_1": "Single stop signal.",
-          "depth_10e9": "Hierarchical propagation. Per-level SLO × tree depth. Each level identical.",
-          "verdict": "SCALE_INVARIANT — per-level contract identical, total bounded by depth"
+          "depth_10e9": "Bounded-diameter stop overlay keeps end-to-end stop propagation ≤ 2000ms for admitted Tier3+ topologies.",
+          "verdict": "SCALE_INVARIANT — topology constraints preserve identical end-to-end contract at scale"
         }
       ]
     },
-
     "falsification_criteria": {
       "note": "For each security law, the falsification criteria specify what evidence would disprove the law's necessity or correctness. This makes the theory scientifically falsifiable, not merely aspirational.",
       "criteria": [

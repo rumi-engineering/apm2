@@ -74,7 +74,6 @@
 //! - **Validation**: All policies are validated before use
 //! - **Fail-closed**: Invalid policies are rejected; default is deny
 
-pub mod attestation_floor;
 mod engine;
 mod error;
 mod event;
@@ -87,10 +86,6 @@ mod validator;
 #[cfg(test)]
 mod tests;
 
-pub use attestation_floor::{
-    AttestationFloorError, AttestationFloorGuard, AttestationFloorPolicy, AttestationLevel,
-    AttestationMetadata, CrossCellImportRequest, EvaluationKind, FloorEvaluation, QuarantineRecord,
-};
 pub use engine::{
     BUDGET_EXCEEDED_RULE_ID, CONTEXT_MISS_RATIONALE, CONTEXT_MISS_RULE_ID, DEFAULT_DENY_RATIONALE,
     DEFAULT_DENY_RULE_ID, EvaluationResult, ManifestEvaluationResult, PolicyEngine,

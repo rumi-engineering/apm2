@@ -122,12 +122,8 @@ pub mod controller;
 pub mod error;
 pub mod events;
 pub mod evidence;
-pub mod planner;
 pub mod reducer;
 pub mod state;
-
-#[cfg(test)]
-mod planner_tests;
 
 #[cfg(test)]
 mod tests;
@@ -151,12 +147,6 @@ pub use events::{
 pub use evidence::{
     CoordinationReceipt, MAX_SESSION_IDS_PER_OUTCOME, MAX_WORK_OUTCOMES, ReceiptBuilder,
     ReceiptError, WorkOutcome,
-};
-// Re-export planner types (TCK-00369, REQ-0023)
-pub use planner::{
-    AdvisoryPlannerScore, CoordinationObjectiveReceiptV1, EfeComponents, EfeObjective, EfeWeights,
-    MAX_PLANNER_COORDINATION_ID_LEN, MAX_PLANNER_WORK_ID_LEN, MAX_TRACKED_OBJECTIVES, PlannerError,
-    TIER3_ESCALATION_THRESHOLD,
 };
 // Re-export reducer types
 pub use reducer::{CoordinationReducer, CoordinationReducerError};

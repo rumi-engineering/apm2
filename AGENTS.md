@@ -189,8 +189,7 @@
         "intent_name": "Security Review and Threat Modeling",
         "precondition": "None.",
         "priority_reads": [
-          "documents/security/AGENTS.cac.json",
-          "documents/reviews/SECURITY_REVIEW_PROMPT.md",
+          "documents/security/SECURITY_POLICY.cac.json",
           "documents/security/THREAT_MODEL.cac.json",
           "SECURITY.md"
         ],
@@ -270,8 +269,7 @@
             "prd": "documents/prds/template/",
             "rfc": "documents/rfcs/template/",
             "skill": "documents/skills/skill-authoring/SKILL.md",
-            "agents_md": "crates/apm2-core/src/reducer/AGENTS.md",
-            "cac_json": "documents/security/AGENTS.cac.json"
+            "agents_md": "crates/apm2-core/src/reducer/AGENTS.md"
           }
         },
         "related_skills": [

@@ -265,6 +265,20 @@ pub struct TamperResult {
 ///    ledger_head)` key
 #[async_trait]
 pub trait ProjectionAdapter: Send + Sync {
+    /// Returns the projection surface name (`github`, etc).
+    fn provider_name(&self) -> &'static str;
+
+    /// Registers changeset -> commit mapping needed for status projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the mapping cannot be stored.
+    async fn register_commit_sha(
+        &self,
+        changeset_digest: [u8; 32],
+        commit_sha: &str,
+    ) -> Result<(), ProjectionError>;
+
     /// Projects a status to the external system.
     ///
     /// This method is idempotent: calling it multiple times with the same
@@ -292,6 +306,19 @@ pub trait ProjectionAdapter: Send + Sync {
         ledger_head: [u8; 32],
         status: ProjectedStatus,
     ) -> Result<ProjectionReceipt, ProjectionError>;
+
+    /// Posts provider-specific review commentary for a projected result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when comment projection fails.
+    async fn post_review_comment(
+        &self,
+        pr_number: u64,
+        receipt_id: &str,
+        status: ProjectedStatus,
+        summary: Option<&str>,
+    ) -> Result<(), ProjectionError>;
 
     /// Returns the adapter's verifying key for receipt validation.
     fn verifying_key(&self) -> apm2_core::crypto::VerifyingKey;
@@ -2040,6 +2067,19 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
 
 #[async_trait]
 impl<T: TimeSource> ProjectionAdapter for GitHubProjectionAdapter<T> {
+    fn provider_name(&self) -> &'static str {
+        "github"
+    }
+
+    async fn register_commit_sha(
+        &self,
+        changeset_digest: [u8; 32],
+        commit_sha: &str,
+    ) -> Result<(), ProjectionError> {
+        self.register_commit_sha_async(changeset_digest, commit_sha.to_string())
+            .await
+    }
+
     async fn project_status(
         &self,
         work_id: &str,
@@ -2079,6 +2119,17 @@ impl<T: TimeSource> ProjectionAdapter for GitHubProjectionAdapter<T> {
         self.cache.put(&key, &receipt)?;
 
         Ok(receipt)
+    }
+
+    async fn post_review_comment(
+        &self,
+        pr_number: u64,
+        receipt_id: &str,
+        status: ProjectedStatus,
+        summary: Option<&str>,
+    ) -> Result<(), ProjectionError> {
+        let body = Self::format_review_comment(receipt_id, status, summary);
+        self.post_comment(pr_number, &body).await
     }
 
     fn verifying_key(&self) -> apm2_core::crypto::VerifyingKey {

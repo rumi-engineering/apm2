@@ -1,0 +1,106 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00481"
+    title: "RFC-0028 REQ-0008,0009 / RFC-0029 REQ-0005,0006,0008,0009: hard-cut projection isolation with GitHub App authority in projection_worker only"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-0010"
+    rfc_id: "RFC-0028"
+    requirements:
+      - requirement_id: "REQ-0008"
+        requirement_ref: "documents/rfcs/RFC-0028/requirements/REQ-0008.yaml#requirement"
+      - requirement_id: "REQ-0009"
+        requirement_ref: "documents/rfcs/RFC-0028/requirements/REQ-0009.yaml#requirement"
+      - requirement_id: "REQ-0005"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0005.yaml#requirement"
+      - requirement_id: "REQ-0006"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0006.yaml#requirement"
+      - requirement_id: "REQ-0008"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0008.yaml#requirement"
+      - requirement_id: "REQ-0009"
+        requirement_ref: "documents/rfcs/RFC-0029/requirements/REQ-0009.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0008"
+        artifact_ref: "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0008.yaml#evidence_artifact"
+      - evidence_id: "EVID-0009"
+        artifact_ref: "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+      - evidence_id: "EVID-0005"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0005.yaml#evidence_artifact"
+      - evidence_id: "EVID-0006"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+      - evidence_id: "EVID-0008"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0008.yaml#evidence_artifact"
+      - evidence_id: "EVID-0009"
+        artifact_ref: "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+      - "AGENT_REVIEWER"
+      - "AGENT_QA"
+    responsibility_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_RELIABILITY"
+      - "DOMAIN_OBSERVABILITY"
+      - "DOMAIN_INFRA"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00468"
+        reason: "Projection-isolation baseline contracts and deny surfaces must remain aligned."
+      - ticket_id: "TCK-00478"
+        reason: "Multi-sink continuity and replay window controls are required for complete REQ-0009 closure."
+  scope:
+    in_scope:
+      - "Hard-cut production behavior: enforce GH-DIRECT-STAGE-2 semantics in APM2 runtime only (no Stage 0/1 runtime behavior and no stage fallback paths)."
+      - "Remove direct `gh` and direct GitHub API authority from agent_runtime surfaces (`fac_pr`, `push`, `barrier`, `ci_status`, `restart`) and replace with projection intent pathways or structured deny defects."
+      - "Implement `GitHubAppTokenProvider` in `apm2_core::github::token_provider` (JWT + installation token minting) with strict request validation and fail-closed behavior."
+      - "Load App private key from OS keyring (SECRET-CLASS-01) or CI runtime env (SECRET-CLASS-02) only; no ambient credential fallback."
+      - "Wire GitHub App installation token usage into daemon projection authority surfaces (`projection_worker`, `GitHubProjectionAdapter`, divergence watchdog read path) so in-product authority is daemon/projection-worker scoped."
+      - "Preserve truth-plane authority independence: projection sink state never becomes an authority input; all projection effects remain receipt-linked and replay-idempotent."
+      - "Add authority-surface monotonicity evidence and security interlock bindings for optimization-related admissions (`RFC-0029::REQ-0006/0008`)."
+      - "Implement outage/compromise continuity bindings needed for `RFC-0028::REQ-0009` and `RFC-0029::REQ-0009`, including bounded replay paths and fail-closed temporal ambiguity handling."
+      - "Add `apm2 fac pr auth-setup` to bootstrap GitHub App credentials and installation binding without exposing secrets in argv or logs."
+    out_of_scope:
+      - "Out-of-band operator or root-agent GitHub actions executed outside APM2 runtime (`gh`, curl, web UI)."
+      - "Production admission for non-GitHub sink families."
+      - "Disclosure-policy mode changes outside current trade-secret interlock posture."
+  plan:
+    steps:
+      - "Reopen and re-scope ticket to hard authority isolation: production runtime denies any direct GitHub authority class in agent surfaces."
+      - "Create/extend forge and projection abstractions so GitHub write authority is projection-worker scoped, not agent-runtime scoped."
+      - "Implement and test `GitHubAppTokenProvider` (JWT mint, installation token exchange, tier/app/scope validation, TTL/rate-limit enforcement, hash-only persistence)."
+      - "Integrate App-token provider into daemon projection and watchdog paths; remove dependency on static personal tokens for in-product authority flows."
+      - "Refactor `fac_pr` command family: write-capable operations become projection-intent submissions or fail-closed denies; no direct actuation path remains."
+      - "Replace residual direct GitHub calls in FAC command stack (`push`, `barrier`, `ci_status`, `restart`) with daemon-mediated capability-gated flows."
+      - "Implement temporal and continuity artifacts needed by covered RFC-0029 requirements for promotion-critical paths."
+      - "Add security and adversarial tests: direct-authority negatives, token-scope containment, outage continuity, replay/idempotency, compromise quarantine."
+      - "Publish/update evidence bundles for all bound requirements and run full CI conformance checks."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0008"
+      - "EVID-0009"
+      - "EVID-0005"
+      - "EVID-0006"
+    criteria:
+      - "Runtime hard-cut holds: production APM2 surfaces expose no Stage 0/1 direct-actuation behavior."
+      - "No `Command::new(\"gh\")` path remains in `crates/apm2-cli`, `crates/apm2-core`, or `crates/apm2-daemon`."
+      - "Direct GitHub API/CLI attempts from agent_runtime contexts are denied with structured defects."
+      - "All admissible GitHub projection effects are projection_worker-mediated and receipt-linked."
+      - "GitHub App tokens are scoped per operation, rate-limited per episode, and validated against tier/app/scope constraints."
+      - "App private key and minted tokens never appear in logs, process arguments, persisted config plaintext, or ledger raw fields."
+      - "Missing, stale, or ambiguous credential/authority state fails closed (no ambient or personal-token fallback)."
+      - "Compromise and outage tests demonstrate authoritative continuity from CAS+ledger with bounded replay recovery."
+      - "Required evidence artifacts are generated and traceable to bound RFC requirements."
+      - "Mandatory pre-commit suite passes: `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo doc --workspace --no-deps`, `cargo test --workspace`."
+  notes:
+    security: |
+      In-product authority is projection-worker only. Replacing `gh` with direct REST in agent-runtime
+      is not admissible for this ticket. APM2 runtime enforces a hard no-direct-actuation boundary.
+    operations: |
+      Operator/root-agent GitHub actions executed outside APM2 runtime are explicitly out-of-scope for this ticket.
+      This ticket governs only in-product runtime authority classes and admission surfaces.
+    implementation: |
+      Replaces the previous partial closure model that wrapped `gh` in `GitHubPrClient`.
+      Completion requires full authority-boundary closure and RFC-0028/RFC-0029 evidence alignment.

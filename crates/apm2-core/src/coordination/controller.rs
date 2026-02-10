@@ -117,10 +117,6 @@ use super::events::{
     CoordinationSessionBound, CoordinationSessionUnbound, CoordinationStarted,
 };
 use super::evidence::{ReceiptBuilder, WorkOutcome};
-use super::planner::{
-    AdvisoryPlannerScore, CoordinationObjectiveReceiptV1, MAX_TRACKED_OBJECTIVES, PlannerError,
-    TIER3_ESCALATION_THRESHOLD,
-};
 use super::state::{
     AbortReason, BudgetUsage, CoordinationBudget, CoordinationError, CoordinationStatus,
     MAX_WORK_QUEUE_SIZE, SessionOutcome, StopCondition, WorkItemOutcome,
@@ -340,12 +336,6 @@ pub struct CoordinationController {
     /// Per-work tracking state.
     work_tracking: Vec<WorkItemState>,
 
-    /// Advisory planner objectives by work queue index.
-    ///
-    /// This collection is strictly informational and is not consulted by
-    /// stop/budget/freshness gate checks.
-    advisory_objectives: Vec<(usize, AdvisoryPlannerScore)>,
-
     /// Active session state (enforces serial execution and `work_id`
     /// validation).
     ///
@@ -413,7 +403,6 @@ impl CoordinationController {
             config,
             work_index: 0,
             work_tracking,
-            advisory_objectives: Vec::new(),
             active_session: None,
             budget_usage: BudgetUsage::with_tick_rate(tick_rate_hz),
             consecutive_failures: 0,
@@ -478,106 +467,6 @@ impl CoordinationController {
     #[must_use]
     pub fn work_tracking(&self) -> &[WorkItemState] {
         &self.work_tracking
-    }
-
-    /// Records an advisory planner objective for a work item.
-    ///
-    /// This method is intentionally non-authoritative: it stores advisory
-    /// information and optionally emits an objective receipt for Tier3+
-    /// escalations, but it does not mutate gate state.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(receipt)` when escalation count is at or above
-    /// [`TIER3_ESCALATION_THRESHOLD`], otherwise `None`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the work item is unknown, the objective collection
-    /// limit is exceeded, or receipt construction fails.
-    pub fn record_advisory_objective(
-        &mut self,
-        work_index: usize,
-        score: AdvisoryPlannerScore,
-        current_tick: u64,
-    ) -> ControllerResult<Option<CoordinationObjectiveReceiptV1>> {
-        let tracked_work =
-            self.work_tracking
-                .get(work_index)
-                .ok_or_else(|| ControllerError::Internal {
-                    message: format!(
-                        "work index out of bounds for advisory objective: {work_index}"
-                    ),
-                })?;
-        if tracked_work.work_id.as_str() != score.work_id() {
-            return Err(ControllerError::WorkNotFound {
-                work_id: score.work_id().to_string(),
-            });
-        }
-
-        let escalation_count = tracked_work.attempt_count;
-
-        if let Some((_, existing_score)) = self
-            .advisory_objectives
-            .iter_mut()
-            .find(|(tracked_index, _)| *tracked_index == work_index)
-        {
-            *existing_score = score;
-        } else {
-            let next_len = self.advisory_objectives.len().saturating_add(1);
-            if next_len > MAX_TRACKED_OBJECTIVES {
-                let error = PlannerError::ObjectiveLimitExceeded {
-                    actual: next_len,
-                    max: MAX_TRACKED_OBJECTIVES,
-                };
-                return Err(planner_error_to_controller(&error));
-            }
-            self.advisory_objectives.push((work_index, score));
-        }
-
-        if escalation_count >= TIER3_ESCALATION_THRESHOLD {
-            let coordination_id =
-                self.coordination_id
-                    .clone()
-                    .ok_or_else(|| ControllerError::Internal {
-                        message: "coordination not started".to_string(),
-                    })?;
-
-            let advisory_score =
-                self.advisory_score_for(work_index)
-                    .ok_or_else(|| ControllerError::Internal {
-                        message: "advisory objective not found after record".to_string(),
-                    })?;
-
-            let receipt = CoordinationObjectiveReceiptV1::new(
-                coordination_id,
-                advisory_score.objective(),
-                escalation_count,
-                current_tick,
-            )
-            .map_err(|error| planner_error_to_controller(&error))?;
-
-            return Ok(Some(receipt));
-        }
-
-        Ok(None)
-    }
-
-    /// Returns the latest advisory score recorded for a work item.
-    ///
-    /// This method is read-only and informational.
-    #[must_use]
-    pub fn advisory_score_for(&self, work_index: usize) -> Option<&AdvisoryPlannerScore> {
-        self.advisory_objectives
-            .iter()
-            .rev()
-            .find_map(|(tracked_index, score)| {
-                if *tracked_index == work_index {
-                    Some(score)
-                } else {
-                    None
-                }
-            })
     }
 
     /// Returns the configuration.
@@ -1516,12 +1405,6 @@ impl CoordinationController {
 /// Format: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`
 fn generate_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
-}
-
-fn planner_error_to_controller(error: &PlannerError) -> ControllerError {
-    ControllerError::Internal {
-        message: format!("planner error: {error}"),
-    }
 }
 
 #[cfg(test)]

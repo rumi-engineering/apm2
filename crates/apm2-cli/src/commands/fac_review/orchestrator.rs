@@ -330,7 +330,7 @@ fn run_single_review(
     let mut restart_count: u32 = 0;
     let review_started = Instant::now();
     let review_type = review_kind.as_str();
-    let expected_comment_author = resolve_authenticated_gh_login();
+    let expected_comment_author = resolve_authenticated_gh_login(owner_repo);
     let sequence_number = next_review_sequence_number(pr_number, review_type)?;
     let run_id = build_review_run_id(pr_number, review_type, sequence_number, &current_head_sha);
     let mut run_state = ReviewRunState {

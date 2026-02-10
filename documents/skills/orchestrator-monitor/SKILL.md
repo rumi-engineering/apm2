@@ -32,7 +32,7 @@ notes:
   - "Use `apm2 fac review project --pr <N> --emit-errors` to monitor all gate states (CI gates + reviews) after a push."
   - "Use `apm2 fac review` for reviewer lifecycle actions (`status`, `project`). Use `apm2 fac restart` for recovery."
   - "Use `apm2 fac logs --pr <N>` to discover and display local pipeline/evidence/review log files. Add `--json` for machine-readable output."
-  - "Use direct `gh` commands only when FAC has no equivalent (for now: PR metadata and full comment-body retrieval)."
+  - "All GitHub interactions are available via `apm2 fac pr` subcommands — no direct `gh` usage required."
 
 references[11]:
   - path: "@documents/theory/unified-theory-v2.json"
@@ -71,7 +71,7 @@ implementor_warm_handoff_required_reads[17]:
     purpose: "Mode #08: Counterexample-Guided Reasoning"
   - path: "@documents/skills/modes-of-reasoning/assets/65-deontic.json"
     purpose: "Mode #65: Deontic (Authority) Reasoning"
-  - path: "@documents/security/AGENTS.cac.json"
+  - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security Documentation"
   - path: "@documents/security/THREAT_MODEL.cac.json"
     purpose: "Threat model context and trust-boundary assumptions."
@@ -157,7 +157,7 @@ invariants[15]:
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "One active implementor agent per PR at any time."
   - "At most one active review batch per PR at any time."
-  - "Use `apm2 fac restart` for review reruns; direct `gh workflow run forge-admission-cycle.yml` is fallback-only."
+  - "Use `apm2 fac restart` for review reruns."
   - "No merge action without Forge Admission Cycle=success for current HEAD SHA."
   - "Review prompt dispatch includes review_prompt_required_payload."
   - "Never use the same model family for both implementing and reviewing the same PR cycle."

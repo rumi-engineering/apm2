@@ -163,11 +163,7 @@ Output JSON to `evidence/aat/PR-{number}_{timestamp}.json`:
 Use GitHub API to set `aat/acceptance` status:
 
 ```bash
-gh api repos/{owner}/{repo}/statuses/{sha} \
-  -f state=success \
-  -f context="aat/acceptance" \
-  -f description="AAT passed: 3/3 hypotheses verified" \
-  -f target_url="https://example.com/evidence/aat/PR-123_20260124.json"
+apm2 fac pr set-status --sha {sha} --state success --context "aat/acceptance" --description "AAT passed: 3/3 hypotheses verified"
 ```
 
 **Status States:**
