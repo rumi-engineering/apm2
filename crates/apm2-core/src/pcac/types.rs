@@ -13,6 +13,7 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::intent_class::BoundaryIntentClass;
 use crate::crypto::Hash;
 
 mod signature_bytes_serde {
@@ -250,6 +251,13 @@ pub struct AuthorityJoinInputV1 {
     /// Canonicalized digest of the request/effect intent.
     pub intent_digest: Hash,
 
+    /// Boundary intent class for lifecycle admission.
+    ///
+    /// Missing values deserialize to `observe` for backward compatibility and
+    /// fail-closed authorization behavior.
+    #[serde(default = "default_boundary_intent_class")]
+    pub boundary_intent_class: BoundaryIntentClass,
+
     // -- Capability bindings --
     /// Hash of the capability manifest at join time.
     pub capability_manifest_hash: Hash,
@@ -444,6 +452,10 @@ impl std::error::Error for PcacValidationError {}
 
 /// Zero hash constant for comparison.
 const ZERO_HASH: Hash = [0u8; 32];
+
+const fn default_boundary_intent_class() -> BoundaryIntentClass {
+    BoundaryIntentClass::Observe
+}
 
 impl AuthorityJoinInputV1 {
     /// Validate string field constraints (non-empty, within length bounds).
@@ -675,6 +687,13 @@ pub struct AuthorityJoinCertificateV1 {
 
     /// The intent this certificate authorizes (32 bytes).
     pub intent_digest: Hash,
+
+    /// Boundary intent class admitted at join time.
+    ///
+    /// Missing values deserialize to `observe` for backward compatibility and
+    /// fail-closed authorization behavior.
+    #[serde(default = "default_boundary_intent_class")]
+    pub boundary_intent_class: BoundaryIntentClass,
 
     /// Risk classification at join time.
     pub risk_tier: RiskTier,

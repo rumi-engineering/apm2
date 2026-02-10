@@ -768,6 +768,8 @@ struct PendingPcacAuthority {
     gate: Arc<crate::pcac::LifecycleGate>,
     certificate: apm2_core::pcac::AuthorityJoinCertificateV1,
     intent_digest: Hash,
+    boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+    requires_authoritative_acceptance: bool,
     pcac_policy: PcacPolicyKnobs,
     principal_id: String,
     pre_actuation_required: bool,
@@ -2359,11 +2361,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 },
                 _ => apm2_core::pcac::DeterminismClass::BoundedNondeterministic,
             };
+            let boundary_intent_class = match tool_class {
+                ToolClass::Read | ToolClass::ListFiles | ToolClass::Search => {
+                    apm2_core::pcac::BoundaryIntentClass::Observe
+                },
+                _ => apm2_core::pcac::BoundaryIntentClass::Actuate,
+            };
+            let requires_authoritative_acceptance = !matches!(
+                boundary_intent_class,
+                apm2_core::pcac::BoundaryIntentClass::Observe
+            );
 
             let pcac_input = apm2_core::pcac::AuthorityJoinInputV1 {
                 session_id: token.session_id.clone(),
                 holon_id: None,
                 intent_digest,
+                boundary_intent_class,
                 capability_manifest_hash,
                 scope_witness_hashes: Self::derive_scope_witness_hashes(
                     tool_class,
@@ -2520,6 +2533,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 gate: Arc::clone(pcac_gate),
                 certificate,
                 intent_digest,
+                boundary_intent_class,
+                requires_authoritative_acceptance,
                 pcac_policy,
                 principal_id: Self::token_principal_id(&token).to_string(),
                 pre_actuation_required,
@@ -3270,6 +3285,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         .consume_before_effect_with_sovereignty(
                             &pending_pcac.certificate,
                             effect_intent_digest,
+                            pending_pcac.boundary_intent_class,
+                            pending_pcac.requires_authoritative_acceptance,
                             current_time_envelope_ref,
                             current_ledger_anchor,
                             current_revocation_head,
@@ -6287,6 +6304,7 @@ mod tests {
                     ajc_id,
                     authority_join_hash: *blake3::hash(&input.intent_digest).as_bytes(),
                     intent_digest: input.intent_digest,
+                    boundary_intent_class: input.boundary_intent_class,
                     risk_tier: input.risk_tier,
                     issued_time_envelope_ref: input.time_envelope_ref,
                     as_of_ledger_anchor: input.as_of_ledger_anchor,
@@ -6322,6 +6340,8 @@ mod tests {
                 &self,
                 cert: &AuthorityJoinCertificateV1,
                 intent_digest: Hash,
+                _boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+                _requires_authoritative_acceptance: bool,
                 current_time_envelope_ref: Hash,
                 _current_revocation_head_hash: Hash,
             ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>>
@@ -6863,6 +6883,7 @@ mod tests {
                 ajc_id: [0x11; 32],
                 authority_join_hash: [0x22; 32],
                 intent_digest: [0x33; 32],
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
                 risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
                 issued_time_envelope_ref: [0x44; 32],
                 as_of_ledger_anchor: [0x55; 32],
@@ -6875,6 +6896,8 @@ mod tests {
                 gate: pcac_gate,
                 certificate: certificate.clone(),
                 intent_digest: certificate.intent_digest,
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Actuate,
+                requires_authoritative_acceptance: true,
                 pcac_policy: apm2_core::pcac::PcacPolicyKnobs {
                     lifecycle_enforcement: true,
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
@@ -6991,6 +7014,7 @@ mod tests {
                 ajc_id: [0x11; 32],
                 authority_join_hash: [0x12; 32],
                 intent_digest: [0xAA; 32],
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
                 risk_tier: apm2_core::pcac::RiskTier::Tier1,
                 issued_time_envelope_ref: [0x13; 32],
                 as_of_ledger_anchor: current_ledger_anchor,
@@ -7005,6 +7029,8 @@ mod tests {
                 gate: Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel)),
                 certificate: cert,
                 intent_digest: [0xAA; 32],
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Observe,
+                requires_authoritative_acceptance: false,
                 pcac_policy: apm2_core::pcac::PcacPolicyKnobs {
                     lifecycle_enforcement: true,
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
@@ -7117,6 +7143,7 @@ mod tests {
                 ajc_id: [0x31; 32],
                 authority_join_hash: [0x32; 32],
                 intent_digest,
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Observe,
                 risk_tier: apm2_core::pcac::RiskTier::Tier1,
                 issued_time_envelope_ref: [0x33; 32],
                 as_of_ledger_anchor: current_ledger_anchor,
@@ -7131,6 +7158,8 @@ mod tests {
                 gate: Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel)),
                 certificate: cert,
                 intent_digest,
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Observe,
+                requires_authoritative_acceptance: false,
                 pcac_policy: apm2_core::pcac::PcacPolicyKnobs {
                     lifecycle_enforcement: true,
                     min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,

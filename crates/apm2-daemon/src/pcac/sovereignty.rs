@@ -642,6 +642,7 @@ mod tests {
             ajc_id: test_hash(0xAA),
             authority_join_hash: test_hash(0xBB),
             intent_digest: test_hash(0x01),
+            boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
             risk_tier: RiskTier::Tier2Plus,
             issued_time_envelope_ref: test_hash(0x07),
             as_of_ledger_anchor: test_hash(0x08),

@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex};
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, AuthorityJoinKernel, FreezeAction, RiskTier,
+    AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass, FreezeAction, RiskTier,
 };
+use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
 use crate::htf::HolonicClock;
@@ -266,6 +267,15 @@ impl InProcessKernel {
         }
         // Intent binding (fixed-length hash, no prefix needed)
         update_tagged_fixed(&mut hasher, b"intent_digest", &input.intent_digest);
+        hasher.update(b"boundary_intent_class");
+        hasher.update(&[match input.boundary_intent_class {
+            BoundaryIntentClass::Observe => 0u8,
+            BoundaryIntentClass::Assert => 1u8,
+            BoundaryIntentClass::Delegate => 2u8,
+            BoundaryIntentClass::Actuate => 3u8,
+            BoundaryIntentClass::Govern => 4u8,
+            _ => u8::MAX, // fail-closed: unknown classes
+        }]);
         // Capability bindings
         update_tagged_fixed(
             &mut hasher,
@@ -537,6 +547,7 @@ impl AuthorityJoinKernel for InProcessKernel {
             ajc_id,
             authority_join_hash: join_hash,
             intent_digest: input.intent_digest,
+            boundary_intent_class: input.boundary_intent_class,
             risk_tier: input.risk_tier,
             issued_time_envelope_ref: input.time_envelope_ref,
             as_of_ledger_anchor: input.as_of_ledger_anchor,
@@ -612,6 +623,8 @@ impl AuthorityJoinKernel for InProcessKernel {
         &self,
         cert: &AuthorityJoinCertificateV1,
         intent_digest: Hash,
+        boundary_intent_class: BoundaryIntentClass,
+        requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
@@ -642,7 +655,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         }
 
         // Law 4: Revocation frontier advancement check in consume.
-        if current_revocation_head_hash != cert.revocation_head_hash {
+        if !bool::from(current_revocation_head_hash.ct_eq(&cert.revocation_head_hash)) {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: apm2_core::pcac::AuthorityDenyClass::RevocationFrontierAdvanced,
                 ajc_id: Some(cert.ajc_id),
@@ -653,8 +666,41 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
+        let join_intent_class = cert.boundary_intent_class;
+        if !bool::from(
+            join_intent_class
+                .value()
+                .ct_eq(&boundary_intent_class.value()),
+        ) {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::IntentClassDriftBetweenStages {
+                    join_intent_class,
+                    consume_intent_class: boundary_intent_class,
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+
+        if requires_authoritative_acceptance && !boundary_intent_class.is_authoritative() {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class:
+                    apm2_core::pcac::AuthorityDenyClass::ObservationalPayloadInAuthoritativePath {
+                        intent_class: boundary_intent_class,
+                    },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+
         // Law 2: Intent digest equality.
-        if intent_digest != cert.intent_digest {
+        if !bool::from(intent_digest.ct_eq(&cert.intent_digest)) {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: apm2_core::pcac::AuthorityDenyClass::IntentDigestMismatch {
                     expected: cert.intent_digest,
@@ -1209,12 +1255,16 @@ impl LifecycleGate {
         &self,
         cert: &AuthorityJoinCertificateV1,
         intent_digest: Hash,
+        boundary_intent_class: BoundaryIntentClass,
+        requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
         self.kernel.consume(
             cert,
             intent_digest,
+            boundary_intent_class,
+            requires_authoritative_acceptance,
             current_time_envelope_ref,
             current_revocation_head_hash,
         )
@@ -1227,6 +1277,8 @@ impl LifecycleGate {
         &self,
         cert: &AuthorityJoinCertificateV1,
         intent_digest: Hash,
+        boundary_intent_class: BoundaryIntentClass,
+        requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
@@ -1246,6 +1298,8 @@ impl LifecycleGate {
         self.consume_before_effect(
             cert,
             intent_digest,
+            boundary_intent_class,
+            requires_authoritative_acceptance,
             current_time_envelope_ref,
             current_revocation_head_hash,
         )
@@ -1304,6 +1358,8 @@ impl LifecycleGate {
         let (consumed_witness, consume_record) = self.consume_before_effect_with_sovereignty(
             &cert,
             input.intent_digest,
+            input.boundary_intent_class,
+            input.boundary_intent_class.is_authoritative(),
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,

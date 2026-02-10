@@ -497,6 +497,8 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         &self,
         cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
         intent_digest: Hash,
+        boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+        requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<
@@ -513,6 +515,8 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
         let (consumed_witness, consume_record) = self.inner.consume(
             cert,
             intent_digest,
+            boundary_intent_class,
+            requires_authoritative_acceptance,
             current_time_envelope_ref,
             current_revocation_head_hash,
         )?;
@@ -609,6 +613,8 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
         &self,
         cert: &apm2_core::pcac::AuthorityJoinCertificateV1,
         intent_digest: Hash,
+        boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+        requires_authoritative_acceptance: bool,
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<
@@ -625,6 +631,8 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
         let (consumed_witness, consume_record) = self.inner.consume(
             cert,
             intent_digest,
+            boundary_intent_class,
+            requires_authoritative_acceptance,
             current_time_envelope_ref,
             current_revocation_head_hash,
         )?;
@@ -926,6 +934,7 @@ mod tests {
             session_id: "session-001".to_string(),
             holon_id: None,
             intent_digest: test_hash(0x01),
+            boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Assert,
             capability_manifest_hash: test_hash(0x02),
             scope_witness_hashes: vec![],
             lease_id: "lease-001".to_string(),
@@ -971,6 +980,8 @@ mod tests {
             &self,
             cert: &AuthorityJoinCertificateV1,
             intent_digest: Hash,
+            _boundary_intent_class: apm2_core::pcac::BoundaryIntentClass,
+            _requires_authoritative_acceptance: bool,
             current_time_envelope_ref: Hash,
             _current_revocation_head_hash: Hash,
         ) -> Result<
@@ -1021,6 +1032,8 @@ mod tests {
             .consume(
                 &cert,
                 input.intent_digest,
+                input.boundary_intent_class,
+                input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
             )
@@ -1045,6 +1058,8 @@ mod tests {
             .consume(
                 &cert,
                 input.intent_digest,
+                input.boundary_intent_class,
+                input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
             )
@@ -1055,6 +1070,8 @@ mod tests {
             .consume(
                 &cert,
                 input.intent_digest,
+                input.boundary_intent_class,
+                input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
             )
@@ -1085,6 +1102,8 @@ mod tests {
                 .consume(
                     &cert,
                     input.intent_digest,
+                    input.boundary_intent_class,
+                    input.boundary_intent_class.is_authoritative(),
                     input.time_envelope_ref,
                     cert.revocation_head_hash,
                 )
@@ -1108,6 +1127,8 @@ mod tests {
                 .consume(
                     &cert,
                     input.intent_digest,
+                    input.boundary_intent_class,
+                    input.boundary_intent_class.is_authoritative(),
                     input.time_envelope_ref,
                     cert.revocation_head_hash,
                 )
@@ -1135,6 +1156,8 @@ mod tests {
             .consume(
                 &cert,
                 input.intent_digest,
+                input.boundary_intent_class,
+                input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
             )
@@ -1166,6 +1189,8 @@ mod tests {
             .consume(
                 &cert,
                 input.intent_digest,
+                input.boundary_intent_class,
+                input.boundary_intent_class.is_authoritative(),
                 input.time_envelope_ref,
                 cert.revocation_head_hash,
             )
@@ -1361,6 +1386,8 @@ mod tests {
             .consume(
                 &cert1,
                 input1.intent_digest,
+                input1.boundary_intent_class,
+                input1.boundary_intent_class.is_authoritative(),
                 input1.time_envelope_ref,
                 cert1.revocation_head_hash,
             )
@@ -1375,6 +1402,8 @@ mod tests {
             .consume(
                 &cert2,
                 input2.intent_digest,
+                input2.boundary_intent_class,
+                input2.boundary_intent_class.is_authoritative(),
                 input2.time_envelope_ref,
                 cert2.revocation_head_hash,
             )
