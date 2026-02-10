@@ -13,14 +13,12 @@
 //! 3. **Freshness Dominance**: Tier2+ denies on stale freshness.
 //! 4. **Revocation Dominance**: Revocation frontier advancement denies.
 //! 5. **Delegation Narrowing**: Delegated joins are strict-subset.
-//! 6. **Boundary Monotonicity**: `join < pre-actuation <
-//!    revalidate-before-decision < revalidate-before-execution < consume <=
-//!    effect`.
+//! 6. **Boundary Monotonicity**: `join < revalidate <= consume <= effect`.
 //! 7. **Evidence Sufficiency**: Authoritative outcomes need replay receipts.
 //!
 //! [`LifecycleGate`] wraps a kernel and provides a single-call entry point
-//! for `handle_request_tool` that executes the full `join -> revalidate
-//! (before-decision) -> revalidate (before-execution) -> consume` sequence.
+//! for `handle_request_tool` that executes the full `join -> revalidate ->
+//! consume` sequence.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -28,8 +26,11 @@ use std::sync::{Arc, Mutex};
 use apm2_core::crypto::Hash;
 use apm2_core::pcac::{
     AuthorityConsumeRecordV1, AuthorityConsumedV1, AuthorityDenyV1, AuthorityJoinCertificateV1,
-    AuthorityJoinInputV1, AuthorityJoinKernel, RiskTier,
+    AuthorityJoinInputV1, AuthorityJoinKernel, FreezeAction, RiskTier,
 };
+use tracing::{info, warn};
+
+use crate::htf::HolonicClock;
 
 const ZERO_HASH: Hash = [0u8; 32];
 
@@ -41,183 +42,330 @@ const ZERO_HASH: Hash = [0u8; 32];
 ///
 /// Validates authority locally. The consumed set is held in memory;
 /// TCK-00426 (Durable Consume) will add persistent backing.
+///
+/// # Clock Integration (TCK-00427 quality BLOCKER fix)
+///
+/// When constructed with [`InProcessKernel::with_clock`], the kernel
+/// derives its current tick dynamically from the shared [`HolonicClock`].
+/// This ensures certificate expiry checks in `revalidate` and `consume`
+/// use real elapsed time rather than a frozen starting tick.
+///
+/// The test constructor [`InProcessKernel::new`] uses a manual tick that
+/// can be advanced via [`InProcessKernel::advance_tick`] for deterministic
+/// unit testing.
 pub struct InProcessKernel {
     /// Set of consumed AJC IDs (Law 1: Linear Consumption).
     consumed: Mutex<HashSet<Hash>>,
-    /// Current tick counter (monotonic).
-    current_tick: Mutex<u64>,
+    /// Manual tick counter (used when no clock is provided, i.e., tests).
+    manual_tick: Mutex<u64>,
+    /// Optional shared holonic clock for dynamic tick derivation.
+    ///
+    /// When present, `current_tick()` reads the monotonic tick from the
+    /// clock instead of using the manual counter. This prevents the
+    /// "frozen tick" bug where certificates never expire.
+    clock: Option<Arc<HolonicClock>>,
 }
 
 impl InProcessKernel {
     /// Creates a new in-process kernel with the given starting tick.
+    ///
+    /// This constructor is intended for **tests** that need deterministic
+    /// tick control. For production use, prefer [`with_clock`] to derive
+    /// ticks from the shared [`HolonicClock`].
+    ///
+    /// [`with_clock`]: InProcessKernel::with_clock
     #[must_use]
     pub fn new(starting_tick: u64) -> Self {
         Self {
             consumed: Mutex::new(HashSet::new()),
-            current_tick: Mutex::new(starting_tick),
+            manual_tick: Mutex::new(starting_tick),
+            clock: None,
+        }
+    }
+
+    /// Creates a new in-process kernel backed by a shared [`HolonicClock`].
+    ///
+    /// The kernel derives its current tick from the clock's monotonic tick
+    /// source (`now_mono_tick`), ensuring certificate expiry checks use
+    /// real elapsed time. This satisfies RFC-0027 Law 4 (Freshness/Revocation
+    /// Dominance) for TTL enforcement.
+    ///
+    /// # Fail-Closed Semantics
+    ///
+    /// If the clock reports a regression error, `current_tick()` returns an
+    /// `Err` denial rather than falling back to a tick value. This prevents
+    /// time-based security checks (certificate expiry, sovereignty staleness)
+    /// from failing open.
+    #[must_use]
+    pub fn with_clock(clock: Arc<HolonicClock>) -> Self {
+        Self {
+            consumed: Mutex::new(HashSet::new()),
+            manual_tick: Mutex::new(0),
+            clock: Some(clock),
         }
     }
 
     /// Advances the kernel tick (for testing and time progression).
+    ///
+    /// When a clock is configured, this sets a floor for the manual tick
+    /// counter but the clock-derived tick takes precedence via `max()`.
     pub fn advance_tick(&self, new_tick: u64) {
-        let mut tick = self.current_tick.lock().expect("lock poisoned");
+        let mut tick = self.manual_tick.lock().expect("lock poisoned");
         if new_tick > *tick {
             *tick = new_tick;
         }
     }
 
     /// Returns the current tick.
-    #[must_use]
-    pub fn current_tick(&self) -> u64 {
-        *self.current_tick.lock().expect("lock poisoned")
+    ///
+    /// When a [`HolonicClock`] is configured (production), derives the tick
+    /// from the clock's monotonic source and takes the maximum of the
+    /// clock-derived tick and the manual tick floor (monotonicity).
+    ///
+    /// When no clock is configured (tests), returns the manual tick counter.
+    ///
+    /// # Fail-Closed (Security)
+    ///
+    /// Clock regression errors return `Err` instead of a fallback value.
+    /// Falling back to tick `0` would cause time-based security checks
+    /// (certificate expiry, sovereignty staleness) to **fail-open**, because
+    /// `0 > any_positive_threshold` is always `false`. Callers must
+    /// construct an appropriate `AuthorityDenyV1` with their available
+    /// context (time envelope ref, ledger anchor, AJC ID).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `String` describing the clock error. Callers are responsible
+    /// for wrapping this into an `AuthorityDenyV1` with appropriate context.
+    pub fn current_tick(&self) -> Result<u64, String> {
+        let manual = *self.manual_tick.lock().expect("lock poisoned");
+
+        match self.clock.as_ref() {
+            None => Ok(manual),
+            Some(clock) => {
+                let clock_tick = match clock.now_mono_tick() {
+                    Ok(t) => t.value(),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "InProcessKernel: clock regression during tick derivation \
+                             — denying authority operation (fail-closed)"
+                        );
+                        return Err(format!("clock regression during tick derivation: {e}"));
+                    },
+                };
+                // Monotonicity: take the max of clock-derived and manual floor.
+                Ok(manual.max(clock_tick))
+            },
+        }
+    }
+
+    /// Converts a clock error from [`current_tick`] into an authority denial
+    /// with the provided context.
+    ///
+    /// [`current_tick`]: InProcessKernel::current_tick
+    pub(crate) fn clock_error_to_deny(
+        &self,
+        reason: String,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+    ) -> Box<AuthorityDenyV1> {
+        let denied_at_tick = {
+            let manual_tick = *self.manual_tick.lock().expect("lock poisoned");
+            if manual_tick == 0 {
+                u64::MAX
+            } else {
+                manual_tick
+            }
+        };
+
+        Box::new(AuthorityDenyV1 {
+            deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty { reason },
+            ajc_id,
+            time_envelope_ref,
+            ledger_anchor,
+            // Prefer last-known kernel tick; use MAX as unknown sentinel.
+            denied_at_tick,
+            containment_action: Some(apm2_core::pcac::FreezeAction::HardFreeze),
+        })
     }
 
     /// Validates that a hash field is non-zero (fail-closed).
-    fn require_nonzero(hash: &Hash, field_name: &str) -> Result<(), Box<AuthorityDenyV1>> {
+    ///
+    /// TCK-00427 quality MAJOR fix: Deny records now carry contextual
+    /// `time_envelope_ref`, `ledger_anchor`, and `denied_at_tick` so they
+    /// pass `AuthorityDenyV1::validate` replay-binding invariants.
+    fn require_nonzero(
+        hash: &Hash,
+        field_name: &str,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
         if *hash == ZERO_HASH {
             return Err(Box::new(AuthorityDenyV1 {
                 deny_class: apm2_core::pcac::AuthorityDenyClass::ZeroHash {
                     field_name: field_name.to_string(),
                 },
                 ajc_id: None,
-                time_envelope_ref: ZERO_HASH,
-                ledger_anchor: ZERO_HASH,
-                denied_at_tick: 0,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+                containment_action: None,
             }));
         }
         Ok(())
     }
 
-    /// Computes the authority join hash from the FULL input surface.
+    /// Computes the authority join hash from the full normative input set.
     ///
-    /// All authority dimensions are canonicalized with domain-separated
-    /// field tags to prevent cross-field collision and ensure binding
-    /// completeness (RFC-0027 §3.1).
+    /// Per RFC-0027 §3.1, the join hash commits to ALL required fields:
+    /// session, intent, capabilities, scope witnesses, identity, freshness,
+    /// stop/budget, risk tier, determinism class, identity evidence level,
+    /// and time/ledger anchors. Omitting any field would allow an attacker
+    /// to produce colliding join hashes for semantically distinct authority
+    /// requests.
+    ///
+    /// # Framing
+    ///
+    /// Every field is domain-separated with an explicit field tag. Variable-
+    /// length fields are prefixed with `(len as u64).to_le_bytes()` to
+    /// prevent concatenation ambiguity attacks. Vec fields additionally
+    /// include a count prefix.
     fn compute_join_hash(input: &AuthorityJoinInputV1) -> Hash {
+        use apm2_core::pcac::{DeterminismClass, IdentityEvidenceLevel};
         use blake3::Hasher;
-        fn put_field(hasher: &mut Hasher, name: &[u8], value: &[u8]) {
-            hasher.update(name);
-            hasher.update(&(value.len() as u64).to_le_bytes());
-            hasher.update(value);
-        }
-
-        fn put_hash(hasher: &mut Hasher, name: &[u8], hash: &Hash) {
-            put_field(hasher, name, hash);
-        }
-
-        fn put_opt_hash(hasher: &mut Hasher, name: &[u8], value: Option<&Hash>) {
-            hasher.update(name);
-            if let Some(hash) = value {
-                hasher.update(&[1u8]);
-                hasher.update(&(hash.len() as u64).to_le_bytes());
-                hasher.update(hash);
-            } else {
-                hasher.update(&[0u8]);
-                hasher.update(&0u64.to_le_bytes());
-            }
-        }
-
-        fn put_opt_str(hasher: &mut Hasher, name: &[u8], value: Option<&str>) {
-            hasher.update(name);
-            if let Some(text) = value {
-                hasher.update(&[1u8]);
-                hasher.update(&(text.len() as u64).to_le_bytes());
-                hasher.update(text.as_bytes());
-            } else {
-                hasher.update(&[0u8]);
-                hasher.update(&0u64.to_le_bytes());
-            }
-        }
-
-        fn put_sorted_hash_vec(hasher: &mut Hasher, name: &[u8], values: &[Hash]) {
-            let mut sorted = values.to_vec();
-            sorted.sort_unstable();
-            hasher.update(name);
-            hasher.update(&(sorted.len() as u64).to_le_bytes());
-            for value in sorted {
-                hasher.update(&(value.len() as u64).to_le_bytes());
-                hasher.update(&value);
-            }
-        }
-
         let mut hasher = Hasher::new();
-        hasher.update(b"apm2-authority-join-v1");
 
-        // Schema-defined canonical field order.
-        put_field(&mut hasher, b"session_id", input.session_id.as_bytes());
-        put_opt_str(&mut hasher, b"holon_id", input.holon_id.as_deref());
-        put_hash(&mut hasher, b"intent_digest", &input.intent_digest);
-        put_hash(
+        // Helper: domain-separated fixed-width field.
+        let update_tagged_fixed = |h: &mut Hasher, tag: &[u8], data: &[u8]| {
+            h.update(tag);
+            h.update(data);
+        };
+        // Helper: domain-separated length-prefixed variable-length field.
+        let update_tagged_var = |h: &mut Hasher, tag: &[u8], data: &[u8]| {
+            h.update(tag);
+            h.update(&(data.len() as u64).to_le_bytes());
+            h.update(data);
+        };
+        // Helper: domain-separated u64 field.
+        let update_tagged_u64 = |h: &mut Hasher, tag: &[u8], value: u64| {
+            h.update(tag);
+            h.update(&value.to_le_bytes());
+        };
+
+        // Subject bindings (length-prefixed strings)
+        update_tagged_var(&mut hasher, b"session_id", input.session_id.as_bytes());
+        hasher.update(b"holon_id");
+        if let Some(ref holon_id) = input.holon_id {
+            hasher.update(&[1u8]); // present marker
+            update_tagged_var(&mut hasher, b"holon_id_value", holon_id.as_bytes());
+        } else {
+            hasher.update(&[0u8]); // absent marker
+        }
+        // Intent binding (fixed-length hash, no prefix needed)
+        update_tagged_fixed(&mut hasher, b"intent_digest", &input.intent_digest);
+        // Capability bindings
+        update_tagged_fixed(
             &mut hasher,
             b"capability_manifest_hash",
             &input.capability_manifest_hash,
         );
-        put_sorted_hash_vec(
-            &mut hasher,
-            b"scope_witness_hashes",
-            &input.scope_witness_hashes,
-        );
-        put_field(&mut hasher, b"lease_id", input.lease_id.as_bytes());
-        put_opt_hash(
-            &mut hasher,
-            b"permeability_receipt_hash",
-            input.permeability_receipt_hash.as_ref(),
-        );
-        put_hash(
+        // Scope witnesses: count prefix + each hash (canonical set ordering).
+        // Security: sorting prevents order-dependent AJC IDs for semantically
+        // identical witness sets.
+        let mut sorted_scope_witness_hashes = input.scope_witness_hashes.clone();
+        sorted_scope_witness_hashes.sort_unstable();
+        hasher.update(b"scope_witness_hashes");
+        hasher.update(&(sorted_scope_witness_hashes.len() as u64).to_le_bytes());
+        for scope_hash in &sorted_scope_witness_hashes {
+            update_tagged_fixed(&mut hasher, b"scope_witness_hash", scope_hash);
+        }
+        // Delegation bindings (length-prefixed strings)
+        update_tagged_var(&mut hasher, b"lease_id", input.lease_id.as_bytes());
+        hasher.update(b"permeability_receipt_hash");
+        if let Some(ref perm_hash) = input.permeability_receipt_hash {
+            hasher.update(&[1u8]);
+            update_tagged_fixed(&mut hasher, b"permeability_receipt_hash_value", perm_hash);
+        } else {
+            hasher.update(&[0u8]);
+        }
+        // Identity bindings
+        update_tagged_fixed(
             &mut hasher,
             b"identity_proof_hash",
             &input.identity_proof_hash,
         );
-        put_field(
-            &mut hasher,
-            b"identity_evidence_level",
-            input.identity_evidence_level.to_string().as_bytes(),
-        );
-        put_hash(
+        // MAJOR 2 FIX: Include identity_evidence_level in hash.
+        hasher.update(b"identity_evidence_level");
+        hasher.update(&[match input.identity_evidence_level {
+            IdentityEvidenceLevel::Verified => 0u8,
+            IdentityEvidenceLevel::PointerOnly => 1u8,
+            _ => u8::MAX, // fail-closed: unknown levels
+        }]);
+        // Pointer-only waiver binding
+        hasher.update(b"pointer_only_waiver_hash");
+        if let Some(ref waiver_hash) = input.pointer_only_waiver_hash {
+            hasher.update(&[1u8]); // present marker
+            update_tagged_fixed(&mut hasher, b"pointer_only_waiver_hash_value", waiver_hash);
+        } else {
+            hasher.update(&[0u8]); // absent marker
+        }
+        // Freshness bindings
+        update_tagged_fixed(
             &mut hasher,
             b"directory_head_hash",
             &input.directory_head_hash,
         );
-        put_hash(
+        update_tagged_fixed(
             &mut hasher,
             b"freshness_policy_hash",
             &input.freshness_policy_hash,
         );
-        put_field(
+        update_tagged_u64(
             &mut hasher,
             b"freshness_witness_tick",
-            &input.freshness_witness_tick.to_le_bytes(),
+            input.freshness_witness_tick,
         );
-        put_hash(
+        // Stop/budget bindings
+        update_tagged_fixed(
             &mut hasher,
             b"stop_budget_profile_digest",
             &input.stop_budget_profile_digest,
         );
-        put_sorted_hash_vec(
-            &mut hasher,
-            b"pre_actuation_receipt_hashes",
-            &input.pre_actuation_receipt_hashes,
-        );
-        put_field(
-            &mut hasher,
-            b"risk_tier",
-            input.risk_tier.to_string().as_bytes(),
-        );
-        let determinism = match input.determinism_class {
-            apm2_core::pcac::DeterminismClass::Deterministic => b"deterministic".as_slice(),
-            apm2_core::pcac::DeterminismClass::BoundedNondeterministic => {
-                b"bounded_nondeterministic".as_slice()
-            },
-            _ => b"unknown".as_slice(),
-        };
-        put_field(&mut hasher, b"determinism_class", determinism);
-        put_hash(&mut hasher, b"time_envelope_ref", &input.time_envelope_ref);
-        put_hash(
+        // Pre-actuation receipts: count prefix + each hash (canonical set
+        // ordering). Security: sorting prevents replay amplification by receipt
+        // permutation.
+        let mut sorted_pre_actuation_receipt_hashes = input.pre_actuation_receipt_hashes.clone();
+        sorted_pre_actuation_receipt_hashes.sort_unstable();
+        hasher.update(b"pre_actuation_receipt_hashes");
+        hasher.update(&(sorted_pre_actuation_receipt_hashes.len() as u64).to_le_bytes());
+        for receipt_hash in &sorted_pre_actuation_receipt_hashes {
+            update_tagged_fixed(&mut hasher, b"pre_actuation_receipt_hash", receipt_hash);
+        }
+        // Risk classification
+        hasher.update(b"risk_tier");
+        hasher.update(&[match input.risk_tier {
+            RiskTier::Tier0 => 0u8,
+            RiskTier::Tier1 => 1u8,
+            RiskTier::Tier2Plus => 2u8,
+            _ => u8::MAX, // fail-closed: unknown tiers get maximum ordinal
+        }]);
+        // MAJOR 2 FIX: Include determinism_class in hash.
+        hasher.update(b"determinism_class");
+        hasher.update(&[match input.determinism_class {
+            DeterminismClass::Deterministic => 0u8,
+            DeterminismClass::BoundedNondeterministic => 1u8,
+            _ => u8::MAX, // fail-closed: unknown classes
+        }]);
+        // Time/ledger anchors
+        update_tagged_fixed(&mut hasher, b"time_envelope_ref", &input.time_envelope_ref);
+        update_tagged_fixed(
             &mut hasher,
             b"as_of_ledger_anchor",
             &input.as_of_ledger_anchor,
         );
-
         *hasher.finalize().as_bytes()
     }
 
@@ -236,7 +384,14 @@ impl AuthorityJoinKernel for InProcessKernel {
         &self,
         input: &AuthorityJoinInputV1,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
-        let tick = self.current_tick();
+        let tick = self.current_tick().map_err(|reason| {
+            self.clock_error_to_deny(
+                reason,
+                None,
+                input.time_envelope_ref,
+                input.as_of_ledger_anchor,
+            )
+        })?;
 
         // Validate required string fields.
         if input.session_id.is_empty() {
@@ -246,6 +401,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: input.time_envelope_ref,
                 ledger_anchor: input.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
         if input.lease_id.is_empty() {
@@ -255,20 +411,86 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: input.time_envelope_ref,
                 ledger_anchor: input.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
-        // Validate required hash fields are non-zero.
-        Self::require_nonzero(&input.intent_digest, "intent_digest")?;
-        Self::require_nonzero(&input.capability_manifest_hash, "capability_manifest_hash")?;
-        Self::require_nonzero(&input.identity_proof_hash, "identity_proof_hash")?;
-        Self::require_nonzero(&input.time_envelope_ref, "time_envelope_ref")?;
-        Self::require_nonzero(&input.as_of_ledger_anchor, "as_of_ledger_anchor")?;
-        Self::require_nonzero(&input.directory_head_hash, "directory_head_hash")?;
-        Self::require_nonzero(&input.freshness_policy_hash, "freshness_policy_hash")?;
+        // TCK-00427 quality MAJOR fix: Validate time_envelope_ref and
+        // as_of_ledger_anchor first so they can be threaded as context into
+        // subsequent require_nonzero calls, producing deny records that pass
+        // AuthorityDenyV1::validate replay-binding invariants.
+        if input.time_envelope_ref == ZERO_HASH {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::ZeroHash {
+                    field_name: "time_envelope_ref".to_string(),
+                },
+                ajc_id: None,
+                // time_envelope_ref itself is zero, but as_of_ledger_anchor
+                // may be valid. Use the best-available context.
+                time_envelope_ref: input.as_of_ledger_anchor,
+                ledger_anchor: input.as_of_ledger_anchor,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+        if input.as_of_ledger_anchor == ZERO_HASH {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::ZeroHash {
+                    field_name: "as_of_ledger_anchor".to_string(),
+                },
+                ajc_id: None,
+                time_envelope_ref: input.time_envelope_ref,
+                // ledger_anchor itself is zero; use time_envelope_ref as
+                // best-available anchor binding.
+                ledger_anchor: input.time_envelope_ref,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+
+        // Both time_envelope_ref and as_of_ledger_anchor are now validated
+        // non-zero and can be threaded into remaining require_nonzero calls.
+        Self::require_nonzero(
+            &input.intent_digest,
+            "intent_digest",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.capability_manifest_hash,
+            "capability_manifest_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.identity_proof_hash,
+            "identity_proof_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.directory_head_hash,
+            "directory_head_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
+        Self::require_nonzero(
+            &input.freshness_policy_hash,
+            "freshness_policy_hash",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
         Self::require_nonzero(
             &input.stop_budget_profile_digest,
             "stop_budget_profile_digest",
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
         )?;
 
         // Law 3 (partial): Freshness witness must be non-stale at join.
@@ -280,6 +502,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: input.time_envelope_ref,
                 ledger_anchor: input.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -296,6 +519,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: input.time_envelope_ref,
                 ledger_anchor: input.as_of_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -330,7 +554,14 @@ impl AuthorityJoinKernel for InProcessKernel {
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<(), Box<AuthorityDenyV1>> {
-        let tick = self.current_tick();
+        let tick = self.current_tick().map_err(|reason| {
+            self.clock_error_to_deny(
+                reason,
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                current_ledger_anchor,
+            )
+        })?;
 
         // Law 4: Certificate expiry check.
         if tick > cert.expires_at_tick {
@@ -343,43 +574,8 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
             }));
-        }
-
-        // Law 3: Ledger anchor drift check (RFC-0027 §4).
-        // If the ledger has advanced since the AJC was issued, the authority
-        // context may no longer reflect the current system state.
-        if current_ledger_anchor != cert.as_of_ledger_anchor {
-            return Err(Box::new(AuthorityDenyV1 {
-                deny_class: apm2_core::pcac::AuthorityDenyClass::LedgerAnchorDrift,
-                ajc_id: Some(cert.ajc_id),
-                time_envelope_ref: current_time_envelope_ref,
-                ledger_anchor: current_ledger_anchor,
-                denied_at_tick: tick,
-            }));
-        }
-
-        // Law 3: Freshness dominance check (RFC-0027 §4).
-        // The current kernel tick must not have advanced beyond the AJC's
-        // freshness window. A staleness threshold of 300 ticks (matching
-        // the default AJC TTL) bounds the maximum freshness drift.
-        if tick > 0 && cert.expires_at_tick > 0 {
-            // Derive the join-time tick from the cert's expiry minus the
-            // TTL of 300 ticks used during join.
-            let issued_tick = cert.expires_at_tick.saturating_sub(300);
-            // If the kernel tick has advanced beyond the cert's entire TTL
-            // window, freshness is stale. This is a stricter check than
-            // expiry alone — it denies even if tick <= expires_at_tick when
-            // the temporal gap is too large relative to issued time.
-            if tick > issued_tick && (tick - issued_tick) > 300 {
-                return Err(Box::new(AuthorityDenyV1 {
-                    deny_class: apm2_core::pcac::AuthorityDenyClass::StaleFreshnessAtRevalidate,
-                    ajc_id: Some(cert.ajc_id),
-                    time_envelope_ref: current_time_envelope_ref,
-                    ledger_anchor: current_ledger_anchor,
-                    denied_at_tick: tick,
-                }));
-            }
         }
 
         // Law 4: Revocation frontier advancement.
@@ -390,6 +586,22 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: current_ledger_anchor,
                 denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+
+        // MAJOR 3 FIX: LedgerAnchorDrift check — if the current ledger
+        // anchor has advanced beyond the AJC's `as_of_ledger_anchor`, the
+        // authority is stale. This enforces the trait contract documented in
+        // kernel.rs.
+        if current_ledger_anchor != cert.as_of_ledger_anchor {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::LedgerAnchorDrift,
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -403,7 +615,43 @@ impl AuthorityJoinKernel for InProcessKernel {
         current_time_envelope_ref: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
-        let tick = self.current_tick();
+        let tick = self.current_tick().map_err(|reason| {
+            self.clock_error_to_deny(
+                reason,
+                Some(cert.ajc_id),
+                current_time_envelope_ref,
+                cert.as_of_ledger_anchor,
+            )
+        })?;
+
+        // MAJOR 3 FIX: Certificate expiry check in consume — the trait
+        // contract documents this as a required check, and time can advance
+        // between revalidate and consume.
+        if tick > cert.expires_at_tick {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::CertificateExpired {
+                    expired_at: cert.expires_at_tick,
+                    current_tick: tick,
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
+
+        // Law 4: Revocation frontier advancement check in consume.
+        if current_revocation_head_hash != cert.revocation_head_hash {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::RevocationFrontierAdvanced,
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: cert.as_of_ledger_anchor,
+                denied_at_tick: tick,
+                containment_action: None,
+            }));
+        }
 
         // Law 2: Intent digest equality.
         if intent_digest != cert.intent_digest {
@@ -416,17 +664,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: cert.as_of_ledger_anchor,
                 denied_at_tick: tick,
-            }));
-        }
-
-        // Law 4: Revocation frontier check at consume time.
-        if current_revocation_head_hash != cert.revocation_head_hash {
-            return Err(Box::new(AuthorityDenyV1 {
-                deny_class: apm2_core::pcac::AuthorityDenyClass::RevocationFrontierAdvanced,
-                ajc_id: Some(cert.ajc_id),
-                time_envelope_ref: current_time_envelope_ref,
-                ledger_anchor: cert.as_of_ledger_anchor,
-                denied_at_tick: tick,
+                containment_action: None,
             }));
         }
 
@@ -442,6 +680,7 @@ impl AuthorityJoinKernel for InProcessKernel {
                     time_envelope_ref: current_time_envelope_ref,
                     ledger_anchor: cert.as_of_ledger_anchor,
                     denied_at_tick: tick,
+                    containment_action: None,
                 }));
             }
             consumed.insert(cert.ajc_id);
@@ -499,30 +738,51 @@ pub struct LifecycleReceipts {
 ///
 /// Executes the full `join -> revalidate -> consume` sequence. If any stage
 /// fails, the deny is returned and no side effect may execute.
+///
+/// TCK-00427: When a `SovereigntyChecker` is configured, Tier2+ operations
+/// are additionally validated against sovereignty state during revalidate
+/// and consume stages.
 pub struct LifecycleGate {
     kernel: Arc<dyn AuthorityJoinKernel>,
     /// Optional reference to the in-process kernel for production tick
-    /// advancement. When set, `advance_tick` calls are forwarded to the
-    /// underlying kernel so that freshness checks use monotonic runtime time.
+    /// advancement. When set, `advance_tick` calls are forwarded so
+    /// freshness checks observe monotonic runtime time.
     tick_kernel: Option<Arc<InProcessKernel>>,
+    /// Optional sovereignty checker for Tier2+ enforcement (TCK-00427).
+    sovereignty_checker: Option<super::sovereignty::SovereigntyChecker>,
+    /// Optional stop authority for sovereignty freeze actuation (TCK-00427
+    /// security review BLOCKER 1).
+    ///
+    /// When a sovereignty denial carries a `containment_action`, the gate
+    /// actuates the freeze via this authority before returning the denial.
+    /// `HardFreeze` triggers an emergency stop (persistent, all sessions).
+    /// `SoftFreeze` triggers a governance stop (session-scoped restriction).
+    stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
 }
 
 impl LifecycleGate {
+    /// Returns `true` if the certificate's risk tier requires sovereignty
+    /// checks.
+    const fn requires_sovereignty_check(cert: &AuthorityJoinCertificateV1) -> bool {
+        matches!(cert.risk_tier, RiskTier::Tier2Plus)
+    }
+
     /// Creates a new lifecycle gate with the given kernel.
     #[must_use]
     pub fn new(kernel: Arc<dyn AuthorityJoinKernel>) -> Self {
         Self {
             kernel,
             tick_kernel: None,
+            sovereignty_checker: None,
+            stop_authority: None,
         }
     }
 
-    /// Creates a lifecycle gate with production tick advancement wired in.
+    /// Creates a lifecycle gate with production tick advancement wiring.
     ///
-    /// The `tick_kernel` reference is used to advance the monotonic tick
-    /// from the session dispatch path when fresh HLC timestamps are obtained.
-    /// This ensures revalidation freshness checks operate on real time
-    /// rather than a static starting tick.
+    /// The `tick_kernel` reference is advanced by session dispatch using
+    /// fresh HLC-derived ticks so revalidation/consume freshness checks
+    /// cannot stay pinned to join-time.
     #[must_use]
     pub fn with_tick_kernel(
         kernel: Arc<dyn AuthorityJoinKernel>,
@@ -531,22 +791,324 @@ impl LifecycleGate {
         Self {
             kernel,
             tick_kernel: Some(tick_kernel),
+            sovereignty_checker: None,
+            stop_authority: None,
         }
     }
 
-    /// Advance the kernel tick to the given value (monotonic — no-op if
-    /// `new_tick <= current_tick`). Called from the session dispatch path
-    /// with the freshness witness tick derived from HLC wall time.
+    /// Creates a lifecycle gate with both tick advancement and sovereignty
+    /// composition checks.
+    #[must_use]
+    pub fn with_tick_kernel_and_sovereignty(
+        kernel: Arc<dyn AuthorityJoinKernel>,
+        tick_kernel: Arc<InProcessKernel>,
+        checker: super::sovereignty::SovereigntyChecker,
+        stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Self {
+        Self {
+            kernel,
+            tick_kernel: Some(tick_kernel),
+            sovereignty_checker: Some(checker),
+            stop_authority: Some(stop_authority),
+        }
+    }
+
+    /// Creates a new lifecycle gate with sovereignty enforcement (TCK-00427).
+    ///
+    /// When a sovereignty checker is provided, Tier2+ operations are
+    /// validated against sovereignty state during revalidate and consume.
+    #[must_use]
+    pub fn with_sovereignty_checker(
+        kernel: Arc<dyn AuthorityJoinKernel>,
+        checker: super::sovereignty::SovereigntyChecker,
+    ) -> Self {
+        Self {
+            kernel,
+            tick_kernel: None,
+            sovereignty_checker: Some(checker),
+            stop_authority: None,
+        }
+    }
+
+    /// Creates a new lifecycle gate with sovereignty enforcement and freeze
+    /// actuation (TCK-00427 security review BLOCKER 1).
+    ///
+    /// When a sovereignty denial carries a `containment_action`, the gate
+    /// actuates the freeze via the provided `StopAuthority` before returning
+    /// the denial. This ensures `HardFreeze` and `SoftFreeze` are
+    /// persistently applied to runtime controls, not just logged.
+    #[must_use]
+    pub fn with_sovereignty_and_stop_authority(
+        kernel: Arc<dyn AuthorityJoinKernel>,
+        checker: super::sovereignty::SovereigntyChecker,
+        stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Self {
+        Self {
+            kernel,
+            tick_kernel: None,
+            sovereignty_checker: Some(checker),
+            stop_authority: Some(stop_authority),
+        }
+    }
+
+    /// Advances the attached tick kernel (if configured) monotonically.
     pub fn advance_tick(&self, new_tick: u64) {
-        if let Some(ref tk) = self.tick_kernel {
-            tk.advance_tick(new_tick);
+        if let Some(ref tick_kernel) = self.tick_kernel {
+            tick_kernel.advance_tick(new_tick);
+        }
+    }
+
+    /// Actuates a sovereignty freeze via `StopAuthority` and logs the
+    /// containment action.
+    ///
+    /// TCK-00427 security review BLOCKER 1: Sovereignty denials with
+    /// `containment_action` are now mapped to authoritative runtime controls:
+    /// - `HardFreeze` -> `set_emergency_stop(true)` (persistent, all sessions)
+    /// - `SoftFreeze` -> `set_governance_stop(true)` (session-scoped
+    ///   restriction)
+    fn actuate_containment(&self, stage: &'static str, deny: &AuthorityDenyV1) {
+        let Some(containment_action) = deny.containment_action else {
+            return;
+        };
+
+        warn!(
+            stage = stage,
+            deny_class = %deny.deny_class,
+            containment_action = %containment_action,
+            ajc_id = ?deny.ajc_id.map(hex::encode),
+            denied_at_tick = deny.denied_at_tick,
+            "sovereignty denial emitted containment recommendation"
+        );
+
+        // Actuate the freeze via StopAuthority (BLOCKER 1 fix).
+        if let Some(ref authority) = self.stop_authority {
+            match containment_action {
+                FreezeAction::HardFreeze => {
+                    authority.set_emergency_stop(true);
+                    info!(
+                        stage = stage,
+                        containment_action = %containment_action,
+                        "sovereignty hard freeze actuated: emergency stop set"
+                    );
+                },
+                FreezeAction::SoftFreeze => {
+                    authority.set_governance_stop(true);
+                    info!(
+                        stage = stage,
+                        containment_action = %containment_action,
+                        "sovereignty soft freeze actuated: governance stop set"
+                    );
+                },
+                FreezeAction::NoAction => {},
+                // Fail-closed: unknown freeze actions trigger emergency stop.
+                _ => {
+                    authority.set_emergency_stop(true);
+                    warn!(
+                        stage = stage,
+                        containment_action = %containment_action,
+                        "unknown freeze action actuated as emergency stop (fail-closed)"
+                    );
+                },
+            }
+        } else {
+            warn!(
+                stage = stage,
+                containment_action = %containment_action,
+                "sovereignty freeze recommended but no StopAuthority configured for actuation"
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_revalidate_sovereignty(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        stage: &'static str,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        let sovereignty_mode = pcac_policy
+            .map(|p| p.tier2_sovereignty_mode)
+            .unwrap_or_default();
+
+        if !Self::requires_sovereignty_check(cert)
+            || sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled
+        {
+            return Ok(());
+        }
+
+        match (&self.sovereignty_checker, sovereignty_state) {
+            (Some(checker), Some(sov_state)) => {
+                if let Err(deny) = checker.check_revalidate(
+                    cert,
+                    sov_state,
+                    current_tick,
+                    current_time_envelope_ref,
+                    current_ledger_anchor,
+                ) {
+                    if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                        warn!(
+                            stage = stage,
+                            deny_class = %deny.deny_class,
+                            "Sovereignty violation observed (monitor mode)"
+                        );
+                    } else {
+                        self.actuate_containment(stage, &deny);
+                        return Err(deny);
+                    }
+                }
+                Ok(())
+            },
+            (Some(_), None) => {
+                let deny = Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                        reason: "sovereignty state not available for Tier2+ revalidation"
+                            .to_string(),
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick: current_tick,
+                    containment_action: Some(FreezeAction::HardFreeze),
+                });
+                if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                    warn!(
+                        stage = stage,
+                        deny_class = %deny.deny_class,
+                        "Sovereignty state missing (monitor mode)"
+                    );
+                    Ok(())
+                } else {
+                    self.actuate_containment(stage, &deny);
+                    Err(deny)
+                }
+            },
+            (None, _) => {
+                if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Strict {
+                    let deny = Box::new(AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                            reason: "sovereignty checker not wired; strict mode requires checker"
+                                .to_string(),
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: current_ledger_anchor,
+                        denied_at_tick: current_tick,
+                        containment_action: Some(FreezeAction::HardFreeze),
+                    });
+                    self.actuate_containment(stage, &deny);
+                    Err(deny)
+                } else {
+                    if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                        warn!(
+                            stage = stage,
+                            "Sovereignty checker not wired (monitor mode)"
+                        );
+                    }
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_consume_sovereignty(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        stage: &'static str,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        let sovereignty_mode = pcac_policy
+            .map(|p| p.tier2_sovereignty_mode)
+            .unwrap_or_default();
+
+        if !Self::requires_sovereignty_check(cert)
+            || sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled
+        {
+            return Ok(());
+        }
+
+        match (&self.sovereignty_checker, sovereignty_state) {
+            (Some(checker), Some(sov_state)) => {
+                if let Err(deny) = checker.check_consume(
+                    cert,
+                    sov_state,
+                    current_tick,
+                    current_time_envelope_ref,
+                    current_ledger_anchor,
+                ) {
+                    if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                        warn!(
+                            stage = stage,
+                            deny_class = %deny.deny_class,
+                            "Sovereignty violation observed (monitor mode)"
+                        );
+                    } else {
+                        self.actuate_containment(stage, &deny);
+                        return Err(deny);
+                    }
+                }
+                Ok(())
+            },
+            (Some(_), None) => {
+                let deny = Box::new(AuthorityDenyV1 {
+                    deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                        reason: "sovereignty state not available for Tier2+ consume".to_string(),
+                    },
+                    ajc_id: Some(cert.ajc_id),
+                    time_envelope_ref: current_time_envelope_ref,
+                    ledger_anchor: current_ledger_anchor,
+                    denied_at_tick: current_tick,
+                    containment_action: Some(FreezeAction::HardFreeze),
+                });
+                if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                    warn!(
+                        stage = stage,
+                        deny_class = %deny.deny_class,
+                        "Sovereignty state missing (monitor mode)"
+                    );
+                    Ok(())
+                } else {
+                    self.actuate_containment(stage, &deny);
+                    Err(deny)
+                }
+            },
+            (None, _) => {
+                if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Strict {
+                    let deny = Box::new(AuthorityDenyV1 {
+                        deny_class: apm2_core::pcac::AuthorityDenyClass::SovereigntyUncertainty {
+                            reason: "sovereignty checker not wired; strict mode requires checker"
+                                .to_string(),
+                        },
+                        ajc_id: Some(cert.ajc_id),
+                        time_envelope_ref: current_time_envelope_ref,
+                        ledger_anchor: current_ledger_anchor,
+                        denied_at_tick: current_tick,
+                        containment_action: Some(FreezeAction::HardFreeze),
+                    });
+                    self.actuate_containment(stage, &deny);
+                    Err(deny)
+                } else {
+                    if sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Monitor {
+                        warn!(
+                            stage = stage,
+                            "Sovereignty checker not wired (monitor mode)"
+                        );
+                    }
+                    Ok(())
+                }
+            },
         }
     }
 
     /// Executes `join -> revalidate-before-decision`.
-    ///
-    /// This is the pre-broker lifecycle checkpoint. Callers must still perform
-    /// a fresh revalidate + consume immediately before effect execution.
     pub fn join_and_revalidate(
         &self,
         input: &AuthorityJoinInputV1,
@@ -564,7 +1126,39 @@ impl LifecycleGate {
         Ok(cert)
     }
 
-    /// Executes revalidate-before-execution for an already joined certificate.
+    /// Executes `join -> revalidate-before-decision` with optional
+    /// sovereignty checks for Tier2+.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_and_revalidate_with_sovereignty(
+        &self,
+        input: &AuthorityJoinInputV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+    ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+        let cert = self.join_and_revalidate(
+            input,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )?;
+        self.check_revalidate_sovereignty(
+            &cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            sovereignty_state,
+            current_tick,
+            pcac_policy,
+            "revalidate-before-decision",
+        )?;
+        Ok(cert)
+    }
+
+    /// Executes revalidate-before-execution for an already joined
+    /// certificate.
     pub fn revalidate_before_execution(
         &self,
         cert: &AuthorityJoinCertificateV1,
@@ -577,6 +1171,36 @@ impl LifecycleGate {
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+        )
+    }
+
+    /// Executes revalidate-before-execution with optional sovereignty checks
+    /// for Tier2+.
+    #[allow(clippy::too_many_arguments)]
+    pub fn revalidate_before_execution_with_sovereignty(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        self.revalidate_before_execution(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+        )?;
+        self.check_revalidate_sovereignty(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            sovereignty_state,
+            current_tick,
+            pcac_policy,
+            "revalidate-before-execution",
         )
     }
 
@@ -596,31 +1220,40 @@ impl LifecycleGate {
         )
     }
 
-    /// Executes the full PCAC lifecycle for a tool request.
-    ///
-    /// RFC-0027 §3.3 lifecycle ordering:
-    /// `join < pre-actuation < revalidate-before-decision <
-    ///  revalidate-before-execution < consume <= effect`
-    ///
-    /// # Arguments
-    ///
-    /// * `input` — Authority join inputs (session, intent, capabilities, etc.)
-    /// * `current_time_envelope_ref` — Current HTF time witness for
-    ///   revalidation.
-    /// * `current_ledger_anchor` — Current ledger anchor for revalidation.
-    /// * `current_revocation_head_hash` — Current revocation frontier for
-    ///   revalidation.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(LifecycleReceipts)` if all stages pass, or `Err(deny)` at
-    /// the first failing stage.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Box<AuthorityDenyV1>` from whichever lifecycle stage fails
-    /// first. The deny carries the stage context (join, revalidate, or
-    /// consume).
+    /// Consumes authority immediately before effect execution with optional
+    /// sovereignty checks for Tier2+.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_before_effect_with_sovereignty(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        intent_digest: Hash,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+    ) -> Result<(AuthorityConsumedV1, AuthorityConsumeRecordV1), Box<AuthorityDenyV1>> {
+        self.check_consume_sovereignty(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            sovereignty_state,
+            current_tick,
+            pcac_policy,
+            "consume-before-effect",
+        )?;
+        self.consume_before_effect(
+            cert,
+            intent_digest,
+            current_time_envelope_ref,
+            current_revocation_head_hash,
+        )
+    }
+
+    /// Executes the full lifecycle:
+    /// `join -> revalidate-before-decision -> revalidate-before-execution ->
+    /// consume`.
     pub fn execute(
         &self,
         input: &AuthorityJoinInputV1,
@@ -628,31 +1261,55 @@ impl LifecycleGate {
         current_ledger_anchor: Hash,
         current_revocation_head_hash: Hash,
     ) -> Result<LifecycleReceipts, Box<AuthorityDenyV1>> {
-        // Stage 1+2: Join + revalidate-before-decision.
-        let cert = self.join_and_revalidate(
+        self.execute_with_sovereignty(
             input,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            None,
+            0,
+        )
+    }
+
+    /// Executes the full lifecycle with optional sovereignty checks.
+    pub fn execute_with_sovereignty(
+        &self,
+        input: &AuthorityJoinInputV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+    ) -> Result<LifecycleReceipts, Box<AuthorityDenyV1>> {
+        let cert = self.join_and_revalidate_with_sovereignty(
+            input,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+            sovereignty_state,
+            current_tick,
+            None,
         )?;
 
-        // Stage 3: Revalidate-before-execution — second revalidation
-        // immediately before consume to close the window between decision
-        // and execution (RFC-0027 §3.3 ordering requirement).
-        self.revalidate_before_execution(
+        self.revalidate_before_execution_with_sovereignty(
             &cert,
             current_time_envelope_ref,
             current_ledger_anchor,
             current_revocation_head_hash,
+            sovereignty_state,
+            current_tick,
+            None,
         )?;
 
-        // Stage 4: Consume — single-use consumption with intent equality.
-        // Consume must be immediately before the effect.
-        let (consumed_witness, consume_record) = self.consume_before_effect(
+        let (consumed_witness, consume_record) = self.consume_before_effect_with_sovereignty(
             &cert,
             input.intent_digest,
             current_time_envelope_ref,
+            current_ledger_anchor,
             current_revocation_head_hash,
+            sovereignty_state,
+            current_tick,
+            None,
         )?;
 
         Ok(LifecycleReceipts {

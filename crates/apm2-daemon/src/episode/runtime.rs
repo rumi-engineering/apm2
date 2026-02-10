@@ -4092,6 +4092,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some(episode_id.as_str().to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             })
             .unwrap();
 
@@ -4156,6 +4158,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some(episode_id.as_str().to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             })
             .unwrap();
 
@@ -4207,6 +4211,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some(episode_id.as_str().to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             })
             .unwrap();
 
@@ -4259,6 +4265,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some(episode_id.as_str().to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             })
             .unwrap();
 
@@ -4347,6 +4355,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some(episode_id.as_str().to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             })
             .unwrap();
 
@@ -4399,6 +4409,8 @@ mod tests {
                 policy_resolved_ref: String::new(),
                 capability_manifest_hash: vec![],
                 episode_id: Some(episode_id.as_str().to_string()),
+                pcac_policy: None,
+                pointer_only_waiver: None,
             })
             .unwrap();
 

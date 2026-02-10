@@ -532,6 +532,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
                         denied_at_tick,
+                        containment_action: None,
                     }));
                 },
                 ConsumeError::IoError(io_err) => {
@@ -544,6 +545,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
                         denied_at_tick,
+                        containment_action: None,
                     }));
                 },
                 ConsumeError::CorruptLog { line, reason } => {
@@ -555,6 +557,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
                         denied_at_tick,
+                        containment_action: None,
                     }));
                 },
                 ConsumeError::CapacityExhausted { count, max } => {
@@ -568,6 +571,7 @@ impl<K: apm2_core::pcac::AuthorityJoinKernel> apm2_core::pcac::AuthorityJoinKern
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
                         denied_at_tick,
+                        containment_action: None,
                     }));
                 },
             }
@@ -639,6 +643,7 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
                         denied_at_tick,
+                        containment_action: None,
                     }));
                 },
                 ConsumeError::IoError(io_err) => {
@@ -650,6 +655,7 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
                         denied_at_tick,
+                        containment_action: None,
                     }));
                 },
                 ConsumeError::CorruptLog { line, reason } => {
@@ -661,6 +667,7 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
                         denied_at_tick,
+                        containment_action: None,
                     }));
                 },
                 ConsumeError::CapacityExhausted { count, max } => {
@@ -674,6 +681,7 @@ impl apm2_core::pcac::AuthorityJoinKernel for DurableKernelShared {
                         time_envelope_ref: current_time_envelope_ref,
                         ledger_anchor: cert.as_of_ledger_anchor,
                         denied_at_tick,
+                        containment_action: None,
                     }));
                 },
             }
@@ -933,6 +941,7 @@ mod tests {
             determinism_class: DeterminismClass::Deterministic,
             time_envelope_ref: test_hash(0x07),
             as_of_ledger_anchor: test_hash(0x08),
+            pointer_only_waiver_hash: None,
         }
     }
 
@@ -981,6 +990,7 @@ mod tests {
                     time_envelope_ref: current_time_envelope_ref,
                     ledger_anchor: cert.as_of_ledger_anchor,
                     denied_at_tick: 0,
+                    containment_action: None,
                 }));
             }
 
@@ -992,6 +1002,7 @@ mod tests {
                 time_envelope_ref: current_time_envelope_ref,
                 ledger_anchor: cert.as_of_ledger_anchor,
                 denied_at_tick: 0,
+                containment_action: None,
             }))
         }
     }
