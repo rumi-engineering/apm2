@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00448"
     title: "Production WorkObject role binding and end-to-end fail-closed validation"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"
