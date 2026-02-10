@@ -246,6 +246,59 @@ fn terminate_process_with_timeout(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn wait_for_unit_inactive(unit: &str, timeout: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if !is_systemd_unit_active(unit) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn send_unit_signal(unit: &str, signal: &str) -> Result<(), String> {
+    if !is_systemd_unit_active(unit) {
+        return Ok(());
+    }
+    let status = Command::new("systemctl")
+        .args(["--user", "kill", "--signal", signal, unit])
+        .status()
+        .map_err(|err| format!("failed to send SIG{signal} to unit {unit}: {err}"))?;
+    if status.success() || !is_systemd_unit_active(unit) {
+        return Ok(());
+    }
+    Err(format!("failed to send SIG{signal} to unit {unit}"))
+}
+
+fn terminate_systemd_unit_with_timeout(unit: &str) -> Result<(), String> {
+    if !is_systemd_unit_active(unit) {
+        return Ok(());
+    }
+
+    let _ = send_unit_signal(unit, "TERM");
+    wait_for_unit_inactive(unit, TERMINATE_TIMEOUT);
+    if !is_systemd_unit_active(unit) {
+        return Ok(());
+    }
+
+    send_unit_signal(unit, "KILL")?;
+    wait_for_unit_inactive(unit, Duration::from_secs(1));
+    if is_systemd_unit_active(unit) {
+        return Err(format!("unit {unit} remained active after SIGKILL"));
+    }
+    Ok(())
+}
+
+fn terminate_pending_dispatch_entry(entry: &PendingDispatchEntry) -> Result<(), String> {
+    if let Some(pid) = entry.pid {
+        terminate_process_with_timeout(pid)?;
+    }
+    if let Some(unit) = entry.unit.as_deref() {
+        terminate_systemd_unit_with_timeout(unit)?;
+    }
+    Ok(())
+}
+
 // ── Tool availability ───────────────────────────────────────────────────────
 
 fn command_available(command: &str) -> bool {
@@ -357,10 +410,91 @@ fn fail_closed_dispatch(
     Err(message)
 }
 
+fn deny_dispatch_without_state_mutation(
+    terminal_reason: &str,
+    detail: &str,
+) -> Result<DispatchReviewResult, String> {
+    Err(format!(
+        "dispatch denied: reason={terminal_reason} detail={detail}"
+    ))
+}
+
 #[derive(Debug, Clone)]
 struct DriftLineage {
     previous_run_id: String,
     previous_head_sha: String,
+}
+
+fn drift_lineage_from_state(state: &ReviewRunState, key: &DispatchIdempotencyKey) -> DriftLineage {
+    let old_run_id = if state.run_id.is_empty() {
+        build_review_run_id(
+            key.pr_number,
+            &key.review_type,
+            state.sequence_number.max(1),
+            &state.head_sha,
+        )
+    } else {
+        state.run_id.clone()
+    };
+    DriftLineage {
+        previous_run_id: old_run_id,
+        previous_head_sha: state.head_sha.clone(),
+    }
+}
+
+fn resume_dispatch_after_head_drift_for_home<F>(
+    home: &Path,
+    pr_url: &str,
+    key: &DispatchIdempotencyKey,
+    review_kind: ReviewKind,
+    dispatch_epoch: u64,
+    state: &ReviewRunState,
+    spawn_review: &F,
+) -> Result<DispatchReviewResult, String>
+where
+    F: Fn(&str, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
+{
+    let mut superseded = state.clone();
+    superseded.status = ReviewRunStatus::Failed;
+    superseded.terminal_reason = Some(TERMINAL_SHA_DRIFT_SUPERSEDED.to_string());
+    superseded.pid = None;
+    write_review_run_state_for_home(home, &superseded)?;
+
+    let lineage = drift_lineage_from_state(state, key);
+    let mut seeded =
+        seed_pending_run_state_for_dispatch_for_home(home, pr_url, key, Some(&lineage))?;
+    let started = match spawn_review(
+        pr_url,
+        key.pr_number,
+        review_kind,
+        &key.head_sha,
+        dispatch_epoch,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            seeded.status = ReviewRunStatus::Failed;
+            seeded.terminal_reason = Some("dispatch_spawn_failed".to_string());
+            write_review_run_state_for_home(home, &seeded)?;
+            return Err(err);
+        },
+    };
+    write_pending_dispatch_for_home(home, key, &started)?;
+
+    attach_run_state_contract_for_home(
+        home,
+        key,
+        DispatchReviewResult {
+            review_type: key.review_type.clone(),
+            mode: "drift_resumed".to_string(),
+            run_state: "pending".to_string(),
+            run_id: None,
+            sequence_number: None,
+            terminal_reason: None,
+            pid: started.pid,
+            unit: started.unit,
+            log_file: started.log_file,
+        },
+    )
 }
 
 fn seed_pending_run_state_for_dispatch_for_home(
@@ -507,83 +641,63 @@ where
                                 Some(state.sequence_number.saturating_add(1).max(1)),
                             );
                         }
-
-                        let old_run_id = if state.run_id.is_empty() {
-                            build_review_run_id(
-                                key.pr_number,
-                                &key.review_type,
-                                state.sequence_number.max(1),
-                                &state.head_sha,
-                            )
-                        } else {
-                            state.run_id.clone()
-                        };
-                        let old_sha = state.head_sha.clone();
-
-                        let mut superseded = state.clone();
-                        superseded.status = ReviewRunStatus::Failed;
-                        superseded.terminal_reason =
-                            Some(TERMINAL_SHA_DRIFT_SUPERSEDED.to_string());
-                        superseded.pid = None;
-                        write_review_run_state_for_home(home, &superseded)?;
-
-                        let lineage = DriftLineage {
-                            previous_run_id: old_run_id,
-                            previous_head_sha: old_sha,
-                        };
-
-                        let mut seeded = seed_pending_run_state_for_dispatch_for_home(
+                        return resume_dispatch_after_head_drift_for_home(
                             home,
                             pr_url,
                             key,
-                            Some(&lineage),
-                        )?;
-                        let started = match spawn_review(
-                            pr_url,
-                            key.pr_number,
                             review_kind,
-                            &key.head_sha,
                             dispatch_epoch,
-                        ) {
-                            Ok(result) => result,
-                            Err(err) => {
-                                seeded.status = ReviewRunStatus::Failed;
-                                seeded.terminal_reason = Some("dispatch_spawn_failed".to_string());
-                                write_review_run_state_for_home(home, &seeded)?;
-                                return Err(err);
-                            },
-                        };
-                        write_pending_dispatch_for_home(home, key, &started)?;
-
-                        return attach_run_state_contract_for_home(
-                            home,
-                            key,
-                            DispatchReviewResult {
-                                review_type: key.review_type.clone(),
-                                mode: "drift_resumed".to_string(),
-                                run_state: "pending".to_string(),
-                                run_id: None,
-                                sequence_number: None,
-                                terminal_reason: None,
-                                pid: started.pid,
-                                unit: started.unit,
-                                log_file: started.log_file,
-                            },
+                            &state,
+                            spawn_review,
                         );
                     },
                     Some(_) => {},
                     None => {
-                        return fail_closed_dispatch(
-                            home,
-                            pr_url,
-                            key,
-                            TERMINAL_STALE_HEAD_AMBIGUITY,
-                            &format!(
-                                "stale run-state has no pid old_head={} run_id={}",
-                                state.head_sha, state.run_id
-                            ),
-                            Some(state.sequence_number.saturating_add(1).max(1)),
+                        let stale_key = DispatchIdempotencyKey::new(
+                            &key.owner_repo,
+                            key.pr_number,
+                            &key.review_type,
+                            &state.head_sha,
                         );
+                        if let Err(err) = stale_key.validate() {
+                            return fail_closed_dispatch(
+                                home,
+                                pr_url,
+                                key,
+                                TERMINAL_STALE_HEAD_AMBIGUITY,
+                                &format!(
+                                    "stale run-state has invalid head old_head={} run_id={} detail={err}",
+                                    state.head_sha, state.run_id
+                                ),
+                                Some(state.sequence_number.saturating_add(1).max(1)),
+                            );
+                        }
+                        if let Some(pending) =
+                            read_fresh_pending_dispatch_for_home(home, &stale_key)?
+                        {
+                            if let Err(err) = terminate_pending_dispatch_entry(&pending) {
+                                return fail_closed_dispatch(
+                                    home,
+                                    pr_url,
+                                    key,
+                                    TERMINAL_STALE_HEAD_AMBIGUITY,
+                                    &format!(
+                                        "failed to terminate stale pending run old_head={} run_id={}: {err}",
+                                        state.head_sha, state.run_id
+                                    ),
+                                    Some(state.sequence_number.saturating_add(1).max(1)),
+                                );
+                            }
+                            return resume_dispatch_after_head_drift_for_home(
+                                home,
+                                pr_url,
+                                key,
+                                review_kind,
+                                dispatch_epoch,
+                                &state,
+                                spawn_review,
+                            );
+                        }
                     },
                 }
             }
@@ -653,13 +767,9 @@ where
     let _scope_lock = match acquire_dispatch_lock(&scope_lock_path) {
         Ok(lock) => lock,
         Err(error @ DispatchLockError::Timeout { .. }) => {
-            return fail_closed_dispatch(
-                home,
-                pr_url,
-                key,
+            return deny_dispatch_without_state_mutation(
                 TERMINAL_DISPATCH_LOCK_TIMEOUT,
                 &dispatch_lock_error_detail(&error),
-                None,
             );
         },
         Err(error) => {
@@ -671,13 +781,9 @@ where
     let _lock = match acquire_dispatch_lock(&lock_path) {
         Ok(lock) => lock,
         Err(error @ DispatchLockError::Timeout { .. }) => {
-            return fail_closed_dispatch(
-                home,
-                pr_url,
-                key,
+            return deny_dispatch_without_state_mutation(
                 TERMINAL_DISPATCH_LOCK_TIMEOUT,
                 &dispatch_lock_error_detail(&error),
-                None,
             );
         },
         Err(error) => {
@@ -848,17 +954,20 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
+    use std::time::Duration;
 
     use super::{
-        DispatchIdempotencyKey, DispatchReviewResult, ReviewRunStateLoad,
-        dispatch_single_review_for_home_with_spawn, run_state_has_live_process,
+        DispatchIdempotencyKey, DispatchReviewResult, ReviewRunStateLoad, acquire_dispatch_lock,
+        dispatch_single_review_for_home_with_spawn, review_dispatch_scope_lock_path_for_home,
+        run_state_has_live_process, write_pending_dispatch_for_home,
     };
     use crate::commands::fac_review::state::{
         load_review_run_state_for_home, review_run_state_path_for_home,
         write_review_run_state_for_home,
     };
     use crate::commands::fac_review::types::{
-        ReviewKind, ReviewRunState, ReviewRunStatus, TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP,
+        DISPATCH_LOCK_ACQUIRE_TIMEOUT, ReviewKind, ReviewRunState, ReviewRunStatus,
+        TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP, TERMINAL_DISPATCH_LOCK_TIMEOUT,
         TERMINAL_SHA_DRIFT_SUPERSEDED,
     };
 
@@ -1125,6 +1234,103 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_head_pid_none_with_pending_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let stale_pid = spawn_long_lived_pid();
+
+        let mut stale_state = sample_run_state(None);
+        stale_state.head_sha = "1111111111111111111111111111111111111111".to_string();
+        stale_state.run_id = "pr441-security-s3-11111111".to_string();
+        stale_state.sequence_number = 3;
+        write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
+
+        let stale_key = dispatch_key("1111111111111111111111111111111111111111");
+        write_pending_dispatch_for_home(
+            home,
+            &stale_key,
+            &DispatchReviewResult {
+                review_type: "security".to_string(),
+                mode: "started".to_string(),
+                run_state: "pending".to_string(),
+                run_id: None,
+                sequence_number: None,
+                terminal_reason: None,
+                pid: Some(stale_pid),
+                unit: None,
+                log_file: None,
+            },
+        )
+        .expect("write stale pending marker");
+
+        let spawned_children = Arc::new(Mutex::new(Vec::new()));
+        let children_ref = Arc::clone(&spawned_children);
+        let spawn = move |_: &str,
+                          _: u32,
+                          _: ReviewKind,
+                          _: &str,
+                          _: u64|
+              -> Result<DispatchReviewResult, String> {
+            let pid = spawn_long_lived_pid();
+            children_ref.lock().expect("children lock").push(pid);
+            Ok(DispatchReviewResult {
+                review_type: "security".to_string(),
+                mode: "started".to_string(),
+                run_state: "pending".to_string(),
+                run_id: None,
+                sequence_number: None,
+                terminal_reason: None,
+                pid: Some(pid),
+                unit: None,
+                log_file: None,
+            })
+        };
+
+        let key = dispatch_key("2222222222222222222222222222222222222222");
+        let result = dispatch_single_review_for_home_with_spawn(
+            home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            42,
+            &spawn,
+        )
+        .expect("dispatch with stale pid none + pending marker");
+
+        assert_eq!(result.mode, "drift_resumed");
+        assert!(
+            !crate::commands::fac_review::state::is_process_alive(stale_pid),
+            "stale pid should be terminated from pending marker"
+        );
+
+        match load_review_run_state_for_home(home, 441, "security").expect("load state") {
+            ReviewRunStateLoad::Present(state) => {
+                assert_eq!(state.head_sha, "2222222222222222222222222222222222222222");
+                assert_eq!(
+                    state.previous_run_id.as_deref(),
+                    Some("pr441-security-s3-11111111")
+                );
+                assert_eq!(
+                    state.previous_head_sha.as_deref(),
+                    Some("1111111111111111111111111111111111111111")
+                );
+                assert_eq!(state.sequence_number, 4);
+            },
+            other => panic!("expected present run-state, got {other:?}"),
+        }
+
+        if crate::commands::fac_review::state::is_process_alive(stale_pid) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &stale_pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        cleanup_children(&spawned_children);
+    }
+
+    #[test]
     fn test_ambiguous_state_fails_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
@@ -1327,6 +1533,63 @@ mod tests {
         assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
 
         cleanup_children(&spawned_children);
+    }
+
+    #[test]
+    fn test_lock_timeout_no_state_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().to_path_buf();
+        let key = dispatch_key("0123456789abcdef0123456789abcdef01234567");
+
+        let mut seeded_state = sample_run_state(Some(dead_pid_for_test()));
+        seeded_state.run_id = "pr441-security-s11-01234567".to_string();
+        seeded_state.sequence_number = 11;
+        write_review_run_state_for_home(&home, &seeded_state).expect("seed state");
+        let canonical = review_run_state_path_for_home(&home, 441, "security");
+        let before = fs::read_to_string(&canonical).expect("read seeded state");
+
+        let scope_lock_path = review_dispatch_scope_lock_path_for_home(&home, &key);
+        let barrier = Arc::new(Barrier::new(2));
+        let holder = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let _lock = acquire_dispatch_lock(&scope_lock_path).expect("acquire scope lock");
+                barrier.wait();
+                std::thread::sleep(DISPATCH_LOCK_ACQUIRE_TIMEOUT + Duration::from_millis(250));
+            })
+        };
+
+        barrier.wait();
+
+        let spawn = |_: &str,
+                     _: u32,
+                     _: ReviewKind,
+                     _: &str,
+                     _: u64|
+         -> Result<DispatchReviewResult, String> {
+            panic!("spawn should not execute when lock acquisition times out");
+        };
+
+        let err = dispatch_single_review_for_home_with_spawn(
+            &home,
+            pr_url(),
+            &key,
+            ReviewKind::Security,
+            99,
+            &spawn,
+        )
+        .expect_err("lock-timeout dispatch must fail");
+        assert!(
+            err.contains(TERMINAL_DISPATCH_LOCK_TIMEOUT),
+            "unexpected error: {err}"
+        );
+
+        holder.join().expect("holder join");
+        let after = fs::read_to_string(&canonical).expect("read seeded state after timeout");
+        assert_eq!(
+            after, before,
+            "lock-timeout contender must not mutate state"
+        );
     }
 
     #[test]
