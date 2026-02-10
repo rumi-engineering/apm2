@@ -66,6 +66,7 @@
 //! ```
 
 pub mod anti_entropy;
+pub mod attestation_overhead;
 pub mod batch_epoch;
 pub mod bft;
 pub mod bft_machine;
@@ -97,6 +98,11 @@ pub use anti_entropy::{
     MAX_SYNC_BATCH_SIZE, RATE_LIMIT_INTERVAL, RangeDigestResult, RangeQuery, SyncEvent,
     SyncRateLimiter, SyncSession, event_record_to_sync_event, verify_events_with_proof,
     verify_sync_catchup, verify_sync_events,
+};
+pub use attestation_overhead::{
+    AttestationOverheadError, AttestationOverheadGate, AttestationProjectionModel,
+    AttestationScaleMeasurement, DEFAULT_MAX_P99_OVERHEAD_RATIO, SCALE_EFFECTS_10E6,
+    SCALE_EFFECTS_10E8, SCALE_EFFECTS_10E12,
 };
 // BatchEpochRootV1 hierarchical batch forests (TCK-00371)
 pub use batch_epoch::{

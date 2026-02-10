@@ -1,0 +1,93 @@
+{
+  "ticket_id": "TCK-00372",
+  "generated_at_utc": "2026-02-10T21:45:33Z",
+  "batch_size": 256,
+  "gate_limit_ratio": 0.01,
+  "bootstrap": {
+    "replicates": 512,
+    "protocol": "resample per-batch latency with replacement, estimate p99 envelope with CLT aggregation, report 95% CI"
+  },
+  "scale_10e3": {
+    "effects": 1000,
+    "methodology": "direct_measurement",
+    "direct_elapsed_us": 3219049,
+    "batched_elapsed_us": 19936,
+    "direct_p99_model_us": 3335710.898,
+    "direct_p99_ci95_lower_us": 3335710.898,
+    "direct_p99_ci95_upper_us": 3335710.898,
+    "batched_p99_model_us": 24434.192,
+    "batched_p99_ci95_lower_us": 24434.192,
+    "batched_p99_ci95_upper_us": 24434.192,
+    "cpu_overhead_ratio": -0.992675,
+    "network_overhead_ratio": -0.00794,
+    "gate_pass": true
+  },
+  "scale_10e4": {
+    "effects": 10000,
+    "methodology": "direct_measurement",
+    "direct_elapsed_us": 28157345,
+    "batched_elapsed_us": 134109,
+    "direct_p99_model_us": 29742424.218,
+    "direct_p99_ci95_lower_us": 28830271.826,
+    "direct_p99_ci95_upper_us": 30555088.964,
+    "batched_p99_model_us": 135193.524,
+    "batched_p99_ci95_lower_us": 134716.284,
+    "batched_p99_ci95_upper_us": 135514.2,
+    "cpu_overhead_ratio": -0.9953,
+    "network_overhead_ratio": -0.00794,
+    "gate_pass": true
+  },
+  "scale_10e5": {
+    "effects": 100000,
+    "methodology": "direct_measurement",
+    "direct_elapsed_us": 286654893,
+    "batched_elapsed_us": 1255123,
+    "direct_p99_model_us": 293802567.554,
+    "direct_p99_ci95_lower_us": 285333201.096,
+    "direct_p99_ci95_upper_us": 302677771.115,
+    "batched_p99_model_us": 1256514.09,
+    "batched_p99_ci95_lower_us": 1254945.802,
+    "batched_p99_ci95_upper_us": 1258428.909,
+    "cpu_overhead_ratio": -0.99559,
+    "network_overhead_ratio": -0.00794,
+    "gate_pass": true
+  },
+  "scale_10e6": {
+    "effects": 1000000,
+    "methodology": "statistical_model",
+    "direct_p99_model_us": 2877811306.578,
+    "direct_p99_ci95_lower_us": 2815445395.687,
+    "direct_p99_ci95_upper_us": 2942112192.569,
+    "batched_p99_model_us": 12674485.246,
+    "batched_p99_ci95_lower_us": 12600955.347,
+    "batched_p99_ci95_upper_us": 12787045.02,
+    "cpu_overhead_ratio": -0.995458,
+    "network_overhead_ratio": -0.00794,
+    "gate_pass": true
+  },
+  "scale_10e8": {
+    "effects": 100000000,
+    "methodology": "statistical_model",
+    "direct_p99_model_us": 285564137803.758,
+    "direct_p99_ci95_lower_us": 280654217031.491,
+    "direct_p99_ci95_upper_us": 292011259404.841,
+    "batched_p99_model_us": 1265409723.645,
+    "batched_p99_ci95_lower_us": 1259121759.824,
+    "batched_p99_ci95_upper_us": 1273580232.007,
+    "cpu_overhead_ratio": -0.995462,
+    "network_overhead_ratio": -0.00794,
+    "gate_pass": true
+  },
+  "projection_10e12": {
+    "effects": 1000000000000,
+    "methodology": "statistical_model",
+    "cpu_overhead_ratio": -0.99547,
+    "network_overhead_ratio": -0.00794,
+    "gate_pass": true
+  },
+  "methodology_notes": {
+    "direct_measurement": "Real elapsed wall-clock measurement (Instant::now) at 10^3, 10^4, and 10^5 effects.",
+    "statistical_model": "Bootstrap-derived p99 envelopes from measured per-batch latency samples; 10^6 and 10^8 are modeled, not directly measured."
+  },
+  "source_log": "evidence/rfc/RFC-0020/perf/tck_00372/tck_00372_attestation_overhead.log"
+}
