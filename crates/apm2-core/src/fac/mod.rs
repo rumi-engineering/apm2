@@ -97,6 +97,7 @@ pub mod review_receipt;
 pub mod risk_tier;
 pub mod role_conformance;
 mod role_spec;
+mod role_spec_v2;
 pub mod selection_policy;
 pub mod serde_helpers;
 pub mod taint;
@@ -307,9 +308,12 @@ pub mod view_commitment;
 // Re-export summary receipt types (TCK-00327)
 // Re-export builtin role types (TCK-00331)
 pub use builtin_roles::{
-    CODE_QUALITY_REVIEWER_ROLE_ID, IMPLEMENTER_ROLE_ID, ORCHESTRATOR_ROLE_ID,
-    SECURITY_REVIEWER_ROLE_ID, all_builtin_roles, code_quality_reviewer_role, get_builtin_role,
+    CODE_QUALITY_REVIEWER_ROLE_ID, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID, IMPLEMENTER_ROLE_ID,
+    ORCHESTRATOR_ROLE_ID, SECURITY_REVIEWER_ROLE_ID, all_builtin_role_contracts_v2,
+    all_builtin_roles, builtin_role_contract_hash_registry_v2, code_quality_reviewer_role,
+    fac_workobject_implementor_v2_role_contract, get_builtin_role, get_builtin_role_contract_v2,
     implementer_role, orchestrator_role, security_reviewer_role,
+    seed_builtin_role_contracts_v2_in_cas,
 };
 // Re-export role conformance harness types (TCK-00331)
 pub use role_conformance::{
@@ -325,6 +329,13 @@ pub use role_spec::{
     MAX_ROLE_NAME_LENGTH, MAX_TOOL_BUDGETS, MAX_TOOL_CLASS_LENGTH, MAX_TOOLS_IN_ALLOWLIST,
     ROLE_SPEC_V1_SCHEMA, RequiredOutputSchema, RoleBudgets, RoleSpecError, RoleSpecV1,
     RoleSpecV1Builder, RoleType, ToolAllowlist, ToolBudget,
+};
+pub use role_spec_v2::{
+    DenyCondition, DenyReason, DenyReasonCode, MAX_V2_DENY_REASON_MESSAGE_LENGTH,
+    MAX_V2_DENY_TAXONOMY_ENTRIES, MAX_V2_OUTPUT_FIELD_NAME_LENGTH, MAX_V2_OUTPUT_SCHEMA_FIELDS,
+    MAX_V2_REQUIRED_CAPABILITIES, MAX_V2_TOOL_BUDGETS, MAX_V2_TOOLS_IN_ALLOWLISTS, OutputFieldType,
+    OutputSchemaField, OutputSchemaV2, ROLE_SPEC_V2_SCHEMA, RoleSpecV2, RoleSpecV2Error,
+    ToolBudgetV2,
 };
 pub use summary_receipt::{
     LossProfile, MAX_REVIEW_ID_LENGTH as MAX_SUMMARY_RECEIPT_REVIEW_ID_LENGTH,
