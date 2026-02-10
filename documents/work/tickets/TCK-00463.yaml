@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00463"
     title: "RFC-0028 REQ-0002 identity/freshness/revocation closure and temporal arbitration"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0010"
     rfc_id: "RFC-0028"

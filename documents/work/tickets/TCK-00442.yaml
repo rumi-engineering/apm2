@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00442"
     title: "Trusted workflow context and preflight authorization gate for FAC projection"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

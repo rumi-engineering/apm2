@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00449"
     title: "FAC CLI role launch contract with hash-binding admission checks"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0020"

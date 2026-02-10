@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00446"
     title: "RoleSpec v2 contract and conformance gates for WorkObject implementor"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"

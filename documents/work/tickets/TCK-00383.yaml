@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00383"
     title: "Daemon session dispatcher: wire CAS, broker, ledger, and clock via with_persistence_and_cas"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"
