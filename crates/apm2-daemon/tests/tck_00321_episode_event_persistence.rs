@@ -136,7 +136,8 @@ async fn test_atomic_receipt_emission() {
     let emitter = Arc::new(StubLedgerEventEmitter::new());
 
     // Emit a review receipt
-    let episode_id = "ep-test-123";
+    let lease_id = "lease-test-123";
+    let work_id = "W-TEST-123";
     let receipt_id = "rcpt-456";
     let changeset_digest = [0x42u8; 32];
     let artifact_bundle_hash = [0x43u8; 32];
@@ -149,7 +150,8 @@ async fn test_atomic_receipt_emission() {
     let identity_proof_hash = [0x99u8; 32];
     let signed_event = emitter
         .emit_review_receipt(
-            episode_id,
+            lease_id,
+            work_id,
             receipt_id,
             &changeset_digest,
             &artifact_bundle_hash,
@@ -166,11 +168,11 @@ async fn test_atomic_receipt_emission() {
 
     // Verify the receipt event was persisted
     assert_eq!(signed_event.event_type, "review_receipt_recorded");
-    assert_eq!(signed_event.work_id, episode_id);
+    assert_eq!(signed_event.work_id, work_id);
     assert_eq!(signed_event.actor_id, reviewer_actor_id);
 
     // Verify it can be queried
-    let events = emitter.get_events_by_work_id(episode_id);
+    let events = emitter.get_events_by_work_id(work_id);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, "review_receipt_recorded");
 
