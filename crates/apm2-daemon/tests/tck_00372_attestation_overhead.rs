@@ -1,8 +1,9 @@
 //! TCK-00372: Attestation overhead contract and fallback safety.
 //!
 //! This harness measures direct vs batched receipt verification envelopes,
-//! evaluates the `<1%` overhead gate at `10^6` and `10^8`, projects to `10^12`,
-//! and validates automatic batched->direct fallback behavior.
+//! evaluates the `<1%` overhead gate at directly measured `10^3`/`10^4`/`10^5`,
+//! then uses a bootstrap statistical model for `10^6`/`10^8` and projects to
+//! `10^12`, and validates automatic batched->direct fallback behavior.
 
 use std::time::Instant;
 
@@ -20,25 +21,243 @@ use apm2_daemon::identity::{
 };
 
 const TEST_SUBJECT_KIND: &str = "apm2.tool_execution_receipt.v1";
-const SAMPLE_COUNT: usize = 96;
 const BATCH_SIZE: usize = 256;
-const BATCH_SIZE_F64: f64 = 256.0;
-const SCALE_EFFECTS_10E6_F64: f64 = 1_000_000.0;
-const SCALE_EFFECTS_10E8_F64: f64 = 100_000_000.0;
+const SCALE_EFFECTS_10E3: u64 = 1_000;
+const SCALE_EFFECTS_10E4: u64 = 10_000;
+const SCALE_EFFECTS_10E5: u64 = 100_000;
+const BOOTSTRAP_REPLICATES: usize = 512;
+const P99_Z_SCORE: f64 = 2.326_347_874_040_840_8;
 
-fn p99(values: &mut [u64]) -> u64 {
-    assert!(!values.is_empty(), "p99 requires non-empty sample set");
-    values.sort_unstable();
-    let idx = ((values.len() * 99).div_ceil(100)).saturating_sub(1);
-    values[idx]
+#[derive(Debug, Clone, Copy)]
+struct BootstrapP99Envelope {
+    point_p99: f64,
+    ci95_lower: f64,
+    ci95_upper: f64,
 }
 
-fn u64_to_f64_saturating(value: u64) -> f64 {
+#[derive(Debug)]
+struct ScaleRun {
+    effects: u64,
+    direct_total_elapsed_us: u64,
+    batched_total_elapsed_us: u64,
+    direct_batch_samples_us: Vec<u64>,
+    batched_batch_samples_us: Vec<u64>,
+}
+
+struct ScaleMeasurementFixture<'a> {
+    direct_material: &'a [(ReceiptPointerV1, AuthoritySealV1)],
+    full_multiproof: &'a ReceiptMultiProofV1,
+    batch_root: [u8; 32],
+    batch_seal_hash: [u8; 32],
+    proofs: &'a [MerkleInclusionProof],
+    receipt_hashes: &'a [[u8; 32]],
+    batch_seal: &'a AuthoritySealV1,
+    signer: &'a Signer,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    const fn new(seed: u64) -> Self {
+        Self {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    const fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.state
+    }
+
+    fn sample_index(&mut self, len: usize) -> usize {
+        let len_u64 = u64::try_from(len).unwrap_or(u64::MAX).max(1);
+        let idx_u64 = self.next_u64() % len_u64;
+        usize::try_from(idx_u64).unwrap_or(0)
+    }
+}
+
+fn u64_to_f64(value: u64) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-fn usize_to_f64_saturating(value: usize) -> f64 {
+fn usize_to_f64(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+const fn percentile_index(len: usize, numerator: usize, denominator: usize) -> usize {
+    ((len * numerator).div_ceil(denominator)).saturating_sub(1)
+}
+
+fn bootstrap_p99_envelope(
+    per_batch_samples_us: &[u64],
+    batches_per_scale: usize,
+    seed: u64,
+) -> BootstrapP99Envelope {
+    assert!(
+        !per_batch_samples_us.is_empty(),
+        "bootstrap requires non-empty sample set",
+    );
+    let resample_len = per_batch_samples_us.len();
+    let resample_len_f64 = usize_to_f64(resample_len.max(1));
+    let batches_f64 = usize_to_f64(batches_per_scale.max(1));
+    let sqrt_batches = batches_f64.sqrt();
+    let mut modeled_p99_totals_us = Vec::with_capacity(BOOTSTRAP_REPLICATES);
+    let mut rng = DeterministicRng::new(seed);
+
+    for _ in 0..BOOTSTRAP_REPLICATES {
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        for _ in 0..resample_len {
+            let sample = u64_to_f64(per_batch_samples_us[rng.sample_index(resample_len)].max(1));
+            sum += sample;
+            sum_sq = sample.mul_add(sample, sum_sq);
+        }
+        let mean = sum / resample_len_f64;
+        let variance = mean.mul_add(-mean, sum_sq / resample_len_f64).max(0.0);
+        let std_dev = variance.sqrt();
+        let modeled_p99 = batches_f64.mul_add(mean, P99_Z_SCORE * sqrt_batches * std_dev);
+        modeled_p99_totals_us.push(modeled_p99.max(1.0));
+    }
+
+    modeled_p99_totals_us.sort_by(f64::total_cmp);
+    let len = modeled_p99_totals_us.len();
+    let p50_idx = percentile_index(len, 500, 1_000);
+    let ci95_lower_idx = percentile_index(len, 25, 1_000);
+    let ci95_upper_idx = percentile_index(len, 975, 1_000);
+
+    BootstrapP99Envelope {
+        point_p99: modeled_p99_totals_us[p50_idx],
+        ci95_lower: modeled_p99_totals_us[ci95_lower_idx],
+        ci95_upper: modeled_p99_totals_us[ci95_upper_idx],
+    }
+}
+
+fn batch_count_for_effects(effects: u64) -> usize {
+    let effects_usize = usize::try_from(effects).unwrap_or(usize::MAX);
+    effects_usize.div_ceil(BATCH_SIZE).max(1)
+}
+
+fn verify_direct_slice(
+    direct_material: &[(ReceiptPointerV1, AuthoritySealV1)],
+    count: usize,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) {
+    for (ptr, seal) in direct_material.iter().take(count) {
+        ReceiptPointerVerifier::verify_direct(ptr, seal, verifying_key, TEST_SUBJECT_KIND, true)
+            .expect("direct verification baseline");
+    }
+}
+
+fn build_partial_multiproof(
+    batch_root: [u8; 32],
+    receipt_hashes: &[[u8; 32]],
+    batch_seal_hash: [u8; 32],
+    proofs: &[MerkleInclusionProof],
+    count: usize,
+) -> ReceiptMultiProofV1 {
+    ReceiptMultiProofV1::new(
+        batch_root,
+        receipt_hashes[..count].to_vec(),
+        batch_seal_hash,
+        proofs[..count].to_vec(),
+    )
+    .expect("partial multiproof must remain structurally valid")
+}
+
+fn measure_scale_run(effects: u64, fixture: &ScaleMeasurementFixture<'_>) -> ScaleRun {
+    let effects_usize = usize::try_from(effects).unwrap_or(usize::MAX);
+    let full_batches = effects_usize / BATCH_SIZE;
+    let remainder = effects_usize % BATCH_SIZE;
+    let batch_samples = full_batches + usize::from(remainder > 0);
+    let verifying_key = fixture.signer.verifying_key();
+
+    let mut direct_batch_samples_us = Vec::with_capacity(batch_samples);
+    let direct_total_start = Instant::now();
+    for _ in 0..full_batches {
+        let start = Instant::now();
+        verify_direct_slice(fixture.direct_material, BATCH_SIZE, &verifying_key);
+        direct_batch_samples_us.push(elapsed_us(start));
+    }
+    if remainder > 0 {
+        let start = Instant::now();
+        verify_direct_slice(fixture.direct_material, remainder, &verifying_key);
+        direct_batch_samples_us.push(elapsed_us(start));
+    }
+    let direct_total_elapsed_us = elapsed_us(direct_total_start);
+
+    let partial_multiproof = (remainder > 0).then(|| {
+        build_partial_multiproof(
+            fixture.batch_root,
+            fixture.receipt_hashes,
+            fixture.batch_seal_hash,
+            fixture.proofs,
+            remainder,
+        )
+    });
+
+    let mut batched_batch_samples_us = Vec::with_capacity(batch_samples);
+    let batched_total_start = Instant::now();
+    for _ in 0..full_batches {
+        let start = Instant::now();
+        ReceiptPointerVerifier::verify_multiproof(
+            fixture.full_multiproof,
+            fixture.batch_seal,
+            BatchSealVerifier::SingleKey(&verifying_key),
+            TEST_SUBJECT_KIND,
+            true,
+        )
+        .expect("batched multiproof verification");
+        batched_batch_samples_us.push(elapsed_us(start));
+    }
+    if let Some(partial) = partial_multiproof.as_ref() {
+        let start = Instant::now();
+        ReceiptPointerVerifier::verify_multiproof(
+            partial,
+            fixture.batch_seal,
+            BatchSealVerifier::SingleKey(&verifying_key),
+            TEST_SUBJECT_KIND,
+            true,
+        )
+        .expect("partial batched multiproof verification");
+        batched_batch_samples_us.push(elapsed_us(start));
+    }
+    let batched_total_elapsed_us = elapsed_us(batched_total_start);
+
+    ScaleRun {
+        effects,
+        direct_total_elapsed_us,
+        batched_total_elapsed_us,
+        direct_batch_samples_us,
+        batched_batch_samples_us,
+    }
+}
+
+fn conservative_scale_measurement(
+    effects: u64,
+    direct_envelope: BootstrapP99Envelope,
+    batched_envelope: BootstrapP99Envelope,
+    direct_bytes_per_effect: f64,
+    batched_bytes_per_effect: f64,
+) -> AttestationScaleMeasurement {
+    let scale_f64 = u64_to_f64(effects);
+    AttestationScaleMeasurement::new(
+        effects,
+        direct_envelope.ci95_lower.max(1.0),
+        batched_envelope.ci95_upper.max(1.0),
+        direct_bytes_per_effect * scale_f64,
+        batched_bytes_per_effect * scale_f64,
+    )
+    .expect("scale measurement must be valid")
 }
 
 fn test_cell_id() -> CellIdV1 {
@@ -194,7 +413,7 @@ fn tck_00372_attestation_overhead_contract_scales_and_projection() {
         batch_root,
         receipt_hashes.clone(),
         batch_seal_hash,
-        batch_proofs,
+        batch_proofs.clone(),
     )
     .unwrap();
 
@@ -206,113 +425,173 @@ fn tck_00372_attestation_overhead_contract_scales_and_projection() {
         direct_material.push((ptr, seal));
     }
 
-    let mut direct_samples_us = Vec::with_capacity(SAMPLE_COUNT);
-    let mut batch_samples_us = Vec::with_capacity(SAMPLE_COUNT);
-
-    for _ in 0..SAMPLE_COUNT {
-        let start = Instant::now();
-        for (ptr, seal) in &direct_material {
-            ReceiptPointerVerifier::verify_direct(
-                ptr,
-                seal,
-                &signer.verifying_key(),
-                TEST_SUBJECT_KIND,
-                true,
-            )
-            .expect("direct verification baseline");
-        }
-        direct_samples_us.push(u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX));
-
-        let start = Instant::now();
-        ReceiptPointerVerifier::verify_multiproof(
-            &multiproof,
-            &batch_seal,
-            BatchSealVerifier::SingleKey(&signer.verifying_key()),
-            TEST_SUBJECT_KIND,
-            true,
-        )
-        .expect("batched multiproof verification");
-        batch_samples_us.push(u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX));
-    }
-
-    let direct_batch_p99_us = u64_to_f64_saturating(p99(&mut direct_samples_us).max(1));
-    let batched_batch_p99_us = u64_to_f64_saturating(p99(&mut batch_samples_us).max(1));
-
-    let direct_cpu_per_effect_p99 = direct_batch_p99_us / BATCH_SIZE_F64;
-    let batched_cpu_per_effect_p99 = batched_batch_p99_us / BATCH_SIZE_F64;
-
     let direct_bytes_per_batch: f64 = direct_material
         .iter()
         .map(|(ptr, seal)| {
-            usize_to_f64_saturating(
+            usize_to_f64(
                 ptr.canonical_bytes()
                     .len()
                     .saturating_add(seal.canonical_bytes().len()),
             )
         })
         .sum();
-    let batched_bytes_per_batch = usize_to_f64_saturating(
+    let batched_bytes_per_batch = usize_to_f64(
         multiproof
             .canonical_bytes()
             .len()
             .saturating_add(batch_seal.canonical_bytes().len()),
     );
+    let batch_size_f64 = usize_to_f64(BATCH_SIZE);
+    let direct_bytes_per_effect = direct_bytes_per_batch / batch_size_f64;
+    let batched_bytes_per_effect = batched_bytes_per_batch / batch_size_f64;
 
-    let direct_bytes_per_effect = direct_bytes_per_batch / BATCH_SIZE_F64;
-    let batched_bytes_per_effect = batched_bytes_per_batch / BATCH_SIZE_F64;
+    let fixture = ScaleMeasurementFixture {
+        direct_material: &direct_material,
+        full_multiproof: &multiproof,
+        batch_root,
+        batch_seal_hash,
+        proofs: &batch_proofs,
+        receipt_hashes: &receipt_hashes,
+        batch_seal: &batch_seal,
+        signer: &signer,
+    };
 
-    let measured_10e6 = AttestationScaleMeasurement::new(
-        SCALE_EFFECTS_10E6,
-        direct_cpu_per_effect_p99 * SCALE_EFFECTS_10E6_F64,
-        batched_cpu_per_effect_p99 * SCALE_EFFECTS_10E6_F64,
-        direct_bytes_per_effect * SCALE_EFFECTS_10E6_F64,
-        batched_bytes_per_effect * SCALE_EFFECTS_10E6_F64,
-    )
-    .unwrap();
-    let measured_10e8 = AttestationScaleMeasurement::new(
-        SCALE_EFFECTS_10E8,
-        direct_cpu_per_effect_p99 * SCALE_EFFECTS_10E8_F64,
-        batched_cpu_per_effect_p99 * SCALE_EFFECTS_10E8_F64,
-        direct_bytes_per_effect * SCALE_EFFECTS_10E8_F64,
-        batched_bytes_per_effect * SCALE_EFFECTS_10E8_F64,
-    )
-    .unwrap();
+    let measured_runs = [
+        measure_scale_run(SCALE_EFFECTS_10E3, &fixture),
+        measure_scale_run(SCALE_EFFECTS_10E4, &fixture),
+        measure_scale_run(SCALE_EFFECTS_10E5, &fixture),
+    ];
 
     let gate = AttestationOverheadGate::default();
-    gate.enforce(&measured_10e6)
-        .expect("10^6 overhead must satisfy <1% gate");
-    gate.enforce(&measured_10e8)
-        .expect("10^8 overhead must satisfy <1% gate");
 
-    let model = AttestationProjectionModel::new(measured_10e6, measured_10e8).unwrap();
+    let mut measured_scale_measurements = Vec::with_capacity(measured_runs.len());
+    let mut pooled_direct_batch_samples_us = Vec::new();
+    let mut pooled_batched_batch_samples_us = Vec::new();
+
+    for run in &measured_runs {
+        let batches = batch_count_for_effects(run.effects);
+        let direct_envelope = bootstrap_p99_envelope(
+            &run.direct_batch_samples_us,
+            batches,
+            0xD1CE_0000_0000_0000 ^ run.effects,
+        );
+        let batched_envelope = bootstrap_p99_envelope(
+            &run.batched_batch_samples_us,
+            batches,
+            0xB47C_0000_0000_0000 ^ run.effects,
+        );
+        let measured = conservative_scale_measurement(
+            run.effects,
+            direct_envelope,
+            batched_envelope,
+            direct_bytes_per_effect,
+            batched_bytes_per_effect,
+        );
+        gate.enforce(&measured)
+            .expect("directly measured scale must satisfy <1% gate");
+        measured_scale_measurements.push((run.effects, measured));
+
+        pooled_direct_batch_samples_us.extend_from_slice(&run.direct_batch_samples_us);
+        pooled_batched_batch_samples_us.extend_from_slice(&run.batched_batch_samples_us);
+
+        println!(
+            "TCK-00372 scale={} methodology=direct_measurement direct_elapsed_us={} batched_elapsed_us={} direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
+            run.effects,
+            run.direct_total_elapsed_us,
+            run.batched_total_elapsed_us,
+            direct_envelope.point_p99,
+            direct_envelope.ci95_lower,
+            direct_envelope.ci95_upper,
+            batched_envelope.point_p99,
+            batched_envelope.ci95_lower,
+            batched_envelope.ci95_upper,
+            measured.cpu_overhead_ratio(),
+            measured.network_overhead_ratio(),
+        );
+    }
+
+    let modeled_10e6_direct = bootstrap_p99_envelope(
+        &pooled_direct_batch_samples_us,
+        batch_count_for_effects(SCALE_EFFECTS_10E6),
+        0xD1CE_10E6_0000_0001,
+    );
+    let modeled_10e6_batch = bootstrap_p99_envelope(
+        &pooled_batched_batch_samples_us,
+        batch_count_for_effects(SCALE_EFFECTS_10E6),
+        0xB47C_10E6_0000_0001,
+    );
+    let modeled_10e6 = conservative_scale_measurement(
+        SCALE_EFFECTS_10E6,
+        modeled_10e6_direct,
+        modeled_10e6_batch,
+        direct_bytes_per_effect,
+        batched_bytes_per_effect,
+    );
+    gate.enforce(&modeled_10e6)
+        .expect("10^6 statistical model must satisfy <1% gate");
+
+    let modeled_10e8_direct = bootstrap_p99_envelope(
+        &pooled_direct_batch_samples_us,
+        batch_count_for_effects(SCALE_EFFECTS_10E8),
+        0xD1CE_10E8_0000_0001,
+    );
+    let modeled_10e8_batch = bootstrap_p99_envelope(
+        &pooled_batched_batch_samples_us,
+        batch_count_for_effects(SCALE_EFFECTS_10E8),
+        0xB47C_10E8_0000_0001,
+    );
+    let modeled_10e8 = conservative_scale_measurement(
+        SCALE_EFFECTS_10E8,
+        modeled_10e8_direct,
+        modeled_10e8_batch,
+        direct_bytes_per_effect,
+        batched_bytes_per_effect,
+    );
+    gate.enforce(&modeled_10e8)
+        .expect("10^8 statistical model must satisfy <1% gate");
+
+    println!(
+        "TCK-00372 scale=1000000 methodology=statistical_model direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
+        modeled_10e6_direct.point_p99,
+        modeled_10e6_direct.ci95_lower,
+        modeled_10e6_direct.ci95_upper,
+        modeled_10e6_batch.point_p99,
+        modeled_10e6_batch.ci95_lower,
+        modeled_10e6_batch.ci95_upper,
+        modeled_10e6.cpu_overhead_ratio(),
+        modeled_10e6.network_overhead_ratio(),
+    );
+    println!(
+        "TCK-00372 scale=100000000 methodology=statistical_model direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
+        modeled_10e8_direct.point_p99,
+        modeled_10e8_direct.ci95_lower,
+        modeled_10e8_direct.ci95_upper,
+        modeled_10e8_batch.point_p99,
+        modeled_10e8_batch.ci95_lower,
+        modeled_10e8_batch.ci95_upper,
+        modeled_10e8.cpu_overhead_ratio(),
+        modeled_10e8.network_overhead_ratio(),
+    );
+
+    let model = AttestationProjectionModel::new(modeled_10e6, modeled_10e8).unwrap();
     let projected_10e12 = model.project_10e12();
     assert_eq!(projected_10e12.effects, SCALE_EFFECTS_10E12);
     gate.enforce(&projected_10e12)
         .expect("10^12 projection must satisfy <1% gate");
-
     println!(
-        "TCK-00372 measurement: batch_size={BATCH_SIZE}, direct_batch_p99_us={direct_batch_p99_us:.3}, batched_batch_p99_us={batched_batch_p99_us:.3}",
-    );
-    println!(
-        "TCK-00372 scale 10^6: cpu_overhead_ratio={:.6}, network_overhead_ratio={:.6}",
-        measured_10e6.cpu_overhead_ratio(),
-        measured_10e6.network_overhead_ratio()
-    );
-    println!(
-        "TCK-00372 scale 10^8: cpu_overhead_ratio={:.6}, network_overhead_ratio={:.6}",
-        measured_10e8.cpu_overhead_ratio(),
-        measured_10e8.network_overhead_ratio()
-    );
-    println!(
-        "TCK-00372 projection 10^12: cpu_overhead_ratio={:.6}, network_overhead_ratio={:.6}",
+        "TCK-00372 scale=1000000000000 methodology=statistical_model_projection cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
         projected_10e12.cpu_overhead_ratio(),
         projected_10e12.network_overhead_ratio()
     );
 
-    assert!(measured_10e6.cpu_overhead_ratio() <= 0.01);
-    assert!(measured_10e6.network_overhead_ratio() <= 0.01);
-    assert!(measured_10e8.cpu_overhead_ratio() <= 0.01);
-    assert!(measured_10e8.network_overhead_ratio() <= 0.01);
+    for (_, measured) in &measured_scale_measurements {
+        assert!(measured.cpu_overhead_ratio() <= 0.01);
+        assert!(measured.network_overhead_ratio() <= 0.01);
+    }
+    assert!(modeled_10e6.cpu_overhead_ratio() <= 0.01);
+    assert!(modeled_10e6.network_overhead_ratio() <= 0.01);
+    assert!(modeled_10e8.cpu_overhead_ratio() <= 0.01);
+    assert!(modeled_10e8.network_overhead_ratio() <= 0.01);
     assert!(projected_10e12.cpu_overhead_ratio() <= 0.01);
     assert!(projected_10e12.network_overhead_ratio() <= 0.01);
 }

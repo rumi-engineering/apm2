@@ -9,8 +9,9 @@ evidence_artifact:
 
     The attestation overhead harness validates the `<1%` p99 CPU/network
     overhead contract for batched verification versus direct verification at
-    measured scales `10^6` and `10^8`, then projects to `10^12` using a
-    deterministic log-log projection model.
+    directly measured scales `10^3`, `10^4`, and `10^5`. Higher scales
+    (`10^6`, `10^8`) use a bootstrap statistical model from measured
+    per-batch samples, with `10^12` derived via the projection model.
 
     The ticket also verifies automatic batch->direct fallback behavior for:
     - degradation (overhead gate breach),
@@ -38,9 +39,9 @@ evidence_artifact:
     - type: "measurement_log"
       description: |
         Captured p99 measurement output and normalized snapshot for:
-        - direct vs batched p99 CPU envelope,
-        - network overhead ratios,
-        - `10^12` projection gate evaluation.
+        - direct-measurement scales (`10^3`, `10^4`, `10^5`) with elapsed-time runs,
+        - bootstrap-modeled p99 envelopes (`10^6`, `10^8`),
+        - network overhead ratios and `10^12` projection gate evaluation.
       ref:
         - "evidence/rfc/RFC-0020/perf/tck_00372/tck_00372_attestation_overhead.log"
         - "evidence/rfc/RFC-0020/perf/tck_00372/measurement_snapshot.json"

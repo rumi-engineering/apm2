@@ -10,8 +10,9 @@ evidence_artifact:
 
     This artifact captures measured benchmark outputs for batched attestation
     verification against direct verification, including:
-    - measured `10^6` and `10^8` scale envelopes,
-    - deterministic `10^12` projection,
+    - direct measurements at `10^3`, `10^4`, and `10^5` effects,
+    - bootstrap-modeled `10^6` and `10^8` p99 envelopes,
+    - `10^12` projection from the modeled high-scale points,
     - `<1%` p99 CPU/network overhead gate compliance,
     - automatic fallback to direct verification when degradation/integrity/
       freshness failures occur,
@@ -28,8 +29,8 @@ evidence_artifact:
       description: |
         Integrated attestation overhead benchmark + projection output:
         - `batch_size=256` benchmark run
-        - direct vs batched p99 CPU envelope
-        - measured overhead ratios for `10^6` and `10^8`
+        - direct-measurement scales (`10^3`, `10^4`, `10^5`)
+        - bootstrap-modeled p99 envelopes for `10^6` and `10^8`
         - projected overhead ratios for `10^12`
       ref:
         - "cargo test -p apm2-daemon --test tck_00372_attestation_overhead -- --nocapture"

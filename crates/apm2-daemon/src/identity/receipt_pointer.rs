@@ -964,6 +964,56 @@ pub enum BatchSealVerifier<'a> {
 ///
 /// The policy carries direct-path baseline envelopes used to evaluate whether
 /// authenticated batch proof structure violates the `<1%` overhead contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalibrationProvenance {
+    /// Versioned identifier for the baseline/coefficient bundle.
+    pub baseline_version: &'static str,
+    /// UTC date for the calibration snapshot.
+    pub measurement_date_utc: &'static str,
+    /// Hardware class the calibration applies to.
+    pub hardware_class: &'static str,
+}
+
+/// Provenance classification for overhead baseline calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationSource {
+    /// Baselines and coefficients came from measured evidence artifacts.
+    MeasuredArtifact(CalibrationProvenance),
+    /// Baselines were explicitly configured by the caller/operator.
+    ExplicitConfiguration(CalibrationProvenance),
+    /// Baselines are built-in defaults and should be treated as uncalibrated.
+    DefaultHeuristic(CalibrationProvenance),
+}
+
+impl CalibrationSource {
+    /// Returns calibration provenance metadata attached to this source.
+    #[must_use]
+    pub const fn provenance(self) -> CalibrationProvenance {
+        match self {
+            Self::MeasuredArtifact(provenance)
+            | Self::ExplicitConfiguration(provenance)
+            | Self::DefaultHeuristic(provenance) => provenance,
+        }
+    }
+}
+
+/// Structural CPU model coefficients used by degradation gating.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StructuralCpuCalibration {
+    /// Constant CPU floor per verification.
+    pub base_us: f64,
+    /// CPU slope per signature checked.
+    pub us_per_signature: f64,
+    /// CPU slope per Merkle proof layer.
+    pub us_per_merkle_layer: f64,
+    /// CPU slope per canonicalized byte processed.
+    pub us_per_canonical_byte: f64,
+}
+
+/// Deterministic overhead policy for batched attestation verification.
+///
+/// The policy carries direct-path baseline envelopes used to evaluate whether
+/// authenticated batch proof structure violates the `<1%` overhead contract.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BatchOverheadPolicy {
     /// Direct verification CPU p99 baseline in microseconds.
@@ -974,7 +1024,30 @@ pub struct BatchOverheadPolicy {
     pub max_cpu_overhead_ratio: f64,
     /// Maximum network overhead ratio allowed.
     pub max_network_overhead_ratio: f64,
+    /// Calibration source/provenance for baseline envelopes.
+    pub calibration_source: CalibrationSource,
+    /// Structural CPU coefficients for batch-path overhead estimation.
+    pub structural_cpu_calibration: StructuralCpuCalibration,
 }
+
+const DEFAULT_BATCH_CALIBRATION_PROVENANCE: CalibrationProvenance = CalibrationProvenance {
+    baseline_version: "tck-00372-default-v2",
+    measurement_date_utc: "2026-02-10",
+    hardware_class: "x86_64-linux-generic",
+};
+
+const EXPLICIT_CONFIGURATION_PROVENANCE: CalibrationProvenance = CalibrationProvenance {
+    baseline_version: "explicit-config",
+    measurement_date_utc: "unspecified",
+    hardware_class: "unspecified",
+};
+
+const DEFAULT_STRUCTURAL_CPU_CALIBRATION: StructuralCpuCalibration = StructuralCpuCalibration {
+    base_us: 8.0,
+    us_per_signature: 40.0,
+    us_per_merkle_layer: 2.0,
+    us_per_canonical_byte: 0.01,
+};
 
 impl Default for BatchOverheadPolicy {
     fn default() -> Self {
@@ -988,6 +1061,10 @@ impl Default for BatchOverheadPolicy {
             direct_network_p99_bytes: DEFAULT_DIRECT_NETWORK_P99_BYTES,
             max_cpu_overhead_ratio: DEFAULT_MAX_P99_OVERHEAD_RATIO,
             max_network_overhead_ratio: DEFAULT_MAX_P99_OVERHEAD_RATIO,
+            calibration_source: CalibrationSource::DefaultHeuristic(
+                DEFAULT_BATCH_CALIBRATION_PROVENANCE,
+            ),
+            structural_cpu_calibration: DEFAULT_STRUCTURAL_CPU_CALIBRATION,
         }
     }
 }
@@ -1001,12 +1078,44 @@ impl BatchOverheadPolicy {
         max_cpu_overhead_ratio: f64,
         max_network_overhead_ratio: f64,
     ) -> Self {
+        Self::with_calibration(
+            direct_cpu_p99_us,
+            direct_network_p99_bytes,
+            max_cpu_overhead_ratio,
+            max_network_overhead_ratio,
+            CalibrationSource::ExplicitConfiguration(EXPLICIT_CONFIGURATION_PROVENANCE),
+            DEFAULT_STRUCTURAL_CPU_CALIBRATION,
+        )
+    }
+
+    /// Creates a policy with explicit baseline envelopes and calibration
+    /// metadata.
+    #[must_use]
+    pub const fn with_calibration(
+        direct_cpu_p99_us: f64,
+        direct_network_p99_bytes: f64,
+        max_cpu_overhead_ratio: f64,
+        max_network_overhead_ratio: f64,
+        calibration_source: CalibrationSource,
+        structural_cpu_calibration: StructuralCpuCalibration,
+    ) -> Self {
         Self {
             direct_cpu_p99_us,
             direct_network_p99_bytes,
             max_cpu_overhead_ratio,
             max_network_overhead_ratio,
+            calibration_source,
+            structural_cpu_calibration,
         }
+    }
+
+    /// Returns `true` when the policy uses built-in default heuristics.
+    #[must_use]
+    pub const fn is_uncalibrated_default(&self) -> bool {
+        matches!(
+            self.calibration_source,
+            CalibrationSource::DefaultHeuristic(_)
+        )
     }
 }
 
@@ -1174,10 +1283,6 @@ impl ReceiptPointerVerifier {
     }
 
     const OVERHEAD_RATIO_PPM_SCALE: f64 = 1_000_000.0;
-    const STRUCTURAL_CPU_BASE_US: f64 = 8.0;
-    const STRUCTURAL_CPU_US_PER_SIGNATURE: f64 = 40.0;
-    const STRUCTURAL_CPU_US_PER_MERKLE_LAYER: f64 = 2.0;
-    const STRUCTURAL_CPU_US_PER_CANONICAL_BYTE: f64 = 0.01;
 
     fn ratio_to_ppm(overhead_ratio: f64) -> u32 {
         if !overhead_ratio.is_finite() {
@@ -1230,7 +1335,11 @@ impl ReceiptPointerVerifier {
         f64::from(pointer_bytes) + f64::from(seal_bytes)
     }
 
-    fn estimate_structural_batch_cpu_us(pointer: &ReceiptPointerV1, seal: &AuthoritySealV1) -> f64 {
+    fn estimate_structural_batch_cpu_us(
+        pointer: &ReceiptPointerV1,
+        seal: &AuthoritySealV1,
+        calibration: StructuralCpuCalibration,
+    ) -> f64 {
         let signature_count = f64::from(u32::try_from(seal.signatures().len()).unwrap_or(u32::MAX));
         let merkle_layers = f64::from(
             u32::try_from(
@@ -1242,16 +1351,23 @@ impl ReceiptPointerVerifier {
         );
         let canonical_bytes = Self::estimate_verification_bytes(pointer, seal);
         let structural_cpu_us = merkle_layers.mul_add(
-            Self::STRUCTURAL_CPU_US_PER_MERKLE_LAYER,
-            signature_count.mul_add(
-                Self::STRUCTURAL_CPU_US_PER_SIGNATURE,
-                Self::STRUCTURAL_CPU_BASE_US,
-            ),
+            calibration.us_per_merkle_layer,
+            signature_count.mul_add(calibration.us_per_signature, calibration.base_us),
         );
-        canonical_bytes.mul_add(
-            Self::STRUCTURAL_CPU_US_PER_CANONICAL_BYTE,
-            structural_cpu_us,
-        )
+        canonical_bytes.mul_add(calibration.us_per_canonical_byte, structural_cpu_us)
+    }
+
+    fn emit_uncalibrated_overhead_warning(policy: &BatchOverheadPolicy) {
+        if !policy.is_uncalibrated_default() {
+            return;
+        }
+        let provenance = policy.calibration_source.provenance();
+        tracing::warn!(
+            baseline_version = provenance.baseline_version,
+            measurement_date_utc = provenance.measurement_date_utc,
+            hardware_class = provenance.hardware_class,
+            "batch overhead degradation gate using default heuristic calibration; prefer measured artifact calibration for production enforcement"
+        );
     }
 
     const fn batch_quorum_requirements(
@@ -1291,7 +1407,7 @@ impl ReceiptPointerVerifier {
     fn evaluate_batch_overhead_policy(
         batch_estimated_cpu_us: f64,
         batch_network_bytes: f64,
-        policy: BatchOverheadPolicy,
+        policy: &BatchOverheadPolicy,
     ) -> Result<(), ReceiptPointerError> {
         let measurement = AttestationScaleMeasurement::new(
             1,
@@ -1495,13 +1611,17 @@ impl ReceiptPointerVerifier {
         match batch_result {
             Ok(batch_ok) => {
                 if let Some(policy) = overhead_policy {
+                    Self::emit_uncalibrated_overhead_warning(&policy);
                     let batch_network_bytes = Self::estimate_verification_bytes(pointer, seal);
-                    let batch_estimated_cpu_us =
-                        Self::estimate_structural_batch_cpu_us(pointer, seal);
+                    let batch_estimated_cpu_us = Self::estimate_structural_batch_cpu_us(
+                        pointer,
+                        seal,
+                        policy.structural_cpu_calibration,
+                    );
                     if let Err(overhead_error) = Self::evaluate_batch_overhead_policy(
                         batch_estimated_cpu_us,
                         batch_network_bytes,
-                        policy,
+                        &policy,
                     ) {
                         return Self::verify_direct_fallback_or_fail(
                             pointer,
@@ -2621,6 +2741,28 @@ mod tests {
             policy.direct_network_p99_bytes >= 512.0,
             "default network baseline must be realistic, got: {}",
             policy.direct_network_p99_bytes
+        );
+        assert!(
+            policy.is_uncalibrated_default(),
+            "default policy must be marked as uncalibrated/default provenance",
+        );
+        let provenance = policy.calibration_source.provenance();
+        assert!(
+            provenance.baseline_version.starts_with("tck-00372-default"),
+            "default provenance must expose versioned baseline identity, got: {}",
+            provenance.baseline_version
+        );
+        assert!(
+            provenance.measurement_date_utc != "unspecified",
+            "default provenance must include a measurement date"
+        );
+        assert!(
+            provenance.hardware_class != "unspecified",
+            "default provenance must include hardware class"
+        );
+        assert!(
+            policy.structural_cpu_calibration.us_per_signature > 0.0,
+            "structural CPU calibration must be positive"
         );
     }
 
