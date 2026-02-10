@@ -41,10 +41,10 @@ use barrier::{
 };
 use dispatch::dispatch_single_review;
 use events::{read_last_event_values, review_events_path};
-use projection::{
-    projection_state_done, projection_state_failed, resolve_current_head_sha, run_project_inner,
+use projection::{projection_state_done, projection_state_failed, run_project_inner};
+use state::{
+    list_review_pr_numbers, load_review_run_state, read_pulse_file, review_run_state_path,
 };
-use state::{is_process_alive, read_pulse_file, with_review_state_shared};
 // Re-export public API for use by `fac.rs`
 pub use types::ReviewRunType;
 use types::{
@@ -97,6 +97,59 @@ fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
     }
 }
 
+fn emit_run_ndjson_since(
+    offset: u64,
+    pr_number: u32,
+    run_ids: &[String],
+    to_stderr: bool,
+) -> Result<(), String> {
+    let path = review_events_path()?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut file =
+        File::open(&path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|err| format!("failed to seek {}: {err}", path.display()))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+
+    for line in buf.lines() {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let matches_pr = parsed
+            .get("pr_number")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|value| value == u64::from(pr_number));
+        if !matches_pr {
+            continue;
+        }
+        let is_sequence_done = parsed
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|event| event == "sequence_done");
+        if run_ids.is_empty() || is_sequence_done {
+            if to_stderr {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+            continue;
+        }
+        let run_id = parsed.get("run_id").and_then(serde_json::Value::as_str);
+        if run_id.is_some_and(|id| run_ids.iter().any(|candidate| candidate == id)) {
+            if to_stderr {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── Public entry points ─────────────────────────────────────────────────────
 
 pub fn run_review(
@@ -105,12 +158,32 @@ pub fn run_review(
     expected_head_sha: Option<&str>,
     json_output: bool,
 ) -> u8 {
+    let event_offset = review_events_path()
+        .ok()
+        .and_then(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+        .unwrap_or(0);
+
     match orchestrator::run_review_inner(pr_url, review_type, expected_head_sha) {
         Ok(summary) => {
+            let success = summary.security.as_ref().is_none_or(|entry| entry.success)
+                && summary.quality.as_ref().is_none_or(|entry| entry.success);
+
             if json_output {
+                let mut run_ids = Vec::new();
+                if let Some(entry) = &summary.security {
+                    run_ids.push(entry.run_id.clone());
+                }
+                if let Some(entry) = &summary.quality {
+                    run_ids.push(entry.run_id.clone());
+                }
+                let _ = emit_run_ndjson_since(event_offset, summary.pr_number, &run_ids, true);
+                let payload = serde_json::json!({
+                    "schema": "apm2.fac.review.run.v1",
+                    "summary": summary,
+                });
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
                 println!("FAC Review");
@@ -124,33 +197,41 @@ pub fn run_review(
                         .tokens_used
                         .map_or_else(String::new, |n| format!(", tokens={n}"));
                     println!(
-                        "  Security:     {} (verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
+                        "  Security:     {} (run_id={}, state={}, verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
                         if security.success { "PASS" } else { "FAIL" },
+                        security.run_id,
+                        security.state,
                         security.verdict,
                         security.model,
                         security.backend,
                         security.restart_count,
                         security.duration_secs
                     );
+                    if let Some(reason) = &security.terminal_reason {
+                        println!("                 terminal_reason={reason}");
+                    }
                 }
                 if let Some(quality) = &summary.quality {
                     let tok = quality
                         .tokens_used
                         .map_or_else(String::new, |n| format!(", tokens={n}"));
                     println!(
-                        "  Quality:      {} (verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
+                        "  Quality:      {} (run_id={}, state={}, verdict={}, model={}, backend={}, restarts={}, secs={}{tok})",
                         if quality.success { "PASS" } else { "FAIL" },
+                        quality.run_id,
+                        quality.state,
                         quality.verdict,
                         quality.model,
                         quality.backend,
                         quality.restart_count,
                         quality.duration_secs
                     );
+                    if let Some(reason) = &quality.terminal_reason {
+                        println!("                 terminal_reason={reason}");
+                    }
                 }
             }
 
-            let success = summary.security.as_ref().is_none_or(|entry| entry.success)
-                && summary.quality.as_ref().is_none_or(|entry| entry.success);
             if success {
                 exit_codes::SUCCESS
             } else {
@@ -176,9 +257,73 @@ pub fn run_review(
     }
 }
 
+pub fn run_dispatch(
+    pr_url: &str,
+    review_type: ReviewRunType,
+    expected_head_sha: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    match run_dispatch_inner(pr_url, review_type, expected_head_sha) {
+        Ok(summary) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "schema": "apm2.fac.review.dispatch.v1",
+                    "summary": summary,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("FAC Review Dispatch");
+                println!("  PR:            {}", summary.pr_url);
+                println!("  PR Number:     {}", summary.pr_number);
+                println!("  Head SHA:      {}", summary.head_sha);
+                println!("  Dispatch Epoch:{}", summary.dispatch_epoch);
+                for result in &summary.results {
+                    println!(
+                        "  - type={} mode={} state={} run_id={} seq={} terminal_reason={}",
+                        result.review_type,
+                        result.mode,
+                        result.run_state,
+                        result.run_id.as_deref().unwrap_or("-"),
+                        result
+                            .sequence_number
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                        result.terminal_reason.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+            exit_codes::SUCCESS
+        },
+        Err(err) => {
+            if json_output {
+                let payload = serde_json::json!({
+                    "error": "fac_review_dispatch_failed",
+                    "message": err,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
+                );
+            } else {
+                eprintln!("ERROR: {err}");
+            }
+            exit_codes::GENERIC_ERROR
+        },
+    }
+}
+
 pub fn run_status(pr_number: Option<u32>, pr_url: Option<&str>, json_output: bool) -> u8 {
     match run_status_inner(pr_number, pr_url, json_output) {
-        Ok(()) => exit_codes::SUCCESS,
+        Ok(fail_closed) => {
+            if fail_closed {
+                exit_codes::GENERIC_ERROR
+            } else {
+                exit_codes::SUCCESS
+            }
+        },
         Err(err) => {
             if json_output {
                 let payload = serde_json::json!({
@@ -305,7 +450,7 @@ pub fn run_kickoff(
     }
     if !json_output && !public_projection_only {
         println!(
-            "details=~/.apm2/review_events.ndjson state=~/.apm2/reviewer_state.json dispatch_logs=~/.apm2/review_dispatch/"
+            "details=~/.apm2/review_events.ndjson state=~/.apm2/reviews/ dispatch_logs=~/.apm2/review_dispatch/"
         );
     }
     match run_kickoff_inner(
@@ -367,6 +512,13 @@ pub fn run_project(
 ) -> u8 {
     match run_project_inner(pr_number, head_sha, since_epoch, after_seq) {
         Ok(status) => {
+            let fail_closed_state = matches!(
+                status.security.as_str(),
+                "no-run-state" | "corrupt-state" | "ambiguous-state"
+            ) || matches!(
+                status.quality.as_str(),
+                "no-run-state" | "corrupt-state" | "ambiguous-state"
+            );
             if json_output {
                 println!(
                     "{}",
@@ -384,7 +536,7 @@ pub fn run_project(
                 }
             }
 
-            if fail_on_terminal && status.terminal_failure {
+            if fail_closed_state || (fail_on_terminal && status.terminal_failure) {
                 exit_codes::GENERIC_ERROR
             } else {
                 exit_codes::SUCCESS
@@ -609,7 +761,7 @@ fn run_status_inner(
     pr_number: Option<u32>,
     pr_url: Option<&str>,
     json_output: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let derived_pr = if let Some(url) = pr_url {
         let (_, number) = parse_pr_url(url)?;
         Some(number)
@@ -627,46 +779,81 @@ fn run_status_inner(
         (None, None) => None,
     };
 
-    let state = with_review_state_shared(|state| Ok(state.clone()))?;
-    let events = read_last_event_values(40)?;
+    let target_prs = if let Some(number) = filter_pr {
+        vec![number]
+    } else {
+        list_review_pr_numbers()?
+    };
 
-    let filtered_state = state
-        .reviewers
-        .iter()
-        .filter(|(_, entry)| {
+    let mut entries = Vec::new();
+    let mut fail_closed = false;
+    for pr in &target_prs {
+        for review_type in ["security", "quality"] {
+            let state_path = review_run_state_path(*pr, review_type)?;
+            match load_review_run_state(*pr, review_type)? {
+                state::ReviewRunStateLoad::Present(state) => {
+                    entries.push(serde_json::json!({
+                        "pr_number": pr,
+                        "review_type": review_type,
+                        "state": state.status.as_str(),
+                        "run_id": state.run_id,
+                        "sequence_number": state.sequence_number,
+                        "pr_url": state.pr_url,
+                        "head_sha": state.head_sha,
+                        "started_at": state.started_at,
+                        "model_id": state.model_id,
+                        "backend_id": state.backend_id,
+                        "restart_count": state.restart_count,
+                        "terminal_reason": state.terminal_reason,
+                        "state_path": state_path.display().to_string(),
+                    }));
+                },
+                state::ReviewRunStateLoad::Missing { path } => {
+                    if filter_pr.is_some() {
+                        fail_closed = true;
+                    }
+                    entries.push(serde_json::json!({
+                        "pr_number": pr,
+                        "review_type": review_type,
+                        "state": "no-run-state",
+                        "state_path": path.display().to_string(),
+                    }));
+                },
+                state::ReviewRunStateLoad::Corrupt { path, error } => {
+                    fail_closed = true;
+                    entries.push(serde_json::json!({
+                        "pr_number": pr,
+                        "review_type": review_type,
+                        "state": "corrupt-state",
+                        "state_path": path.display().to_string(),
+                        "detail": error,
+                    }));
+                },
+                state::ReviewRunStateLoad::Ambiguous { dir, candidates } => {
+                    fail_closed = true;
+                    entries.push(serde_json::json!({
+                        "pr_number": pr,
+                        "review_type": review_type,
+                        "state": "ambiguous-state",
+                        "state_dir": dir.display().to_string(),
+                        "candidates": candidates
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>(),
+                    }));
+                },
+            }
+        }
+    }
+
+    let filtered_events = read_last_event_values(40)?
+        .into_iter()
+        .filter(|event| {
             filter_pr.is_none_or(|number| {
-                if entry.pr_number > 0 {
-                    entry.pr_number == number
-                } else {
-                    parse_pr_url(&entry.pr_url).is_ok_and(|(_, pr_num)| pr_num == number)
-                }
-            })
-        })
-        .map(|(run_key, entry)| {
-            let entry_pr = if entry.pr_number > 0 {
-                entry.pr_number
-            } else {
-                parse_pr_url(&entry.pr_url)
-                    .map(|(_, pr_num)| pr_num)
-                    .unwrap_or(0)
-            };
-            serde_json::json!({
-                "run_key": run_key,
-                "review_type": entry.review_type,
-                "pr_number": entry_pr,
-                "pid": entry.pid,
-                "alive": is_process_alive(entry.pid),
-                "started_at": entry.started_at,
-                "pr_url": entry.pr_url,
-                "head_sha": entry.head_sha,
-                "model": entry.model,
-                "backend": entry.backend.as_str(),
-                "restart_count": entry.restart_count,
-                "log_file": entry.log_file.display().to_string(),
-                "last_message_file": entry
-                    .last_message_file
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
+                event
+                    .get("pr_number")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|value| value == u64::from(number))
             })
         })
         .collect::<Vec<_>>();
@@ -680,23 +867,32 @@ fn run_status_inner(
         .transpose()?
         .flatten();
 
-    let filtered_events = events
-        .into_iter()
-        .filter(|event| {
-            filter_pr.is_none_or(|number| {
-                event
+    let current_head_sha = filter_pr.and_then(|number| {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry
                     .get("pr_number")
                     .and_then(serde_json::Value::as_u64)
                     .is_some_and(|value| value == u64::from(number))
             })
-        })
-        .collect::<Vec<_>>();
-    let current_head_sha =
-        filter_pr.map(|number| resolve_current_head_sha(number, &state, &filtered_events, "-"));
+            .filter_map(|entry| entry.get("head_sha").and_then(serde_json::Value::as_str))
+            .find(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                pulse_security
+                    .as_ref()
+                    .map(|pulse| pulse.head_sha.clone())
+                    .or_else(|| pulse_quality.as_ref().map(|pulse| pulse.head_sha.clone()))
+            })
+    });
 
     if json_output {
         let payload = serde_json::json!({
-            "state_entries": filtered_state,
+            "schema": "apm2.fac.review.status.v1",
+            "filter_pr": filter_pr,
+            "fail_closed": fail_closed,
+            "entries": entries,
             "recent_events": filtered_events,
             "pulse_security": pulse_security,
             "pulse_quality": pulse_quality,
@@ -707,7 +903,7 @@ fn run_status_inner(
             serde_json::to_string_pretty(&payload)
                 .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
         );
-        return Ok(());
+        return Ok(fail_closed);
     }
 
     println!("FAC Review Status");
@@ -718,20 +914,20 @@ fn run_status_inner(
             current_head_sha.as_deref().unwrap_or("-")
         );
     }
-    if filtered_state.is_empty() {
-        println!("  Active Runs: none");
+    if entries.is_empty() {
+        println!("  Run State: no-run-state");
     } else {
-        println!("  Active Runs:");
-        for entry in filtered_state {
+        println!("  Run States:");
+        for entry in &entries {
             println!(
-                "    - {} | pid={} alive={} model={} backend={} reviewed_sha={} restarts={}",
-                entry["review_type"].as_str().unwrap_or("unknown"),
-                entry["pid"].as_u64().unwrap_or(0),
-                entry["alive"].as_bool().unwrap_or(false),
-                entry["model"].as_str().unwrap_or("unknown"),
-                entry["backend"].as_str().unwrap_or("unknown"),
-                entry["head_sha"].as_str().unwrap_or("unknown"),
-                entry["restart_count"].as_u64().unwrap_or(0),
+                "    - pr=#{} type={} state={} run_id={} seq={} head_sha={} terminal_reason={}",
+                entry["pr_number"].as_u64().unwrap_or(0),
+                entry["review_type"].as_str().unwrap_or("-"),
+                entry["state"].as_str().unwrap_or("-"),
+                entry["run_id"].as_str().unwrap_or("-"),
+                entry["sequence_number"].as_u64().unwrap_or(0),
+                entry["head_sha"].as_str().unwrap_or("-"),
+                entry["terminal_reason"].as_str().unwrap_or("-"),
             );
         }
     }
@@ -742,11 +938,12 @@ fn run_status_inner(
     } else {
         for event in filtered_events.iter().rev().take(20).rev() {
             println!(
-                "    [{}] {} {} pr=#{} event_sha={}",
+                "    [{}] {} {} pr=#{} run_id={} event_sha={}",
                 event["ts"].as_str().unwrap_or("-"),
                 event["event"].as_str().unwrap_or("-"),
                 event["review_type"].as_str().unwrap_or("-"),
                 event["pr_number"].as_u64().unwrap_or(0),
+                event["run_id"].as_str().unwrap_or("-"),
                 event["head_sha"].as_str().unwrap_or("-"),
             );
         }
@@ -768,8 +965,9 @@ fn run_status_inner(
                 .map_or_else(|| "missing".to_string(), |pulse| pulse.head_sha.clone())
         );
     }
+    println!("  Fail Closed: {}", if fail_closed { "yes" } else { "no" });
 
-    Ok(())
+    Ok(fail_closed)
 }
 
 fn run_tail_inner(lines: usize, follow: bool) -> Result<(), String> {
@@ -836,8 +1034,8 @@ mod tests {
     };
     use super::state::{read_last_lines, read_pulse_file_from_path, write_pulse_file_to_path};
     use super::types::{
-        EVENT_ROTATE_BYTES, FacEventContext, ReviewBackend, ReviewKind, ReviewStateEntry,
-        ReviewStateFile, default_model, default_review_type, now_iso8601_millis,
+        EVENT_ROTATE_BYTES, FacEventContext, ReviewBackend, ReviewKind, ReviewRunStatus,
+        ReviewStateEntry, ReviewStateFile, default_model, default_review_type, now_iso8601_millis,
     };
 
     fn dead_pid_for_test() -> u32 {
@@ -1269,6 +1467,12 @@ mod tests {
                 model: default_model(),
                 backend: ReviewBackend::Codex,
                 temp_files: Vec::new(),
+                run_id: "stale-security-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some(default_model()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         let events = Vec::<serde_json::Value>::new();
@@ -1303,6 +1507,12 @@ mod tests {
                 model: default_model(),
                 backend: ReviewBackend::Codex,
                 temp_files: Vec::new(),
+                run_id: "stale-quality-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some(default_model()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         let events = vec![serde_json::json!({
@@ -1454,6 +1664,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "security-1-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         assert_eq!(
@@ -1485,6 +1701,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "security-old-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         state.reviewers.insert(
@@ -1503,6 +1725,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "security-new-run".to_string(),
+                sequence_number: 2,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         assert_eq!(
@@ -1532,6 +1760,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "quality-1-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         assert_eq!(latest_state_head_sha(&state, 42), None);
@@ -1598,6 +1832,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "sec-state-fallback-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         let events: Vec<serde_json::Value> = vec![];
@@ -1636,6 +1876,12 @@ mod tests {
                 model: "test-model".to_string(),
                 backend: ReviewBackend::default(),
                 temp_files: Vec::new(),
+                run_id: "sec-current-head-run".to_string(),
+                sequence_number: 1,
+                terminal_reason: None,
+                model_id: Some("test-model".to_string()),
+                backend_id: Some("codex".to_string()),
+                status: ReviewRunStatus::Alive,
             },
         );
         let events: Vec<serde_json::Value> = vec![];

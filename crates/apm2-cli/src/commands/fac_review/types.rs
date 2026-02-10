@@ -62,6 +62,33 @@ pub enum ReviewRunType {
     Quality,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRunStatus {
+    #[default]
+    Pending,
+    Alive,
+    Done,
+    Failed,
+    Crashed,
+}
+
+impl ReviewRunStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Alive => "alive",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Crashed => "crashed",
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Crashed)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewModelSelection {
     pub model: String,
@@ -130,6 +157,19 @@ pub struct ReviewStateEntry {
     pub backend: ReviewBackend,
     #[serde(default)]
     pub temp_files: Vec<PathBuf>,
+    // TCK-00441: Deterministic run state fields
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub sequence_number: u32,
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub backend_id: Option<String>,
+    #[serde(default)]
+    pub status: ReviewRunStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -146,11 +186,40 @@ pub struct PulseFile {
     pub written_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewRunState {
+    pub run_id: String,
+    pub pr_url: String,
+    pub pr_number: u32,
+    pub head_sha: String,
+    pub review_type: String,
+    pub reviewer_role: String,
+    pub started_at: String,
+    pub status: ReviewRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_id: Option<String>,
+    #[serde(default)]
+    pub restart_count: u32,
+    pub sequence_number: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SingleReviewSummary {
+    pub run_id: String,
+    pub sequence_number: u32,
+    pub state: String,
     pub review_type: String,
     pub success: bool,
     pub verdict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
     pub model: String,
     pub backend: String,
     pub duration_secs: u64,
@@ -174,6 +243,13 @@ pub struct ReviewRunSummary {
 pub struct DispatchReviewResult {
     pub review_type: String,
     pub mode: String,
+    pub run_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -393,6 +469,12 @@ pub fn sanitize_for_path(input: &str) -> String {
 }
 
 pub fn apm2_home_dir() -> Result<PathBuf, String> {
+    if let Some(override_dir) = std::env::var_os("APM2_HOME") {
+        let path = PathBuf::from(override_dir);
+        if !path.as_os_str().is_empty() {
+            return Ok(path);
+        }
+    }
     let base_dirs = directories::BaseDirs::new()
         .ok_or_else(|| "could not resolve home directory".to_string())?;
     Ok(base_dirs.home_dir().join(".apm2"))

@@ -23,6 +23,7 @@
 //!   observe FAC review lifecycle for GitHub projection
 //! - `apm2 fac review run <PR_URL>` - Run FAC review orchestration (parallel,
 //!   multi-model)
+//! - `apm2 fac review dispatch <PR_URL>` - Dispatch detached FAC review runs
 //! - `apm2 fac review status` - Show FAC review state and recent events
 //! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
 //!   optimal point
@@ -463,6 +464,8 @@ pub struct ReviewArgs {
 pub enum ReviewSubcommand {
     /// Run FAC review orchestration for a pull request URL.
     Run(ReviewRunArgs),
+    /// Dispatch FAC review orchestration in detached mode.
+    Dispatch(ReviewDispatchArgs),
     /// Show FAC review state/events from local operational artifacts.
     Status(ReviewStatusArgs),
     /// Render one condensed projection line for GitHub log surfaces.
@@ -488,6 +491,26 @@ pub struct ReviewRunArgs {
 
     /// Optional expected head SHA (40 hex) to fail closed on stale review
     /// start.
+    #[arg(long)]
+    pub expected_head_sha: Option<String>,
+}
+
+/// Arguments for `apm2 fac review dispatch`.
+#[derive(Debug, Args)]
+pub struct ReviewDispatchArgs {
+    /// GitHub pull request URL.
+    pub pr_url: String,
+
+    /// Review selection (`all`, `security`, or `quality`).
+    #[arg(
+        long = "type",
+        alias = "review-type",
+        value_enum,
+        default_value_t = fac_review::ReviewRunType::All
+    )]
+    pub review_type: fac_review::ReviewRunType,
+
+    /// Optional expected head SHA (40 hex) to fail closed on stale dispatch.
     #[arg(long)]
     pub expected_head_sha: Option<String>,
 }
@@ -759,6 +782,12 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
                 &run_args.pr_url,
                 run_args.review_type,
                 run_args.expected_head_sha.as_deref(),
+                json_output,
+            ),
+            ReviewSubcommand::Dispatch(dispatch_args) => fac_review::run_dispatch(
+                &dispatch_args.pr_url,
+                dispatch_args.review_type,
+                dispatch_args.expected_head_sha.as_deref(),
                 json_output,
             ),
             ReviewSubcommand::Status(status_args) => {

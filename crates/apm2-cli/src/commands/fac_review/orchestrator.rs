@@ -24,14 +24,15 @@ use super::model_pool::{
     select_cross_family_fallback, select_fallback_model, select_review_model_random,
 };
 use super::state::{
-    build_run_key, find_active_review_entry, remove_review_state_entry, try_acquire_review_lease,
-    upsert_review_state_entry, write_pulse_file,
+    build_review_run_id, build_run_key, find_active_review_entry, load_review_run_state_strict,
+    next_review_sequence_number, remove_review_state_entry, try_acquire_review_lease,
+    upsert_review_state_entry, write_pulse_file, write_review_run_state,
 };
 use super::types::{
     ExecutionContext, LIVENESS_REPORT_INTERVAL, LOOP_SLEEP, MAX_RESTART_ATTEMPTS,
-    PULSE_POLL_INTERVAL, ReviewKind, ReviewModelSelection, ReviewRunSummary, ReviewRunType,
-    ReviewStateEntry, STALL_THRESHOLD, SingleReviewResult, SingleReviewSummary, SpawnMode,
-    split_owner_repo, validate_expected_head_sha,
+    PULSE_POLL_INTERVAL, ReviewKind, ReviewModelSelection, ReviewRunState, ReviewRunStatus,
+    ReviewRunSummary, ReviewRunType, ReviewStateEntry, STALL_THRESHOLD, SingleReviewResult,
+    SingleReviewSummary, SpawnMode, split_owner_repo, validate_expected_head_sha,
 };
 
 // ── Token usage extraction ───────────────────────────────────────────────────
@@ -199,6 +200,16 @@ pub fn run_review_inner(
             "total_secs": total_started.elapsed().as_secs(),
             "security_tokens": security_summary.as_ref().and_then(|s| s.tokens_used),
             "quality_tokens": quality_summary.as_ref().and_then(|s| s.tokens_used),
+            "security_run_id": security_summary.as_ref().map(|s| s.run_id.clone()),
+            "quality_run_id": quality_summary.as_ref().map(|s| s.run_id.clone()),
+            "security_state": security_summary.as_ref().map(|s| s.state.clone()),
+            "quality_state": quality_summary.as_ref().map(|s| s.state.clone()),
+            "security_terminal_reason": security_summary
+                .as_ref()
+                .and_then(|s| s.terminal_reason.clone()),
+            "quality_terminal_reason": quality_summary
+                .as_ref()
+                .and_then(|s| s.terminal_reason.clone()),
         }),
     )?;
 
@@ -211,6 +222,57 @@ pub fn run_review_inner(
         security: security_summary,
         quality: quality_summary,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_single_review_summary(
+    run_id: &str,
+    sequence_number: u32,
+    state: ReviewRunStatus,
+    review_type: &str,
+    success: bool,
+    verdict: String,
+    terminal_reason: Option<String>,
+    model: &str,
+    backend: &str,
+    duration_secs: u64,
+    restart_count: u32,
+    tokens_used: Option<u64>,
+) -> SingleReviewSummary {
+    SingleReviewSummary {
+        run_id: run_id.to_string(),
+        sequence_number,
+        state: state.as_str().to_string(),
+        review_type: review_type.to_string(),
+        success,
+        verdict,
+        terminal_reason,
+        model: model.to_string(),
+        backend: backend.to_string(),
+        duration_secs,
+        restart_count,
+        tokens_used,
+    }
+}
+
+fn persist_review_run_state(
+    state: &mut ReviewRunState,
+    status: ReviewRunStatus,
+    terminal_reason: Option<String>,
+    current_head_sha: &str,
+    model: &ReviewModelSelection,
+    restart_count: u32,
+    pid: Option<u32>,
+) -> Result<(), String> {
+    state.status = status;
+    state.terminal_reason = terminal_reason;
+    state.head_sha = current_head_sha.to_string();
+    state.model_id = Some(model.model.clone());
+    state.backend_id = Some(model.backend.as_str().to_string());
+    state.restart_count = restart_count;
+    state.pid = pid;
+    let _ = write_review_run_state(state)?;
+    Ok(())
 }
 
 // ── run_single_review ───────────────────────────────────────────────────────
@@ -268,18 +330,56 @@ fn run_single_review(
     let review_started = Instant::now();
     let review_type = review_kind.as_str();
     let expected_comment_author = resolve_authenticated_gh_login();
+    let sequence_number = next_review_sequence_number(pr_number, review_type)?;
+    let run_id = build_review_run_id(pr_number, review_type, sequence_number, &current_head_sha);
+    let mut run_state = ReviewRunState {
+        run_id: run_id.clone(),
+        pr_url: pr_url.to_string(),
+        pr_number,
+        head_sha: current_head_sha.clone(),
+        review_type: review_type.to_string(),
+        reviewer_role: "fac_reviewer".to_string(),
+        started_at: super::types::now_iso8601(),
+        status: ReviewRunStatus::Pending,
+        terminal_reason: None,
+        model_id: Some(current_model.model.clone()),
+        backend_id: Some(current_model.backend.as_str().to_string()),
+        restart_count,
+        sequence_number,
+        pid: None,
+    };
+
+    let emit_run_event =
+        |event_name: &str, event_head_sha: &str, extra: serde_json::Value| -> Result<(), String> {
+            let mut payload = match extra {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            payload.insert("run_id".to_string(), serde_json::json!(run_id));
+            payload.insert(
+                "sequence_number".to_string(),
+                serde_json::json!(sequence_number),
+            );
+            emit_event(
+                event_ctx,
+                event_name,
+                review_type,
+                event_head_sha,
+                serde_json::Value::Object(payload),
+            )
+        };
 
     let Some(_lease) = try_acquire_review_lease(owner_repo, pr_number, review_type)? else {
+        let existing_state = load_review_run_state_strict(pr_number, review_type)?;
         let existing = find_active_review_entry(pr_number, review_type, Some(&current_head_sha))?;
-        emit_event(
-            event_ctx,
+        emit_run_event(
             "run_deduplicated",
-            review_type,
             &current_head_sha,
             serde_json::json!({
                 "reason": "active_review_for_same_type",
                 "existing_pid": existing.as_ref().map(|entry| entry.pid),
                 "existing_sha": existing.as_ref().map(|entry| entry.head_sha.clone()),
+                "existing_run_id": existing_state.as_ref().map(|state| state.run_id.clone()),
             }),
         )?;
         let model = existing
@@ -291,21 +391,38 @@ fn run_single_review(
         );
         let restart_count = existing.as_ref().map_or(0, |entry| entry.restart_count);
         return Ok(SingleReviewResult {
-            summary: SingleReviewSummary {
-                review_type: review_type.to_string(),
-                success: true,
-                verdict: "DEDUPED".to_string(),
-                model,
-                backend,
-                duration_secs: review_started.elapsed().as_secs(),
+            summary: build_single_review_summary(
+                existing_state
+                    .as_ref()
+                    .map_or(&run_id, |state| state.run_id.as_str()),
+                existing_state
+                    .as_ref()
+                    .map_or(sequence_number, |state| state.sequence_number),
+                ReviewRunStatus::Alive,
+                review_type,
+                true,
+                "DEDUPED".to_string(),
+                Some("active_review_for_same_type".to_string()),
+                &model,
+                &backend,
+                review_started.elapsed().as_secs(),
                 restart_count,
-                tokens_used: None,
-            },
+                None,
+            ),
             final_head_sha: current_head_sha,
         });
     };
     write_pulse_file(pr_number, review_type, &current_head_sha)?;
     let run_key = build_run_key(pr_number, review_type, &current_head_sha);
+    persist_review_run_state(
+        &mut run_state,
+        ReviewRunStatus::Pending,
+        None,
+        &current_head_sha,
+        &current_model,
+        restart_count,
+        None,
+    )?;
 
     'restart_loop: loop {
         if let Some(posted_review) = confirm_review_posted(
@@ -319,10 +436,8 @@ fn run_single_review(
                 .verdict
                 .clone()
                 .unwrap_or_else(|| "UNKNOWN".to_string());
-            emit_event(
-                event_ctx,
+            emit_run_event(
                 "run_deduplicated",
-                review_type,
                 &current_head_sha,
                 serde_json::json!({
                     "reason": "review_comment_already_present",
@@ -330,17 +445,30 @@ fn run_single_review(
                     "verdict": completion_verdict,
                 }),
             )?;
+            persist_review_run_state(
+                &mut run_state,
+                ReviewRunStatus::Done,
+                Some("review_comment_already_present".to_string()),
+                &current_head_sha,
+                &current_model,
+                restart_count,
+                None,
+            )?;
             return Ok(SingleReviewResult {
-                summary: SingleReviewSummary {
-                    review_type: review_type.to_string(),
-                    success: completion_verdict != "UNKNOWN",
-                    verdict: completion_verdict,
-                    model: current_model.model.clone(),
-                    backend: current_model.backend.as_str().to_string(),
-                    duration_secs: review_started.elapsed().as_secs(),
+                summary: build_single_review_summary(
+                    &run_id,
+                    sequence_number,
+                    ReviewRunStatus::Done,
+                    review_type,
+                    completion_verdict != "UNKNOWN",
+                    completion_verdict,
+                    Some("review_comment_already_present".to_string()),
+                    &current_model.model,
+                    current_model.backend.as_str(),
+                    review_started.elapsed().as_secs(),
                     restart_count,
-                    tokens_used: None,
-                },
+                    None,
+                ),
                 final_head_sha: current_head_sha.clone(),
             });
         }
@@ -369,11 +497,39 @@ fn run_single_review(
             ),
         };
 
-        let _provider_slot_lease = acquire_provider_slot(current_model.backend)?;
-        let mut child = Command::new("sh")
-            .args(["-lc", &command])
-            .spawn()
-            .map_err(|err| format!("failed to spawn {} review: {err}", review_kind.display()))?;
+        let _provider_slot_lease = match acquire_provider_slot(current_model.backend) {
+            Ok(lease) => lease,
+            Err(err) => {
+                persist_review_run_state(
+                    &mut run_state,
+                    ReviewRunStatus::Failed,
+                    Some("provider_slot_unavailable".to_string()),
+                    &current_head_sha,
+                    &current_model,
+                    restart_count,
+                    None,
+                )?;
+                return Err(err);
+            },
+        };
+        let mut child = match Command::new("sh").args(["-lc", &command]).spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                persist_review_run_state(
+                    &mut run_state,
+                    ReviewRunStatus::Failed,
+                    Some("spawn_failed".to_string()),
+                    &current_head_sha,
+                    &current_model,
+                    restart_count,
+                    None,
+                )?;
+                return Err(format!(
+                    "failed to spawn {} review: {err}",
+                    review_kind.display()
+                ));
+            },
+        };
 
         upsert_review_state_entry(
             &run_key,
@@ -391,13 +547,26 @@ fn run_single_review(
                 model: current_model.model.clone(),
                 backend: current_model.backend,
                 temp_files: Vec::new(),
+                run_id: run_state.run_id.clone(),
+                sequence_number: run_state.sequence_number,
+                terminal_reason: None,
+                model_id: Some(current_model.model.clone()),
+                backend_id: Some(current_model.backend.as_str().to_string()),
+                status: ReviewRunStatus::Alive,
             },
         )?;
+        persist_review_run_state(
+            &mut run_state,
+            ReviewRunStatus::Alive,
+            None,
+            &current_head_sha,
+            &current_model,
+            restart_count,
+            Some(child.id()),
+        )?;
 
-        emit_event(
-            event_ctx,
+        emit_run_event(
             "run_start",
-            review_type,
             &current_head_sha,
             serde_json::json!({
                 "model": current_model.model,
@@ -439,10 +608,8 @@ fn run_single_review(
 
                     if is_valid_completion {
                         let tokens = extract_token_usage(&log_path);
-                        emit_event(
-                            event_ctx,
+                        emit_run_event(
                             "run_complete",
-                            review_type,
                             &current_head_sha,
                             serde_json::json!({
                                 "exit_code": exit_code.unwrap_or(0),
@@ -453,10 +620,8 @@ fn run_single_review(
                         )?;
 
                         if let Some(comment_id) = comment_id {
-                            emit_event(
-                                event_ctx,
+                            emit_run_event(
                                 "review_posted",
-                                review_type,
                                 &current_head_sha,
                                 serde_json::json!({
                                     "comment_id": comment_id,
@@ -466,10 +631,8 @@ fn run_single_review(
                         }
 
                         let latest_head = fetch_pr_head_sha(owner_repo, pr_number)?;
-                        emit_event(
-                            event_ctx,
+                        emit_run_event(
                             "pulse_check",
-                            review_type,
                             &current_head_sha,
                             serde_json::json!({
                                 "pulse_sha": latest_head,
@@ -478,10 +641,8 @@ fn run_single_review(
                         )?;
                         if !latest_head.eq_ignore_ascii_case(&current_head_sha) {
                             let old_sha = current_head_sha.clone();
-                            emit_event(
-                                event_ctx,
+                            emit_run_event(
                                 "sha_update",
-                                review_type,
                                 &old_sha,
                                 serde_json::json!({
                                     "old_sha": old_sha,
@@ -490,6 +651,15 @@ fn run_single_review(
                             )?;
                             current_head_sha.clone_from(&latest_head);
                             write_pulse_file(pr_number, review_type, &current_head_sha)?;
+                            persist_review_run_state(
+                                &mut run_state,
+                                ReviewRunStatus::Pending,
+                                Some("sha_update".to_string()),
+                                &current_head_sha,
+                                &current_model,
+                                restart_count,
+                                None,
+                            )?;
                             spawn_mode = SpawnMode::Resume {
                                 message: build_sha_update_message(
                                     pr_number,
@@ -502,27 +672,39 @@ fn run_single_review(
 
                         remove_review_state_entry(&run_key)?;
                         let tokens = extract_token_usage(&log_path);
+                        let completion_reason = completion_verdict.to_ascii_lowercase();
+                        persist_review_run_state(
+                            &mut run_state,
+                            ReviewRunStatus::Done,
+                            Some(completion_reason.clone()),
+                            &current_head_sha,
+                            &current_model,
+                            restart_count,
+                            None,
+                        )?;
 
                         return Ok(SingleReviewResult {
-                            summary: SingleReviewSummary {
-                                review_type: review_type.to_string(),
-                                success: true,
-                                verdict: completion_verdict,
-                                model: current_model.model,
-                                backend: current_model.backend.as_str().to_string(),
-                                duration_secs: review_started.elapsed().as_secs(),
+                            summary: build_single_review_summary(
+                                &run_id,
+                                sequence_number,
+                                ReviewRunStatus::Done,
+                                review_type,
+                                true,
+                                completion_verdict,
+                                Some(completion_reason),
+                                &current_model.model,
+                                current_model.backend.as_str(),
+                                review_started.elapsed().as_secs(),
                                 restart_count,
-                                tokens_used: tokens,
-                            },
+                                tokens,
+                            ),
                             final_head_sha: current_head_sha,
                         });
                     }
 
                     let comment_permission_denied = detect_comment_permission_denied(&log_path);
-                    emit_event(
-                        event_ctx,
+                    emit_run_event(
                         "run_crash",
-                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "exit_code": exit_code.unwrap_or(0),
@@ -536,27 +718,38 @@ fn run_single_review(
                     )?;
                     if comment_permission_denied {
                         remove_review_state_entry(&run_key)?;
+                        persist_review_run_state(
+                            &mut run_state,
+                            ReviewRunStatus::Crashed,
+                            Some("comment_post_permission_denied".to_string()),
+                            &current_head_sha,
+                            &current_model,
+                            restart_count,
+                            None,
+                        )?;
                         return Ok(SingleReviewResult {
-                            summary: SingleReviewSummary {
-                                review_type: review_type.to_string(),
-                                success: false,
-                                verdict: "UNKNOWN".to_string(),
-                                model: current_model.model,
-                                backend: current_model.backend.as_str().to_string(),
-                                duration_secs: review_started.elapsed().as_secs(),
+                            summary: build_single_review_summary(
+                                &run_id,
+                                sequence_number,
+                                ReviewRunStatus::Crashed,
+                                review_type,
+                                false,
+                                "UNKNOWN".to_string(),
+                                Some("comment_post_permission_denied".to_string()),
+                                &current_model.model,
+                                current_model.backend.as_str(),
+                                review_started.elapsed().as_secs(),
                                 restart_count,
-                                tokens_used: extract_token_usage(&log_path),
-                            },
+                                extract_token_usage(&log_path),
+                            ),
                             final_head_sha: current_head_sha,
                         });
                     }
                 } else {
                     let reason_is_http = detect_http_400_or_rate_limit(&log_path);
                     let reason_is_auth = detect_comment_permission_denied(&log_path);
-                    emit_event(
-                        event_ctx,
+                    emit_run_event(
                         "run_crash",
-                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "exit_code": exit_code.unwrap_or(1),
@@ -568,17 +761,30 @@ fn run_single_review(
                     )?;
                     if reason_is_auth {
                         remove_review_state_entry(&run_key)?;
+                        persist_review_run_state(
+                            &mut run_state,
+                            ReviewRunStatus::Crashed,
+                            Some("comment_post_permission_denied".to_string()),
+                            &current_head_sha,
+                            &current_model,
+                            restart_count,
+                            None,
+                        )?;
                         return Ok(SingleReviewResult {
-                            summary: SingleReviewSummary {
-                                review_type: review_type.to_string(),
-                                success: false,
-                                verdict: "UNKNOWN".to_string(),
-                                model: current_model.model,
-                                backend: current_model.backend.as_str().to_string(),
-                                duration_secs: review_started.elapsed().as_secs(),
+                            summary: build_single_review_summary(
+                                &run_id,
+                                sequence_number,
+                                ReviewRunStatus::Crashed,
+                                review_type,
+                                false,
+                                "UNKNOWN".to_string(),
+                                Some("comment_post_permission_denied".to_string()),
+                                &current_model.model,
+                                current_model.backend.as_str(),
+                                review_started.elapsed().as_secs(),
                                 restart_count,
-                                tokens_used: extract_token_usage(&log_path),
-                            },
+                                extract_token_usage(&log_path),
+                            ),
                             final_head_sha: current_head_sha,
                         });
                     }
@@ -586,17 +792,30 @@ fn run_single_review(
                     restart_count = restart_count.saturating_add(1);
                     if restart_count > MAX_RESTART_ATTEMPTS {
                         remove_review_state_entry(&run_key)?;
+                        persist_review_run_state(
+                            &mut run_state,
+                            ReviewRunStatus::Failed,
+                            Some("max_restarts_exceeded".to_string()),
+                            &current_head_sha,
+                            &current_model,
+                            restart_count,
+                            None,
+                        )?;
                         return Ok(SingleReviewResult {
-                            summary: SingleReviewSummary {
-                                review_type: review_type.to_string(),
-                                success: false,
-                                verdict: "UNKNOWN".to_string(),
-                                model: current_model.model,
-                                backend: current_model.backend.as_str().to_string(),
-                                duration_secs: review_started.elapsed().as_secs(),
+                            summary: build_single_review_summary(
+                                &run_id,
+                                sequence_number,
+                                ReviewRunStatus::Failed,
+                                review_type,
+                                false,
+                                "UNKNOWN".to_string(),
+                                Some("max_restarts_exceeded".to_string()),
+                                &current_model.model,
+                                current_model.backend.as_str(),
+                                review_started.elapsed().as_secs(),
                                 restart_count,
-                                tokens_used: extract_token_usage(&log_path),
-                            },
+                                extract_token_usage(&log_path),
+                            ),
                             final_head_sha: current_head_sha,
                         });
                     }
@@ -611,10 +830,8 @@ fn run_single_review(
                     }
                     .ok_or_else(|| "no fallback model available".to_string())?;
 
-                    emit_event(
-                        event_ctx,
+                    emit_run_event(
                         "model_fallback",
-                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "from_model": current_model.model,
@@ -624,6 +841,19 @@ fn run_single_review(
                     )?;
 
                     current_model = ensure_model_backend_available(fallback)?;
+                    persist_review_run_state(
+                        &mut run_state,
+                        ReviewRunStatus::Pending,
+                        Some(if reason_is_http {
+                            "http_400_or_rate_limit".to_string()
+                        } else {
+                            "run_crash".to_string()
+                        }),
+                        &current_head_sha,
+                        &current_model,
+                        restart_count,
+                        None,
+                    )?;
                     spawn_mode = SpawnMode::Initial;
                     continue 'restart_loop;
                 }
@@ -631,17 +861,30 @@ fn run_single_review(
                 restart_count = restart_count.saturating_add(1);
                 if restart_count > MAX_RESTART_ATTEMPTS {
                     remove_review_state_entry(&run_key)?;
+                    persist_review_run_state(
+                        &mut run_state,
+                        ReviewRunStatus::Failed,
+                        Some("max_restarts_exceeded".to_string()),
+                        &current_head_sha,
+                        &current_model,
+                        restart_count,
+                        None,
+                    )?;
                     return Ok(SingleReviewResult {
-                        summary: SingleReviewSummary {
-                            review_type: review_type.to_string(),
-                            success: false,
-                            verdict: "UNKNOWN".to_string(),
-                            model: current_model.model,
-                            backend: current_model.backend.as_str().to_string(),
-                            duration_secs: review_started.elapsed().as_secs(),
+                        summary: build_single_review_summary(
+                            &run_id,
+                            sequence_number,
+                            ReviewRunStatus::Failed,
+                            review_type,
+                            false,
+                            "UNKNOWN".to_string(),
+                            Some("max_restarts_exceeded".to_string()),
+                            &current_model.model,
+                            current_model.backend.as_str(),
+                            review_started.elapsed().as_secs(),
                             restart_count,
-                            tokens_used: extract_token_usage(&log_path),
-                        },
+                            extract_token_usage(&log_path),
+                        ),
                         final_head_sha: current_head_sha,
                     });
                 }
@@ -657,10 +900,8 @@ fn run_single_review(
                 }
                 .ok_or_else(|| "no fallback model available".to_string())?;
 
-                emit_event(
-                    event_ctx,
+                emit_run_event(
                     "model_fallback",
-                    review_type,
                     &current_head_sha,
                     serde_json::json!({
                         "from_model": current_model.model,
@@ -670,6 +911,19 @@ fn run_single_review(
                 )?;
 
                 current_model = ensure_model_backend_available(fallback)?;
+                persist_review_run_state(
+                    &mut run_state,
+                    ReviewRunStatus::Pending,
+                    Some(if reason_is_http {
+                        "http_400_or_rate_limit".to_string()
+                    } else {
+                        "invalid_completion".to_string()
+                    }),
+                    &current_head_sha,
+                    &current_model,
+                    restart_count,
+                    None,
+                )?;
                 spawn_mode = SpawnMode::Initial;
                 continue 'restart_loop;
             }
@@ -678,10 +932,8 @@ fn run_single_review(
 
             if last_pulse_check.elapsed() >= PULSE_POLL_INTERVAL {
                 let latest_head = fetch_pr_head_sha(owner_repo, pr_number)?;
-                emit_event(
-                    event_ctx,
+                emit_run_event(
                     "pulse_check",
-                    review_type,
                     &current_head_sha,
                     serde_json::json!({
                         "pulse_sha": latest_head,
@@ -691,10 +943,8 @@ fn run_single_review(
                 last_pulse_check = Instant::now();
 
                 if !latest_head.eq_ignore_ascii_case(&current_head_sha) {
-                    emit_event(
-                        event_ctx,
+                    emit_run_event(
                         "sha_update",
-                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "old_sha": current_head_sha,
@@ -705,6 +955,15 @@ fn run_single_review(
                     let old_sha = current_head_sha.clone();
                     current_head_sha.clone_from(&latest_head);
                     write_pulse_file(pr_number, review_type, &current_head_sha)?;
+                    persist_review_run_state(
+                        &mut run_state,
+                        ReviewRunStatus::Pending,
+                        Some("sha_update".to_string()),
+                        &current_head_sha,
+                        &current_model,
+                        restart_count,
+                        None,
+                    )?;
                     spawn_mode = SpawnMode::Resume {
                         message: build_sha_update_message(pr_number, &old_sha, &latest_head),
                     };
@@ -720,10 +979,8 @@ fn run_single_review(
                 }
                 let idle_secs = last_progress_at.elapsed().as_secs();
 
-                emit_event(
-                    event_ctx,
+                emit_run_event(
                     "liveness_check",
-                    review_type,
                     &current_head_sha,
                     serde_json::json!({
                         "events_since_last": liveness.events_since_last,
@@ -747,10 +1004,8 @@ fn run_single_review(
                     });
                     if completion_verdict != "UNKNOWN" {
                         let tokens = extract_token_usage(&log_path);
-                        emit_event(
-                            event_ctx,
+                        emit_run_event(
                             "run_complete",
-                            review_type,
                             &current_head_sha,
                             serde_json::json!({
                                 "exit_code": 0,
@@ -760,10 +1015,8 @@ fn run_single_review(
                                 "tokens_used": tokens,
                             }),
                         )?;
-                        emit_event(
-                            event_ctx,
+                        emit_run_event(
                             "review_posted",
-                            review_type,
                             &current_head_sha,
                             serde_json::json!({
                                 "comment_id": posted_review.id,
@@ -772,27 +1025,39 @@ fn run_single_review(
                             }),
                         )?;
                         remove_review_state_entry(&run_key)?;
+                        let completion_reason = completion_verdict.to_ascii_lowercase();
+                        persist_review_run_state(
+                            &mut run_state,
+                            ReviewRunStatus::Done,
+                            Some(completion_reason.clone()),
+                            &current_head_sha,
+                            &current_model,
+                            restart_count,
+                            None,
+                        )?;
                         return Ok(SingleReviewResult {
-                            summary: SingleReviewSummary {
-                                review_type: review_type.to_string(),
-                                success: true,
-                                verdict: completion_verdict,
-                                model: current_model.model,
-                                backend: current_model.backend.as_str().to_string(),
-                                duration_secs: review_started.elapsed().as_secs(),
+                            summary: build_single_review_summary(
+                                &run_id,
+                                sequence_number,
+                                ReviewRunStatus::Done,
+                                review_type,
+                                true,
+                                completion_verdict,
+                                Some(completion_reason),
+                                &current_model.model,
+                                current_model.backend.as_str(),
+                                review_started.elapsed().as_secs(),
                                 restart_count,
-                                tokens_used: extract_token_usage(&log_path),
-                            },
+                                extract_token_usage(&log_path),
+                            ),
                             final_head_sha: current_head_sha,
                         });
                     }
                 }
 
                 if detect_comment_permission_denied(&log_path) {
-                    emit_event(
-                        event_ctx,
+                    emit_run_event(
                         "run_crash",
-                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "exit_code": -1,
@@ -804,26 +1069,37 @@ fn run_single_review(
                     )?;
                     super::terminate_child(&mut child)?;
                     remove_review_state_entry(&run_key)?;
+                    persist_review_run_state(
+                        &mut run_state,
+                        ReviewRunStatus::Crashed,
+                        Some("comment_post_permission_denied".to_string()),
+                        &current_head_sha,
+                        &current_model,
+                        restart_count,
+                        None,
+                    )?;
                     return Ok(SingleReviewResult {
-                        summary: SingleReviewSummary {
-                            review_type: review_type.to_string(),
-                            success: false,
-                            verdict: "UNKNOWN".to_string(),
-                            model: current_model.model,
-                            backend: current_model.backend.as_str().to_string(),
-                            duration_secs: review_started.elapsed().as_secs(),
+                        summary: build_single_review_summary(
+                            &run_id,
+                            sequence_number,
+                            ReviewRunStatus::Crashed,
+                            review_type,
+                            false,
+                            "UNKNOWN".to_string(),
+                            Some("comment_post_permission_denied".to_string()),
+                            &current_model.model,
+                            current_model.backend.as_str(),
+                            review_started.elapsed().as_secs(),
                             restart_count,
-                            tokens_used: extract_token_usage(&log_path),
-                        },
+                            extract_token_usage(&log_path),
+                        ),
                         final_head_sha: current_head_sha,
                     });
                 }
 
                 if last_progress_at.elapsed() >= STALL_THRESHOLD {
-                    emit_event(
-                        event_ctx,
+                    emit_run_event(
                         "stall_detected",
-                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "stall_duration_secs": last_progress_at.elapsed().as_secs(),
@@ -836,27 +1112,38 @@ fn run_single_review(
                     restart_count = restart_count.saturating_add(1);
                     if restart_count > MAX_RESTART_ATTEMPTS {
                         remove_review_state_entry(&run_key)?;
+                        persist_review_run_state(
+                            &mut run_state,
+                            ReviewRunStatus::Failed,
+                            Some("max_restarts_exceeded".to_string()),
+                            &current_head_sha,
+                            &current_model,
+                            restart_count,
+                            None,
+                        )?;
                         return Ok(SingleReviewResult {
-                            summary: SingleReviewSummary {
-                                review_type: review_type.to_string(),
-                                success: false,
-                                verdict: "UNKNOWN".to_string(),
-                                model: current_model.model,
-                                backend: current_model.backend.as_str().to_string(),
-                                duration_secs: review_started.elapsed().as_secs(),
+                            summary: build_single_review_summary(
+                                &run_id,
+                                sequence_number,
+                                ReviewRunStatus::Failed,
+                                review_type,
+                                false,
+                                "UNKNOWN".to_string(),
+                                Some("max_restarts_exceeded".to_string()),
+                                &current_model.model,
+                                current_model.backend.as_str(),
+                                review_started.elapsed().as_secs(),
                                 restart_count,
-                                tokens_used: extract_token_usage(&log_path),
-                            },
+                                extract_token_usage(&log_path),
+                            ),
                             final_head_sha: current_head_sha,
                         });
                     }
 
                     let fallback = select_fallback_model(&current_model.model)
                         .ok_or_else(|| "no fallback model available after stall".to_string())?;
-                    emit_event(
-                        event_ctx,
+                    emit_run_event(
                         "model_fallback",
-                        review_type,
                         &current_head_sha,
                         serde_json::json!({
                             "from_model": current_model.model,
@@ -865,6 +1152,15 @@ fn run_single_review(
                         }),
                     )?;
                     current_model = ensure_model_backend_available(fallback)?;
+                    persist_review_run_state(
+                        &mut run_state,
+                        ReviewRunStatus::Pending,
+                        Some("stall_detected".to_string()),
+                        &current_head_sha,
+                        &current_model,
+                        restart_count,
+                        None,
+                    )?;
                     spawn_mode = SpawnMode::Initial;
                     continue 'restart_loop;
                 }
