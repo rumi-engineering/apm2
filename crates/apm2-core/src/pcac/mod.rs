@@ -37,6 +37,7 @@
 //! All types enforce fail-closed semantics: missing required fields, unknown
 //! enum variants, and ambiguous authority states produce deterministic denials.
 
+mod auth_verifier;
 mod deny;
 mod kernel;
 mod receipts;
@@ -45,6 +46,11 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use auth_verifier::{
+    BindingExpectations, FactClass, MAX_MERKLE_INCLUSION_PROOF_DEPTH, MAX_REPLAY_LIFECYCLE_ENTRIES,
+    ReplayLifecycleEntry, classify_fact, validate_authoritative_bindings,
+    validate_replay_lifecycle_order, verify_receipt_authentication,
+};
 pub use deny::{AuthorityDenyClass, AuthorityDenyV1};
 pub use kernel::AuthorityJoinKernel;
 pub use receipts::{
