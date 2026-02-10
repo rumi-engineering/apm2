@@ -665,6 +665,7 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_channel_context_signer(Arc::new(apm2_core::crypto::Signer::generate()))
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
                 .with_telemetry_store(telemetry_store);
@@ -753,6 +754,7 @@ impl DispatcherState {
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_channel_context_signer(Arc::new(apm2_core::crypto::Signer::generate()))
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
                 .with_telemetry_store(telemetry_store);
@@ -824,6 +826,7 @@ impl DispatcherState {
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
         let sqlite_conn_for_pcac = sqlite_conn.clone();
+        let mut channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
         let mut sovereignty_trusted_signer_key = ledger_signing_key
             .as_ref()
             .map(|key| key.verifying_key().to_bytes());
@@ -854,6 +857,7 @@ impl DispatcherState {
                 use rand::rngs::OsRng;
                 ed25519_dalek::SigningKey::generate(&mut OsRng)
             });
+            channel_context_signer = Arc::new(apm2_core::crypto::Signer::new(signing_key.clone()));
             sovereignty_trusted_signer_key = Some(signing_key.verifying_key().to_bytes());
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
@@ -1037,6 +1041,7 @@ impl DispatcherState {
         // enforcement and lifecycle gate wiring.
         let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
                 .with_telemetry_store(telemetry_store)
@@ -1231,6 +1236,7 @@ impl DispatcherState {
             use rand::rngs::OsRng;
             ed25519_dalek::SigningKey::generate(&mut OsRng)
         });
+        let channel_context_signer = Arc::new(apm2_core::crypto::Signer::new(signing_key.clone()));
         let sovereignty_trusted_signer_key = signing_key.verifying_key().to_bytes();
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());
@@ -1457,6 +1463,7 @@ impl DispatcherState {
             privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
         let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
                 .with_ledger(event_emitter)

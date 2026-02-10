@@ -754,6 +754,10 @@ pub struct RequestToolResponse {
     /// TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
     #[prost(bytes = "vec", optional, tag = "6")]
     pub inline_result: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Daemon-issued signed channel context token for FAC role-launch authorization.
+    /// Present when authoritative channel-boundary checks pass for launch-relevant tools.
+    #[prost(string, optional, tag = "11")]
+    pub channel_context_token: ::core::option::Option<::prost::alloc::string::String>,
     /// TCK-00351: Pre-actuation stop check proof.
     /// True indicates stop conditions were evaluated and cleared before actuation.
     /// False or absent indicates stop check was not performed (fail-closed: deny).

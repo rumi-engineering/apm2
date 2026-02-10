@@ -184,6 +184,11 @@ pub struct HelloAck {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_canonicalizers: Vec<CanonicalizerInfo>,
 
+    /// Daemon Ed25519 verifying key (hex-encoded) used for signed authority
+    /// tokens.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub daemon_signing_public_key: String,
+
     /// Whether a contract mismatch was detected and waived (TCK-00348).
     ///
     /// `true` if the client's `cli_contract_hash` differs from the
@@ -204,6 +209,7 @@ impl HelloAck {
             capabilities: Vec::new(),
             server_contract_hash: String::new(),
             server_canonicalizers: Vec::new(),
+            daemon_signing_public_key: String::new(),
             contract_mismatch_waived: false,
         }
     }
@@ -233,6 +239,13 @@ impl HelloAck {
     #[must_use]
     pub fn with_server_canonicalizers(mut self, canonicalizers: Vec<CanonicalizerInfo>) -> Self {
         self.server_canonicalizers = canonicalizers;
+        self
+    }
+
+    /// Set the daemon signing public key (hex-encoded).
+    #[must_use]
+    pub fn with_daemon_signing_public_key(mut self, key_hex: impl Into<String>) -> Self {
+        self.daemon_signing_public_key = key_hex.into();
         self
     }
 
@@ -487,6 +500,10 @@ pub struct ServerHandshake {
     /// Server's supported canonicalizers (TCK-00348).
     server_canonicalizers: Vec<CanonicalizerInfo>,
 
+    /// Daemon Ed25519 verifying key (hex-encoded) used for signed authority
+    /// tokens.
+    daemon_signing_public_key: String,
+
     /// Risk tier for mismatch policy evaluation (TCK-00348).
     risk_tier: crate::hsi_contract::RiskTier,
 
@@ -505,6 +522,7 @@ impl ServerHandshake {
             negotiated_version: None,
             server_contract_hash: String::new(),
             server_canonicalizers: Vec::new(),
+            daemon_signing_public_key: String::new(),
             risk_tier: crate::hsi_contract::RiskTier::Tier0,
             mismatch_outcome: None,
         }
@@ -528,6 +546,13 @@ impl ServerHandshake {
     #[must_use]
     pub fn with_server_canonicalizers(mut self, canonicalizers: Vec<CanonicalizerInfo>) -> Self {
         self.server_canonicalizers = canonicalizers;
+        self
+    }
+
+    /// Set the daemon signing public key (hex-encoded).
+    #[must_use]
+    pub fn with_daemon_signing_public_key(mut self, key_hex: impl Into<String>) -> Self {
+        self.daemon_signing_public_key = key_hex.into();
         self
     }
 
@@ -626,6 +651,9 @@ impl ServerHandshake {
         if !self.server_canonicalizers.is_empty() {
             ack = ack.with_server_canonicalizers(self.server_canonicalizers.clone());
         }
+        if !self.daemon_signing_public_key.is_empty() {
+            ack = ack.with_daemon_signing_public_key(&self.daemon_signing_public_key);
+        }
         if mismatch_waived {
             ack = ack.with_contract_mismatch_waived(true);
         }
@@ -688,6 +716,8 @@ pub struct ClientHandshake {
 
     /// Server info from `HelloAck`.
     server_info: Option<String>,
+    /// Daemon signing public key (hex-encoded) from `HelloAck`.
+    daemon_signing_public_key: Option<String>,
 }
 
 impl ClientHandshake {
@@ -699,6 +729,7 @@ impl ClientHandshake {
             state: HandshakeState::AwaitingHello,
             negotiated_version: None,
             server_info: None,
+            daemon_signing_public_key: None,
         }
     }
 
@@ -719,6 +750,8 @@ impl ClientHandshake {
                 self.state = HandshakeState::Completed;
                 self.negotiated_version = Some(ack.protocol_version);
                 self.server_info = Some(ack.server_info);
+                self.daemon_signing_public_key = (!ack.daemon_signing_public_key.is_empty())
+                    .then_some(ack.daemon_signing_public_key);
                 Ok(())
             },
             HandshakeMessage::HelloNack(nack) => {
@@ -755,6 +788,12 @@ impl ClientHandshake {
     #[must_use]
     pub fn server_info(&self) -> Option<&str> {
         self.server_info.as_deref()
+    }
+
+    /// Returns the daemon signing public key (hex-encoded), if provided.
+    #[must_use]
+    pub fn daemon_signing_public_key(&self) -> Option<&str> {
+        self.daemon_signing_public_key.as_deref()
     }
 
     /// Returns `true` if the handshake completed successfully.

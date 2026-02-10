@@ -13,8 +13,9 @@ use anyhow::{Result, anyhow};
 use apm2_core::channel::derive_channel_source_witness;
 use apm2_core::channel::{
     ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
-    decode_channel_context_token, validate_channel_boundary, verify_channel_source_witness,
+    decode_channel_context_token, validate_channel_boundary,
 };
+use apm2_core::crypto::VerifyingKey;
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::fac::{DenyCondition, RoleSpecV2};
 use apm2_core::ledger::{Ledger, LedgerError};
@@ -22,6 +23,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::client::protocol::OperatorClient;
 use crate::exit_codes::codes as exit_codes;
 
 /// Maximum allowed size for a CAS object read by this command (64 MiB).
@@ -325,9 +327,16 @@ pub fn handle_role_launch(
     args: &RoleLaunchArgs,
     ledger_path: &Path,
     cas_path: &Path,
+    operator_socket_path: &Path,
     json: bool,
 ) -> Result<()> {
-    match execute_role_launch(args, ledger_path, cas_path) {
+    let daemon_verifying_key = resolve_daemon_channel_verifying_key(args, operator_socket_path);
+    match execute_role_launch_with_daemon_verifying_key(
+        args,
+        ledger_path,
+        cas_path,
+        daemon_verifying_key.as_ref(),
+    ) {
         Ok(response) => {
             output_success(&response, json);
             Ok(())
@@ -339,17 +348,41 @@ pub fn handle_role_launch(
     }
 }
 
-fn execute_role_launch(
+fn execute_role_launch_with_daemon_verifying_key(
     args: &RoleLaunchArgs,
     ledger_path: &Path,
     cas_path: &Path,
+    daemon_verifying_key: Option<&VerifyingKey>,
 ) -> std::result::Result<RoleLaunchResponse, RoleLaunchError> {
-    let channel_context = resolve_channel_context(args);
+    let channel_context = resolve_channel_context(args, daemon_verifying_key);
     execute_role_launch_with_channel_context(args, ledger_path, cas_path, channel_context)
 }
 
-fn resolve_channel_context(args: &RoleLaunchArgs) -> RoleLaunchChannelContext {
+fn resolve_daemon_channel_verifying_key(
+    args: &RoleLaunchArgs,
+    operator_socket_path: &Path,
+) -> Option<VerifyingKey> {
+    args.channel_context_token.as_ref()?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        let client = OperatorClient::connect(operator_socket_path).await.ok()?;
+        let key_bytes = client.daemon_signing_public_key()?;
+        apm2_core::crypto::parse_verifying_key(key_bytes).ok()
+    })
+}
+
+fn resolve_channel_context(
+    args: &RoleLaunchArgs,
+    daemon_verifying_key: Option<&VerifyingKey>,
+) -> RoleLaunchChannelContext {
     let Some(token) = args.channel_context_token.as_deref() else {
+        return RoleLaunchChannelContext::direct_cli_fail_closed();
+    };
+    let Some(daemon_verifying_key) = daemon_verifying_key else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
 
@@ -357,17 +390,13 @@ fn resolve_channel_context(args: &RoleLaunchArgs) -> RoleLaunchChannelContext {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     }
 
-    let Ok(check) = decode_channel_context_token(token) else {
+    let Ok(check) = decode_channel_context_token(token, daemon_verifying_key) else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
 
     let Some(witness) = check.channel_source_witness else {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
     };
-
-    if !verify_channel_source_witness(ChannelSource::TypedToolIntent, &witness) {
-        return RoleLaunchChannelContext::direct_cli_fail_closed();
-    }
 
     if check.source != ChannelSource::TypedToolIntent {
         return RoleLaunchChannelContext::direct_cli_fail_closed();
@@ -1334,6 +1363,7 @@ impl From<LedgerError> for RoleLaunchError {
 #[cfg(test)]
 mod tests {
     use apm2_core::channel::issue_channel_context_token;
+    use apm2_core::crypto::Signer;
     use apm2_core::fac::fac_workobject_implementor_v2_role_contract;
     use apm2_core::ledger::EventRecord;
 
@@ -1791,8 +1821,13 @@ mod tests {
     #[test]
     fn test_direct_cli_context_defaults_fail_closed() {
         let env = setup_test_env();
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("direct CLI launch without daemon context should fail closed");
+        let error = execute_role_launch_with_daemon_verifying_key(
+            &env.args,
+            &env.ledger_path,
+            &env.cas_path,
+            None,
+        )
+        .expect_err("direct CLI launch without daemon context should fail closed");
         match error {
             RoleLaunchError::Denied {
                 reason: LaunchDenyReason::ChannelBoundaryViolation { ref violations, .. },
@@ -1818,6 +1853,8 @@ mod tests {
     #[test]
     fn test_daemon_channel_context_token_allows_launch() {
         let mut env = setup_test_env();
+        let signer = Signer::generate();
+        let daemon_verifying_key = signer.verifying_key();
         let check = ChannelBoundaryCheck {
             source: ChannelSource::TypedToolIntent,
             channel_source_witness: Some(derive_channel_source_witness(
@@ -1828,11 +1865,17 @@ mod tests {
             context_firewall_verified: true,
             policy_ledger_verified: true,
         };
-        env.args.channel_context_token =
-            Some(issue_channel_context_token(&check).expect("token issuance should succeed"));
+        env.args.channel_context_token = Some(
+            issue_channel_context_token(&check, &signer).expect("token issuance should succeed"),
+        );
 
-        let response = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect("daemon-issued channel context token should admit launch");
+        let response = execute_role_launch_with_daemon_verifying_key(
+            &env.args,
+            &env.ledger_path,
+            &env.cas_path,
+            Some(&daemon_verifying_key),
+        )
+        .expect("daemon-issued channel context token should admit launch");
         assert_eq!(response.work_id, env.args.work_id);
         assert_eq!(response.role, env.args.role);
     }
@@ -1840,10 +1883,17 @@ mod tests {
     #[test]
     fn test_invalid_channel_context_token_fails_closed() {
         let mut env = setup_test_env();
+        let signer = Signer::generate();
+        let daemon_verifying_key = signer.verifying_key();
         env.args.channel_context_token = Some("not-base64-token".to_string());
 
-        let error = execute_role_launch(&env.args, &env.ledger_path, &env.cas_path)
-            .expect_err("invalid token should fail closed to direct CLI denial");
+        let error = execute_role_launch_with_daemon_verifying_key(
+            &env.args,
+            &env.ledger_path,
+            &env.cas_path,
+            Some(&daemon_verifying_key),
+        )
+        .expect_err("invalid token should fail closed to direct CLI denial");
         match error {
             RoleLaunchError::Denied {
                 reason: LaunchDenyReason::ChannelBoundaryViolation { violations, .. },

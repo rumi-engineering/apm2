@@ -7,6 +7,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::crypto::{Signature, Signer, VerifyingKey, parse_signature, verify_signature};
+
 /// Maximum string length for channel enforcement detail fields.
 pub const MAX_CHANNEL_DETAIL_LENGTH: usize = 512;
 const CHANNEL_SOURCE_WITNESS_DOMAIN: &[u8] = b"apm2.channel_source_witness.v1";
@@ -57,18 +59,26 @@ pub struct ChannelBoundaryCheck {
     pub policy_ledger_verified: bool,
 }
 
-/// Serialized channel context token payload.
+/// Serialized channel context payload signed by the daemon signer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
-struct ChannelContextTokenV1 {
-    schema_id: String,
+struct ChannelContextTokenPayloadV1 {
     source: ChannelSource,
     channel_source_witness: [u8; 32],
     broker_verified: bool,
     capability_verified: bool,
     context_firewall_verified: bool,
     policy_ledger_verified: bool,
+}
+
+/// Serialized signed channel context token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelContextTokenV1 {
+    schema_id: String,
+    payload: ChannelContextTokenPayloadV1,
+    signature: String,
 }
 
 /// Channel context token decode/encode errors.
@@ -106,6 +116,15 @@ pub enum ChannelContextTokenError {
     /// Token witness did not validate against the claimed source.
     #[error("channel context token witness verification failed")]
     WitnessVerificationFailed,
+    /// Token signature was malformed.
+    #[error("channel context token signature is invalid: {detail}")]
+    InvalidSignature {
+        /// Signature decode/parse detail.
+        detail: String,
+    },
+    /// Token signature did not verify against the daemon public key.
+    #[error("channel context token signature verification failed")]
+    SignatureVerificationFailed,
 }
 
 /// Channel boundary violation defect.
@@ -161,11 +180,24 @@ pub fn derive_channel_source_witness(source: ChannelSource) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Validates a channel source witness token.
-#[must_use]
-pub fn verify_channel_source_witness(source: ChannelSource, witness: &[u8; 32]) -> bool {
+fn matches_channel_source_witness(source: ChannelSource, witness: &[u8; 32]) -> bool {
     let expected = derive_channel_source_witness(source);
     bool::from(expected.ct_eq(witness))
+}
+
+/// Validates a channel source witness token and daemon signature.
+#[must_use]
+pub fn verify_channel_source_witness(
+    source: ChannelSource,
+    witness: &[u8; 32],
+    signed_payload: &[u8],
+    signature: &Signature,
+    daemon_verifying_key: &VerifyingKey,
+) -> bool {
+    if !matches_channel_source_witness(source, witness) {
+        return false;
+    }
+    verify_signature(daemon_verifying_key, signed_payload, signature).is_ok()
 }
 
 /// Issues a base64-encoded channel context token from a boundary check.
@@ -179,13 +211,13 @@ pub fn verify_channel_source_witness(source: ChannelSource, witness: &[u8; 32]) 
 /// serialization fails.
 pub fn issue_channel_context_token(
     check: &ChannelBoundaryCheck,
+    signer: &Signer,
 ) -> Result<String, ChannelContextTokenError> {
     let Some(channel_source_witness) = check.channel_source_witness else {
         return Err(ChannelContextTokenError::MissingWitness);
     };
 
-    let payload = ChannelContextTokenV1 {
-        schema_id: CHANNEL_CONTEXT_TOKEN_SCHEMA_ID.to_string(),
+    let payload = ChannelContextTokenPayloadV1 {
         source: check.source,
         channel_source_witness,
         broker_verified: check.broker_verified,
@@ -198,7 +230,17 @@ pub fn issue_channel_context_token(
         serde_json::to_vec(&payload).map_err(|error| ChannelContextTokenError::InvalidJson {
             detail: error.to_string(),
         })?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(payload_json))
+    let signature = signer.sign(&payload_json);
+    let token = ChannelContextTokenV1 {
+        schema_id: CHANNEL_CONTEXT_TOKEN_SCHEMA_ID.to_string(),
+        payload,
+        signature: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+    };
+    let token_json =
+        serde_json::to_vec(&token).map_err(|error| ChannelContextTokenError::InvalidJson {
+            detail: error.to_string(),
+        })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(token_json))
 }
 
 /// Decodes and verifies a base64-encoded channel context token.
@@ -209,6 +251,7 @@ pub fn issue_channel_context_token(
 /// has an invalid source witness.
 pub fn decode_channel_context_token(
     token: &str,
+    daemon_verifying_key: &VerifyingKey,
 ) -> Result<ChannelBoundaryCheck, ChannelContextTokenError> {
     if token.len() > MAX_CHANNEL_CONTEXT_TOKEN_LEN {
         return Err(ChannelContextTokenError::TokenTooLong {
@@ -235,17 +278,45 @@ pub fn decode_channel_context_token(
         });
     }
 
-    if !verify_channel_source_witness(payload.source, &payload.channel_source_witness) {
+    let payload_json = serde_json::to_vec(&payload.payload).map_err(|error| {
+        ChannelContextTokenError::InvalidJson {
+            detail: error.to_string(),
+        }
+    })?;
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&payload.signature)
+        .map_err(|error| ChannelContextTokenError::InvalidSignature {
+            detail: error.to_string(),
+        })?;
+    let signature = parse_signature(&signature_bytes).map_err(|error| {
+        ChannelContextTokenError::InvalidSignature {
+            detail: error.to_string(),
+        }
+    })?;
+
+    if !matches_channel_source_witness(
+        payload.payload.source,
+        &payload.payload.channel_source_witness,
+    ) {
         return Err(ChannelContextTokenError::WitnessVerificationFailed);
+    }
+    if !verify_channel_source_witness(
+        payload.payload.source,
+        &payload.payload.channel_source_witness,
+        &payload_json,
+        &signature,
+        daemon_verifying_key,
+    ) {
+        return Err(ChannelContextTokenError::SignatureVerificationFailed);
     }
 
     Ok(ChannelBoundaryCheck {
-        source: payload.source,
-        channel_source_witness: Some(payload.channel_source_witness),
-        broker_verified: payload.broker_verified,
-        capability_verified: payload.capability_verified,
-        context_firewall_verified: payload.context_firewall_verified,
-        policy_ledger_verified: payload.policy_ledger_verified,
+        source: payload.payload.source,
+        channel_source_witness: Some(payload.payload.channel_source_witness),
+        broker_verified: payload.payload.broker_verified,
+        capability_verified: payload.payload.capability_verified,
+        context_firewall_verified: payload.payload.context_firewall_verified,
+        policy_ledger_verified: payload.payload.policy_ledger_verified,
     })
 }
 
@@ -314,7 +385,7 @@ fn resolve_effective_source(
     }
 
     if let Some(witness) = check.channel_source_witness {
-        if verify_channel_source_witness(ChannelSource::TypedToolIntent, &witness) {
+        if matches_channel_source_witness(ChannelSource::TypedToolIntent, &witness) {
             ChannelSource::TypedToolIntent
         } else {
             defects.push(ChannelBoundaryDefect::new(
@@ -533,15 +604,17 @@ mod tests {
     #[test]
     fn test_channel_context_token_roundtrip() {
         let check = baseline_check();
-        let token = issue_channel_context_token(&check).expect("token should encode");
-        let decoded = decode_channel_context_token(&token).expect("token should decode");
+        let signer = Signer::generate();
+        let token = issue_channel_context_token(&check, &signer).expect("token should encode");
+        let decoded = decode_channel_context_token(&token, &signer.verifying_key())
+            .expect("token should decode");
         assert_eq!(decoded, check);
     }
 
     #[test]
     fn test_channel_context_token_rejects_invalid_witness() {
-        let payload = ChannelContextTokenV1 {
-            schema_id: CHANNEL_CONTEXT_TOKEN_SCHEMA_ID.to_string(),
+        let signer = Signer::generate();
+        let payload = ChannelContextTokenPayloadV1 {
             source: ChannelSource::TypedToolIntent,
             channel_source_witness: [0xCC; 32],
             broker_verified: true,
@@ -550,12 +623,57 @@ mod tests {
             policy_ledger_verified: true,
         };
         let payload_json = serde_json::to_vec(&payload).expect("payload should serialize");
-        let token = base64::engine::general_purpose::STANDARD.encode(payload_json);
+        let token_payload = ChannelContextTokenV1 {
+            schema_id: CHANNEL_CONTEXT_TOKEN_SCHEMA_ID.to_string(),
+            payload,
+            signature: base64::engine::general_purpose::STANDARD
+                .encode(signer.sign(&payload_json).to_bytes()),
+        };
+        let token = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&token_payload).expect("token payload should serialize"));
 
-        let result = decode_channel_context_token(&token);
+        let result = decode_channel_context_token(&token, &signer.verifying_key());
         assert_eq!(
             result,
             Err(ChannelContextTokenError::WitnessVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn test_forged_token_rejected() {
+        let check = baseline_check();
+        let daemon_signer = Signer::generate();
+        let attacker_signer = Signer::generate();
+        let forged_token = issue_channel_context_token(&check, &attacker_signer)
+            .expect("attacker token should encode");
+
+        let result = decode_channel_context_token(&forged_token, &daemon_signer.verifying_key());
+        assert_eq!(
+            result,
+            Err(ChannelContextTokenError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn test_tampered_token_rejected() {
+        let check = baseline_check();
+        let signer = Signer::generate();
+        let token = issue_channel_context_token(&check, &signer).expect("token should encode");
+
+        let token_json = base64::engine::general_purpose::STANDARD
+            .decode(token)
+            .expect("token should be valid base64");
+        let mut token_payload: ChannelContextTokenV1 =
+            serde_json::from_slice(&token_json).expect("token payload should parse");
+        token_payload.payload.policy_ledger_verified = false;
+
+        let tampered_token = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&token_payload).expect("tampered token should serialize"));
+
+        let result = decode_channel_context_token(&tampered_token, &signer.verifying_key());
+        assert_eq!(
+            result,
+            Err(ChannelContextTokenError::SignatureVerificationFailed)
         );
     }
 }

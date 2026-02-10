@@ -652,6 +652,8 @@ fn channel_boundary_dispatcher() -> &'static PrivilegedDispatcher {
 pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Token minter for validation.
     token_minter: TokenMinter,
+    /// Daemon signer used to issue channel context tokens.
+    channel_context_signer: Arc<apm2_core::crypto::Signer>,
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
     /// Manifest store for capability validation (TCK-00260).
@@ -795,6 +797,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
     pub fn new(token_minter: TokenMinter) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config: DecodeConfig::default(),
             manifest_store: None,
             ledger: None,
@@ -824,6 +827,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
     pub fn with_decode_config(token_minter: TokenMinter, decode_config: DecodeConfig) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config,
             manifest_store: None,
             ledger: None,
@@ -858,6 +862,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     pub fn with_manifest_store(token_minter: TokenMinter, manifest_store: Arc<M>) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config: DecodeConfig::default(),
             manifest_store: Some(manifest_store),
             ledger: None,
@@ -892,6 +897,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config,
             manifest_store: Some(manifest_store),
             ledger: None,
@@ -942,6 +948,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ) -> Self {
         Self {
             token_minter,
+            channel_context_signer: Arc::new(apm2_core::crypto::Signer::generate()),
             decode_config: DecodeConfig::default(),
             manifest_store: Some(manifest_store),
             ledger: Some(ledger),
@@ -970,6 +977,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_ledger(mut self, ledger: Arc<dyn LedgerEventEmitter>) -> Self {
         self.ledger = Some(ledger);
+        self
+    }
+
+    /// Sets the signer used for channel context token issuance.
+    #[must_use]
+    pub fn with_channel_context_signer(mut self, signer: Arc<apm2_core::crypto::Signer>) -> Self {
+        self.channel_context_signer = signer;
         self
     }
 
@@ -1609,12 +1623,30 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         )
     }
 
+    const fn tool_decision_broker_verified(
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+    ) -> bool {
+        matches!(
+            decision,
+            Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
+        )
+    }
+
+    const fn tool_decision_capability_verified(
+        decision: &Result<ToolDecision, crate::episode::BrokerError>,
+    ) -> bool {
+        matches!(
+            decision,
+            Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
+        )
+    }
+
     const fn tool_decision_policy_verified(
         decision: &Result<ToolDecision, crate::episode::BrokerError>,
     ) -> bool {
         matches!(
             decision,
-            Ok(ToolDecision::Allow { .. } | ToolDecision::Deny { .. })
+            Ok(ToolDecision::Allow { .. } | ToolDecision::DedupeCacheHit { .. })
         )
     }
 
@@ -2943,35 +2975,54 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         let channel_context_token = if Self::requires_channel_boundary_enforcement(tool_class) {
             let policy_verified = Self::tool_decision_policy_verified(&decision);
-            let broker_verified = true;
-            let capability_verified = true;
+            let broker_verified = Self::tool_decision_broker_verified(&decision);
+            let capability_verified = Self::tool_decision_capability_verified(&decision);
             let context_firewall_verified = defects.is_empty();
+            let all_verification_flags_true = broker_verified
+                && capability_verified
+                && context_firewall_verified
+                && policy_verified;
 
-            match channel_boundary_dispatcher().validate_channel_boundary_and_issue_context_token(
-                &tool_class,
-                policy_verified,
-                broker_verified,
-                capability_verified,
-                context_firewall_verified,
-            ) {
-                Ok(token) => Some(token),
-                Err(defects) => {
-                    let defects_json = Self::format_channel_boundary_defects(&defects);
-                    warn!(
-                        session_id = %token.session_id,
-                        tool_class = %tool_class,
-                        defects = %defects_json,
-                        "RequestTool denied by channel-boundary enforcement"
-                    );
-                    return Ok(SessionResponse::error(
-                        SessionErrorCode::SessionErrorToolNotAllowed,
-                        format!("channel boundary validation failed: {defects_json}"),
-                    ));
-                },
+            if all_verification_flags_true {
+                match channel_boundary_dispatcher()
+                    .validate_channel_boundary_and_issue_context_token(
+                        self.channel_context_signer.as_ref(),
+                        &tool_class,
+                        policy_verified,
+                        broker_verified,
+                        capability_verified,
+                        context_firewall_verified,
+                    ) {
+                    Ok(token) => Some(token),
+                    Err(defects) => {
+                        let defects_json = Self::format_channel_boundary_defects(&defects);
+                        warn!(
+                            session_id = %token.session_id,
+                            tool_class = %tool_class,
+                            defects = %defects_json,
+                            "RequestTool denied by channel-boundary enforcement"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorToolNotAllowed,
+                            format!("channel boundary validation failed: {defects_json}"),
+                        ));
+                    },
+                }
+            } else {
+                None
             }
         } else {
             None
         };
+
+        if let Some(channel_context_token) = channel_context_token.as_deref() {
+            debug!(
+                session_id = %token.session_id,
+                tool_class = %tool_class,
+                token_len = channel_context_token.len(),
+                "channel context token issued for actuation request"
+            );
+        }
 
         let mut response = self.handle_broker_decision(
             decision,
@@ -2984,16 +3035,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             verified_content,
             toctou_verification_required,
             pending_pcac,
+            channel_context_token,
         );
-
-        if let Some(channel_context_token) = channel_context_token.as_deref() {
-            debug!(
-                session_id = %token.session_id,
-                tool_class = %tool_class,
-                token_len = channel_context_token.len(),
-                "channel context token issued for actuation request"
-            );
-        }
 
         if !defects.is_empty() {
             let has_mandatory_termination_defect = defects
@@ -3100,6 +3143,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         mut verified_content: Option<VerifiedToolContent>,
         toctou_verification_required: bool,
         pending_pcac: Option<PendingPcacAuthority>,
+        channel_context_token: Option<String>,
     ) -> ProtocolResult<SessionResponse> {
         let timestamp_ns = actuation_timestamp.wall_ns;
         match decision {
@@ -3616,6 +3660,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: policy_hash.to_vec(),
                     result_hash,
                     inline_result,
+                    channel_context_token,
                     stop_checked,
                     budget_checked,
                     budget_enforcement_deferred,
@@ -3651,6 +3696,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: policy_hash.to_vec(),
                     result_hash: None,
                     inline_result: None,
+                    channel_context_token,
                     stop_checked,
                     budget_checked,
                     budget_enforcement_deferred,
@@ -3705,6 +3751,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: Vec::new(),
                     result_hash,
                     inline_result,
+                    channel_context_token,
                     stop_checked,
                     budget_checked,
                     budget_enforcement_deferred,
@@ -5473,6 +5520,7 @@ mod tests {
             policy_hash: vec![],
             result_hash: None,
             inline_result: None,
+            channel_context_token: None,
             stop_checked: false,
             budget_checked: false,
             budget_enforcement_deferred: false,
@@ -5618,14 +5666,14 @@ mod tests {
 
     #[test]
     fn test_channel_context_token_roundtrip() {
-        use apm2_core::channel::{
-            ChannelSource, decode_channel_context_token, verify_channel_source_witness,
-        };
+        use apm2_core::channel::{ChannelSource, decode_channel_context_token};
 
         use crate::episode::ToolClass;
 
+        let signer = apm2_core::crypto::Signer::generate();
         let token = channel_boundary_dispatcher()
             .validate_channel_boundary_and_issue_context_token(
+                &signer,
                 &ToolClass::Execute,
                 true,
                 true,
@@ -5634,14 +5682,58 @@ mod tests {
             )
             .expect("daemon should issue channel context token");
 
-        let decoded = decode_channel_context_token(&token).expect("token should decode");
+        let decoded = decode_channel_context_token(&token, &signer.verifying_key())
+            .expect("token should decode");
         assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
-        let witness = decoded
-            .channel_source_witness
-            .expect("decoded token should include witness");
         assert!(
-            verify_channel_source_witness(ChannelSource::TypedToolIntent, &witness),
-            "CLI witness verification must succeed for daemon-issued tokens"
+            decoded.channel_source_witness.is_some(),
+            "decoded token should include witness"
+        );
+    }
+
+    #[test]
+    fn test_channel_verification_flags_false_on_deny() {
+        use crate::episode::capability::DenyReason;
+
+        let decision = Ok(ToolDecision::Deny {
+            request_id: "REQ-DENY-001".to_string(),
+            reason: DenyReason::PolicyDenied {
+                rule_id: "rule-deny".to_string(),
+                reason: "policy denied".to_string(),
+            },
+            rule_id: Some("rule-deny".to_string()),
+            policy_hash: [0x11; 32],
+        });
+
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_broker_verified(&decision)
+        );
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_capability_verified(
+                &decision
+            )
+        );
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_policy_verified(&decision)
+        );
+    }
+
+    #[test]
+    fn test_channel_verification_flags_false_on_broker_error() {
+        let decision = Err(crate::episode::BrokerError::Internal {
+            message: "broker unavailable".to_string(),
+        });
+
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_broker_verified(&decision)
+        );
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_capability_verified(
+                &decision
+            )
+        );
+        assert!(
+            !SessionDispatcher::<InMemoryManifestStore>::tool_decision_policy_verified(&decision)
         );
     }
 
@@ -6491,6 +6583,7 @@ mod tests {
                     None,
                     false,
                     None,
+                    None,
                 )
                 .expect("dispatch should return application-level error response");
 
@@ -7170,6 +7263,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                 )
                 .expect("handle_broker_decision should return application-level response");
 
@@ -7303,6 +7397,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                 )
                 .expect("dispatch should return application-level response");
 
@@ -7432,6 +7527,7 @@ mod tests {
                     None,
                     false,
                     Some(pending_pcac),
+                    None,
                 )
                 .expect("dispatch should return application-level response");
 

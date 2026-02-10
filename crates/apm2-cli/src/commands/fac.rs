@@ -743,7 +743,13 @@ pub fn run_fac(cmd: &FacCommand, operator_socket: &Path) -> u8 {
             },
         },
         FacSubcommand::RoleLaunch(args) => {
-            match role_launch::handle_role_launch(args, &ledger_path, &cas_path, json_output) {
+            match role_launch::handle_role_launch(
+                args,
+                &ledger_path,
+                &cas_path,
+                operator_socket,
+                json_output,
+            ) {
                 Ok(()) => exit_codes::SUCCESS,
                 Err(error) => error
                     .downcast_ref::<role_launch::RoleLaunchError>()

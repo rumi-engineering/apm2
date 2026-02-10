@@ -33,7 +33,6 @@ use std::time::{Duration, SystemTime};
 use apm2_core::channel::{
     ChannelBoundaryCheck, ChannelBoundaryDefect, ChannelSource, ChannelViolationClass,
     derive_channel_source_witness, issue_channel_context_token, validate_channel_boundary,
-    verify_channel_source_witness,
 };
 use apm2_core::credentials::{
     AuthMethod, CredentialProfile as CoreCredentialProfile, CredentialStore, ProfileId, Provider,
@@ -6411,8 +6410,7 @@ impl PrivilegedDispatcher {
         };
 
         let channel_source_witness = if source == ChannelSource::TypedToolIntent {
-            let witness = derive_channel_source_witness(source);
-            verify_channel_source_witness(source, &witness).then_some(witness)
+            Some(derive_channel_source_witness(source))
         } else {
             None
         };
@@ -6441,6 +6439,7 @@ impl PrivilegedDispatcher {
     #[allow(clippy::fn_params_excessive_bools)]
     pub fn validate_channel_boundary_and_issue_context_token(
         &self,
+        signer: &apm2_core::crypto::Signer,
         tool_class: &ToolClass,
         policy_verified: bool,
         broker_verified: bool,
@@ -6459,7 +6458,7 @@ impl PrivilegedDispatcher {
             return Err(defects);
         }
 
-        issue_channel_context_token(&check).map_err(|error| {
+        issue_channel_context_token(&check, signer).map_err(|error| {
             vec![ChannelBoundaryDefect::new(
                 ChannelViolationClass::MissingChannelMetadata,
                 format!("failed to issue channel context token: {error}"),
@@ -15872,8 +15871,10 @@ mod tests {
         #[test]
         fn test_channel_context_token_roundtrip() {
             let dispatcher = PrivilegedDispatcher::new();
+            let signer = apm2_core::crypto::Signer::generate();
             let token = dispatcher
                 .validate_channel_boundary_and_issue_context_token(
+                    &signer,
                     &ToolClass::Execute,
                     true,
                     true,
@@ -15882,7 +15883,8 @@ mod tests {
                 )
                 .expect("validated boundary should issue token");
 
-            let decoded = decode_channel_context_token(&token).expect("token should decode");
+            let decoded = decode_channel_context_token(&token, &signer.verifying_key())
+                .expect("token should decode");
             assert_eq!(decoded.source, ChannelSource::TypedToolIntent);
             assert!(decoded.broker_verified);
             assert!(decoded.capability_verified);

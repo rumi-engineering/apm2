@@ -2074,6 +2074,8 @@ async fn handle_dual_socket_connection(
     // contract_mismatch_total counter is emitted from the production path.
     let handshake_config = {
         let mut config = HandshakeConfig::from_manifest();
+        let daemon_signing_public_key = dispatcher_state.event_emitter().verifying_key().to_bytes();
+        config = config.with_daemon_signing_public_key(hex::encode(daemon_signing_public_key));
         if let Some(metrics_reg) = state.metrics_registry() {
             config = config.with_metrics(metrics_reg.daemon_metrics().clone());
         }
