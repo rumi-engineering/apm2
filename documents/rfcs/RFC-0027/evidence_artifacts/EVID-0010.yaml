@@ -15,9 +15,14 @@ evidence_artifact:
   ticket_ids:
     - "TCK-PCAC-0009"
     - "TCK-PCAC-0010"
+    - "TCK-00431"
   expected_contents:
     - "scenario outputs for missing lifecycle selector acceptance attempts"
     - "scenario outputs for duplicate consume attempts"
     - "scenario outputs for Tier2+ stale or ambiguous freshness allow attempts"
     - "scenario outputs for verifier-economics regression checks"
     - "scenario outputs for crash-replay with missing durable consume record"
+    - "scenario outputs for Tier2+ sovereignty uncertainty denial probes"
+    - "deterministic objective/gate non-admissible summaries for falsification hits"
+  source_refs:
+    - "crates/apm2-daemon/tests/tck_00431_pcac_conformance.rs"

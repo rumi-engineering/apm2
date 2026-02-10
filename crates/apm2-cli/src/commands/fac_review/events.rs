@@ -1,16 +1,11 @@
 //! NDJSON event emission, rotation, and file locking for FAC review telemetry.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, OnceLock};
 
-use fs2::FileExt;
+use apm2_daemon::telemetry::reviewer::ReviewerTelemetryWriter;
 
-use super::types::{
-    EVENT_ROTATE_BYTES, ExecutionContext, apm2_home_dir, ensure_parent_dir, now_iso8601_millis,
-};
+use super::types::{EVENT_ROTATE_BYTES, ExecutionContext, apm2_home_dir, now_iso8601_millis};
 
 // ── Path helpers ────────────────────────────────────────────────────────────
 
@@ -18,20 +13,7 @@ pub fn review_events_path() -> Result<std::path::PathBuf, String> {
     Ok(apm2_home_dir()?.join("review_events.ndjson"))
 }
 
-fn review_events_rotated_path(events_path: &Path) -> Result<std::path::PathBuf, String> {
-    let parent = events_path
-        .parent()
-        .ok_or_else(|| format!("event path has no parent: {}", events_path.display()))?;
-    Ok(parent.join("review_events.ndjson.1"))
-}
-
-fn review_events_lock_path() -> Result<std::path::PathBuf, String> {
-    Ok(apm2_home_dir()?.join("review_events.ndjson.lock"))
-}
-
 // ── Event emission ──────────────────────────────────────────────────────────
-
-static EVENT_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn emit_event(
     ctx: &ExecutionContext,
@@ -65,46 +47,10 @@ pub fn emit_review_event_to_path(
     events_path: &Path,
     event: &serde_json::Value,
 ) -> Result<(), String> {
-    let lock = EVENT_FILE_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock
-        .lock()
-        .map_err(|_| "event file lock poisoned".to_string())?;
-    ensure_parent_dir(events_path)?;
-    let lock_path = review_events_lock_path()?;
-    ensure_parent_dir(&lock_path)?;
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|err| format!("failed to open event lock {}: {err}", lock_path.display()))?;
-    FileExt::lock_exclusive(&lock_file)
-        .map_err(|err| format!("failed to lock event stream {}: {err}", lock_path.display()))?;
-
-    if let Ok(meta) = fs::metadata(events_path) {
-        if meta.len() > EVENT_ROTATE_BYTES {
-            let rotated = review_events_rotated_path(events_path)?;
-            let _ = fs::remove_file(&rotated);
-            let _ = fs::rename(events_path, &rotated);
-        }
-    }
-
-    let serialized =
-        serde_json::to_string(event).map_err(|err| format!("failed to serialize event: {err}"))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(events_path)
-        .map_err(|err| format!("failed to open {}: {err}", events_path.display()))?;
-    file.write_all(serialized.as_bytes())
-        .map_err(|err| format!("failed to append event: {err}"))?;
-    file.write_all(b"\n")
-        .map_err(|err| format!("failed to write newline: {err}"))?;
-    file.sync_all()
-        .map_err(|err| format!("failed to sync {}: {err}", events_path.display()))?;
-    drop(lock_file);
-    Ok(())
+    ReviewerTelemetryWriter::new(events_path.to_path_buf())
+        .with_rotate_bytes(EVENT_ROTATE_BYTES)
+        .append_value(event)
+        .map_err(|err| err.to_string())
 }
 
 pub fn read_last_event_values(max_lines: usize) -> Result<Vec<serde_json::Value>, String> {

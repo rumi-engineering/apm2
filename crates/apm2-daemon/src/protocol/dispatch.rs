@@ -43,9 +43,10 @@ use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
 use apm2_core::fac::{
     AdapterSelectionPolicy, AttestationLevel, AttestationRequirements, CHANGESET_PUBLISHED_PREFIX,
     DenyCondition, DenyReasonCode, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID,
-    REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, SelectionDecision,
-    builtin_profiles, fac_workobject_implementor_v2_role_contract,
-    seed_builtin_role_contracts_v2_in_cas, validate_receipt_attestation,
+    REVIEW_BLOCKED_RECORDED_PREFIX, REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation,
+    ReceiptKind, RiskTier, SelectionDecision, builtin_profiles,
+    fac_workobject_implementor_v2_role_contract, seed_builtin_role_contracts_v2_in_cas,
+    validate_receipt_attestation,
 };
 use apm2_core::htf::{Canonicalizable, ClockProfile, TimeEnvelope, WallTimeSource};
 use apm2_core::liveness::{
@@ -544,6 +545,34 @@ pub trait LedgerEventEmitter: Send + Sync {
         None
     }
 
+    /// Queries a review-receipt event by semantic identity tuple.
+    ///
+    /// Canonical tuple: `(receipt_id, lease_id, work_id,
+    /// changeset_digest_hex)`. Implementations should use this lookup for
+    /// semantic idempotency in `IngestReviewReceipt`.
+    fn get_event_by_receipt_identity(
+        &self,
+        receipt_id: &str,
+        lease_id: &str,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let _ = (receipt_id, lease_id, work_id, changeset_digest_hex);
+        None
+    }
+
+    /// Queries a `changeset_published` event by semantic identity tuple.
+    ///
+    /// Canonical tuple: `(work_id, changeset_digest_hex)`.
+    fn get_event_by_changeset_identity(
+        &self,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let _ = (work_id, changeset_digest_hex);
+        None
+    }
+
     /// Emits an episode lifecycle event to the ledger (TCK-00321).
     ///
     /// Per REQ-0005, episode events must be streamed directly to the ledger
@@ -600,7 +629,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `episode_id` - The episode that produced this receipt
+    /// * `lease_id` - Gate lease identifier associated with this receipt
+    /// * `work_id` - Canonical work identifier bound to the lease
     /// * `receipt_id` - Unique receipt identifier
     /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
     /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
@@ -623,7 +653,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn emit_review_receipt(
         &self,
-        episode_id: &str,
+        lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -646,6 +677,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// # Arguments
     ///
     /// * `lease_id` - Gate lease identifier associated with this review
+    /// * `work_id` - Canonical work identifier bound to the lease
     /// * `receipt_id` - Unique receipt identifier (used as `blocked_id`)
     /// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
     /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
@@ -670,6 +702,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     fn emit_review_blocked_receipt(
         &self,
         lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -1055,7 +1088,7 @@ pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] = CHANGESET_PUBLISHED_
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used when emitting review blocked events to the ledger.
-pub const REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX: &[u8] = b"apm2.event.review_blocked_recorded:";
+pub const REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX: &[u8] = REVIEW_BLOCKED_RECORDED_PREFIX;
 
 /// Maximum length for ID fields (`work_id`, `lease_id`, etc.).
 ///
@@ -2978,6 +3011,57 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         None
     }
 
+    fn get_event_by_receipt_identity(
+        &self,
+        receipt_id: &str,
+        lease_id: &str,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        guard.1.values().find_map(|event| {
+            if event.event_type != "review_receipt_recorded"
+                && event.event_type != "review_blocked_recorded"
+            {
+                return None;
+            }
+            let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+            let payload_receipt_id = payload.get("receipt_id")?.as_str()?;
+            let payload_lease_id = payload.get("lease_id")?.as_str()?;
+            let payload_work_id = payload.get("work_id")?.as_str()?;
+            let payload_changeset_digest = payload.get("changeset_digest")?.as_str()?;
+            if payload_receipt_id == receipt_id
+                && payload_lease_id == lease_id
+                && payload_work_id == work_id
+                && payload_changeset_digest == changeset_digest_hex
+            {
+                Some(event.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn get_event_by_changeset_identity(
+        &self,
+        work_id: &str,
+        changeset_digest_hex: &str,
+    ) -> Option<SignedLedgerEvent> {
+        let guard = self.events.read().expect("lock poisoned");
+        guard.1.values().find_map(|event| {
+            if event.event_type != "changeset_published" || event.work_id != work_id {
+                return None;
+            }
+            let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+            let payload_changeset_digest = payload.get("changeset_digest")?.as_str()?;
+            if payload_changeset_digest == changeset_digest_hex {
+                Some(event.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     fn get_work_transition_count(&self, work_id: &str) -> u32 {
         let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
         let guard = self.events.read().expect("lock poisoned");
@@ -3088,7 +3172,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
     fn emit_review_receipt(
         &self,
-        episode_id: &str,
+        lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -3131,8 +3216,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "event_type".to_string(),
             serde_json::json!("review_receipt_recorded"),
         );
-        payload_map.insert("episode_id".to_string(), serde_json::json!(episode_id));
-        payload_map.insert("lease_id".to_string(), serde_json::json!(episode_id));
+        payload_map.insert("episode_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("work_id".to_string(), serde_json::json!(work_id));
         payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
         payload_map.insert(
             "changeset_digest".to_string(),
@@ -3202,7 +3288,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
             event_type: "review_receipt_recorded".to_string(),
-            work_id: episode_id.to_string(),
+            work_id: work_id.to_string(),
             actor_id: reviewer_actor_id.to_string(),
             payload: payload_bytes,
             signature: signature.to_bytes().to_vec(),
@@ -3236,14 +3322,15 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             order.push(event_id.clone());
             events.insert(event_id.clone(), signed_event.clone());
             events_by_work
-                .entry(episode_id.to_string())
+                .entry(work_id.to_string())
                 .or_default()
                 .push(event_id);
         }
 
         info!(
             event_id = %signed_event.event_id,
-            episode_id = %episode_id,
+            lease_id = %lease_id,
+            work_id = %work_id,
             receipt_id = %receipt_id,
             "ReviewReceiptRecorded event signed and persisted"
         );
@@ -3255,6 +3342,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     fn emit_review_blocked_receipt(
         &self,
         lease_id: &str,
+        work_id: &str,
         receipt_id: &str,
         changeset_digest: &[u8; 32],
         artifact_bundle_hash: &[u8; 32],
@@ -3294,6 +3382,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             serde_json::json!("review_blocked_recorded"),
         );
         payload_map.insert("lease_id".to_string(), serde_json::json!(lease_id));
+        payload_map.insert("work_id".to_string(), serde_json::json!(work_id));
         payload_map.insert("receipt_id".to_string(), serde_json::json!(receipt_id));
         payload_map.insert(
             "changeset_digest".to_string(),
@@ -3368,7 +3457,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
             event_type: "review_blocked_recorded".to_string(),
-            work_id: receipt_id.to_string(),
+            work_id: work_id.to_string(),
             actor_id: reviewer_actor_id.to_string(),
             payload: payload_bytes,
             signature: signature.to_bytes().to_vec(),
@@ -3401,13 +3490,15 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             order.push(event_id.clone());
             events.insert(event_id.clone(), signed_event.clone());
             events_by_work
-                .entry(receipt_id.to_string())
+                .entry(work_id.to_string())
                 .or_default()
                 .push(event_id);
         }
 
         info!(
             event_id = %signed_event.event_id,
+            lease_id = %lease_id,
+            work_id = %work_id,
             receipt_id = %receipt_id,
             reason_code = %reason_code,
             "ReviewBlockedRecorded event signed and persisted"
@@ -3846,10 +3937,12 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
-        let payload_bytes =
-            serde_json::to_vec(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("payload serialization failed: {e}"),
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
             })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
 
         let mut canonical_bytes =
             Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
@@ -4618,6 +4711,7 @@ fn extract_sublease_replay_bindings(event_payload: &[u8]) -> Result<(String, [u8
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceiptReplayBindings {
     lease_id: String,
+    work_id: String,
     changeset_digest: [u8; 32],
     verdict: String,
     identity_proof_hash: [u8; 32],
@@ -4664,6 +4758,14 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
         .ok_or_else(|| "missing lease_id".to_string())?;
     if lease_id.is_empty() {
         return Err("lease_id is empty".to_string());
+    }
+    let work_id = lookup_field("work_id")
+        .or_else(|| lookup_field("lease_id"))
+        .or_else(|| lookup_field("episode_id"))
+        .map(str::to_owned)
+        .ok_or_else(|| "missing work_id".to_string())?;
+    if work_id.is_empty() {
+        return Err("work_id is empty".to_string());
     }
 
     let changeset_digest_hex =
@@ -4722,6 +4824,7 @@ fn extract_receipt_replay_bindings(event_payload: &[u8]) -> Result<ReceiptReplay
 
     Ok(ReceiptReplayBindings {
         lease_id,
+        work_id,
         changeset_digest,
         verdict,
         identity_proof_hash,
@@ -12429,6 +12532,7 @@ impl PrivilegedDispatcher {
             ));
         }
         let lease_time_envelope_ref = lease_for_receipt.time_envelope_ref;
+        let authoritative_work_id = lease_for_receipt.work_id.clone();
         let Some(claim_for_receipt) = self.work_registry.get_claim(&lease_for_receipt.work_id)
         else {
             return Ok(deny_response_for_authority_context(
@@ -12439,6 +12543,15 @@ impl PrivilegedDispatcher {
                 ),
             ));
         };
+        if claim_for_receipt.work_id != authoritative_work_id {
+            return Ok(deny_response_for_authority_context(
+                DenyCondition::MissingAuthorityContext,
+                format!(
+                    "lease work_id '{}' does not match authoritative claim work_id '{}'",
+                    authoritative_work_id, claim_for_receipt.work_id
+                ),
+            ));
+        }
         let claim_role_spec_hash = match Self::validate_claim_authority_context_lineage(
             &claim_for_receipt,
             cas.as_ref(),
@@ -12529,6 +12642,7 @@ impl PrivilegedDispatcher {
             .as_slice()
             .try_into()
             .expect("validated to be 32 bytes above");
+        let request_changeset_digest_hex = hex::encode(request_changeset_digest_arr);
         let request_verdict = match verdict {
             ReviewReceiptVerdict::Approve => "APPROVE",
             ReviewReceiptVerdict::Blocked => "BLOCKED",
@@ -12581,6 +12695,22 @@ impl PrivilegedDispatcher {
                 return Err(format!(
                     "receipt_id '{}' was originally submitted for lease '{}', not '{}'",
                     request.receipt_id, original.lease_id, request.lease_id
+                ));
+            }
+
+            if original.work_id != authoritative_work_id {
+                warn!(
+                    receipt_id = %request.receipt_id,
+                    existing_event_id = %existing.event_id,
+                    original_work_id = %original.work_id,
+                    requested_work_id = %authoritative_work_id,
+                    "Idempotent review receipt replay rejected: work_id mismatch"
+                );
+                return Err(format!(
+                    "receipt_id '{}' was originally submitted for work '{}', not '{}'",
+                    request.receipt_id,
+                    original.work_id,
+                    authoritative_work_id.as_str()
                 ));
             }
 
@@ -12750,10 +12880,7 @@ impl PrivilegedDispatcher {
             // Full validation: non-zero + CAS resolvability
             if let Err(auth_err) = validate_review_outcome_bindings(&bindings, cas.as_ref()) {
                 let defect_ts = self.get_htf_timestamp_ns().unwrap_or(0);
-                let work_id = self
-                    .lease_validator
-                    .get_lease_work_id(&request.lease_id)
-                    .unwrap_or_else(|| format!("unknown-for-lease-{}", request.lease_id));
+                let work_id = authoritative_work_id.clone();
                 emit_authority_binding_defect(
                     self.event_emitter.as_ref(),
                     &work_id,
@@ -12774,12 +12901,39 @@ impl PrivilegedDispatcher {
             bindings
         };
 
-        // ---- Phase 2: Idempotency check ----
-        //
-        // SECURITY (v10 MAJOR 1 -- receipt_id idempotency fix):
-        //
-        // Use `get_event_by_receipt_id` to look up existing events by the
-        // caller-supplied `receipt_id` embedded in the event payload.
+        // ---- Phase 2: Semantic idempotency check ----
+        if let Some(existing) = self.event_emitter.get_event_by_receipt_identity(
+            &request.receipt_id,
+            &request.lease_id,
+            &authoritative_work_id,
+            &request_changeset_digest_hex,
+        ) {
+            if let Err(message) = validate_receipt_replay(&existing) {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    message,
+                ));
+            }
+
+            info!(
+                receipt_id = %request.receipt_id,
+                lease_id = %request.lease_id,
+                work_id = %authoritative_work_id,
+                existing_event_id = %existing.event_id,
+                "Duplicate semantic review identity detected - returning existing event"
+            );
+
+            return Ok(PrivilegedResponse::IngestReviewReceipt(
+                IngestReviewReceiptResponse {
+                    receipt_id: request.receipt_id.clone(),
+                    event_type: to_response_event_type(&existing.event_type),
+                    event_id: existing.event_id,
+                },
+            ));
+        }
+
+        // If the transport-level receipt_id already exists under a different
+        // semantic tuple, fail closed with a conflict.
         if let Some(existing) = self
             .event_emitter
             .get_event_by_receipt_id(&request.receipt_id)
@@ -12790,12 +12944,6 @@ impl PrivilegedDispatcher {
                     message,
                 ));
             }
-
-            info!(
-                receipt_id = %request.receipt_id,
-                existing_event_id = %existing.event_id,
-                "Duplicate receipt_id detected with matching replay bindings - returning existing event"
-            );
 
             return Ok(PrivilegedResponse::IngestReviewReceipt(
                 IngestReviewReceiptResponse {
@@ -12964,6 +13112,7 @@ impl PrivilegedDispatcher {
                 "ReviewReceiptRecorded".to_string(),
                 self.event_emitter.emit_review_receipt(
                     &request.lease_id,
+                    &authoritative_work_id,
                     &request.receipt_id,
                     &request_changeset_digest_arr,
                     &request_artifact_bundle_hash_arr,
@@ -12985,6 +13134,7 @@ impl PrivilegedDispatcher {
                     "ReviewBlockedRecorded".to_string(),
                     self.event_emitter.emit_review_blocked_receipt(
                         &request.lease_id,
+                        &authoritative_work_id,
                         &request.receipt_id,
                         &request_changeset_digest_arr,
                         &request_artifact_bundle_hash_arr,
@@ -13010,21 +13160,37 @@ impl PrivilegedDispatcher {
             Err(e) if e.to_string().contains("UNIQUE constraint") => {
                 warn!(
                     receipt_id = %request.receipt_id,
+                    lease_id = %request.lease_id,
+                    work_id = %authoritative_work_id,
                     verdict = %request_verdict,
                     error = %e,
-                    "Concurrent duplicate receipt_id detected by UNIQUE constraint"
+                    "Concurrent duplicate review receipt detected by UNIQUE constraint"
                 );
 
-                let Some(existing) = self
+                let existing = self
                     .event_emitter
-                    .get_event_by_receipt_id(&request.receipt_id)
-                else {
+                    .get_event_by_receipt_identity(
+                        &request.receipt_id,
+                        &request.lease_id,
+                        &authoritative_work_id,
+                        &request_changeset_digest_hex,
+                    )
+                    .or_else(|| {
+                        self.event_emitter
+                            .get_event_by_receipt_id(&request.receipt_id)
+                    });
+
+                let Some(existing) = existing else {
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
                         format!(
-                            "receipt_id '{}' hit a uniqueness race, but the existing event \
+                            "receipt identity tuple (receipt_id='{}', lease_id='{}', work_id='{}', \
+                             changeset_digest='{}') hit a uniqueness race, but the existing event \
                              could not be resolved",
-                            request.receipt_id
+                            request.receipt_id,
+                            request.lease_id,
+                            authoritative_work_id.as_str(),
+                            request_changeset_digest_hex
                         ),
                     ));
                 };
@@ -13880,19 +14046,12 @@ impl PrivilegedDispatcher {
         work_id: &str,
         changeset_digest_hex: &str,
     ) -> Option<(String, String)> {
-        self.event_emitter
-            .get_events_by_work_id(work_id)
-            .into_iter()
-            .filter(|event| event.event_type == "changeset_published")
-            .find_map(|event| {
-                let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
-                let persisted_digest = payload.get("changeset_digest")?.as_str()?;
-                if persisted_digest != changeset_digest_hex {
-                    return None;
-                }
-                let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
-                Some((event.event_id, persisted_cas_hash))
-            })
+        let event = self
+            .event_emitter
+            .get_event_by_changeset_identity(work_id, changeset_digest_hex)?;
+        let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
+        let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
+        Some((event.event_id, persisted_cas_hash))
     }
 
     // =========================================================================
@@ -25713,9 +25872,7 @@ mod tests {
             }
 
             // Verify only ONE event was created in the ledger (not two)
-            let events = dispatcher
-                .event_emitter
-                .get_events_by_work_id("lease-dup-001");
+            let events = dispatcher.event_emitter.get_events_by_work_id("W-DUP-001");
             let receipt_event_count = events
                 .iter()
                 .filter(|e| e.event_type == "review_receipt_recorded")
@@ -25723,6 +25880,17 @@ mod tests {
             assert_eq!(
                 receipt_event_count, 1,
                 "Duplicate receipt_id submission must NOT create a second event"
+            );
+
+            let semantic_event = dispatcher.event_emitter.get_event_by_receipt_identity(
+                "RR-DUP-001",
+                "lease-dup-001",
+                "W-DUP-001",
+                &hex::encode([0x42u8; 32]),
+            );
+            assert!(
+                semantic_event.is_some(),
+                "receipt replay identity tuple must resolve to the canonical persisted event"
             );
         }
 
@@ -28395,7 +28563,7 @@ mod tests {
             let review_events = state
                 .privileged_dispatcher()
                 .event_emitter()
-                .get_events_by_work_id("pcac-review-lease-ok");
+                .get_events_by_work_id("W-PCAC-RR-OK");
             let review_event_count = review_events
                 .iter()
                 .filter(|event| event.event_type == "review_receipt_recorded")
@@ -28484,7 +28652,7 @@ mod tests {
             let blocked_events = state
                 .privileged_dispatcher()
                 .event_emitter()
-                .get_events_by_work_id("RR-PCAC-BLOCKED-OK");
+                .get_events_by_work_id("W-PCAC-RR-BLOCKED-OK");
             let blocked_event_count = blocked_events
                 .iter()
                 .filter(|event| event.event_type == "review_blocked_recorded")
@@ -29085,7 +29253,7 @@ mod tests {
             let review_events = state
                 .privileged_dispatcher()
                 .event_emitter()
-                .get_events_by_work_id("pcac-review-rollout-off");
+                .get_events_by_work_id("W-PCAC-RR-ROLLOUT-OFF");
             let review_event_count = review_events
                 .iter()
                 .filter(|event| event.event_type == "review_receipt_recorded")

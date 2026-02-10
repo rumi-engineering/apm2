@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00450"
     title: "Markov-blanket channel enforcement and no-bypass launch actuation"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0020"

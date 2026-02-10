@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00451"
     title: "Launch liveness pulse receipts and bounded restart policy"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0020"

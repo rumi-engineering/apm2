@@ -1,6 +1,10 @@
 //! Projection engine: SHA resolution, state rendering, and sequence-done
 //! fallback for FAC review lifecycle.
 
+use apm2_daemon::telemetry::reviewer::{
+    ProjectionSummary, ReviewerProjectionFilter, ReviewerTelemetryError,
+    read_reviewer_projection_events,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use super::state::{
@@ -162,12 +166,6 @@ pub fn event_seq(event: &serde_json::Value) -> u64 {
         .unwrap_or(0)
 }
 
-fn event_timestamp_epoch(raw: &str) -> Option<u64> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .and_then(|value| value.timestamp().try_into().ok())
-}
-
 fn run_state_started_epoch(state: &super::types::ReviewRunState) -> Option<u64> {
     DateTime::parse_from_rfc3339(&state.started_at)
         .ok()
@@ -181,6 +179,63 @@ fn run_state_is_stale_for_dispatch(
     since_epoch.is_some_and(|min_epoch| {
         run_state_started_epoch(state).is_none_or(|started_epoch| started_epoch < min_epoch)
     })
+}
+
+const fn run_state_is_terminal(load: &super::state::ReviewRunStateLoad) -> bool {
+    match load {
+        super::state::ReviewRunStateLoad::Present(state) => state.status.is_terminal(),
+        super::state::ReviewRunStateLoad::Missing { .. }
+        | super::state::ReviewRunStateLoad::Corrupt { .. }
+        | super::state::ReviewRunStateLoad::Ambiguous { .. } => false,
+    }
+}
+
+fn telemetry_projection_error(err: &ReviewerTelemetryError) -> ProjectionError {
+    let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    match err {
+        ReviewerTelemetryError::Missing { path } => ProjectionError {
+            ts,
+            event: "telemetry_missing".to_string(),
+            review_type: "-".to_string(),
+            seq: 0,
+            detail: format!("path={}", path.display()),
+        },
+        ReviewerTelemetryError::Malformed { path, line, detail } => ProjectionError {
+            ts,
+            event: "telemetry_malformed".to_string(),
+            review_type: "-".to_string(),
+            seq: 0,
+            detail: format!("path={} line={line} detail={detail}", path.display()),
+        },
+        ReviewerTelemetryError::Io { path, detail } => ProjectionError {
+            ts,
+            event: "telemetry_io_error".to_string(),
+            review_type: "-".to_string(),
+            seq: 0,
+            detail: format!("path={} detail={detail}", path.display()),
+        },
+        ReviewerTelemetryError::Lock { path, detail } => ProjectionError {
+            ts,
+            event: "telemetry_lock_error".to_string(),
+            review_type: "-".to_string(),
+            seq: 0,
+            detail: format!("path={} detail={detail}", path.display()),
+        },
+        ReviewerTelemetryError::Serialize { detail } => ProjectionError {
+            ts,
+            event: "telemetry_serialize_error".to_string(),
+            review_type: "-".to_string(),
+            seq: 0,
+            detail: detail.clone(),
+        },
+        ReviewerTelemetryError::InvalidEvent { detail } => ProjectionError {
+            ts,
+            event: "telemetry_malformed".to_string(),
+            review_type: "-".to_string(),
+            seq: 0,
+            detail: detail.clone(),
+        },
+    }
 }
 
 pub fn event_is_terminal_crash(event: &serde_json::Value) -> bool {
@@ -419,32 +474,35 @@ pub fn run_project_inner(
     };
 
     let state = with_review_state_shared(|state| Ok(state.clone()))?;
-    let mut events = super::events::read_last_event_values(400)?
-        .into_iter()
-        .filter(|event| {
-            event
-                .get("pr_number")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|value| value == u64::from(pr_number))
-        })
-        .filter(|event| {
-            normalized_head.as_ref().is_none_or(|head| {
-                event
-                    .get("head_sha")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| value.eq_ignore_ascii_case(head))
-            })
-        })
-        .filter(|event| {
-            since_epoch.is_none_or(|min_epoch| {
-                event
-                    .get("ts")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(event_timestamp_epoch)
-                    .is_some_and(|epoch| epoch >= min_epoch)
-            })
-        })
-        .collect::<Vec<_>>();
+    let projection_filter = ReviewerProjectionFilter::new(pr_number)
+        .with_head_sha(normalized_head.as_deref())
+        .with_since_epoch(since_epoch)
+        .with_max_events(400);
+    let mut telemetry_error: Option<ReviewerTelemetryError> = None;
+    let mut telemetry_event_count = 0_usize;
+    let mut events = match read_reviewer_projection_events(
+        &super::events::review_events_path()?,
+        &projection_filter,
+    ) {
+        Ok(parsed) => {
+            telemetry_event_count = match parsed.health {
+                apm2_daemon::telemetry::reviewer::ReviewerTelemetryHealth::Present {
+                    lifecycle_events,
+                } => lifecycle_events,
+                apm2_daemon::telemetry::reviewer::ReviewerTelemetryHealth::Missing
+                | apm2_daemon::telemetry::reviewer::ReviewerTelemetryHealth::Malformed => 0,
+            };
+            parsed.events.into_iter().map(|entry| entry.raw).collect()
+        },
+        Err(
+            err @ (ReviewerTelemetryError::Missing { .. }
+            | ReviewerTelemetryError::Malformed { .. }),
+        ) => {
+            telemetry_error = Some(err);
+            Vec::new()
+        },
+        Err(err) => return Err(err.to_string()),
+    };
     events.sort_by_key(event_seq);
 
     let mut security_load = load_review_run_state(pr_number, "security")?;
@@ -534,6 +592,27 @@ pub fn run_project_inner(
         quality.as_str(),
         "no-run-state" | "corrupt-state" | "ambiguous-state"
     );
+    let attempting_authoritative_progression = projection_state_done(&security)
+        || projection_state_done(&quality)
+        || projection_state_failed(&security)
+        || projection_state_failed(&quality)
+        || run_state_is_terminal(&security_load)
+        || run_state_is_terminal(&quality_load);
+    if let Some(err) = telemetry_error.as_ref() {
+        errors.push(telemetry_projection_error(err));
+        if attempting_authoritative_progression {
+            terminal_failure = true;
+        }
+    } else if telemetry_event_count == 0 && attempting_authoritative_progression {
+        errors.push(ProjectionError {
+            ts: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            event: "telemetry_missing".to_string(),
+            review_type: "-".to_string(),
+            seq: 0,
+            detail: "no lifecycle telemetry events for authoritative projection".to_string(),
+        });
+        terminal_failure = true;
+    }
     let mut last_seq = after_seq;
     for event in &events {
         let seq = event_seq(event);
@@ -551,13 +630,14 @@ pub fn run_project_inner(
         }
         if !matches!(
             ev_name.as_str(),
-            "run_crash" | "stall_detected" | "model_fallback" | "sha_update"
+            "run_crash" | "stall_detected" | "model_fallback" | "sha_update" | "sha_drift"
         ) {
             continue;
         }
 
         let detail = event
-            .get("reason")
+            .get("reason_code")
+            .or_else(|| event.get("reason"))
             .or_else(|| event.get("signal"))
             .or_else(|| event.get("exit_code"))
             .or_else(|| event.get("new_sha"))
@@ -582,15 +662,14 @@ pub fn run_project_inner(
         });
     }
 
-    let line = format!(
-        "ts={} sha={} current_head_sha={} security={} quality={} events={}",
-        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        sha,
-        current_head_sha,
-        security,
-        quality,
-        recent_events
-    );
+    let line = ProjectionSummary::from_projection(
+        sha.clone(),
+        current_head_sha.clone(),
+        security.clone(),
+        quality.clone(),
+        recent_events.clone(),
+    )
+    .render_line();
 
     Ok(ProjectionStatus {
         line,

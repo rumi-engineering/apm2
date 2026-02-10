@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00447"
     title: "Deterministic ContextPack recipe compiler and drift fingerprinting"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0019"

@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00416"
     title: "Lifecycle authority bindings: mandatory delegation/context/stop/budget/view contracts"
-    status: "OPEN"
+    status: "CLOSED"
   binds:
     prd_id: "PRD-0009"
     rfc_id: "RFC-0018"

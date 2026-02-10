@@ -1,0 +1,1 @@
+bash scripts/ci/fac_preflight_authorization.sh

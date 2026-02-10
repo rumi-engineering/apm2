@@ -70,6 +70,7 @@ pub mod batch_epoch;
 pub mod bft;
 pub mod bft_machine;
 pub mod bisimulation;
+pub mod convergence;
 pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
@@ -77,6 +78,7 @@ pub mod fact_root;
 pub mod functor;
 pub mod genesis;
 pub mod handlers;
+pub mod hsi_anti_entropy;
 pub mod merkle;
 pub mod metrics;
 pub mod network;
@@ -119,6 +121,11 @@ pub use bisimulation::{
     ObservableSemantics, PromotionGate, PromotionGateResult, StopKind, TraceStep, Transition,
     build_linear_composition, deserialize_and_validate_semantics,
 };
+pub use convergence::{
+    ConvergenceError, ConvergenceReport, ConvergenceRound, ConvergenceSimulator,
+    MAX_CELL_ID_LEN as MAX_CONVERGENCE_CELL_ID_LEN, MAX_CONVERGENCE_ROUNDS, MAX_EVENTS_PER_PULL,
+    MAX_IDENTITIES_PER_CELL, MAX_LEDGER_EVENTS_PER_CELL, MAX_SIM_CELLS,
+};
 // HLC-based CRDT merge operators (TCK-00197)
 // Revocation-wins signed CRDT merge law (TCK-00360)
 pub use crdt::{
@@ -160,6 +167,15 @@ pub use handlers::{
     BftMessageEnvelope, HandlerConfig, HandlerError, MAX_EPOCH_AGE, MAX_PENDING_INBOUND,
     MAX_REPLAY_CACHE_SIZE, MessageHandler, PeerEndpoint, PeerManager, REPLAY_CACHE_ROUND_WINDOW,
     ReplayCache,
+};
+pub use hsi_anti_entropy::{
+    AntiEntropyCompare, AntiEntropyDefect, AntiEntropyDefectKind, AntiEntropyDeliver,
+    AntiEntropyOffer, AntiEntropyRequestEvents, ByzantineRelayDetector, DeliveredEvent,
+    EventAttestationVerifier, HsiAntiEntropyError, MAX_ANTI_ENTROPY_LEAVES, MAX_CELL_ID_LEN,
+    MAX_COMPARE_ID_LEN, MAX_DELIVER_PROOF_HASHES, MAX_EVENTS_PER_DELIVER, MAX_OFFER_ID_LEN,
+    MAX_OUTSTANDING_REQUESTS, MAX_REPLAY_ISSUERS, MAX_REPLAY_LOG_ENTRIES, MAX_REQUEST_ID_LEN,
+    MAX_SESSION_ID_LEN, PullOnlyEnforcer, RelayBudget, RelayBudgetEnforcer, ReplayProtector,
+    SessionUsageSnapshot,
 };
 pub use merkle::{
     DivergentRange, EMPTY_HASH, MAX_PROOF_NODES, MAX_TREE_DEPTH, MAX_TREE_LEAVES, MerkleError,
