@@ -5,6 +5,7 @@
 # - test_safety_guard.sh blocks dangerous signatures and honors allowlist
 # - workspace_integrity_guard.sh detects tracked-content mutation
 # - run_bounded_tests.sh terminates hung commands via timeout watchdog
+# - fac_preflight_authorization.sh enforces trusted FAC workflow policy
 
 set -euo pipefail
 
@@ -176,6 +177,17 @@ if env APM2_CI_ALLOW_TIMEOUT_FALLBACK=1 \
     log_pass "bounded runner allows command completion within limits"
 else
     log_fail "bounded runner failed a command that should pass"
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# Test 4: FAC preflight authorization policy regression fixtures
+# ---------------------------------------------------------------------------
+echo "Test 4: fac_preflight_authorization.sh"
+if "${REPO_ROOT}/scripts/ci/test_fac_preflight_fixtures.sh"; then
+    log_pass "FAC preflight policy fixtures passed"
+else
+    log_fail "FAC preflight policy fixtures failed"
 fi
 echo
 
