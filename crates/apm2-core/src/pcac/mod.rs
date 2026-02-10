@@ -77,4 +77,4 @@ pub use types::{
 pub use verifier_economics::{
     VerifierEconomicsChecker, VerifierEconomicsProfile, VerifierOperation,
 };
-pub use verifier_metrics::record_verifier_metrics;
+pub use verifier_metrics::{record_anti_entropy_event_metrics, record_verifier_metrics};

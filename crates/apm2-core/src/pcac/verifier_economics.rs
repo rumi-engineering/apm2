@@ -24,7 +24,11 @@ pub struct VerifierEconomicsProfile {
     pub p95_replay_lifecycle_us: u64,
     /// p95 upper bound for anti-entropy verification operations (microseconds).
     pub p95_anti_entropy_us: u64,
-    /// Maximum allowed proof checks per verification operation.
+    /// Maximum allowed cryptographic proof checks per verification operation.
+    ///
+    /// This bound applies only to cryptographic verification work
+    /// (for example Merkle-proof verification and digest comparisons), not to
+    /// throughput counters such as anti-entropy event batch size.
     pub max_proof_checks: u64,
 }
 
@@ -38,7 +42,7 @@ impl Default for VerifierEconomicsProfile {
             p95_replay_lifecycle_us: 10_000,
             // Anti-entropy verification may include digest + transfer checks.
             p95_anti_entropy_us: 50_000,
-            // Match replay lifecycle entry bound (`MAX_REPLAY_LIFECYCLE_ENTRIES`).
+            // Conservative cryptographic-check budget per verifier call.
             max_proof_checks: 256,
         }
     }

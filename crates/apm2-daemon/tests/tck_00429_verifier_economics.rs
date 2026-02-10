@@ -6,15 +6,17 @@
 //! - Proof-check-count enforcement works
 //! - Anti-entropy bounds enforcement works
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use apm2_core::consensus::SyncEvent;
 use apm2_core::crypto::{EventHasher, Hash};
 use apm2_core::pcac::{
-    AuthorityDenyClass, AuthorityJoinInputV1, BoundaryIntentClass, DeterminismClass,
-    IdentityEvidenceLevel, RiskTier, VerifierEconomicsProfile, timed_anti_entropy_verification,
+    AuthorityDenyClass, AuthorityJoinInputV1, AuthorityJoinKernel, BoundaryIntentClass,
+    DeterminismClass, IdentityEvidenceLevel, RiskTier, VerifierEconomicsProfile,
+    timed_anti_entropy_verification,
 };
-use apm2_daemon::pcac::InProcessKernel;
+use apm2_daemon::pcac::{InProcessKernel, LifecycleGate};
 
 const fn test_hash(byte: u8) -> Hash {
     [byte; 32]
@@ -94,17 +96,17 @@ fn p95(samples: &mut [u64]) -> u64 {
 }
 
 #[test]
-fn test_tier2_join_denies_on_verifier_bounds_exceeded() {
+fn test_join_scope_witness_cardinality_does_not_trigger_merkle_depth_denial() {
     let kernel = InProcessKernel::new(100).with_verifier_economics(permissive_timing_profile(0));
-    let input = valid_input(RiskTier::Tier2Plus, 4, 0x20);
-    let err = kernel
+    let input = valid_input(
+        RiskTier::Tier2Plus,
+        apm2_core::pcac::MAX_SCOPE_WITNESS_HASHES,
+        0x20,
+    );
+    let cert = kernel
         .join(&input)
-        .expect_err("Tier2+ must deny when bounds exceed");
-    assert!(matches!(
-        err.deny_class,
-        AuthorityDenyClass::VerifierEconomicsBoundsExceeded { ref operation, risk_tier }
-            if operation == "verify_receipt_authentication" && risk_tier == RiskTier::Tier2Plus
-    ));
+        .expect("join must allow contract-valid max scope witnesses");
+    assert_eq!(cert.risk_tier, RiskTier::Tier2Plus);
 }
 
 #[test]
@@ -151,13 +153,16 @@ fn test_proof_check_count_enforcement() {
 
 #[test]
 fn test_anti_entropy_bounds_enforcement() {
-    let kernel = InProcessKernel::new(100).with_verifier_economics(permissive_timing_profile(0));
+    let tick_kernel =
+        Arc::new(InProcessKernel::new(100).with_verifier_economics(permissive_timing_profile(0)));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = tick_kernel.clone();
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&tick_kernel));
     let events = make_sync_events(3);
     let digest = test_hash(0x44);
     let expected_prev_hash = [0u8; 32];
 
-    let err = kernel
-        .check_anti_entropy_verification(
+    let err = gate
+        .enforce_anti_entropy_economics(
             RiskTier::Tier2Plus,
             Some(&digest),
             Some(&digest),
@@ -180,6 +185,26 @@ fn test_anti_entropy_bounds_enforcement() {
 }
 
 #[test]
+fn test_anti_entropy_proof_checks_exclude_event_count() {
+    let events = make_sync_events(512);
+    let digest = test_hash(0x45);
+
+    let timed = timed_anti_entropy_verification(
+        Some(&digest),
+        Some(&digest),
+        &events,
+        &[0u8; 32],
+        Some(1),
+        None,
+        None,
+    );
+
+    assert!(timed.result.is_ok());
+    assert_eq!(timed.proof_check_count, 1);
+    assert_eq!(timed.event_count, 512);
+}
+
+#[test]
 fn test_evid_0005_benchmark_output() {
     let profile = VerifierEconomicsProfile::default();
     let mut join_samples = Vec::new();
@@ -187,7 +212,7 @@ fn test_evid_0005_benchmark_output() {
     let mut consume_samples = Vec::new();
     let mut anti_entropy_samples = Vec::new();
 
-    let mut join_proof_checks_total = 0_u64;
+    let join_proof_checks_total = 0_u64;
     let mut replay_proof_checks_total = 0_u64;
     let mut anti_entropy_proof_checks_total = 0_u64;
 
@@ -206,9 +231,6 @@ fn test_evid_0005_benchmark_output() {
             let start = Instant::now();
             let cert = kernel.join(&input).expect("join benchmark");
             join_samples.push(elapsed_us_since(start));
-            if complexity > 1 {
-                join_proof_checks_total = join_proof_checks_total.saturating_add(1);
-            }
 
             let start = Instant::now();
             kernel
@@ -261,9 +283,19 @@ fn test_evid_0005_benchmark_output() {
     let anti_entropy_p95 = p95(&mut anti_entropy_samples);
 
     let tier2_join_deny = {
-        let kernel =
-            InProcessKernel::new(200).with_verifier_economics(permissive_timing_profile(0));
-        let input = valid_input(RiskTier::Tier2Plus, 4, 0x90);
+        let kernel = InProcessKernel::new(200).with_verifier_economics(VerifierEconomicsProfile {
+            p95_verify_receipt_us: 0,
+            p95_validate_bindings_us: u64::MAX,
+            p95_classify_fact_us: u64::MAX,
+            p95_replay_lifecycle_us: u64::MAX,
+            p95_anti_entropy_us: u64::MAX,
+            max_proof_checks: u64::MAX,
+        });
+        let input = valid_input(
+            RiskTier::Tier2Plus,
+            apm2_core::pcac::MAX_SCOPE_WITNESS_HASHES,
+            0x90,
+        );
         kernel.join(&input).expect_err("tier2 join deny").deny_class
     };
     let tier2_consume_deny = {
@@ -292,27 +324,29 @@ fn test_evid_0005_benchmark_output() {
             .deny_class
     };
     let tier2_anti_entropy_deny = {
-        let kernel =
-            InProcessKernel::new(400).with_verifier_economics(permissive_timing_profile(0));
+        let tick_kernel = Arc::new(
+            InProcessKernel::new(400).with_verifier_economics(permissive_timing_profile(0)),
+        );
+        let kernel_trait: Arc<dyn AuthorityJoinKernel> = tick_kernel.clone();
+        let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&tick_kernel));
         let events = make_sync_events(4);
         let digest = test_hash(0x92);
-        kernel
-            .check_anti_entropy_verification(
-                RiskTier::Tier2Plus,
-                Some(&digest),
-                Some(&digest),
-                &events,
-                &[0u8; 32],
-                Some(1),
-                None,
-                None,
-                None,
-                test_hash(0x93),
-                test_hash(0x94),
-                400,
-            )
-            .expect_err("tier2 anti-entropy deny")
-            .deny_class
+        gate.enforce_anti_entropy_economics(
+            RiskTier::Tier2Plus,
+            Some(&digest),
+            Some(&digest),
+            &events,
+            &[0u8; 32],
+            Some(1),
+            None,
+            None,
+            None,
+            test_hash(0x93),
+            test_hash(0x94),
+            400,
+        )
+        .expect_err("tier2 anti-entropy deny")
+        .deny_class
     };
 
     println!(

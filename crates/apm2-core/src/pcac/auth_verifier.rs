@@ -88,8 +88,17 @@ pub struct TimedVerificationResult<T> {
     pub result: T,
     /// Elapsed wall-clock time in microseconds.
     pub elapsed_us: u64,
-    /// Count of proof checks performed by the operation.
+    /// Count of cryptographic proof checks performed by the operation.
+    ///
+    /// This count is reserved for cryptographic verification work
+    /// (for example, digest comparisons or Merkle-proof verification calls).
+    /// It intentionally excludes generic payload volume.
     pub proof_check_count: u64,
+    /// Count of non-crypto items processed by the operation.
+    ///
+    /// For anti-entropy verification this is the number of events processed.
+    /// Other verifier operations set this to `0`.
+    pub event_count: u64,
 }
 
 /// Verify an authentication shape is admissible for authoritative acceptance.
@@ -358,6 +367,7 @@ pub fn timed_verify_receipt_authentication(
         result,
         elapsed_us: elapsed_us_since(start),
         proof_check_count: proof_checks_for_receipt_auth(auth),
+        event_count: 0,
     }
 }
 
@@ -384,6 +394,7 @@ pub fn timed_validate_authoritative_bindings(
         result,
         elapsed_us: elapsed_us_since(start),
         proof_check_count: 0,
+        event_count: 0,
     }
 }
 
@@ -412,6 +423,7 @@ pub fn timed_classify_fact(
         result,
         elapsed_us: elapsed_us_since(start),
         proof_check_count: 0,
+        event_count: 0,
     }
 }
 
@@ -438,6 +450,7 @@ pub fn timed_validate_replay_lifecycle_order(
         result,
         elapsed_us: elapsed_us_since(start),
         proof_check_count: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+        event_count: 0,
     }
 }
 
@@ -463,12 +476,13 @@ pub fn timed_anti_entropy_verification(
         proof,
         proof_root,
     );
-    let event_checks = u64::try_from(events.len()).unwrap_or(u64::MAX);
-    let proof_checks = u64::from(proof.is_some());
+    let digest_comparison_checks = u64::from(local_digest.is_some() && remote_digest.is_some());
+    let merkle_proof_checks = u64::from(proof.is_some());
     TimedVerificationResult {
         result,
         elapsed_us: elapsed_us_since(start),
-        proof_check_count: event_checks.saturating_add(proof_checks),
+        proof_check_count: digest_comparison_checks.saturating_add(merkle_proof_checks),
+        event_count: u64::try_from(events.len()).unwrap_or(u64::MAX),
     }
 }
 

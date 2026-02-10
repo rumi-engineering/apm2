@@ -1082,6 +1082,9 @@ impl DispatcherState {
                             Arc::clone(&stop_authority),
                         ),
                     );
+                    // TODO(TCK-ANTI-ENTROPY-RUNTIME): when daemon anti-entropy
+                    // catch-up is wired, route verification through
+                    // `pcac_gate.enforce_anti_entropy_economics(...)`.
                     privileged_dispatcher =
                         privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
                     session_dispatcher = session_dispatcher.with_pcac_lifecycle_gate(pcac_gate);
@@ -1460,6 +1463,9 @@ impl DispatcherState {
                 Arc::clone(&stop_authority),
             ),
         );
+        // TODO(TCK-ANTI-ENTROPY-RUNTIME): when daemon anti-entropy catch-up is
+        // wired, route verification through
+        // `pcac_gate.enforce_anti_entropy_economics(...)`.
         privileged_dispatcher =
             privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
         let mut session_dispatcher =

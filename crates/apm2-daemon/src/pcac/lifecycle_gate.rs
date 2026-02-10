@@ -22,6 +22,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use apm2_core::consensus::{MerkleProof, SyncEvent};
 use apm2_core::crypto::Hash;
@@ -31,9 +32,9 @@ use apm2_core::pcac::{
     BindingExpectations, BoundaryIntentClass, FactClass, FreezeAction, IdentityEvidenceLevel,
     LifecycleStage, PcacPolicyKnobs, ReceiptAuthentication, ReplayLifecycleEntry, RiskTier,
     SovereigntyEnforcementMode, VerifierEconomicsChecker, VerifierEconomicsProfile,
-    VerifierOperation, record_verifier_metrics, timed_anti_entropy_verification,
-    timed_classify_fact, timed_validate_authoritative_bindings,
-    timed_validate_replay_lifecycle_order, timed_verify_receipt_authentication,
+    VerifierOperation, record_anti_entropy_event_metrics, record_verifier_metrics,
+    timed_anti_entropy_verification, timed_classify_fact, timed_validate_authoritative_bindings,
+    timed_validate_replay_lifecycle_order,
 };
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
@@ -397,45 +398,6 @@ impl InProcessKernel {
         )
     }
 
-    fn build_join_receipt_authentication(
-        input: &AuthorityJoinInputV1,
-    ) -> (ReceiptAuthentication, Option<Hash>) {
-        let authority_seal_hash = input.identity_proof_hash;
-        let Some((receipt_hash, siblings)) = input.scope_witness_hashes.split_first() else {
-            return (
-                ReceiptAuthentication::Direct {
-                    authority_seal_hash,
-                },
-                None,
-            );
-        };
-
-        if siblings.is_empty() {
-            return (
-                ReceiptAuthentication::PointerUnbatched {
-                    receipt_hash: *receipt_hash,
-                    authority_seal_hash,
-                },
-                Some(*receipt_hash),
-            );
-        }
-
-        let mut root = apm2_core::consensus::hash_leaf(receipt_hash);
-        for sibling in siblings {
-            root = apm2_core::consensus::hash_internal(&root, sibling);
-        }
-
-        (
-            ReceiptAuthentication::PointerBatched {
-                receipt_hash: *receipt_hash,
-                authority_seal_hash,
-                merkle_inclusion_proof: siblings.to_vec(),
-                receipt_batch_root_hash: root,
-            },
-            Some(root),
-        )
-    }
-
     const fn build_revalidate_bindings(
         cert: &AuthorityJoinCertificateV1,
         time_envelope_ref: Hash,
@@ -481,10 +443,13 @@ impl InProcessKernel {
         ]
     }
 
-    /// Validates anti-entropy verification work against verifier economics
+    /// Validates anti-entropy verification work against verifier-economics
     /// bounds.
+    ///
+    /// This is the callable runtime hook for daemon anti-entropy catch-up
+    /// paths. It is intentionally independent of test-only wiring.
     #[allow(clippy::too_many_arguments)]
-    pub fn check_anti_entropy_verification(
+    pub fn enforce_anti_entropy_economics(
         &self,
         risk_tier: RiskTier,
         local_digest: Option<&Hash>,
@@ -508,6 +473,7 @@ impl InProcessKernel {
             proof,
             proof_root,
         );
+        record_anti_entropy_event_metrics(timed.event_count);
         timed.result.map_err(|error| {
             Self::deny(
                 AuthorityDenyClass::UnknownState {
@@ -525,6 +491,39 @@ impl InProcessKernel {
             timed.elapsed_us,
             timed.proof_check_count,
             risk_tier,
+            ajc_id,
+            time_envelope_ref,
+            ledger_anchor,
+            denied_at_tick,
+        )
+    }
+
+    /// Backward-compatible shim retained for existing call sites.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_anti_entropy_verification(
+        &self,
+        risk_tier: RiskTier,
+        local_digest: Option<&Hash>,
+        remote_digest: Option<&Hash>,
+        events: &[SyncEvent],
+        expected_prev_hash: &Hash,
+        expected_start_seq_id: Option<u64>,
+        proof: Option<&MerkleProof>,
+        proof_root: Option<&Hash>,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        self.enforce_anti_entropy_economics(
+            risk_tier,
+            local_digest,
+            remote_digest,
+            events,
+            expected_prev_hash,
+            expected_start_seq_id,
+            proof,
+            proof_root,
             ajc_id,
             time_envelope_ref,
             ledger_anchor,
@@ -847,6 +846,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         input: &AuthorityJoinInputV1,
         policy: &PcacPolicyKnobs,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+        let join_started_at = Instant::now();
         let tick = self.current_tick().map_err(|reason| {
             self.clock_error_to_deny(
                 reason,
@@ -1018,29 +1018,6 @@ impl AuthorityJoinKernel for InProcessKernel {
             Self::validate_pointer_only_waiver(input, policy, tick)?;
         }
 
-        // TCK-00429: verify receipt authentication on the actual join input
-        // shape, then enforce verifier-economics bounds.
-        let (join_auth, expected_subject) = Self::build_join_receipt_authentication(input);
-        let timed_verify = timed_verify_receipt_authentication(
-            &join_auth,
-            &input.identity_proof_hash,
-            expected_subject.as_ref(),
-            input.time_envelope_ref,
-            input.as_of_ledger_anchor,
-            tick,
-        );
-        timed_verify.result?;
-        self.enforce_verifier_economics_sample(
-            VerifierOperation::VerifyReceiptAuthentication,
-            timed_verify.elapsed_us,
-            timed_verify.proof_check_count,
-            input.risk_tier,
-            None,
-            input.time_envelope_ref,
-            input.as_of_ledger_anchor,
-            tick,
-        )?;
-
         // Compute join hash and mint AJC.
         let join_hash = Self::compute_join_hash(input);
         let ajc_id = Self::mint_ajc_id(&join_hash, tick);
@@ -1063,6 +1040,21 @@ impl AuthorityJoinKernel for InProcessKernel {
 
         // Compute revocation head from directory_head_hash.
         let revocation_head_hash = input.directory_head_hash;
+
+        // TCK-00429 MAJOR fix: join economics timing must not reinterpret
+        // `scope_witness_hashes` as a depth-constrained Merkle proof. Measure
+        // the actual join operation latency directly and keep proof checks
+        // independent of scope witness cardinality.
+        self.enforce_verifier_economics_sample(
+            VerifierOperation::VerifyReceiptAuthentication,
+            u64::try_from(join_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            0,
+            input.risk_tier,
+            None,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            tick,
+        )?;
 
         Ok(AuthorityJoinCertificateV1 {
             ajc_id,
@@ -1613,6 +1605,95 @@ impl LifecycleGate {
         if let Some(ref tick_kernel) = self.tick_kernel {
             tick_kernel.advance_tick(new_tick);
         }
+    }
+
+    /// Runtime hook for anti-entropy verifier-economics enforcement.
+    ///
+    /// This method is the daemon-level integration point for anti-entropy
+    /// catch-up verification. When a shared `InProcessKernel` is present
+    /// (production wiring via `with_tick_kernel[_and_sovereignty]`), it
+    /// enforces full economics bounds. Without that wiring, Tier2+ fails
+    /// closed because economics cannot be proven.
+    ///
+    /// TODO(TCK-ANTI-ENTROPY-RUNTIME): Call this from the daemon's anti-entropy
+    /// sync runtime path once catch-up transport is wired in `apm2-daemon`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enforce_anti_entropy_economics(
+        &self,
+        risk_tier: RiskTier,
+        local_digest: Option<&Hash>,
+        remote_digest: Option<&Hash>,
+        events: &[SyncEvent],
+        expected_prev_hash: &Hash,
+        expected_start_seq_id: Option<u64>,
+        proof: Option<&MerkleProof>,
+        proof_root: Option<&Hash>,
+        ajc_id: Option<Hash>,
+        time_envelope_ref: Hash,
+        ledger_anchor: Hash,
+        denied_at_tick: u64,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if let Some(ref tick_kernel) = self.tick_kernel {
+            return tick_kernel.enforce_anti_entropy_economics(
+                risk_tier,
+                local_digest,
+                remote_digest,
+                events,
+                expected_prev_hash,
+                expected_start_seq_id,
+                proof,
+                proof_root,
+                ajc_id,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+            );
+        }
+
+        let timed = timed_anti_entropy_verification(
+            local_digest,
+            remote_digest,
+            events,
+            expected_prev_hash,
+            expected_start_seq_id,
+            proof,
+            proof_root,
+        );
+        record_anti_entropy_event_metrics(timed.event_count);
+        timed.result.map_err(|error| {
+            Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::UnknownState {
+                    description: format!("anti-entropy verification failed: {error}"),
+                },
+                ajc_id,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+                containment_action: None,
+            })
+        })?;
+
+        if matches!(risk_tier, RiskTier::Tier2Plus) {
+            return Err(Box::new(AuthorityDenyV1 {
+                deny_class: AuthorityDenyClass::UnknownState {
+                    description: "anti-entropy economics enforcement unavailable: \
+                         LifecycleGate requires with_tick_kernel wiring"
+                        .to_string(),
+                },
+                ajc_id,
+                time_envelope_ref,
+                ledger_anchor,
+                denied_at_tick,
+                containment_action: None,
+            }));
+        }
+
+        record_verifier_metrics(
+            VerifierOperation::AntiEntropy,
+            timed.elapsed_us,
+            timed.proof_check_count,
+        );
+        Ok(())
     }
 
     /// Actuates a sovereignty freeze via `StopAuthority` and logs the

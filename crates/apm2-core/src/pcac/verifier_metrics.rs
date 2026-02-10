@@ -16,3 +16,13 @@ pub fn record_verifier_metrics(operation: VerifierOperation, elapsed_us: u64, pr
         "pcac verifier economics sample"
     );
 }
+
+/// Emits anti-entropy throughput metrics separately from proof-check metrics.
+pub fn record_anti_entropy_event_metrics(event_count: u64) {
+    tracing::info!(
+        target: "pcac_verifier_economics",
+        operation = %VerifierOperation::AntiEntropy,
+        event_count,
+        "pcac anti-entropy event throughput sample"
+    );
+}
