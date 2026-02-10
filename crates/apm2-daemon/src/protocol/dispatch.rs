@@ -9450,6 +9450,12 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        let mut delegated_gate_inputs: Option<(
+            [u8; 32],
+            apm2_core::policy::permeability::AuthorityVector,
+            u64,
+        )> = None;
+
         if let Some(ref receipt_hash_bytes) = request.permeability_receipt_hash {
             use apm2_core::policy::permeability::ConsumptionContext;
 
@@ -9612,6 +9618,8 @@ impl PrivilegedDispatcher {
                     format!("permeability consumption binding failed: {e}"),
                 ));
             }
+
+            delegated_gate_inputs = Some((receipt_hash, required_authority, now_ms));
 
             info!(
                 work_id = %request.work_id,
@@ -10049,6 +10057,137 @@ impl PrivilegedDispatcher {
         // Generate session ID and ephemeral handle
         let session_id = format!("S-{}", uuid::Uuid::new_v4());
         let ephemeral_handle = EphemeralHandle::generate();
+
+        // TCK-00406: Build authoritative V1 envelope and enforce spawn gate
+        // in the production dispatch path BEFORE any session-state mutation.
+        let Some(envelope_risk_tier) =
+            crate::episode::RiskTier::from_u8(claim.policy_resolution.resolved_risk_tier)
+        else {
+            warn!(
+                work_id = %request.work_id,
+                resolved_risk_tier = claim.policy_resolution.resolved_risk_tier,
+                "SpawnEpisode rejected: invalid resolved_risk_tier for envelope gate (fail-closed)"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "invalid resolved_risk_tier {} for envelope gate (fail-closed)",
+                    claim.policy_resolution.resolved_risk_tier
+                ),
+            ));
+        };
+
+        let mut view_commitment_hasher = blake3::Hasher::new();
+        view_commitment_hasher.update(b"apm2.spawn.view_commitment.v1");
+        view_commitment_hasher.update(session_id.as_bytes());
+        view_commitment_hasher.update(claim.work_id.as_bytes());
+        view_commitment_hasher.update(claim.lease_id.as_bytes());
+        view_commitment_hasher.update(claim.actor_id.as_bytes());
+        view_commitment_hasher.update(&claim.policy_resolution.resolved_policy_hash);
+        view_commitment_hasher.update(&claim.policy_resolution.capability_manifest_hash);
+        view_commitment_hasher.update(&claim.policy_resolution.context_pack_hash);
+        view_commitment_hasher.update(&claim.policy_resolution.context_pack_recipe_hash);
+        view_commitment_hasher.update(&adapter_profile_hash);
+        if let Some(hash) = role_spec_hash {
+            view_commitment_hasher.update(&hash);
+        }
+        let view_commitment_hash: [u8; 32] = view_commitment_hasher.finalize().into();
+
+        let mut freshness_pinset_hasher = blake3::Hasher::new();
+        freshness_pinset_hasher.update(b"apm2.spawn.freshness_pinset.v1");
+        freshness_pinset_hasher.update(claim.work_id.as_bytes());
+        freshness_pinset_hasher.update(claim.lease_id.as_bytes());
+        freshness_pinset_hasher.update(&claim.policy_resolution.context_pack_hash);
+        freshness_pinset_hasher.update(&claim.policy_resolution.context_pack_recipe_hash);
+        let freshness_pinset_hash: [u8; 32] = freshness_pinset_hasher.finalize().into();
+
+        let pinned_snapshot = crate::episode::PinnedSnapshot::builder()
+            .repo_hash(claim.policy_resolution.context_pack_hash)
+            .policy_hash(claim.policy_resolution.resolved_policy_hash)
+            .model_profile_hash(adapter_profile_hash)
+            .build();
+
+        let context_refs = crate::episode::ContextRefs {
+            context_pack_hash: claim.policy_resolution.context_pack_hash.to_vec(),
+            dcp_refs: vec![claim.policy_resolution.policy_resolved_ref.clone()],
+        };
+
+        let mut envelope_builder = crate::episode::EpisodeEnvelopeV1::builder()
+            .episode_id(&session_id)
+            .actor_id(&claim.actor_id)
+            .work_id(&claim.work_id)
+            .lease_id(&claim.lease_id)
+            .capability_manifest_hash(claim.policy_resolution.capability_manifest_hash)
+            .budget(crate::episode::EpisodeBudget::default())
+            .stop_conditions(resolved_stop_conditions.clone())
+            .pinned_snapshot(pinned_snapshot)
+            .risk_tier(envelope_risk_tier)
+            .context_refs(context_refs)
+            .view_commitment_hash(view_commitment_hash)
+            .freshness_pinset_hash(freshness_pinset_hash);
+
+        if let Some((receipt_hash, _, _)) = delegated_gate_inputs.as_ref() {
+            envelope_builder = envelope_builder.permeability_receipt_hash(*receipt_hash);
+        }
+
+        let authoritative_envelope = match envelope_builder.build() {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: failed to build authoritative envelope (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("authoritative envelope build failed: {e}"),
+                ));
+            },
+        };
+
+        if let Some((_, required_authority, now_ms)) = delegated_gate_inputs.as_ref() {
+            let Some(receipt) = claim.permeability_receipt.as_ref() else {
+                warn!(
+                    work_id = %request.work_id,
+                    "SpawnEpisode rejected: delegated gate inputs present without receipt (fail-closed)"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "delegated gate inputs present without claim permeability receipt (fail-closed)",
+                ));
+            };
+
+            if let Err(e) = crate::episode::validate_delegated_spawn_gate(
+                Some(&authoritative_envelope),
+                receipt,
+                required_authority,
+                *now_ms,
+            ) {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: delegated envelope gate failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("delegated envelope gate failed: {e}"),
+                ));
+            }
+        } else if let Err(e) =
+            crate::episode::validate_spawn_gate(Some(&authoritative_envelope), false)
+        {
+            warn!(
+                work_id = %request.work_id,
+                error = %e,
+                "SpawnEpisode rejected: envelope gate failed"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("envelope gate failed: {e}"),
+            ));
+        }
+
+        let authoritative_envelope_hash = authoritative_envelope.envelope_hash();
 
         // TCK-00384 security fix: Transactional session + telemetry registration
         // with guaranteed rollback on any failure path.
@@ -10654,23 +10793,7 @@ impl PrivilegedDispatcher {
         // workspace directory. The episode must be started BEFORE returning
         // to the client so that tool handlers are properly initialized.
         //
-        // Generate envelope hash from session_id + work_id + lease_id for uniqueness.
-        // Null-byte delimiters prevent collision between fields (MAJOR-2 security fix).
-        // adapter/role/context lineage hashes are included in the envelope hash
-        // so runtime identity reflects authoritative policy bindings.
-        // TODO(TCK-00397): migrate to EpisodeEnvelopeBuilder for structured
-        // envelope construction once the full EpisodeEnvelope lifecycle is wired.
-        let envelope_data = format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
-            session_id,
-            request.work_id,
-            claim.lease_id,
-            hex::encode(adapter_profile_hash),
-            role_spec_hash_log,
-            context_pack_hash_component,
-            context_pack_recipe_hash_component,
-        );
-        let envelope_hash: [u8; 32] = blake3::hash(envelope_data.as_bytes()).into();
+        let envelope_hash = authoritative_envelope_hash;
 
         // Try to create and start the episode. This requires a Tokio runtime.
         // In unit tests without a runtime, we skip episode creation but still
