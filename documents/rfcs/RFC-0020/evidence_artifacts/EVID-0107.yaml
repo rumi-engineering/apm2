@@ -1,0 +1,59 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0107"
+  title: "Import admission gate and receipt issuance evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that cross-cell import admission gate implementation satisfies
+    RFC-0020 Section 2.4.0b normative requirements:
+    - DigestFirstFetchPolicy enforces bounded body size, concurrent fetches,
+      and fetch timeout
+    - ImportAdmissionGate classifies HMP message classes into import
+      categories (LedgerEventRange, CasArtifact, PermeabilityGrant,
+      PolicyRootCertificate)
+    - Admission evaluation produces per-artifact decisions (Admitted/Rejected)
+      with full receipt binding
+    - Receipt IDs are deterministic and change with different inputs
+    - Rejection reasons are safely truncated at char boundaries
+    - Import receipts carry category metadata and optional source ranges
+    - Non-import message classes are denied at the gate (fail-closed)
+    - All structural bounds from the parent HMP module are enforced
+
+    Covers digest-first fetch policy, import classification, admission
+    evaluation, receipt issuance, deterministic receipt IDs, rejection
+    truncation, and fail-closed gate behavior.
+  requirement_ids:
+    - "REQ-0034"
+  source_refs:
+    - "crates/apm2-daemon/src/hmp/admission.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        HMP admission module tests (crates/apm2-daemon/src/hmp/admission.rs):
+        Fetch policy:
+        - fetch_policy_admits_within_bounds: within-bounds body accepted
+        - fetch_policy_rejects_oversized: oversized body rejected
+        - fetch_policy_custom_bounds: custom policy bounds enforced
+        Import classification:
+        - classify_anti_entropy_as_ledger_range: HSI.ANTI_ENTROPY.* -> LedgerEventRange
+        - classify_cas_as_artifact: HSI.CAS.* -> CasArtifact
+        - classify_permeability_as_grant: HSI.PERMEABILITY.* -> PermeabilityGrant
+        - classify_directory_as_certificate: HSI.DIRECTORY.* -> PolicyRootCertificate
+        - classify_unknown_returns_none: non-import class returns None
+        Admission evaluation:
+        - evaluate_all_admitted: all artifacts pass verification
+        - evaluate_partial_admission: mixed pass/fail tracked correctly
+        - evaluate_all_rejected: all artifacts rejected with reasons
+        Import receipt:
+        - issue_import_receipt_with_range: receipt with source range
+        - issue_import_receipt_non_import_class_fails: non-import denied
+        Receipt determinism:
+        - receipt_id_deterministic: same inputs produce same receipt ID
+        - receipt_id_changes_with_different_input: different inputs differ
+        Rejection handling:
+        - rejection_reason_truncated_safely: char-boundary-safe truncation
+        Gate accessors:
+        - gate_exposes_fetch_policy: fetch policy accessible
+        - gate_exposes_local_cell_id: local cell ID accessible
+      ref: "cargo test -p apm2-daemon --lib hmp::admission"

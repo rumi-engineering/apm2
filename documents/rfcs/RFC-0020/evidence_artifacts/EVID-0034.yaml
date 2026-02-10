@@ -1,0 +1,88 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0034"
+  title: "HMP digest-first channels and admission receipt semantics evidence"
+  category: "UNIT_TEST_RESULT"
+  status: "PASS"
+  description: |
+    Evidence that HMP message envelope and admission receipt implementation
+    satisfies RFC-0020 Section 7.3 and Section 2.4.0b security properties:
+    - Five channel classes (DISCOVERY, HANDSHAKE, WORK, EVIDENCE, GOVERNANCE)
+      with correct authority-bearing and routing-only classification
+    - Digest-first body references (CAS hash + content type, never inlined)
+    - Envelope admission gate with pre-decode size bounds
+    - HmpMessageV1 structural validation (field length, parent count, channel
+      class constraints)
+    - Authority-bearing channels (HANDSHAKE, GOVERNANCE) require permeability
+      receipt hash; WORK operates under session authority
+    - Deterministic domain-separated envelope hashing with optional field
+      presence markers
+    - Unsolicited large payloads dropped with bounded resource use
+    - Fail-closed deserialization: unknown fields rejected via
+      deny_unknown_fields
+    - AdmissionReceiptV1 binds sender cell ID, policy root key ID, admitted
+      hashes, verification method, local ledger anchor, and rejection reasons
+    - ImportReceiptV1 wraps admission receipt with import category metadata
+    - Routing facts (envelope metadata) and acceptance facts (admission
+      receipts) are operationally distinct
+
+    Covers channel class semantics, digest-first design, envelope admission,
+    receipt issuance, bounded fields, fail-closed parsing, and deterministic
+    hashing.
+  requirement_ids:
+    - "REQ-0034"
+  source_refs:
+    - "crates/apm2-daemon/src/hmp/mod.rs"
+    - "crates/apm2-daemon/src/hmp/admission.rs"
+  artifacts:
+    - type: "test_output"
+      description: |
+        HMP module tests (crates/apm2-daemon/src/hmp/mod.rs):
+        Channel class:
+        - channel_class_authority_bearing: HANDSHAKE/WORK/GOVERNANCE are authority-bearing
+        - channel_class_routing_only: DISCOVERY/EVIDENCE are routing-only
+        - channel_class_display: canonical string representations
+        - channel_class_serde_roundtrip: JSON serialization roundtrip
+        Body reference:
+        - body_ref_valid: valid body reference accepted
+        - body_ref_content_type_too_long: oversized content type rejected
+        Envelope validation:
+        - valid_evidence_envelope_passes: well-formed envelope passes
+        - work_channel_without_permeability_receipt_passes: WORK under session authority
+        - handshake_without_permeability_receipt_fails: HANDSHAKE requires receipt
+        - governance_without_permeability_receipt_fails: GOVERNANCE requires receipt
+        - handshake_with_permeability_receipt_passes: valid HANDSHAKE accepted
+        - too_many_parents_fails: parent list bounded
+        - oversized_protocol_id_fails: field length bounded
+        Envelope hashing:
+        - envelope_hash_deterministic: same input produces same hash
+        - envelope_hash_changes_with_field_mutation: field changes hash
+        - envelope_hash_changes_with_optional_field: optional field changes hash
+        Envelope admission gate:
+        - gate_rejects_oversized_envelope: pre-decode size bound
+        - gate_rejects_invalid_json: malformed input rejected
+        - gate_admits_valid_envelope: valid envelope admitted
+        Admission receipt:
+        - admission_receipt_valid: valid receipt passes validation
+        - admission_receipt_with_rejections: partial admission tracked
+        - admission_receipt_too_many_hashes: bounded admitted hashes
+        - admission_receipt_too_many_rejection_reasons: bounded rejections
+        - admission_receipt_rejection_reason_too_long: bounded reason length
+        - admission_receipt_hash_deterministic: deterministic receipt hash
+        - admission_receipt_hash_changes_with_mutation: mutation changes hash
+        Import receipt:
+        - import_receipt_valid: valid import receipt passes
+        - import_receipt_invalid_range: inverted range rejected
+        - import_receipt_no_range: no range for non-range imports
+        Verification method:
+        - verification_method_display: canonical display strings
+        - verification_method_serde_roundtrip: JSON roundtrip
+        Import category:
+        - import_category_serde_roundtrip: JSON roundtrip
+        Integration:
+        - routing_facts_and_acceptance_facts_are_distinct: operational distinction
+        - unsolicited_large_payload_dropped_bounded: bounded resource use
+        Fail-closed:
+        - unknown_fields_rejected_body_ref: deny_unknown_fields
+        - unknown_fields_rejected_admission_receipt: deny_unknown_fields
+      ref: "cargo test -p apm2-daemon --lib hmp::"
