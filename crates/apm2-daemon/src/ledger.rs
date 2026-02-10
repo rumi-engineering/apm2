@@ -118,20 +118,21 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type = 'SubleaseIssued'",
             [],
         )?;
-        // SECURITY (TCK-00407 — Receipt Semantic Identity Constraint):
+        // SECURITY (TCK-00407 — Receipt Identity Constraints):
         //
-        // Enforce at-most-once semantics for review receipt events using the
-        // canonical semantic tuple:
-        //   `(receipt_id, lease_id, work_id, changeset_digest)`.
+        // Enforce two complementary receipt constraints:
+        // - transport-level uniqueness by `receipt_id` (global uniqueness)
+        // - semantic identity uniqueness by tuple `(receipt_id, lease_id, work_id,
+        //   changeset_digest)`
         //
-        // `work_id` is sourced from the payload field and falls back to the
-        // row's `work_id` column for legacy rows that predate canonical tuple
-        // persistence.
+        // `work_id` in the semantic tuple is sourced from the payload field
+        // and falls back to the row's `work_id` column for legacy rows that
+        // predate canonical tuple persistence.
         //
-        // MIGRATION: Quarantine historical duplicate semantic tuples before
-        // creating the unique index. Quarantine entries are keyed by stable
-        // `event_id` (never persistent `rowid`) so startup replays are safe
-        // even if SQLite rowids are recycled over time.
+        // MIGRATION: Quarantine historical duplicate `receipt_id` rows before
+        // creating `idx_unique_receipt_id`. Quarantine entries are keyed by
+        // stable `event_id` (never persistent `rowid`) so startup replays are
+        // safe even if SQLite rowids are recycled over time.
         //
         // The migration is idempotent:
         // - quarantine table is created with `IF NOT EXISTS`
@@ -146,30 +147,15 @@ impl SqliteLedgerEventEmitter {
              FROM ledger_events le \
              INNER JOIN ( \
                  SELECT json_extract(CAST(payload AS TEXT), '$.receipt_id') AS receipt_id, \
-                        json_extract(CAST(payload AS TEXT), '$.lease_id') AS lease_id, \
-                        COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id) AS work_identity, \
-                        json_extract(CAST(payload AS TEXT), '$.changeset_digest') AS changeset_digest, \
                         MIN(rowid) AS keep_rowid \
                  FROM ledger_events \
                  WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
                  AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL \
-                 AND json_extract(CAST(payload AS TEXT), '$.lease_id') IS NOT NULL \
-                 AND COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id) IS NOT NULL \
-                 AND json_extract(CAST(payload AS TEXT), '$.changeset_digest') IS NOT NULL \
-                 GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id'), \
-                          json_extract(CAST(payload AS TEXT), '$.lease_id'), \
-                          COALESCE(json_extract(CAST(payload AS TEXT), '$.work_id'), work_id), \
-                          json_extract(CAST(payload AS TEXT), '$.changeset_digest') \
+                 GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id') \
                  HAVING COUNT(*) > 1 \
              ) dups ON json_extract(CAST(le.payload AS TEXT), '$.receipt_id') = dups.receipt_id \
-                     AND json_extract(CAST(le.payload AS TEXT), '$.lease_id') = dups.lease_id \
-                     AND COALESCE(json_extract(CAST(le.payload AS TEXT), '$.work_id'), le.work_id) = dups.work_identity \
-                     AND json_extract(CAST(le.payload AS TEXT), '$.changeset_digest') = dups.changeset_digest \
              WHERE le.event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
              AND json_extract(CAST(le.payload AS TEXT), '$.receipt_id') IS NOT NULL \
-             AND json_extract(CAST(le.payload AS TEXT), '$.lease_id') IS NOT NULL \
-             AND COALESCE(json_extract(CAST(le.payload AS TEXT), '$.work_id'), le.work_id) IS NOT NULL \
-             AND json_extract(CAST(le.payload AS TEXT), '$.changeset_digest') IS NOT NULL \
              AND le.rowid != dups.keep_rowid \
              ",
             [],
@@ -181,7 +167,12 @@ impl SqliteLedgerEventEmitter {
              )",
             [],
         )?;
-        conn.execute("DROP INDEX IF EXISTS idx_unique_receipt_id", [])?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
+             WHERE json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL",
+            [],
+        )?;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_semantic_identity \
              ON ledger_events( \
@@ -3625,6 +3616,69 @@ mod tests {
         assert_eq!(
             duplicate_quarantined_count_after_rerun, 1,
             "idempotent reruns must not duplicate quarantine entries"
+        );
+    }
+
+    /// Regression: `receipt_id` uniqueness is enforced at the `SQLite` boundary
+    /// even when semantic tuple fields differ.
+    #[test]
+    fn init_schema_restores_global_receipt_id_uniqueness() {
+        let conn = Connection::open_in_memory().unwrap();
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+
+        let has_receipt_id_unique_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_unique_receipt_id'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_receipt_id_unique_index,
+            "init_schema must restore idx_unique_receipt_id for DB-level race protection"
+        );
+
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "receipt-unique-base",
+                "review_receipt_recorded",
+                "work-base",
+                "actor-base",
+                br#"{"receipt_id":"RR-UNIQUE-001","lease_id":"lease-base","work_id":"work-base","changeset_digest":"digest-base"}"#.as_slice(),
+                b"sig-base".as_slice(),
+                101_i64
+            ],
+        )
+        .unwrap();
+
+        let duplicate_err = conn
+            .execute(
+                "INSERT INTO ledger_events
+                    (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "receipt-unique-duplicate",
+                    "review_blocked_recorded",
+                    "work-other",
+                    "actor-other",
+                    br#"{"receipt_id":"RR-UNIQUE-001","lease_id":"lease-other","work_id":"work-other","changeset_digest":"digest-other"}"#.as_slice(),
+                    b"sig-other".as_slice(),
+                    102_i64
+                ],
+            )
+            .expect_err("duplicate receipt_id must be rejected by unique index");
+
+        let duplicate_err_text = duplicate_err.to_string();
+        assert!(
+            duplicate_err_text.contains("idx_unique_receipt_id")
+                || duplicate_err_text.contains("UNIQUE constraint failed"),
+            "expected UNIQUE failure for idx_unique_receipt_id, got: {duplicate_err_text}"
         );
     }
 

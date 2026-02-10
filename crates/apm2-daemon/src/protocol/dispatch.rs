@@ -13012,7 +13012,7 @@ impl PrivilegedDispatcher {
                     work_id = %authoritative_work_id,
                     verdict = %request_verdict,
                     error = %e,
-                    "Concurrent duplicate semantic review identity detected by UNIQUE constraint"
+                    "Concurrent duplicate review receipt detected by UNIQUE constraint"
                 );
 
                 let existing = self
