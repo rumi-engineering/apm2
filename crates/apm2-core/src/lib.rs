@@ -51,6 +51,7 @@ pub mod coordination;
 pub mod credentials;
 pub mod crypto;
 pub mod determinism;
+pub mod economics;
 pub mod events;
 pub mod evidence;
 pub mod fac;

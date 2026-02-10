@@ -623,7 +623,7 @@ impl AuthorityJoinInputV1 {
 ///
 /// Maps to the broader `RiskTierClass` but scoped to the PCAC context
 /// with fail-closed semantics on unknown variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RiskTier {
