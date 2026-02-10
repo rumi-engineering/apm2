@@ -1,7 +1,7 @@
 name: Forge Admission Cycle
 
 on:
-  pull_request_target:
+  pull_request:
     branches: [main]
     types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
@@ -43,6 +43,11 @@ jobs:
               pr_number="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
               [[ "$pr_number" =~ ^[0-9]+$ ]] || fail "missing_or_invalid_pull_request_number"
               echo "fac-barrier: decision=ALLOW stage=barrier event=pull_request_target pr=${pr_number}"
+              ;;
+            pull_request)
+              pr_number="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
+              [[ "$pr_number" =~ ^[0-9]+$ ]] || fail "missing_or_invalid_pull_request_number"
+              echo "fac-barrier: decision=ALLOW stage=barrier event=pull_request pr=${pr_number}"
               ;;
             workflow_dispatch)
               pr_number="$(jq -r '.inputs.pr_number // .client_payload.pr_number // empty' "$GITHUB_EVENT_PATH")"
@@ -95,13 +100,19 @@ jobs:
           set -euo pipefail
           echo "fac-kickoff: decision=ALLOW reason=preflight_success dispatch_target=self-hosted stage=kickoff"
 
+      - name: Checkout trusted workflow context
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
       - name: Resolve PR context
         id: pr-context
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "pull_request_target" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request_target" || "${{ github.event_name }}" == "pull_request" ]]; then
             pr_number="${{ github.event.pull_request.number }}"
             head_sha="${{ github.event.pull_request.head.sha }}"
           else
