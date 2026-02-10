@@ -53,6 +53,7 @@
 
 pub mod ci_queue;
 mod error;
+pub mod parity;
 mod reducer;
 mod state;
 
@@ -64,5 +65,10 @@ pub use ci_queue::{
     target_phase_for_conclusion,
 };
 pub use error::WorkError;
+pub use parity::{
+    EventFamily, EventFamilyMapping, EventFamilyPromotionGate, MAPPING_MATRIX, ParityCheckResult,
+    ParityDefect, ParityField, ParityValidator, PromotionGateResult, ReplayEquivalenceChecker,
+    ReplayResult, TransitionClass,
+};
 pub use reducer::{WorkReducer, WorkReducerState, helpers};
 pub use state::{Work, WorkState, WorkType};
