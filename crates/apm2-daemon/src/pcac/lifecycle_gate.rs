@@ -38,6 +38,10 @@ use crate::htf::HolonicClock;
 
 const ZERO_HASH: Hash = [0u8; 32];
 
+fn hashes_equal(left: &Hash, right: &Hash) -> bool {
+    left.ct_eq(right).unwrap_u8() == 1
+}
+
 // =============================================================================
 // InProcessKernel
 // =============================================================================
@@ -937,15 +941,17 @@ impl LifecycleGate {
 
     fn temporal_arbitration_tick(
         &self,
-        receipt: &TemporalArbitrationReceiptV1,
+        _receipt: &TemporalArbitrationReceiptV1,
     ) -> Result<u64, TemporalArbitrationError> {
-        self.tick_kernel
-            .as_ref()
-            .map_or(Ok(receipt.arbitrated_at_tick), |kernel| {
-                kernel
-                    .current_tick()
-                    .map_err(TemporalArbitrationError::TickDerivation)
-            })
+        let Some(kernel) = self.tick_kernel.as_ref() else {
+            return Err(TemporalArbitrationError::TickDerivation(
+                "local tick derivation unavailable; refusing untrusted receipt tick".to_string(),
+            ));
+        };
+
+        kernel
+            .current_tick()
+            .map_err(TemporalArbitrationError::TickDerivation)
     }
 
     /// Validates and maps temporal arbitration receipt outcome into admission
@@ -979,9 +985,26 @@ impl LifecycleGate {
             return Ok(());
         };
 
-        let denied_at_tick = self
-            .temporal_arbitration_tick(receipt)
-            .unwrap_or(receipt.arbitrated_at_tick);
+        let denied_at_tick = self.temporal_arbitration_tick(receipt).unwrap_or(u64::MAX);
+
+        // Verify receipt is cryptographically bound to the current temporal
+        // context.
+        if !hashes_equal(&receipt.time_envelope_ref, &current_time_envelope_ref) {
+            let deny = Box::new(AuthorityDenyV1 {
+                deny_class: apm2_core::pcac::AuthorityDenyClass::TemporalArbitrationDenied {
+                    predicate_id: receipt.predicate_id.to_string(),
+                    outcome: "time_envelope_mismatch".to_string(),
+                },
+                ajc_id: Some(cert.ajc_id),
+                time_envelope_ref: current_time_envelope_ref,
+                ledger_anchor: current_ledger_anchor,
+                denied_at_tick,
+                containment_action: Some(FreezeAction::HardFreeze),
+            });
+            self.actuate_containment(stage, &deny);
+            return Err(deny);
+        }
+
         let action = match self.check_temporal_arbitration(receipt) {
             Ok(action) => action,
             Err(error) => {
@@ -1114,6 +1137,45 @@ impl LifecycleGate {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn check_identity_membership(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_tick: u64,
+        membership_verified: bool,
+        stage: &'static str,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
+        if !Self::requires_sovereignty_check(cert) {
+            return Ok(());
+        }
+        if membership_verified {
+            return Ok(());
+        }
+
+        let principal_id = sovereignty_state
+            .map(|state| state.principal_id.as_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let deny = Box::new(AuthorityDenyV1 {
+            deny_class: apm2_core::pcac::AuthorityDenyClass::IdentityMembershipUnverifiable {
+                detail: format!(
+                    "tier2+ identity membership unverifiable for principal '{principal_id}' (ajc_id={})",
+                    hex::encode(cert.ajc_id)
+                ),
+            },
+            ajc_id: Some(cert.ajc_id),
+            time_envelope_ref: current_time_envelope_ref,
+            ledger_anchor: current_ledger_anchor,
+            denied_at_tick: current_tick,
+            containment_action: Some(FreezeAction::HardFreeze),
+        });
+        self.actuate_containment(stage, &deny);
+        Err(deny)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn check_revalidate_sovereignty(
         &self,
         cert: &AuthorityJoinCertificateV1,
@@ -1122,6 +1184,7 @@ impl LifecycleGate {
         sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
         current_tick: u64,
         pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        membership_verified: bool,
         stage: &'static str,
     ) -> Result<(), Box<AuthorityDenyV1>> {
         let sovereignty_mode = pcac_policy
@@ -1133,6 +1196,16 @@ impl LifecycleGate {
         {
             return Ok(());
         }
+
+        self.check_identity_membership(
+            cert,
+            sovereignty_state,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_tick,
+            membership_verified,
+            stage,
+        )?;
 
         match (&self.sovereignty_checker, sovereignty_state) {
             (Some(checker), Some(sov_state)) => {
@@ -1333,6 +1406,32 @@ impl LifecycleGate {
         current_tick: u64,
         pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
     ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
+        self.join_and_revalidate_with_sovereignty_membership(
+            input,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+            sovereignty_state,
+            current_tick,
+            pcac_policy,
+            true,
+        )
+    }
+
+    /// Executes `join -> revalidate-before-decision` with optional
+    /// sovereignty checks and explicit Tier2+ membership verification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_and_revalidate_with_sovereignty_membership(
+        &self,
+        input: &AuthorityJoinInputV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        membership_verified: bool,
+    ) -> Result<AuthorityJoinCertificateV1, Box<AuthorityDenyV1>> {
         let cert = self.join_and_revalidate(
             input,
             current_time_envelope_ref,
@@ -1346,6 +1445,7 @@ impl LifecycleGate {
             sovereignty_state,
             current_tick,
             pcac_policy,
+            membership_verified,
             "revalidate-before-decision",
         )?;
         Ok(cert)
@@ -1382,6 +1482,34 @@ impl LifecycleGate {
         pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
         temporal_arbitration_receipt: Option<&TemporalArbitrationReceiptV1>,
     ) -> Result<(), Box<AuthorityDenyV1>> {
+        self.revalidate_before_execution_with_sovereignty_membership(
+            cert,
+            current_time_envelope_ref,
+            current_ledger_anchor,
+            current_revocation_head_hash,
+            sovereignty_state,
+            current_tick,
+            pcac_policy,
+            temporal_arbitration_receipt,
+            true,
+        )
+    }
+
+    /// Executes revalidate-before-execution with optional sovereignty checks,
+    /// temporal arbitration, and explicit Tier2+ membership verification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn revalidate_before_execution_with_sovereignty_membership(
+        &self,
+        cert: &AuthorityJoinCertificateV1,
+        current_time_envelope_ref: Hash,
+        current_ledger_anchor: Hash,
+        current_revocation_head_hash: Hash,
+        sovereignty_state: Option<&super::sovereignty::SovereigntyState>,
+        current_tick: u64,
+        pcac_policy: Option<&apm2_core::pcac::PcacPolicyKnobs>,
+        temporal_arbitration_receipt: Option<&TemporalArbitrationReceiptV1>,
+        membership_verified: bool,
+    ) -> Result<(), Box<AuthorityDenyV1>> {
         self.revalidate_before_execution(
             cert,
             current_time_envelope_ref,
@@ -1395,6 +1523,7 @@ impl LifecycleGate {
             sovereignty_state,
             current_tick,
             pcac_policy,
+            membership_verified,
             "revalidate-before-execution",
         )?;
         self.enforce_temporal_arbitration(

@@ -67,7 +67,10 @@ use apm2_core::context::firewall::FirewallViolationDefect;
 use apm2_core::coordination::ContextRefinementRequest;
 use apm2_core::crypto::Hash;
 use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
-use apm2_core::pcac::PcacPolicyKnobs;
+use apm2_core::pcac::{
+    ArbitrationOutcome, EvaluatorTuple, PcacPolicyKnobs, TemporalArbitrationReceiptV1,
+    TemporalPredicateId,
+};
 use apm2_core::tool::{self, tool_request as tool_req};
 use apm2_holon::defect::{
     DefectContext as HolonDefectContext, DefectRecord, DefectSeverity, DefectSignal, SignalType,
@@ -772,6 +775,8 @@ struct PendingPcacAuthority {
     requires_authoritative_acceptance: bool,
     pcac_policy: PcacPolicyKnobs,
     principal_id: String,
+    membership_verified: bool,
+    temporal_arbitration_receipt: Option<TemporalArbitrationReceiptV1>,
     pre_actuation_required: bool,
     pre_actuation_receipt_hashes: Vec<Hash>,
 }
@@ -1749,6 +1754,114 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         Ok(tick)
     }
 
+    #[inline]
+    const fn requires_temporal_arbitration(risk_tier: apm2_core::pcac::RiskTier) -> bool {
+        matches!(risk_tier, apm2_core::pcac::RiskTier::Tier2Plus)
+    }
+
+    fn verify_tier2_membership(
+        risk_tier: apm2_core::pcac::RiskTier,
+        sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode,
+        requesting_principal_id: &str,
+        sovereignty_state: Option<&crate::pcac::SovereigntyState>,
+    ) -> bool {
+        if !matches!(risk_tier, apm2_core::pcac::RiskTier::Tier2Plus)
+            || sovereignty_mode == apm2_core::pcac::SovereigntyEnforcementMode::Disabled
+        {
+            return true;
+        }
+
+        let Some(state) = sovereignty_state else {
+            return false;
+        };
+
+        !requesting_principal_id.is_empty()
+            && !state.principal_id.is_empty()
+            && requesting_principal_id == state.principal_id
+    }
+
+    fn build_temporal_arbitration_receipt(
+        time_envelope_ref: Hash,
+        arbitrated_at_tick: u64,
+    ) -> TemporalArbitrationReceiptV1 {
+        let predicate_id = TemporalPredicateId::TpEio29001;
+        let contract_digest_set = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-temporal-contract-digest-set-v1");
+            hasher.update(&time_envelope_ref);
+            hasher.update(&arbitrated_at_tick.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let canonicalizer_tuple = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-temporal-canonicalizer-tuple-v1");
+            hasher.update(&time_envelope_ref);
+            *hasher.finalize().as_bytes()
+        };
+        let time_authority_ref = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-temporal-time-authority-ref-v1");
+            hasher.update(&time_envelope_ref);
+            hasher.update(&arbitrated_at_tick.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let window_ref = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-temporal-window-ref-v1");
+            hasher.update(&arbitrated_at_tick.to_le_bytes());
+            *hasher.finalize().as_bytes()
+        };
+
+        let evaluator_a = EvaluatorTuple {
+            evaluator_id: "dispatch-eval-a".to_string(),
+            predicate_id,
+            contract_digest_set,
+            canonicalizer_tuple,
+            time_authority_ref,
+            window_ref,
+            verdict: ArbitrationOutcome::AgreedAllow,
+            deny_reason: None,
+        };
+        let evaluator_b = EvaluatorTuple {
+            evaluator_id: "dispatch-eval-b".to_string(),
+            ..evaluator_a.clone()
+        };
+
+        let content_digest = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"pcac-temporal-arbitration-receipt-v1");
+            hasher.update(&time_envelope_ref);
+            hasher.update(&arbitrated_at_tick.to_le_bytes());
+            hasher.update(predicate_id.to_string().as_bytes());
+            hasher.update(ArbitrationOutcome::AgreedAllow.to_string().as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+
+        TemporalArbitrationReceiptV1 {
+            predicate_id,
+            evaluators: vec![evaluator_a, evaluator_b],
+            aggregate_outcome: ArbitrationOutcome::AgreedAllow,
+            time_envelope_ref,
+            arbitrated_at_tick,
+            deadline_tick: None,
+            content_digest,
+        }
+    }
+
+    fn derive_temporal_arbitration_receipt(
+        risk_tier: apm2_core::pcac::RiskTier,
+        time_envelope_ref: Hash,
+        arbitrated_at_tick: u64,
+    ) -> Option<TemporalArbitrationReceiptV1> {
+        if !Self::requires_temporal_arbitration(risk_tier) {
+            return None;
+        }
+        Some(Self::build_temporal_arbitration_receipt(
+            time_envelope_ref,
+            arbitrated_at_tick,
+        ))
+    }
+
     /// Handles `RequestTool` requests (IPC-SESS-001).
     ///
     /// # TCK-00260: Capability Manifest Validation
@@ -2417,12 +2530,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 };
 
             let sovereignty_state_ref = self.sovereignty_state.as_deref();
+            let session_principal_id = Self::token_principal_id(&token);
             if matches!(risk_tier, apm2_core::pcac::RiskTier::Tier2Plus) {
                 match pcac_policy.tier2_sovereignty_mode {
                     apm2_core::pcac::SovereigntyEnforcementMode::Disabled => {},
                     mode => {
                         if let Some(sovereignty_state) = sovereignty_state_ref {
-                            let session_principal_id = Self::token_principal_id(&token);
                             if session_principal_id != sovereignty_state.principal_id.as_str() {
                                 let deny = Self::build_sovereignty_principal_mismatch_deny(
                                     "revalidate-before-decision",
@@ -2482,7 +2595,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     },
                 }
             }
-            let certificate = match pcac_gate.join_and_revalidate_with_sovereignty(
+
+            let membership_verified = Self::verify_tier2_membership(
+                risk_tier,
+                pcac_policy.tier2_sovereignty_mode,
+                session_principal_id,
+                sovereignty_state_ref,
+            );
+
+            let certificate = match pcac_gate.join_and_revalidate_with_sovereignty_membership(
                 &pcac_input,
                 current_time_envelope_ref,
                 current_ledger_anchor,
@@ -2490,6 +2611,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 sovereignty_state_ref,
                 freshness_witness_tick,
                 Some(&pcac_policy),
+                membership_verified,
             ) {
                 Ok(cert) => cert,
                 Err(deny) => {
@@ -2536,7 +2658,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 boundary_intent_class,
                 requires_authoritative_acceptance,
                 pcac_policy,
-                principal_id: Self::token_principal_id(&token).to_string(),
+                principal_id: session_principal_id.to_string(),
+                membership_verified,
+                temporal_arbitration_receipt: None,
                 pre_actuation_required,
                 pre_actuation_receipt_hashes,
             })
@@ -3184,9 +3308,26 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             },
                         }
                     }
+                    let membership_verified = pending_pcac.membership_verified
+                        && Self::verify_tier2_membership(
+                            pending_pcac.certificate.risk_tier,
+                            pending_pcac.pcac_policy.tier2_sovereignty_mode,
+                            &pending_pcac.principal_id,
+                            sovereignty_state_ref,
+                        );
+                    let temporal_arbitration_receipt = pending_pcac
+                        .temporal_arbitration_receipt
+                        .clone()
+                        .or_else(|| {
+                            Self::derive_temporal_arbitration_receipt(
+                                pending_pcac.certificate.risk_tier,
+                                current_time_envelope_ref,
+                                fresh_tick,
+                            )
+                        });
                     if let Err(deny) = pending_pcac
                         .gate
-                        .revalidate_before_execution_with_sovereignty(
+                        .revalidate_before_execution_with_sovereignty_membership(
                             &pending_pcac.certificate,
                             current_time_envelope_ref,
                             current_ledger_anchor,
@@ -3194,7 +3335,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             sovereignty_state_ref,
                             fresh_tick,
                             Some(&pending_pcac.pcac_policy),
-                            None,
+                            temporal_arbitration_receipt.as_ref(),
+                            membership_verified,
                         )
                     {
                         let containment_action = deny.containment_action;
@@ -3294,7 +3436,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             sovereignty_state_ref,
                             fresh_tick,
                             Some(&pending_pcac.pcac_policy),
-                            None,
+                            temporal_arbitration_receipt.as_ref(),
                         ) {
                         Ok(receipts) => receipts,
                         Err(deny) => {
@@ -6907,6 +7049,8 @@ mod tests {
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
                 },
                 principal_id: "principal-A".to_string(),
+                membership_verified: true,
+                temporal_arbitration_receipt: None,
                 pre_actuation_required: false,
                 pre_actuation_receipt_hashes: Vec::new(),
             };
@@ -6964,6 +7108,146 @@ mod tests {
                 consumes.load(Ordering::SeqCst),
                 0,
                 "stage-3 principal mismatch must deny before consume"
+            );
+        }
+
+        #[test]
+        fn test_session_dispatch_passes_arbitration_receipt_to_lifecycle_gate() {
+            let minter = test_minter();
+            let session_id = "session-arbitration-flow";
+            let policy_ref = "policy-arbitration-flow";
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            registry
+                .register_session(SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: "W-PCAC-ARBITRATION-FLOW".to_string(),
+                    role: crate::protocol::messages::WorkRole::Implementer.into(),
+                    lease_id: "lease-001".to_string(),
+                    ephemeral_handle: "handle-arbitration-flow".to_string(),
+                    policy_resolved_ref: policy_ref.to_string(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    capability_manifest_hash: blake3::hash(b"arbitration-flow-manifest")
+                        .as_bytes()
+                        .to_vec(),
+                    episode_id: Some(session_id.to_string()),
+                })
+                .expect("session registration");
+            let registry_dyn: Arc<dyn SessionRegistry> = registry;
+
+            let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock"));
+            let ledger = Arc::new(StubLedgerEventEmitter::new());
+            let ledger_dyn: Arc<dyn LedgerEventEmitter> = Arc::clone(&ledger) as _;
+            let stop_authority = Arc::new(StopAuthority::new());
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+            let tick_kernel = Arc::new(crate::pcac::InProcessKernel::new(1));
+            let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&tick_kernel) as _;
+            let pcac_gate = Arc::new(crate::pcac::LifecycleGate::with_tick_kernel(
+                kernel_trait,
+                Arc::clone(&tick_kernel),
+            ));
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter, manifest_store)
+                .with_clock(clock)
+                .with_ledger(ledger_dyn)
+                .with_session_registry(registry_dyn)
+                .with_stop_authority(Arc::clone(&stop_authority));
+
+            let request_arguments = br#"{"type":"read","path":"/tmp/in"}"#;
+            let effect_intent_digest = *blake3::hash(request_arguments).as_bytes();
+            let current_ledger_anchor =
+                SessionDispatcher::<InMemoryManifestStore>::derive_pcac_ledger_anchor(
+                    ledger.as_ref(),
+                );
+            let current_revocation_head = *blake3::hash(policy_ref.as_bytes()).as_bytes();
+
+            let certificate = AuthorityJoinCertificateV1 {
+                ajc_id: [0x31; 32],
+                authority_join_hash: [0x32; 32],
+                intent_digest: effect_intent_digest,
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Actuate,
+                risk_tier: apm2_core::pcac::RiskTier::Tier2Plus,
+                issued_time_envelope_ref: [0x33; 32],
+                as_of_ledger_anchor: current_ledger_anchor,
+                expires_at_tick: u64::MAX,
+                revocation_head_hash: current_revocation_head,
+                identity_evidence_level: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                admission_capacity_token: None,
+            };
+
+            let bad_receipt =
+                SessionDispatcher::<InMemoryManifestStore>::build_temporal_arbitration_receipt(
+                    [0xEE; 32], 100,
+                );
+            let pending_pcac = PendingPcacAuthority {
+                gate: pcac_gate,
+                certificate,
+                intent_digest: effect_intent_digest,
+                boundary_intent_class: apm2_core::pcac::BoundaryIntentClass::Actuate,
+                requires_authoritative_acceptance: true,
+                pcac_policy: apm2_core::pcac::PcacPolicyKnobs {
+                    lifecycle_enforcement: true,
+                    min_tier2_identity_evidence: apm2_core::pcac::IdentityEvidenceLevel::Verified,
+                    freshness_max_age_ticks: 100,
+                    tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Disabled,
+                },
+                principal_id: "lease-001".to_string(),
+                membership_verified: true,
+                temporal_arbitration_receipt: Some(bad_receipt),
+                pre_actuation_required: false,
+                pre_actuation_receipt_hashes: Vec::new(),
+            };
+
+            let decision = Ok(ToolDecision::Allow {
+                request_id: "REQ-PCAC-ARBITRATION-FLOW".to_string(),
+                capability_id: "cap-read-tier3".to_string(),
+                rule_id: Some("rule-tier3".to_string()),
+                policy_hash: [0u8; 32],
+                budget_delta: crate::episode::decision::BudgetDelta::single_call(),
+                credential: None,
+            });
+            let episode_id = EpisodeId::new(session_id).expect("valid episode id");
+
+            let response = dispatcher
+                .handle_broker_decision(
+                    decision,
+                    session_id,
+                    ToolClass::Read,
+                    request_arguments,
+                    ReplayTimestamp::new(100, 0),
+                    &episode_id,
+                    None,
+                    None,
+                    false,
+                    Some(pending_pcac),
+                )
+                .expect("handle_broker_decision should return application-level response");
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32
+                    );
+                    assert!(
+                        err.message.contains("time_envelope_mismatch"),
+                        "expected temporal arbitration mismatch denial, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("containment_action: hard_freeze"),
+                        "expected containment action in denial message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected arbitration denial response, got: {other:?}"),
+            }
+
+            assert!(
+                stop_authority.emergency_stop_active(),
+                "bad arbitration receipt must trigger hard-freeze actuation"
             );
         }
 
@@ -7040,6 +7324,8 @@ mod tests {
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
                 },
                 principal_id: "lease-001".to_string(),
+                membership_verified: true,
+                temporal_arbitration_receipt: None,
                 pre_actuation_required: true,
                 pre_actuation_receipt_hashes: vec![[0x55; 32]],
             };
@@ -7169,6 +7455,8 @@ mod tests {
                     tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
                 },
                 principal_id: "lease-001".to_string(),
+                membership_verified: true,
+                temporal_arbitration_receipt: None,
                 pre_actuation_required: true,
                 pre_actuation_receipt_hashes: vec![],
             };

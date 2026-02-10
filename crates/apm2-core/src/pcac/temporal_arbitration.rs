@@ -7,6 +7,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq;
 
+use super::types::MAX_REASON_LENGTH;
+
 /// Maximum length for evaluator identifiers.
 pub const MAX_EVALUATOR_ID_LENGTH: usize = 256;
 /// Maximum number of evaluator tuples allowed in one receipt.
@@ -14,7 +16,7 @@ pub const MAX_EVALUATORS: usize = 64;
 /// Maximum length for predicate identifiers.
 pub const MAX_PREDICATE_ID_LENGTH: usize = 256;
 /// Maximum length for deny reason strings.
-pub const MAX_DENY_REASON_LENGTH: usize = 512;
+pub const MAX_DENY_REASON_LENGTH: usize = MAX_REASON_LENGTH;
 
 const ZERO_HASH: [u8; 32] = [0u8; 32];
 
@@ -198,6 +200,20 @@ impl TemporalArbitrationReceiptV1 {
         }
         if matches!(self.deadline_tick, Some(0)) {
             return Err("deadline_tick must be > 0 when present".to_string());
+        }
+        if self.aggregate_outcome == ArbitrationOutcome::DisagreementTransient {
+            match self.deadline_tick {
+                None => {
+                    return Err("DisagreementTransient requires deadline_tick".to_string());
+                },
+                Some(deadline) if deadline <= self.arbitrated_at_tick => {
+                    return Err(
+                        "deadline_tick must be strictly greater than arbitrated_at_tick"
+                            .to_string(),
+                    );
+                },
+                Some(_) => {},
+            }
         }
         if is_zero_hash(&self.content_digest) {
             return Err("content_digest must not be zero".to_string());
@@ -774,6 +790,54 @@ mod tests {
             action,
             ArbitrationAction::DenyAndRebaseline { .. }
         ));
+    }
+
+    #[test]
+    fn test_transient_disagreement_requires_deadline() {
+        let mut tuple_a = valid_tuple();
+        tuple_a.predicate_id = TemporalPredicateId::TpEio29008;
+        tuple_a.verdict = ArbitrationOutcome::DisagreementTransient;
+        tuple_a.deny_reason = Some("awaiting adjudication".to_string());
+
+        let mut tuple_b = tuple_a.clone();
+        tuple_b.evaluator_id = "eval-b".to_string();
+
+        let receipt = TemporalArbitrationReceiptV1 {
+            predicate_id: TemporalPredicateId::TpEio29008,
+            evaluators: vec![tuple_a, tuple_b],
+            aggregate_outcome: ArbitrationOutcome::DisagreementTransient,
+            time_envelope_ref: hash(0x99),
+            arbitrated_at_tick: 42,
+            deadline_tick: None,
+            content_digest: hash(0xAA),
+        };
+
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("DisagreementTransient requires deadline_tick"));
+    }
+
+    #[test]
+    fn test_transient_disagreement_deadline_must_exceed_arbitrated_at() {
+        let mut tuple_a = valid_tuple();
+        tuple_a.predicate_id = TemporalPredicateId::TpEio29008;
+        tuple_a.verdict = ArbitrationOutcome::DisagreementTransient;
+        tuple_a.deny_reason = Some("awaiting adjudication".to_string());
+
+        let mut tuple_b = tuple_a.clone();
+        tuple_b.evaluator_id = "eval-b".to_string();
+
+        let receipt = TemporalArbitrationReceiptV1 {
+            predicate_id: TemporalPredicateId::TpEio29008,
+            evaluators: vec![tuple_a, tuple_b],
+            aggregate_outcome: ArbitrationOutcome::DisagreementTransient,
+            time_envelope_ref: hash(0x99),
+            arbitrated_at_tick: 42,
+            deadline_tick: Some(42),
+            content_digest: hash(0xAA),
+        };
+
+        let err = receipt.validate().unwrap_err();
+        assert!(err.contains("deadline_tick must be strictly greater than arbitrated_at_tick"));
     }
 
     #[test]

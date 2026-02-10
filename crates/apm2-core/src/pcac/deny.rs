@@ -13,7 +13,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::intent_class::BoundaryIntentClass;
-use super::temporal_arbitration::{MAX_DENY_REASON_LENGTH, MAX_PREDICATE_ID_LENGTH};
+use super::temporal_arbitration::MAX_PREDICATE_ID_LENGTH;
 use super::types::{
     MAX_DESCRIPTION_LENGTH, MAX_FIELD_NAME_LENGTH, MAX_OPERATION_LENGTH, MAX_REASON_LENGTH,
     MAX_STRING_LENGTH, PcacValidationError, RiskTier, deserialize_bounded_string,
@@ -25,11 +25,11 @@ where
     D: Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    if value.len() > MAX_DENY_REASON_LENGTH {
+    if value.len() > MAX_REASON_LENGTH {
         return Err(serde::de::Error::custom(format!(
             "detail length {} exceeds maximum {}",
             value.len(),
-            MAX_DENY_REASON_LENGTH,
+            MAX_REASON_LENGTH,
         )));
     }
     Ok(value)
@@ -525,11 +525,11 @@ impl AuthorityDenyClass {
                 }
             },
             Self::IdentityMembershipUnverifiable { detail } => {
-                if detail.len() > MAX_DENY_REASON_LENGTH {
+                if detail.len() > MAX_REASON_LENGTH {
                     return Err(PcacValidationError::StringTooLong {
                         field: "detail",
                         len: detail.len(),
-                        max: MAX_DENY_REASON_LENGTH,
+                        max: MAX_REASON_LENGTH,
                     });
                 }
             },

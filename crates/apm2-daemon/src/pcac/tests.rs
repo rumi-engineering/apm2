@@ -105,6 +105,7 @@ fn temporal_receipt(
     predicate_id: TemporalPredicateId,
     deadline_tick: Option<u64>,
     arbitrated_at_tick: u64,
+    time_envelope_ref: Hash,
 ) -> TemporalArbitrationReceiptV1 {
     let deny_reason =
         (outcome != ArbitrationOutcome::AgreedAllow).then(|| "stale freshness witness".to_string());
@@ -128,7 +129,7 @@ fn temporal_receipt(
         predicate_id,
         evaluators: vec![tuple_a, tuple_b],
         aggregate_outcome: outcome,
-        time_envelope_ref: test_hash(0xA5),
+        time_envelope_ref,
         arbitrated_at_tick,
         deadline_tick,
         content_digest: test_hash(0xA6),
@@ -534,7 +535,8 @@ fn lifecycle_gate_denies_at_revalidate_stage() {
 #[test]
 fn test_revalidate_denies_on_agreed_deny_arbitration() {
     let kernel = Arc::new(InProcessKernel::new(100));
-    let gate = LifecycleGate::new(kernel);
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&kernel));
     let input = valid_input();
     let cert = gate
         .join_and_revalidate(
@@ -550,6 +552,7 @@ fn test_revalidate_denies_on_agreed_deny_arbitration() {
         TemporalPredicateId::TpEio29001,
         None,
         100,
+        input.time_envelope_ref,
     );
     let err = gate
         .revalidate_before_execution_with_sovereignty(
@@ -576,7 +579,8 @@ fn test_revalidate_denies_on_agreed_deny_arbitration() {
 #[test]
 fn test_consume_denies_on_stale_freshness() {
     let kernel = Arc::new(InProcessKernel::new(100));
-    let gate = LifecycleGate::new(kernel);
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&kernel));
     let input = valid_input();
     let cert = gate
         .join_and_revalidate(
@@ -592,6 +596,7 @@ fn test_consume_denies_on_stale_freshness() {
         TemporalPredicateId::TpEio29001,
         None,
         100,
+        input.time_envelope_ref,
     );
     let err = gate
         .consume_before_effect_with_sovereignty(
@@ -615,6 +620,133 @@ fn test_consume_denies_on_stale_freshness() {
             ref predicate_id,
             ref outcome,
         } if predicate_id == "TP-EIO29-001" && outcome == "agreed_deny"
+    ));
+}
+
+#[test]
+fn test_arbitration_rejects_mismatched_time_envelope() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let kernel_trait: Arc<dyn AuthorityJoinKernel> = Arc::clone(&kernel) as _;
+    let gate = LifecycleGate::with_tick_kernel(kernel_trait, Arc::clone(&kernel));
+    let input = valid_input();
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before arbitration check");
+
+    let receipt = temporal_receipt(
+        ArbitrationOutcome::AgreedAllow,
+        TemporalPredicateId::TpEio29001,
+        None,
+        100,
+        test_hash(0xE1),
+    );
+    let err = gate
+        .revalidate_before_execution_with_sovereignty(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            None,
+            Some(&receipt),
+        )
+        .expect_err("mismatched time envelope must be denied");
+
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            ref predicate_id,
+            ref outcome,
+        } if predicate_id == "TP-EIO29-001" && outcome == "time_envelope_mismatch"
+    ));
+}
+
+#[test]
+fn test_tick_derivation_failure_does_not_trust_receipt() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let input = valid_input();
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before arbitration check");
+
+    let receipt = temporal_receipt(
+        ArbitrationOutcome::AgreedAllow,
+        TemporalPredicateId::TpEio29001,
+        None,
+        12345,
+        input.time_envelope_ref,
+    );
+    let err = gate
+        .revalidate_before_execution_with_sovereignty(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            None,
+            Some(&receipt),
+        )
+        .expect_err("tick derivation failure must deny without trusting receipt tick");
+
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::TemporalArbitrationDenied {
+            ref predicate_id,
+            ref outcome,
+        } if predicate_id == "TP-EIO29-001" && outcome == "invalid_receipt"
+    ));
+    assert_eq!(
+        err.denied_at_tick,
+        u64::MAX,
+        "denied tick must use fail-closed sentinel, not receipt tick"
+    );
+}
+
+#[test]
+fn test_tier2_revalidate_denies_unverifiable_membership() {
+    let kernel = Arc::new(InProcessKernel::new(100));
+    let gate = LifecycleGate::new(kernel);
+    let mut input = valid_input();
+    input.risk_tier = RiskTier::Tier2Plus;
+    let cert = gate
+        .join_and_revalidate(
+            &input,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+        )
+        .expect("join+revalidate should succeed before membership check");
+
+    let err = gate
+        .revalidate_before_execution_with_sovereignty_membership(
+            &cert,
+            input.time_envelope_ref,
+            input.as_of_ledger_anchor,
+            input.directory_head_hash,
+            None,
+            100,
+            Some(&strict_sovereignty_policy()),
+            None,
+            false,
+        )
+        .expect_err("tier2+ revalidate must deny unverifiable membership");
+
+    assert!(matches!(
+        err.deny_class,
+        AuthorityDenyClass::IdentityMembershipUnverifiable { .. }
     ));
 }
 
